@@ -8,38 +8,61 @@ Issue #325, a follow-up of #283
 `e222d340ff` plus the accepted #283 branch), on macOS with Git 2.56.0. Line references are
 to that commit. No product code is written until this design is approved.
 
+**Revision 1 (2026-11-07)** records the maintainer's answers to revision 0's five questions and
+answers the first Codex review. The retry inside the operation is gone: a person now
+approves a sign-in that names the remote and its host, and the sign-in runs as its own
+short Git command outside every lock, capped at 10 minutes. See
+[Review findings and resolutions](#review-findings-and-resolutions).
+
 ## Goal
 
-On a local desktop server, a fetch, pull or push that the person starts from the Git
-Manager may open the system credential manager's sign-in. Background Git (bootstrap fetch,
-watchers, automatic fetch, checkpoints) and agent-driven Git (the `/mcp` Git tools) never
-prompt. A remote server, including a desktop-owned WSL server, never prompts.
+On a local desktop server, a fetch, pull or push that the person starts may open the
+system credential manager's sign-in. Background Git (bootstrap fetch, watchers, automatic
+fetch, checkpoints) and agent-driven Git (the `/mcp` tools) never prompt. A remote server,
+including a desktop-owned WSL server, never prompts.
 
 Acceptance, from the issue: this note is approved first; then tests for each mode.
 
 ## Decisions
 
-1. **Who may prompt.** The call must come from the desktop app's own session, whose
+The maintainer's answers (2026-11-07):
+
+- **M1.** Tag push and remote-branch delete get the sign-in too.
+- **M2.** A pending sign-in is capped at 10 minutes. Then BiBCode kills the Git process
+  group or Job, holds no lock, and reports a timeout.
+- **M3.** No BiBCode user name or token dialog for `osxkeychain` users.
+- **M4.** Only the desktop's in-process server; a loopback `bibcode serve` does not count.
+- **M5.** The Source Control panel's push and pull get the sign-in too, which needs a
+  Cancel control there first. This note designs it.
+
+Design decisions:
+
+1. **Who may sign in.** The call must come from the desktop app's own session, whose
    principal subject is `DESKTOP_BOOTSTRAP_SUBJECT`. That is the predicate
    `Claimant::of` already uses to let only the desktop serve a diagnostics relay
-   (`production/diagnostic_logs_relay.rs:326`), whatever the session's scopes. No request
-   field and no header mark a call as person-initiated, because any caller can set those.
-2. **Where it may prompt.** The server must be the desktop's in-process backend. A new
+   (`production/diagnostic_logs_relay.rs:326`), whatever the session's scopes. A header or
+   a payload flag never grants this.
+2. **Where.** The server must be the desktop's in-process backend. A new
    `ServerConfig::interactive_git_sign_in: bool` defaults to `false`; only the desktop's
    `server_config_for_launch` (`apps/desktop/src-tauri/src/backend.rs:2290`), which builds
    the in-process configuration, sets it. No CLI flag or bootstrap JSON key sets it.
-3. **Which operations.** `fetch`, `pull`, `push`, `publish-branch` and `force-push` of
-   `gitManager.runOperation`. Nothing else changes.
-4. **When it prompts.** Never on the first attempt. The first attempt runs with today's
-   guards. Only when it fails because Git Credential Manager (GCM) needed to ask, and the
-   call passes decisions 1 to 3, does the server run the same Git command once more without
-   `GCM_INTERACTIVE=never`.
-5. **What the person sees.** Before the retry the stream sends a new
-   `awaiting-sign-in` event, and the operation banner asks the person to finish signing in,
-   with Cancel.
-6. **How it ends.** Cancel, losing the connection, losing the workspace and server shutdown
-   kill the Git process group or Windows Job, and GCM's window with it. There is no separate
-   sign-in deadline (see [Timeouts](#timeouts)).
+3. **Which operations.** Git Manager `fetch`, `pull`, `push`, `publish-branch`,
+   `force-push`, `tag-push`, `remote-branch-delete` and `branch-delete` with
+   `deleteRemote`; Source Control `vcs.pull` and the push step of `git.runStackedAction`.
+4. **Operations never prompt.** Every operation keeps today's non-interactive environment.
+   When it fails, and Git's stderr has a line that starts with GCM's refusal, an eligible
+   operation fails with a new `sign-in-required` outcome that names the remote, its URL
+   host and the direction (fetch or push). Nothing is retried automatically.
+5. **The person approves a named destination.** The panel asks "Sign in to
+   `github.com/owner/repo` for remote `origin`?". Only a click on Sign in starts the
+   sign-in.
+6. **The sign-in is its own command.** A new unary RPC, `git.signIn`, runs one short Git
+   command against the approved URL with `GCM_INTERACTIVE` left unset: `git ls-remote` for
+   fetch, `git push --dry-run` for push. Git stores the credential when that request
+   authenticates. It holds no project lock and no status mutation guard. It is capped at
+   10 minutes (M2). One sign-in runs at a time per server.
+7. **Then the operation runs again, non-interactively.** After a successful sign-in the
+   panel reruns the original operation, which now finds the stored credential.
 
 ## Current behaviour
 
@@ -47,18 +70,29 @@ Acceptance, from the issue: this note is approved first; then tests for each mod
   starts from `prompt_guard_environment()` (`:7922`): `GCM_INTERACTIVE=never`,
   `GIT_ASKPASS=`, `GIT_TERMINAL_PROMPT=0`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`,
   `LC_ALL=C`, `LANG=C`, plus the curated `GIT_CONFIG_SYSTEM` file from #283.
-- `git_manager_fetch` (`:4410`), the network step of `git_manager_pull` (`:4451`, after two
-  `git config --get` reads) and `git_manager_push` (`:4488`) run on
-  `for_network_transfer()` (`:370`): a 24-hour runaway bound
+- `git_manager_fetch` (`:4410`), the network step of `git_manager_pull` (`:4451`),
+  `git_manager_push` (`:4488`), `git_manager_delete_remote_branch` (`:4392`) and the tag
+  push run on `for_network_transfer()` (`:370`): a 24-hour runaway bound
   (`NETWORK_TRANSFER_TIMEOUT`, `git/mod.rs:98`), Git's HTTP stall guard
   (`http.lowSpeedLimit=1000`, `http.lowSpeedTime=60`, `:54`) and Cancel.
 - `gitManager.runOperation` is registered with `register_stream`
   (`production/git_manager_rpc.rs:1023`), which drops the `RpcSessionContext`. Its handler
-  sends `started` before taking the project mutation lock, then runs
-  `run_branch_or_sync_operation` (`git/manager/operations.rs:965`) under that lock.
-- The `/mcp` Git tools (`mcp/tools/git.rs`) call the same stream through
-  `invoke_local_stream` (`rpc/session.rs:826`) with a context built from the MCP client's
-  own principal (`mcp/control.rs:1162`).
+  sends `started`, then runs `run_branch_or_sync_operation`
+  (`git/manager/operations.rs:965`) under the project mutation lock and a
+  `begin_mutation` guard.
+- `begin_mutation` (`git/status_owner.rs:507-540`) closes the worktree's status read gate,
+  retires in-flight reads and holds the worktree's mutation mutex until the guard is
+  dropped. Source Control mutations take the same guard through `run_owned_git_mutation`
+  (`production/git_vcs.rs:801-843`).
+- Source Control's `vcs.pull` is a unary method whose work runs in a spawned task
+  (`await_server_owned_rpc`, `git_vcs.rs:597`), so a client interrupt does not stop it.
+  `git.runStackedAction` is a stream registered without context (`git_vcs.rs:592`). Their
+  transfers run on `for_bounded_transfer()` (10 minutes, `git/mod.rs:105`) because they have
+  no Cancel.
+- The `/mcp` Git tools (`mcp/tools/git.rs`) call `gitManager.runOperation` through
+  `invoke_local_stream` (`rpc/session.rs:826`), and `mcp/tools/pull_requests.rs:42` calls
+  `git.runStackedAction`, each with a context built from the MCP client's own principal
+  (`mcp/control.rs:1162`).
 - A failed transfer whose stderr contains "authentication failed", "could not read
   username", "could not read password" or "permission denied (publickey)" is classified as
   `authentication` (`operations.rs:200-223`) and shown as "Authentication failed. Check the
@@ -122,13 +156,20 @@ Sources: GCM at tag v3.0.2 (2026-10-26) and Git at v2.51.0. Base URLs:
   ([`docs/msauth-broker.md`](https://github.com/git-ecosystem/git-credential-manager/blob/v3.0.2/docs/msauth-broker.md)).
 - A stored credential is returned without any prompt
   ([`HostProvider.cs` L122-145](https://github.com/git-ecosystem/git-credential-manager/blob/v3.0.2/src/Core/HostProvider.cs#L122)).
-  GCM keeps no lock files. Git stores a new credential only after the transfer succeeds,
-  so a run killed during sign-in stores nothing. The exception is GitHub's basic-auth token
-  generation, which stores at once
-  ([`GitHubHostProvider.cs` L307](https://github.com/git-ecosystem/git-credential-manager/blob/v3.0.2/src/GitHub/GitHubHostProvider.cs#L307)).
+  GCM keeps no lock files. Git sends `store` only after the request succeeds. GCM itself
+  can persist state before it returns a credential: GitHub's basic-auth token generation
+  stores at once
+  ([`GitHubHostProvider.cs` L307](https://github.com/git-ecosystem/git-credential-manager/blob/v3.0.2/src/GitHub/GitHubHostProvider.cs#L307)),
+  the generic OAuth provider stores its refresh token before returning
+  (`GenericHostProvider.cs` L345-369, reported by the Codex review), and Entra sign-in
+  registers an MSAL token cache. So a sign-in the person completes is kept even when the Git
+  command is then killed.
   No source describes GCM's behaviour when it is killed. A killed process group or Job
-  ends GCM and its `GitHub.UI` helper; a browser tab GCM opened stays open, and its redirect
-  then reaches a closed port.
+  ends GCM and its `GitHub.UI` helper. It does not end windows owned by other processes: a
+  browser tab GCM opened stays open (its redirect then reaches a closed port), and the OS
+  broker's window (WAM on Windows,
+  [`docs/msauth-broker.md`](https://github.com/git-ecosystem/git-credential-manager/blob/v3.0.2/docs/msauth-broker.md))
+  belongs to the OS and stays until the person closes it.
 - Defaults: Windows Credential Manager on Windows, Keychain on macOS. Linux has no default
   store and fails with "No credential store has been selected." until
   `credential.credentialStore` is set
@@ -145,8 +186,12 @@ Sources: GCM at tag v3.0.2 (2026-10-26) and Git at v2.51.0. Base URLs:
 | `cache`, `store`                               | No prompt (documented).                                                                                                                                                                                                                                                                                                                                               |
 | `libsecret` (only when global config names it) | No sign-in. It searches with `SECRET_SEARCH_UNLOCK` ([L118-130](https://github.com/git/git/blob/v2.51.0/contrib/credential/libsecret/git-credential-libsecret.c#L118-L130)), so a locked Secret Service collection can show its own unlock prompt, independent of Git variables.                                                                                      |
 
-Only GCM reads `GCM_INTERACTIVE`. For every other helper this design changes nothing, and
-the retry in decision 4 never runs, because its trigger is GCM's own message.
+Only GCM reads `GCM_INTERACTIVE`. For every other helper this design changes nothing: the
+sign-in offer appears only after GCM's own refusal line.
+
+Git copies the remote's sideband messages to stderr with a `remote: ` prefix on every line
+(`sideband.c` L180-220 at v2.51.0, reported by the Codex review), so a remote can print any
+text, including GCM's message, but never at the start of a line.
 
 SSH remotes stay out of scope. `SSH_ASKPASS_REQUIRE=never` blocks the askpass dialog, but
 `ssh` still reads a key passphrase from `/dev/tty` when the server has one
@@ -154,168 +199,270 @@ SSH remotes stay out of scope. `SSH_ASKPASS_REQUIRE=never` blocks the askpass di
 
 ## Alternatives
 
-| Option                                                                                                                                          | For                                                                                                                                                                            | Against                                                                                                                                                                                                                                                                    |
-| ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| (A) Status quo: never prompt (#283 decision B)                                                                                                  | No change.                                                                                                                                                                     | The person must sign in with their own Git first; the issue rejects this.                                                                                                                                                                                                  |
-| (B) Relax `GCM_INTERACTIVE` on the first attempt of an eligible call                                                                            | One process per operation.                                                                                                                                                     | The UI cannot tell a sign-in wait from a slow transfer; the banner can only say "Running fetch…". A helper that is not GCM gains nothing.                                                                                                                                  |
-| **(C) recommended:** first attempt with today's guards; retry once without `GCM_INTERACTIVE=never` only when GCM reported that it needed to ask | A stored credential never reaches the prompt path. The UI knows exactly when a sign-in is pending. Callers that are not eligible, and helpers that are not GCM, see no change. | One extra round trip to the remote, only when a sign-in is needed. A command that partly succeeded before its credential failure (a submodule fetch, a `push.recurseSubmodules` push) runs again; fetch, pull and push are safe to repeat after an authentication failure. |
-| (D) Sign in through `git credential fill`, then `approve`, then retry with today's guards                                                       | A sign-in phase with its own deadline.                                                                                                                                         | BiBCode would hold the secret in memory and pipe it between processes, and would have to reproduce Git's URL resolution (`pushurl`, `insteadOf`, `credential.useHttpPath`).                                                                                                |
-| (E) A BiBCode askpass dialog for every helper                                                                                                   | `osxkeychain` users could sign in too.                                                                                                                                         | BiBCode would collect passwords and tokens itself, and it needs a re-exec mode or a native helper, which `AGENTS.md` forbids except for the crash monitor. Out of scope (question 3).                                                                                      |
+| Option                                                                                                                                                                                                                                                               | For                                                                                                                                                                                               | Against                                                                                                                                                                                                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (A) Status quo: never prompt (#283 decision B)                                                                                                                                                                                                                       | No change.                                                                                                                                                                                        | The person must sign in with their own Git first; the issue rejects this.                                                                                                                                                                                  |
+| (B) Relax `GCM_INTERACTIVE` on the first attempt of an eligible call                                                                                                                                                                                                 | One process per operation.                                                                                                                                                                        | The UI cannot tell a sign-in wait from a slow transfer, and the sign-in would hold the project lock and the status gate. A helper that is not GCM gains nothing.                                                                                           |
+| (C) Revision 0: retry the operation inside its lock when stderr contains GCM's message                                                                                                                                                                               | No new RPC.                                                                                                                                                                                       | A remote can print the message through sideband text and force a second push. The sign-in holds the project lock and the status mutation guard, so status reads stop. A 10-minute cap (M2) on the whole retry would also cut long transfers after sign-in. |
+| **(D) recommended:** the operation fails with `sign-in-required` on a line-anchored GCM refusal; the person approves the named destination; `git.signIn` runs a short authenticating command outside every lock with a 10-minute cap; the panel reruns the operation | The cap measures the sign-in alone. No lock or status gate is held while a window is open. The person sees where they sign in before anything opens. A stored credential never reaches this path. | A new RPC, a new outcome and one approval click. A sign-in can succeed while the rerun then fails (for example a read-only token for a push); the rerun reports that as today.                                                                             |
+| (E) Sign in through `git credential fill`, then `approve`                                                                                                                                                                                                            | No probe request.                                                                                                                                                                                 | BiBCode would hold the secret in memory and pipe it between processes, and would have to reproduce Git's URL resolution (`pushurl`, `insteadOf`, `credential.useHttpPath`).                                                                                |
+| (F) A BiBCode askpass dialog for every helper                                                                                                                                                                                                                        | `osxkeychain` users could sign in too.                                                                                                                                                            | Rejected by the maintainer (M3).                                                                                                                                                                                                                                    |
 
 Eligibility alternatives:
 
 | Option                                                                                                                                              | Against                                                                                                                                                                                    |
 | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| A request field set by the toolbar                                                                                                                  | Any caller can set a field, including the `/mcp` tools. It would still need decision 1.                                                                                                    |
+| A payload flag set by the toolbar                                                                                                                   | Any caller can set a field, including the `/mcp` tools.                                                                                                                                    |
 | `required_scope` or administrative scopes                                                                                                           | MCP clients and paired devices can hold the same scopes.                                                                                                                                   |
 | Derive "local desktop" from `mode == Desktop && desktop_bootstrap_token.is_some() && !desktop_wsl_transport` (the `maintenance.rs:633-649` pattern) | Correct today, but a future launch path that reuses the bootstrap file descriptor (for example over SSH) would become eligible without anyone deciding it. The explicit flag fails closed. |
-| Treat a loopback `bibcode serve` used in the person's own browser as local                                                                          | The server cannot tell whether its process has the person's desktop session (it may run over SSH or as a service). Question 4.                                                             |
+| Treat a loopback `bibcode serve` as local                                                                                                           | Rejected by the maintainer (M4).                                                                                                                                                                    |
 
 ## Design
 
 ### Eligibility
 
-`git_manager_rpc.rs` registers `gitManager.runOperation` with
-`register_stream_with_context` and computes, once per request:
+One function, `sign_in_eligible(services, context)`, is true when:
 
 ```text
-sign_in_allowed =
-    services.interactive_git_sign_in              // decision 2, from ServerConfig
-    && context.principal().is_some_and(|p| p.subject == DESKTOP_BOOTSTRAP_SUBJECT)
-    && request is Fetch | Pull | Push | PublishBranch | ForcePush
+services.interactive_git_sign_in        // decision 2, from ServerConfig
+&& context.principal().is_some_and(|p| p.subject == DESKTOP_BOOTSTRAP_SUBJECT)
 ```
 
-`ConfiguredGitManagerRpcServices` gains the boolean from `ServerConfig`. It is passed to
-`run_branch_or_sync_operation` and on to `execute_branch_or_sync_operation` as a
-`CredentialPrompt` value (`Never` or `AfterGcmRefusal`), not as a context object, so the
-domain layer does not depend on authentication types. Every other caller passes `Never`.
+`gitManager.runOperation` (`git_manager_rpc.rs:1023`) and `git.runStackedAction`
+(`git_vcs.rs:592`) move to `register_stream_with_context`; `vcs.pull` already has its
+context (`git_vcs.rs:609`). `git.signIn` checks it again on every call. The domain layer
+receives a plain `CredentialPrompt::{Never, OfferSignIn}` value, not authentication types;
+every other caller passes `Never`.
 
-What each caller gets:
+| Caller                                                  | Subject              | Server flag | Result                                                        |
+| ------------------------------------------------------- | -------------------- | ----------- | ------------------------------------------------------------- |
+| Desktop app, in-process server                          | `desktop-bootstrap`  | true        | Eligible.                                                     |
+| Desktop app, WSL server                                 | `desktop-bootstrap`  | false       | Never.                                                        |
+| Desktop app or browser, remote `bibcode serve`          | paired subject       | false       | Never.                                                        |
+| Paired phone or browser on an exposed desktop server    | paired subject       | true        | Never; a window would open on a desktop the person is not at. |
+| `/mcp` tools, any scopes                                | MCP client's subject | any         | Never.                                                        |
+| `unsafe_no_auth` server                                 | no principal         | any         | Never.                                                        |
+| Bootstrap fetch, watchers, automatic fetch, checkpoints | not these RPCs       | any         | Never; they keep `git_environment()`.                         |
 
-| Caller                                                                   | Subject                | Server flag | Result                                                        |
-| ------------------------------------------------------------------------ | ---------------------- | ----------- | ------------------------------------------------------------- |
-| Desktop app, in-process server                                           | `desktop-bootstrap`    | true        | Eligible.                                                     |
-| Desktop app, WSL server                                                  | `desktop-bootstrap`    | false       | Never.                                                        |
-| Desktop app or browser, remote `bibcode serve`                           | paired subject         | false       | Never.                                                        |
-| Paired phone or browser on an exposed desktop server                     | paired subject         | true        | Never; a window would open on a desktop the person is not at. |
-| `/mcp` Git tools, any scopes                                             | MCP client's subject   | any         | Never.                                                        |
-| `unsafe_no_auth` server                                                  | no principal           | any         | Never.                                                        |
-| Bootstrap fetch, watchers, automatic fetch, checkpoints, stacked actions | not RPC `runOperation` | any         | Never; they keep `git_environment()`.                         |
+UI intents cannot start an operation or a sign-in: `ui.publishIntent` carries a commit
+message or a focus request only (`packages/contracts/src/uiIntents.ts:94`).
 
-UI intents cannot start an operation: `ui.publishIntent` carries a commit message or a
-focus request only (`packages/contracts/src/uiIntents.ts:94`).
+### Detecting that GCM needs the person
 
-The rule follows the RPC method, not the panel. The Source Control panel's push and pull
-(`git.runStackedAction`, `vcs.pull`) stay non-interactive, so a person gets the sign-in
-from the Git Manager's Push and not from the Source Control panel's (question 5).
+An eligible operation's network command runs as today. It reports `sign-in-required` only
+when all of these hold:
 
-### The retry
+1. It exited non-zero and was not cancelled.
+2. A line of its stderr starts with `fatal: Cannot prompt because user interactivity has
+been disabled.` (compared without case, after stripping a trailing `\r`). Remote
+   sideband lines start with `remote: `, so a remote cannot produce this line. GCM writes
+   it to the stderr it shares with Git.
+3. The remote's URL in the operation's direction, read with `git remote get-url <remote>`
+   (fetch) or `git remote get-url --push <remote>` (push), which apply `insteadOf` and
+   `pushInsteadOf`, parses as an `https://` URL. Its user name and password parts are
+   dropped. Any other scheme, including SSH and `http://`, reports today's authentication
+   error.
 
-For an eligible operation, the network command runs as today. If it exits non-zero and its
-stderr contains "user interactivity has been disabled" (GCM's message, compared without
-case), and the call's cancellation has not fired:
+The outcome carries `{ remote, url, host, direction }`, where `url` is the parsed URL
+without user information. Operations with several remote steps (a branch delete with
+`deleteRemote`) report it for the step that failed.
 
-1. The handler sends `{ "_tag": "awaiting-sign-in", "operation": … }` on the stream.
-2. It runs the same arguments again on `for_network_transfer()` with
-   `git_environment()` minus its `GCM_INTERACTIVE` entry.
-3. The second result is the operation's result, classified as today.
+A local hook (for example `pre-push`) can also print a line at column 0. That can only make
+the approval appear. The person still sees the real destination, and the sign-in that
+follows changes only `GCM_INTERACTIVE`.
 
-Only that one network command is retried: for pull, the `git config --get` reads are not
-repeated. The retry runs inside the same project mutation lock and the same
-`begin_mutation` guard as the first attempt, so no other Git Manager operation can run in
-between.
+### Approval
 
-Environment of the retried command:
+The panel shows the destination before anything opens:
 
-| Variable                              | First attempt | Retry              | Reason                                                                                                                                                 |
-| ------------------------------------- | ------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GCM_INTERACTIVE`                     | `never`       | not set by BiBCode | GCM then allows interaction. Leaving it unset, instead of `auto`, lets the person's own `GCM_INTERACTIVE` or `credential.interactive=never` still win. |
-| `GIT_TERMINAL_PROMPT`                 | `0`           | `0`                | Blocks Git's `/dev/tty` prompt and GCM's terminal fallback.                                                                                            |
-| `GIT_ASKPASS`, `SSH_ASKPASS`          | empty         | empty              | No askpass program.                                                                                                                                    |
-| `SSH_ASKPASS_REQUIRE`                 | `never`       | `never`            | SSH unchanged.                                                                                                                                         |
-| `GIT_CONFIG_SYSTEM`, `LC_ALL`, `LANG` | as #283       | as #283            | Same curated system file and stable messages.                                                                                                          |
+- Title: "Sign in to `github.com/owner/repo`?"
+- Body: "Git Credential Manager needs you to sign in before it can {fetch from | push to}
+  remote `origin`. It opens its own window or a browser page."
+- Buttons: **Sign in** (primary) and **Not now**. Not now ends the operation with today's
+  authentication error.
+
+The text shows host and path, never user information or query. A long path is shortened
+in the middle; the host is never shortened. An agent may have rewritten the remote URL
+before the click; this is why the dialog shows the URL BiBCode resolved at failure time,
+and why `git.signIn` checks it again.
+
+### `git.signIn`
+
+A unary RPC, scope `orchestration:operate`, declared in `auth/scope.rs`, registered with
+context, and added to `is_long_running` (`diagnostics/profiler/latency.rs:106`) because it
+waits on a person. It is not run in a spawned task, so an interrupt drops it and the
+supervised drop guard kills its process group or Job.
+
+Input: `{ projectId, cwd, remote, direction, url }`, where `url` is the one the person
+approved. Steps:
+
+1. Refuse unless `sign_in_eligible`. The error is `GitSignInUnavailableError`.
+2. Validate `cwd` as `gitManager.runOperation` does (project ownership, workspace
+   admission).
+3. Resolve the remote's URL again in that direction. If it differs from `url`, refuse with
+   `GitSignInDestinationChangedError` carrying the new URL; the panel asks again.
+4. Take the server's single sign-in slot. If another sign-in is pending, refuse with
+   `GitSignInBusyError` ("Another sign-in is open. Finish or cancel it first.").
+5. Run one Git command in `cwd`, with the resolved URL as an argument, never the remote
+   name, so a URL changed after step 3 cannot redirect it:
+   - fetch: `git ls-remote --heads <url>`;
+   - push: `git push --dry-run --porcelain <url> HEAD:refs/heads/<current branch>`, or
+     `HEAD` alone on a detached head. A dry run contacts the receive-pack service, which
+     authenticates, and sends no objects.
+     It runs with `git_environment()` minus its `GCM_INTERACTIVE` entry, the
+     `for_network_transfer()` configuration, and a 10-minute timeout instead of 24 hours.
+6. Answer `signedIn` when the command authenticated: exit 0, or a push refusal that is not
+   an authentication failure (for example non-fast-forward). Answer `failed` with the
+   classified message otherwise, `timedOut` after 10 minutes, and `cancelled` on interrupt.
+
+Git sends `store` to every helper after a request authenticates, so the credential is saved
+before the probe ends. A public repository that needs no sign-in to read answers
+`signedIn` for fetch without storing anything; the rerun then succeeds without one. For
+push the dry run asks for write access, so the stored credential is the one the push needs.
+
+Environment of the sign-in command:
+
+| Variable                              | Operations | `git.signIn`       | Reason                                                                                                                                                 |
+| ------------------------------------- | ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GCM_INTERACTIVE`                     | `never`    | not set by BiBCode | GCM then allows interaction. Leaving it unset, instead of `auto`, lets the person's own `GCM_INTERACTIVE` or `credential.interactive=never` still win. |
+| `GIT_TERMINAL_PROMPT`                 | `0`        | `0`                | Blocks Git's `/dev/tty` prompt and GCM's terminal fallback.                                                                                            |
+| `GIT_ASKPASS`, `SSH_ASKPASS`          | empty      | empty              | No askpass program.                                                                                                                                    |
+| `SSH_ASKPASS_REQUIRE`                 | `never`    | `never`            | SSH unchanged.                                                                                                                                         |
+| `GIT_CONFIG_SYSTEM`, `LC_ALL`, `LANG` | as #283    | as #283            | Same curated system file and stable messages.                                                                                                          |
 
 `git_environment()` and `prompt_guard_environment()` stay unchanged for every other caller.
-The new variant is one function beside them in `git/repository.rs`, used only by the retry.
+The sign-in environment is one function beside them in `git/repository.rs`.
 
-### Cancellation
+### Rerun
 
-- **Cancel** in the banner interrupts the RPC. The handler's token fires, the supervised
-  runner kills the Git process group (Unix) or Job (Windows), and GCM, its `GitHub.UI`
-  helper and its window end with it. The result is today's `cancelled` outcome.
-- **Losing the connection** (the window closes, the app quits, the backend restarts)
-  cancels the stream the same way.
-- **Losing the workspace** cancels through `admission.loss_cancellation()`
-  (`git_manager_rpc.rs:257`), as today.
-- **Server shutdown** drops the run, and the drop guard kills the group or Job without
-  waiting (`docs/architecture/overview.md:392`).
-- A browser tab GCM opened stays open. Finishing the sign-in there after a cancel reaches a
-  closed loopback port and stores nothing.
+After `signedIn`, the panel reruns the request it started: the same
+`gitManager.runOperation` payload, `vcs.pull`, or `git.runStackedAction` with action `push`
+when the stacked action already committed. The rerun is an ordinary non-interactive call.
+If it reports `sign-in-required` again, the panel shows the error "Signed in, but Git
+Credential Manager still asked to sign in. Sign in with your own Git, then try again." and
+does not offer a second sign-in in a row.
 
-### Timeouts
+### Locks while a sign-in is open
 
-The retry keeps `for_network_transfer()`: Cancel, the 24-hour runaway bound, and the stall
-guard once data flows. There is no separate sign-in deadline, because BiBCode cannot see
-when sign-in ends and the transfer starts, and a deadline on the whole retry would cut
-long pushes. While the person has not finished signing in, the project mutation lock is
-held: other Git Manager operations and the `/mcp` Git tools on that project answer
-`operation-in-flight`, and the banner with Cancel stays visible. Background work that does
-not take that lock is unaffected. Question 2 asks whether to add a cap.
+`git.signIn` takes neither the project mutation lock nor `begin_mutation`. While its window
+is open:
+
+| Caller                                                                                  | Effect                                                            |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Status reads, status streams, refs and history reads                                    | Continue.                                                         |
+| Other Git Manager operations, Source Control mutations, `/mcp` Git tools on the project | Run normally. One that needs a credential fails as it does today. |
+| Another `git.signIn` anywhere on the server                                             | Refused with `GitSignInBusyError`.                                |
+| Checkpoints, bootstrap fetch, watchers                                                  | Unaffected.                                                       |
+
+The operation that asked for the sign-in released its lock and guard when it failed with
+`sign-in-required`. The rerun takes them again and revalidates as any operation does
+(`run_branch_or_sync_operation` rebuilds its refs snapshot and checks blocked reasons
+first), so a change made during the sign-in is seen.
+
+### Cancellation and timeout
+
+- **Cancel** during the sign-in interrupts `git.signIn`. The handler is dropped and the
+  supervised runner kills the Git process group (Unix) or Job (Windows), which ends GCM and
+  its `GitHub.UI` helper.
+- **Losing the connection** (the window closes, the app quits, the backend restarts) and
+  **server shutdown** drop the handler the same way
+  (`docs/architecture/overview.md:392`).
+- **Timeout** after 10 minutes (M2) kills the group or Job the same way and answers
+  `timedOut`: "Sign-in timed out after 10 minutes. Nothing was fetched or pushed." No lock
+  is held, so nothing else needs releasing.
+- **What cancel does not undo.** Cancel and timeout stop BiBCode's processes and the probe.
+  They do not undo authentication: a sign-in the person already finished in GCM may be
+  stored (GCM persists OAuth refresh tokens and MSAL caches before returning; Git stores
+  the credential once the request authenticates). A browser tab GCM opened, and the OS
+  broker window (WAM), belong to other processes and stay open until the person closes
+  them.
+- The original operation never runs during the sign-in, so cancelling a sign-in cannot
+  leave a half-done transfer.
+
+### Source Control Cancel (M5)
+
+The Source Control panel has no Cancel today, so its pull and push use the 10-minute
+bounded transfer. M5 needs one before a sign-in can be offered there.
+
+- **UI.** While `vcs.pull` runs, or while `git.runStackedAction` reports its `push`
+  phase, the panel's progress row shows a **Cancel** button. The commit, branch and pull
+  request phases show none: the first two are local and short, and the third is a provider
+  API call, not a Git transfer.
+- **`git.runStackedAction`.** A stream: Cancel interrupts it, its token fires, and the
+  running push is killed. The stream then sends `action_failed` with phase `push` and the
+  message "Push cancelled. Your commit is saved locally." A commit that finished stays.
+- **`vcs.pull`.** Its work runs in a spawned task today, so an interrupt does not reach it.
+  The handler holds a `CancellationToken::drop_guard()` for the operation token while it
+  awaits the task, and disarms it when the task finishes. An interrupt or a lost
+  connection then cancels the token and kills the pull's Git process group or Job. This is
+  the same exposure the Git Manager's cancellable pull already has: Git killed during its
+  merge step can leave `index.lock`, which the in-progress strip already reports.
+- Both keep `for_bounded_transfer()` (10 minutes); Cancel is added, the bound stays.
+- **Sign-in.** On an eligible session both report `sign-in-required` the same way:
+  `vcs.pull` as a typed error `GitSignInRequiredError { remote, url, host, direction }`,
+  the stacked action as an optional `signIn` object on `action_failed`. The panel shows
+  the same approval and calls the same `git.signIn`.
 
 ### Process supervision and profiler coverage
 
-- **Child processes.** The retry is one more Git command through the same
-  `GitRepository` runner and `process::supervised`, so its exit and crash reporting match
-  the first attempt. GCM is Git's child in the same group or Job. No new process kind.
-- **RPC methods.** No new method. `gitManager.runOperation` is timed to its first item
-  (`FIRST_ITEM`, `diagnostics/profiler/latency.rs:36`), and `started` goes out before any
-  Git runs, so a sign-in wait raises no `rpc.slow` or `rpc.hang`. A test pins this.
-- **Events.** One new profiler event, `git.signIn`, emitted when a retry ends, with
-  `operation`, `outcome` (`succeeded`, `failed`, `cancelled`, `timedOut`) and `waitMs`. It
-  carries no remote name, URL, user name or Git output, and it is documented in
-  `docs/skills/bibcode-profiler/references/events.md` and the Profiler section of the
-  overview. The retry start is logged with `tracing::info!` and a failed retry with
-  `tracing::warn!`, both with the operation name only.
+- **Child processes.** The sign-in command runs through the same `GitRepository` runner and
+  `process::supervised`, so exit and crash reporting match other Git commands. GCM is Git's
+  child in the same group or Job. No new process kind.
+- **RPC methods.** `git.signIn` is registered through the `rpc/session.rs` wrappers, which
+  time it, and is listed in `is_long_running`, so a 10-minute wait raises no `rpc.slow` or
+  `rpc.hang`. `gitManager.runOperation` and `git.runStackedAction` are timed to their first
+  item (`FIRST_ITEM`, `latency.rs:36`) and are unchanged.
+- **Events.** One new profiler event, `git.signInEnded`, with `direction`, `outcome`
+  (`signedIn`, `failed`, `cancelled`, `timedOut`) and `waitMs`. It carries no remote name,
+  URL, host, user name or Git output. It is documented in
+  `docs/skills/bibcode-profiler/references/events.md` and the overview's Profiler section.
+  The sign-in start is logged with `tracing::info!`, a failure or timeout with
+  `tracing::warn!`, both with the direction only.
 - Worktree removal, binaries and shutdown order: not touched.
 
-### UI while waiting
+### UI
 
-`packages/contracts/src/gitManager.ts` adds
-`Schema.TaggedStruct("awaiting-sign-in", { operation })` to `GitManagerOperationEvent`.
-Only the in-process server sends it, to the desktop app's own WebView, which ships in the
-same build, so no older client receives it.
+Contracts (`packages/contracts`):
 
-`GitManagerOperationBanner` (`apps/web/src/components/gitManager/toolbar/`) gains one
-state:
+- `GitManagerOperationEvent` gains `sign-in-required { operation, remote, url, host,
+direction }` as a terminal failure event. Only the in-process server sends it, to the
+  desktop app's own WebView, which ships in the same build. `StreamSchema` for
+  `gitManager.runOperation` (`rpc/session.rs:511-522`) learns it as a failure, although
+  `/mcp` never receives it.
+- `vcs.pull` gains `GitSignInRequiredError`; `action_failed` gains an optional `signIn`.
+- `git.signIn` input and result schemas, and its three errors.
 
-- Text: "Finish signing in with Git Credential Manager in the window or browser page it
-  opened. The {operation} continues after you sign in."
-- The spinner and Cancel stay. The state lasts until `finished` or `failed`.
-- A failed retry shows a failure text the implementer writes under `UI.md`, since "Check
-  the configured credentials" reads oddly right after a sign-in. A cancelled one shows
-  today's cancel text.
-- `StreamSchema` for `gitManager.runOperation` (`rpc/session.rs:511-522`) learns the new
-  tag as a non-terminal event, although `/mcp` never receives it.
-- Nothing changes when the event never arrives, which covers every ineligible caller and
-  every helper that is not GCM.
+Web (`apps/web`):
 
-The text names GCM because only GCM causes this state. The implementation is reviewed
-against `UI.md` and `vercel-react-best-practices`.
+- The approval in [Approval](#approval), shown in place of the operation banner
+  (`gitManager/toolbar/GitManagerOperationBanner.tsx`) and the Source Control progress row.
+- While `git.signIn` runs: "Finish signing in with Git Credential Manager in the window or
+  browser page it opened." with a spinner and **Cancel**. After `signedIn`, the banner
+  returns to "Running {operation}…" for the rerun.
+- `failed`, `timedOut` and `cancelled` show their messages from
+  [`git.signIn`](#gitsignin) and [Cancellation and timeout](#cancellation-and-timeout).
+  Cancelled reads "Sign-in cancelled. Nothing was fetched or pushed."
+- Nothing changes when no `sign-in-required` arrives, which covers every ineligible caller
+  and every helper that is not GCM.
+
+The implementation is reviewed against `UI.md` and `vercel-react-best-practices`.
 
 ### Security
 
 - No prompt is reachable from MCP: the `/mcp` context carries the MCP client's principal,
-  never `desktop-bootstrap`, and no request field can change that. A test drives the
-  `git_fetch` tool through `invoke_local_stream` with administrative scopes and asserts
-  `GCM_INTERACTIVE=never` on every spawned Git.
+  never `desktop-bootstrap`. Its operations never report `sign-in-required`, and a direct
+  `git.signIn` through `invoke_local` is refused by eligibility. No `/mcp` tool lists
+  `git.signIn` among its methods.
 - No prompt is reachable from a remote client: paired sessions have their own subjects, and
   remote and WSL servers never set the flag.
+- A remote cannot trigger the offer: its sideband text never starts a stderr line.
+- An agent that rewrites a remote URL cannot redirect an approved sign-in: the dialog shows
+  the resolved URL, `git.signIn` compares it again, and the command uses the URL string,
+  not the remote name.
+- Only `https://` destinations get a sign-in.
 - The desktop bootstrap credential stays in the desktop process. The implementer confirms
   that no spawned process (terminals, providers, Git) receives it in its environment; this
   design does not change that.
-- The retry trigger is GCM's message in Git's stderr. A remote cannot plant it in a way
-  that matters: a forged message only causes one retry that a person started anyway, with
-  the same guards except `GCM_INTERACTIVE`.
 
 ### Pre-existing behaviour outside this change
 
@@ -329,54 +476,77 @@ Keychain or keyring dialog on any Git call, and `ssh` can read a passphrase from
 Rust, `apps/server`:
 
 1. `git/manager/mod.rs`, `assert_non_interactive_git` (`:92`) also asserts
-   `GCM_INTERACTIVE=never`, so every read and operation stays guarded.
-2. A recording runner returns GCM's message on the first fetch, pull and push. With
-   `CredentialPrompt::AfterGcmRefusal` the second spawn has no `GCM_INTERACTIVE` and keeps
-   `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=`, `SSH_ASKPASS=` and `SSH_ASKPASS_REQUIRE=never`;
-   pull does not repeat its config reads.
-3. Same runner with `Never`: one spawn, the failure is `authentication`.
-4. `AfterGcmRefusal` with an "Authentication failed" stderr that lacks GCM's message
-   (osxkeychain), and with "permission denied (publickey)": no retry.
-5. Every other operation with `AfterGcmRefusal`: one spawn, guarded.
-6. `git_manager_rpc.rs` stream tests: a `desktop-bootstrap` principal with the flag on gets
-   `started`, `awaiting-sign-in` and then the terminal event; with the flag off, with a
-   paired principal, with no principal, and through `invoke_local_stream` with an MCP
-   principal holding administrative scopes, no `awaiting-sign-in` and no unguarded spawn.
-7. Cancel during the retry: the runner observes cancellation, the stream ends `cancelled`,
-   and the project mutation lock is released.
-8. `ServerConfig`: `interactive_git_sign_in` is false by default, from `bibcode serve`, and
-   from a WSL bootstrap; `server_config_for_launch` sets it.
-9. Profiler: a retry emits one `git.signIn` with no remote, URL or output, and a stream that
-   waits after `started` raises no `rpc.hang`.
+   `GCM_INTERACTIVE=never`, so every read and operation stays guarded, including on an
+   eligible session.
+2. Detection: a recording runner returns GCM's refusal line for fetch, pull, push,
+   publish-branch, force-push, tag-push, remote-branch-delete and branch-delete with
+   `deleteRemote`. With `OfferSignIn` and an `https://` remote each fails with
+   `sign-in-required` carrying remote, URL without user information, host and direction.
+   Exactly one network spawn, no retry.
+3. Detection negatives, each giving today's `authentication`: the same text after
+   `remote: `; an "Authentication failed" stderr without the line (osxkeychain);
+   "permission denied (publickey)"; an SSH or `http://` remote; `Never`.
+4. `git.signIn` environment: no `GCM_INTERACTIVE`, and `GIT_TERMINAL_PROMPT=0`,
+   `GIT_ASKPASS=`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`; arguments are
+   `ls-remote --heads <url>` or `push --dry-run --porcelain <url> <refspec>` with the URL,
+   never the remote name.
+5. `git.signIn` refusals: ineligible session (flag off, paired principal, no principal, MCP
+   principal with administrative scopes through `invoke_local`); URL changed since the
+   approval; a second concurrent sign-in.
+6. `git.signIn` outcomes: exit 0 and a non-fast-forward dry run answer `signedIn`; an
+   authentication failure answers `failed`; a runner that never exits answers `timedOut`
+   at the configured cap (the test injects a short cap) and its process is killed; an
+   interrupt answers `cancelled` and kills it.
+7. Locks: while a `git.signIn` is pending, a status read on the same worktree completes and
+   a Git Manager operation on the same project acquires the project lock.
+8. Stream tests: a `desktop-bootstrap` principal with the flag on receives
+   `sign-in-required`; with the flag off, a paired principal, no principal, and an MCP
+   principal through `invoke_local_stream`, the same failure is today's `authentication`
+   and no `sign-in-required` is sent.
+9. Source Control: `vcs.pull` interrupted mid-transfer kills its Git process and ends with
+   the cancelled error; `git.runStackedAction` cancelled in its push phase keeps the commit
+   and sends the "Push cancelled" failure; both report `sign-in-required` on an eligible
+   session only.
+10. `ServerConfig`: `interactive_git_sign_in` is false by default, from `bibcode serve`, and
+    from a WSL bootstrap; `server_config_for_launch` sets it.
+11. Profiler: each `git.signIn` outcome emits one `git.signInEnded` with no remote, URL,
+    host or output; `is_long_running("git.signIn")` is true.
 
 Contracts and web:
 
-10. `gitManager.test.ts` decodes `awaiting-sign-in`.
-11. `GitManagerOperationBanner` test: the event shows the sign-in text with Cancel, and
-    `finished`, `failed` and Cancel leave it.
+12. Contract tests decode `sign-in-required`, `GitSignInRequiredError`, the `signIn` field,
+    and the `git.signIn` schemas.
+13. Git Manager and Source Control component tests: the approval names host, path and
+    remote; Not now gives the authentication error; Sign in shows the waiting state with
+    Cancel; `signedIn` reruns the original request once; a second `sign-in-required` after
+    a sign-in shows the error without a new offer; the Source Control Cancel appears only while
+    pulling and in the push phase.
 
 Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` and
 `linux-desktop.md` by the implementer, not run in this round:
 
-12. Windows 11, Git for Windows with GCM, no stored credential for a private HTTPS
-    repository: Git Manager Fetch shows the sign-in banner and GCM's window; signing in
-    completes the fetch, and a second fetch needs no sign-in. Cancel during the window
-    closes it. The same fetch from the `/mcp` `git_fetch` tool fails with the
-    authentication error and no window.
-13. macOS with GCM installed: the same checks, plus that GCM detects a desktop session
-    when Git runs under the desktop app (unverified today). With only `osxkeychain`, the
-    banner never appears and the error is unchanged.
-14. Linux desktop with GCM and `credential.credentialStore=secretservice`: the same checks.
-15. A WSL server and a paired browser on an exposed desktop server: no window; the
+14. Windows 11, Git for Windows with GCM, no stored credential for a private HTTPS
+    repository: Git Manager Fetch shows the approval with the right host; Sign in opens
+    GCM's window; finishing it completes the fetch, and a second fetch needs no sign-in.
+    Repeat for Push and for Source Control commit and push. Cancel during the window closes
+    it; waiting 10 minutes times out. The same fetch from the `/mcp` `git_fetch` tool fails
+    with the authentication error and no window.
+15. macOS with GCM installed: the same checks, plus that GCM detects a desktop session when
+    Git runs under the desktop app (unverified today). With only `osxkeychain`, no approval
+    appears and the error is unchanged.
+16. Linux desktop with GCM and `credential.credentialStore=secretservice`: the same checks.
+17. A WSL server and a paired browser on an exposed desktop server: no approval; the
     authentication error as today.
-16. Confirm GCM's message reaches Git's stderr as "fatal: Cannot prompt because user
-    interactivity has been disabled." on each OS. If the wording differs, the trigger
-    string in test 2 changes with it.
+18. Confirm on each OS that GCM's line reaches Git's stderr at column 0 as "fatal: Cannot
+    prompt because user interactivity has been disabled.", and that a successful
+    `ls-remote` and `push --dry-run` make Git store the credential. If either differs, the
+    detection string or the probe changes with it.
 
 ## Documents changed at implementation
 
 - `docs/architecture/rpc-and-orchestration.md`, "Git process environment" and "Git Manager
-  flow" (coordinator-reserved for this round; text in the lane report).
+  flow", plus the Source Control methods (coordinator-reserved for this round; text in the
+  lane report).
 - `docs/architecture/overview.md`, Profiler section (coordinator-reserved).
 - `docs/skills/bibcode-profiler/references/events.md`.
 - The three desktop runbooks under `docs/testing/`.
@@ -385,30 +555,29 @@ Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` an
 
 ## Risks
 
-- GCM's message is matched as text. A GCM release that rewords it turns the feature off
-  (no retry), never on. Test 16 guards it.
+- GCM's line is matched as text. A GCM release that rewords it turns the offer off, never
+  on. Test 18 guards it.
 - GCM may not detect a desktop session for a Git spawned by the desktop app on macOS. Then
-  it falls back to the terminal, `GIT_TERMINAL_PROMPT=0` blocks it, and the retry fails
-  with today's error after the banner showed. Test 13.
-- An abandoned sign-in holds the project mutation lock until Cancel or the window closes.
+  it falls back to the terminal, `GIT_TERMINAL_PROMPT=0` blocks it, and `git.signIn`
+  answers `failed`. Test 15.
 - When the person's own environment or Git configuration sets `GCM_INTERACTIVE=never` or
-  `credential.interactive=never`, the retry inherits it: the banner shows, then the
-  operation fails as today.
+  `credential.interactive=never`, the approval still appears, then `git.signIn` inherits
+  the setting and answers `failed`.
+- A credential that reads but cannot write (a fetch sign-in followed by a push) makes the
+  push fail; the push then offers its own sign-in, whose dry run asks for write access.
+- Cancel cannot take back a sign-in the person already finished.
+
+## Review findings and resolutions
+
+Codex review (gpt-6.1-sol, high) of revision 0 at `50b8223c1a`. No authentication bypass
+found. Each finding was checked against the source.
+
+| #    | Finding                                                                                                                                                                                                    | Checked                                                                                     | Resolution                                                                                                                                                                                                                                                                                                                         |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P2 1 | Remote sideband text can contain GCM's message and force a retry and a misleading banner, even with only `osxkeychain`. Ask the person to approve a named destination; an agent can rewrite the URL first. | Accepted: revision 0 matched the message anywhere in stderr.                                | **Fixed.** No automatic retry. Detection needs a line starting with GCM's refusal, which sideband lines (`remote: ` prefix) cannot produce. The person approves "Sign in to host/path for remote X"; `git.signIn` re-resolves the URL, refuses if it changed, and passes the URL string to Git. Only `https://`. Tests 2, 3, 4, 5. |
+| P2 2 | An abandoned sign-in holds `begin_mutation`, which closes the status read gate and owns the mutation mutex (`status_owner.rs:507-540`); Source Control mutations take it too (`git_vcs.rs:801-843`).       | Confirmed in `begin_mutation`.                                                              | **Fixed by redesign.** The sign-in is its own RPC with no project lock and no status guard; the operation released both when it failed and revalidates on rerun. Blocked callers are listed in [Locks while a sign-in is open](#locks-while-a-sign-in-is-open); test 7.                                                            |
+| P2 3 | Cancel cannot promise nothing was stored: GCM OAuth persists refresh tokens before returning, Entra registers an MSAL cache, and a group or Job kill does not close an OS broker window.                   | Accepted; the generic provider line numbers come from the review and were not re-read here. | **Fixed.** [Cancellation and timeout](#cancellation-and-timeout) says cancel stops BiBCode's processes and the probe, not authentication, and names the browser tab and the broker window. The research section is corrected.                                                                                                      |
 
 ## Questions only the maintainer can answer
 
-1. Should `tag-push` and `remote-branch-delete`, also network transfers the person starts
-   from the Git Manager, get the same sign-in? Recommended: not now; the issue names fetch,
-   pull and push, and adding them later is one match arm each.
-2. Should a pending sign-in have a cap, for example 10 minutes
-   (`BOUNDED_TRANSFER_TIMEOUT`) on the whole retry? Recommended: no cap. Cancel and closing
-   the window already end it, and a cap would also cut long pushes after sign-in.
-3. On macOS with Apple's default `osxkeychain`, no sign-in can happen. Should BiBCode offer
-   its own user name and token dialog later? Recommended: no; BiBCode would then handle
-   secrets itself.
-4. Should a loopback `bibcode serve` used in the person's own browser count as local?
-   Recommended: no; the server cannot tell whether it runs in the person's desktop
-   session.
-5. Should the Source Control panel's push and pull (`git.runStackedAction`, `vcs.pull`)
-   also get the sign-in? Recommended: not now, for the same reason as question 1; they run
-   on the bounded transfer without Cancel, so they would also need a Cancel first.
+None open. Revision 0's five questions are answered (M1 to M5).
