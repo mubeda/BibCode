@@ -450,8 +450,9 @@ caller, changed destination, busy slot, URL rewrite) records nothing.
 
 It holds no remote name, URL, host, user name or Git output. The start is logged
 at info and a `failed` or `timedOut` outcome at warn, with the direction only.
-`git.signIn` is long-running, so it raises no `rpc.slow`; a sign-in still open
-after 300 s raises `rpc.hang`.
+`git.signIn` is long-running, so it raises no `rpc.slow`, and its hang budget is
+660 s (the 10-minute cap plus cleanup), so only a sign-in past its cap raises
+`rpc.hang`.
 
 ### server.stop
 
