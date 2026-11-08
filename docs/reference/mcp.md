@@ -1619,20 +1619,23 @@ Reverts a thread to its checkpoint after turn `turnCount` (0 means before its fi
 - **Retries:** receipt-backed with `clientRequestId`. A replay does not revert twice; it waits again for the recorded outcome of the same request. Use this to follow up a `reverted: null` result.
 - **Runs long / waits:** long-running (does not hold a wait slot). Waits at most 30 seconds for the effects worker to record the outcome. Cancelling the call or a server shutdown ends the wait the same way as the timeout.
 
-| Argument          | Type    | Required | Limits and default                                     | Meaning                                                           |
-| ----------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
-| `threadId`        | string  | yes      | a live thread                                          | The thread.                                                       |
-| `turnCount`       | integer | yes      | 0 up to the thread's latest turn that has a checkpoint | The last turn to keep, numbered as `get_turn_diff` numbers turns. |
-| `clientRequestId` | string  | no       | 1 to 256 characters                                    | Retry id.                                                         |
+| Argument              | Type    | Required | Limits and default                                     | Meaning                                                           |
+| --------------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
+| `threadId`            | string  | yes      | a live thread                                          | The thread.                                                       |
+| `turnCount`           | integer | yes      | 0 up to the thread's latest turn that has a checkpoint | The last turn to keep, numbered as `get_turn_diff` numbers turns. |
+| `mode`                | string  | no       | `full` (default) or `conversationOnly`                 | `conversationOnly` rewinds the conversation and keeps every file. |
+| `siblingChangesToken` | string  | no       | the token `McpSharedCheckoutChangedError` returned     | Acknowledges the outside changes it describes.                    |
+| `clientRequestId`     | string  | no       | 1 to 256 characters                                    | Retry id.                                                         |
 
 **Result** (`structuredContent`), one of:
 
-- Done: `{ threadId, turnCount, reverted: true, conversationRewound }`. `conversationRewound` is false when the provider could not rewind its conversation: the files were restored but the later messages are kept.
+- Done: `{ threadId, turnCount, reverted: true, conversationRewound, filesRestored }`. `conversationRewound` is false when the provider could not rewind its conversation: the files were restored but the later messages are kept. `filesRestored` is false for `mode: "conversationOnly"`.
 - Not finished within 30 seconds: `{ threadId, turnCount, reverted: null, detail }`. The revert was requested and is still running; it is not a failure. Inspect with `read_thread` or `get_turn_diff`, or repeat the call with the same `clientRequestId` to wait again.
 
 **Errors:**
 
-- `McpTurnRunningError`: a turn is running on the thread. Stop it with `interrupt_turn`, then revert.
+- `McpTurnRunningError`: a turn is running on the thread, or (for a file restore) another chat in the thread's checkout is running a turn or starting one, named in the message. Stop it with `interrupt_turn`, wait, or use `mode: "conversationOnly"`.
+- `McpSharedCheckoutChangedError`: another chat shares the thread's checkout and files there changed outside this thread since `turnCount`. The structured error carries `restoredPaths` (every file the restore changes), `siblingChanges` (`paths` changed since the thread's last turn, and `turns` of other chats with their files) and `siblingChangesToken`. Repeat the call with that token and a new `clientRequestId` to restore anyway, or with `mode: "conversationOnly"`. The worker returns it too when files changed after the check.
 - `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail; a turn's checkpoint still being recorded is retried in a moment), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
 - `McpInvalidArgumentError`: `turnCount` is above the latest turn that has a checkpoint.
 - `McpAccessCeilingError`: the thread runs above this connection's limit.
@@ -4578,6 +4581,7 @@ the tool ran, as the app sees it (for example `GitOperationFailedError`,
 | `McpRequestKindError`                   | The request id names an approval where a question was expected, or the reverse.                                                                                                                      | Use the tool its answerWith names.                                                                                                                    |
 | `McpTurnRunningError`                   | A turn is running, and this change needs the thread idle.                                                                                                                                            | Wait for it (wait_for_thread) or interrupt it (interrupt_turn) first.                                                                                 |
 | `McpCheckpointRevertError`              | Reverting to a checkpoint failed; the message says why.                                                                                                                                              | Read the thread, fix what the message names, then retry.                                                                                              |
+| `McpSharedCheckoutChangedError`         | Files in the thread's checkout changed outside the thread since that turn; the error lists them with a siblingChangesToken.                                                                          | Review the changes, then call again with siblingChangesToken and a new clientRequestId, or use mode conversationOnly.                                 |
 | `McpAttachmentExpiredError`             | A stored request's attachment upload is gone (it expires after 10 minutes idle, or on restart).                                                                                                      | Send it again without the clientRequestId.                                                                                                            |
 | `McpNoTurnDiffError`                    | This thread has no turn with recorded changes yet, or the turn asked for has no captured checkpoint (its capture failed or timed out).                                                               | Ask again after a turn changed files, or ask for another turn.                                                                                        |
 | `McpNotAWorktreeError`                  | This thread works in its project's folder, or in a worktree another thread hosts.                                                                                                                    | Pass the hosting thread's id, as the message says.                                                                                                    |

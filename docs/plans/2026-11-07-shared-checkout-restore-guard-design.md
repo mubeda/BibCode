@@ -11,7 +11,7 @@ changes the Git environment of the same checkpoint commands and lands first.
 **Implementation status (2026-11-07).** Implemented for #279. Where it differs from the
 text below: preparation of one checkout's restores is serial (step 2 before the gate), so
 the four-permit bound applies across checkouts; a sibling's delivery or compaction counts as
-writing while it is *admitted* (registered under the same engine mutex as the marks and
+writing while it is _admitted_ (registered under the same engine mutex as the marks and
 launches), not merely while its thread reservation is held, so a delivery waiting at the
 gate does not refuse the restore; the HEAD fallback check runs before any sibling is
 suspended; the event-log window compares instants (`julianday`), not strings; a project's
