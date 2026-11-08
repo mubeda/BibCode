@@ -85,7 +85,7 @@ export function PipelineJobLogPanel({
     const stacked = getComputedStyle(panel.parentElement ?? panel).flexDirection === "column";
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     if (stacked)
-      panel.scrollIntoView?.({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+      panel.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
     // Never take focus from a field the reader is typing in (a filter, say).
     const active = document.activeElement;
     const typing =
