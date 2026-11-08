@@ -5,7 +5,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     ProviderInfo, ProviderKind, SourceControlDiscoveryResult, host_serves_remote, provider,
-    provider_from_remote, remote_names_web_port, serving_host, split_host,
+    provider_from_remote, remote_web_host, serving_host,
 };
 
 const CAPACITY: usize = 64;
@@ -102,9 +102,10 @@ impl ProviderHosts {
     }
 
     /// The one rule for a remote's provider: well-known host names first, then
-    /// recorded hosts. A named host reached over SSH or scp still takes a recorded
-    /// same-name host with a web port (`gitlab.example.test:8929`), which only a probe
-    /// can know. A recorded host's base URL is its recorded spelling, port included;
+    /// recorded hosts. A named host still takes a recorded spelling that serves it but
+    /// differs from its own (see [`host_serves_remote`]): a web port its SSH or scp
+    /// origin cannot name (`gitlab.example.test:8929`), or a written default port for an
+    /// HTTP(S) origin (`gitlab.example.test:443`), which only a probe can know. A recorded host's base URL is its recorded spelling, port included;
     /// Pull Requests scopes take their host from it.
     #[must_use]
     pub fn identify(&self, remote: &str) -> IdentifiedProvider {
@@ -112,9 +113,7 @@ impl ProviderHosts {
         match self.recorded_host(remote) {
             Some((host, kind))
                 if named.kind == ProviderKind::Unknown
-                    || (named.kind == kind
-                        && split_host(&host).1.is_some()
-                        && !remote_names_web_port(remote)) =>
+                    || (named.kind == kind && Some(&host) != remote_web_host(remote).as_ref()) =>
             {
                 let name = if kind == ProviderKind::Github {
                     "GitHub"
@@ -311,7 +310,12 @@ mod tests {
         hosts.record("localhost:9000", ProviderKind::Gitlab);
         hosts.record("localhost:8929", ProviderKind::Gitlab);
         hosts.record("gitlab.example.test:8929", ProviderKind::Gitlab);
+        hosts.record("gitlab.tls.test:443", ProviderKind::Gitlab);
         for (remote, expected) in [
+            (
+                "https://gitlab.tls.test/g/p.git",
+                "recorded https://gitlab.tls.test:443",
+            ),
             (
                 "git@localhost:group/project.git",
                 "recorded https://localhost:8929",
