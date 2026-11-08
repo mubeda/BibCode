@@ -176,13 +176,29 @@ impl PendingScope {
             ScopeAuthentication::Recorded => (provider_status(runner, &self.scope, c).await, true),
             ScopeAuthentication::Discovered(status) => (status.clone(), true),
         };
-        let result = ensure_authenticated(runner, &self.scope, status.as_deref(), c).await;
-        match &result {
+        let mut result = ensure_authenticated(runner, &self.scope, status.as_deref(), c).await;
+        match &mut result {
             Ok(()) if record_host => runner
                 .provider_hosts()
                 .record(&self.scope.host, self.scope.provider.kind()),
             Err(unavailable) if unavailable.code == "not_authenticated" => {
                 runner.provider_hosts().forget(&self.scope.host);
+                // Only a failed login looks for another spelling, so the common case
+                // keeps its probes and their order. The read already ran against the
+                // scope host: record the placement and let the next read use it.
+                if matches!(self.authentication, ScopeAuthentication::Named)
+                    && self.scope.provider == PullRequestsProvider::Gitlab
+                    && let Some(placed) =
+                        place_named_host(runner, &self.scope, &self.remote, c).await
+                {
+                    runner
+                        .provider_hosts()
+                        .record(&placed, ProviderKind::Gitlab);
+                    unavailable.message = format!(
+                        "glab is signed in to this repository's host as `{placed}`. Rescan to use it."
+                    );
+                    unavailable.auth_command = None;
+                }
             }
             Err(unavailable) if unavailable.code == "cli_missing" => {
                 validate_checkout(&self.scope.cwd).await?;
@@ -200,9 +216,25 @@ async fn resolve_checked_scope(
     read: ContextRead,
     c: &CancellationToken,
 ) -> Result<HostScope, Unavailable> {
-    let pending = resolve_login_scope(runner, cwd, discovered_hosts, read, c).await?;
-    pending.authenticate(runner, c).await?;
-    Ok(pending.scope)
+    let pending = resolve_pending_scope(runner, cwd, discovered_hosts, read, c).await?;
+    match pending.authenticate(runner, c).await {
+        Ok(()) => Ok(pending.scope),
+        // A failed login may have placed a named host on another spelling; this path
+        // reads nothing yet, so it can resolve once more and use the placement now.
+        Err(unavailable)
+            if unavailable.code == "not_authenticated"
+                && matches!(pending.authentication, ScopeAuthentication::Named) =>
+        {
+            let placed =
+                resolve_pending_scope(runner, cwd, discovered_hosts, ContextRead::Open, c).await?;
+            if placed.scope.host == pending.scope.host {
+                return Err(unavailable);
+            }
+            placed.authenticate(runner, c).await?;
+            Ok(placed.scope)
+        }
+        Err(unavailable) => Err(unavailable),
+    }
 }
 
 pub(super) async fn resolve_pending_scope(
@@ -219,26 +251,6 @@ pub(super) async fn resolve_pending_scope(
         validate_checkout(cwd).await?;
     }
     result
-}
-
-/// [`resolve_pending_scope`] for a caller about to check the login: a named GitLab host
-/// is also placed on the port glab configured it with (see `named_scope`). Snapshot and
-/// subscription reads need only the identity and stay on [`resolve_pending_scope`],
-/// which spawns no provider CLI for a named or recorded host.
-pub(super) async fn resolve_login_scope(
-    runner: &HostCommandRunner,
-    cwd: &Path,
-    discovered_hosts: &DiscoveredHosts,
-    read: ContextRead,
-    c: &CancellationToken,
-) -> Result<PendingScope, Unavailable> {
-    let mut pending = resolve_pending_scope(runner, cwd, discovered_hosts, read, c).await?;
-    if matches!(pending.authentication, ScopeAuthentication::Named) {
-        let (scope, authentication) = named_scope(runner, pending.scope, &pending.remote, c).await;
-        pending.scope = scope;
-        pending.authentication = authentication;
-    }
-    Ok(pending)
 }
 
 /// A checkout's origin before a provider is admitted: only CLI discovery can say
@@ -412,8 +424,12 @@ async fn resolve_existing_checkout_scope(
         Err(failure) => return Err(process_unavailable(&failure, "git", None)),
     };
     let recorded = runner.provider_hosts();
-    if read == ContextRead::Rescan {
-        recorded.forget_remote(&remote);
+    // Rescan forgets the origin's own spelling only: a placement on another spelling
+    // (`host:8929`) is what Rescan is asked to pick up, and forgets itself on a failed login.
+    if read == ContextRead::Rescan
+        && let Some(host) = remote_web_host(&remote)
+    {
+        recorded.forget(&host);
     }
     let (scope, authentication) = match scope_from_remote(
         cwd,
@@ -484,60 +500,27 @@ async fn resolve_existing_checkout_scope(
     })
 }
 
-/// A named GitLab host may be configured in glab under another spelling: with its web
-/// port when the origin is SSH or scp (`gitlab.example.test:8929`), or with a written
-/// default port for an HTTP(S) origin (`gitlab.example.test:443`). The scope host's own
-/// login check runs first, the probe authentication runs anyway; its answer is reused
-/// and the host recorded, so a recorded host spawns nothing here. Only when it fails
-/// does glab, unpinned, list every host once.
-async fn named_scope(
+/// A named GitLab host may be configured in glab only under another spelling: with
+/// its web port when the origin is SSH or scp (`gitlab.example.test:8929`), or with a
+/// written default port for an HTTP(S) origin (`gitlab.example.test:443`). Asked only
+/// after the scope host's own login check failed, so a configured bare name costs
+/// nothing: glab, unpinned, lists every host once, and an authenticated spelling that
+/// serves this origin is returned for the caller to record.
+async fn place_named_host(
     runner: &HostCommandRunner,
-    scope: HostScope,
+    scope: &HostScope,
     remote: &str,
     c: &CancellationToken,
-) -> (HostScope, ScopeAuthentication) {
-    let provider = PullRequestsProvider::Gitlab;
-    if scope.provider != provider
-        || runner.provider_hosts().provider(&scope.host) == Some(ProviderKind::Gitlab)
-    {
-        return (scope, ScopeAuthentication::Named);
-    }
-    let bare = runner
-        .probe(
-            &scope,
-            &["auth", "status", "--hostname", scope.host.as_str()],
-            c,
-        )
-        .await
-        .or_else(ProcessFailure::into_output);
-    match bare {
-        Ok(output) => {
-            let text = status_text(provider, &output);
-            if status_authenticated(provider, &text, &scope.host) {
-                return (scope, ScopeAuthentication::Discovered(Some(text)));
-            }
-        }
-        Err(_) => return (scope, ScopeAuthentication::Named),
-    }
+) -> Option<String> {
     let mut every_host = scope.clone();
     every_host.host.clear();
-    let Ok(text) = discovery_probe(runner, &every_host, c).await else {
-        return (scope, ScopeAuthentication::Named);
-    };
+    let text = discovery_probe(runner, &every_host, c).await.ok()?;
     let hosts: Vec<String> = parse_gitlab_auth_status(&text)
         .into_iter()
         .map(|host| host.host)
+        .filter(|host| *host != scope.host && gitlab_authenticated(&text, host))
         .collect();
-    match serving_host(hosts.iter().map(String::as_str), remote) {
-        Some(host) if host != scope.host => (
-            HostScope {
-                host: host.to_owned(),
-                ..scope
-            },
-            ScopeAuthentication::Discovered(Some(text)),
-        ),
-        _ => (scope, ScopeAuthentication::Named),
-    }
+    serving_host(hosts.iter().map(String::as_str), remote).map(str::to_owned)
 }
 
 /// The provider and configured host serving this remote: the same host, or for an SSH

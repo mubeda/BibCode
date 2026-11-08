@@ -1149,9 +1149,11 @@ async fn pull_requests_and_pipelines_snapshot_reads_of_a_named_ssh_host_spawn_no
     assert_eq!(f.calls("glab"), "", "identity reads spawned glab");
 }
 
-/// #332: glab knows a named HTTPS host only as `gitlab.tls.test:443`. Signing in places
-/// the scope there and stores rows under that host; the identity-only path that snapshot
-/// reads and subscriptions take reuses the recorded spelling, so it finds those rows.
+/// #332: glab knows a named HTTPS host only as `gitlab.tls.test:443`. The first context
+/// read checks the origin's own spelling alongside its reads, as for every named host;
+/// its failed login places the host and says to rescan. Rescan then uses the placement
+/// and stores rows under it, and the identity-only path that snapshot reads and
+/// subscriptions take reuses the recorded spelling, so it finds those rows.
 #[tokio::test]
 async fn pull_requests_named_host_on_a_written_default_port_keeps_its_snapshot_host() {
     let origin = "https://gitlab.tls.test/team/sub/repo.git";
@@ -1174,13 +1176,22 @@ async fn pull_requests_named_host_on_a_written_default_port_keeps_its_snapshot_h
         .unwrap();
     let service = PullRequestsService::with_runner(f.runner.clone()).with_database(database);
     let c = CancellationToken::new();
-    let context = serde_json::to_value(
-        service
-            .context(&f.cwd, ContextRead::Open, &c)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let read = |read| {
+        let service = service.clone();
+        let cwd = f.cwd.clone();
+        let c = c.clone();
+        async move { serde_json::to_value(service.context(&cwd, read, &c).await.unwrap()).unwrap() }
+    };
+    let first = read(ContextRead::Open).await;
+    assert_eq!(first["code"], "not_authenticated", "{first}");
+    assert!(
+        first["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`gitlab.tls.test:443`. Rescan")),
+        "{first}"
+    );
+    assert!(first["authCommand"].is_null(), "{first}");
+    let context = read(ContextRead::Rescan).await;
     assert_eq!(context["host"], "gitlab.tls.test:443", "{context}");
     service.list(&f.cwd, f.query(), &c).await.unwrap();
     let snapshot = service
