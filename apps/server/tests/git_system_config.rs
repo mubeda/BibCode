@@ -907,6 +907,13 @@ impl PlantedNullHook {
         ] {
             write_marker_hook(&directory, marker);
         }
+        // Git for Windows cannot index a reserved name, so a capture's `add -A` would fail on it.
+        let mut exclude = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(checkout.join(".git/info/exclude"))
+            .ok()?;
+        std::io::Write::write_all(&mut exclude, b"\n/nul/\n").ok()?;
         Some(planted)
     }
 }
@@ -1102,6 +1109,10 @@ async fn a_new_capture_stores_an_lfs_pointer() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "Git for Windows runs its bundled git-lfs ahead of PATH"
+)]
 async fn a_full_content_blob_restores_unchanged_with_lfs_configured() {
     let Some((_, phase, root)) = in_processes(
         "a_full_content_blob_restores_unchanged_with_lfs_configured",
@@ -1190,6 +1201,10 @@ async fn an_unread_policy_keeps_checkpoints_on_the_inherited_system_file() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "Git for Windows runs its bundled git-lfs ahead of PATH"
+)]
 async fn a_failed_lfs_smudge_fails_the_restore_under_required() {
     let Some((_, phase, root)) = in_processes(
         "a_failed_lfs_smudge_fails_the_restore_under_required",
