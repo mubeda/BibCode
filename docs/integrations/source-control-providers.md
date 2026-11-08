@@ -435,10 +435,12 @@ glab auth login --hostname gitlab.company.example
 
 Use the actual hostname from the checkout's `origin`. A self-hosted instance on a
 non-default web port is configured with that port (`glab auth login --hostname
-gitlab.example.test:8929`); an HTTP(S) `origin` matches it with its port, and an
-SSH or scp `origin`, whose port is the SSH port, matches it by name. For such a
-remote, when glab pinned to the bare name lists no host, BiBCode asks glab once
-more without a pinned host. BiBCode recognizes
+gitlab.example.test:8929`); an HTTP(S) `origin` matches it with its port, a written
+default port (`:443`, `:80`) counting as none, and an SSH, scp or `git://` `origin`,
+whose port is the SSH port, matches it by name, including a host whose name
+contains `gitlab`; the lowest port wins when several share the name. When glab,
+pinned to the remote's host, lists no match, BiBCode asks glab once more without a
+pinned host. BiBCode recognizes
 configured CLI hosts, including GitLab subgroup repository paths; it does not
 guess a provider from an arbitrary hostname. Only the host name counts:
 `github.com`, a host containing `gitlab`, Azure DevOps and Bitbucket hosts are

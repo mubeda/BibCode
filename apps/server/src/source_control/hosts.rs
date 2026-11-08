@@ -4,8 +4,8 @@
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
-    ProviderInfo, ProviderKind, SourceControlDiscoveryResult, provider, provider_from_remote,
-    remote_web_host,
+    ProviderInfo, ProviderKind, SourceControlDiscoveryResult, host_serves_remote, provider,
+    provider_from_remote, remote_names_web_port, serving_host, split_host,
 };
 
 const CAPACITY: usize = 64;
@@ -85,25 +85,45 @@ impl ProviderHosts {
         }
     }
 
+    /// Forgets every recorded host that serves this remote (see [`host_serves_remote`]).
+    pub fn forget_remote(&self, remote: &str) {
+        self.write()
+            .retain(|(known, _)| !host_serves_remote(known, remote));
+    }
+
+    /// The recorded host serving this remote, in [`serving_host`]'s order, and its provider.
+    fn recorded_host(&self, remote: &str) -> Option<(String, ProviderKind)> {
+        let hosts = self.read();
+        let host = serving_host(hosts.iter().map(|(host, _)| host.as_str()), remote)?;
+        hosts
+            .iter()
+            .find(|(known, _)| known == host)
+            .map(|(known, provider)| (known.clone(), *provider))
+    }
+
     /// The one rule for a remote's provider: well-known host names first, then
-    /// recorded hosts. GitLab hosts and recorded GitHub hosts use their own base URL.
+    /// recorded hosts. A named host reached over SSH or scp still takes a recorded
+    /// same-name host with a web port (`gitlab.example.test:8929`), which only a probe
+    /// can know. A recorded host's base URL is its recorded spelling, port included;
+    /// Pull Requests scopes take their host from it.
     #[must_use]
     pub fn identify(&self, remote: &str) -> IdentifiedProvider {
         let named = provider_from_remote(remote);
-        if named.kind != ProviderKind::Unknown {
-            return IdentifiedProvider::Named(named);
-        }
-        let Some(host) = remote_web_host(remote) else {
-            return IdentifiedProvider::Unknown;
-        };
-        let base_url = format!("https://{host}");
-        match self.provider(&host) {
-            Some(ProviderKind::Github) => {
-                IdentifiedProvider::Recorded(provider(ProviderKind::Github, "GitHub", &base_url))
+        match self.recorded_host(remote) {
+            Some((host, kind))
+                if named.kind == ProviderKind::Unknown
+                    || (named.kind == kind
+                        && split_host(&host).1.is_some()
+                        && !remote_names_web_port(remote)) =>
+            {
+                let name = if kind == ProviderKind::Github {
+                    "GitHub"
+                } else {
+                    "GitLab"
+                };
+                IdentifiedProvider::Recorded(provider(kind, name, &format!("https://{host}")))
             }
-            Some(ProviderKind::Gitlab) => {
-                IdentifiedProvider::Recorded(provider(ProviderKind::Gitlab, "GitLab", &base_url))
-            }
+            _ if named.kind != ProviderKind::Unknown => IdentifiedProvider::Named(named),
             _ => IdentifiedProvider::Unknown,
         }
     }
@@ -272,6 +292,54 @@ mod tests {
                 "{remote}"
             );
         }
+    }
+
+    /// #332: an SSH or scp remote does not name the web port, so a recorded `host:port`
+    /// of the same name identifies it, the lowest port first, named hosts included;
+    /// an HTTP(S) remote keeps its own port and a named one its name.
+    #[test]
+    fn provider_hosts_identify_ssh_remotes_by_a_recorded_host_of_the_same_name() {
+        let base_url = |hosts: &ProviderHosts, remote: &str| match hosts.identify(remote) {
+            IdentifiedProvider::Recorded(info) => format!("recorded {}", info.base_url),
+            IdentifiedProvider::Named(info) => format!("named {}", info.base_url),
+            IdentifiedProvider::Unknown => "unknown".into(),
+        };
+        let hosts = ProviderHosts::default();
+        hosts.record("localhost:9000", ProviderKind::Gitlab);
+        hosts.record("localhost:8929", ProviderKind::Gitlab);
+        hosts.record("gitlab.example.test:8929", ProviderKind::Gitlab);
+        for (remote, expected) in [
+            (
+                "git@localhost:group/project.git",
+                "recorded https://localhost:8929",
+            ),
+            (
+                "ssh://git@localhost:2224/group/project.git",
+                "recorded https://localhost:8929",
+            ),
+            (
+                "http://localhost:9000/group/project.git",
+                "recorded https://localhost:9000",
+            ),
+            (
+                "git@gitlab.example.test:g/p.git",
+                "recorded https://gitlab.example.test:8929",
+            ),
+            (
+                "https://gitlab.example.test/g/p.git",
+                "named https://gitlab.example.test",
+            ),
+            ("git@other.example.test:g/p.git", "unknown"),
+        ] {
+            assert_eq!(base_url(&hosts, remote), expected, "{remote}");
+        }
+        hosts.forget_remote("git@localhost:group/project.git");
+        assert_eq!(hosts.provider("localhost:8929"), None);
+        assert_eq!(hosts.provider("localhost:9000"), None);
+        assert_eq!(
+            hosts.provider("gitlab.example.test:8929"),
+            Some(ProviderKind::Gitlab)
+        );
     }
 
     #[test]
