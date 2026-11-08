@@ -1,6 +1,7 @@
 # Git Manager Sign-In on a Local Desktop
 
-Status: Proposed — awaiting Codex + advisor review.
+Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revision 0, advisor
+reviewed revision 1).
 
 Issue #325, a follow-up of #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md),
@@ -253,9 +254,9 @@ An eligible operation's network command runs as today. It reports `sign-in-requi
 when all of these hold:
 
 1. It exited non-zero and was not cancelled.
-2. A line of its stderr starts with `fatal: Cannot prompt because user interactivity has
-been disabled.` (compared without case, after stripping a trailing `\r`). Remote
-   sideband lines start with `remote: `, so a remote cannot produce this line. GCM writes
+2. A line of its stderr starts with GCM's refusal,
+   `fatal: Cannot prompt because user interactivity has been disabled.`, compared without
+   case after stripping a trailing `\r`. Remote sideband lines start with `remote: `, so a remote cannot produce this line. GCM writes
    it to the stderr it shares with Git.
 3. The remote's URL in the operation's direction, read with `git remote get-url <remote>`
    (fetch) or `git remote get-url --push <remote>` (push), which apply `insteadOf` and
@@ -305,10 +306,11 @@ approved. Steps:
    `GitSignInBusyError` ("Another sign-in is open. Finish or cancel it first.").
 5. Run one Git command in `cwd`, with the resolved URL as an argument, never the remote
    name, so a URL changed after step 3 cannot redirect it:
-   - fetch: `git ls-remote --heads <url>`;
-   - push: `git push --dry-run --porcelain <url> HEAD:refs/heads/<current branch>`, or
+   - fetch: `git ls-remote <url> HEAD`, which keeps the output to one line;
+   - push: `git push --dry-run --no-verify --porcelain <url> HEAD:refs/heads/<current branch>`, or
      `HEAD` alone on a detached head. A dry run contacts the receive-pack service, which
-     authenticates, and sends no objects.
+     authenticates, and sends no objects. `--no-verify` keeps a `pre-push` hook from running
+     twice; the real push still runs it.
      It runs with `git_environment()` minus its `GCM_INTERACTIVE` entry, the
      `for_network_transfer()` configuration, and a 10-minute timeout instead of 24 hours.
 6. Answer `signedIn` when the command authenticated: exit 0, or a push refusal that is not
@@ -336,8 +338,10 @@ The sign-in environment is one function beside them in `git/repository.rs`.
 ### Rerun
 
 After `signedIn`, the panel reruns the request it started: the same
-`gitManager.runOperation` payload, `vcs.pull`, or `git.runStackedAction` with action `push`
-when the stacked action already committed. The rerun is an ordinary non-interactive call.
+`gitManager.runOperation` payload or `vcs.pull`. A stacked action reruns without the commit
+it already made (`git_vcs.rs:3378` lists each action's phases): `commit_push` and `push`
+rerun as `push`, `commit_push_pr` and `create_pr` rerun as `create_pr` (push, then pull
+request). The rerun is an ordinary non-interactive call.
 If it reports `sign-in-required` again, the panel shows the error "Signed in, but Git
 Credential Manager still asked to sign in. Sign in with your own Git, then try again." and
 does not offer a second sign-in in a row.
@@ -397,6 +401,9 @@ bounded transfer. M5 needs one before a sign-in can be offered there.
   connection then cancels the token and kills the pull's Git process group or Job. This is
   the same exposure the Git Manager's cancellable pull already has: Git killed during its
   merge step can leave `index.lock`, which the in-progress strip already reports.
+  This reverses, for `vcs.pull` only, the server-owned lifecycle that lets a mutation finish
+  after its caller disconnects (`docs/architecture/rpc-and-orchestration.md`, the
+  cancellation invariants near line 5380). That document changes in the same patch.
 - Both keep `for_bounded_transfer()` (10 minutes); Cancel is added, the bound stays.
 - **Sign-in.** On an eligible session both report `sign-in-required` the same way:
   `vcs.pull` as a typed error `GitSignInRequiredError { remote, url, host, direction }`,
@@ -424,13 +431,14 @@ bounded transfer. M5 needs one before a sign-in can be offered there.
 
 Contracts (`packages/contracts`):
 
-- `GitManagerOperationEvent` gains `sign-in-required { operation, remote, url, host,
-direction }` as a terminal failure event. Only the in-process server sends it, to the
-  desktop app's own WebView, which ships in the same build. `StreamSchema` for
-  `gitManager.runOperation` (`rpc/session.rs:511-522`) learns it as a failure, although
-  `/mcp` never receives it.
+- The existing `failed` event of `GitManagerOperationEvent` uses code `sign-in-required`
+  and gains an optional `signIn { remote, url, host, direction }` object, the same shape as
+  on `action_failed`. `StreamSchema` needs no change. Only the in-process server sends it,
+  to the desktop app's own WebView, which ships in the same build.
 - `vcs.pull` gains `GitSignInRequiredError`; `action_failed` gains an optional `signIn`.
-- `git.signIn` input and result schemas, and its three errors.
+- `git.signIn` input and result schemas, and its three errors. Its client command sets no
+  `timeoutMs` (`packages/client-runtime/src/state/runtime.ts:925`), so the server's
+  10-minute cap decides, as for `vcs.pull`.
 
 Web (`apps/web`):
 
@@ -488,7 +496,7 @@ Rust, `apps/server`:
    "permission denied (publickey)"; an SSH or `http://` remote; `Never`.
 4. `git.signIn` environment: no `GCM_INTERACTIVE`, and `GIT_TERMINAL_PROMPT=0`,
    `GIT_ASKPASS=`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`; arguments are
-   `ls-remote --heads <url>` or `push --dry-run --porcelain <url> <refspec>` with the URL,
+   `ls-remote <url> HEAD` or `push --dry-run --no-verify --porcelain <url> <refspec>` with the URL,
    never the remote name.
 5. `git.signIn` refusals: ineligible session (flag off, paired principal, no principal, MCP
    principal with administrative scopes through `invoke_local`); URL changed since the
@@ -518,7 +526,8 @@ Contracts and web:
     and the `git.signIn` schemas.
 13. Git Manager and Source Control component tests: the approval names host, path and
     remote; Not now gives the authentication error; Sign in shows the waiting state with
-    Cancel; `signedIn` reruns the original request once; a second `sign-in-required` after
+    Cancel; `signedIn` reruns the original request once, and a stacked action reruns as
+    `push` or `create_pr` without a second commit; a second `sign-in-required` after
     a sign-in shows the error without a new offer; the Source Control Cancel appears only while
     pulling and in the push phase.
 
