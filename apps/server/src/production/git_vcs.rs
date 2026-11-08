@@ -27,8 +27,8 @@ use crate::{
             NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
         },
         sign_in::{
-            CredentialPrompt, Destination, SignInDirection, SignInRequired, current_branch_remote,
-            has_gcm_refusal, resolve_destination,
+            CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
+            resolve_destination, upstream_remote,
         },
         validate_pathspecs,
     },
@@ -2705,7 +2705,7 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
 }
 
 /// The remote a stacked action's push contacts: `origin` for a selected source branch, as the
-/// push step names it, otherwise the current branch's push remote.
+/// push step names it, otherwise the remote `plan_current_branch_push` chose.
 async fn stacked_push_remote(
     repository: &GitRepository,
     input: &StackedActionInput,
@@ -2714,7 +2714,11 @@ async fn stacked_push_remote(
     if input.action == "create_pr" && input.pull_request_head_branch.is_some() {
         return Some("origin".to_owned());
     }
-    current_branch_remote(repository, &input.cwd, SignInDirection::Push, cancellation).await
+    repository
+        .plan_current_branch_push(&input.cwd, cancellation)
+        .await
+        .ok()
+        .map(|push| push.remote)
 }
 
 /// The `signIn` object of a stacked action whose push failed on GCM's refusal (#325), or the
@@ -3114,20 +3118,36 @@ async fn run_stacked_action_steps(
     };
     let push = if wants_push {
         *phase = Some("push");
-        if input.expected_destination.is_some() {
-            let remote = stacked_push_remote(repository, input, cancellation).await;
-            check_expected_destination(
-                repository,
-                &input.cwd,
-                remote.as_deref(),
-                SignInDirection::Push,
-                input.expected_destination.as_deref(),
-                cancellation,
-            )
-            .await
-            .map_err(StackedActionFailure::from)?;
-        }
-        let branch = if let Some(head) = selected_head {
+        // One choice of push: a resumed push validates the very remote it then pushes to.
+        let current_push = match selected_head {
+            Some(_) => None,
+            None => Some(
+                repository
+                    .plan_current_branch_push(&input.cwd, cancellation)
+                    .await
+                    .map_err(StackedActionFailure::from)?,
+            ),
+        };
+        let push_remote = current_push
+            .as_ref()
+            .map_or("origin", |push| push.remote.as_str());
+        check_expected_destination(
+            repository,
+            &input.cwd,
+            Some(push_remote),
+            SignInDirection::Push,
+            input.expected_destination.as_deref(),
+            cancellation,
+        )
+        .await
+        .map_err(StackedActionFailure::from)?;
+        let branch = if let Some(push) = current_push {
+            repository
+                .run_current_branch_push(&input.cwd, &push, cancellation)
+                .await
+                .map_err(StackedActionFailure::from)?;
+            push.branch
+        } else if let Some(head) = selected_head {
             let mut args = vec![
                 "push".to_owned(),
                 "--no-force".to_owned(),
@@ -3173,10 +3193,7 @@ async fn run_stacked_action_steps(
                 .map_err(StackedActionFailure::from)?;
             head.to_owned()
         } else {
-            repository
-                .push_current_branch(&input.cwd, cancellation)
-                .await
-                .map_err(StackedActionFailure::from)?
+            unreachable!("a push without a selected head has a planned current-branch push")
         };
         json!({ "status": "pushed", "branch": branch })
     } else {
@@ -3666,7 +3683,7 @@ async fn pull_offering_sign_in(
 ) -> RpcResult {
     let direction = SignInDirection::Fetch;
     if input.expected_destination.is_some() {
-        let remote = current_branch_remote(repository, &input.cwd, direction, cancellation).await;
+        let remote = upstream_remote(repository, &input.cwd, cancellation).await;
         check_expected_destination(
             repository,
             &input.cwd,
@@ -3685,7 +3702,7 @@ async fn pull_offering_sign_in(
         Err(error) => error,
     };
     let remote = if prompt == CredentialPrompt::OfferSignIn {
-        current_branch_remote(repository, &input.cwd, direction, cancellation).await
+        upstream_remote(repository, &input.cwd, cancellation).await
     } else {
         None
     };
