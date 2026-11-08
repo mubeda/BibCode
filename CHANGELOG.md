@@ -36,7 +36,7 @@
 - Diff tool, MCP interrupt and terminal observer tests no longer fail under CPU load: they wait for the fake tool's own output, count only interrupt events, and keep a held test join off the shared reaper. (#333)
 - Server tests no longer depend on how fast a loaded Mac first runs a new executable: Cursor fixture tests reuse a binary that has already run, the startup probe test runs its scripts once first, isolated test cases are timed from their first output and fail instead of hanging when a child outlives SIGKILL, and the clone retention test answers for Git. (#335)
 - A web link-notice test loads its modules outside the test timer. (#336)
-- CI runs a gitleaks **Secrets** job. Test fixtures and plan docs use placeholder hosts and names, and a hash-based test guard blocks private values. (#331)
+- CI runs a **Secrets** job: gitleaks scans every commit a pull request or push adds, merge resolutions and merged branches included, and a hash-based guard checks files and commit messages for private values. Test fixtures and plan docs use placeholder hosts and names. (#331)
 - `scripts/gitlab-local-test/` starts a throwaway GitLab CE with a runner in Docker for testing pipeline screens without a real GitLab server.
 
 ## [v0.15.2] - 2026-11-05
