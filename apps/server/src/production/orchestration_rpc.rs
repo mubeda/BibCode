@@ -140,6 +140,7 @@ fn register_orchestration_rpc_inner(
     let availability = availability
         .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
     let query_availability = availability.clone();
+    let preview_provider = provider.clone();
     let dispatch = engine.clone();
     registry.register_unary_with_context(
         "orchestration.dispatchCommand",
@@ -264,6 +265,18 @@ fn register_orchestration_rpc_inner(
             async move { handle_query(&engine, availability.as_ref(), request, cancellation).await }
         });
     }
+
+    // Runs capture-sized Git reads and asks the supervisor, so it is in `is_long_running`.
+    let preview = (engine.clone(), preview_provider);
+    registry.register_unary(
+        "orchestration.previewCheckpointRevert",
+        move |request, cancellation| {
+            let (engine, provider) = preview.clone();
+            async move {
+                preview_checkpoint_revert(&engine, provider.as_ref(), request, &cancellation).await
+            }
+        },
+    );
 
     // A local database read, like `replayEvents`: not in `is_long_running`.
     let pages = engine.clone();
@@ -3063,6 +3076,43 @@ async fn read_replay(
         events,
         exhausted: true,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewCheckpointRevertInput {
+    thread_id: String,
+    turn_count: i64,
+}
+
+/// `orchestration.previewCheckpointRevert` (#279): what a revert would do in a checkout other
+/// chats may share, read before the dialog. Advisory; the effects worker checks again.
+async fn preview_checkpoint_revert(
+    engine: &OrchestrationEngine,
+    provider: Option<&ProviderRegistration>,
+    request: RpcRequest,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Value, Value> {
+    let input = decode::<PreviewCheckpointRevertInput>(request)?;
+    let probe =
+        provider.map(
+            |provider| crate::production::provider_runtime::SupervisorRevertProbe {
+                supervisor: &provider.provider,
+                settings_root: &provider.settings_root,
+                engine,
+            },
+        );
+    crate::production::orchestration_effects::preview_checkpoint_revert(
+        engine,
+        probe
+            .as_ref()
+            .map(|probe| probe as &dyn crate::production::orchestration_effects::RevertProbe),
+        &input.thread_id,
+        input.turn_count,
+        cancellation,
+    )
+    .await
+    .map_err(|error| orchestration_error("OrchestrationPreviewCheckpointRevertError", error))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(request: RpcRequest) -> Result<T, Value> {
@@ -6639,11 +6689,6 @@ mod tests {
         dispatch_registered_command(&mut socket, "9", durable_after_disconnect)
             .await
             .expect("interrupted durable command replays exactly");
-        let event_count_before_loss_turn = engine
-            .read_events(0)
-            .await
-            .expect("events before loss turn")
-            .len();
 
         let pause = hooks.pause_before_next_command_finalization();
         socket
@@ -6731,11 +6776,18 @@ mod tests {
             .get_provider_turn_delivery("loss-turn".to_owned())
             .await
             .expect("outbox lookup");
-        let event_count_after_loss_turn = engine
+        // The earlier turn's delivery keeps committing events in the background, so the loss
+        // turn's own events are counted, by its command id and message id, not the log length.
+        let loss_turn_events = engine
             .read_events(0)
             .await
             .expect("events after loss turn")
-            .len();
+            .into_iter()
+            .filter(|event| {
+                event.event.command_id.as_deref() == Some("loss-turn")
+                    || event.event.payload.to_string().contains("loss-message")
+            })
+            .count();
         let messages = thread_snapshot(&engine, &thread_id)
             .await
             .expect("thread snapshot")["thread"]["messages"]
@@ -6750,11 +6802,11 @@ mod tests {
         assert!(
             receipt.is_none()
                 && outbox.is_none()
-                && event_count_after_loss_turn == event_count_before_loss_turn
+                && loss_turn_events == 0
                 && !messages
                     .iter()
                     .any(|message| message["id"] == "loss-message"),
-            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, events_before={event_count_before_loss_turn}, events_after={event_count_after_loss_turn}, message={} ",
+            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, loss_turn_events={loss_turn_events}, message={} ",
             receipt.is_some(),
             outbox.is_some(),
             messages

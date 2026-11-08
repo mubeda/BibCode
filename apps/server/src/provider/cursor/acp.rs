@@ -1048,6 +1048,43 @@ mod tests {
         ));
     }
 
+    /// #316: Cursor and Grok share this 128 KiB bound. The pending request must fail with the
+    /// nested detail that `provider_runtime::provider_error` classifies as a non-retryable
+    /// transport size close, with or without a trailing LF.
+    #[tokio::test]
+    async fn oversized_stdout_closes_pending_requests_with_the_classified_detail() {
+        for trailing_lf in [false, true] {
+            let (stdout, mut stdout_peer) = duplex(16 * 1024);
+            let (stdin, stdin_peer) = duplex(1024);
+            let (stderr, _stderr_peer) = duplex(1024);
+            let (connection, mut incoming) =
+                AcpJsonRpcConnection::spawn(stdout, stdin, stderr, AcpConnectionConfig::default());
+            let peer = async move {
+                let mut request = String::new();
+                BufReader::new(stdin_peer)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                let mut payload = vec![b'x'; 128 * 1024 + 1];
+                if trailing_lf {
+                    payload.push(b'\n');
+                }
+                stdout_peer.write_all(&payload).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(connection.request("session/new", json!({})), peer);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ACP JSON-RPC connection is closed: ACP JSON-RPC read line exceeded 131072 bytes on stdout"
+            );
+            assert_eq!(acp_error_class(&error), "transport_error");
+            assert!(matches!(
+                incoming.recv().await,
+                Some(IncomingEvent::Closed { .. })
+            ));
+        }
+    }
+
     #[test]
     fn stale_response_ids_are_canonical_and_already_issued() {
         let (writer, _writer_rx) = mpsc::unbounded_channel();

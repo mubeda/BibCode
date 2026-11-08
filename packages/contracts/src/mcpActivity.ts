@@ -48,6 +48,11 @@ export const McpActiveClient = Schema.Struct({
    * however long ago it last called, revoked or not, so Stop stays in reach.
    */
   runningTurns: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  /**
+   * The named client (`bibcode mcp --client`, #280) of a revoked run that still runs turns:
+   * Stop on its row ends that identity. Left out for every other entry.
+   */
+  namedClientId: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type McpActiveClient = typeof McpActiveClient.Type;
 

@@ -32,7 +32,9 @@ and Copy for Codex. Otherwise:
 | WSL environment         | `claude mcp add bibcode -- wsl.exe -d <distro> --exec <server binary> mcp --base-dir <root>` |
 
 Add `--base-dir <root>` for a data root other than `~/.bibcode`, and `--access read-only`
-(or another level up to the environment's limit) to connect with less. The relay exits with
+(or another level up to the environment's limit) to connect with less. Add
+`--client <name>` so a restarted agent keeps its `clientRequestId` retries (24 hours), the
+panels it opened and a paired webhook endpoint. The relay exits with
 a message when the server is off, not running, or not this BiBCode; tell the user that
 message. MCP servers load when the agent starts, so the user restarts the agent after
 adding one. Give the user these commands to run: they change the agent's own configuration.
@@ -116,7 +118,8 @@ the user where to do them in BiBCode.
 ## Retries, unknown outcomes and following changes
 
 - Keep the `clientRequestId` of every change. After a transport error or a timeout, retry
-  with the same id and arguments: it never runs twice.
+  with the same id and arguments: it never runs twice. A new MCP server process sees the
+  old ids only when it runs with the same `--client <name>`.
 - `McpOutcomeUnknownError` means BiBCode cannot tell whether the change happened (MCP turned
   off, Take over, Stop, a restart, or no answer from a host). Check the state first
   (`git_status`, `view_pull_request`, `read_thread`, `clone_status`), then retry with a

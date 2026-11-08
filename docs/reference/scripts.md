@@ -71,6 +71,10 @@ state kind.
 - `vp run release:smoke`: exercise release versioning and lockfile generation.
 - `vp run check:dependency-ledger`: validate the machine-consumed dependency
   upgrade ledger.
+- `node scripts/check-markdown-links.ts [file ...]`: check that every relative
+  link, image, and `#anchor` in the given Markdown files (default `README.md`)
+  points to an existing file or heading. It skips external URLs, so run a
+  network link checker for those.
 
 Use `vp test` for the built-in Vite+ test command. Use `vp run test` when the
 workspace package-script graph is specifically required. The graph keeps

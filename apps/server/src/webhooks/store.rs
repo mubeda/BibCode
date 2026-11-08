@@ -373,16 +373,19 @@ impl Store {
             .await
     }
 
-    /// Enabled endpoints paired with a session that is gone, revoked or expired: what a missed
-    /// revocation notice leaves behind.
+    /// Enabled endpoints paired with a client that is gone or revoked: what a missed
+    /// revocation notice leaves behind. A pairing names a session or a named client (#280); a
+    /// named client's pairing outlives each of its runs and ends only with the identity.
     pub(crate) async fn orphaned_pairings(&self) -> Result<Vec<String>> {
         self.database
             .call(|connection| {
                 let mut statement = connection.prepare_cached(
                     "SELECT DISTINCT w.paired_session_id FROM webhook_endpoints AS w \
                      LEFT JOIN auth_sessions AS s ON s.session_id = w.paired_session_id \
+                     LEFT JOIN mcp_named_clients AS n ON n.client_id = w.paired_session_id \
                      WHERE w.enabled = 1 AND w.paired_session_id IS NOT NULL \
-                       AND (s.session_id IS NULL OR s.revoked_at IS NOT NULL)",
+                       AND (s.session_id IS NULL OR s.revoked_at IS NOT NULL) \
+                       AND (n.client_id IS NULL OR n.revoked_at IS NOT NULL)",
                 )?;
                 Ok(statement
                     .query_map([], |row| row.get::<_, String>(0))?
@@ -391,19 +394,44 @@ impl Store {
             .await
     }
 
-    /// Whether `session_id` is an outside agent's session that is not revoked.
-    pub(crate) async fn is_live_agent_session(&self, session_id: &str) -> Result<bool> {
-        let session_id = session_id.to_owned();
+    /// What an endpoint paired with `id` stores: a live outside agent's session, or the named
+    /// client (#280) that session is a run of, or a live named client's id. `None` when `id`
+    /// is none of these.
+    pub(crate) async fn pairing_target(&self, id: &str) -> Result<Option<String>> {
+        let id = id.to_owned();
         self.database
             .call(move |connection| {
                 Ok(connection
                     .query_row(
-                        "SELECT 1 FROM auth_sessions WHERE session_id = ?1 AND subject = ?2 AND revoked_at IS NULL",
-                        params![session_id, crate::auth::MCP_CLIENT_SUBJECT],
-                        |_| Ok(()),
+                        "SELECT COALESCE(s.mcp_named_client_id, s.session_id) FROM auth_sessions AS s \
+                         WHERE s.session_id = ?1 AND s.subject = ?2 AND s.revoked_at IS NULL \
+                         UNION ALL \
+                         SELECT client_id FROM mcp_named_clients WHERE client_id = ?1 AND revoked_at IS NULL",
+                        params![id, crate::auth::MCP_CLIENT_SUBJECT],
+                        |row| row.get(0),
                     )
-                    .optional()?
-                    .is_some())
+                    .optional()?)
+            })
+            .await
+    }
+
+    /// The name each paired client shows by (#280): a named client's name, else a live
+    /// session's label.
+    pub(crate) async fn paired_client_names(&self) -> Result<HashMap<String, String>> {
+        self.database
+            .call(|connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT DISTINCT w.paired_session_id, COALESCE(n.name, s.client_label) \
+                     FROM webhook_endpoints AS w \
+                     LEFT JOIN mcp_named_clients AS n ON n.client_id = w.paired_session_id \
+                     LEFT JOIN auth_sessions AS s ON s.session_id = w.paired_session_id \
+                       AND s.revoked_at IS NULL \
+                     WHERE w.paired_session_id IS NOT NULL \
+                       AND COALESCE(n.name, s.client_label) IS NOT NULL",
+                )?;
+                Ok(statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<HashMap<_, _>>>()?)
             })
             .await
     }

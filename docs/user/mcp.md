@@ -60,7 +60,10 @@ page, register it by hand:
 
 For Codex, replace `claude mcp add` with `codex mcp add`. For a data root other than
 `~/.bibcode`, add `--base-dir <root>`. To connect with less than the environment allows, add
-`--access read-only` (or `approval-required`, `auto-accept-edits`).
+`--access read-only` (or `approval-required`, `auto-accept-edits`). To let a restarted agent
+keep its retries, its panels and a paired webhook endpoint, add `--client <name>` with a
+name of your choice; **Revoke** or **Stop** on its row ends that identity, and its next run
+starts fresh.
 
 Over SSH no tunnel is needed: `bibcode mcp` runs on the remote host and talks to that host's
 own loopback server.
@@ -100,7 +103,7 @@ for the steps, and
 | `answer_question`           | Answers an open question                                                                                               |
 | `answer_approval`           | Accepts, accepts for the session, declines or cancels a pending approval                                               |
 | `interrupt_turn`            | Stops the running turn; when no turn runs it does nothing and says so                                                  |
-| `revert_thread_to_turn`     | Restores the files to a turn's checkpoint and rewinds the provider; refused while a turn runs                          |
+| `revert_thread_to_turn`     | Restores the files to a turn's checkpoint and rewinds the provider, or rewinds only the conversation (see below)       |
 | `get_turn_diff`             | One turn's patch, paged                                                                                                |
 | `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                          |
 
@@ -111,6 +114,14 @@ can retry a call without starting a second turn.
 
 Codex stops a tool call after 60 seconds by default, so one wait lasts at most 50 seconds and
 an agent waits longer by calling it again.
+
+`revert_thread_to_turn` is refused while the thread runs a turn. With `mode:
+"conversationOnly"` it rewinds only the conversation and leaves every file as it is (Codex and
+OpenCode 2). Other chats can share the thread's checkout; a file restore is then refused while
+one of them is working (`McpTurnRunningError` names it). When files there changed outside the
+thread since that turn, it returns `McpSharedCheckoutChangedError` with the files the restore
+changes, the outside changes and a `siblingChangesToken`; call again with that token, and a new
+`clientRequestId`, to restore anyway.
 
 ### Worktrees
 
