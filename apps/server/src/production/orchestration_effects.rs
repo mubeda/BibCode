@@ -188,7 +188,7 @@ impl WritingReason {
                 "BiBCode can't tell whether {title} is still working. Stop its session, then revert, or rewind only the conversation."
             ),
             Self::UnmanagedServer => format!(
-                "{title} runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead. If nothing but BiBCode uses that server, turn on Only BiBCode uses this server in Settings → Providers → OpenCode."
+                "\"{title}\" uses an OpenCode server that other apps may also use, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead. If only BiBCode uses that server, turn on \"Only BiBCode uses this server\" in Settings → Providers → OpenCode."
             ),
             Self::StartingSession => {
                 "Another chat in this checkout is starting its session. Try the revert again in a moment.".to_owned()
@@ -197,13 +197,13 @@ impl WritingReason {
                 "BiBCode can't tell whether {title} works in this checkout. Try the revert again, or check that chat's folder."
             ),
             Self::OpenCode1Server => format!(
-                "{title}'s OpenCode 1 server can't report whether it's idle. Rewind only the conversation instead."
+                "The OpenCode 1 server that \"{title}\" uses can't report whether it's idle. Rewind only the conversation instead."
             ),
             Self::ServerWorking => format!(
-                "{title}'s OpenCode server is still working in this checkout. Try the revert again when it finishes."
+                "The OpenCode server that \"{title}\" uses is still working in this checkout. Try the revert again when it finishes."
             ),
             Self::ServerUnreadable => format!(
-                "BiBCode can't read whether {title}'s OpenCode server is idle. Rewind only the conversation instead."
+                "BiBCode can't read whether the OpenCode server that \"{title}\" uses is idle. Rewind only the conversation instead."
             ),
         }
     }
@@ -2978,6 +2978,14 @@ async fn recheck_shared_restore(
             ),
         });
     }
+    // The last look before the irreversible rewind: a fence can trip while the checks above
+    // await.
+    if let Some((title, trip)) = tripped_fence(&shared.fences).await {
+        tracing::warn!(thread_id, %trip, "a file restore was refused: another chat's external OpenCode server started working");
+        return Err(OrchestrationEffectsError::Effect(
+            WritingReason::ServerWorking.detail(title),
+        ));
+    }
     Ok(())
 }
 
@@ -3500,7 +3508,7 @@ async fn sibling_started_before_restore(
     let (title, trip) = tripped_fence(fences).await?;
     tracing::warn!(thread_id, %trip, "a file restore was skipped: another chat's external OpenCode server started working");
     Some(format!(
-        "{title}'s OpenCode server started working. Revert again when it finishes."
+        "The OpenCode server that \"{title}\" uses started working. Revert again when it finishes."
     ))
 }
 
@@ -3530,7 +3538,7 @@ async fn report_sibling_started_during_restore(
                 payload: json!({
                     "turnCount": turn_count,
                     "detail": format!(
-                        "Files were restored, but {title}'s OpenCode server started working during the restore. Check {title}'s changes."
+                        "Files were restored, but the OpenCode server that \"{title}\" uses started working during the restore. Check that chat's changes."
                     ),
                 }),
                 turn_id: None,

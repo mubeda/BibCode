@@ -36,6 +36,11 @@ struct Script {
     streams: Mutex<Vec<mpsc::UnboundedSender<Bytes>>>,
     open_streams: Arc<AtomicUsize>,
     pid: AtomicU64,
+    /// An event sent in the same chunk as the next stream's `server.connected`.
+    connect_with: Mutex<Option<Value>>,
+    info_reads: AtomicUsize,
+    /// From this `/api/info` read on (1-based), the server answers this `pid`, as after a restart.
+    restart_at: Mutex<Option<(usize, u64)>>,
 }
 
 /// Decrements the open-stream count when the server drops a stream's body.
@@ -141,6 +146,20 @@ impl ScriptedOpenCode {
             .insert(path.to_owned(), delay);
     }
 
+    /// Sends `event` in the same chunk as the next stream's `server.connected`.
+    pub(crate) fn connect_with(&self, event: Value) {
+        *self.script.connect_with.lock().unwrap() = Some(event);
+    }
+
+    /// Answers `pid` from the `read`-th `/api/info` read on, counting every read so far.
+    pub(crate) fn restart_at_info_read(&self, read: usize, pid: u64) {
+        *self.script.restart_at.lock().unwrap() = Some((read, pid));
+    }
+
+    pub(crate) fn info_reads(&self) -> usize {
+        self.script.info_reads.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn set_pid(&self, pid: u64) {
         self.script.pid.store(pid, Ordering::SeqCst);
     }
@@ -209,11 +228,12 @@ async fn handle(State(script): State<Arc<Script>>, uri: OriginalUri) -> Response
     }
     if path == "/api/event" {
         let (sender, receiver) = mpsc::unbounded_channel();
-        sender
-            .send(Bytes::from(
-                "data: {\"id\":\"evt\",\"type\":\"server.connected\",\"data\":{}}\n\n",
-            ))
-            .unwrap();
+        let mut first =
+            "data: {\"id\":\"evt\",\"type\":\"server.connected\",\"data\":{}}\n\n".to_owned();
+        if let Some(event) = script.connect_with.lock().unwrap().take() {
+            first.push_str(&format!("data: {event}\n\n"));
+        }
+        sender.send(Bytes::from(first)).unwrap();
         script.streams.lock().unwrap().push(sender);
         script.open_streams.fetch_add(1, Ordering::SeqCst);
         let open = Open(script.open_streams.clone());
@@ -228,8 +248,12 @@ async fn handle(State(script): State<Arc<Script>>, uri: OriginalUri) -> Response
             .into_response();
     }
     if path == "/api/info" {
-        return axum::Json(json!({"version":"2.2.5","pid":script.pid.load(Ordering::SeqCst)}))
-            .into_response();
+        let read = script.info_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let pid = match *script.restart_at.lock().unwrap() {
+            Some((from, pid)) if read >= from => pid,
+            _ => script.pid.load(Ordering::SeqCst),
+        };
+        return axum::Json(json!({"version":"2.2.5","pid":pid})).into_response();
     }
     let routes = script.routes.lock().unwrap();
     let answer = routes

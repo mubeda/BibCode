@@ -323,6 +323,22 @@ async fn a_start_in_the_tree_or_the_checkout_trips_the_fence() {
 }
 
 #[tokio::test]
+async fn a_start_in_the_same_chunk_as_server_connected_is_seen_without_more_bytes() {
+    let probe = Probe::new().await;
+    // Nothing follows on the stream: no heartbeat, no later event.
+    probe
+        .server
+        .connect_with(started("ses_other", Some(&probe.inside())));
+    match probe.run().await {
+        Err(refusal) => assert_eq!(refusal, QuietRefusal::Working),
+        // The watcher may judge the buffered frame just after the probe's last look.
+        Ok(fence) => {
+            tripped(&fence).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_reconnect_an_end_a_silence_or_a_restart_trips_the_fence() {
     let probe = Probe::new().await;
     let fence = probe.run().await.unwrap();

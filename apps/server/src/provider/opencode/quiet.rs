@@ -422,19 +422,11 @@ async fn watch_stream(
     silence: Duration,
 ) -> String {
     loop {
-        // Any chunk, heartbeat comments included, shows the stream alive.
-        let chunk = match tokio::time::timeout(silence, response.chunk()).await {
-            Err(_) => return "the event stream went silent".to_owned(),
-            Ok(Err(error)) => return format!("the event stream failed: {error}"),
-            Ok(Ok(None)) => return "the event stream ended".to_owned(),
-            Ok(Ok(Some(chunk))) => chunk,
-        };
-        if let Err(error) = decoder.push(&chunk) {
-            return error;
-        }
         if tree.has_changed().unwrap_or(false) {
             filter.tree = tree.borrow().clone();
         }
+        // Every complete frame already buffered is judged before waiting for more bytes: the
+        // chunk that carried `server.connected` may carry a start event too.
         loop {
             match next_event(&mut decoder) {
                 Err(error) => return error,
@@ -451,6 +443,16 @@ async fn watch_stream(
                 }
                 Ok(Some(_)) => {}
             }
+        }
+        // Any chunk, heartbeat comments included, shows the stream alive.
+        let chunk = match tokio::time::timeout(silence, response.chunk()).await {
+            Err(_) => return "the event stream went silent".to_owned(),
+            Ok(Err(error)) => return format!("the event stream failed: {error}"),
+            Ok(Ok(None)) => return "the event stream ended".to_owned(),
+            Ok(Ok(Some(chunk))) => chunk,
+        };
+        if let Err(error) = decoder.push(&chunk) {
+            return error;
         }
     }
 }
