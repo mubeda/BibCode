@@ -33,6 +33,11 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       label: "environment-data:orchestration:archived-shell-snapshot",
       tag: ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
     }),
+    /** What a checkpoint revert would do, read before its dialog (#279). */
+    previewCheckpointRevert: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:orchestration:preview-checkpoint-revert",
+      tag: ORCHESTRATION_WS_METHODS.previewCheckpointRevert,
+    }),
     /** A page of the threads a capped shell left out, or a title search (#223). */
     listOlderThreads: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:orchestration:list-older-threads",

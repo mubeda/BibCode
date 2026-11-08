@@ -1494,6 +1494,30 @@ says it hasn't started yet). When the job
 finishes the log loads once; choosing a step then scrolls to where its output
 starts. A log past GitHub's retention says "This log has expired."
 
+### Reverting to a message
+
+**Revert to this message** on a sent message opens a dialog with named choices:
+
+- **Revert files and conversation** puts the checkout's files back to how they
+  were after that turn and removes the newer messages in the thread. It can't be
+  undone.
+- **Rewind conversation only** removes the newer messages and leaves every file
+  as it is. It is offered when the provider can rewind without touching files
+  (Codex and OpenCode 2) and the server supports it.
+- A provider that can't rewind its conversation (Claude, Cursor, Grok) offers
+  **Restore files** instead, and the newer messages stay.
+
+Other chats can work in the same checkout: the thread's panels and side chats,
+other threads on the project's root, and threads of a project on a subfolder of
+the same Git worktree. When they do, the dialog lists the files the revert
+restores and the changes other chats, terminals or editors made since that turn,
+because restoring files undoes those too. If another chat there is running a
+turn or background work, is starting, or BiBCode can't tell whether it is still
+working, the dialog says **Can't restore files right now**, names the chat, and
+offers **Rewind conversation only**. While a revert restores files, messages
+sent to the other chats in that checkout wait and are delivered after it; their
+idle provider sessions are stopped and start again with their next message.
+
 ## Right Panel
 
 The right panel hosts persistent tool surfaces for the active thread. Use its

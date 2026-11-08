@@ -591,6 +591,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Read the thread, fix what the message names, then retry.",
     ),
     (
+        "McpSharedCheckoutChangedError",
+        "Files in the thread's checkout changed outside the thread since that turn; the error lists them with a siblingChangesToken.",
+        "Review the changes, then call again with siblingChangesToken and a new clientRequestId, or use mode conversationOnly.",
+    ),
+    (
         "McpAttachmentExpiredError",
         "A stored request's attachment upload is gone (it expires after 10 minutes idle, or on restart).",
         "Send it again without the clientRequestId.",
