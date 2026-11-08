@@ -1854,6 +1854,75 @@ impl Repositories {
         self.database.call(move |connection| { connection.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL", [thread_id])?; Ok(()) }).await
     }
 
+    /// Every thread in every project with the directory its Git commands run in (its worktree,
+    /// or its project's root), for finding the threads that share a checkout (#279). Deleted
+    /// threads are included only when `include_deleted`, for the event-log evidence.
+    pub async fn list_thread_checkouts(
+        &self,
+        include_deleted: bool,
+    ) -> Result<Vec<ThreadCheckout>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    "SELECT thread.thread_id, thread.title, COALESCE(thread.worktree_path, project.workspace_root), thread.deleted_at IS NOT NULL \
+                     FROM projection_threads thread JOIN projection_projects project ON project.project_id = thread.project_id \
+                     WHERE ?1 OR thread.deleted_at IS NULL ORDER BY thread.thread_id",
+                    [include_deleted],
+                    |row| {
+                        Ok(ThreadCheckout {
+                            thread_id: row.get(0)?,
+                            title: row.get(1)?,
+                            directory: row.get(2)?,
+                            deleted: row.get(3)?,
+                        })
+                    },
+                )
+            })
+            .await
+    }
+
+    /// The events of `thread_ids` that end a turn with its files (`thread.turn-diff-completed`)
+    /// or start one (`thread.session-set` running), that occurred after `after` and no later
+    /// than `until`. Read from the append-only event log, which no revert or deletion changes.
+    /// Times compare as instants: stored ones may or may not carry fractional seconds.
+    pub async fn list_turn_events_between(
+        &self,
+        thread_ids: Vec<String>,
+        after: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<TurnEventRecord>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT event_id, stream_id, event_type, payload_json FROM orchestration_events \
+                     WHERE aggregate_kind = 'thread' AND stream_id IN (SELECT value FROM json_each(?1)) \
+                     AND julianday(occurred_at) > julianday(?2) AND julianday(occurred_at) <= julianday(?3) \
+                     AND (event_type = 'thread.turn-diff-completed' OR (event_type = 'thread.session-set' \
+                          AND json_extract(payload_json, '$.session.status') = 'running')) \
+                     ORDER BY sequence",
+                )?;
+                let rows = statement.query_map(
+                    params![Value::from(thread_ids).to_string(), after, until],
+                    |row| {
+                        let payload: String = row.get(3)?;
+                        Ok(TurnEventRecord {
+                            event_id: row.get(0)?,
+                            thread_id: row.get(1)?,
+                            event_type: row.get(2)?,
+                            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                        })
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn create_auth_pairing_link(&self, row: AuthPairingLink) -> Result<()> {
         self.database
             .call(move |connection| {
@@ -3560,6 +3629,22 @@ pub struct ProjectionCheckpoint {
     pub diff_available: bool,
     pub assistant_message_id: Option<String>,
     pub completed_at: Timestamp,
+}
+/// A thread and the stored directory its Git commands run in (#279).
+#[derive(Clone, Debug)]
+pub struct ThreadCheckout {
+    pub thread_id: String,
+    pub title: String,
+    pub directory: String,
+    pub deleted: bool,
+}
+/// A turn's start or end in the event log (#279).
+#[derive(Clone, Debug)]
+pub struct TurnEventRecord {
+    pub event_id: String,
+    pub thread_id: String,
+    pub event_type: String,
+    pub payload: Value,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthPairingLink {

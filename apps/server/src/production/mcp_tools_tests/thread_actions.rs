@@ -393,6 +393,13 @@ fn git(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) {
 /// A Git checkout of `tracked.txt` with checkpoints for turns 0 to 2 of `thread_id`, recorded
 /// in the read model as the effects worker would.
 async fn checkpointed_checkout(harness: &Harness, thread_id: &str) -> tempfile::TempDir {
+    let repository = tempfile::tempdir().unwrap();
+    checkpoint_checkout(harness, thread_id, repository.path()).await;
+    repository
+}
+
+/// Makes `cwd` the Git checkout `checkpointed_checkout` describes.
+async fn checkpoint_checkout(harness: &Harness, thread_id: &str, cwd: &Path) {
     // The checkpoint capture and the revert run production Git, which keeps the inherited
     // environment. Refuse to run rather than let it restore and clean another checkout.
     for name in [
@@ -403,8 +410,6 @@ async fn checkpointed_checkout(harness: &Harness, thread_id: &str) -> tempfile::
     ] {
         assert!(std::env::var_os(name).is_none(), "unset {name} first");
     }
-    let repository = tempfile::tempdir().unwrap();
-    let cwd = repository.path();
     let config = IsolatedGitConfig::new();
     for args in [
         &["init"][..],
@@ -440,7 +445,6 @@ async fn checkpointed_checkout(harness: &Harness, thread_id: &str) -> tempfile::
                 .unwrap();
         }
     }
-    repository
 }
 
 #[tokio::test]
@@ -514,6 +518,110 @@ async fn revert_thread_to_turn_restores_the_checkpoint_and_reports_failures() {
         )
         .await;
     assert_eq!(error_tag(&running), "McpTurnRunningError", "{running}");
+
+    effects.shutdown().await;
+    harness.shutdown().await;
+}
+
+/// A thread `thread_id` whose stored worktree is `cwd`, as a shared checkout's chats have.
+async fn thread_in(harness: &Harness, thread_id: &str, title: &str, cwd: &Path) {
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.create", "commandId": format!("create-{thread_id}"), "threadId": thread_id,
+            "projectId": "p1", "title": title, "runtimeMode": "full-access",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "branch": null, "worktreePath": cwd, "createdAt": CREATED_AT,
+        })))
+        .await
+        .unwrap();
+}
+
+/// #279: `mode: conversationOnly` rewinds and keeps every file; on a checkout another chat
+/// shares, a file restore is refused while that chat runs a turn, and changes outside the
+/// thread need the token the refusal returns.
+#[tokio::test]
+async fn revert_thread_to_turn_rewinds_only_the_conversation_and_round_trips_the_token() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let checkout = tempfile::tempdir().unwrap();
+    let cwd = std::fs::canonicalize(checkout.path()).unwrap();
+    thread_in(&harness, "host", "Host", &cwd).await;
+    thread_in(&harness, "panel", "Panel, Codex", &cwd).await;
+    checkpoint_checkout(&harness, "host", &cwd).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let effects = OrchestrationEffects::start(
+        harness.engine.clone(),
+        Arc::new(crate::git::GitRepository::default()),
+        Arc::new(Rewinds::new("host", &cwd, elsewhere.path())),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+    let tracked = || std::fs::read_to_string(cwd.join("tracked.txt")).unwrap();
+
+    let rewound = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": "host", "turnCount": 1, "mode": "conversationOnly" }),
+        )
+        .await;
+    let rewound = structured(&rewound);
+    assert_eq!(rewound["reverted"], true, "{rewound}");
+    assert_eq!(rewound["filesRestored"], false);
+    assert_eq!(tracked(), "two\n", "the files are kept");
+
+    harness.engine.dispatch(command(json!({"type":"thread.session.set", "commandId":"panel-running", "threadId":"panel", "session":{"threadId":"panel", "status":"running", "providerName":"codex", "activeTurnId":"panel-turn", "lastError":null, "updatedAt":CREATED_AT}, "createdAt":CREATED_AT}))).await.unwrap();
+    let busy = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": "host", "turnCount": 0 }),
+        )
+        .await;
+    assert_eq!(error_tag(&busy), "McpTurnRunningError", "{busy}");
+    assert!(
+        busy["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Panel, Codex"),
+        "{busy}"
+    );
+    harness.engine.dispatch(command(json!({"type":"thread.session.set", "commandId":"panel-ready", "threadId":"panel", "session":{"threadId":"panel", "status":"ready", "providerName":"codex", "activeTurnId":null, "lastError":null, "updatedAt":CREATED_AT}, "createdAt":CREATED_AT}))).await.unwrap();
+
+    std::fs::write(cwd.join("notes.txt"), "from a terminal\n").unwrap();
+    let changed = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": "host", "turnCount": 0 }),
+        )
+        .await;
+    assert_eq!(
+        error_tag(&changed),
+        "McpSharedCheckoutChangedError",
+        "{changed}"
+    );
+    let error = &changed["structuredContent"]["error"];
+    assert!(
+        error["siblingChanges"]["paths"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("notes.txt")),
+        "{changed}"
+    );
+    let token = error["siblingChangesToken"].as_str().unwrap().to_owned();
+    assert_eq!(tracked(), "two\n");
+    let reverted = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": "host", "turnCount": 0, "siblingChangesToken": token }),
+        )
+        .await;
+    assert_eq!(structured(&reverted)["reverted"], true, "{reverted}");
+    assert_eq!(tracked(), "baseline\n");
 
     effects.shutdown().await;
     harness.shutdown().await;

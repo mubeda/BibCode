@@ -164,6 +164,8 @@ pub fn is_long_running(method: &str) -> bool {
             | "server.refreshProviderUsage"
             // Served from a cache, but a cold one waits on the provider's probe (#107).
             | "server.getProviderCapabilities"
+            // A revert preview runs capture-sized Git reads and asks the supervisor (#279).
+            | "orchestration.previewCheckpointRevert"
             // Saving settings re-probes the providers, which runs OpenCode's `--version` (#115).
             | "server.updateSettings"
             | "worktree.createManaged"

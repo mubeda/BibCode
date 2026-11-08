@@ -3780,15 +3780,17 @@ worker runs the rewind and the restore, then the queued effects. Every effect
 that writes still runs on the worker one at a time, so checkpoint work on a
 checkout that sibling threads share never overlaps. Reverts of one checkout
 (chats without a worktree of their own share the project's) also restore in
-the order they were requested. The worker fixes each revert's place when it
-receives the request, before any preparation, and that includes a revert that
-queues behind the same thread's earlier revert. A waiter hands its preparation
-back only once the checkout's previous revert has restored, so a later revert
-prepared sooner cannot restore first and then be undone by the earlier one's
-restore and clean. Reverts of different checkouts do not wait for each other.
-At most four reverts are prepared at once. A revert past that bound still
-parks: its waiter takes the thread's reservation first and only then waits for
-a free slot, so a message sent after the revert is not delivered ahead of it.
+the order they were requested. The worker fixes each file restore's place by
+its checkout key (see [Shared checkouts](#shared-checkouts)) when it receives
+the request, before any preparation, and that includes a revert that queues
+behind the same thread's earlier revert. A waiter starts its preparation only
+once the checkout's previous restore has finished, so a later revert cannot
+restore first and then be undone by the earlier one's restore and clean; the
+preparation of one checkout's restores is therefore serial. Reverts of
+different checkouts do not wait for each other, and at most four are prepared
+at once. A revert past that bound still parks: its waiter takes the thread's
+reservation first and only then waits for a free slot, so a message sent after
+the revert is not delivered ahead of it.
 The worker never prepares a revert itself. A parked thread holds at most 64 events; past that the worker
 waits for the thread's revert, as it did before parking.
 The reservation is in memory only. That is enough because a revert never
@@ -3800,6 +3802,95 @@ rewind the provider again. Shutdown therefore waits for step 3 instead of
 interrupting it, and a restore that fails is still recorded: the work log
 then says the conversation was rewound but the files were not restored. Every
 failure is a `checkpoint.revert.failed` activity.
+
+#### Shared checkouts
+
+Several threads can work in one checkout: a thread's panels and side chats,
+other threads on the project root, and threads of a project registered on a
+subdirectory of the same worktree. A file restore (any revert that runs
+`restore_checkpoint`, a `FilesOnly` provider's included) would overwrite their
+work, so it is guarded (#279).
+
+- **Checkout key.** `git rev-parse --show-toplevel` in the thread's stored
+  directory, passed through `canonical_worktree_path_key`. It is resolved fresh
+  every time, never cached: a nested repository removed later changes it while no
+  stored path changes. Linked worktrees keep their own keys. The key orders the
+  checkout's restores and names its gate.
+- **Siblings.** Every other non-deleted thread, in any project, whose stored
+  directory lies inside the checkout's top level and resolves to the same key. A
+  candidate whose directory is gone or that Git cannot resolve refuses the
+  restore ("BiBCode can't tell whether ... works in this checkout"). A thread
+  that never started a provider session and has no turn (such as a project's
+  untouched default thread) cannot have written a file: it does not make the
+  checkout shared, is not suspended and needs no token, but the restore still
+  holds it, so its first message waits.
+- **Gate.** `OrchestrationEngine` keeps one in-memory read/write lock per key.
+  Each turn delivery and compaction holds it shared, after its thread
+  reservation, from before its claim until the provider has the turn. A file
+  restore holds it exclusively from its planning until the revert is recorded,
+  after waiting for the checkout's previous restore. The exclusive wait is capped
+  at 15 s; on timeout the restore is refused with nothing changed ("Another chat
+  in this checkout is starting a turn") and its place in line is given up.
+  Delivery and queue promotion skip a thread a restore holds, and the restore's
+  end wakes delivery, so a message sent meanwhile is delivered after it.
+- **Writing siblings refuse the restore.** A sibling refuses it while its session
+  holds a turn, its delivery or compaction is admitted (under any key, so one
+  keyed before a repository change still counts), its provider session is
+  launching, or its last turn's checkpoint is still being recorded. The
+  supervisor adds: background work reported recently, work BiBCode cannot see
+  (Cursor, Grok, or Chat Activity off), an OpenCode instance with a
+  `serverUrl`, live or suspended, because BiBCode cannot prove an external
+  server quiet, and a suspended session whose provider instance no longer
+  resolves (it may have named such a server).
+- **Quiet siblings.** Under the gate the restore marks every sibling, then the
+  supervisor suspends each live, idle sibling session through the idle
+  suspension path. `launch_session`, where every provider driver is created,
+  refuses a marked thread ("Another chat in this checkout is restoring files"),
+  so no delivery, compaction, rewind or reconciliation reopens it. One engine
+  mutex covers the marks, launches in progress and admitted turns: a launch or
+  admission either registers before the marks and the restore refuses, or comes
+  after and is refused. The restoring thread's own reopen is not held.
+- **Checked again.** On the worker, immediately before the irreversible rewind,
+  the restore repeats the sibling checks and recomputes the checkout's current
+  tree; a change refuses it ("Files in this checkout changed after you
+  confirmed").
+- **Turn 0.** The `HEAD` fallback for a missing ref 0 is refused when siblings
+  exist, because `clean -fd` would discard their uncommitted work. A project's
+  default thread lives on its root, but while it never started it does not
+  count.
+
+The warning reads only evidence no sibling action removes: Git, through one
+temporary index as a capture uses, and the append-only event log.
+`orchestration.previewCheckpointRevert` returns the files the restore changes
+(the target versus the current tree of every tracked and untracked,
+non-ignored file), the files changed since the thread's last checkpoint, the
+sibling turns between the target and that checkpoint
+(`thread.turn-diff-completed` and running `thread.session-set` events of
+every thread with the key, deleted ones included), the writing siblings, the
+conversation-rewind support and `siblingChangesToken`: the SHA-256 of the
+target commit, the current tree id and the sorted event ids. A full revert on a
+shared checkout proceeds only when its token matches the one recomputed under
+the gate. A request without a token (an older client) proceeds only when no
+outside change exists. Otherwise the refusal carries the new token in its
+activity payload. The preview is advisory, runs Git, and is in
+`is_long_running`. It needs `orchestration:operate`, as a revert does: its
+`git add` into a temporary index runs the repository's clean filters, which can
+run commands on the host.
+
+#### Conversation-only rewind
+
+`thread.checkpoint.revert` with `mode: "conversationOnly"` (default `full`;
+older events decode as `full`) rewinds the provider, deletes the newer
+checkpoint refs and dispatches `thread.revert.complete`, plus an info activity
+`checkpoint.revert.conversation-only`. It never runs `restore`, `clean` or
+`reset`, takes only the thread reservation (no gate, no place in the checkout's
+order) and runs while siblings are busy. It needs a rewind that keeps files
+(`rewind_keeps_files`): Codex and OpenCode 2 do, OpenCode 1's
+`/session/{id}/revert` restores files, and Claude, Cursor and Grok cannot
+rewind. The supervisor answers from the live session after the preparation
+reopened it, and a refusal comes before any rewind request. A newer client
+offers it only when the environment reports `conversationOnlyRewind`. Side
+chats stay refused in both modes.
 
 ## Outside-agent thread tools
 
@@ -3880,6 +3971,12 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   `checkpoint.revert.files-only` (files restored, conversation kept), or
   `checkpoint.revert.failed` (`McpCheckpointRevertError` with the worker's detail).
   Reading the log rather than the live stream also answers a receipt replay.
+  `mode: "conversationOnly"` and `siblingChangesToken` pass through to the command
+  (#279). A file restore first runs the revert preview without the supervisor: a
+  writing sibling is `McpTurnRunningError` naming it, and an unacknowledged outside
+  change is `McpSharedCheckoutChangedError` with `restoredPaths`, `siblingChanges` and
+  the token in its structured error. A worker refusal that carries a token comes back
+  the same way. A preview that cannot run leaves the refusal to the worker.
 - **Waiting.** `wait_for_thread` subscribes to `subscribe_events()` before its first
   read, keeps only the thread's events, re-reads at most once per 100 ms burst, and
   returns when the selected turn settles (or, without `messageId`, the thread is

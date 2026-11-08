@@ -2818,6 +2818,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookBearerToken": true,
         "webhookStatusKinds": true,
         "sideChats": true,
+        "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
     // A flag is advertised only when every method it promises is registered.

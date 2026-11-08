@@ -8,6 +8,27 @@ design (the issue's design gate). Companion: #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md))
 changes the Git environment of the same checkpoint commands and lands first.
 
+**Implementation status (2026-11-07).** Implemented for #279. Where it differs from the
+text below:
+
+- Preparation of one checkout's restores is serial (step 2 before the gate), so the
+  four-permit bound applies across checkouts.
+- A sibling's delivery or compaction counts as writing while it is _admitted_ (registered
+  under the same engine mutex as the marks and launches), not merely while its thread
+  reservation is held. Confirmed by the coordinator: a delivery waiting at the gate holds
+  its reservation but cannot write, and counting it would refuse every restore a waiting
+  message meets, which defeats the planning-interval gate.
+- A thread that never started a provider session and has no turn is not a sibling (the maintainer,
+  Q1: it cannot have written a file). The restore still holds it, so its first message waits.
+- The preview needs `orchestration:operate`, not read: its temporary-index `git add` runs
+  the repository's clean filters, which can run host commands (Codex review).
+- A suspended sibling whose provider instance no longer resolves refuses the restore, since
+  it may have named an external server (Codex review).
+- The HEAD fallback check runs before any sibling is suspended.
+- The event-log window compares instants (`julianday`), not strings.
+- Test 5 uses a short configurable wait (`EffectsOptions::checkout_restore_admission_wait`)
+  instead of a paused clock, which production Git's child processes would advance.
+
 **Revision 1 (2026-11-07)** records the maintainer's decisions (C, D, and the gate's scope) and
 answers the first Codex review. See [Review findings and resolutions](#review-findings-and-resolutions).
 It changes these things:

@@ -84,6 +84,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "webhookBearerToken": true,
             "webhookStatusKinds": true,
             "sideChats": true,
+            "conversationOnlyRewind": true,
             "threadDeleteOnlyIfUnused": true,
         },
     })

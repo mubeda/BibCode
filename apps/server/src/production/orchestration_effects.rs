@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -27,9 +27,9 @@ use crate::{
     },
     orchestration::engine::{
         ActivityInput, BootstrapSetupInput, BootstrapSetupResult, BootstrapWorktree,
-        BoxBootstrapFuture, BoxProjectCommandFuture, OrchestrationCommand, OrchestrationEngine,
-        ProjectCommandEffects, ThreadTurnBootstrapEffects, ThreadTurnReservation,
-        ThreadTurnStartBootstrapPrepareWorktree,
+        BoxBootstrapFuture, BoxProjectCommandFuture, CheckoutRestore, OrchestrationCommand,
+        OrchestrationEngine, ProjectCommandEffects, ThreadTurnBootstrapEffects,
+        ThreadTurnReservation, ThreadTurnStartBootstrapPrepareWorktree,
     },
     persistence::{OrchestrationEvent, PersistenceError},
 };
@@ -132,6 +132,125 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
             )
         })
     }
+
+    /// What a file restore asks about the other chats in its checkout (#279). `None` (the
+    /// default) treats every other chat as having no live provider session.
+    fn revert_probe(&self) -> Option<Box<dyn RevertProbe + '_>> {
+        None
+    }
+}
+
+/// Why another chat in a shared checkout keeps a file restore from running (#279).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WritingReason {
+    /// Its session is running a turn.
+    Turn,
+    /// Its turn delivery or compaction is admitted and about to start a turn.
+    StartingTurn,
+    BackgroundWork,
+    /// Its last turn's checkpoint is still being recorded.
+    CheckpointPending,
+    /// BiBCode can't see its work: Cursor, Grok, or Chat Activity off.
+    Unobservable,
+    /// It runs on an OpenCode server BiBCode doesn't manage.
+    UnmanagedServer,
+    StartingSession,
+    /// Its folder's Git checkout could not be resolved.
+    UnresolvableCheckout,
+}
+
+impl WritingReason {
+    /// The refusal a file restore records, naming the other chat by `title`.
+    pub fn detail(self, title: &str) -> String {
+        match self {
+            Self::Turn => format!(
+                "Another chat in this checkout ({title}) is running a turn. Stop it or wait for it to finish, then revert, or rewind only the conversation."
+            ),
+            Self::StartingTurn => format!(
+                "Another chat in this checkout ({title}) is starting a turn. Try the revert again in a moment, or rewind only the conversation."
+            ),
+            Self::BackgroundWork => format!(
+                "Another chat in this checkout ({title}) is running background work. Stop it or wait for it to finish, then revert, or rewind only the conversation."
+            ),
+            Self::CheckpointPending => format!(
+                "Another chat in this checkout ({title}) is still saving its checkpoint. Try the revert again in a moment, or rewind only the conversation."
+            ),
+            Self::Unobservable => format!(
+                "BiBCode can't tell whether {title} is still working. Stop its session, then revert, or rewind only the conversation."
+            ),
+            Self::UnmanagedServer => format!(
+                "{title} runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead."
+            ),
+            Self::StartingSession => {
+                "Another chat in this checkout is starting its session. Try the revert again in a moment.".to_owned()
+            }
+            Self::UnresolvableCheckout => format!(
+                "BiBCode can't tell whether {title} works in this checkout. Try the revert again, or check that chat's folder."
+            ),
+        }
+    }
+}
+
+/// Whether a thread's provider can rewind its conversation and leave the files alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConversationRewind {
+    Available,
+    /// The provider cannot rewind its conversation at all (Claude, Cursor, Grok).
+    FilesOnlyProvider {
+        provider_label: String,
+    },
+    /// The provider's rewind also restores files (OpenCode 1).
+    RewindRestoresFiles {
+        provider_label: String,
+    },
+}
+
+impl ConversationRewind {
+    fn wire(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::FilesOnlyProvider { .. } => "filesOnlyProvider",
+            Self::RewindRestoresFiles { .. } => "rewindRestoresFiles",
+        }
+    }
+
+    /// Why a conversation-only rewind is refused, if it is.
+    fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Available => None,
+            Self::FilesOnlyProvider { provider_label } => Some(format!(
+                "{provider_label} can't rewind its conversation, so only a file restore is possible."
+            )),
+            Self::RewindRestoresFiles { provider_label } => Some(format!(
+                "{provider_label} can't rewind its conversation without restoring files. Revert files and conversation instead."
+            )),
+        }
+    }
+}
+
+/// The provider side of the shared-checkout guard (#279), answered by the supervisor.
+pub trait RevertProbe: Send + Sync {
+    /// Whether the thread's live provider session writes in its checkout now; `None` when it
+    /// does not, or has no live session.
+    fn thread_writes_checkout<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, Option<WritingReason>>;
+
+    /// Makes the thread quiet for a restore: suspends its live, idle session. `Some` names why
+    /// it cannot be made quiet, and nothing is suspended then.
+    fn quiet_sibling<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, Option<WritingReason>>;
+
+    /// Whether the thread's provider can rewind its conversation and keep the files. Answered
+    /// from the live session once `prepare_provider_rewind` reopened it.
+    fn conversation_rewind<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, ConversationRewind>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -140,6 +259,9 @@ pub struct EffectsOptions {
     /// How long an ended turn holds its thread's turn deliveries for its checkpoint. A capture
     /// still pending then is given up as stale, so a hung Git never holds a thread for good.
     pub checkpoint_hold_limit: Duration,
+    /// How long a file restore waits for the turns admitted to its checkout to reach their
+    /// providers before it gives up, with nothing changed (#279).
+    pub checkout_restore_admission_wait: Duration,
 }
 
 impl Default for EffectsOptions {
@@ -147,9 +269,13 @@ impl Default for EffectsOptions {
         Self {
             queue_capacity: 64,
             checkpoint_hold_limit: CHECKPOINT_HOLD_LIMIT,
+            checkout_restore_admission_wait: CHECKOUT_RESTORE_ADMISSION_WAIT,
         }
     }
 }
+
+/// The maintainer's cap (#279): long enough for a delivery in flight to reach its provider.
+const CHECKOUT_RESTORE_ADMISSION_WAIT: Duration = Duration::from_secs(15);
 
 /// Longer than a capture's Git calls take in a large checkout, short enough that a worker that
 /// never answers does not hold a thread's turns for long.
@@ -173,6 +299,13 @@ pub enum OrchestrationEffectsError {
     Persistence(#[from] PersistenceError),
     #[error("orchestration effect failed: {0}")]
     Effect(String),
+    /// A file restore refused until the caller acknowledges what other chats changed in the
+    /// checkout with this token (#279).
+    #[error("orchestration effect failed: {detail}")]
+    Refused {
+        detail: String,
+        sibling_changes_token: String,
+    },
 }
 
 pub async fn normalize_project_workspace_root(
@@ -535,6 +668,7 @@ impl OrchestrationEffects {
             callbacks,
             receiver,
             cancellation.clone(),
+            options.checkout_restore_admission_wait,
         ));
         let producer = tokio::spawn(run_producer(
             engine.clone(),
@@ -739,9 +873,21 @@ impl EffectContext {
                 reservation = engine.reserve_thread_turns(&thread_id) => reservation,
                 () = cancellation.cancelled() => return,
             };
-            let result = callbacks
-                .compact_provider(&compaction_id, &cancellation)
-                .await;
+            // A compaction can reopen a suspended session, which could start a turn of its own,
+            // so it is admitted to the checkout like a delivery (#279).
+            let admission = tokio::select! {
+                admission = admit_thread_turn(&engine, &thread_id) => admission,
+                () = cancellation.cancelled() => return,
+            };
+            let result = match admission {
+                Some(_) => {
+                    callbacks
+                        .compact_provider(&compaction_id, &cancellation)
+                        .await
+                }
+                None => Err(crate::orchestration::engine::RESTORING_FILES_DETAIL.to_owned()),
+            };
+            drop(admission);
             drop(reservation);
             engine.wake_turn_delivery();
             if let Err(detail) = result {
@@ -764,8 +910,13 @@ impl EffectContext {
         self.report(event, result).await;
     }
 
-    /// Rewinds and restores a planned revert, then releases its thread and wakes delivery.
-    async fn revert(&self, event: &OrchestrationEvent, (reservation, plan): PreparedRevert) {
+    /// Rewinds and restores a planned revert, then releases its thread and its checkout, and
+    /// wakes delivery.
+    async fn revert(
+        &self,
+        event: &OrchestrationEvent,
+        (reservation, restore, plan): PreparedRevert,
+    ) {
         let result = match plan {
             Ok(plan) => {
                 finish_revert(
@@ -778,6 +929,7 @@ impl EffectContext {
             }
             Err(error) => Err(error),
         };
+        drop(restore);
         drop(reservation);
         self.engine.wake_turn_delivery();
         self.report(event, result).await;
@@ -790,7 +942,14 @@ impl EffectContext {
     ) {
         if let Err(error) = result {
             tracing::warn!(event_type = %event.event.event_type, sequence = event.sequence, %error, "orchestration side effect failed");
-            append_failure_activity(&self.engine, event, &error.to_string()).await;
+            let token = match &error {
+                OrchestrationEffectsError::Refused {
+                    sibling_changes_token,
+                    ..
+                } => Some(sibling_changes_token.as_str()),
+                _ => None,
+            };
+            append_failure_activity(&self.engine, event, &error.to_string(), token).await;
         }
     }
 }
@@ -844,9 +1003,11 @@ fn event_thread_id(event: &OrchestrationEvent) -> Option<&str> {
     event.event.payload.get("threadId").and_then(Value::as_str)
 }
 
-/// A revert whose thread is reserved for it, with its checks done and its provider ready.
+/// A revert whose thread is reserved for it, with its checks done and its provider ready. A
+/// file restore also holds its checkout (#279).
 type PreparedRevert = (
     ThreadTurnReservation,
+    Option<CheckoutRestore>,
     Result<RevertPlan, OrchestrationEffectsError>,
 );
 
@@ -888,8 +1049,10 @@ type ParkedEvent = (OrchestrationEvent, Option<OrderedRevert>);
 /// before it has restored, so a slow preparation is not overtaken by a later, faster one.
 struct ParkedThreads {
     queues: HashMap<String, VecDeque<ParkedEvent>>,
-    /// Per checkout, the `done` of its latest revert, which the next one waits for.
-    tails: HashMap<PathBuf, oneshot::Receiver<()>>,
+    /// Per checkout key, the `done` of its latest file restore, which the next one waits for.
+    tails: HashMap<String, oneshot::Receiver<()>>,
+    /// How long a file restore waits for its checkout's admitted turns.
+    restore_wait: Duration,
     /// [`REVERT_PREPARATION_LIMIT`] permits, one per revert being prepared.
     preparations: Arc<Semaphore>,
     ready: mpsc::UnboundedSender<ReadyRevert>,
@@ -916,8 +1079,9 @@ impl ParkedThreads {
         None
     }
 
-    /// Places a revert after the earlier reverts of its checkout. A revert whose checkout cannot
-    /// be resolved here waits for nobody; its preparation resolves the checkout again.
+    /// Places a file restore after the earlier restores of its checkout, by its physical key.
+    /// A revert whose checkout cannot be resolved here waits for nobody; its preparation
+    /// resolves the checkout again. A conversation-only rewind writes no file and takes no place.
     async fn order(
         &mut self,
         context: &EffectContext,
@@ -927,11 +1091,17 @@ impl ParkedThreads {
             return None;
         }
         let thread_id = event_thread_id(event)?.to_owned();
-        let checkout = resolve_workspace(&context.engine, context.callbacks.as_ref(), &thread_id)
+        let checkout = if is_revert_conversation_only(event) {
+            None
+        } else {
+            revert_gate_key(
+                &context.engine,
+                context.callbacks.as_ref(),
+                &thread_id,
+                &context.cancellation,
+            )
             .await
-            .ok()
-            .flatten()
-            .map(|cwd| normalize_host_path_lexically(&cwd));
+        };
         // Forget checkouts whose latest revert has restored.
         self.tails.retain(|_, tail| {
             !matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Closed))
@@ -964,28 +1134,67 @@ impl ParkedThreads {
             return context.handle(&event).await;
         };
         self.queues.insert(thread_id.clone(), VecDeque::new());
-        let (engine, callbacks, cancellation, preparations, ready) = (
+        let (engine, callbacks, cancellation, preparations, ready, restore_wait) = (
             context.engine.clone(),
             context.callbacks.clone(),
             context.cancellation.clone(),
             self.preparations.clone(),
             self.ready.clone(),
+            self.restore_wait,
         );
         self.waiters.spawn(async move {
             let prepared = tokio::select! {
                 prepared = async {
-                    // Taken before waiting for a preparation slot, so a turn sent after the
-                    // revert does not start ahead of it.
+                    // Taken first, so a turn sent after the revert does not start ahead of it.
                     let reservation = engine.reserve_thread_turns(&thread_id).await;
-                    let plan = {
-                        // The semaphore is never closed.
-                        let _permit = preparations.acquire().await.ok();
-                        plan_revert(&engine, callbacks.as_ref(), &event, &cancellation).await
-                    };
+                    // The checkout's previous restore finishes before this one takes the
+                    // checkout, which that one releases before its `done`.
                     if let Some(previous) = previous {
                         let _ = previous.await;
                     }
-                    (reservation, plan)
+                    // A file restore holds its checkout from its planning until it is recorded,
+                    // so no turn of another chat there starts meanwhile (#279).
+                    let mut restore = None;
+                    let mut refused = None;
+                    if !is_revert_conversation_only(&event)
+                        && let Some(key) =
+                            revert_gate_key(&engine, callbacks.as_ref(), &thread_id, &cancellation)
+                                .await
+                    {
+                        match tokio::time::timeout(
+                            restore_wait,
+                            engine.hold_checkout_for_restore(&key),
+                        )
+                        .await
+                        {
+                            Ok(held) => restore = Some(held),
+                            Err(_) => {
+                                tracing::warn!(
+                                    %thread_id,
+                                    "a file restore gave up waiting for the turns admitted to its checkout"
+                                );
+                                refused = Some(OrchestrationEffectsError::Effect(
+                                    CHECKOUT_RESTORE_WAIT_DETAIL.to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    let plan = match refused {
+                        Some(error) => Err(error),
+                        None => {
+                            // The semaphore is never closed.
+                            let _permit = preparations.acquire().await.ok();
+                            plan_revert(
+                                &engine,
+                                callbacks.as_ref(),
+                                &event,
+                                restore.as_mut(),
+                                &cancellation,
+                            )
+                            .await
+                        }
+                    };
+                    (reservation, restore, plan)
                 } => Some(prepared),
                 () = cancellation.cancelled() => None,
             };
@@ -1022,6 +1231,7 @@ impl ParkedThreads {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
@@ -1030,6 +1240,7 @@ async fn run_worker(
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     mut receiver: mpsc::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
+    restore_wait: Duration,
 ) {
     let context = EffectContext {
         engine,
@@ -1043,6 +1254,7 @@ async fn run_worker(
     let mut parked = ParkedThreads {
         queues: HashMap::new(),
         tails: HashMap::new(),
+        restore_wait,
         preparations: Arc::new(Semaphore::new(REVERT_PREPARATION_LIMIT)),
         ready,
         waiters: TaskTracker::new(),
@@ -1166,6 +1378,14 @@ async fn resolve_thread_workspace(
     {
         return Ok(Some(cwd));
     }
+    Ok(stored_thread_checkout(repositories, thread_id).await?)
+}
+
+/// The directory a thread's Git commands run in, as stored: its worktree, or its project's root.
+pub(crate) async fn stored_thread_checkout(
+    repositories: &crate::persistence::Repositories,
+    thread_id: &str,
+) -> Result<Option<PathBuf>, PersistenceError> {
     let Some(thread) = repositories.get_thread(thread_id.to_owned()).await? else {
         return Ok(None);
     };
@@ -1284,6 +1504,72 @@ async fn remove_temporary_index(path: PathBuf) {
         tracing::warn!(
             "a checkpoint's temporary index was not removed in time; it is left to finish on its own"
         );
+    }
+}
+
+/// A test pause at a capture's ref 0 update in one checkout, after its commit is fixed and
+/// before `update-ref` runs. Checkpoint Git runs no hooks, so tests hold the update here.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HeldRefZeroUpdate {
+    commit: std::sync::Mutex<Option<String>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl HeldRefZeroUpdate {
+    /// The commit the held update is to publish, once it is held.
+    pub(crate) async fn entered(&self) -> String {
+        loop {
+            let entered = self.entered.notified();
+            if let Some(commit) = self.commit.lock().unwrap().clone() {
+                return commit;
+            }
+            entered.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+static REF_ZERO_UPDATE_GATES: std::sync::Mutex<Vec<(PathBuf, Arc<HeldRefZeroUpdate>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds the next ref 0 update of a capture in the checkout `cwd` until released.
+#[cfg(test)]
+pub(crate) fn hold_ref_zero_update(cwd: &Path) -> Arc<HeldRefZeroUpdate> {
+    let held = Arc::new(HeldRefZeroUpdate::default());
+    REF_ZERO_UPDATE_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((cwd.to_path_buf(), held.clone()));
+    held
+}
+
+#[cfg(test)]
+async fn pause_ref_zero_update(cwd: &Path, reference: &str, commit: &str) {
+    if !reference.ends_with("/turn/0") {
+        return;
+    }
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let held = {
+        let mut gates = REF_ZERO_UPDATE_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = gates
+            .iter()
+            .position(|(gated, _)| canonical(gated) == canonical(cwd));
+        index.map(|index| gates.remove(index).1)
+    };
+    if let Some(held) = held {
+        *held.commit.lock().unwrap() = Some(commit.to_owned());
+        held.entered.notify_waiters();
+        held.release.notified().await;
     }
 }
 
@@ -1845,6 +2131,881 @@ async fn dispatch_turn_checkpoint(
         .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))
 }
 
+/// A checkout's key (#279): its Git worktree's top level, canonicalized the way the workspace
+/// availability registry keys paths, with that top level.
+#[derive(Clone, Debug)]
+pub(crate) struct CheckoutKey {
+    pub(crate) key: String,
+    top_key: String,
+}
+
+/// Resolves the checkout key of `directory` fresh: a project at `/repo` and one at
+/// `/repo/subdir` share one, symlinked spellings share one, linked worktrees keep their own.
+/// Never cached, because a nested repository removed later changes the answer while no stored
+/// path changes. Fails when the directory is gone or Git cannot name its top level.
+pub(crate) async fn checkout_key(
+    directory: &Path,
+    cancellation: &CancellationToken,
+) -> Result<CheckoutKey, String> {
+    let directory = tokio::fs::canonicalize(directory)
+        .await
+        .map_err(|error| error.to_string())?;
+    let output = run_git(
+        &directory,
+        Path::new("git"),
+        &["rev-parse", "--show-toplevel"],
+        &[],
+        true,
+        cancellation,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if output.exit_code != 0 {
+        return Err(format!(
+            "Git could not name the checkout (exit {}).",
+            output.exit_code
+        ));
+    }
+    let top = process_compatible_path(PathBuf::from(output.stdout.trim()));
+    let key = crate::git::canonical_worktree_path_key(&top)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(CheckoutKey {
+        top_key: key.clone(),
+        key,
+    })
+}
+
+/// The key a turn delivery or compaction takes admission under: the checkout key, or for a
+/// directory outside Git (or one Git cannot read), the directory's own key. A restore never
+/// relies on this alone: it also refuses while any thread it holds has a turn admitted.
+async fn admission_key(directory: &Path) -> String {
+    if let Ok(key) = checkout_key(directory, &CancellationToken::new()).await {
+        return key.key;
+    }
+    crate::git::canonical_worktree_path_key(directory)
+        .await
+        .unwrap_or_else(|_| {
+            normalize_host_path_lexically(directory)
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
+/// Admits a turn delivery or compaction of `thread_id` to its checkout (#279), after its own
+/// thread reservation. Waits while a file restore holds the checkout; `None` when a restore of
+/// another chat in the checkout holds this thread.
+pub(crate) async fn admit_thread_turn(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+) -> Option<crate::orchestration::engine::CheckoutTurnAdmission> {
+    let key = match stored_thread_checkout(&engine.repositories(), thread_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(directory) => admission_key(&directory).await,
+        None => format!("thread:{thread_id}"),
+    };
+    engine.admit_checkout_turn(thread_id, &key).await
+}
+
+/// The key a full revert of `thread_id` holds its checkout under, if it resolves.
+async fn revert_gate_key(
+    engine: &OrchestrationEngine,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+    cancellation: &CancellationToken,
+) -> Option<String> {
+    let cwd = resolve_workspace(engine, callbacks, thread_id)
+        .await
+        .ok()
+        .flatten()?;
+    checkout_key(&cwd, cancellation)
+        .await
+        .ok()
+        .map(|key| key.key)
+}
+
+fn is_revert_conversation_only(event: &OrchestrationEvent) -> bool {
+    event.event.payload.get("mode").and_then(Value::as_str) == Some("conversationOnly")
+}
+
+/// Why a restore gave up waiting for the turns admitted to its checkout.
+const CHECKOUT_RESTORE_WAIT_DETAIL: &str =
+    "Another chat in this checkout is starting a turn. Try the revert again in a moment.";
+
+/// Another thread whose checkout has the restoring thread's key.
+#[derive(Clone, Debug)]
+struct Sibling {
+    thread_id: String,
+    title: String,
+}
+
+/// The other threads of a checkout, in every project.
+#[derive(Default)]
+struct SiblingScan {
+    siblings: Vec<Sibling>,
+    /// Threads inside the checkout's folder whose own checkout could not be resolved; a restore
+    /// treats them as sharing it and refuses.
+    unresolvable: Vec<Sibling>,
+    /// Deleted threads that shared the checkout, whose turns still count as outside changes.
+    deleted: Vec<String>,
+    /// Threads of the checkout that never started a provider session and have no turns, so
+    /// they cannot have written a file (the maintainer, #279 Q1). They do not make the checkout shared,
+    /// but a restore still holds them, so a first message waits for it.
+    dormant: Vec<String>,
+}
+
+/// Whether the thread never started a provider session and has no turn.
+async fn never_started(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+) -> Result<bool, OrchestrationEffectsError> {
+    let repositories = engine.repositories();
+    Ok(repositories
+        .get_thread_session(thread_id.to_owned())
+        .await?
+        .is_none()
+        && repositories
+            .get_provider_session_runtime(thread_id.to_owned())
+            .await?
+            .is_none()
+        && repositories
+            .list_turns_by_thread(thread_id.to_owned())
+            .await?
+            .is_empty())
+}
+
+/// Lists the other threads of `own`'s checkout. Only a thread whose stored folder lies inside
+/// the checkout's top level can resolve to it, so threads elsewhere cost one path lookup and
+/// no Git call.
+async fn checkout_siblings(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    own: &CheckoutKey,
+    cancellation: &CancellationToken,
+) -> Result<SiblingScan, OrchestrationEffectsError> {
+    let mut scan = SiblingScan::default();
+    for thread in engine.repositories().list_thread_checkouts(true).await? {
+        if thread.thread_id == thread_id {
+            continue;
+        }
+        let directory = process_compatible_path(PathBuf::from(&thread.directory));
+        let Ok(folder) = crate::git::canonical_worktree_path_key(&directory).await else {
+            if !thread.deleted {
+                scan.unresolvable.push(Sibling {
+                    thread_id: thread.thread_id,
+                    title: thread.title,
+                });
+            }
+            continue;
+        };
+        let inside = folder == own.top_key
+            || folder.starts_with(&format!("{}/", own.top_key))
+            || folder.starts_with(&format!("{}\\", own.top_key));
+        if !inside {
+            continue;
+        }
+        if !thread.deleted && never_started(engine, &thread.thread_id).await? {
+            if let Ok(key) = checkout_key(&directory, cancellation).await
+                && key.key == own.key
+            {
+                scan.dormant.push(thread.thread_id);
+            }
+            continue;
+        }
+        match checkout_key(&directory, cancellation).await {
+            Ok(key) if key.key == own.key => {
+                if thread.deleted {
+                    scan.deleted.push(thread.thread_id);
+                } else {
+                    scan.siblings.push(Sibling {
+                        thread_id: thread.thread_id,
+                        title: thread.title,
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(_) if thread.deleted => {}
+            Err(_) => scan.unresolvable.push(Sibling {
+                thread_id: thread.thread_id,
+                title: thread.title,
+            }),
+        }
+    }
+    Ok(scan)
+}
+
+/// Whether the sibling writes in the checkout now. With `quiet`, a live idle session of its is
+/// suspended, so only a message (which delivery holds) can start it again.
+async fn sibling_writing(
+    engine: &OrchestrationEngine,
+    probe: Option<&dyn RevertProbe>,
+    thread_id: &str,
+    quiet: bool,
+) -> Result<Option<WritingReason>, OrchestrationEffectsError> {
+    if engine.thread_session_launching(thread_id) {
+        return Ok(Some(WritingReason::StartingSession));
+    }
+    if engine.thread_turn_admitted(thread_id) {
+        return Ok(Some(WritingReason::StartingTurn));
+    }
+    if engine.turns_held_for_checkpoint(thread_id) {
+        return Ok(Some(WritingReason::CheckpointPending));
+    }
+    if engine
+        .repositories()
+        .get_thread_session(thread_id.to_owned())
+        .await?
+        .is_some_and(|session| super::provider_runtime::session_holds_a_turn(&session))
+    {
+        return Ok(Some(WritingReason::Turn));
+    }
+    let Some(probe) = probe else {
+        return Ok(None);
+    };
+    if quiet {
+        probe.quiet_sibling(thread_id).await
+    } else {
+        probe.thread_writes_checkout(thread_id).await
+    }
+    .map_err(OrchestrationEffectsError::Effect)
+}
+
+/// Refuses the restore while a sibling writes; with `quiet`, makes every sibling quiet.
+async fn refuse_writing_siblings(
+    engine: &OrchestrationEngine,
+    probe: Option<&dyn RevertProbe>,
+    thread_id: &str,
+    siblings: &[Sibling],
+    quiet: bool,
+) -> Result<(), OrchestrationEffectsError> {
+    for sibling in siblings {
+        if let Some(reason) = sibling_writing(engine, probe, &sibling.thread_id, quiet).await? {
+            tracing::warn!(
+                thread_id,
+                sibling_thread_id = %sibling.thread_id,
+                ?reason,
+                "a file restore was refused: another chat in its checkout is writing"
+            );
+            return Err(OrchestrationEffectsError::Effect(
+                reason.detail(&sibling.title),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a file restore of a shared checkout changes, and what other chats changed (#279).
+struct SiblingChanges {
+    /// Every path the restore rewrites or deletes.
+    restored_paths: Vec<String>,
+    /// Paths changed since this thread's last checkpoint, so by someone else.
+    changed_since_last_turn: Vec<String>,
+    /// Sibling turns between the target and this thread's last checkpoint, from the event log.
+    turns: Vec<Value>,
+    event_ids: Vec<String>,
+    target_commit: String,
+    /// The tree of every tracked and untracked, non-ignored file now.
+    current_tree: String,
+    /// Where the current tree's temporary index starts from.
+    tree_start: Option<String>,
+}
+
+impl SiblingChanges {
+    fn token(&self) -> String {
+        sibling_changes_token(&self.target_commit, &self.current_tree, &self.event_ids)
+    }
+
+    fn outside_changes(&self) -> bool {
+        !self.changed_since_last_turn.is_empty() || !self.turns.is_empty()
+    }
+}
+
+/// The hex SHA-256 of the target commit, the current tree and the sorted sibling event ids, so
+/// any byte changed in the checkout, or any sibling turn, gives a new token.
+fn sibling_changes_token(target_commit: &str, current_tree: &str, event_ids: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(target_commit.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(current_tree.as_bytes());
+    for id in event_ids {
+        hasher.update(b"\n");
+        hasher.update(id.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Reads the restore's changes from Git and the append-only event log, which no sibling
+/// rewind or deletion removes.
+#[allow(clippy::too_many_arguments)]
+async fn sibling_changes(
+    engine: &OrchestrationEngine,
+    cwd: &Path,
+    thread_id: &str,
+    turn_count: i64,
+    target_revision: &str,
+    checkpoints: &[crate::persistence::ProjectionCheckpoint],
+    scan: &SiblingScan,
+    cancellation: &CancellationToken,
+) -> Result<SiblingChanges, OrchestrationEffectsError> {
+    let git = Path::new("git");
+    let newest = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.status == "ready")
+        .max_by_key(|checkpoint| checkpoint.checkpoint_turn_count);
+    let mut tree_start = None;
+    if let Some(newest) = newest
+        && has_ref(cwd, git, &newest.checkpoint_ref, cancellation).await?
+    {
+        tree_start = Some(newest.checkpoint_ref.clone());
+    }
+    let current_tree = current_tree(cwd, git, tree_start.as_deref(), cancellation).await?;
+    let target_commit = run_git(
+        cwd,
+        git,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{target_revision}^{{commit}}"),
+        ],
+        &[],
+        false,
+        cancellation,
+    )
+    .await?
+    .stdout
+    .trim()
+    .to_owned();
+    let restored_paths =
+        changed_paths(cwd, git, &target_commit, &current_tree, cancellation).await?;
+    let changed_since_last_turn = match &tree_start {
+        Some(start) => changed_paths(cwd, git, start, &current_tree, cancellation).await?,
+        None => Vec::new(),
+    };
+    // The target's time: its checkpoint's, or for turn 0 when turn 1 was asked for.
+    let since = if turn_count == 0 {
+        engine
+            .repositories()
+            .list_turns_by_thread(thread_id.to_owned())
+            .await?
+            .into_iter()
+            .find(|turn| turn.checkpoint_turn_count == Some(1))
+            .map(|turn| turn.started_at.unwrap_or(turn.requested_at))
+            .unwrap_or_else(|| BEFORE_ANY_TURN.to_owned())
+    } else {
+        checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_turn_count == turn_count)
+            .map(|checkpoint| checkpoint.completed_at.clone())
+            .unwrap_or_else(|| BEFORE_ANY_TURN.to_owned())
+    };
+    let until = newest.map_or_else(now_iso, |checkpoint| checkpoint.completed_at.clone());
+    let titles = scan
+        .siblings
+        .iter()
+        .map(|sibling| (sibling.thread_id.clone(), sibling.title.clone()))
+        .collect::<HashMap<_, _>>();
+    let thread_ids = scan
+        .siblings
+        .iter()
+        .map(|sibling| sibling.thread_id.clone())
+        .chain(scan.deleted.iter().cloned())
+        .collect::<Vec<_>>();
+    let events = engine
+        .repositories()
+        .list_turn_events_between(thread_ids, since, until)
+        .await?;
+    let mut event_ids = events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    event_ids.sort();
+    // Per thread: its turns, and the files they changed when any turn reported them.
+    let mut by_thread = BTreeMap::<String, (BTreeSet<String>, Option<BTreeSet<String>>)>::new();
+    for event in &events {
+        let (turns, files) = by_thread.entry(event.thread_id.clone()).or_default();
+        if event.event_type == "thread.turn-diff-completed" {
+            if let Some(turn) = event.payload.get("turnId").and_then(Value::as_str) {
+                turns.insert(turn.to_owned());
+            }
+            let files = files.get_or_insert_with(BTreeSet::new);
+            for file in event
+                .payload
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(path) = file.get("path").and_then(Value::as_str) {
+                    files.insert(path.to_owned());
+                }
+            }
+        } else if let Some(turn) = event
+            .payload
+            .pointer("/session/activeTurnId")
+            .and_then(Value::as_str)
+        {
+            turns.insert(turn.to_owned());
+        }
+    }
+    let turns = by_thread
+        .into_iter()
+        .filter(|(_, (turns, _))| !turns.is_empty())
+        .map(|(sibling, (turns, files))| {
+            json!({
+                "threadId": sibling,
+                "title": titles.get(&sibling).cloned().unwrap_or_else(|| "A deleted chat".to_owned()),
+                "turns": turns.len(),
+                "files": files.map(|files| files.into_iter().collect::<Vec<_>>()),
+            })
+        })
+        .collect();
+    Ok(SiblingChanges {
+        restored_paths,
+        changed_since_last_turn,
+        turns,
+        event_ids,
+        target_commit,
+        current_tree,
+        tree_start,
+    })
+}
+
+/// The tree of the checkout's tracked and untracked, non-ignored files now, written through a
+/// temporary index as a capture does, starting from `start` so unchanged files are not hashed.
+async fn current_tree(
+    cwd: &Path,
+    git_command: &Path,
+    start: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<String, OrchestrationEffectsError> {
+    let common_dir = run_git(
+        cwd,
+        git_command,
+        &["rev-parse", "--git-common-dir"],
+        &[],
+        false,
+        cancellation,
+    )
+    .await?
+    .stdout;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        cwd.join(common_dir)
+    };
+    let temporary_index = common_dir.join(format!("bibcode-checkpoint-index-{}", Uuid::new_v4()));
+    let env = checkpoint_environment(&temporary_index);
+    let result = async {
+        if let Some(start) = start {
+            run_git(
+                cwd,
+                git_command,
+                &["read-tree", start],
+                &env,
+                false,
+                cancellation,
+            )
+            .await?;
+        }
+        run_git(
+            cwd,
+            git_command,
+            &["add", "-A", "--", "."],
+            &env,
+            false,
+            cancellation,
+        )
+        .await?;
+        Ok(
+            run_git(cwd, git_command, &["write-tree"], &env, false, cancellation)
+                .await?
+                .stdout
+                .trim()
+                .to_owned(),
+        )
+    }
+    .await;
+    remove_temporary_index(temporary_index).await;
+    result
+}
+
+/// The paths that differ between two trees.
+async fn changed_paths(
+    cwd: &Path,
+    git_command: &Path,
+    from: &str,
+    to: &str,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, OrchestrationEffectsError> {
+    let output = run_git(
+        cwd,
+        git_command,
+        &["diff", "--name-only", "--no-renames", "-z", from, to],
+        &[],
+        false,
+        cancellation,
+    )
+    .await?;
+    Ok(output
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The lower bound of the event read when the target's time is unknown.
+const BEFORE_ANY_TURN: &str = "1970-01-01T00:00:00Z";
+
+/// A shared checkout's state a planned file restore checks again before its rewind.
+struct SharedRestore {
+    siblings: Vec<Sibling>,
+    target_commit: String,
+    current_tree: String,
+    tree_start: Option<String>,
+    event_ids: Vec<String>,
+}
+
+/// Step 5 of the guard, under the checkout gate: the siblings, their quiet, the `HEAD`
+/// fallback and the sibling-change token. Returns the revision to restore and, for a shared
+/// checkout, what step 7 checks again.
+#[allow(clippy::too_many_arguments)]
+async fn plan_shared_restore(
+    engine: &OrchestrationEngine,
+    probe: Option<&dyn RevertProbe>,
+    restore: &mut CheckoutRestore,
+    thread_id: &str,
+    turn_count: i64,
+    cwd: &Path,
+    target_ref: &str,
+    checkpoints: &[crate::persistence::ProjectionCheckpoint],
+    token: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(bool, Option<SharedRestore>), OrchestrationEffectsError> {
+    let own = checkout_key(cwd, cancellation).await.map_err(|error| {
+        OrchestrationEffectsError::Effect(format!(
+            "BiBCode can't tell which checkout this chat works in, so nothing was restored. {error}"
+        ))
+    })?;
+    let scan = checkout_siblings(engine, thread_id, &own, cancellation).await?;
+    if let Some(sibling) = scan.unresolvable.first() {
+        tracing::warn!(thread_id, sibling_thread_id = %sibling.thread_id, "a file restore was refused: another chat's checkout could not be resolved");
+        return Err(OrchestrationEffectsError::Effect(
+            WritingReason::UnresolvableCheckout.detail(&sibling.title),
+        ));
+    }
+    let fallback_to_head = turn_count == 0 && scan.siblings.is_empty();
+    let revision = checkpoint_revision(
+        cwd,
+        Path::new("git"),
+        target_ref,
+        fallback_to_head,
+        cancellation,
+    )
+    .await?;
+    if scan.siblings.is_empty() {
+        let Some(revision) = revision else {
+            return Err(missing_checkpoint(turn_count));
+        };
+        // A chat that never started cannot be writing, but its first message waits.
+        if let Err(conflict) = restore.hold_threads(&scan.dormant) {
+            return Err(hold_conflict(thread_id, &scan, conflict));
+        }
+        // No other chat works here now, but a deleted one may have changed files since the
+        // target: those still need acknowledging.
+        if !scan.deleted.is_empty() {
+            let changes = sibling_changes(
+                engine,
+                cwd,
+                thread_id,
+                turn_count,
+                &revision,
+                checkpoints,
+                &scan,
+                cancellation,
+            )
+            .await?;
+            if !changes.turns.is_empty() {
+                acknowledge_sibling_changes(thread_id, turn_count, &changes, token)?;
+                return Ok((
+                    fallback_to_head,
+                    Some(SharedRestore {
+                        siblings: Vec::new(),
+                        target_commit: changes.target_commit,
+                        current_tree: changes.current_tree,
+                        tree_start: changes.tree_start,
+                        event_ids: changes.event_ids,
+                    }),
+                ));
+            }
+        }
+        return Ok((fallback_to_head, None));
+    }
+    let Some(revision) = revision else {
+        if turn_count == 0 {
+            return Err(OrchestrationEffectsError::Effect(
+                HEAD_FALLBACK_REFUSED_DETAIL.to_owned(),
+            ));
+        }
+        return Err(missing_checkpoint(turn_count));
+    };
+    let held = scan
+        .siblings
+        .iter()
+        .map(|sibling| sibling.thread_id.clone())
+        .chain(scan.dormant.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Err(conflict) = restore.hold_threads(&held) {
+        return Err(hold_conflict(thread_id, &scan, conflict));
+    }
+    refuse_writing_siblings(engine, probe, thread_id, &scan.siblings, true).await?;
+    let changes = sibling_changes(
+        engine,
+        cwd,
+        thread_id,
+        turn_count,
+        &revision,
+        checkpoints,
+        &scan,
+        cancellation,
+    )
+    .await?;
+    acknowledge_sibling_changes(thread_id, turn_count, &changes, token)?;
+    Ok((
+        false,
+        Some(SharedRestore {
+            siblings: scan.siblings,
+            target_commit: changes.target_commit,
+            current_tree: changes.current_tree,
+            tree_start: changes.tree_start,
+            event_ids: changes.event_ids,
+        }),
+    ))
+}
+
+/// Refuses the restore unless `token` acknowledges the outside changes (an older client, with
+/// no token, may restore only when there are none).
+fn acknowledge_sibling_changes(
+    thread_id: &str,
+    turn_count: i64,
+    changes: &SiblingChanges,
+    token: Option<&str>,
+) -> Result<(), OrchestrationEffectsError> {
+    let expected = changes.token();
+    let acknowledged = match token {
+        Some(token) => token == expected,
+        None => !changes.outside_changes(),
+    };
+    if acknowledged {
+        return Ok(());
+    }
+    tracing::warn!(
+        thread_id,
+        "a file restore was refused: files changed outside the chat that the request did not acknowledge"
+    );
+    Err(OrchestrationEffectsError::Refused {
+        detail: format!(
+            "Files in this checkout changed since turn {turn_count}, outside this chat. Review them and revert again."
+        ),
+        sibling_changes_token: expected,
+    })
+}
+
+/// The refusal for a held thread that is launching a session or has a turn admitted.
+fn hold_conflict(
+    thread_id: &str,
+    scan: &SiblingScan,
+    conflict: crate::orchestration::engine::RestoreHoldConflict,
+) -> OrchestrationEffectsError {
+    let (thread, reason) = match conflict {
+        crate::orchestration::engine::RestoreHoldConflict::Launching(thread) => {
+            (thread, WritingReason::StartingSession)
+        }
+        crate::orchestration::engine::RestoreHoldConflict::Admitted(thread) => {
+            (thread, WritingReason::StartingTurn)
+        }
+    };
+    let title = scan
+        .siblings
+        .iter()
+        .find(|sibling| sibling.thread_id == thread)
+        .map_or("another chat", |sibling| sibling.title.as_str());
+    tracing::warn!(thread_id, sibling_thread_id = %thread, ?reason, "a file restore was refused: another chat in its checkout is starting");
+    OrchestrationEffectsError::Effect(reason.detail(title))
+}
+
+/// Why turn 0's `HEAD` fallback is refused on a shared checkout (the maintainer, decision D).
+const HEAD_FALLBACK_REFUSED_DETAIL: &str = "This thread has no starting checkpoint, and other chats share this checkout, so restoring files would discard their work. Rewind only the conversation, or revert to a later turn.";
+
+/// Step 7 of the guard, on the worker right before the irreversible rewind: every sibling is
+/// still quiet, and no file changed since the plan.
+async fn recheck_shared_restore(
+    engine: &OrchestrationEngine,
+    probe: Option<&dyn RevertProbe>,
+    thread_id: &str,
+    cwd: &Path,
+    shared: &SharedRestore,
+    cancellation: &CancellationToken,
+) -> Result<(), OrchestrationEffectsError> {
+    refuse_writing_siblings(engine, probe, thread_id, &shared.siblings, true).await?;
+    let tree = current_tree(
+        cwd,
+        Path::new("git"),
+        shared.tree_start.as_deref(),
+        cancellation,
+    )
+    .await?;
+    if tree != shared.current_tree {
+        tracing::warn!(
+            thread_id,
+            "a file restore was refused: files changed after it was confirmed"
+        );
+        return Err(OrchestrationEffectsError::Refused {
+            detail:
+                "Files in this checkout changed after you confirmed. Review them and revert again."
+                    .to_owned(),
+            sibling_changes_token: sibling_changes_token(
+                &shared.target_commit,
+                &tree,
+                &shared.event_ids,
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The checks and target of a revert to `turn_count`, shared by the plan and the preview.
+fn revert_target(
+    thread_id: &str,
+    turn_count: i64,
+    checkpoints: &[crate::persistence::ProjectionCheckpoint],
+) -> Result<(i64, String), OrchestrationEffectsError> {
+    let current_turn_count = checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.checkpoint_turn_count)
+        .max()
+        .unwrap_or(0);
+    if turn_count > current_turn_count {
+        return Err(OrchestrationEffectsError::Effect(format!(
+            "Checkpoint turn count {turn_count} exceeds current turn count {current_turn_count}."
+        )));
+    }
+    if turn_count == 0 {
+        return Ok((current_turn_count, checkpoint_ref(thread_id, 0)));
+    }
+    let target = checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_turn_count == turn_count)
+        .ok_or_else(|| {
+            OrchestrationEffectsError::Effect(format!(
+                "Checkpoint ref for turn {turn_count} is unavailable in read model."
+            ))
+        })?;
+    // Only a captured checkpoint is the turn's end state, with or without a diff. A ref of a
+    // turn not captured (`missing`) or given up (`error`) may hold a later checkout, so it is
+    // never restored.
+    if target.status != "ready" {
+        return Err(uncaptured_checkpoint(turn_count));
+    }
+    Ok((current_turn_count, target.checkpoint_ref.clone()))
+}
+
+/// What a revert of `thread_id` to `turn_count` would do (`orchestration.previewCheckpointRevert`,
+/// #279): the other chats writing in its checkout, every file a restore changes, what other
+/// chats changed and the token that acknowledges it, and whether the conversation alone can be
+/// rewound. Advisory: the worker repeats every check under the checkout gate.
+pub(crate) async fn preview_checkpoint_revert(
+    engine: &OrchestrationEngine,
+    probe: Option<&dyn RevertProbe>,
+    thread_id: &str,
+    turn_count: i64,
+    cancellation: &CancellationToken,
+) -> Result<Value, OrchestrationEffectsError> {
+    let cwd = stored_thread_checkout(&engine.repositories(), thread_id)
+        .await?
+        .ok_or_else(|| OrchestrationEffectsError::Effect("Thread was not found.".to_owned()))?;
+    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
+        return Err(OrchestrationEffectsError::Effect(
+            "Checkpoints are unavailable because this project is not a git repository.".to_owned(),
+        ));
+    }
+    let checkpoints = engine
+        .repositories()
+        .list_checkpoints_by_thread(thread_id.to_owned())
+        .await?;
+    let (_, target_ref) = revert_target(thread_id, turn_count, &checkpoints)?;
+    let own = checkout_key(&cwd, cancellation)
+        .await
+        .map_err(OrchestrationEffectsError::Effect)?;
+    let scan = checkout_siblings(engine, thread_id, &own, cancellation).await?;
+    let mut writing = Vec::new();
+    for sibling in &scan.unresolvable {
+        writing.push(json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": WritingReason::UnresolvableCheckout}));
+    }
+    for sibling in &scan.siblings {
+        if let Some(reason) = sibling_writing(engine, probe, &sibling.thread_id, false).await? {
+            writing.push(
+                json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": reason}),
+            );
+        }
+    }
+    let shared = !scan.siblings.is_empty() || !scan.unresolvable.is_empty();
+    let revision = checkpoint_revision(
+        &cwd,
+        Path::new("git"),
+        &target_ref,
+        turn_count == 0 && !shared,
+        cancellation,
+    )
+    .await?;
+    let head_fallback_refused = shared && turn_count == 0 && revision.is_none();
+    let changes = match (&revision, shared || !scan.deleted.is_empty()) {
+        (Some(revision), true) => Some(
+            sibling_changes(
+                engine,
+                &cwd,
+                thread_id,
+                turn_count,
+                revision,
+                &checkpoints,
+                &scan,
+                cancellation,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
+    // A deleted chat's changes count only when it changed files since the target.
+    let changes = changes.filter(|changes| shared || !changes.turns.is_empty());
+    let conversation_rewind = match probe {
+        Some(probe) => probe
+            .conversation_rewind(thread_id)
+            .await
+            .map_err(OrchestrationEffectsError::Effect)?,
+        None => ConversationRewind::Available,
+    };
+    Ok(json!({
+        "writingSiblings": writing,
+        "restoredPaths": changes.as_ref().map(|changes| changes.restored_paths.clone()).unwrap_or_default(),
+        "siblingChanges": {
+            "paths": changes.as_ref().map(|changes| changes.changed_since_last_turn.clone()).unwrap_or_default(),
+            "turns": changes.as_ref().map(|changes| changes.turns.clone()).unwrap_or_default(),
+        },
+        "siblingChangesToken": changes.as_ref().map(SiblingChanges::token),
+        "conversationRewind": conversation_rewind.wire(),
+        "headFallbackRefused": head_fallback_refused,
+    }))
+}
+
 /// A revert that passed its checks, with what its rewind and restore need. Planned while the
 /// thread is reserved, off the worker; nothing in it writes the checkout.
 struct RevertPlan {
@@ -1858,6 +3019,12 @@ struct RevertPlan {
     rewind_key: String,
     /// The request's command id, which the outcome's command id names.
     request: Option<String>,
+    /// Rewinds the conversation and leaves every file as it is.
+    conversation_only: bool,
+    /// Turn 0 may restore from `HEAD` when ref 0 is gone: only with no other chat in the checkout.
+    fallback_to_head: bool,
+    /// What step 7 checks again in a checkout other chats share.
+    shared: Option<SharedRestore>,
 }
 
 /// Checks the revert under its thread's reservation, then lets the provider prepare its rewind
@@ -1867,6 +3034,7 @@ async fn plan_revert(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
     event: &OrchestrationEvent,
+    restore: Option<&mut CheckoutRestore>,
     cancellation: &CancellationToken,
 ) -> Result<RevertPlan, OrchestrationEffectsError> {
     let payload = &event.event.payload;
@@ -1911,49 +3079,34 @@ async fn plan_revert(
         .repositories()
         .list_checkpoints_by_thread(thread_id.to_owned())
         .await?;
-    let current_turn_count = checkpoints
-        .iter()
-        .map(|checkpoint| checkpoint.checkpoint_turn_count)
-        .max()
-        .unwrap_or(0);
-    if turn_count > current_turn_count {
-        return Err(OrchestrationEffectsError::Effect(format!(
-            "Checkpoint turn count {turn_count} exceeds current turn count {current_turn_count}."
-        )));
-    }
-    let target_ref = if turn_count == 0 {
-        checkpoint_ref(thread_id, 0)
-    } else {
-        let target = checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.checkpoint_turn_count == turn_count)
-            .ok_or_else(|| {
-                OrchestrationEffectsError::Effect(format!(
-                    "Checkpoint ref for turn {turn_count} is unavailable in read model."
-                ))
-            })?;
-        // Only a captured checkpoint is the turn's end state, with or without a diff. A ref of a
-        // turn not captured (`missing`) or given up (`error`) may hold a later checkout, so it is
-        // never restored.
-        if target.status != "ready" {
-            return Err(uncaptured_checkpoint(turn_count));
-        }
-        target.checkpoint_ref.clone()
-    };
+    let (current_turn_count, target_ref) = revert_target(thread_id, turn_count, &checkpoints)?;
+    let conversation_only = is_revert_conversation_only(event);
     // The provider rewind cannot be undone, so it runs before any file is touched and only once
-    // the checkpoint is known to resolve. A refused rewind then changes nothing.
-    if checkpoint_revision(
-        &cwd,
-        Path::new("git"),
-        &target_ref,
-        turn_count == 0,
-        cancellation,
-    )
-    .await?
-    .is_none()
-    {
-        return Err(missing_checkpoint(turn_count));
-    }
+    // the checkpoint is known to resolve. A refused rewind then changes nothing. A
+    // conversation-only rewind restores no file, so it needs no checkpoint and no guard.
+    let (fallback_to_head, shared) = if conversation_only {
+        (false, None)
+    } else {
+        let restore = restore.ok_or_else(|| {
+            OrchestrationEffectsError::Effect(
+                "BiBCode can't tell which checkout this chat works in, so nothing was restored. Try the revert again.".to_owned(),
+            )
+        })?;
+        let probe = callbacks.revert_probe();
+        plan_shared_restore(
+            engine,
+            probe.as_deref(),
+            restore,
+            thread_id,
+            turn_count,
+            &cwd,
+            &target_ref,
+            &checkpoints,
+            payload.get("siblingChangesToken").and_then(Value::as_str),
+            cancellation,
+        )
+        .await?
+    };
     let rolled_back_turns = current_turn_count.saturating_sub(turn_count);
     // The rewind's idempotency key: the transcript it counts from, named by its newest turn. A
     // retry from the same transcript (its earlier completion was not recorded) reuses it; once
@@ -1969,6 +3122,17 @@ async fn plan_revert(
             .await
             .map_err(OrchestrationEffectsError::Effect)?;
     }
+    // Asked of the live session, which the preparation reopened, so the API version is known.
+    if conversation_only
+        && let Some(probe) = callbacks.revert_probe()
+        && let Some(refusal) = probe
+            .conversation_rewind(thread_id)
+            .await
+            .map_err(OrchestrationEffectsError::Effect)?
+            .refusal()
+    {
+        return Err(OrchestrationEffectsError::Effect(refusal));
+    }
     Ok(RevertPlan {
         thread_id: thread_id.to_owned(),
         turn_count,
@@ -1978,6 +3142,9 @@ async fn plan_revert(
         rolled_back_turns,
         rewind_key,
         request: event.event.command_id.clone(),
+        conversation_only,
+        fallback_to_head,
+        shared,
     })
 }
 
@@ -2039,9 +3206,38 @@ async fn finish_revert(
         rolled_back_turns,
         rewind_key,
         request,
+        conversation_only,
+        fallback_to_head,
+        shared,
     } = plan;
     let thread_id = thread_id.as_str();
     let missing_checkpoint = || missing_checkpoint(turn_count);
+    if conversation_only {
+        return finish_conversation_rewind(
+            engine,
+            callbacks,
+            thread_id,
+            turn_count,
+            &cwd,
+            &checkpoints,
+            rolled_back_turns,
+            &rewind_key,
+            request.as_deref(),
+        )
+        .await;
+    }
+    if let Some(shared) = &shared {
+        let probe = callbacks.revert_probe();
+        recheck_shared_restore(
+            engine,
+            probe.as_deref(),
+            thread_id,
+            &cwd,
+            shared,
+            cancellation,
+        )
+        .await?;
+    }
     if rolled_back_turns > 0
         && let ProviderRewind::FilesOnly { provider_label } = callbacks
             .rollback_provider(thread_id, rolled_back_turns, &rewind_key)
@@ -2054,7 +3250,7 @@ async fn finish_revert(
             &cwd,
             Path::new("git"),
             &target_ref,
-            turn_count == 0,
+            fallback_to_head,
             cancellation,
         )
         .await?
@@ -2104,7 +3300,7 @@ async fn finish_revert(
         &cwd,
         Path::new("git"),
         &target_ref,
-        turn_count == 0,
+        fallback_to_head,
         cancellation,
     )
     .await
@@ -2168,6 +3364,91 @@ async fn finish_revert(
     })
 }
 
+/// Rewinds only the conversation (#279): the provider drops the newer turns, the thread drops
+/// its newer messages, turns and checkpoint refs, and the working tree stays byte for byte as it
+/// is. It never runs `restore`, `clean` or `reset`.
+#[allow(clippy::too_many_arguments)]
+async fn finish_conversation_rewind(
+    engine: &OrchestrationEngine,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+    turn_count: i64,
+    cwd: &Path,
+    checkpoints: &[crate::persistence::ProjectionCheckpoint],
+    rolled_back_turns: i64,
+    rewind_key: &str,
+    request: Option<&str>,
+) -> Result<(), OrchestrationEffectsError> {
+    if rolled_back_turns > 0
+        && let ProviderRewind::FilesOnly { provider_label } = callbacks
+            .rollback_provider(thread_id, rolled_back_turns, rewind_key)
+            .await
+            .map_err(OrchestrationEffectsError::Effect)?
+    {
+        return Err(OrchestrationEffectsError::Effect(
+            ConversationRewind::FilesOnlyProvider { provider_label }
+                .refusal()
+                .unwrap_or_default(),
+        ));
+    }
+    // The provider has rewound, so the revert is recorded whatever happens next.
+    let uninterruptible = CancellationToken::new();
+    for checkpoint in checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.checkpoint_turn_count > turn_count)
+    {
+        if delete_ref(
+            cwd,
+            Path::new("git"),
+            &checkpoint.checkpoint_ref,
+            &uninterruptible,
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                thread_id,
+                turn_count = checkpoint.checkpoint_turn_count,
+                "a rewound turn's checkpoint ref could not be deleted"
+            );
+        }
+    }
+    let created_at = now_iso();
+    engine
+        .dispatch(OrchestrationCommand::ThreadRevertComplete {
+            command_id: outcome_id("checkpoint-revert-complete", request),
+            thread_id: thread_id.to_owned(),
+            turn_count,
+            created_at: created_at.clone(),
+        })
+        .await
+        .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))?;
+    if let Err(error) = engine
+        .dispatch(OrchestrationCommand::ThreadActivityAppend {
+            command_id: outcome_id("checkpoint-revert-conversation-only", request),
+            thread_id: thread_id.to_owned(),
+            activity: ActivityInput {
+                id: Uuid::new_v4().to_string(),
+                tone: "info".to_owned(),
+                kind: "checkpoint.revert.conversation-only".to_owned(),
+                summary: "Conversation rewound, files kept".to_owned(),
+                payload: json!({
+                    "turnCount": turn_count,
+                    "detail": "The newer messages were removed. Files in the checkout were not changed.",
+                }),
+                turn_id: None,
+                sequence: None,
+                created_at: created_at.clone(),
+            },
+            created_at,
+        })
+        .await
+    {
+        tracing::warn!(thread_id, %error, "a conversation-only rewind's work-log entry could not be recorded");
+    }
+    Ok(())
+}
+
 async fn cleanup_deleted_thread(
     callbacks: &dyn OrchestrationEffectCallbacks,
     event: &OrchestrationEvent,
@@ -2193,6 +3474,7 @@ async fn append_failure_activity(
     engine: &OrchestrationEngine,
     event: &OrchestrationEvent,
     detail: &str,
+    sibling_changes_token: Option<&str>,
 ) {
     let Some(thread_id) = event.event.payload.get("threadId").and_then(Value::as_str) else {
         return;
@@ -2203,7 +3485,14 @@ async fn append_failure_activity(
                 "checkpoint.revert.failed",
                 "Checkpoint revert failed",
                 None,
-                json!({"turnCount":event.event.payload.get("turnCount"),"detail":detail}),
+                {
+                    let mut payload =
+                        json!({"turnCount":event.event.payload.get("turnCount"),"detail":detail});
+                    if let Some(token) = sibling_changes_token {
+                        payload["siblingChangesToken"] = json!(token);
+                    }
+                    payload
+                },
             )
         } else {
             (
@@ -2366,6 +3655,8 @@ async fn capture_checkpoint_with_cancellation(
         )
         .await?
         .stdout;
+        #[cfg(test)]
+        pause_ref_zero_update(cwd, &reference, commit.trim()).await;
         run_git(
             cwd,
             git_command,
@@ -2682,6 +3973,10 @@ fn outcome_id(tag: &str, request: Option<&str>) -> String {
         None => server_id(tag),
     }
 }
+
+#[cfg(test)]
+#[path = "shared_checkout_restore_tests.rs"]
+mod shared_checkout_restore_tests;
 
 #[cfg(test)]
 mod tests {
