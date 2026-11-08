@@ -91,6 +91,9 @@ import {
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import { GitManagerTagsView, type GitManagerTagRowAction } from "./tags/GitManagerTagsView";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
+import { GitSignInPrompt } from "../gitSignIn/GitSignInPrompt";
+import { SIGN_IN_REPEATED_MESSAGE } from "../gitSignIn/gitSignIn.logic";
+import { useGitSignInFlow } from "../gitSignIn/useGitSignInFlow";
 import { useCheckoutStatusRereads } from "./useCheckoutStatusRereads";
 import { GitManagerRepositoryUnavailable } from "./GitManagerRepositoryUnavailable";
 import {
@@ -485,6 +488,36 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     revalidateRefs();
     if (stashPaneOpen) revalidateStashes();
   }, [revalidateRefs, revalidateStashes, stashPaneOpen]);
+  const signIn = useGitSignInFlow(environmentId);
+  const offerSignIn = signIn.offer;
+  // Set while the request a sign-in resumed runs: a second `sign-in-required` is not offered again.
+  const resumingAfterSignInRef = useRef(false);
+  const executeOperationRef = useRef<
+    ((input: GitManagerOperationRequest) => Promise<boolean>) | null
+  >(null);
+  const presentOperationEvent = useCallback(
+    (event: GitManagerOperationEvent): GitManagerOperationEvent => {
+      if (event._tag !== "failed" || event.signIn === undefined) return event;
+      const { signIn: offer, ...failure } = event;
+      if (resumingAfterSignInRef.current) {
+        return { ...failure, message: SIGN_IN_REPEATED_MESSAGE };
+      }
+      offerSignIn({
+        offer,
+        cwd: offer.resume.cwd,
+        projectId: offer.resume.projectId,
+        onSignedIn: () => {
+          resumingAfterSignInRef.current = true;
+          void executeOperationRef.current?.(offer.resume).finally(() => {
+            resumingAfterSignInRef.current = false;
+          });
+        },
+        onEnded: (code, message) => setOperationEvent({ ...failure, code, message, blocked: null }),
+      });
+      return failure;
+    },
+    [offerSignIn],
+  );
   const executeOperation = useCallback(
     async (
       input: GitManagerOperationRequest,
@@ -495,7 +528,8 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       const startedEvent = { _tag: "started", operation: input._tag } as const;
       setOperationEvent(startedEvent);
       onEvent?.(startedEvent);
-      const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
+      const handle = runGitManagerOperation(registry, { environmentId, input }, (received) => {
+        const event = presentOperationEvent(received);
         setOperationEvent(event);
         onEvent?.(event);
         if (event._tag === "failed" || event._tag === "finished") {
@@ -529,8 +563,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       }
       return result.value._tag === "finished";
     },
-    [environmentId, revalidateRepositoryReads, registry],
+    [environmentId, presentOperationEvent, revalidateRepositoryReads, registry],
   );
+  useEffect(() => {
+    executeOperationRef.current = executeOperation;
+  }, [executeOperation]);
   const cancelOperation = useCallback(() => {
     activeOperationRef.current?.cancel();
     activeOperationRef.current = null;
@@ -970,9 +1007,17 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           {liveSignalDisabledReason}
         </p>
       )}
-      {presentedMultiCommitState === null ? (
+      {presentedMultiCommitState !== null ? null : signIn.state !== null ? (
+        <GitSignInPrompt
+          offer={signIn.state.offer}
+          phase={signIn.state.phase}
+          onCancel={signIn.cancel}
+          onNotNow={signIn.decline}
+          onSignIn={signIn.approve}
+        />
+      ) : (
         <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
-      ) : null}
+      )}
       {resumableOperation === null ? null : (
         <GitManagerInProgressStrip
           blocked={inProgressBlocked}

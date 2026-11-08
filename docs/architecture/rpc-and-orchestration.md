@@ -346,9 +346,72 @@ Status, diff, the Git Manager, worktrees, refs, the watcher, turn checkpoints, t
 bootstrap fetch and the other commands built on `git_environment()`
 (`apps/server/src/git/repository.rs`) run Git noninteractively: `GCM_INTERACTIVE=never`,
 empty `GIT_ASKPASS` and `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`,
-`GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add `GIT_OPTIONAL_LOCKS=0`. No BiBCode Git
-call opens a credential window or prompt: a fetch, pull or push uses a stored credential
-through a kept helper, or fails with an authentication error.
+`GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add `GIT_OPTIONAL_LOCKS=0`. No operation
+opens a credential window or prompt: a fetch, pull or push uses a stored credential
+through a kept helper, or fails with an authentication error. The one exception is
+[Git Credential Manager sign-in](#git-credential-manager-sign-in), a separate command the
+person approves. `osxkeychain` and `libsecret` can still raise an OS Keychain or keyring
+unlock dialog, and `ssh` can read a key passphrase from `/dev/tty`; no Git variable controls
+those.
+
+### Git Credential Manager sign-in
+
+#325, [design](../plans/2026-11-07-git-manager-interactive-sign-in-design.md). On the
+desktop's in-process server only, a fetch, pull or push the person starts can lead to Git
+Credential Manager's (GCM) sign-in. Background Git (bootstrap fetch, watchers, automatic
+fetch, checkpoints), the `/mcp` tools, paired devices, remote and WSL servers never prompt.
+
+- **Eligibility.** `sign_in_eligible` (`production/git_manager_rpc.rs`) is true when
+  `ServerConfig::interactive_git_sign_in` is set and the session's principal subject is
+  `desktop-bootstrap`. Only `server_config_for_launch` in the desktop's in-process launch sets
+  the flag; no CLI flag or bootstrap key does. A header, payload field or scope never grants
+  it. `gitManager.runOperation` and `git.runStackedAction` are registered with their session
+  context for this; the domain receives `CredentialPrompt::{Never, OfferSignIn}`.
+- **Detection.** Operations keep `GCM_INTERACTIVE=never`. Git Manager `fetch`, `pull`,
+  `push`, `publish-branch`, `force-push`, `tag-push`, `remote-branch-delete`, and
+  `branch-delete` with `deleteRemote`, Source Control `vcs.pull` and the stacked action's
+  push step report a sign-in when, on an eligible session, the failed command was not
+  cancelled, a stderr line starts with GCM's
+  `fatal: Cannot prompt because user interactivity has been disabled.` (compared without
+  case), and `git remote get-url --all [--push] <remote>` prints exactly one `https://` URL
+  without a query, fragment or `=`. The line is an untrusted hint: a remote's band-3
+  sideband or a hook can print it, and it only shows the approval. The destination is that
+  URL without user information, frozen at failure time, never text from stderr. Several URLs
+  in the direction append "BiBCode offers a sign-in only for a remote with one {fetch | push}
+  URL. Sign in with your own Git." to the authentication error. Nothing is retried.
+- **Outcome.** Git Manager's `failed` event uses code `sign-in-required` and an optional
+  `signIn { remote, destination, host, direction, resume }`; `vcs.pull` fails with
+  `GitSignInRequiredError` carrying the same fields; `action_failed` gains an optional
+  `signIn`. `resume` is the request to send after a sign-in, carrying `expectedDestination`.
+  A branch delete resumes as `remote-branch-delete` of the failed remote step, because its
+  local branch is already gone. A stacked action resumes without its commit: `commit_push`
+  and `push` as `push`, the pull request actions as `create_pr` (`commit_push_pr` without
+  `pullRequestHeadBranch`, so it pushes the current branch as before).
+- **`git.signIn`** (unary, `orchestration:operate`, long-running) takes
+  `{ projectId?, cwd, remote, direction, destination }`. It refuses an ineligible caller
+  (`GitSignInUnavailableError`), validates `cwd` as the failed operation did (project
+  ownership when `projectId` is given, then workspace admission), resolves the remote's URLs
+  again and refuses a change or a second URL (`GitSignInDestinationChangedError`, with the
+  new URL or null), and takes the server's single slot (`GitSignInBusyError`). It holds no
+  project lock and no status mutation guard. In a new `0700` repository under
+  `<state>/git-sign-in/`, removed on every outcome, it refuses when any
+  `url.*.insteadOf` or `pushInsteadOf` value (`git config --includes -z --get-regexp`)
+  prefixes the destination (`GitSignInRewrittenError`), then runs
+  `git -c http.followRedirects=false -c http.<destination>.followRedirects=false` with
+  `ls-remote <destination> HEAD` (fetch) or
+  `push --dry-run --no-verify --porcelain <destination> :refs/heads/bibcode-sign-in-<uuid>`
+  (push). Its environment is `git_environment()` without `GCM_INTERACTIVE` (so the person's
+  own `GCM_INTERACTIVE` or `credential.interactive=never` still wins) plus
+  `GIT_ALLOW_PROTOCOL=https`, on the network-transfer configuration with a 10-minute timeout.
+  It answers `{ outcome, message }`: `signedIn` for exit 0 or a push refused only because the
+  probe branch does not exist, `failed`, `timedOut` or `cancelled`. It is not run in a
+  spawned task: an interrupt or lost connection drops it and the supervised runner kills the
+  probe's process group or Job, which ends GCM and its `GitHub.UI` helper. Cancel does not
+  undo a sign-in GCM already stored, nor close a browser tab or OS broker window GCM opened.
+- **Resume.** A request with `expectedDestination` resolves its remote's URLs again right
+  before its network step, under the lock and guard it already holds, and fails with
+  `destination-changed` (Git Manager) or `GitSignInDestinationChangedError` (Source Control)
+  unless there is exactly that one URL. The field can only add a refusal.
 
 They read one curated subset of the system configuration (#282,
 [design](../plans/2026-11-03-git-system-line-endings-design.md); #283,
@@ -812,7 +875,16 @@ rewrite, conflict continuation or resolution, and tag operations. It emits one
 `started` event, zero or more `output` events—one capped chunk per completed Git
 command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
-supervised child process.
+supervised child process. On the desktop's own session a network operation that Git
+Credential Manager refused fails with `sign-in-required` and a `signIn` object; the panel
+asks, calls `git.signIn`, then sends `signIn.resume` (see
+[Git Credential Manager sign-in](#git-credential-manager-sign-in)).
+
+Source Control's `vcs.pull` runs server-owned, but its Git process uses a child of the
+request's token, so an interrupt (the panel's Cancel) or a lost connection kills it; the
+mutation guard still settles. `git.runStackedAction` stops its running push the same way;
+the panel shows Cancel only during the push phase, and a commit the action made stays
+("Push cancelled. Your commit is saved locally.").
 
 `merge-into {source, target}` merges a full source ref into a local branch that
 is not checked out, without touching any worktree. It is advertised by the
@@ -5115,6 +5187,8 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   clone, publish, lookup, and discovery (`vcs.clone`,
   `sourceControl.cloneRepository`, `publishRepository`, and `lookupRepository`,
   and `server.discoverSourceControl`); `vcs.pull` and `vcs.generateCommitMessage`;
+  `git.signIn`, which waits on a person for up to 10 minutes and so can still raise
+  `rpc.hang` after 300 s;
   `gitManager.commit`, `gitManager.getRemoteTags`, and
   `gitManager.listPullRequests`; `git.resolvePullRequest` and
   `git.preparePullRequestThread`; the pull request reads and actions

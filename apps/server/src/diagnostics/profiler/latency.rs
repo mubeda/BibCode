@@ -131,6 +131,8 @@ pub fn is_long_running(method: &str) -> bool {
             | "server.subscribeDiagnosticLogsRelay"
             | "server.sendDiagnosticLogsRelayItem"
             | "vcs.pull"
+            // Waits on a person signing in with Git Credential Manager, up to 10 minutes (#325).
+            | "git.signIn"
             | "vcs.generateCommitMessage"
             | "git.resolvePullRequest"
             | "git.preparePullRequestThread"
@@ -1242,6 +1244,8 @@ mod tests {
         assert!(!is_long_running("pipelines.subscribe"));
         // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
         assert!(is_long_running("terminal.open"));
+        // A Git Credential Manager sign-in waits on a person (#325).
+        assert!(is_long_running("git.signIn"));
         assert!(!is_long_running("terminal.writeInput"));
         // A test event or a redelivery waits on the person's endpoint (up to 10 s), and a
         // token change waits for the request in flight; the rest of the webhook methods read

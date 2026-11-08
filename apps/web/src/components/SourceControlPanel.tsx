@@ -1,13 +1,17 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
-import type {
-  GitManagerOperationEvent,
-  GitManagerOperationRequest,
-  GitManagerRefEntry,
-  GitStackedAction,
-  ScopedProjectRef,
-  ScopedThreadRef,
-  VcsStagingArea,
-  VcsStatusResult,
+import {
+  GitSignInRequiredError,
+  type GitActionProgressEvent,
+  type GitManagerOperationEvent,
+  type GitManagerOperationRequest,
+  type GitManagerRefEntry,
+  type GitRunStackedActionInput,
+  type GitStackedAction,
+  type ScopedProjectRef,
+  type ScopedThreadRef,
+  type VcsPullInput,
+  type VcsStagingArea,
+  type VcsStatusResult,
 } from "@bibcode/contracts";
 import {
   isAtomCommandInterrupted,
@@ -15,6 +19,7 @@ import {
 } from "@bibcode/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
+import * as Schema from "effect/Schema";
 import {
   ChevronDownIcon,
   CloudUploadIcon,
@@ -41,7 +46,10 @@ import {
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
 import { Spinner } from "~/components/ui/spinner";
 import { Textarea } from "~/components/ui/textarea";
-import { stackedThreadToast, toastManager } from "~/components/ui/toast";
+import { stackedThreadToast, toastManager, type ThreadToastData } from "~/components/ui/toast";
+import { GitSignInPrompt } from "~/components/gitSignIn/GitSignInPrompt";
+import { SIGN_IN_REPEATED_MESSAGE } from "~/components/gitSignIn/gitSignIn.logic";
+import { useGitSignInFlow } from "~/components/gitSignIn/useGitSignInFlow";
 import { useDiffPanelStore } from "~/diffPanelStore";
 import { usePreferredEditor } from "~/editorPreferences";
 import { usePrimarySettings } from "~/hooks/useSettings";
@@ -204,6 +212,12 @@ export default function SourceControlPanel({
   );
 
   const runAction = useGitStackedAction(scope);
+  const signIn = useGitSignInFlow(environmentId);
+  const offerSignIn = signIn.offer;
+  const runPullRef = useRef<((resume?: VcsPullInput) => Promise<void>) | null>(null);
+  const runResumedPushRef = useRef<((resume: GitRunStackedActionInput) => Promise<void>) | null>(
+    null,
+  );
   const capabilities = useServerConfigs().get(environmentId)?.environment.capabilities;
   const pullRequestBranchSelection = capabilities?.gitPullRequestBranchSelection === true;
   const mergeAvailable =
@@ -491,16 +505,38 @@ export default function SourceControlPanel({
         timeout: 0,
         data: threadToastData,
       });
+      const push = trackPushPhase(toastId, threadToastData);
       // Create MR/PR publishes the branch first, then reviews it in the shared dialog.
       const result = await runAction.run({
         actionId: randomUUID(),
         action: action === "create_pr" ? "push" : action,
         ...(message ? { commitMessage: message } : {}),
         ...commitInput,
+        onProgress: push.onProgress,
+        signal: push.signal,
       });
       if (result._tag === "Failure") {
         if (isAtomCommandInterrupted(result)) {
+          closeOrReportCancelledPush(toastId, push.signal, threadToastData);
+          return;
+        }
+        const offer = push.failure()?.signIn;
+        if (offer !== undefined && gitCwd !== null) {
           toastManager.close(toastId);
+          offerSignIn({
+            offer,
+            cwd: gitCwd,
+            onSignedIn: () => void runResumedPushRef.current?.(offer.resume),
+            onEnded: (_code, message) =>
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Push failed",
+                  description: message,
+                  data: threadToastData,
+                }),
+              ),
+          });
           return;
         }
         const error = squashAtomCommandFailure(result);
@@ -545,41 +581,143 @@ export default function SourceControlPanel({
       environmentId,
       pullRequestBranchSelection,
       reloadCommits,
+      offerSignIn,
     ],
   );
 
-  const runPull = useCallback(async () => {
-    const toastId = toastManager.add({
-      type: "loading",
-      title: "Pulling…",
-      timeout: 0,
-      data: threadToastData,
-    });
-    const result = await pullAction.run();
-    if (result._tag === "Failure") {
-      if (isAtomCommandInterrupted(result)) {
-        toastManager.close(toastId);
+  // The push a sign-in resumed (#325), sent as the server named it: no second commit, bound
+  // to the approved destination. A second refusal is not offered again.
+  const runResumedPush = useCallback(
+    async (resume: GitRunStackedActionInput) => {
+      const toastId = toastManager.add({
+        type: "loading",
+        title: "Pushing…",
+        timeout: 0,
+        data: threadToastData,
+      });
+      const push = trackPushPhase(toastId, threadToastData);
+      // This panel sends commit, push and commit-and-push only, so the resume is a `push`.
+      const result = await runAction.run({
+        actionId: randomUUID(),
+        action: resume.action,
+        ...(resume.expectedDestination === undefined
+          ? {}
+          : { expectedDestination: resume.expectedDestination }),
+        onProgress: push.onProgress,
+        signal: push.signal,
+      });
+      if (result._tag === "Failure") {
+        if (isAtomCommandInterrupted(result)) {
+          closeOrReportCancelledPush(toastId, push.signal, threadToastData);
+          return;
+        }
+        const error = squashAtomCommandFailure(result);
+        toastManager.update(
+          toastId,
+          stackedThreadToast({
+            type: "error",
+            title: stackedActionFailureTitle(error),
+            description:
+              push.failure()?.signIn !== undefined
+                ? SIGN_IN_REPEATED_MESSAGE
+                : sourceControlErrorMessage(error),
+            data: threadToastData,
+          }),
+        );
         return;
       }
-      const error = squashAtomCommandFailure(result);
-      toastManager.update(
-        toastId,
-        stackedThreadToast({
-          type: "error",
-          title: "Pull failed",
-          description: sourceControlErrorMessage(error),
-          data: threadToastData,
-        }),
-      );
-      return;
-    }
-    toastManager.update(toastId, {
-      type: "success",
-      title: result.value.status === "pulled" ? "Pulled" : "Already up to date",
-      timeout: 0,
-      data: threadToastData,
-    });
-  }, [pullAction, threadToastData]);
+      reloadCommits();
+      toastManager.update(toastId, {
+        type: "success",
+        title: result.value.toast.title,
+        description: result.value.toast.description,
+        timeout: 0,
+        data: { ...threadToastData, dismissAfterVisibleMs: 10_000 },
+      });
+    },
+    [reloadCommits, runAction, threadToastData],
+  );
+  useEffect(() => {
+    runResumedPushRef.current = runResumedPush;
+  }, [runResumedPush]);
+
+  const runPull = useCallback(
+    async (resume?: VcsPullInput) => {
+      const controller = new AbortController();
+      const toastId = toastManager.add({
+        type: "loading",
+        title: "Pulling…",
+        timeout: 0,
+        data: threadToastData,
+        actionProps: { children: "Cancel", onClick: () => controller.abort() },
+      });
+      const result = await pullAction.run({
+        ...(resume?.expectedDestination === undefined
+          ? {}
+          : { expectedDestination: resume.expectedDestination }),
+        signal: controller.signal,
+      });
+      if (result._tag === "Failure") {
+        if (isAtomCommandInterrupted(result)) {
+          if (controller.signal.aborted) {
+            toastManager.update(toastId, {
+              type: "info",
+              title: "Pull cancelled",
+              description: "Nothing was pulled.",
+              data: threadToastData,
+            });
+          } else {
+            toastManager.close(toastId);
+          }
+          return;
+        }
+        const error = squashAtomCommandFailure(result);
+        if (isSignInRequired(error) && gitCwd !== null) {
+          toastManager.close(toastId);
+          const pullFailed = (message: string) =>
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Pull failed",
+                description: message,
+                data: threadToastData,
+              }),
+            );
+          if (resume !== undefined) {
+            pullFailed(SIGN_IN_REPEATED_MESSAGE);
+            return;
+          }
+          offerSignIn({
+            offer: error,
+            cwd: gitCwd,
+            onSignedIn: () => void runPullRef.current?.(error.resume),
+            onEnded: (_code, message) => pullFailed(message),
+          });
+          return;
+        }
+        toastManager.update(
+          toastId,
+          stackedThreadToast({
+            type: "error",
+            title: "Pull failed",
+            description: sourceControlErrorMessage(error),
+            data: threadToastData,
+          }),
+        );
+        return;
+      }
+      toastManager.update(toastId, {
+        type: "success",
+        title: result.value.status === "pulled" ? "Pulled" : "Already up to date",
+        timeout: 0,
+        data: threadToastData,
+      });
+    },
+    [gitCwd, pullAction, offerSignIn, threadToastData],
+  );
+  useEffect(() => {
+    runPullRef.current = runPull;
+  }, [runPull]);
 
   const surfaceFileActionFailure = useCallback(
     (result: Awaited<ReturnType<typeof stageAction.run>>, title: string) => {
@@ -1039,6 +1177,15 @@ export default function SourceControlPanel({
           exitSelectionMode();
         }}
       >
+        {signIn.state === null ? null : (
+          <GitSignInPrompt
+            offer={signIn.state.offer}
+            phase={signIn.state.phase}
+            onCancel={signIn.cancel}
+            onNotNow={signIn.decline}
+            onSignIn={signIn.approve}
+          />
+        )}
         <div className="relative">
           <Textarea
             value={draft.message}
@@ -1530,4 +1677,48 @@ export default function SourceControlPanel({
       />
     </DiffPanelShell>
   );
+}
+
+/**
+ * Follows a stacked action's progress for its toast (#325): Cancel appears only while the push
+ * runs (commit and branch are local and short), and the terminal failure's phase and sign-in
+ * offer are kept, since the settled error carries neither.
+ */
+function trackPushPhase(toastId: string, data: ThreadToastData) {
+  const controller = new AbortController();
+  let failed: Extract<GitActionProgressEvent, { kind: "action_failed" }> | null = null;
+  return {
+    signal: controller.signal,
+    failure: () => failed,
+    onProgress: (event: GitActionProgressEvent) => {
+      if (event.kind === "phase_started") {
+        toastManager.update(toastId, {
+          type: "loading",
+          title: event.label,
+          timeout: 0,
+          data,
+          ...(event.phase === "push"
+            ? { actionProps: { children: "Cancel", onClick: () => controller.abort() } }
+            : {}),
+        });
+      } else if (event.kind === "action_failed") {
+        failed = event;
+      }
+    },
+  };
+}
+
+const isSignInRequired = Schema.is(GitSignInRequiredError);
+
+function closeOrReportCancelledPush(toastId: string, signal: AbortSignal, data: ThreadToastData) {
+  if (!signal.aborted) {
+    toastManager.close(toastId);
+    return;
+  }
+  toastManager.update(toastId, {
+    type: "info",
+    title: "Push cancelled",
+    description: "Your commit is saved locally.",
+    data,
+  });
 }

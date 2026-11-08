@@ -74,6 +74,14 @@ const h = vi.hoisted(() => ({
   })),
   branchDialogProps: [] as Array<Record<string, unknown>>,
   historyTagDialogProps: [] as Array<Record<string, unknown>>,
+  runSignIn: vi.fn((_registry: unknown, _target: unknown) => ({
+    result: Promise.resolve({
+      _tag: "Success",
+      value: { outcome: "signedIn", message: "Signed in." },
+      waiting: false,
+    }),
+    cancel: vi.fn(),
+  })),
 }));
 
 vi.mock("react", async (importOriginal) => ({
@@ -163,6 +171,7 @@ vi.mock("../../state/gitManager", () => ({
     discard: { label: "test:discard" },
   },
   runGitManagerOperation: h.runOperation,
+  runGitSignIn: h.runSignIn,
 }));
 
 vi.mock("../../state/sourceControlActions", () => ({
@@ -899,6 +908,103 @@ describe("GitManagerPanel", () => {
         expect.any(Function),
       );
     } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("asks before a Git Credential Manager sign-in and resumes the named request once", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const destination = "https://github.com/owner/repo.git";
+    const resume = {
+      _tag: "fetch",
+      cwd: "/opaque/main",
+      projectId: "project-1",
+      remote: "origin",
+      expectedDestination: destination,
+    };
+    const signInRequired = {
+      _tag: "failed",
+      operation: "fetch",
+      code: "sign-in-required",
+      message: "Git Credential Manager needs you to sign in before Git can reach this remote.",
+      blocked: null,
+      signIn: { remote: "origin", destination, host: "github.com", direction: "fetch", resume },
+    };
+    h.runOperation.mockImplementation((_registry, _target, onEvent) => {
+      (onEvent as (event: unknown) => void)(signInRequired);
+      return {
+        result: Promise.resolve({ _tag: "Success", value: signInRequired, waiting: false }),
+        cancel: vi.fn(),
+      };
+    });
+    const button = (label: string) =>
+      [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (candidate) => candidate.textContent === label,
+      );
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction as (action: unknown) => void;
+      await act(async () => onAction({ _tag: "revert", sha: "d".repeat(40) }));
+
+      expect(document.body.textContent).toContain("Sign in to github.com/owner/repo.git?");
+      expect(document.body.textContent).toContain("fetch from remote origin");
+      expect(h.runSignIn).not.toHaveBeenCalled();
+
+      await act(async () => button("Not now")?.click());
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      expect(document.body.textContent).toContain(
+        "Authentication failed. Check the configured credentials and try again.",
+      );
+      expect(h.runSignIn).not.toHaveBeenCalled();
+
+      await act(async () => onAction({ _tag: "revert", sha: "d".repeat(40) }));
+      const calls = h.runOperation.mock.calls.length;
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      await act(async () => button("Sign in")?.click());
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      expect(h.runSignIn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: {
+            projectId: "project-1",
+            cwd: "/opaque/main",
+            remote: "origin",
+            direction: "fetch",
+            destination,
+          },
+        }),
+      );
+      // The resume request is sent once, as the server named it.
+      expect(h.runOperation).toHaveBeenCalledTimes(calls + 1);
+      expect(h.runOperation).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({ input: resume }),
+        expect.any(Function),
+      );
+      // A second refusal after the sign-in shows the error without a new offer.
+      expect(document.body.textContent).not.toContain("Sign in to github.com/owner/repo.git?");
+      expect(document.body.textContent).toContain(
+        "Signed in, but Git Credential Manager still asked to sign in.",
+      );
+    } finally {
+      h.runOperation.mockReset();
+      h.runOperation.mockImplementation(() => ({
+        result: new Promise(() => undefined),
+        cancel: vi.fn(),
+      }));
       await act(async () => root.unmount());
       container.remove();
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;

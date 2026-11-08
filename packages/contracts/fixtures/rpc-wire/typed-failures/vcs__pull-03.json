@@ -7,8 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "UpdateMaintenanceActiveError",
-          "message": ""
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "'dM'R+T",
+          "threadId": ": 2",
+          "path": "😀",
+          "availability": "missing-registered"
         }
       }
     ]
