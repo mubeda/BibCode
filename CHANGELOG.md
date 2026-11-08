@@ -18,6 +18,8 @@
 
 - Opening a file uses its own tab and keeps the Files tab with its open folders and selection. Folder crumbs are clickable, and **Show in Files** reveals the file. (#288, #323)
 - The pipeline list has an aligned header, resizable and hideable columns and a "+N" stage overflow; widths are remembered per repository. The pipeline page's stages fill the panel, can wrap, open a job's log beside them, and GitLab pipelines that use `needs` can group jobs by dependency. (#285, #286, #321, #322)
+- The list's Status column shows "Passed with warnings" in full, and opening a job in the narrow, stacked layout brings its log into view. (#334)
+- Pipelines and Pull requests load for a self-hosted GitLab or GitHub Enterprise on a non-default web port, and SSH remotes to such a host match it by name. (#332)
 
 ### Reliability
 
@@ -29,7 +31,10 @@
 
 - The README shows light and dark screenshots, a feature overview and the bibcode.dev link; CI checks Markdown links. (#291, #320)
 - The macOS crash smoke logs its build time; the CI guide describes its settings. (#295)
-- Load-sensitive queue, client-runtime, desktop, job log parse and Windows server tests no longer depend on machine speed, and Cursor and Grok oversized-output recovery is covered. (#263, #264, #316, #319, #327, #328)
+- Load-sensitive queue, client-runtime, desktop, job log parse and Windows server tests no longer depend on machine speed, and Cursor and Grok oversized-output recovery is covered. (#263, #264, #316, #319, #327, #328, #329)
+- Native Git watcher tests no longer fail when macOS reports fixture setup changes late under heavy load. (#330)
+- CI runs a gitleaks **Secrets** job. Test fixtures and plan docs use placeholder hosts and names, and a hash-based test guard blocks private values. (#331)
+- `scripts/gitlab-local-test/` starts a throwaway GitLab CE with a runner in Docker for testing pipeline screens without a real GitLab server.
 
 ## [v0.15.2] - 2026-11-05
 

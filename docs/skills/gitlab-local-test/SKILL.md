@@ -39,6 +39,22 @@ and add a clone of `http://localhost:8929/root/sample-project` as a project.
 BiBCode then reads pipelines and merge requests from the local host. Drive the
 browser or packaged app as the runbooks in `docs/testing/` describe.
 
+`glab auth login` keeps the token in the OS keyring (macOS Keychain, Windows
+Credential Manager). A Linux container without a D-Bus session falls back to the
+config file under `GLAB_CONFIG_DIR`. Another machine, VM or container must log in
+again there with the token from `$STATE_DIR/credentials.env`, and must reach the
+kit as `localhost:8929`, because GitLab's clone and web URLs name that host. Use
+a TCP forwarder inside the guest rather than a different host name.
+
+Live Rust check of host resolution and pipelines against the kit (it does
+nothing without these variables):
+
+```sh
+GLAB_CONFIG_DIR=<kit glab config> BIBCODE_LIVE_GITLAB_CHECKOUT=<clone> \
+  BIBCODE_LIVE_GITLAB_HOST=localhost:8929 \
+  cargo test -p bibcode-server --test pull_requests_context_list live -- --nocapture
+```
+
 ## Clean up
 
 ```sh
