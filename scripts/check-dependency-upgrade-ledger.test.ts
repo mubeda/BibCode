@@ -863,7 +863,7 @@ describe("dependency upgrade ledger validation", () => {
       rustRegistry: 141,
       rustPath: 3,
       rustGit: 1,
-      actions: 10,
+      actions: 9,
       toolchains: 9,
     });
     expect({

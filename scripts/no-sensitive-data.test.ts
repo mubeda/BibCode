@@ -66,6 +66,17 @@ function findBanned(text: string, banned: ReadonlySet<string> = BANNED_HASHES): 
   return null;
 }
 
+/** Short SHA plus banned hash for each commit whose message holds a banned token. */
+function findBannedInCommits(log: string, banned: ReadonlySet<string> = BANNED_HASHES): string[] {
+  const findings: string[] = [];
+  for (const record of log.split("\x01")) {
+    const [sha = "", message = ""] = record.trim().split("\x00");
+    const hit = findBanned(message, banned);
+    if (sha && hit) findings.push(`${sha.slice(0, 10)}: commit message matches banned hash ${hit}`);
+  }
+  return findings;
+}
+
 function projectFiles(): string[] {
   return NodeChildProcess.execFileSync(
     "git",
@@ -117,4 +128,29 @@ describe("sensitive data guard", () => {
     }
     expect(findings, findings.slice(0, 200).join("\n")).toEqual([]);
   });
+
+  it("flags a banned token in a commit message log and names only the commit", () => {
+    const banned = new Set([sha256("samplevalue")]);
+    const log = "aaaaaaaaaaaa\0fix: clean\n\x01bbbbbbbbbbbb\0chore: SampleValue slipped in\n\x01";
+    expect(findBannedInCommits(log, banned)).toEqual([
+      `bbbbbbbbbb: commit message matches banned hash ${sha256("samplevalue").slice(0, 8)}`,
+    ]);
+    expect(findBannedInCommits("", banned)).toEqual([]);
+  });
+
+  // CI sets BIBCODE_SENSITIVE_RANGE (e.g. base..head) so every commit a pull
+  // request or push adds is checked, merged branches included.
+  const range = process.env.BIBCODE_SENSITIVE_RANGE;
+  it.skipIf(!range)(
+    "keeps commit messages in BIBCODE_SENSITIVE_RANGE free of banned values",
+    () => {
+      const log = NodeChildProcess.execFileSync(
+        "git",
+        ["log", String(range), "--format=%H%x00%B%x01"],
+        { cwd: REPOSITORY_ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      );
+      const findings = findBannedInCommits(log);
+      expect(findings, findings.slice(0, 200).join("\n")).toEqual([]);
+    },
+  );
 });
