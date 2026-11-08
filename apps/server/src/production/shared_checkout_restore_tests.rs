@@ -9,6 +9,10 @@ use crate::{
     },
     persistence::{Database, run_migrations},
     production::turn_delivery::{DeliveryRouter, TurnDeliveryService},
+    provider::opencode::quiet::{
+        QuietTarget,
+        test_server::{CHILD, ROOT, ScriptedOpenCode, event, started},
+    },
     test_support::isolated_git_config::IsolatedGitConfig,
 };
 use std::sync::{
@@ -66,6 +70,8 @@ struct Provider {
     quieted: StdMutex<Vec<String>>,
     rewind_support: StdMutex<Option<ConversationRewind>>,
     pause: StdMutex<Option<(Stage, Arc<Gate>)>>,
+    /// The fence a sibling on a marked external OpenCode server answers with (#326).
+    fences: StdMutex<HashMap<String, QuietFence>>,
 }
 
 impl Provider {
@@ -159,14 +165,15 @@ impl RevertProbe for ProbeOf<'_> {
     fn quiet_sibling<'a>(
         &'a self,
         thread_id: &'a str,
-    ) -> BoxEffectFuture<'a, Option<WritingReason>> {
+        _restore: &'a QuietRestore<'a>,
+    ) -> BoxEffectFuture<'a, Result<Option<QuietFence>, WritingReason>> {
         Box::pin(async move {
             self.0.at(Stage::Quiet).await;
-            let writing = self.0.writing.lock().unwrap().get(thread_id).copied();
-            if writing.is_none() {
-                self.0.quieted.lock().unwrap().push(thread_id.to_owned());
+            if let Some(writing) = self.0.writing.lock().unwrap().get(thread_id).copied() {
+                return Ok(Err(writing));
             }
-            Ok(writing)
+            self.0.quieted.lock().unwrap().push(thread_id.to_owned());
+            Ok(Ok(self.0.fences.lock().unwrap().remove(thread_id)))
         })
     }
 
@@ -979,7 +986,194 @@ async fn an_unmanaged_opencode_sibling_refuses_the_restore() {
         detail(&failure).contains("runs on an OpenCode server BiBCode doesn't manage"),
         "{failure}"
     );
+    // The refusal names the setting that states nothing else uses the server (#326).
+    assert!(
+        detail(&failure).ends_with(
+            "If nothing but BiBCode uses that server, turn on Only BiBCode uses this server in Settings → Providers → OpenCode."
+        ),
+        "{failure}"
+    );
     assert_eq!(fixture.tracked(), "two\n");
+    fixture.shutdown().await;
+}
+
+/// A fence on an idle scripted OpenCode 2 server for panel `b` (#326), exempting the reverting
+/// thread's own OpenCode session `reverting`.
+async fn quiet_fence(fixture: &Fixture, reverting: Option<&str>) -> (ScriptedOpenCode, QuietFence) {
+    let server = ScriptedOpenCode::idle(&fixture.repo).await;
+    let fence = crate::provider::opencode::quiet::probe(
+        &QuietTarget {
+            endpoint: &server.url,
+            password: None,
+            checkout: &fixture.repo,
+            root_session_id: ROOT,
+            reverting_session_id: reverting,
+        },
+        tokio::time::Instant::now() + WAIT,
+    )
+    .await
+    .unwrap();
+    (server, fence)
+}
+
+async fn fence_tripped(trips: &mut tokio::sync::watch::Receiver<Option<String>>) {
+    timeout(WAIT, trips.wait_for(Option::is_some))
+        .await
+        .expect("the fence trips")
+        .unwrap();
+}
+
+async fn streams_closed(server: &ScriptedOpenCode) {
+    timeout(WAIT, async {
+        while server.open_streams() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every quiet fence closes");
+}
+
+#[tokio::test]
+async fn a_declared_exclusive_idle_opencode_sibling_allows_the_restore() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    fixture.revert("a", 1, "full", None).await.unwrap();
+    assert_eq!(fixture.tracked(), "one\n");
+    assert_eq!(fixture.provider.rewinds(), 1);
+    streams_closed(&server).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_reverting_threads_own_opencode_rewind_does_not_trip_the_fence() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, Some("ses_host")).await;
+    let trips = fence.trips();
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    let gate = fixture.provider.pause_at(Stage::Rollback);
+    let outcome = fixture.request_revert("a", 1, "full", None).await;
+    entered(&gate).await;
+    // The host's `revert/stage` and `revert/commit` publish its rewind in the checkout.
+    let inside = fixture.repo.to_string_lossy().into_owned();
+    for kind in ["session.revert.staged", "session.revert.committed"] {
+        server.push(&event(kind, "ses_host", Some(&inside)));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(*trips.borrow(), None);
+    gate.release.notify_one();
+    outcome.await.unwrap().unwrap();
+    assert_eq!(fixture.tracked(), "one\n");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_sibling_execution_after_planning_refuses_before_the_rewind() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    let mut trips = fence.trips();
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    let gate = fixture.provider.pause_at(Stage::Prepare);
+    let outcome = fixture.request_revert("a", 1, "full", None).await;
+    entered(&gate).await;
+    server.push(&started(CHILD, None));
+    fence_tripped(&mut trips).await;
+    gate.release.notify_one();
+    let failure = outcome.await.unwrap().unwrap_err();
+    assert!(
+        detail(&failure).ends_with(
+            ": Panel, Codex's OpenCode server is still working in this checkout. Try the revert again when it finishes."
+        ),
+        "{failure}"
+    );
+    assert_eq!(fixture.provider.rewinds(), 0, "no provider rewind");
+    assert_eq!(fixture.tracked(), "two\n");
+    streams_closed(&server).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_sibling_execution_after_the_rewind_skips_the_file_restore() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    let mut trips = fence.trips();
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    let gate = fixture.provider.pause_at(Stage::Rollback);
+    let mut events = fixture.engine.subscribe_events();
+    let outcome = fixture.request_revert("a", 1, "full", None).await;
+    entered(&gate).await;
+    server.push(&started(ROOT, None));
+    fence_tripped(&mut trips).await;
+    gate.release.notify_one();
+    // The rewind is recorded (`thread.reverted`), then the files' failure follows.
+    outcome.await.unwrap().unwrap();
+    let failure = timeout(WAIT, async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event
+                .event
+                .payload
+                .pointer("/activity/kind")
+                .and_then(Value::as_str)
+                == Some("checkpoint.revert.failed")
+            {
+                return event.event.payload["activity"]["payload"].clone();
+            }
+        }
+    })
+    .await
+    .expect("the unrestored revert fails");
+    assert!(
+        detail(&failure).ends_with(
+            ": The conversation was rewound, but the files could not be restored: Panel, Codex's OpenCode server started working. Revert again when it finishes."
+        ),
+        "{failure}"
+    );
+    assert_eq!(fixture.provider.rewinds(), 1);
+    assert_eq!(fixture.tracked(), "two\n", "files untouched");
+    streams_closed(&server).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_restore_closes_every_quiet_fence() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    // Refused after the probe, at the outside-change check.
+    std::fs::write(fixture.repo.join("tracked.txt"), "outside\n").unwrap();
+    let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
+    assert!(
+        detail(&failure).contains("changed since turn 1"),
+        "{failure}"
+    );
+    assert_eq!(fixture.tracked(), "outside\n");
+    streams_closed(&server).await;
     fixture.shutdown().await;
 }
 
