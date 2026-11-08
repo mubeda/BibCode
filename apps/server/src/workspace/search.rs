@@ -774,7 +774,7 @@ async fn run_git_ls_files<const N: usize, R: WorkspaceGitCommandRunner + ?Sized>
                 command: PathBuf::from("git"),
                 args,
                 cwd: root.to_path_buf(),
-                env: vec![(OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0"))],
+                env: crate::git::git_read_environment(),
                 stdin: None,
                 timeout: GIT_SCAN_TIMEOUT,
                 max_output_bytes,
@@ -1406,9 +1406,12 @@ mod tests {
         assert_eq!(request.operation, "WorkspaceSearchIndex.gitSnapshot");
         assert_eq!(request.command, PathBuf::from("git"));
         assert_eq!(request.cwd, root);
-        assert_eq!(
-            request.env,
-            [(OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0"))]
+        // The shared policy: no system fsmonitor, hook or filter, and no prompt.
+        assert_eq!(request.env, crate::git::git_read_environment());
+        assert!(
+            request
+                .env
+                .contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into()))
         );
         assert_eq!(request.stdin, None);
         assert_eq!(request.timeout, Duration::from_secs(10));

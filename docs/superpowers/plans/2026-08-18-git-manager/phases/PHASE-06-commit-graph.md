@@ -80,7 +80,7 @@ Risk: Medium (virtualization + SVG; performance is an explicit success criterion
 	  render(
 	    <CommitGraphRow
 	      row={{ sha: "c1", lane: 1, colorIndex: 1, isMerge: false, edges: [{ fromLane: 1, toLane: 1, kind: "straight", colorIndex: 1 }] }}
-	      commit={{ sha: "c1", shortSha: "c1abcde", parents: ["c0"], refs: [{ name: "develop", kind: "local-branch" }], subject: "Fix the thing", authorName: "mubeda", authorEmail: "m@example.invalid", authoredAtMs: 1780000000000, committedAtMs: 1780000000000 }}
+	      commit={{ sha: "c1", shortSha: "c1abcde", parents: ["c0"], refs: [{ name: "develop", kind: "local-branch" }], subject: "Fix the thing", authorName: "test-user", authorEmail: "m@example.invalid", authoredAtMs: 1780000000000, committedAtMs: 1780000000000 }}
 	      isSelected={false}
 	      onSelect={() => {}}
 	    />,

@@ -365,7 +365,9 @@ GraphQL reads, passes `-H "Content-Type: application/json"` before `--input`:
 The explicit header makes the raw file payload JSON on hosts that reject an
 empty content type; GraphQL queries and variables remain in the private file.
 Host/repository operands and `GH_HOST` / `GITLAB_HOST`
-pin every request; `glab api` also receives `--hostname`. Every `glab` that
+pin every request; `glab api` and `gh api` also receive `--hostname`, except for a
+host with a web port (`gitlab.example.test:8929`), whose `--hostname` both CLIs
+reject: the pinned variable alone carries it. Every `glab` that
 BiBCode starts, including status lookups, request creation and Settings
 discovery, runs with `GLAB_SEND_TELEMETRY=0`: otherwise glab sends a telemetry
 event to the host before each command returns, which roughly doubles the cost
@@ -431,7 +433,16 @@ gh auth login --hostname github.company.example
 glab auth login --hostname gitlab.company.example
 ```
 
-Use the actual hostname from the checkout's `origin`. BiBCode recognizes
+Use the actual hostname from the checkout's `origin`. A self-hosted instance on a
+non-default web port is configured with that port (`glab auth login --hostname
+gitlab.example.test:8929`); an HTTP(S) `origin` matches it with its port, a written
+default port (`:443`, `:80`) counting as none, and an SSH, scp or `git://` `origin`,
+whose port is the SSH port, matches it by name, including a host whose name
+contains `gitlab`; the lowest port wins when several share the name. When glab,
+pinned to the remote's host, lists no match, BiBCode asks glab once more without a
+pinned host. A host whose name contains `gitlab` is checked under its own spelling
+alongside the first reads; only when that login fails does BiBCode look for another
+spelling, and the panel then names it and asks you to rescan, which uses it. BiBCode recognizes
 configured CLI hosts, including GitLab subgroup repository paths; it does not
 guess a provider from an arbitrary hostname. Only the host name counts:
 `github.com`, a host containing `gitlab`, Azure DevOps and Bitbucket hosts are

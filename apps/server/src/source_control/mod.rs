@@ -218,14 +218,93 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+/// A dotted name, an IPv6 address (bracketed or bare `::1`), or any name with a port
+/// (`localhost:8929`).
 fn looks_like_host(value: &str) -> bool {
-    let without_port = value
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|character| character.is_ascii_digit()))
-        .map_or(value, |(host, _)| host);
-    !without_port.is_empty()
-        && !without_port.contains(char::is_whitespace)
-        && (without_port.contains('.') || without_port.starts_with('['))
+    let (name, port) = split_host(value);
+    !name.is_empty()
+        && !name.contains(char::is_whitespace)
+        && (name.contains('.')
+            || value.starts_with('[')
+            || port.is_some()
+            || name.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// A CLI-configured host's name, without IPv6 brackets, and its port:
+/// `host:8929`, `[::1]:8443` and a bare `::1`, which has no port.
+pub(crate) fn split_host(host: &str) -> (&str, Option<&str>) {
+    let numeric = |port: &&str| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+    if let Some((name, rest)) = host.strip_prefix('[').and_then(|h| h.split_once(']')) {
+        return (name, rest.strip_prefix(':').filter(numeric));
+    }
+    if host.matches(':').count() > 1 {
+        return (host, None);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if numeric(&port) => (name, Some(port)),
+        _ => (host, None),
+    }
+}
+
+/// Whether a CLI-configured host serves this remote. Names compare without case or
+/// IPv6 brackets. An HTTP(S) remote also needs the same web port, a written default
+/// port (`:443`, `:80`) being the same as none; an SSH, scp or `git://` port is not
+/// the web port, so any port of the same name serves those remotes.
+#[must_use]
+pub fn host_serves_remote(configured: &str, remote: &str) -> bool {
+    let Some(name) = remote_host(remote) else {
+        return false;
+    };
+    let (configured_name, configured_port) = split_host(configured.trim());
+    if !configured_name.eq_ignore_ascii_case(&name) {
+        return false;
+    }
+    let Some(url) = url::Url::parse(remote.trim())
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+    else {
+        return true;
+    };
+    let default = if url.scheme() == "https" { 443 } else { 80 };
+    configured_port.map_or(Some(default), |port| port.parse().ok()) == url.port_or_known_default()
+}
+
+/// The configured host serving this remote, in a fixed order when several do: a host
+/// without a port first, then the lowest port.
+pub fn serving_host<'a>(
+    configured: impl IntoIterator<Item = &'a str>,
+    remote: &str,
+) -> Option<&'a str> {
+    configured
+        .into_iter()
+        .filter(|host| host_serves_remote(host, remote))
+        .min_by_key(|host| {
+            let port = split_host(host.trim())
+                .1
+                .and_then(|port| port.parse::<u32>().ok());
+            (port.is_some(), port, host.to_ascii_lowercase())
+        })
+}
+/// The host a provider CLI knows a remote by. glab and gh keep a web port in the
+/// host (`host:8929`), and only an HTTP(S) remote names that port; an SSH or scp
+/// port is the SSH port, so those remotes keep the bare name of [`remote_host`].
+pub fn remote_web_host(remote: &str) -> Option<String> {
+    let host = remote_host(remote)?;
+    let port = url::Url::parse(remote.trim())
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .and_then(|url| url.port());
+    Some(match port {
+        Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// Whether the remote's own port is its web port, as only HTTP(S) remotes' is.
+#[must_use]
+pub fn remote_names_web_port(remote: &str) -> bool {
+    url::Url::parse(remote.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 pub fn remote_host(remote: &str) -> Option<String> {
@@ -294,6 +373,169 @@ mod tests {
                 "{remote}"
             );
         }
+    }
+
+    /// #332: glab and gh key a self-hosted instance by `host:port`; only an HTTP(S)
+    /// remote names that web port, and the repository identity stays port-free.
+    #[test]
+    fn remote_web_host_keeps_only_an_http_web_port() {
+        for (remote, host, names_port) in [
+            (
+                "http://LocalHost:8929/group/project.git",
+                Some("localhost:8929"),
+                true,
+            ),
+            (
+                "https://user@gitlab.example.test:8443/a/b.git",
+                Some("gitlab.example.test:8443"),
+                true,
+            ),
+            // A written default port is the same as none (the url crate drops it);
+            // matching treats a configured `host:443` as `host` the same way.
+            (
+                "https://gitlab.example.test:443/a/b.git",
+                Some("gitlab.example.test"),
+                true,
+            ),
+            (
+                "https://gitlab.example.test/a/b.git",
+                Some("gitlab.example.test"),
+                true,
+            ),
+            ("http://[::1]:8929/a/b.git", Some("[::1]:8929"), true),
+            (
+                "ssh://git@gitlab.example.test:2224/a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            (
+                "git://gitlab.example.test:9418/a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            (
+                "gitlab.example.test:a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            ("/local/repo", None, false),
+        ] {
+            assert_eq!(remote_web_host(remote).as_deref(), host, "{remote}");
+            assert_eq!(remote_names_web_port(remote), names_port, "{remote}");
+        }
+        assert_eq!(
+            remote_host("http://localhost:8929/group/project.git").as_deref(),
+            Some("localhost")
+        );
+        for (host, split) in [
+            ("localhost:8929", ("localhost", Some("8929"))),
+            ("[::1]:8443", ("::1", Some("8443"))),
+            ("[::1]", ("::1", None)),
+            ("::1", ("::1", None)),
+            ("gitlab.example.test", ("gitlab.example.test", None)),
+        ] {
+            assert_eq!(split_host(host), split, "{host}");
+        }
+    }
+
+    /// #332: which CLI-configured host serves a remote. A written default port is the
+    /// same as none, so `https://host:443/` comes back as `host` and is served by a
+    /// configured `host` or `host:443`; SSH, scp and `git://` ports are SSH ports.
+    #[test]
+    fn configured_hosts_serve_remotes_by_web_port_or_by_name() {
+        for (configured, remote, serves) in [
+            ("localhost:8929", "http://localhost:8929/g/p.git", true),
+            ("localhost:8929", "http://localhost:9999/g/p.git", false),
+            ("localhost:8929", "https://localhost/g/p.git", false),
+            (
+                "Gitlab.Example.Test",
+                "https://gitlab.example.test:443/g/p.git",
+                true,
+            ),
+            (
+                "gitlab.example.test:443",
+                "https://gitlab.example.test/g/p.git",
+                true,
+            ),
+            (
+                "gitlab.example.test:80",
+                "http://gitlab.example.test/g/p.git",
+                true,
+            ),
+            (
+                "gitlab.example.test:443",
+                "http://gitlab.example.test/g/p.git",
+                false,
+            ),
+            (
+                "gitlab.example.test:8929",
+                "ssh://git@gitlab.example.test:2224/g/p.git",
+                true,
+            ),
+            (
+                "gitlab.example.test:8929",
+                "git@gitlab.example.test:g/p.git",
+                true,
+            ),
+            (
+                "gitlab.example.test:8929",
+                "git://gitlab.example.test/g/p.git",
+                true,
+            ),
+            (
+                "other.example.test:8929",
+                "git@gitlab.example.test:g/p.git",
+                false,
+            ),
+            ("[::1]:8929", "ssh://git@[::1]:2224/g/p.git", true),
+            ("[::1]:8929", "git@[::1]:g/p.git", true),
+            ("[::1]:8929", "http://[::1]:8929/g/p.git", true),
+            ("::1", "https://[::1]/g/p.git", true),
+        ] {
+            assert_eq!(
+                host_serves_remote(configured, remote),
+                serves,
+                "{configured} {remote}"
+            );
+        }
+        let configured = [
+            "h.example.test:9000",
+            "h.example.test:8929",
+            "h.example.test",
+        ];
+        let remote = "git@h.example.test:g/p.git";
+        assert_eq!(serving_host(configured, remote), Some("h.example.test"));
+        assert_eq!(
+            serving_host(configured[..2].iter().copied(), remote),
+            Some("h.example.test:8929")
+        );
+    }
+
+    /// glab 1.126 lists the local Docker kit's instance as `localhost:8929`: no dot, but a port.
+    #[test]
+    fn gitlab_auth_status_lists_a_dotless_host_with_a_port() {
+        let hosts = parse_gitlab_auth_status(
+            "localhost:8929\n  ✓ Logged in to localhost:8929 as test-user (keyring)\n  ✓ REST API Endpoint: http://localhost:8929/api/v4/\n",
+        );
+        assert_eq!(
+            hosts,
+            vec![GitLabAuthStatusHost {
+                host: "localhost:8929".into(),
+                account: Some("test-user".into()),
+            }]
+        );
+        assert!(
+            parse_gitlab_auth_status("localhost\n  ✓ Logged in to localhost as test-user\n")
+                .is_empty()
+        );
+        // A bare IPv6 header has no port to show it is a host; the address itself does.
+        let hosts: Vec<_> = parse_gitlab_auth_status(
+            "::1\n  ✓ Logged in to ::1 as test-user\nfe80::1\n  x not logged in\n",
+        )
+        .into_iter()
+        .map(|host| host.host)
+        .collect();
+        assert_eq!(hosts, ["::1", "fe80::1"]);
     }
 
     #[test]

@@ -34,6 +34,24 @@ describe("openDiffFilePrimaryAction", () => {
     expect(openInEditor).not.toHaveBeenCalled();
   });
 
+  it("keeps an open Files tab beside the diff file's tab", () => {
+    useRightPanelStore.getState().open(THREAD_REF, "files");
+
+    openDiffFilePrimaryAction({
+      threadRef: THREAD_REF,
+      filePath: "a.ts",
+      activeCwd: "/repo/project",
+      openInEditor: vi.fn(),
+    });
+
+    const state = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      THREAD_REF,
+    );
+    expect(state.surfaces.map((surface) => surface.id)).toEqual(["files", "file:a.ts"]);
+    expect(state.activeSurfaceId).toBe("file:a.ts");
+  });
+
   it("falls back to the editor without thread context", () => {
     const openInEditor = vi.fn();
 

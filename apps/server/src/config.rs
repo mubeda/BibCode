@@ -76,6 +76,9 @@ pub struct ServerConfig {
     /// True only for a desktop-owned server launched through the WSL bootstrap transport.
     #[doc(hidden)]
     pub desktop_wsl_transport: bool,
+    /// Lets the desktop app's own session sign in with Git Credential Manager (#325). Only the
+    /// desktop's in-process launch sets it; no CLI flag or bootstrap key does.
+    pub interactive_git_sign_in: bool,
     pub unsafe_no_auth: bool,
     pub environment_id: String,
     pub environment_label: String,
@@ -115,6 +118,7 @@ impl ServerConfig {
             startup_pairing_offer: true,
             desktop_bootstrap_token: None,
             desktop_wsl_transport: false,
+            interactive_git_sign_in: false,
             unsafe_no_auth: false,
             environment_id: "local".to_owned(),
             environment_label: LOCAL_ENVIRONMENT_LABEL.to_owned(),
@@ -296,6 +300,22 @@ mod tests {
     }
 
     #[test]
+    fn interactive_git_sign_in_is_off_unless_the_desktop_in_process_launch_sets_it() {
+        assert!(!ServerConfig::new("/tmp/bibcode-test").interactive_git_sign_in);
+        for args in [
+            vec!["bibcode", "serve"],
+            vec!["bibcode", "serve", "--mode", "desktop"],
+            vec!["bibcode"],
+        ] {
+            let config = Cli::try_parse_from(args.clone())
+                .expect("parse CLI")
+                .into_server_config()
+                .expect("build config");
+            assert!(!config.interactive_git_sign_in, "{args:?}");
+        }
+    }
+
+    #[test]
     fn headless_server_declares_its_hostname_as_the_environment_label() {
         let config = Cli::try_parse_from(["bibcode", "serve"])
             .expect("parse serve CLI")
@@ -472,6 +492,25 @@ mod tests {
         .into_server_config()
         .expect_err("pairing issue is not a server command");
         assert!(matches!(error, ConfigError::PairingCommandIsNotServer));
+    }
+
+    #[test]
+    fn mcp_client_names_the_stdio_relay_only() {
+        let action = Cli::try_parse_from(["bibcode", "mcp", "--client", " builder "])
+            .expect("parse mcp --client")
+            .into_action()
+            .expect("an mcp action");
+        assert!(
+            matches!(action, CliAction::Mcp(options) if options.client.as_deref() == Some("builder"))
+        );
+        let error = Cli::try_parse_from(["bibcode", "mcp", "--client", "builder", "tools"])
+            .expect("parse mcp --client tools")
+            .into_action();
+        assert!(matches!(error, Err(ConfigError::McpClientWithSubcommand)));
+        assert!(
+            Cli::try_parse_from(["bibcode", "mcp", "--client", ""]).is_err(),
+            "a blank name is a usage error"
+        );
     }
 
     #[test]
@@ -797,6 +836,10 @@ pub struct McpArgs {
     /// approval-required, auto-accept-edits or full-access.
     #[arg(long, value_name = "LEVEL", value_parser = crate::mcp::relay::parse_access)]
     pub access: Option<crate::mcp::control::McpAccess>,
+    /// Sign each run in as this named client, so it keeps its retries, panels and webhook
+    /// pairing across runs. Only for the stdio server, not its subcommands.
+    #[arg(long, value_name = "NAME", value_parser = crate::mcp::relay::client_name)]
+    pub client: Option<String>,
     #[command(subcommand)]
     pub command: Option<McpSubcommand>,
 }
@@ -1108,6 +1151,8 @@ pub enum ConfigError {
     ProfilerCommandIsNotServer,
     #[error("diagnostics commands cannot be converted into a server configuration")]
     DiagnosticsCommandIsNotServer,
+    #[error("--client names the MCP server's identity; use it without authorize, call or tools")]
+    McpClientWithSubcommand,
     #[error("mcp cannot be converted into a server configuration")]
     McpCommandIsNotServer,
     #[error("thread cannot be converted into a server configuration")]
@@ -1274,6 +1319,7 @@ impl Cli {
                         McpArgs {
                             url: None,
                             access: None,
+                            client: None,
                             command: None,
                         },
                     )?,
@@ -1415,6 +1461,9 @@ pub(crate) fn mcp_action(
     mut mcp: McpArgs,
 ) -> Result<CliAction, ConfigError> {
     let command = mcp.command.take();
+    if command.is_some() && mcp.client.is_some() {
+        return Err(ConfigError::McpClientWithSubcommand);
+    }
     let options = relay_options(base_dir, dev_url, mcp)?;
     Ok(match command {
         Some(McpSubcommand::Authorize(args)) => CliAction::McpAuthorize { options, args },
@@ -1437,6 +1486,7 @@ pub(crate) fn relay_options(
         dev_url,
         url: mcp.url,
         access: mcp.access,
+        client: mcp.client,
     })
 }
 

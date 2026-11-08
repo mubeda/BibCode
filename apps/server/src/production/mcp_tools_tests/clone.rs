@@ -1617,10 +1617,10 @@ async fn an_ssh_url_is_cloned_as_written_and_a_rewrite_of_it_is_refused() {
         command
             .args(args)
             .current_dir(&fixture.projects)
-            .env("HOME", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env("HOME", if cfg!(windows) { "nul" } else { "/dev/null" })
             .env(
                 "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
+                if cfg!(windows) { "nul" } else { "/dev/null" },
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -1818,5 +1818,80 @@ async fn a_silent_ssh_server_ends_the_clone_without_a_cancel() {
         );
         assert!(!fixture.projects.join("stall").exists());
     }
+    fixture.harness.shutdown().await;
+}
+
+/// #280: a named client's clone is recorded under its request scope, so `clone_status` finds
+/// it from the same run and from the next one.
+#[tokio::test]
+async fn a_named_clients_clone_status_finds_its_clone_across_runs() {
+    let fixture = fixture(Options::default()).await;
+    let first =
+        super::threads::named_agent(&fixture.harness, "builder", McpAccess::ApprovalRequired).await;
+    fixture.server.stall();
+    let started = fixture
+        .clone_briefly(&first, json!({ "url": fixture.url() }))
+        .await;
+    let clone_id = structured(&started)["cloneId"].as_str().unwrap().to_owned();
+    let status = fixture.status(&first, &clone_id).await;
+    assert_eq!(structured(&status)["state"], "running", "{status}");
+    fixture.server.release();
+    let done = fixture.settled(&first, &clone_id).await;
+    assert_eq!(structured(&done)["state"], "done");
+    super::threads::end_run(&fixture.harness, &first).await;
+    let second =
+        super::threads::named_agent(&fixture.harness, "builder", McpAccess::ApprovalRequired).await;
+    let again = fixture.status(&second, &clone_id).await;
+    assert_eq!(structured(&again)["state"], "done", "{again}");
+    fixture.harness.shutdown().await;
+}
+
+/// A clone row past its 24 hours is gone for `clone_status`, which never records a new
+/// request under that id, so the id starts fresh work afterwards.
+#[tokio::test]
+async fn clone_status_on_an_expired_clone_records_nothing() {
+    let fixture = fixture(Options::default()).await;
+    let started = fixture
+        .clone(
+            &fixture.agent,
+            json!({ "url": fixture.url(), "directoryName": "old" }),
+        )
+        .await;
+    let clone_id = structured(&started)["cloneId"].as_str().unwrap().to_owned();
+    let aged = (time::OffsetDateTime::now_utc()
+        - time::Duration::seconds(crate::mcp::control::REQUEST_ROW_TTL_SECONDS + 60))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    let id = clone_id.clone();
+    fixture
+        .harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE mcp_tool_requests SET created_at = ?1 WHERE client_request_id = ?2",
+                rusqlite::params![aged, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let status = fixture.status(&fixture.agent, &clone_id).await;
+    assert_eq!(error_tag(&status), "McpCloneNotFoundError", "{status}");
+    let id = clone_id.clone();
+    let fresh: i64 = fixture
+        .harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM mcp_tool_requests WHERE client_request_id = ?1 AND created_at >= ?2",
+                rusqlite::params![id, crate::mcp::control::request_row_cutoff()],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(fresh, 0, "clone_status recorded no request");
     fixture.harness.shutdown().await;
 }

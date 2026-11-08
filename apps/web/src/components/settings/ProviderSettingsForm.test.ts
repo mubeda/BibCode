@@ -36,6 +36,37 @@ describe("ProviderSettingsForm helpers", () => {
     });
   });
 
+  it("offers the OpenCode exclusive-server statement as an off-by-default switch", () => {
+    const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
+    expect(opencode).toBeDefined();
+    const fields = deriveProviderSettingsFields(opencode!);
+
+    expect(fields.map((field) => field.key)).toEqual([
+      "binaryPath",
+      "serverUrl",
+      "serverPassword",
+      "exclusiveServer",
+    ]);
+    const exclusiveServer = fields.find((field) => field.key === "exclusiveServer")!;
+    expect(exclusiveServer).toMatchObject({
+      label: "Only BiBCode uses this server",
+      control: "switch",
+      defaultBooleanValue: false,
+    });
+    expect(exclusiveServer.description).toContain("no schedule, and no plugin");
+    expect(readProviderConfigBoolean({}, "exclusiveServer", false)).toBe(false);
+    expect(
+      nextProviderConfigWithFieldValue({ serverUrl: "http://x" }, exclusiveServer, true),
+    ).toEqual({ serverUrl: "http://x", exclusiveServer: true });
+    expect(
+      nextProviderConfigWithFieldValue(
+        { serverUrl: "http://x", exclusiveServer: true },
+        exclusiveServer,
+        false,
+      ),
+    ).toEqual({ serverUrl: "http://x" });
+  });
+
   it("preserves unknown config keys while omitting empty configurable fields", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();

@@ -1,3 +1,4 @@
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@bibcode/contracts";
 import type {
   EditorId,
@@ -185,6 +186,45 @@ function fileListStatus(input: {
   return input.pending ? "Indexing…" : null;
 }
 
+/**
+ * What a workspace's tree looked like when its panel last unmounted: the Files tab, the file
+ * tabs' sidebar and a Diff round trip each unmount it. Kept per workspace so the next mount
+ * opens the same folders and the same selected row. One short record per visited workspace.
+ */
+interface FileTreeViewMemory {
+  readonly expanded: readonly string[];
+  readonly selected: string | null;
+}
+const MAX_REMEMBERED_TREES = 32;
+const fileTreeViewMemory = new Map<string, FileTreeViewMemory>();
+
+function rememberFileTreeView(key: string, memory: FileTreeViewMemory): void {
+  // A Map iterates in insertion order, so the first key is the least recently saved.
+  fileTreeViewMemory.delete(key);
+  fileTreeViewMemory.set(key, memory);
+  if (fileTreeViewMemory.size > MAX_REMEMBERED_TREES) {
+    fileTreeViewMemory.delete(fileTreeViewMemory.keys().next().value!);
+  }
+}
+
+export function fileTreeViewMemorySize(): number {
+  return fileTreeViewMemory.size;
+}
+
+export function resetFileTreeViewMemory(): void {
+  fileTreeViewMemory.clear();
+}
+
+/** The workspace path of the tree row a click came from, or null when it came from elsewhere. */
+function clickedRowPath(event: Event): string | null {
+  for (const target of event.composedPath()) {
+    if (target instanceof HTMLElement && target.dataset["itemPath"]) {
+      return stripTrailingSlash(target.dataset["itemPath"]);
+    }
+  }
+  return null;
+}
+
 export function collapseDirectoryTreePaths(
   model: CollapsibleTreeModel,
   directoryTreePaths: ReadonlyArray<string>,
@@ -226,6 +266,14 @@ export default function FileBrowserPanel({
   const treePaths = useMemo(() => entries.map(treePath), [entries]);
   const expandedTreePaths = useMemo(() => expandedDirectoryTreePaths(entries), [entries]);
   const previousTreePathsRef = useRef<readonly string[]>([]);
+  const viewKey = `${environmentId}:${cwd}`;
+  // Read in the first effect, not in render: a keyed replacement renders this panel before the
+  // outgoing panel's cleanup has saved its tree. Read once, so a StrictMode remount keeps it.
+  const restoreViewRef = useRef<FileTreeViewMemory | null | undefined>(undefined);
+  const restoringSelectionRef = useRef(false);
+  const treeLoadedRef = useRef(false);
+  // A selection that just opened its file; the click that caused it must not open it again.
+  const openedBySelectionRef = useRef<string | null>(null);
 
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const environment = useEnvironment(environmentId);
@@ -252,6 +300,10 @@ export default function FileBrowserPanel({
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const [preferredEditor] = usePreferredEditor(availableEditors);
 
+  const revealRequest = useRightPanelStore(
+    (state) => state.filesReveal[scopedThreadKey(threadRef)],
+  );
+  const clearFilesReveal = useRightPanelStore((state) => state.clearFilesReveal);
   const remapFileSurfaces = useRightPanelStore((state) => state.remapFileSurfaces);
   const closeFileSurfacesUnder = useRightPanelStore((state) => state.closeFileSurfacesUnder);
 
@@ -710,8 +762,13 @@ export default function FileBrowserPanel({
     initialExpansion: 0,
     icons: BIBCODE_PIERRE_ICONS,
     onSelectionChange: (selectedPaths) => {
+      if (restoringSelectionRef.current) return;
       const selectedPath = selectedPaths.at(-1)?.replace(/\/$/, "");
       if (selectedPath && entryKindsRef.current.get(selectedPath) === "file") {
+        openedBySelectionRef.current = selectedPath;
+        setTimeout(() => {
+          openedBySelectionRef.current = null;
+        }, 0);
         onOpenFile(selectedPath);
       }
     },
@@ -721,13 +778,126 @@ export default function FileBrowserPanel({
   });
 
   useEffect(() => {
+    restoreViewRef.current ??= fileTreeViewMemory.get(viewKey) ?? null;
     if (previousTreePathsRef.current === treePaths) return;
     entryKindsRef.current = entryKinds;
     previousTreePathsRef.current = treePaths;
+    const restore = treePaths.length > 0 ? (restoreViewRef.current ?? null) : null;
+    const keptExpanded = currentlyExpandedTreePaths(model, expandedTreePaths);
+    const knownDirectories = new Set(expandedTreePaths);
     model.resetPaths(treePaths, {
-      initialExpandedPaths: currentlyExpandedTreePaths(model, expandedTreePaths),
+      initialExpandedPaths: restore
+        ? [
+            ...new Set([
+              ...keptExpanded,
+              ...restore.expanded.filter((p) => knownDirectories.has(p)),
+            ]),
+          ]
+        : keptExpanded,
     });
+    if (treePaths.length > 0) treeLoadedRef.current = true;
+    if (restore) {
+      restoreViewRef.current = null;
+      const selected = restore.selected;
+      if (selected !== null && entryKinds.has(selected.replace(/\/$/, ""))) {
+        // Selecting would open the file again, and switch the panel away from the tree.
+        restoringSelectionRef.current = true;
+        try {
+          model.getItem(selected)?.select();
+        } finally {
+          restoringSelectionRef.current = false;
+        }
+        model.scrollToPath(selected, { offset: "nearest" });
+      }
+    }
   }, [entryKinds, expandedTreePaths, model, treePaths]);
+
+  // A breadcrumb or "Show in Files" asked for a path: open its folders, select it, scroll to it.
+  // Runs after the path effect above so a request that beats the entry list waits for it.
+  const listPending = entriesQuery.isPending;
+  const revalidateEntries = entriesQuery.revalidate;
+  const refreshedForRevealRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (revealRequest === undefined || !treeLoadedRef.current || listPending) return;
+    const target = revealRequest.path;
+    const kind = entryKinds.get(target);
+    if (
+      kind === undefined &&
+      target !== "" &&
+      refreshedForRevealRef.current !== revealRequest.requestId
+    ) {
+      // The list may predate the file (just created): read it again once, and decide on that.
+      refreshedForRevealRef.current = revealRequest.requestId;
+      revalidateEntries();
+      return;
+    }
+    if (kind !== undefined) {
+      // A search that hides non-matches would select the row out of sight.
+      if (model.isSearchOpen() || model.getSearchValue() !== "") model.closeSearch();
+      const key = kind === "directory" ? `${target}/` : target;
+      // Selecting would open a file again, and a request must not replace the Files tab.
+      restoringSelectionRef.current = true;
+      try {
+        for (let i = target.indexOf("/"); i !== -1; i = target.indexOf("/", i + 1)) {
+          const folder = model.getItem(`${target.slice(0, i)}/`);
+          if (folder && "expand" in folder) folder.expand();
+        }
+        for (const path of model.getSelectedPaths()) {
+          if (path !== key) model.getItem(path)?.deselect();
+        }
+        model.getItem(key)?.select();
+      } finally {
+        restoringSelectionRef.current = false;
+      }
+      // The click that asked for this left a tab that is gone now; keep the keyboard on the tree.
+      model.scrollToPath(key, { offset: "nearest", focus: true });
+    }
+    clearFilesReveal(threadRef, revealRequest.requestId);
+  }, [
+    clearFilesReveal,
+    entryKinds,
+    listPending,
+    model,
+    revalidateEntries,
+    revealRequest,
+    threadRef,
+  ]);
+
+  // A native listener: the rows live in the tree's shadow root, where React finds no fiber to
+  // deliver a click to. The tree reports a selection only when it changes, so a click on the row
+  // that is already selected (the file whose tab was closed, say) opens its file here.
+  const onOpenFileRef = useRef(onOpenFile);
+  useEffect(() => {
+    onOpenFileRef.current = onOpenFile;
+  }, [onOpenFile]);
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (panel === null) return;
+    const onClick = (event: globalThis.MouseEvent) => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const path = clickedRowPath(event);
+      if (path === null || path === openedBySelectionRef.current) return;
+      if (entryKindsRef.current.get(path) === "file") onOpenFileRef.current(path);
+    };
+    panel.addEventListener("click", onClick);
+    return () => panel.removeEventListener("click", onClick);
+  }, []);
+
+  const expandedTreePathsRef = useRef(expandedTreePaths);
+  useEffect(() => {
+    expandedTreePathsRef.current = expandedTreePaths;
+  }, [expandedTreePaths]);
+  useEffect(
+    () => () => {
+      if (!treeLoadedRef.current) return;
+      rememberFileTreeView(viewKey, {
+        expanded: currentlyExpandedTreePaths(model, expandedTreePathsRef.current),
+        selected: model.getSelectedPaths().at(-1) ?? null,
+      });
+    },
+    [model, viewKey],
+  );
 
   useEffect(() => model.setGitStatus(gitStatus), [gitStatus, model]);
 
@@ -807,6 +977,7 @@ export default function FileBrowserPanel({
 
   return (
     <div
+      ref={panelRef}
       className="flex min-h-0 flex-1 flex-col bg-background"
       data-file-browser-panel={`${environmentId}:${cwd}`}
     >

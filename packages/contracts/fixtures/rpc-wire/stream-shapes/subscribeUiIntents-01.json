@@ -12,12 +12,12 @@
         "path": "4294967295",
         "actor": {
           "kind": "mcp-client",
-          "clientId": "",
-          "label": "Q/vGx(D:Nb"
+          "clientId": "\u0000",
+          "label": null
         },
-        "createdAt": "q;S~`=dWNL",
-        "expiresAt": "😀",
-        "expiresInMs": 28
+        "createdAt": "/vGx(",
+        "expiresAt": "\n",
+        "expiresInMs": 99
       }
     }
   ]

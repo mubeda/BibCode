@@ -55,7 +55,7 @@ workflows do not listen for `merge_group`.
 `main` has no branch protection rule. Repository ruleset 20454382 blocks only
 branch deletion and non-fast-forward pushes; it requires no status checks. If
 required checks are added, require the job names that run on every pull
-request: `Check`, `Test`, `Release Smoke`, the four `Native desktop - Linux
+request: `Secrets`, `Check`, `Test`, `Release Smoke`, the four `Native desktop - Linux
 …`/`Windows …` rows, and `Crash smoke - ubuntu-24.04` and `- windows-2025`.
 Do not require the macOS rows or the seeded upgrade jobs: on pull requests
 without `ci:full` they do not report under their row names (`macos-26` is not
@@ -64,6 +64,16 @@ the merge.
 
 ## Jobs
 
+- **Secrets** runs the gitleaks 8.30.1 CLI (release tarball pinned by SHA-256) over
+  every commit a pull request (`base..head`) or push (`before..sha`; the full
+  history for a new branch) adds, merged branches included, with `.gitleaks.toml`.
+  It then runs `scripts/no-sensitive-data.test.ts` with `BIBCODE_SENSITIVE_RANGE`
+  set to the same range, which checks every commit message against the hashed
+  banned values. It allowlists `.repos/` and the fixture hash manifests, posts
+  no comments and uploads no artifact. The repository is public; see AGENTS.md,
+  Sensitive Data.
+- **Check** also runs `vp run check:markdown-links` on `README.md` and the living
+  docs (relative links, images and anchors; no network).
 - **Check** runs `vp check` (which fails on any lint warning), workspace
   typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, and Clippy with warnings denied on Ubuntu 24.04.
@@ -182,21 +192,21 @@ the merge.
   0.27.0 are installed with `cargo install --locked`, and Rust Cache keeps them
   in `~/.cargo/bin`. A failed run uploads the dump, its sidecar, the symbol
   store, and the stack walk as the `crash-smoke-<os>` artifact. The Windows
-  ARM64 dump path stays disabled, so the job has no ARM64 rows.
+  ARM64 dump path stays disabled, so the job has no Windows ARM64 row; the
+  `macos-26` row is ARM64.
   The crash step adds `CARGO_PROFILE_RELEASE_LTO=off` and
-  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile. With the shipped
-  thin-LTO single codegen unit, rustc spent most of the build optimising the
-  `bibcode-server` crate on one core: the crash step took 52 minutes on
-  `39356f37`, and `macos-26` runs reached the 90-minute limit, which also
-  meant no cache was saved. The planted frames are `#[inline(never)]`, and the
-  symbol format, line tables, and unwind tables do not depend on LTO or codegen
-  units, so the smoke still proves the release symbol path. `Cargo.toml`'s
-  shipped profile is unchanged. A cold
-  `cargo test -p bibcode-server --test crash_smoke --release --no-run` with
-  the symbol environment, pinned to 4 cores, took 666 seconds with the shipped
-  profile and 293 seconds with these overrides. The job budget is 60 minutes:
-  90 minutes divided by that 2.3x speedup is about 40 for a macOS run, plus
-  room for a cold cache.
+  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile; optimisation, line
+  tables, symbols and the packed dSYM stay. With the shipped thin-LTO single
+  codegen unit, rustc spent most of the build optimising the `bibcode-server`
+  crate on one core, and `macos-26` runs took 40 to 79 minutes or hit the
+  90-minute limit. Commit `546648ee5f` added the overrides: a cold
+  `cargo test -p bibcode-server --test crash_smoke --release --no-run` pinned to
+  4 cores took 666 seconds with the shipped profile and 293 seconds with them,
+  and the job timeout is 60 minutes. The planted frames are
+  `#[inline(never)]`, and the symbol format, line tables, and unwind tables do
+  not depend on LTO or codegen units, so the smoke still proves the release
+  symbol path. `Cargo.toml`'s shipped profile is unchanged. The step prints its
+  elapsed seconds as a `::notice::`.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's

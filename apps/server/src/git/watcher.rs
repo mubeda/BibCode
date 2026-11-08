@@ -2522,21 +2522,22 @@ mod tests {
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     #[derive(Default)]
     struct NativeReadiness {
-        observed: AtomicBool,
+        /// Highest fence round whose sentinel the native stream delivered.
+        observed_round: AtomicUsize,
         notify: Notify,
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     impl NativeReadiness {
-        fn observe(&self) {
-            self.observed.store(true, Ordering::Release);
+        fn observe(&self, round: usize) {
+            self.observed_round.fetch_max(round, Ordering::AcqRel);
             self.notify.notify_waiters();
         }
 
-        async fn wait(&self) {
+        async fn wait(&self, round: usize) {
             loop {
                 let notified = self.notify.notified();
-                if self.observed.load(Ordering::Acquire) {
+                if self.observed_round.load(Ordering::Acquire) >= round {
                     return;
                 }
                 notified.await;
@@ -2548,15 +2549,27 @@ mod tests {
     #[derive(Clone)]
     struct NativeReadinessRegistration {
         root: PathBuf,
+        /// Each fence round writes `<sentinel>.<round>`, so a late event for an
+        /// earlier round's file cannot satisfy a later fence.
         sentinel: PathBuf,
         sentinel_key: String,
         readiness: Arc<NativeReadiness>,
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    impl NativeReadinessRegistration {
+        fn sentinel_for(&self, round: usize) -> PathBuf {
+            let mut name = self.sentinel.as_os_str().to_owned();
+            name.push(format!(".{round}"));
+            PathBuf::from(name)
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     #[derive(Default)]
     struct NativeReadinessState {
         registrations: Mutex<Vec<NativeReadinessRegistration>>,
+        rounds: AtomicUsize,
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -2571,7 +2584,32 @@ mod tests {
                 .collect()
         }
 
-        fn intercept(&self, event: &notify::Result<Event>) -> Option<Vec<Arc<NativeReadiness>>> {
+        /// Writes a new round of sentinels and waits until the native stream has
+        /// delivered each one. Each watched root's stream delivers in order, so
+        /// every change made before the fence has been published when it returns.
+        async fn fence(&self, registrations: &[NativeReadinessRegistration]) {
+            let round = self.rounds.fetch_add(1, Ordering::AcqRel) + 1;
+            for registration in registrations {
+                std::fs::write(registration.sentinel_for(round), b"ready")
+                    .expect("native readiness sentinel");
+            }
+            for registration in registrations {
+                test_timeout(
+                    "native readiness sentinel delivery",
+                    registration.readiness.wait(round),
+                )
+                .await;
+            }
+            for registration in registrations {
+                std::fs::remove_file(registration.sentinel_for(round))
+                    .expect("remove native readiness sentinel");
+            }
+        }
+
+        fn intercept(
+            &self,
+            event: &notify::Result<Event>,
+        ) -> Option<Vec<(Arc<NativeReadiness>, usize)>> {
             let event = event.as_ref().ok()?;
             if event.paths.is_empty() {
                 return None;
@@ -2585,10 +2623,14 @@ mod tests {
                 .iter()
                 .map(|path| {
                     let key = normalize_worktree_path_key(path, host_path_platform());
-                    registrations
-                        .iter()
-                        .find(|registration| registration.sentinel_key == key)
-                        .map(|registration| Arc::clone(&registration.readiness))
+                    registrations.iter().find_map(|registration| {
+                        let round = key
+                            .strip_prefix(registration.sentinel_key.as_str())?
+                            .strip_prefix('.')?
+                            .parse()
+                            .ok()?;
+                        Some((Arc::clone(&registration.readiness), round))
+                    })
                 })
                 .collect()
         }
@@ -2620,8 +2662,8 @@ mod tests {
             let state = Arc::clone(&self.state);
             let callback = Arc::new(move |event: notify::Result<Event>| {
                 if let Some(readiness) = state.intercept(&event) {
-                    for signal in readiness {
-                        signal.observe();
+                    for (signal, round) in readiness {
+                        signal.observe(round);
                     }
                     return;
                 }
@@ -2737,22 +2779,8 @@ mod tests {
                     registration.sentinel.parent(),
                     Some(registration.root.as_path())
                 );
-                std::fs::write(&registration.sentinel, b"ready")
-                    .expect("native readiness sentinel");
             }
-            for registration in &registrations {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    registration.readiness.wait(),
-                )
-                .await
-                .expect("native readiness deadline");
-            }
-            for registration in &registrations {
-                std::fs::remove_file(&registration.sentinel)
-                    .expect("remove native readiness sentinel");
-            }
-            assert_eq!(subscription.try_recv(), None);
+            settle_native_subscription(&mut subscription, &readiness, &registrations).await;
             assert_eq!(subscription.health(), GitWatcherHealth::Healthy);
             Self {
                 subscription,
@@ -2781,9 +2809,28 @@ mod tests {
             self.readiness
                 .registrations()
                 .iter()
-                .filter(|registration| registration.readiness.observed.load(Ordering::Acquire))
+                .filter(|registration| {
+                    registration
+                        .readiness
+                        .observed_round
+                        .load(Ordering::Acquire)
+                        > 0
+                })
                 .count()
         }
+    }
+
+    /// Fences the native stream, then discards what fixture setup published.
+    /// FSEvents can deliver changes made before the stream started when
+    /// fseventsd lags (#330); the fence delivers them all before it returns.
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    async fn settle_native_subscription(
+        subscription: &mut GitWatchSubscription,
+        readiness: &NativeReadinessState,
+        registrations: &[NativeReadinessRegistration],
+    ) {
+        readiness.fence(registrations).await;
+        while subscription.try_recv().is_some() {}
     }
 
     #[cfg(any(unix, target_os = "windows"))]
@@ -2804,6 +2851,11 @@ mod tests {
             fixture.readiness_acknowledgement_count(),
             fixture.readiness_registration_count()
         );
+        // Settling drained setup changes; a second fence must publish nothing.
+        fixture
+            .readiness
+            .fence(&fixture.readiness.registrations())
+            .await;
         assert_eq!(fixture.subscription.try_recv(), None);
         assert_eq!(fixture.subscription.health(), GitWatcherHealth::Healthy);
     }
@@ -4049,15 +4101,8 @@ mod tests {
             1,
             "native worktree recursion includes its Git directory and refs"
         );
-        std::fs::write(&registrations[0].sentinel, b"ready").expect("native readiness sentinel");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            registrations[0].readiness.wait(),
-        )
-        .await
-        .expect("nested native readiness deadline");
-        std::fs::remove_file(&registrations[0].sentinel).expect("remove native readiness sentinel");
-        assert_eq!(subscription.try_recv(), None);
+        settle_native_subscription(&mut subscription, &readiness, &registrations).await;
+        assert_eq!(subscription.health(), GitWatcherHealth::Healthy);
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -4176,7 +4221,10 @@ mod tests {
             std::fs::create_dir_all(path).expect("watch root");
         }
         symlink(&outside, worktree.join("outside-link")).expect("outside symlink");
-        let service = GitWatchService::new();
+        let readiness = Arc::new(NativeReadinessState::default());
+        let service = GitWatchService::with_backend_factory(Arc::new(
+            NativeReadinessBackendFactory::new(Arc::clone(&readiness)),
+        ));
         let mut subscription = test_timeout(
             "native symlink watch subscription setup",
             service.subscribe(request(&worktree, &git_dir, &common_dir)),
@@ -4184,15 +4232,19 @@ mod tests {
         .await
         .expect("native watch subscription");
         assert_native_watching_available(&subscription);
+        let registrations = readiness.registrations();
+        settle_native_subscription(&mut subscription, &readiness, &registrations).await;
 
         std::fs::write(outside.join("not-in-worktree.txt"), b"outside")
             .expect("outside target write");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), subscription.recv())
-                .await
-                .is_err(),
+        // The stream delivers whatever the outside write produced before the fence.
+        readiness.fence(&registrations).await;
+        assert_eq!(
+            subscription.try_recv(),
+            None,
             "outside-target activity must not traverse the worktree symlink"
         );
+        assert_eq!(subscription.health(), GitWatcherHealth::Healthy);
     }
 
     #[test]

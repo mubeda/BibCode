@@ -138,7 +138,8 @@ timer cannot be observed. A test must not assert that a queued turn is still pro
 delivery service runs: the service may already have promoted it. The Device tests'
 `wait_until` (`device/android/testing.rs`) polls for up to a minute for the same reason. Their
 cancelled-start test cancels once the adb log shows the server launch, which proves the forward
-exists, never after a fixed delay. A ChatView scroll-spy test waits until the send's own landing
+exists, never after a fixed delay. A fake adb that takes a second to answer `forward tcp:0` is the
+controlled counterexample: the 500 ms version fails it every run. A ChatView scroll-spy test waits until the send's own landing
 has scrolled and then stayed quiet for a number of frames, not a fixed few, and models the
 anchored turn the spec names (the sent row alone, ending inside the view). Host load alone did not
 reproduce that test; a 150 ms stall between clearing the spies and the assertions did.
@@ -349,3 +350,60 @@ missed its `sleep` that way on the Linux arm64 job (main, run 41789911736) and
 passed on the identical tree in the release PR's run. A standalone loop of the
 same calls on arm64 Ubuntu 22.04 missed about once in 10,000 spawns under 8
 threads, with the child still running the test binary at the miss.
+
+On macOS under load, the exec of a freshly copied compiled fixture can stay
+launched-suspended for good: the child shows 0 CPU at `_dyld_start` and
+`vmmap --summary <pid>` reports "launched-suspended". The Cursor fixture runner
+relaunches a run that has not finished in 10 s instead of waiting longer. A test
+that proves two probes overlap makes each wait for the other's start rather than
+sleeping, and retries a run in which a child never started before the 10 s probe
+timeout. The device RPC harness waits longer than the boot timeout for each
+catalog frame, because a booting device sends none until it is ready (#329).
+
+Native Git watcher tests fence before they assert quiet. Under load, FSEvents
+can deliver changes that a fixture made before the stream started, after the
+watch reports ready. `settle_native_subscription` (`git/watcher.rs` tests)
+writes round-numbered sentinels in every watched root, waits for each, and then
+drains what setup published. Each root's stream delivers in order, so nothing
+earlier can arrive later. A test that requires no event writes its change,
+fences again, and then checks `try_recv() == None`. It never waits a fixed time
+for silence (#330).
+
+Four more tests failed under load for four reasons (#333). A diff-tool launch
+counts as open once its 1 s window ends, so on a slow host `open` can return
+before the fake tool has logged its call or its process group. The test
+launcher's window now outlasts any start, so a tool that exits at once has
+exited when `open` returns. The tests that launch a tool that keeps running
+wait for its process group, which the fake tool writes after its call.
+`interrupt_turn`'s test counted every orchestration event, and turn delivery
+appends its own after `start_thread` returns, so the test now counts only
+interrupt requests. The terminal observer join reaper is one thread for the
+whole process, and a test hook that held one join there stalled every other
+test's worker for as long as that test ran. A held join now runs on its own
+thread. Last, unwinding a panic out of an observer worker's Tokio frames costs
+the debug test binary about 0.4 s of CPU on an idle Mac, against the 1 s the
+panic test allowed; it now waits the module's 5 s hang bound. The linker warns
+that the test binary's `__eh_frame` is too large for the compact unwind table,
+which is a likely reason unwinding is that slow.
+
+Two full lib runs under 12 CPU hogs took 745 s and 1,186 s, and in each a group
+of tests that start child processes failed in the same few minutes while
+in-process tests kept passing (#335). On macOS the first exec of a new file is
+slow: on a loaded Mac, a fresh copy of the compiled Cursor fixture or a freshly
+written script took about 0.17 s to run, against 0.015 s for a file that had
+run before. The cause is likely a system check of new code (`syspolicyd` was
+busy), but the logs did not confirm it. A few of these first execs never finish.
+Copies of the Cursor fixture were found hours later at `_dyld_start`,
+launched-suspended and reparented to launchd, and no other kind of process was
+found stuck that way. The Cursor fixture tests therefore hard-link the compiled
+fixture, which runs once when it is built, instead of copying it; the probes
+inside `update_provider` have a 10 s timeout and no relaunch. Nothing may open
+that shared file for writing, because macOS kills an exec of a file that
+another process holds open for writing, so the busy-executable test runs on
+Linux only. The startup probe test runs both probe scripts once, with
+relaunch, before it measures overlap. The isolated-case runner in
+`test_support/sandbox.rs` gives a case 10 s from its first stdout byte, which
+libtest writes before any test runs, and waits up to 60 s for that byte. The
+clone outcome retention test answers for Git instead of running it: outcomes
+expire on the wall clock after 3 s, so a slow Git between two outcomes let the
+first expire, and one Git run took longer than the 20 s test deadline.

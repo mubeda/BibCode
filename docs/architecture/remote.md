@@ -971,6 +971,13 @@ ticks. Reconciliation cancels removed sessions' local connection tokens while
 holding the service state lock and before publishing access changes, so an
 already-ACKed stream closes before later authority events are admitted. Local
 revocation still cancels immediately without waiting for the watcher.
+`AuthService` sends every access change on the access broadcast, and takes its
+revision, while it still holds the state lock that made the change. This
+covers issuance, revocation, connection counts, pairing links, pending remote
+authorizations, and watcher reconciliation. The broadcast send is synchronous
+and never waits on a receiver. Channel order therefore equals state order, and
+an access snapshot's revision matches the state it read. A delayed upsert
+cannot bring back a client that a concurrent reconcile already removed.
 Live-connection registration arms its RAII guard immediately after the
 in-memory count and cancellation token are published, before awaiting SQLite
 connected-state persistence. Cancellation or persistence failure therefore

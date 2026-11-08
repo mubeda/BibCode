@@ -305,3 +305,61 @@ describe("Git Manager wire schemas", () => {
     expect(decoded.blocked).toBeNull();
   });
 });
+
+describe("Git Credential Manager sign-in (#325)", () => {
+  const destination = "https://github.com/owner/repo.git";
+
+  it("decodes a sign-in-required failure and its resume request", () => {
+    const event = decodeGitManagerOperationEvent({
+      _tag: "failed",
+      operation: "branch-delete",
+      code: "sign-in-required",
+      message: "Git Credential Manager needs you to sign in before Git can reach this remote.",
+      blocked: null,
+      signIn: {
+        remote: "origin",
+        destination,
+        host: "github.com",
+        direction: "push",
+        resume: {
+          _tag: "remote-branch-delete",
+          cwd: "/repo",
+          projectId: "project-1",
+          remote: "origin",
+          branch: "topic",
+          expectedDestination: destination,
+        },
+      },
+    });
+    expect(event._tag === "failed" && event.signIn?.resume._tag).toBe("remote-branch-delete");
+  });
+
+  it("keeps a failure without a sign-in decoding as before", () => {
+    const event = decodeGitManagerOperationEvent({
+      _tag: "failed",
+      operation: "fetch",
+      code: "authentication",
+      message: "Authentication failed.",
+      blocked: null,
+    });
+    expect(event._tag === "failed" && event.signIn).toBeUndefined();
+  });
+
+  it("accepts expectedDestination on every resumable request", () => {
+    for (const request of [
+      { _tag: "fetch", remote: "origin" },
+      { _tag: "pull", remote: "origin" },
+      { _tag: "push", remote: "origin", localBranch: "main", remoteBranch: null },
+      { _tag: "tag-push", name: "v1", remote: "origin" },
+      { _tag: "remote-branch-delete", remote: "origin", branch: "topic" },
+    ]) {
+      const decoded = decodeGitManagerOperationRequest({
+        ...request,
+        cwd: "/repo",
+        projectId: "project-1",
+        expectedDestination: destination,
+      });
+      expect("expectedDestination" in decoded && decoded.expectedDestination).toBe(destination);
+    }
+  });
+});

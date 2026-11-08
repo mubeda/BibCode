@@ -358,6 +358,8 @@ pub(crate) fn parse_job(
         },
         url: link(context, &format!("actions/runs/{run}/job/{id}")),
         downstream_url: None,
+        scheduling: None,
+        needs: None,
     })
 }
 

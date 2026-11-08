@@ -1071,7 +1071,8 @@ pub(crate) mod tests {
             format!(
                 "#!/bin/sh\nS='{state}'\n\
                  case \"$1\" in\n\
-                 --version) cat \"$S/version\"; exit 0;;\n\
+                 --version) [ -f \"$S/probe-hook\" ] && . \"$S/probe-hook\"; \
+                 cat \"$S/version\"; exit 0;;\n\
                  upgrade)\n\
                  echo \"$CODEGRAPH_NO_PROMPT_HOOK,$CODEGRAPH_NO_INSTALL_REFRESH\" > \"$S/env.log\"\n\
                  [ \"$CODEGRAPH_NO_PROMPT_HOOK\" = 1 ] || echo x > \"$S/agent-config-written\"\n\

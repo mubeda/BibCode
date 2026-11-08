@@ -36,7 +36,9 @@ vi.mock("@tanstack/react-router", () => ({
     params,
     children,
     className,
+    title,
   }: {
+    title?: string;
     to: string;
     params: Record<string, string>;
     children: React.ReactNode;
@@ -44,6 +46,7 @@ vi.mock("@tanstack/react-router", () => ({
   }) => (
     <a
       className={className}
+      title={title}
       href={Object.entries(params).reduce(
         (path, [name, value]) => path.replace(`$${name}`, value),
         to,
@@ -105,7 +108,7 @@ afterEach(() => {
 describe("PipelinesListRow navigation", () => {
   it("opens the pipeline in BiBCode from anywhere on the row, with actions as their own stops", () => {
     renderRows([4821]);
-    const row = node.querySelector('[role="listitem"]')!;
+    const row = node.querySelector('[role="row"][aria-label]')!;
     const title = [...row.querySelectorAll("a")].find(
       (anchor) => anchor.textContent === "Fix connection recovery",
     )!;
@@ -114,6 +117,10 @@ describe("PipelinesListRow navigation", () => {
     expect(row.className).toContain("relative");
     expect(title.className).toContain("after:absolute");
     expect(title.className).toContain("after:inset-0");
+    // The overlay hides the status cell from the pointer, so the tooltip carries its text.
+    expect(title.getAttribute("title")).toBe(
+      `Fix connection recovery\n${row.getAttribute("aria-label")!.replace(/^#\d+ /, "")}`,
+    );
     const retry = row.querySelector('[aria-label="Retry pipeline #4821"]')!;
     expect(retry.closest(".relative.z-10")).not.toBeNull();
     expect(row.querySelector('[aria-label="More actions for pipeline #4821"]')).not.toBeNull();
@@ -156,5 +163,86 @@ describe("PipelinesListRow hover prefetch", () => {
     hover(3);
     act(() => vi.advanceTimersByTime(HOVER_PREFETCH_MS));
     expect(h.get).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("PipelinesListRow columns", () => {
+  function renderRow(row: typeof pipelineRow) {
+    act(() =>
+      root.render(
+        <PipelineActions.Provider scope={scope} provider="gitlab" revision={1} onSettled={vi.fn()}>
+          <PipelinesListRow
+            row={row}
+            provider="gitlab"
+            scope={scope}
+            projectRef={projectRef}
+            mutationsDisabledReason={null}
+            repositoryPermission="write"
+          />
+        </PipelineActions.Provider>,
+      ),
+    );
+    return node.querySelector<HTMLElement>('[role="row"]')!;
+  }
+
+  it("gives a row with Retry, a row with Cancel and a row with neither the same template and cells", () => {
+    const shapes = [
+      pipelineRow, // failed: Retry
+      { ...pipelineRow, status: "running" as const, terminal: false }, // Cancel
+      { ...pipelineRow, status: "success" as const, url: null }, // no buttons at all
+    ].map((row) => {
+      const element = renderRow(row);
+      const cells = [...element.querySelectorAll(':scope > [role="cell"]')];
+      return { className: element.className, cells: cells.length, last: cells.at(-1)!.className };
+    });
+    expect(new Set(shapes.map((shape) => shape.className)).size).toBe(1);
+    expect(new Set(shapes.map((shape) => shape.cells)).size).toBe(1);
+    // The last cell is the Actions track whatever it holds.
+    expect(new Set(shapes.map((shape) => shape.last)).size).toBe(1);
+    expect(shapes[0]!.className).toContain("grid-cols-(--pipelines-grid-narrow)");
+    expect(shapes[0]!.className).toContain("@min-[1100px]:grid-cols-(--pipelines-grid-full)");
+  });
+
+  describe("stage overflow", () => {
+    const stages = ["build", "lint", "test", "package", "deploy", "verify"].map((name) => ({
+      name,
+      status: "success" as const,
+      warnings: false,
+    }));
+    let width = 0;
+    beforeEach(() => {
+      Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+        configurable: true,
+        get: () => width,
+      });
+    });
+    afterEach(() => {
+      delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
+    });
+
+    it("counts the stages that do not fit and keeps each one readable for assistive technology", () => {
+      width = 64;
+      const row = renderRow({ ...pipelineRow, stages });
+      const list = row.querySelector('ol[aria-label="Stages"]')!;
+      const items = [...list.querySelectorAll("li[aria-label]")];
+      expect(items.map((item) => item.getAttribute("aria-label"))).toEqual(
+        stages.map((stage) => `${stage.name}: passed`),
+      );
+      expect(items.filter((item) => item.className.includes("sr-only")).length).toBe(4);
+      const count = list.querySelector('li[aria-hidden="true"]')!;
+      expect(count.textContent).toBe("+4");
+      expect(count.getAttribute("title")).toBe(
+        "test: passed\npackage: passed\ndeploy: passed\nverify: passed",
+      );
+    });
+
+    it("shows every stage and no count when they fit or the width is unknown", () => {
+      width = 160;
+      let row = renderRow({ ...pipelineRow, stages });
+      expect(row.querySelector('li[aria-hidden="true"]')).toBeNull();
+      width = 0;
+      row = renderRow({ ...pipelineRow, stages });
+      expect(row.querySelector('li[aria-hidden="true"]')).toBeNull();
+    });
   });
 });

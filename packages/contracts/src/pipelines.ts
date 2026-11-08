@@ -158,6 +158,10 @@ export const PipelinesJob = Schema.Struct({
   permissions: PipelinesJobPermissions,
   url: Schema.NullOr(Schema.String),
   downstreamUrl: Schema.NullOr(Schema.String),
+  /** GitLab `schedulingType`: `dag` waits for `needs`, `stage` for earlier stages. Absent or null: unknown. */
+  scheduling: Schema.optionalKey(Schema.NullOr(Schema.Literals(["dag", "stage"]))),
+  /** Names of the jobs a `dag` job needs. Absent or null: unknown. */
+  needs: Schema.optionalKey(Schema.NullOr(Schema.Array(Schema.String))),
 });
 export type PipelinesJob = typeof PipelinesJob.Type;
 
@@ -208,7 +212,7 @@ export const PipelinesDetail = Schema.Struct({
   stages: Schema.NullOr(Schema.Array(PipelinesDetailStage)),
   /** GitLab: a group over 100 jobs. GitHub: a run over 1,000 jobs. */
   truncated: Schema.Boolean,
-  /** Reserved for the deferred job dependencies view. */
+  /** GitLab: the pipeline uses `needs`, so its jobs carry `scheduling` and `needs` when known. */
   usesNeeds: Schema.Boolean,
   /** GitHub run artifacts; empty on GitLab, where artifacts belong to jobs. */
   artifacts: Schema.Array(PipelinesArtifact),

@@ -21,6 +21,73 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Scans the commits a pull request or push adds for hardcoded secrets
+  # (.gitleaks.toml). The repository is public: see AGENTS.md "Sensitive data".
+  secrets:
+    name: Secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Pull requests scan base..head and pushes scan before..sha, so commits from
+      # merged branches and beyond the first API page are covered (the action
+      # listed one page and used --first-parent --no-merges). A new branch or an
+      # unreachable `before` (force push) scans the whole history of the commit.
+      - name: Select commit range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT_NAME" = "push" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_SHA"
+          else
+            range="$PUSH_SHA"
+          fi
+          echo "BIBCODE_SENSITIVE_RANGE=$range" >> "$GITHUB_ENV"
+
+      # Pinned release; the tarball must match the SHA-256 from the release's
+      # gitleaks_8.30.1_checksums.txt before it is unpacked.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+
+      # --redact keeps matched values out of the public job log. Git hides merge
+      # diffs by default; first-parent shows what a merge changed against its first
+      # parent (conflict resolutions) without limiting which commits are walked.
+      - name: Gitleaks
+        run: |
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --log-opts="--diff-merges=first-parent $BIBCODE_SENSITIVE_RANGE" \
+            --config .gitleaks.toml --redact --exit-code 1
+
+      # Runs here, not in Check: this job already has the full history and the
+      # range, and Check's shallow checkout would need a second fetch.
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@68f39c78aaf39be468cabd2afb09c162574c84af # v1.21.2
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Sensitive-data guard (commit messages)
+        run: vp test run scripts/no-sensitive-data.test.ts
+
   check:
     name: Check
     runs-on: ubuntu-24.04
@@ -82,6 +149,10 @@ jobs:
 
       - name: Check agent delivery decisions
         run: node --test scripts/check-agent-delivery.node-test.mjs
+
+      # Relative links, images and heading anchors only; external URLs are not fetched.
+      - name: Check Markdown links
+        run: vp run check:markdown-links
 
       - name: Typecheck
         run: vpr typecheck
@@ -335,6 +406,15 @@ jobs:
         if: matrix.platform == 'win'
         run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
 
+      # Linux runs these in Test; Windows and macOS Git (LFS, hooks, NUL) differ (#283).
+      - name: Run Git system configuration tests (Windows)
+        if: matrix.platform == 'win'
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_system_config -j 2
+
+      - name: Run Git system configuration tests (macOS)
+        if: matrix.platform == 'mac'
+        run: cargo test -p bibcode-server --test git_system_config -j 2
+
       # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
       # keeps ~/.cargo/bin, so a restored runner skips the compile.
       - name: Install dump_syms
@@ -431,8 +511,8 @@ jobs:
       # The release symbol profile from release.yml: unstripped, with line tables, a dSYM on
       # macOS and a GNU build-id on Linux. CRASH_SMOKE_OUT keeps the dump after the test.
       # LTO off and 16 codegen units: the shipped thin-LTO single unit kept macos-26 on one
-      # core until the 90-minute timeout. The planted frames are #[inline(never)], and the
-      # symbol format, debug info, and unwind tables do not depend on either setting.
+      # core. The planted frames are #[inline(never)], and the symbol format, line tables and
+      # unwind tables do not depend on either setting. The step logs its elapsed seconds.
       - name: Crash the smoke binary
         shell: bash
         env:
@@ -445,6 +525,8 @@ jobs:
             Linux) export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1" ;;
             macOS) export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;
           esac
+          start=$SECONDS
+          trap 'echo "::notice title=Crash step::${RUNNER_OS} cargo test took $((SECONDS - start)) s"' EXIT
           node scripts/run-msvc.mjs cargo test -p bibcode-server --test crash_smoke --release
 
       - name: Symbolicate the dump

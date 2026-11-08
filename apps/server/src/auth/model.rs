@@ -277,6 +277,10 @@ pub struct ClientSessionView {
     /// server was reached on, which **Remote agents** shows when the app's own is not HTTPS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_resource: Option<String>,
+    /// The named client (#280) this outside agent's session is a run of: it keeps its
+    /// identity across runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_named_client: Option<crate::persistence::McpNamedClient>,
 }
 
 /// A remote MCP authorization waiting for a person (#139, slice R), as the **Requests to
@@ -313,6 +317,18 @@ pub(crate) enum AuthAccessChange {
     },
     /// The pending remote MCP authorizations changed; the list is the new whole.
     PendingMcpAuthorizations,
+    /// The live named MCP clients changed (#324); the list is the new whole.
+    McpNamedClients,
+}
+
+/// A named MCP client not yet ended (#324), so a client can list the idle ones. `name` is
+/// the agent's own, untrusted, text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpNamedClientView {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug)]

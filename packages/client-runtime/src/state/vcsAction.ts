@@ -85,6 +85,8 @@ export interface RunVcsStackedActionInput {
   readonly pullRequestBaseBranch?: string;
   readonly pullRequestHeadBranch?: string;
   readonly pullRequestOptions?: GitPullRequestCreateOptions;
+  /** A push resumed after a Git Credential Manager sign-in (#325). */
+  readonly expectedDestination?: string;
   readonly onProgress?: (event: GitActionProgressEvent) => void;
 }
 
@@ -515,6 +517,9 @@ export function createVcsActionManager<R, E>(
             : {}),
           ...(input.pullRequestOptions !== undefined
             ? { pullRequestOptions: input.pullRequestOptions }
+            : {}),
+          ...(input.expectedDestination !== undefined
+            ? { expectedDestination: input.expectedDestination }
             : {}),
         };
         return consumeVcsActionProgress(

@@ -290,6 +290,9 @@ mod tests {
 
     type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+    const NEXT_MESSAGE_GUARD: Duration =
+        Duration::from_secs(crate::device::android::emulator::BOOT_TIMEOUT.as_secs() + 10);
+
     struct Harness {
         handle: ServerHandle,
         socket: Socket,
@@ -341,8 +344,10 @@ mod tests {
                 .expect("send");
         }
 
-        /// The next message for request `id`, within 20 s. Every chunk is acknowledged on
-        /// arrival, and messages for other requests wait in `pending`.
+        /// The next message for request `id`. Every chunk is acknowledged on arrival, and
+        /// messages for other requests wait in `pending`. The wait is a hang guard past the boot
+        /// timeout, the longest a step can run before the catalog reports it: a loaded host can
+        /// hold a device in one state well past any shorter bound, with no frame between (#329).
         async fn next(&mut self, id: &str) -> Value {
             if let Some(index) = self
                 .pending
@@ -351,11 +356,13 @@ mod tests {
             {
                 return self.pending.remove(index);
             }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let deadline = tokio::time::Instant::now() + NEXT_MESSAGE_GUARD;
             loop {
                 let frame = tokio::time::timeout_at(deadline, self.socket.next())
                     .await
-                    .unwrap_or_else(|_| panic!("no response for request {id} within 20 s"))
+                    .unwrap_or_else(|_| {
+                        panic!("no response for request {id} within {NEXT_MESSAGE_GUARD:?}")
+                    })
                     .expect("socket open")
                     .expect("frame");
                 let Message::Text(text) = frame else {

@@ -7,6 +7,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 
 use super::{GitLabHost, encoded, parse, project_path};
+use crate::git::ProcessError;
 use crate::pull_requests::{
     backoff,
     error::PullRequestsOperationError,
@@ -17,7 +18,8 @@ use crate::pull_requests::{
         model::{
             ActionKind, ActionResult, ActionTarget, Artifact, Badge, Commit, Detail, DetailStage,
             Job, JobDetail, JobGroup, JobKind, JobPermissions, ListInput, ListScope, Permission,
-            PipelineRef, Reason, RefKind, Row, RowPermissions, Runner, Total, is_terminal,
+            PipelineRef, Reason, RefKind, Row, RowPermissions, Runner, Scheduling, Total,
+            is_terminal,
         },
         read_failure, unsupported_action,
     },
@@ -28,6 +30,19 @@ use crate::pull_requests::{
 pub(crate) const PAGE_SIZE: u64 = 15;
 
 const PIPELINE_GID: &str = "gid://gitlab/Ci::Pipeline/";
+
+/// Jobs per page of the needs read, and the most pages one pipeline reads.
+const NEEDS_PAGE_SIZE: u64 = 50;
+const NEEDS_MAX_PAGES: usize = 40;
+/// Pipelines whose needs the host remembers; a pipeline's needs never change.
+pub(super) const NEEDS_CACHE_SIZE: usize = 64;
+
+/// A pipeline's jobs by name: how GitLab schedules each and what a `dag` job
+/// needs. `None` for a `schedulingType` this server does not know.
+pub(crate) type PipelineNeeds =
+    std::collections::HashMap<String, Option<(Scheduling, Vec<String>)>>;
+/// Cache key: the lowercased host, the repository and the pipeline id.
+pub(super) type NeedsKey = (String, String, u64);
 
 fn invalid(operation: &str) -> PullRequestsOperationError {
     PullRequestsOperationError::new(operation, "invalid_response")
@@ -353,6 +368,8 @@ fn parse_job(
         },
         url: parse::host_link(origin, &node["webPath"]),
         downstream_url: parse::host_link(origin, &node["downstreamPipeline"]["path"]),
+        scheduling: None,
+        needs: None,
     })
 }
 
@@ -521,6 +538,8 @@ pub(crate) fn parse_job_detail(
             },
             url: web_url.clone(),
             downstream_url: None,
+            scheduling: None,
+            needs: None,
         },
         pipeline_id: value["pipeline"]["id"]
             .as_u64()
@@ -546,6 +565,62 @@ pub(crate) fn parse_job_detail(
     })
 }
 
+/// Adds one needs page to `needs`; returns the next page's cursor, if any.
+pub(crate) fn parse_needs_page(
+    value: &Value,
+    needs: &mut PipelineNeeds,
+    operation: &str,
+) -> Result<Option<String>, PullRequestsOperationError> {
+    let jobs = &value["data"]["project"]["pipeline"]["jobs"];
+    if jobs.is_null() {
+        return Err(invalid(operation));
+    }
+    for job in nodes(jobs) {
+        let name = text(job, "name").ok_or_else(|| invalid(operation))?;
+        let scheduling = match job["schedulingType"].as_str() {
+            Some("dag") => Some(Scheduling::Dag),
+            Some("stage") => Some(Scheduling::Stage),
+            _ => None,
+        };
+        let entry = scheduling.map(|scheduling| {
+            let names = nodes(&job["needs"])
+                .iter()
+                .filter_map(|need| text(need, "name"))
+                .collect();
+            (scheduling, names)
+        });
+        needs.insert(name, entry);
+    }
+    Ok((jobs["pageInfo"]["hasNextPage"].as_bool() == Some(true))
+        .then(|| text(&jobs["pageInfo"], "endCursor"))
+        .flatten())
+}
+
+/// Each displayed job takes its own entry; a job with none stays unknown.
+pub(crate) fn fill_needs(detail: &mut Detail, needs: &PipelineNeeds) {
+    for stage in detail.stages.iter_mut().flatten() {
+        for group in &mut stage.groups {
+            for job in &mut group.jobs {
+                if let Some(Some((scheduling, names))) = needs.get(&job.name) {
+                    job.scheduling = Some(*scheduling);
+                    job.needs = Some(names.clone());
+                }
+            }
+        }
+    }
+}
+
+fn displayed_job_names(detail: &Detail) -> std::collections::HashSet<String> {
+    detail
+        .stages
+        .iter()
+        .flatten()
+        .flat_map(|stage| &stage.groups)
+        .flat_map(|group| &group.jobs)
+        .map(|job| job.name.clone())
+        .collect()
+}
+
 /// GraphQL errors that mean this GitLab lacks a field the full document
 /// selects.
 fn missing_field(value: &Value) -> bool {
@@ -558,6 +633,51 @@ fn missing_field(value: &Value) -> bool {
     })
 }
 
+/// `glab` exits nonzero when GraphQL answers with errors. An unknown-field
+/// answer is still an answer (an older GitLab), so its body, or failing that
+/// `glab`'s stderr, is kept for the caller's fallback.
+fn unknown_field_answer(failure: &ProcessFailure) -> Option<Value> {
+    let ProcessError::NonZeroExit { stdout, .. } = &failure.error else {
+        return None;
+    };
+    let (_, body) = backoff::split_response(stdout.as_bytes());
+    let value = serde_json::from_slice::<Value>(body)
+        .ok()
+        .filter(missing_field)
+        .or_else(|| {
+            failure
+                .stderr
+                .contains("doesn't exist")
+                .then(|| json!({"errors": [{"message": failure.stderr}]}))
+        })?;
+    Some(value)
+}
+
+pub(super) type NeedsCache = std::collections::VecDeque<(NeedsKey, std::sync::Arc<PipelineNeeds>)>;
+
+/// A hit moves to the newest end, so eviction drops the least recently used.
+fn needs_cache_hit(
+    cache: &mut NeedsCache,
+    key: &NeedsKey,
+) -> Option<std::sync::Arc<PipelineNeeds>> {
+    let index = cache.iter().position(|(cached, _)| cached == key)?;
+    let entry = cache.remove(index)?;
+    let needs = entry.1.clone();
+    cache.push_back(entry);
+    Some(needs)
+}
+
+fn needs_cache_insert(cache: &mut NeedsCache, key: NeedsKey, needs: std::sync::Arc<PipelineNeeds>) {
+    if cache.len() >= NEEDS_CACHE_SIZE {
+        cache.pop_front();
+    }
+    cache.push_back((key, needs));
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl GitLabHost {
     fn uses_baseline(&self, scope: &HostScope) -> bool {
         self.pipelines_baseline
@@ -568,6 +688,34 @@ impl GitLabHost {
 
     /// One pipelines GraphQL read: the full document, or the baseline once
     /// GitLab said a newer field does not exist (remembered for the host).
+    /// One GraphQL request, its body parsed; GraphQL `errors` are the caller's.
+    async fn graphql_once(
+        &self,
+        scope: &HostScope,
+        query: String,
+        variables: &Value,
+        operation: &str,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<Value, PullRequestsOperationError> {
+        let input = json!({"query": query, "variables": variables});
+        let started = std::time::Instant::now();
+        let output = self
+            .runner
+            .glab_api_raw(scope, "graphql", Some(&input), true, budget, c)
+            .await;
+        super::trace_gitlab_read(operation, "graphql", started);
+        let output = match output {
+            Ok(output) => output,
+            Err(failure) => {
+                return unknown_field_answer(&failure)
+                    .ok_or_else(|| read_failure(operation, "glab", &failure));
+            }
+        };
+        let (_, body) = backoff::split_response(&output.stdout);
+        serde_json::from_slice(body).map_err(|_| invalid(operation))
+    }
+
     async fn pipelines_graphql(
         &self,
         scope: &HostScope,
@@ -579,16 +727,9 @@ impl GitLabHost {
     ) -> Result<Value, PullRequestsOperationError> {
         let mut baseline = self.uses_baseline(scope);
         loop {
-            let input = json!({"query": document(baseline), "variables": variables});
-            let started = std::time::Instant::now();
-            let output = self
-                .runner
-                .glab_api_raw(scope, "graphql", Some(&input), true, budget, c)
-                .await;
-            super::trace_gitlab_read(operation, "graphql", started);
-            let output = output.map_err(|failure| read_failure(operation, "glab", &failure))?;
-            let (_, body) = backoff::split_response(&output.stdout);
-            let value: Value = serde_json::from_slice(body).map_err(|_| invalid(operation))?;
+            let value = self
+                .graphql_once(scope, document(baseline), &variables, operation, budget, c)
+                .await?;
             if !baseline && missing_field(&value) {
                 self.pipelines_baseline
                     .lock()
@@ -609,6 +750,78 @@ impl GitLabHost {
             }
             return Ok(value);
         }
+    }
+
+    /// The pipeline's needs, from the cache or one paged read that stops once
+    /// every displayed job has an entry. `Ok(None)` when the host cannot say;
+    /// only cancellation is an error, since the detail itself already read.
+    async fn pipeline_needs(
+        &self,
+        scope: &HostScope,
+        detail: &Detail,
+        c: &CancellationToken,
+    ) -> Result<Option<std::sync::Arc<PipelineNeeds>>, PullRequestsOperationError> {
+        let operation = "pipelines.get";
+        let (host, repository) = scope.context_key();
+        if lock(&self.needs_unsupported).contains(&host) {
+            return Ok(None);
+        }
+        let key: NeedsKey = (host.clone(), repository, detail.pipeline.id);
+        if let Some(needs) = needs_cache_hit(&mut lock(&self.needs), &key) {
+            return Ok(Some(needs));
+        }
+        let wanted = displayed_job_names(detail);
+        let mut needs = PipelineNeeds::new();
+        let mut after: Option<String> = None;
+        let mut complete = false;
+        for _ in 0..NEEDS_MAX_PAGES {
+            let variables = json!({
+                "projectPath": scope.repository,
+                "id": format!("{PIPELINE_GID}{}", detail.pipeline.id),
+                "first": NEEDS_PAGE_SIZE,
+                "after": after,
+            });
+            let read = self
+                .graphql_once(
+                    scope,
+                    super::graphql::PIPELINE_NEEDS_QUERY.to_owned(),
+                    &variables,
+                    operation,
+                    Budget::Large,
+                    c,
+                )
+                .await;
+            if c.is_cancelled() {
+                return Err(PullRequestsOperationError::new(operation, "timeout"));
+            }
+            let page = match read {
+                Ok(value) if missing_field(&value) => {
+                    lock(&self.needs_unsupported).insert(host);
+                    return Ok(None);
+                }
+                Ok(value) => parse_needs_page(&value, &mut needs, operation),
+                Err(error) => Err(error),
+            };
+            match page {
+                Ok(next) => {
+                    if wanted.iter().all(|name| needs.contains_key(name)) || next.is_none() {
+                        complete = true;
+                        break;
+                    }
+                    after = next;
+                }
+                Err(error) => {
+                    tracing::warn!(operation, code = %error.code, "GitLab needs read failed");
+                    return Ok(None);
+                }
+            }
+        }
+        if !complete {
+            tracing::warn!(operation, "GitLab needs read stopped at its page cap");
+        }
+        let needs = std::sync::Arc::new(needs);
+        needs_cache_insert(&mut lock(&self.needs), key, needs.clone());
+        Ok(Some(needs))
     }
 
     /// A REST read with `-i`, so a refusal keeps its rate-limit headers.
@@ -780,9 +993,14 @@ impl PipelineHost for GitLabHost {
                     c,
                 )
                 .await?;
-            let detail = parse_detail(&value, context, operation)?;
+            let mut detail = parse_detail(&value, context, operation)?;
             if detail.pipeline.id != pipeline_id {
                 return Err(invalid(operation));
+            }
+            if detail.uses_needs
+                && let Some(needs) = self.pipeline_needs(scope, &detail, c).await?
+            {
+                fill_needs(&mut detail, &needs);
             }
             Ok(detail)
         })
@@ -1182,6 +1400,92 @@ mod tests {
         ));
         assert!(!missing_field(&json!({"data":{}})));
     }
+
+    fn needs_page(jobs: Value, next: Option<&str>) -> Value {
+        json!({"data": {"project": {"pipeline": {"jobs": {
+            "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next},
+            "nodes": jobs,
+        }}}}})
+    }
+
+    #[test]
+    fn gitlab_needs_page_reads_scheduling_and_names_and_its_next_cursor() {
+        let mut needs = PipelineNeeds::new();
+        let next = parse_needs_page(
+            &needs_page(
+                json!([
+                    {"name": "compile", "schedulingType": "stage", "needs": {"nodes": []}},
+                    {"name": "unit", "schedulingType": "dag", "needs": {"nodes": [{"name": "compile"}]}},
+                    {"name": "odd", "schedulingType": "later", "needs": {"nodes": []}},
+                ]),
+                Some("p2"),
+            ),
+            &mut needs,
+            "pipelines.get",
+        )
+        .unwrap();
+        assert_eq!(next.as_deref(), Some("p2"));
+        assert_eq!(needs["compile"], Some((Scheduling::Stage, vec![])));
+        assert_eq!(
+            needs["unit"],
+            Some((Scheduling::Dag, vec!["compile".to_owned()]))
+        );
+        assert_eq!(needs["odd"], None);
+        let last = parse_needs_page(&needs_page(json!([]), None), &mut needs, "pipelines.get");
+        assert_eq!(last.unwrap(), None);
+        assert!(parse_needs_page(&json!({"data": {"project": null}}), &mut needs, "op").is_err());
+    }
+
+    #[test]
+    fn gitlab_needs_fill_displayed_jobs_by_name_and_leave_missing_ones_unknown() {
+        let mut detail = parse_detail(&detail_fixture(), &test_context(), "pipelines.get").unwrap();
+        let mut needs = PipelineNeeds::new();
+        needs.insert("compile".into(), Some((Scheduling::Stage, vec![])));
+        needs.insert(
+            "lint".into(),
+            Some((Scheduling::Dag, vec!["compile".into()])),
+        );
+        fill_needs(&mut detail, &needs);
+        let jobs: Vec<&Job> = detail
+            .stages
+            .iter()
+            .flatten()
+            .flat_map(|stage| &stage.groups)
+            .flat_map(|group| &group.jobs)
+            .collect();
+        let job = |name: &str| *jobs.iter().find(|job| job.name == name).unwrap();
+        assert_eq!(job("compile").scheduling, Some(Scheduling::Stage));
+        assert_eq!(job("compile").needs, Some(vec![]));
+        assert_eq!(job("lint").needs, Some(vec!["compile".to_owned()]));
+        // Not in the map: unknown, never "needs nothing".
+        assert_eq!(job("production").scheduling, None);
+        assert_eq!(job("production").needs, None);
+    }
+
+    #[test]
+    fn gitlab_needs_cache_evicts_the_least_recently_used_pipeline() {
+        let key = |id: u64| ("gitlab.example".to_owned(), "team/repo".to_owned(), id);
+        let mut cache = NeedsCache::new();
+        for id in 0..NEEDS_CACHE_SIZE as u64 {
+            needs_cache_insert(&mut cache, key(id), Default::default());
+        }
+        // Reading pipeline 0 keeps it; the next insert drops pipeline 1 instead.
+        assert!(needs_cache_hit(&mut cache, &key(0)).is_some());
+        needs_cache_insert(&mut cache, key(999), Default::default());
+        assert_eq!(cache.len(), NEEDS_CACHE_SIZE);
+        assert!(needs_cache_hit(&mut cache, &key(0)).is_some());
+        assert!(needs_cache_hit(&mut cache, &key(1)).is_none());
+    }
+
+    #[test]
+    fn a_stored_job_without_scheduling_or_needs_still_decodes_and_writes_neither() {
+        let mut detail = parse_detail(&detail_fixture(), &test_context(), "pipelines.get").unwrap();
+        let job = detail.stages.as_mut().unwrap()[0].groups[0].jobs[0].clone();
+        let stored = serde_json::to_value(&job).unwrap();
+        assert!(stored.get("needs").is_none() && stored.get("scheduling").is_none());
+        let decoded: Job = serde_json::from_value(stored).unwrap();
+        assert_eq!(decoded, job);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1486,5 +1790,197 @@ esac"#,
             moved_on.message,
             "This job can't be retried now. Refresh to see its status."
         );
+    }
+
+    const NEEDS_GLAB: &str = r#"while [ "$1" != --input ]; do shift; done
+cp "$2" q.json
+if grep -q PipelinesGitLabNeeds q.json; then
+  echo "needs $(grep -o '"after":[^,}]*' q.json)" >> calls
+  if [ -f fail_once ]; then rm fail_once; printf 'HTTP/2 200 OK\r\n\r\nnot json'; exit 0; fi
+  if [ -f missing ]; then printf 'HTTP/2 200 OK\r\n\r\n{"errors":[{"message":"Field schedulingType doesn'"'"'t exist on type CiJob"}]}'; echo "glab: Field schedulingType doesn't exist on type CiJob" >&2; exit 1; fi
+  if grep -q '"after":null' q.json; then page=1; elif grep -q '"after":"p2"' q.json; then page=2; else page=3; fi
+  printf 'HTTP/2 200 OK\r\n\r\n'; cat needs$page.json
+else
+  echo detail >> calls
+  printf 'HTTP/2 200 OK\r\n\r\n'; cat detail.json
+fi"#;
+
+    fn needs_sandbox(name: &str, pages: [Value; 3]) -> (TestSandbox, GitLabHost) {
+        let s = TestSandbox::new(name);
+        std::fs::write(
+            s.path("detail.json"),
+            include_str!("../../../tests/fixtures/pull_requests/gitlab_pipeline_detail.json"),
+        )
+        .unwrap();
+        for (index, page) in pages.iter().enumerate() {
+            std::fs::write(s.path(format!("needs{}.json", index + 1)), page.to_string()).unwrap();
+        }
+        let glab = s.executable_script("glab", NEEDS_GLAB, "");
+        let host = GitLabHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands("missing-gh", &glab, "git"),
+        ));
+        (s, host)
+    }
+
+    fn page(jobs: Value, next: Option<&str>) -> Value {
+        json!({"data": {"project": {"pipeline": {"jobs": {
+            "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next},
+            "nodes": jobs,
+        }}}}})
+    }
+
+    fn dag(name: &str, needs: &[&str]) -> Value {
+        let needs: Vec<Value> = needs.iter().map(|need| json!({"name": need})).collect();
+        json!({"name": name, "schedulingType": "dag", "needs": {"nodes": needs}})
+    }
+
+    /// Every job the fixture displays, spread over three pages.
+    fn fixture_pages() -> [Value; 3] {
+        [
+            page(
+                json!([dag("compile", &[]), dag("rspec 1/3", &["compile"])]),
+                Some("p2"),
+            ),
+            page(
+                json!([dag("lint", &[]), {"name": "downstream", "schedulingType": "stage", "needs": {"nodes": []}}]),
+                Some("p3"),
+            ),
+            page(
+                json!([dag("rspec 2/3", &["compile"]), dag("rspec 3/3", &["compile"]),
+                    {"name": "production", "schedulingType": "later", "needs": {"nodes": []}}]),
+                Some("p4"),
+            ),
+        ]
+    }
+
+    fn jobs(detail: &Detail) -> Vec<Job> {
+        detail
+            .stages
+            .iter()
+            .flatten()
+            .flat_map(|stage| &stage.groups)
+            .flat_map(|group| group.jobs.clone())
+            .collect()
+    }
+
+    fn calls(s: &TestSandbox) -> Vec<String> {
+        std::fs::read_to_string(s.path("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The needs read pages until every displayed job is found, then the
+    /// pipeline's needs come from the cache.
+    #[tokio::test]
+    async fn gitlab_needs_read_once_per_pipeline_until_every_shown_job_is_found() {
+        let (s, host) = needs_sandbox("pipelines-needs", fixture_pages());
+        let c = CancellationToken::new();
+        for _ in 0..2 {
+            let detail = host
+                .detail(&scope(&s), &test_context(), 4821, None, &c)
+                .await
+                .unwrap();
+            let jobs = jobs(&detail);
+            let job = |name: &str| jobs.iter().find(|job| job.name == name).unwrap().clone();
+            assert_eq!(job("rspec 2/3").scheduling, Some(Scheduling::Dag));
+            assert_eq!(job("rspec 2/3").needs, Some(vec!["compile".to_owned()]));
+            assert_eq!(job("downstream").scheduling, Some(Scheduling::Stage));
+            assert_eq!(job("production").needs, None);
+        }
+        assert_eq!(
+            calls(&s),
+            [
+                "detail",
+                "needs \"after\":null",
+                "needs \"after\":\"p2\"",
+                "needs \"after\":\"p3\"",
+                "detail"
+            ]
+        );
+    }
+
+    /// Two hosts can serve a repository of the same path with the same id.
+    #[tokio::test]
+    async fn gitlab_needs_cache_keeps_hosts_apart() {
+        let (s, host) = needs_sandbox("pipelines-needs-hosts", fixture_pages());
+        let c = CancellationToken::new();
+        let other = HostScope {
+            host: "GitLab.Other.example".into(),
+            ..scope(&s)
+        };
+        host.detail(&scope(&s), &test_context(), 4821, None, &c)
+            .await
+            .unwrap();
+        host.detail(&other, &test_context(), 4821, None, &c)
+            .await
+            .unwrap();
+        let needs_reads = calls(&s)
+            .iter()
+            .filter(|call| call.starts_with("needs"))
+            .count();
+        assert_eq!(needs_reads, 6);
+    }
+
+    /// A failed needs read leaves the jobs unknown and is tried again; an
+    /// older GitLab without the fields is not asked again.
+    #[tokio::test]
+    async fn gitlab_needs_failure_leaves_jobs_unknown_and_retries_while_missing_fields_stop() {
+        let (s, host) = needs_sandbox("pipelines-needs-fail", fixture_pages());
+        let c = CancellationToken::new();
+        std::fs::write(s.path("fail_once"), "").unwrap();
+        let first = host
+            .detail(&scope(&s), &test_context(), 4821, None, &c)
+            .await
+            .unwrap();
+        assert!(
+            jobs(&first)
+                .iter()
+                .all(|job| job.needs.is_none() && job.scheduling.is_none())
+        );
+        let second = host
+            .detail(&scope(&s), &test_context(), 4821, None, &c)
+            .await
+            .unwrap();
+        assert!(jobs(&second).iter().any(|job| job.needs.is_some()));
+
+        let (s, host) = needs_sandbox("pipelines-needs-missing", fixture_pages());
+        std::fs::write(s.path("missing"), "").unwrap();
+        for _ in 0..2 {
+            let detail = host
+                .detail(&scope(&s), &test_context(), 4821, None, &c)
+                .await
+                .unwrap();
+            assert!(jobs(&detail).iter().all(|job| job.needs.is_none()));
+        }
+        assert_eq!(
+            calls(&s)
+                .iter()
+                .filter(|call| call.starts_with("needs"))
+                .count(),
+            1
+        );
+    }
+
+    /// Pages that never name the shown jobs stop at the cap, leaving them unknown.
+    #[tokio::test]
+    async fn gitlab_needs_read_stops_at_its_page_cap() {
+        let elsewhere = page(json!([dag("other", &[])]), Some("p9"));
+        let (s, host) = needs_sandbox(
+            "pipelines-needs-cap",
+            [elsewhere.clone(), elsewhere.clone(), elsewhere],
+        );
+        let c = CancellationToken::new();
+        let detail = host
+            .detail(&scope(&s), &test_context(), 4821, None, &c)
+            .await
+            .unwrap();
+        assert!(jobs(&detail).iter().all(|job| job.needs.is_none()));
+        let needs_reads = calls(&s)
+            .iter()
+            .filter(|call| call.starts_with("needs"))
+            .count();
+        assert_eq!(needs_reads, NEEDS_MAX_PAGES);
     }
 }

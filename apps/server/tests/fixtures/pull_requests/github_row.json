@@ -10,7 +10,7 @@
   "url": "https://github.com/mubeda/BibCode/pull/14",
   "headRefName": "feature",
   "baseRefName": "main",
-  "author": { "login": "mubeda", "name": "" },
+  "author": { "login": "test-user", "name": "" },
   "labels": [{ "name": "bug", "color": "d73a4a", "description": "Bug fix" }],
   "reviewDecision": "",
   "statusCheckRollup": [

@@ -1,6 +1,11 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
-import { EnvironmentId, ThreadId, type VcsStatusResult } from "@bibcode/contracts";
+import {
+  EnvironmentId,
+  GitSignInRequiredError,
+  ThreadId,
+  type VcsStatusResult,
+} from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import type { Dispatch, ReactElement, SetStateAction } from "react";
@@ -108,6 +113,7 @@ const testState = vi.hoisted(() => ({
   clearDraft: vi.fn(),
   runAction: vi.fn(),
   runPull: vi.fn(),
+  signInOffer: vi.fn(),
   runStage: vi.fn(),
   runUnstage: vi.fn(),
   runDiscard: vi.fn(),
@@ -277,6 +283,16 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("react/compiler-runtime", () => ({
   c: hooks.useMemoCache,
+}));
+
+vi.mock("~/components/gitSignIn/useGitSignInFlow", () => ({
+  useGitSignInFlow: () => ({
+    state: null,
+    offer: testState.signInOffer,
+    approve: vi.fn(),
+    decline: vi.fn(),
+    cancel: vi.fn(),
+  }),
 }));
 
 vi.mock("@effect/atom-react", () => ({
@@ -918,6 +934,80 @@ describe("SourceControlPanel", () => {
     expect(captured.createPullRequest).toBeNull();
   });
 
+  const failPushWithSignIn = () =>
+    testState.runAction.mockImplementationOnce(
+      async (input: { actionId: string; onProgress: (event: Record<string, unknown>) => void }) => {
+        input.onProgress({
+          actionId: input.actionId,
+          cwd: "/repo",
+          action: "push",
+          kind: "action_failed",
+          phase: "push",
+          message: "Authentication failed.",
+          signIn: {
+            remote: "origin",
+            destination: "https://gitlab.test/team/repo.git",
+            host: "gitlab.test",
+            direction: "push",
+            resume: { actionId: input.actionId, cwd: "/repo", action: "push" },
+          },
+        });
+        return AsyncResult.failure(Cause.fail(new Error("Authentication failed.")));
+      },
+    );
+
+  it("opens the merge request review after a sign-in resumes its publishing push (#325)", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    failPushWithSignIn();
+    const props = buildProps();
+    render(props);
+    buttonsByText("Push & create MR")[0]?.onClick?.();
+    await flushPromises();
+    render(props);
+    expect(captured.createPullRequest).toBeNull();
+    for (const effect of hooks.effects) effect();
+    const offer = testState.signInOffer.mock.calls.at(-1)?.[0] as { onSignedIn: () => void };
+    offer.onSignedIn();
+    await flushPromises();
+    render(props);
+    expect(testState.runAction).toHaveBeenCalledTimes(2);
+    expect(testState.runAction).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: "push" }),
+    );
+    expect(captured.createPullRequest).toMatchObject({
+      open: true,
+      scope: { environmentId: props.threadRef.environmentId, cwd: props.gitCwd },
+    });
+  });
+
+  it("keeps the review closed when a sign-in resumes a plain push", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    failPushWithSignIn();
+    const props = buildProps();
+    render(props);
+    const push = captured.menuItems.find((item) => flattenText(item.children) === "Push");
+    expect(push).toBeDefined();
+    push?.onClick?.();
+    await flushPromises();
+    for (const effect of hooks.effects) effect();
+    const offer = testState.signInOffer.mock.calls.at(-1)?.[0] as { onSignedIn: () => void };
+    offer.onSignedIn();
+    await flushPromises();
+    render(props);
+    expect(testState.runAction).toHaveBeenCalledTimes(2);
+    expect(captured.createPullRequest).toBeNull();
+  });
+
   it("uses the shared workspace guard instead of starting Git work", () => {
     const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
     const markup = render(buildProps({ workspaceUnavailable: reason }));
@@ -1275,6 +1365,116 @@ describe("SourceControlPanel", () => {
     pullItem?.onClick?.();
     await flushPromises();
     expect(testState.toast.close).toHaveBeenCalledWith("toast-1");
+  });
+
+  it("offers Cancel while pulling and says nothing was pulled after it", async () => {
+    testState.statusQuery.data = stagingStatus({
+      behindCount: 3,
+      workingTree: {
+        files: [
+          { path: "src/a.ts", insertions: 0, deletions: 0, status: "modified", area: "staged" },
+        ],
+        insertions: 0,
+        deletions: 0,
+      },
+    });
+    let signal: AbortSignal | undefined;
+    testState.runPull.mockImplementationOnce(async (options: { signal: AbortSignal }) => {
+      signal = options.signal;
+      return AsyncResult.failure(Cause.interrupt(1));
+    });
+    render(buildProps());
+    menuItemByText("Pull")?.onClick?.();
+    const loading = testState.toast.add.mock.calls.at(-1)?.[0] as {
+      actionProps?: { children: string; onClick: () => void };
+    };
+    expect(loading.actionProps?.children).toBe("Cancel");
+    loading.actionProps?.onClick();
+    await flushPromises();
+    expect(signal?.aborted).toBe(true);
+    expect(testState.toast.update).toHaveBeenLastCalledWith(
+      "toast-1",
+      expect.objectContaining({ type: "info", title: "Pull cancelled" }),
+    );
+  });
+
+  it("hands a pull that Git Credential Manager refused to the sign-in approval", async () => {
+    testState.statusQuery.data = stagingStatus({
+      behindCount: 3,
+      workingTree: {
+        files: [
+          { path: "src/a.ts", insertions: 0, deletions: 0, status: "modified", area: "staged" },
+        ],
+        insertions: 0,
+        deletions: 0,
+      },
+    });
+    testState.runPull.mockResolvedValueOnce(
+      AsyncResult.failure(
+        Cause.fail(
+          new GitSignInRequiredError({
+            remote: "origin",
+            destination: "https://github.com/owner/repo.git",
+            host: "github.com",
+            direction: "fetch",
+            resume: { cwd: "/repo", expectedDestination: "https://github.com/owner/repo.git" },
+            message: "Git Credential Manager needs you to sign in before Git can pull.",
+          }),
+        ),
+      ),
+    );
+    render(buildProps());
+    menuItemByText("Pull")?.onClick?.();
+    await flushPromises();
+    expect(testState.toast.close).toHaveBeenCalledWith("toast-1");
+    expect(testState.toast.update).not.toHaveBeenCalledWith(
+      "toast-1",
+      expect.objectContaining({ title: "Pull failed" }),
+    );
+    expect(testState.signInOffer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: GIT_CWD,
+        offer: expect.objectContaining({
+          remote: "origin",
+          destination: "https://github.com/owner/repo.git",
+          direction: "fetch",
+        }),
+      }),
+    );
+  });
+
+  it("shows Cancel only in the push phase and keeps the commit when it is used", async () => {
+    let signal: AbortSignal | undefined;
+    testState.runAction.mockImplementationOnce(
+      async (input: {
+        actionId: string;
+        signal: AbortSignal;
+        onProgress: (event: Record<string, unknown>) => void;
+      }) => {
+        signal = input.signal;
+        const base = { actionId: input.actionId, cwd: "/repo", action: "commit_push" };
+        input.onProgress({
+          ...base,
+          kind: "phase_started",
+          phase: "commit",
+          label: "Committing...",
+        });
+        input.onProgress({ ...base, kind: "phase_started", phase: "push", label: "Pushing..." });
+        return AsyncResult.failure(Cause.interrupt(1));
+      },
+    );
+    render(buildProps());
+    buttonsByText("Commit (1)")[0]?.onClick?.();
+    await flushPromises();
+    const updates = testState.toast.update.mock.calls.map(
+      (call) => call[1] as { title?: string; actionProps?: { onClick: () => void } },
+    );
+    const committing = updates.find((update) => update.title === "Committing...");
+    const pushing = updates.find((update) => update.title === "Pushing...");
+    expect(committing?.actionProps).toBeUndefined();
+    expect(pushing?.actionProps).toBeDefined();
+    pushing?.actionProps?.onClick();
+    expect(signal?.aborted).toBe(true);
   });
 
   it("asks for confirmation before pushing the default branch", async () => {

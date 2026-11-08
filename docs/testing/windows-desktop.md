@@ -389,12 +389,27 @@ pass. A fixture whose repository production Git reads (a revert, a checkpoint,
 a worktree removal) pins `core.autocrlf=false` in the repository's own
 configuration, because the test's `IsolatedGitConfig` reaches only the commands
 the fixture runs itself. The pin is still required: the packaged app's Git reads
-the system line-ending keys
-([Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
-but test servers never install that policy and keep `GIT_CONFIG_NOSYSTEM=1`,
-while checkpoints read the full system configuration. The repository pin beats
-both. `apps/server/tests/git_system_line_endings.rs` covers the policy with a
-fixture `GIT_CONFIG_SYSTEM` file, never the host's.
+a curated subset of the system configuration (line endings, `core.symlinks`,
+`core.fscache`, `core.longpaths`, a recognized LFS filter, well-known credential
+helpers and the TLS keys;
+[Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
+but test servers never install that policy, so `git_environment()` keeps
+`GIT_CONFIG_NOSYSTEM=1` while checkpoints read the full system configuration
+with hooks off. The repository pin beats both.
+`apps/server/tests/git_system_config.rs` covers the policy with a fixture
+`GIT_CONFIG_SYSTEM` file and a compiled fake `git-lfs`, never the host's.
+
+Two native checks need Git for Windows with its default system LFS filter and
+Git Credential Manager, and go in the execution report:
+
+1. Revert a thread in a repository with an LFS-tracked file across turns that
+   changed it. The file comes back with its real content, not pointer text.
+2. Start a worktree thread from a private HTTPS repository's freshly fetched
+   base branch with LFS files, once with `http.sslBackend=schannel` and once
+   with `openssl`. The bootstrap fetch authenticates with the stored credential
+   and no window opens, and the worktree holds real LFS content. Remove the
+   credential from Git Credential Manager and repeat: the fetch fails with an
+   authentication error in the work log, and still no window opens.
 
 `bibcode-server` library tests run on a Windows development machine, and these
 Windows behaviors decide how a fixture is written:
@@ -907,6 +922,23 @@ values:
   survivor's parent (`Get-CimInstance Win32_Process`).
 - **WebView.** The desktop client's WebView2 runtime version, and whether it
   showed video or still images with the "Video isn't available" reason.
+
+## Git sign-in (#325)
+
+Run on Windows 11 with Git for Windows and Git Credential Manager (GCM), and no stored credential for a private HTTPS repository. The steps are checks 14 to 18 of the
+[sign-in design](../plans/2026-11-07-git-manager-interactive-sign-in-design.md#tests).
+
+1. Git Manager **Fetch** shows the approval naming the right host and remote.
+   **Sign in** opens GCM's window. Finishing it completes the fetch, and a second
+   fetch needs no sign-in.
+2. Repeat for **Push** and for Source Control commit and push. **Cancel** while the
+   window is open closes the attempt; leaving it for 10 minutes times out with
+   nothing fetched or pushed.
+3. The same fetch from the `/mcp` `git_fetch` tool, a WSL server and a paired
+   browser fail with the authentication error and open no window.
+4. Record whether GCM's refusal reaches Git's stderr at the start of a line and
+   whether `ls-remote` and the dry-run push store the credential. If either
+   differs, file an issue: the detection or the probe must change.
 
 ## Process and Job cleanup
 

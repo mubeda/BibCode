@@ -74,8 +74,7 @@ mod tests {
         ] {
             let identity = repository_identity(remote, "/work/repo").expect(remote);
             assert_eq!(
-                identity["canonicalKey"],
-                "gitlab.example.test/example-group/sample-server",
+                identity["canonicalKey"], "gitlab.example.test/example-group/sample-server",
                 "{remote}"
             );
             assert_eq!(identity["name"], "sample-server");

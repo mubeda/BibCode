@@ -101,6 +101,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
+        | "git.signIn"
         | "gitManager.commit"
         | "gitManager.discard"
         | "gitManager.discardPartial"
@@ -122,6 +123,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "uploads.get"
         | "uploads.cancel"
         | "orchestration.dispatchCommand"
+        // The revert preview runs `git add` into a temporary index, which runs the repository's
+        // clean filters, so it needs the scope a revert itself needs (#279).
+        | "orchestration.previewCheckpointRevert"
         | "preview.claimOpenRequest"
         | "preview.close"
         | "preview.gatewayOpen"
@@ -442,6 +446,7 @@ mod tests {
             "gitManager.discard",
             "gitManager.discardPartial",
             "gitManager.runOperation",
+            "git.signIn",
             "gitManager.stagePartial",
             "gitManager.undoCommit",
             "gitManager.unstagePartial",

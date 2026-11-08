@@ -429,6 +429,14 @@ impl RpcSessionContext {
     /// The paired-client metadata of this connection's session, for audit and host
     /// notices. `None` on an unauthenticated server or for an unknown session.
     pub(crate) async fn current_client_metadata(&self) -> Option<ClientMetadata> {
+        self.current_client_session()
+            .await
+            .map(|session| session.client)
+    }
+
+    /// This connection's session as Authorized clients lists it. `None` on an
+    /// unauthenticated server or for an unknown session.
+    pub(crate) async fn current_client_session(&self) -> Option<crate::auth::ClientSessionView> {
         let (Some(principal), Some(auth)) = (&self.principal, &self.auth) else {
             return None;
         };
@@ -436,7 +444,6 @@ impl RpcSessionContext {
             .await
             .into_iter()
             .find(|client| client.current)
-            .map(|client| client.client)
     }
 
     pub(crate) fn connection_id(&self) -> uuid::Uuid {

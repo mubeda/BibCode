@@ -959,7 +959,7 @@ export const PipelinesDetail = Schema.Struct({
     ),
   ),
   truncated: Schema.Boolean, // GitLab: a group over 100 jobs; GitHub: a run over 1,000 jobs
-  usesNeeds: Schema.Boolean, // reserved for the deferred dependencies view
+  usesNeeds: Schema.Boolean, // jobs then carry `scheduling` and `needs` when known (#322)
   artifacts: Schema.Array(PipelinesArtifact), // GitHub run artifacts; empty on GitLab (per job there)
 });
 export const PipelinesJobInput = Schema.Struct({
@@ -1179,6 +1179,33 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
 - **Toolbar:** tabs All, Running, Finished; a Branch combobox (the project's
   branches from the existing git catalog, free text accepted); on GitHub a
   Workflow select. Refresh lives in the module header.
+- **Columns (issue #285):** one CSS grid shared by a header row (outside the
+  scrolling list, `role="table"` with `columnheader`s) and every 64 px row,
+  defined once on the list root as four custom properties
+  (`--pipelines-grid-narrow|compact|medium|full`) from container-query steps
+  of the list root. Fitting order as the panel narrows: ≥ 1100 px all five
+  columns, with Pipeline capped at its width (the rest of the row stays empty
+  at the end); ≥ 900 px Created by hides; ≥ 720 px Stages folds to 64 px
+  (icons that do not fit become a "+N" count, the hidden stages stay in the
+  accessibility tree as screen-reader-only items); below 720 px Status folds to
+  its icon. Actions has a fixed 104 px track, so rows with and without Retry
+  or Cancel align. Pipeline, Created by and Stages resize at ≥ 1100 px through
+  vertical separators in the header (8 px hit area, arrow keys, Home, End,
+  double-click reset), each a `useResizableWidth` stored per repository under
+  `bibcode:pipelines-list-<column>-width:<host>/<repository>` (issue #321) and
+  painted through the custom property, so a drag re-renders no row. A
+  repository with no width of its own, or a corrupt one, starts from the
+  global key (#285's single setting, now only read) and then the built-in
+  default; stored values are clamped to the column's bounds. Pipeline, Created by and Stages
+  tracks are `minmax(min, width)`, so widths that add up to more than the
+  panel shrink toward their minimums and Actions always stays inside the row.
+  A header menu hides Created by, Stages or the duration and age text under
+  Status (`bibcode:pipelines-list-hidden-columns:<host>/<repository>`, with
+  the same global fallback). The list root is keyed by the repository, so a
+  switch reads the other repository's choice. The table carries
+  `aria-rowcount` (the host's total plus the header, or -1 when capped) and
+  each row `aria-rowindex` (header is 1). Not built: sorting (the list input
+  has no sort field and GitLab and GitHub order the pages).
 - **Row, wide (≥ 720 px panel):** Status (shared icon plus label, duration
   `4m 12s`, and age "2 hours ago" with the absolute time as its title),
   Pipeline (title on the first line; `#4821` link, ref with a branch, tag or
@@ -1225,8 +1252,56 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   duration and queued time. Retry, Cancel, "Retry failed jobs" (GitHub) and
   "Open on GitLab/GitHub" on the right. GitHub shows an Attempt select when
   `attempt > 1`.
-- **Stages:** columns in GitLab's order, horizontally scrollable on wide
-  panels, stacked on narrow ones. A column has the stage icon, name and
+- **Stages:** columns in GitLab's order, stacked on narrow panels. From
+  720 px of page width each column grows from 256 px up to one shared
+  maximum (default 480 px, 256 to 960 px) and the row scrolls sideways only
+  when the stages at 256 px do not fit (issue #286). The maximum is set with
+  one separator on the first column (same primitive as the list's header
+  separators, `shared/PipelineColumnSeparator.tsx`), stored globally under
+  `bibcode:pipelines-stage-width` and painted as `--pipeline-stage-max`.
+  A job name wraps while its stage column is wider than the minimum and
+  truncates (with its full name as the tooltip) only at 256 px. A **Wrap
+  stages** toggle above the wide row (issue #322, `aria-pressed`, stored
+  globally under `bibcode:pipelines-stage-wrap`, a corrupt value reads as off)
+  swaps the row's sideways scroll for `flex-wrap`, so stages that do not fit at
+  256 px move to more rows; it is hidden below 720 px, where stages stack.
+- **Job dependencies (issue #322, design
+  `docs/plans/2026-11-07-pipelines-job-needs-design.md`):** on a GitLab
+  pipeline with `usesNeeds`, jobs carry `scheduling` (GitLab
+  `schedulingType`, `dag` or `stage`) and `needs` (job names), both optional
+  and null when unknown. `GitLabHost::detail` reads them with a separate
+  `PipelinesGitLabNeeds` query, paged until every displayed job is found
+  (at most 40 pages of 50), once per pipeline: an in-memory cache keyed by
+  lowercased host, repository and pipeline id holds the 64 most recently used
+  pipelines, so poller ticks add no reads. A failed read leaves every job
+  unknown and retries on the next read; a GitLab without the fields (an
+  unknown-field answer, which `glab` reports with a nonzero exit) is not asked
+  again. A job missing from
+  the read stays unknown. When some job's scheduling is known, a **Group jobs
+  by** select (Stage, Job dependencies; `bibcode:pipelines-job-grouping`)
+  sits before **Wrap stages**. Job dependencies lays jobs out in "Layer n"
+  columns: a `dag` job one layer after the latest job it needs, a `stage` or
+  unknown job one layer after every job of the earlier stages; a parallel
+  group whose jobs land in different layers is split across them. Each job
+  row shows "Needs: a, b" in either grouping.
+- **Inline job log (issue #322):** on the pipeline page a plain click on a job
+  row opens that job's log in a panel beside the stages
+  (`detail/PipelineJobLogPanel.tsx`); a modified or middle click still opens
+  the job page, whose link the row keeps. `PipelineLinks.selectJob` carries
+  the click, so a view without a panel (the merge request tab) keeps links.
+  The selection is the pipeline route's `?job=`: opening or closing a log is a
+  history step, so Back undoes it and a copied link reopens it; switching from
+  one log to another replaces the step.
+  The panel reads the job once (`pipelines.getJob`, for the attempt, erasure
+  and raw log link), takes status from the page's polled detail, and picks its
+  log with the job page's `jobLogSource`. Header: status, name, **Open job
+  page**, **Close**; then the log's toolbar, lines and status. A line link
+  opens the job page at that line (`?at=`). Focus moves to the panel heading
+  on open; Close or an unclaimed Escape closes it and focuses the job's row,
+  which carries `aria-current`. From 960 px of page width the page stops
+  scrolling as a whole: the stages column and the 45 % log column scroll on
+  their own; below that the log sits under the stages at 70 vh. Details,
+  steps and job actions stay on the job page. A column has the stage icon, name and
   job count; a job row is a full-width link to the job route: icon, name,
   duration, and one trailing action (Retry, Cancel or Play). A parallel group
   (`size > 1`) is one row "rspec 3" that expands to its jobs. A trigger job
@@ -1708,8 +1783,10 @@ methods, setting and fields.
   `##[group]` and `##[error]`, a chunk boundary in the middle of an escape
   sequence and of a line.
 - **Load:** a generated 100,000-line, 8 MiB fixture with sections and colors
-  parses in the worker within a recorded bound (measured on CI hardware, gate
-  at twice the measurement), and the mounted log renders fewer than 200 row
+  parses in time linear in its size: the fastest parse of the whole fixture
+  takes under eight times the fastest parse of its first quarter (about four
+  when linear, sixteen when quadratic), with no wall-clock bound, so machine
+  load cannot fail it (#319); the mounted log renders fewer than 200 row
   elements; scrolling to the end and searching a term with 5,000 matches keep
   the main thread free of tasks over 50 ms (browser test with a long-task
   observer).
@@ -2009,6 +2086,7 @@ recommended answer. Earlier questions 13 and 14 are now Engineering decisions
    a "Group jobs by: Stage / Job dependencies" switch when `usesNeeds`.
    **Recommended: (a)**; it is a second GraphQL read and a layered layout, and
    the stage view answers "what failed". `usesNeeds` is already on the wire.
+   Built later as (b) under issue #322 (see Job dependencies above).
 7. **Artifacts.** (a) Host web links only: GitLab job artifacts with
    Download and Browse links on the job page; GitHub run artifacts listed on
    the pipeline and job pages, each opening the run's page on GitHub; no

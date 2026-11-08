@@ -97,6 +97,7 @@ mod telemetry {
             request.operation
         );
         for (key, value) in [
+            ("GCM_INTERACTIVE", "never"),
             ("GIT_TERMINAL_PROMPT", "0"),
             ("GIT_ASKPASS", ""),
             ("SSH_ASKPASS_REQUIRE", "never"),

@@ -290,6 +290,24 @@ impl Drop for ManualFullProviderRefresh {
     }
 }
 
+/// Probes providers and tools together, so startup waits for the slowest tool version probe
+/// rather than the sum of them. Provider order is unchanged.
+async fn probe_startup_inventory(
+    settings: &Value,
+    cwd: &Path,
+    provider_maintenance: &ProviderMaintenance,
+    tools: &ToolMaintenance,
+) -> Vec<Value> {
+    let (providers, ()) = tokio::join!(
+        provider_inventory::probe(settings, None, cwd, provider_maintenance),
+        tools.refresh(update_checks_enabled(settings), cwd),
+    );
+    providers
+        .into_iter()
+        .map(|result| result.snapshot)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeServerControl {
     config: ServerConfig,
@@ -405,12 +423,7 @@ impl NativeServerControl {
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
         let provider_maintenance = ProviderMaintenance::new();
-        let providers = provider_inventory::probe(&settings, None, &cwd, &provider_maintenance)
-            .await
-            .into_iter()
-            .map(|result| result.snapshot)
-            .collect();
-        let providers = Arc::new(RwLock::new(providers));
+        let providers = Arc::new(RwLock::new(Vec::new()));
         let (config_events, _) = broadcast::channel(32);
         let tools = ToolMaintenance::new(
             ToolSetup::production(provider_maintenance.clone(), state_directory.clone()),
@@ -419,7 +432,9 @@ impl NativeServerControl {
                 events: config_events.clone(),
             },
         );
-        tools.refresh(update_checks_enabled(&settings), &cwd).await;
+        // Nothing subscribes yet, so the tools' publish during startup reaches no one.
+        *providers.write().await =
+            probe_startup_inventory(&settings, &cwd, &provider_maintenance, &tools).await;
         Self {
             config,
             auth_descriptor,
@@ -2818,6 +2833,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookBearerToken": true,
         "webhookStatusKinds": true,
         "sideChats": true,
+        "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
     // A flag is advertised only when every method it promises is registered.
@@ -3050,6 +3066,13 @@ mod tests {
         let executable =
             release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
         let fixture = compiled_cursor_update_fixture().await;
+        // On macOS the first exec of a new file waits for a system check, which a loaded host
+        // can hold back past a probe's 10 s timeout or for good (#335). A hard link is the
+        // compiled file, which has run once already. Nothing writes to it: on macOS, an exec
+        // of a file another process holds open for writing is killed.
+        #[cfg(target_os = "macos")]
+        std::fs::hard_link(&fixture.executable, &executable).expect("link Cursor fixture");
+        #[cfg(not(target_os = "macos"))]
         crate::test_support::executable_fixture::copy_executable(&fixture.executable, &executable);
         executable
     }
@@ -3061,31 +3084,53 @@ mod tests {
     static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
         OnceCell::const_new();
 
-    async fn run_compiled_cursor_update_fixture(
+    /// Runs a test fixture, relaunching a run that has not finished in 10 s. Under load, macOS
+    /// can leave the first exec of a new file launched-suspended for good: the process never
+    /// runs its first instruction (`vmmap` reports it launched-suspended), and only a new launch
+    /// gets past it (#329). Every fixture command run here is idempotent, so a relaunch is safe.
+    async fn run_fixture(
         executable: &Path,
         argument: &str,
     ) -> std::io::Result<std::process::Output> {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match tokio::process::Command::new(executable)
-                    .arg(argument)
-                    .output()
-                    .await
-                {
-                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = tokio::time::timeout_at(deadline, async {
+                loop {
+                    match tokio::process::Command::new(executable)
+                        .arg(argument)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        result => return result,
                     }
-                    result => return result,
+                }
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fixture did not become executable",
+                )
+            })??;
+            let attempt = tokio::time::Instant::now() + Duration::from_secs(10);
+            match tokio::time::timeout_at(attempt.min(deadline), child.wait_with_output()).await {
+                Ok(output) => return output,
+                // Dropping the unfinished wait kills the child.
+                Err(_) if tokio::time::Instant::now() < deadline => {}
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fixture did not finish",
+                    ));
                 }
             }
-        })
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "compiled Cursor update fixture did not become executable",
-            )
-        })?
+        }
     }
 
     async fn compiled_cursor_update_fixture() -> &'static CompiledCursorUpdateFixture {
@@ -3112,6 +3157,10 @@ mod tests {
                     "compile Cursor update fixture: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
+                // The first exec of the new file is the slow one; take it here, with relaunch.
+                run_fixture(&executable, "about")
+                    .await
+                    .expect("first run of the compiled Cursor fixture");
                 CompiledCursorUpdateFixture {
                     _root: root,
                     executable,
@@ -3130,18 +3179,18 @@ mod tests {
             .await
             .expect("write next Cursor version");
 
-        let before = run_compiled_cursor_update_fixture(&executable, "about")
+        let before = run_fixture(&executable, "about")
             .await
             .expect("run Cursor about before update");
         assert_eq!(
             String::from_utf8_lossy(&before.stdout).trim(),
             r#"{"cliVersion":"2026.06.19-653a7fb"}"#
         );
-        let update = run_compiled_cursor_update_fixture(&executable, "update")
+        let update = run_fixture(&executable, "update")
             .await
             .expect("run Cursor update");
         assert!(update.status.success());
-        let after = run_compiled_cursor_update_fixture(&executable, "about")
+        let after = run_fixture(&executable, "about")
             .await
             .expect("run Cursor about after update");
         assert_eq!(
@@ -3150,7 +3199,26 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cursor_update_fixtures_are_the_compiled_file_that_already_ran() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("Cursor fixture directory");
+        let executable = write_cursor_update_fixture(directory.path()).await;
+        let compiled = compiled_cursor_update_fixture().await;
+        assert_eq!(
+            std::fs::metadata(&executable).expect("fixture").ino(),
+            std::fs::metadata(&compiled.executable)
+                .expect("compiled fixture")
+                .ino(),
+            "a copy is a new file, whose first exec a loaded host can hold back for good"
+        );
+    }
+
+    // Linux refuses the exec with ETXTBSY. macOS has no such error: it kills a process that
+    // runs a file another holds open for writing, so there is nothing to retry (#335).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn compiled_cursor_update_fixture_retries_a_busy_executable() {
         let directory = tempfile::tempdir().expect("Cursor fixture directory");
@@ -3165,7 +3233,7 @@ mod tests {
             drop(writable);
         });
 
-        let output = run_compiled_cursor_update_fixture(&executable, "about")
+        let output = run_fixture(&executable, "about")
             .await
             .expect("busy Cursor fixture becomes executable");
         assert!(output.status.success());
@@ -3255,6 +3323,82 @@ mod tests {
         control.tools = control.tools_with(setup);
         control.tools.refresh(true, sandbox.root()).await;
         (control, stub_state)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_runs_the_provider_and_tool_version_probes_concurrently() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("startup-probes");
+        let control = scheduler_control(&temp).await;
+        let (setup, stub, stub_state) = crate::production::tool_maintenance::tests::stub_setup(
+            &sandbox,
+            Duration::from_secs(5),
+        )
+        .await;
+        let log = stub_state.join("probe-log");
+        // Each probe logs its start, then waits for the other's before it logs its end. Probes
+        // that overlap end as soon as both have started, however late a loaded host starts the
+        // second (#329); serial probes give up after about 5 s, inside the 10 s probe timeout,
+        // and log start, end, start, end.
+        let rendezvous = format!(
+            "echo start >> '{log}'\n\
+             n=0\n\
+             while [ $n -lt 50 ]; do\n\
+             c=0; while read -r line; do [ \"$line\" = start ] && c=$((c + 1)); done < '{log}'\n\
+             [ $c -ge 2 ] && break\n\
+             sleep 0.1; n=$((n + 1))\n\
+             done\n\
+             echo end >> '{log}'\n",
+            log = log.display()
+        );
+        std::fs::write(stub_state.join("probe-hook"), &rendezvous).expect("probe hook");
+        let provider = sandbox.executable_script(
+            "overlapping-opencode",
+            &format!("case \"$1\" in --version) {rendezvous}echo 1.0.0;; esac"),
+            "",
+        );
+        let mut settings = control.settings.read().await.clone();
+        settings["providerInstances"]["opencode"]["config"]["binaryPath"] =
+            json!(provider.to_string_lossy());
+        let tools = control.tools_with(setup);
+        // The first exec of a new script waits for a system check that a loaded macOS host can
+        // hold back past the 10 s probe timeout (#335). Take it here, where a run relaunches; an
+        // argument that neither fixture knows makes each exit at once without logging.
+        for fixture in [&provider, &stub] {
+            run_fixture(fixture, "warm-up")
+                .await
+                .expect("first run of a probe fixture");
+        }
+
+        // A starved host can keep a probe's child from starting before the 10 s probe timeout
+        // ends it. A run in which either never started says nothing about overlap, so it is
+        // retried; serial probes still log a start, an end and a second start every time.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            std::fs::write(&log, "").expect("probe log");
+            probe_startup_inventory(
+                &settings,
+                sandbox.root(),
+                &control.provider_maintenance,
+                &tools,
+            )
+            .await;
+            events = std::fs::read_to_string(&log)
+                .expect("read probe log")
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if events.iter().filter(|event| *event == "start").count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 4, "both probes ran: {events:?}");
+        assert_eq!(
+            events[..2],
+            ["start", "start"],
+            "both started before either ended"
+        );
     }
 
     async fn until_exists(path: &Path) {
@@ -3560,23 +3704,41 @@ mod tests {
         .await
         .unwrap();
         let payload = json!({"instanceId":"codex","cwd":sandbox.root()});
-        let request = tokio::spawn(control.call(
-            "server.getProviderCapabilities",
-            payload.clone(),
-            CancellationToken::new(),
-        ));
-        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
-                    && let Ok(pid) = raw.parse()
-                {
-                    break pid;
+        // A starved host can keep the discovery child from starting until discovery's own 10 s
+        // probe timeout ends the request (#329). Such a request was never abandoned with a live
+        // child, so it is reissued; the 60 s bound is a hang guard, not a timing assertion.
+        let mut attempts = 0;
+        let (request, pid) = loop {
+            attempts += 1;
+            let _ = tokio::fs::remove_file(&pid_file).await;
+            let request = tokio::spawn(control.call(
+                "server.getProviderCapabilities",
+                payload.clone(),
+                CancellationToken::new(),
+            ));
+            let pid: Option<libc::pid_t> = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
+                        && let Ok(pid) = raw.parse()
+                    {
+                        break Some(pid);
+                    }
+                    if request.is_finished() {
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            })
+            .await
+            .expect("discovery child started");
+            match pid {
+                Some(pid) if !request.is_finished() => break (request, pid),
+                _ => assert!(
+                    attempts < 3,
+                    "no discovery child ran while its request was open"
+                ),
             }
-        })
-        .await
-        .expect("discovery child started");
+        };
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         tokio::time::timeout(

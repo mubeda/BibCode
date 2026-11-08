@@ -526,6 +526,30 @@ pub struct ClientPrincipal {
     pub resource: Option<String>,
     /// A person took this agent over (Take over); Hand back restores its ceiling.
     pub taken_over: bool,
+    /// What its `clientRequestId`s are remembered under: its named client's id (#280), else
+    /// `bibcode thread`'s label for that CLI's runs, else its session.
+    pub request_scope: String,
+    /// The named client (#280) this session is a run of.
+    pub named_client_id: Option<String>,
+}
+
+impl ClientPrincipal {
+    /// The scope of a session labelled `label`, a run of `named_client_id` when it has one.
+    #[must_use]
+    pub fn request_scope_of(
+        session_id: &str,
+        label: Option<&str>,
+        named_client_id: Option<&str>,
+    ) -> String {
+        // A `bibcode thread` run mints a credential of its own and revokes it on the way out,
+        // so its runs share one scope, as a named client's do.
+        named_client_id
+            .or_else(|| {
+                (label == Some(super::thread_cli::LABEL)).then_some(super::thread_cli::LABEL)
+            })
+            .unwrap_or(session_id)
+            .to_owned()
+    }
 }
 
 /// Progress notifications for one `tools/call`, sent on its own response stream.
@@ -712,11 +736,18 @@ impl McpControl {
             .as_deref()
             .and_then(McpAccess::parse)
             .unwrap_or(McpAccess::ReadOnly);
+        let request_scope = ClientPrincipal::request_scope_of(
+            &credential.principal.session_id,
+            credential.label.as_deref(),
+            credential.named_client_id.as_deref(),
+        );
         Some(ClientPrincipal {
             principal: credential.principal,
             ceiling,
             resource: credential.resource,
             taken_over: credential.taken_over,
+            request_scope,
+            named_client_id: credential.named_client_id,
         })
     }
 
@@ -848,8 +879,8 @@ impl McpControl {
         let session_id = principal.principal.session_id.as_str();
         let label = self.inner.auth.client_label(session_id).await;
         let _presence = self.inner.activity.call_started(session_id, label.clone());
-        let records_activity =
-            !spec.read_only && !super::activity::is_retry(self, session_id, arguments).await;
+        let records_activity = !spec.read_only
+            && !super::activity::is_retry(self, &principal.request_scope, arguments).await;
         let started = std::time::Instant::now();
         let call = ToolCall {
             control: self,
@@ -898,7 +929,16 @@ impl McpControl {
             tracing::debug!(tool = name, thread_id, duration_ms, "MCP tool call");
         }
         if records_activity {
-            super::activity::settle(self, session_id, label, &spec, arguments, &result).await;
+            super::activity::settle(
+                self,
+                session_id,
+                &principal.request_scope,
+                label,
+                &spec,
+                arguments,
+                &result,
+            )
+            .await;
         }
         result
     }
@@ -1059,6 +1099,9 @@ pub(crate) struct ToolCall<'a> {
 /// One `clientRequestId` of one client session, and the call it names.
 #[derive(Clone)]
 pub(crate) struct RequestKey {
+    /// [`ClientPrincipal::request_scope`]: what stored requests, outcomes and claims key on.
+    pub(crate) scope: String,
+    /// The calling session, for its owned slots and live controls.
     pub(crate) session_id: String,
     pub(crate) client_request_id: String,
     pub(crate) tool: String,
@@ -1244,6 +1287,7 @@ impl ToolCall<'_> {
         ))
         .map_err(|error| invalid_argument(&error))?;
         Ok(Some(RequestKey {
+            scope: self.principal.request_scope.clone(),
             session_id: self.principal.principal.session_id.clone(),
             client_request_id: client_request_id.to_owned(),
             tool: tool.to_owned(),
@@ -1262,7 +1306,7 @@ impl ToolCall<'_> {
             .transpose()
             .map_err(storage_failure)?;
         let RequestKey {
-            session_id,
+            scope,
             client_request_id,
             ..
         } = key.clone();
@@ -1274,29 +1318,18 @@ impl ToolCall<'_> {
             .database()
             .call(move |connection| {
                 let transaction = connection.transaction()?;
-                // A `bibcode thread` run mints a credential of its own and revokes it on the
-                // way out, so a retry from a new run could not find the first run's request:
-                // those credentials share one scope. Any other client's request belongs to
-                // its session.
-                let session_id: String = transaction
-                    .query_row(
-                        "SELECT CASE WHEN client_label = ?1 THEN ?1 ELSE session_id END FROM auth_sessions WHERE session_id = ?2",
-                        params![super::thread_cli::LABEL, session_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or(session_id);
                 if let Some(fresh_json) = fresh_json {
                     prune_request_rows(&transaction)?;
                     transaction.execute(
                         "INSERT OR IGNORE INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        params![session_id, client_request_id, tool, digest, fresh_json, now_iso()],
+                        params![scope, client_request_id, tool, digest, fresh_json, now_iso()],
                     )?;
                 }
                 let row = transaction
                     .query_row(
-                        "SELECT tool, arguments_digest, commands_json, state FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ?",
-                        params![session_id, client_request_id],
+                        // A row past its window is not replayed even before a prune removes it.
+                        "SELECT tool, arguments_digest, commands_json, state FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ? AND created_at >= ?",
+                        params![scope, client_request_id, request_row_cutoff()],
                         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
                     )
                     .optional()?;
@@ -1363,15 +1396,18 @@ pub(crate) fn idempotency_conflict() -> Value {
     )
 }
 
+/// Retry rows created before this instant are past their 24-hour window.
+pub(crate) fn request_row_cutoff() -> String {
+    (time::OffsetDateTime::now_utc() - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 /// Deletes retry rows past their 24-hour window.
 pub(crate) fn prune_request_rows(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let cutoff = (time::OffsetDateTime::now_utc()
-        - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
-    .format(&time::format_description::well_known::Rfc3339)
-    .unwrap_or_default();
     connection.execute(
         "DELETE FROM mcp_tool_requests WHERE created_at < ?",
-        [&cutoff],
+        [request_row_cutoff()],
     )?;
     Ok(())
 }

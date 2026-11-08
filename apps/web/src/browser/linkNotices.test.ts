@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-const add = vi.fn();
+import { UNREACHABLE_MESSAGES } from "./browserTargetResolver";
+import {
+  showFileOutsideWorkspaceNotice,
+  showLinkOpenFailedNotice,
+  showPreviewFailedNotice,
+  showPreviewUnreachableNotice,
+} from "./linkNotices";
+
+const { add } = vi.hoisted(() => ({ add: vi.fn() }));
 
 vi.mock("~/components/ui/toast", () => ({
   toastManager: { add },
@@ -10,9 +18,7 @@ vi.mock("~/components/ui/toast", () => ({
 describe("link notices", () => {
   beforeEach(() => add.mockReset());
 
-  it("explains why a preview address is unreachable and offers to copy it", async () => {
-    const { showPreviewUnreachableNotice } = await import("./linkNotices");
-    const { UNREACHABLE_MESSAGES } = await import("./browserTargetResolver");
+  it("explains why a preview address is unreachable and offers to copy it", () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { clipboard: { writeText } });
     showPreviewUnreachableNotice({
@@ -33,9 +39,8 @@ describe("link notices", () => {
     vi.unstubAllGlobals();
   });
 
-  it("offers the editor when a file can't be previewed", async () => {
+  it("offers the editor when a file can't be previewed", () => {
     const onOpenInEditor = vi.fn();
-    const { showPreviewFailedNotice } = await import("./linkNotices");
     showPreviewFailedNotice({ onOpenInEditor });
     const toast = add.mock.calls[0]![0];
     expect(toast).toMatchObject({
@@ -47,9 +52,8 @@ describe("link notices", () => {
     expect(onOpenInEditor).toHaveBeenCalledOnce();
   });
 
-  it("offers the editor for files outside the workspace", async () => {
+  it("offers the editor for files outside the workspace", () => {
     const onOpenInEditor = vi.fn();
-    const { showFileOutsideWorkspaceNotice } = await import("./linkNotices");
     showFileOutsideWorkspaceNotice({ onOpenInEditor });
     const toast = add.mock.calls[0]![0];
     expect(toast).toMatchObject({
@@ -61,10 +65,9 @@ describe("link notices", () => {
     expect(onOpenInEditor).toHaveBeenCalledOnce();
   });
 
-  it("offers to copy a link that failed to open", async () => {
+  it("offers to copy a link that failed to open", () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { clipboard: { writeText } });
-    const { showLinkOpenFailedNotice } = await import("./linkNotices");
     showLinkOpenFailedNotice("https://x.test/");
     const toast = add.mock.calls[0]![0];
     expect(toast).toMatchObject({

@@ -12,6 +12,12 @@ For ongoing issue batches and repeated validation failures, use
 | Replan after two rounds without accepted evidence.                                                    | The same checker requires a revised premise and its evidence.                                                          |
 | Measure progress by accepted requirements and closed issues, preserve scope, and keep analysis brief. | The skill defines these judgment rules. Unit counts and commits are supporting evidence only.                          |
 
+This repository is run by agents end to end. Plan only work an agent can finish
+and verify itself (scripts, tests, WebDriver E2E, CLI profilers, the local Docker
+labs). When an issue can only be done by a person at a GUI or device, look for an
+automatable route first; if none exists, close it as not planned with the reason
+instead of handing manual steps to the user.
+
 The checker uses fresh observations supplied by the agent. It does not grant
 permissions, replace native validation, or waive the completion rules below.
 
@@ -71,6 +77,34 @@ Repository skills live in `docs/skills/<name>/`. `.agents/skills/<name>/SKILL.md
 Investigate disagreements by tracing the relevant call path and tests. Either
 align living documentation in the same change or report the unresolved
 discrepancy.
+
+## Sensitive Data
+
+This repository is public. Never commit, or write into issues, pull requests,
+commit messages or review comments:
+
+- credentials of any kind: tokens, passwords, keys, cookies, pairing codes from
+  a real host;
+- private hosts, internal domains, IP addresses, and the names of real
+  organizations, groups, customers or private projects;
+- real people's names, usernames or email addresses in fixtures, tests, logs or
+  plans;
+- local machine paths (`/Users/...`, `C:\Users\...`) or anything copied from a
+  developer's real environment.
+
+Use placeholders instead: `gitlab.example.test`, `example-group/sample-project`,
+`Test User`, `test-user`, `user@example.test`. Anonymize any response recorded
+from a live API before it becomes a fixture. Test against GitLab only through the
+local Docker kit (`docs/skills/gitlab-local-test/`), never a real server.
+
+| Enforcement                                                  | What it catches                                                                                     |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| CI job **Secrets** (gitleaks, `.gitleaks.toml`)              | Hardcoded secrets and banned values in every commit and commit message a pull request or push adds. |
+| `scripts/` sensitive-data guard test (`vp test run scripts`) | Banned private hosts, organization and person names, stored as hashes only.                         |
+
+If you find sensitive data already in the tree or history, stop, tell the user
+without repeating the value in public text, and replace it with placeholders in
+the same change. Rewriting published history is the user's decision.
 
 ## Testing Runbook Maintenance
 
@@ -209,7 +243,9 @@ No task is complete until all applicable requirements have evidence:
    flawlessly memoised and still ask a question the user cannot answer.
 
 7. Final `git diff` and `git status --short` review for unintended edits,
-   generated files, debug output, dependency drift, and missing documentation.
+   generated files, debug output, dependency drift, missing documentation, and
+   any [sensitive data](#sensitive-data) in added lines, commit messages and the
+   PR body.
 8. A synced configured vendored subtree when its matching dependency changes.
 9. A profiler coverage line in the final report: which items of
    [Profiler, Crash, and Trace Coverage](#profiler-crash-and-trace-coverage)

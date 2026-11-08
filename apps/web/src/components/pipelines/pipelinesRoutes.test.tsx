@@ -17,6 +17,14 @@ describe("Pipeline route", () => {
     for (const attempt of [0, -1, 1.5, "x", null]) expect(validate({ attempt })).toEqual({});
   });
 
+  it("keeps the job whose log is open beside the stages, alone or with an attempt", () => {
+    const validate = Route.options.validateSearch;
+    if (typeof validate !== "function") throw new Error("Missing search validation");
+    expect(validate({ job: "998" })).toEqual({ job: 998 });
+    expect(validate({ attempt: 2, job: 998 })).toEqual({ attempt: 2, job: 998 });
+    for (const job of [0, -1, 1.5, "x", null]) expect(validate({ job })).toEqual({});
+  });
+
   it.each(["nope", "1.5", "0", "-1", "Infinity", "1e2", "9007199254740993"])(
     "redirects pipeline id %s to the project's pipelines",
     (pipelineId) => {

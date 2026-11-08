@@ -54,6 +54,7 @@ function PipelineRouteView() {
         projectRef={projectRef}
         pipelineId={Number(params.pipelineId)}
         attempt={search.attempt ?? null}
+        jobId={search.job ?? null}
       />
     </ChatRouteInset>
   );
@@ -62,12 +63,21 @@ function PipelineRouteView() {
 export const Route = createFileRoute(
   "/_chat/project/$environmentId/$projectId/pipelines/$pipelineId",
 )({
-  // `attempt` opens a GitHub run's earlier attempt; the latest needs none.
-  validateSearch: (search: Record<string, unknown>): { attempt?: number } => {
-    const attempt = typeof search.attempt === "string" ? Number(search.attempt) : search.attempt;
-    return typeof attempt === "number" && Number.isSafeInteger(attempt) && attempt >= 1
-      ? { attempt }
-      : {};
+  // `attempt` opens a GitHub run's earlier attempt; the latest needs none. `job` is the
+  // job whose log shows beside the stages.
+  validateSearch: (search: Record<string, unknown>): { attempt?: number; job?: number } => {
+    const whole = (value: unknown) => {
+      const number = typeof value === "string" ? Number(value) : value;
+      return typeof number === "number" && Number.isSafeInteger(number) && number >= 1
+        ? number
+        : undefined;
+    };
+    const attempt = whole(search.attempt);
+    const job = whole(search.job);
+    return {
+      ...(attempt === undefined ? {} : { attempt }),
+      ...(job === undefined ? {} : { job }),
+    };
   },
   beforeLoad: ({ params }) => {
     if (!isPipelineId(params.pipelineId)) {

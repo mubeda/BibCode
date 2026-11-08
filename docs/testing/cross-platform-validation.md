@@ -397,11 +397,18 @@ delivery worker: the row must fail with one attempt, one launch, and one
 ACP errors share the launch classification for Cursor and Grok. Restart recovery
 of a row left sending must stop after one oversized launch, keep the row
 uncertain across delivery-service restart, and record the same profiler class.
+The ACP regression feeds the real 128 KiB bound through the connection and checks
+the nested Closed detail that the launch classification matches. Two composed
+recovery tests start from a failed oversized launch with a healthy relaunch
+available: Retry must deliver the same row on the second launch, and Dismiss must
+release a later queued message. Both assert exactly two launches and one
+`delivery.failing` finding.
 Run:
 
 ```sh
 cargo test -p bibcode-server --lib oversized_stdout -j 2
 cargo test -p bibcode-server --lib transport_line_too_long -j 2
+cargo test -p bibcode-server --lib an_oversized_stdout_failure -j 2
 cargo test -p bibcode-server --lib mcp_catalogue -j 2
 cargo test -p bibcode-server --lib mcp_status -j 2
 ```
@@ -1029,6 +1036,22 @@ vp test run packages/client-runtime/src/state/pipelines.test.ts
 vp run typecheck
 vp check
 ```
+
+The list's column grid and the page's stage columns respond to container width,
+which happy-dom cannot lay out (its tests pin classes, custom properties and
+persistence). In a packaged build with a project that has pipelines, check the
+list and a pipeline page at about 600, 900 and 1600 px of panel width: columns
+line up across rows with and without Retry or Cancel, a column edge resizes by
+drag and by arrow keys and survives a reload, a second repository keeps its own
+widths and hidden columns, and stage columns fill the page. On the pipeline
+page, **Wrap stages** moves stages that do not fit onto more rows with no
+sideways scroll, and choosing a job opens its log beside the stages at 1600 px
+(stages and log scroll separately, the log follows a running GitLab job) and
+under them at 600 px; Close and Escape return focus to the job's row, Back
+closes the log and a copied link reopens it. On a GitLab project whose
+pipeline uses `needs`, rows show "Needs:" and **Group jobs by: Job
+dependencies** puts each job after what it needs, with stage-scheduled jobs
+after every earlier stage.
 
 `PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
 must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`
@@ -1867,7 +1890,10 @@ from `apps/web`.
     status bar's **Agent active** indicator: the turn is interrupted, a turn you started in
     another thread keeps running, and the agent's next call says its access ended. Restart
     its MCP server, press **Take over**: reads still work and its next change is refused as
-    read-only. **Hand back** restores the level it had, and its next change works.
+    read-only. **Hand back** restores the level it had, and its next change works. With
+    `--client <name>`: Take over, quit the agent and start it again; its new row is
+    **Taken over** and its first change is refused until **Hand back**. Quit it again:
+    Authorized clients shows it as "Not running" with **Revoke**, which removes the row.
 13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
     a disposable public HTTPS receiver with `thread.status_changed` and a **Bearer token**,
     copy the secret, and **Send test event**: the receiver gets `webhook.test` with
@@ -2318,6 +2344,12 @@ rewriting one. The byte budget needs no browser: raise a budget in
 change shrinks a payload. Time at 3G is a reported number, never a gate.
 
 ## Git Manager validation scenario
+
+Any step that needs a real GitLab host, merge requests or a running CI pipeline
+uses the local Docker GitLab from the
+[`gitlab-local-test` skill](../skills/gitlab-local-test/SKILL.md), never a real
+GitLab server or account. Start BiBCode with the `GLAB_CONFIG_DIR` that
+`seed.sh` exports, and run `down.sh` afterwards.
 
 Run this scenario only against the exact packaged application and disposable
 repositories. Destructive Git Manager scenarios must never run against a user

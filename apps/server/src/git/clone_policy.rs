@@ -133,8 +133,18 @@ pub(crate) fn inherited_environment() -> Vec<(OsString, OsString)> {
         .filter(|(name, _)| name.to_str().is_some_and(is_inherited))
         .collect()
 }
-/// The null device, for an empty global configuration and an empty hooks folder.
-const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+/// The null device, for an empty global configuration and home. Git for Windows accepts only
+/// lowercase `nul` (or `/dev/null`) as `GIT_CONFIG_GLOBAL`; `NUL` fails every command, even
+/// `git --version` (#264).
+pub(crate) const NULL_DEVICE: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
+/// A hooks folder no hook can be planted in. Git for Windows treats `nul/<hook>` as present
+/// and fails to spawn it, which aborts every ref update; `/dev/null` there names the
+/// plantable `\dev\null\` on the current drive. The device namespace holds no folders.
+pub(crate) const NO_HOOKS: &str = if cfg!(windows) {
+    r"\\.\nul"
+} else {
+    "/dev/null"
+};
 const OPERATION: &str = "GitVcsDriver.clone";
 
 const NOT_HTTPS: &str = "BiBCode clones for an agent from https:// URLs, such as https://github.com/owner/repo, and from ssh:// URLs when the agent may use terminals. git://, file://, local paths and other transports are refused; clone it in BiBCode yourself to use them.";
@@ -613,7 +623,7 @@ fn ssh_not_allowed(url: &str, target: &Target) -> CloneRefusal {
 /// redirect, LFS smudge, submodule, proxy, hook or fsmonitor. The `http.*` settings stay on an
 /// SSH clone, where they are harmless.
 fn isolated_arguments(protocol: &str, fixture_protocol: Option<&str>) -> Vec<String> {
-    let hooks = format!("core.hooksPath={NULL_DEVICE}");
+    let hooks = format!("core.hooksPath={NO_HOOKS}");
     ["protocol.allow=never", protocol]
         .into_iter()
         .chain(fixture_protocol)
@@ -1097,6 +1107,70 @@ pub(crate) mod tests {
         Arc::new(MapResolver(map))
     }
 
+    /// #264: the isolated environment is one this host's Git starts under. Git for Windows
+    /// refuses `GIT_CONFIG_GLOBAL=NUL` for every command, so agent clones failed there.
+    #[test]
+    fn the_isolated_environment_runs_this_hosts_git() {
+        let output = std::process::Command::new("git")
+            .arg("--version")
+            .envs(ClonePolicy::default().environment("https"))
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git --version failed under the clone environment: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn the_null_values_are_the_ones_each_platforms_git_accepts() {
+        if cfg!(windows) {
+            assert_eq!((NULL_DEVICE, NO_HOOKS), ("nul", r"\\.\nul"));
+        } else {
+            assert_eq!((NULL_DEVICE, NO_HOOKS), ("/dev/null", "/dev/null"));
+        }
+    }
+
+    /// A ref update under `core.hooksPath=NO_HOOKS` succeeds and runs no hook. With `nul`, Git
+    /// for Windows fails to spawn `nul/reference-transaction` and aborts the update.
+    #[test]
+    fn a_ref_update_without_hooks_succeeds() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", &format!("core.hooksPath={NO_HOOKS}")])
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git starts")
+        };
+        for args in [
+            &["init", "-q", "."][..],
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+            &["update-ref", "refs/bibcode/probe", "HEAD"],
+        ] {
+            let output = git(args);
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn leaf(name: &str) -> CloneLeaf {
         crate::git::clone_destination_leaf("https://example.com/repo.git", Some(name))
             .expect("a folder name")
@@ -1306,7 +1380,7 @@ pub(crate) mod tests {
             "http.curloptResolve=github.com:443:140.82.112.3",
             "http.proxy=",
             "core.fsmonitor=false",
-            &format!("core.hooksPath={NULL_DEVICE}"),
+            &format!("core.hooksPath={NO_HOOKS}"),
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
@@ -1731,7 +1805,7 @@ pub(crate) mod tests {
             "submodule.recurse=false",
             "filter.lfs.smudge=",
             "core.fsmonitor=false",
-            &format!("core.hooksPath={NULL_DEVICE}"),
+            &format!("core.hooksPath={NO_HOOKS}"),
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
@@ -1937,6 +2011,30 @@ pub(crate) mod tests {
         assert_eq!(https.failure_reason(old), None);
     }
 
+    /// Gives only the current user access to `folder` and to what is created in it later (files
+    /// already there keep their access). Windows OpenSSH
+    /// refuses a configuration file that another group may write, and a temp folder can grant
+    /// one (a sandbox group, say) through inheritance.
+    #[cfg(windows)]
+    fn owner_only(folder: &Path) {
+        let user = std::env::var("USERNAME").expect("USERNAME is set");
+        let status = std::process::Command::new("icacls")
+            .arg(folder)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{user}:(OI)(CI)F"),
+                "/Q",
+            ])
+            .status()
+            .expect("icacls starts");
+        assert!(
+            status.success(),
+            "icacls could not restrict {}",
+            folder.display()
+        );
+    }
+
     /// Runs `command` through the shell Git runs `GIT_SSH_COMMAND` with: a `!` alias, which
     /// Git runs as `sh -c '<command> "$@"'` with its own `sh` and `PATH` (on Windows, the
     /// bundled `/usr/bin` first, so a plain `ssh` is the client Git uses). `HOME` is `home`.
@@ -1993,6 +2091,9 @@ pub(crate) mod tests {
     #[test]
     fn real_ssh_reads_the_generated_command_as_bibcode_means_it() {
         let root = tempfile::tempdir().unwrap();
+        // Before anything is written, so every file inherits the owner-only access.
+        #[cfg(windows)]
+        owner_only(root.path());
         let home = awkward_home(root.path());
         // A person's configuration that `-F none` must keep out, under `HOME` (what MSYS ssh
         // reads) and as an explicit file (what the swapped `-F` reads).

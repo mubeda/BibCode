@@ -69,7 +69,7 @@ export const permissions: PullRequestsPermissions = {
 };
 export const detail: PullRequestsDetail = {
   ...row,
-  author: { login: "mubeda", name: null, isBot: false },
+  author: { login: "test-user", name: null, isBot: false },
   headBranch: "feature",
   body: "A **description**",
   locked: false,

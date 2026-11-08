@@ -1,5 +1,45 @@
 # Changelog
 
+## [Unreleased]
+
+### Checkpoints and Git
+
+- A file restore in a checkout that other chats share is refused while one of them is writing, warns about their changes before restoring, and holds their turns from planning to completion. **Rewind conversation only** rewinds a chat without touching the working tree. (#279)
+- A restore can proceed beside a chat on an external OpenCode 2 server you mark **Only BiBCode uses this server**; BiBCode refuses if it sees that server working. (#326)
+- BiBCode's Git calls read only a curated set of system Git settings (line endings, symlinks, a recognized Git LFS filter, known credential helpers, TLS settings), so checkpoints run no system hooks, other filters or textconv, LFS files restore and check out with real content, and background fetches never open a credential window. When the system configuration cannot be read or holds an unrecognized LFS setup, checkpoints fall back to inheriting it as before. On Windows, clones and checkpoints use Git-for-Windows-safe null paths. (#283, #264)
+- On the desktop app, a Git Manager or Source Control fetch, pull or push that needs Git Credential Manager offers a sign-in for the named destination, capped at 10 minutes. Source Control pull and push can be cancelled. (#325)
+
+### MCP and access
+
+- `bibcode mcp --client <name>` keeps an agent's retries, panels and paired webhook endpoint across restarts. Revoke or Stop ends that identity; an idle named client is listed with Revoke, and Take over sticks to it until Hand back. (#280, #324)
+- Access-change events are sent under the auth lock, so a revoked client no longer reappears in Settings. (#294)
+
+### Files and pipelines
+
+- Opening a file uses its own tab and keeps the Files tab with its open folders and selection. Folder crumbs are clickable, and **Show in Files** reveals the file. (#288, #323)
+- The pipeline list has an aligned header, resizable and hideable columns and a "+N" stage overflow; widths are remembered per repository. The pipeline page's stages fill the panel, can wrap, open a job's log beside them, and GitLab pipelines that use `needs` can group jobs by dependency. (#285, #286, #321, #322)
+- The list's Status column shows "Passed with warnings" in full, and opening a job in the narrow, stacked layout brings its log into view. (#334)
+- Pipelines and Pull requests load for a self-hosted GitLab or GitHub Enterprise on a non-default web port, and SSH remotes to such a host match it by name. (#332)
+
+### Reliability
+
+- `bibcode storage restore --resume` checks each staged file's size and SHA-256 before finishing an interrupted restore. The recovery journal is now version 3; a version-2 restore journal is refused with a documented manual recovery. (#289)
+- A desktop stop no longer waits for an outside agent's in-flight MCP `wait_for_thread`. (Refs #303)
+- Server startup runs provider and tool version probes concurrently. (#318)
+
+### Docs, CI and tests
+
+- The README shows light and dark screenshots, a feature overview and the bibcode.dev link; CI checks Markdown links. (#291, #320)
+- The macOS crash smoke logs its build time; the CI guide describes its settings. (#295)
+- Load-sensitive queue, client-runtime, desktop, job log parse and Windows server tests no longer depend on machine speed, and Cursor and Grok oversized-output recovery is covered. (#263, #264, #316, #319, #327, #328, #329)
+- Native Git watcher tests no longer fail when macOS reports fixture setup changes late under heavy load. (#330)
+- Diff tool, MCP interrupt and terminal observer tests no longer fail under CPU load: they wait for the fake tool's own output, count only interrupt events, and keep a held test join off the shared reaper. (#333)
+- Server tests no longer depend on how fast a loaded Mac first runs a new executable: Cursor fixture tests reuse a binary that has already run, the startup probe test runs its scripts once first, isolated test cases are timed from their first output and fail instead of hanging when a child outlives SIGKILL, and the clone retention test answers for Git. (#335)
+- A web link-notice test loads its modules outside the test timer. (#336)
+- Desktop tests reserve their ports across test processes, so the exposure-restart test no longer loses its port to a parallel test. (#338)
+- CI runs a **Secrets** job: gitleaks scans every commit a pull request or push adds, merge resolutions and merged branches included, and a hash-based guard checks files and commit messages for private values. Test fixtures and plan docs use placeholder hosts and names. (#331)
+- `scripts/gitlab-local-test/` starts a throwaway GitLab CE with a runner in Docker for testing pipeline screens without a real GitLab server.
+
 ## [v0.15.2] - 2026-11-05
 
 BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308, PR #314, and issue #316 since v0.15.1.

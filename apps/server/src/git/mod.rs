@@ -6,9 +6,10 @@ mod model;
 mod parser;
 mod process;
 mod repository;
+pub mod sign_in;
 mod status_owner;
 mod summary;
-pub mod system_line_endings;
+pub mod system_config;
 mod version;
 mod watcher;
 mod worktree;
@@ -42,6 +43,7 @@ pub use process::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, Pro
 pub(crate) use repository::BoxGitProcessFuture;
 pub(crate) use repository::GitProcessRunner;
 pub(crate) use repository::git_environment;
+pub(crate) use repository::git_environment_inheriting_unread;
 pub(crate) use repository::git_read_environment;
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitManagerCommitOutcome, GitManagerHeadCommit, GitRepository,

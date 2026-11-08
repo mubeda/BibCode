@@ -3,8 +3,10 @@ import type {
   PipelinesDetailStage,
   PipelinesGetInput,
   PipelinesJob,
+  PipelinesJobGroup,
   PipelinesListInput,
   PipelinesSubscribeInput,
+  PullRequestsPipelineStatus,
   PullRequestsProviderKind,
 } from "@bibcode/contracts";
 import type { PipelineActionPermission } from "../list/pipelinesList.logic";
@@ -52,6 +54,128 @@ export function pipelineStageColumns(
       groups: detail.stages.flatMap((stage) => stage.groups),
     },
   ];
+}
+
+/** The host knows how GitLab schedules some of this pipeline's jobs (absent or null: no). */
+export function hasJobDependencies(detail: Pick<PipelinesDetail, "usesNeeds" | "stages">): boolean {
+  if (!detail.usesNeeds) return false;
+  for (const stage of detail.stages ?? [])
+    for (const group of stage.groups)
+      for (const job of group.jobs) if (job.scheduling != null) return true;
+  return false;
+}
+
+/** The status a layer's header shows: the one needing attention first. */
+const LAYER_STATUS_ORDER: readonly PullRequestsPipelineStatus[] = [
+  "failed",
+  "running",
+  "canceling",
+  "waiting",
+  "queued",
+  "created",
+  "scheduled",
+  "manual",
+  "canceled",
+  "success",
+  "skipped",
+  "unknown",
+];
+
+/**
+ * GitLab's "Job dependencies" grouping, job by job: a `dag` job sits one layer after
+ * the latest job it needs (layer 1 when it needs none shown); a `stage` or unknown job
+ * one layer after every job of the earlier stages, when GitLab starts it. A need names
+ * a job or a whole parallel group; one not shown is ignored, and a cycle is broken. A
+ * parallel group whose jobs land in different layers is split across them.
+ */
+export function pipelineNeedsColumns(
+  stages: readonly PipelinesDetailStage[],
+): readonly PipelinesDetailStage[] {
+  // One item per job; a group the host sent without jobs is one item of its own.
+  const items: {
+    readonly group: PipelinesJobGroup;
+    readonly stageIndex: number;
+    readonly job: PipelinesJob | null;
+  }[] = [];
+  stages.forEach((stage, stageIndex) => {
+    for (const group of stage.groups) {
+      if (group.jobs.length === 0) items.push({ group, stageIndex, job: null });
+      for (const job of group.jobs) items.push({ group, stageIndex, job });
+    }
+  });
+  const byName = new Map<string, number[]>();
+  const add = (name: string, index: number) => {
+    const known = byName.get(name);
+    if (known === undefined) byName.set(name, [index]);
+    else if (!known.includes(index)) known.push(index);
+  };
+  items.forEach((item, index) => {
+    add(item.group.name, index);
+    if (item.job !== null) add(item.job.name, index);
+  });
+  const layers: (number | undefined)[] = [];
+  const visiting = new Set<number>();
+  const afterStages: (number | undefined)[] = [];
+  /** The latest layer among every item of the stages before `stageIndex`. */
+  const afterEarlierStages = (stageIndex: number): number => {
+    const known = afterStages[stageIndex];
+    if (known !== undefined) return known;
+    let after = -1;
+    items.forEach((other, otherIndex) => {
+      if (other.stageIndex < stageIndex) after = Math.max(after, layerOf(otherIndex));
+    });
+    afterStages[stageIndex] = after;
+    return after;
+  };
+  const layerOf = (index: number): number => {
+    const known = layers[index];
+    if (known !== undefined) return known;
+    if (visiting.has(index)) return 0;
+    visiting.add(index);
+    const { job, stageIndex } = items[index]!;
+    let after = -1;
+    if (job?.scheduling === "dag") {
+      for (const need of job.needs ?? [])
+        for (const needed of byName.get(need) ?? [])
+          if (needed !== index) after = Math.max(after, layerOf(needed));
+    } else {
+      after = afterEarlierStages(stageIndex);
+    }
+    visiting.delete(index);
+    layers[index] = after + 1;
+    return after + 1;
+  };
+  // Per layer, each group's jobs in that layer, in host order.
+  const columns: Map<PipelinesJobGroup, PipelinesJob[]>[] = [];
+  items.forEach((item, index) => {
+    const column = (columns[layerOf(index)] ??= new Map());
+    const jobs = column.get(item.group) ?? [];
+    if (item.job !== null) jobs.push(item.job);
+    column.set(item.group, jobs);
+  });
+  const statusOf = (statuses: readonly PullRequestsPipelineStatus[]) =>
+    LAYER_STATUS_ORDER.find((status) => statuses.includes(status)) ?? "unknown";
+  return columns.flatMap((column, layer) => {
+    if (column === undefined) return [];
+    const groups = [...column].map(([group, jobs]) =>
+      jobs.length === group.jobs.length
+        ? group
+        : {
+            ...group,
+            size: jobs.length,
+            status: statusOf(jobs.map((job) => job.status)),
+            jobs,
+          },
+    );
+    return [
+      {
+        name: `Layer ${layer + 1}`,
+        status: statusOf(groups.map((group) => group.status)),
+        warnings: groups.some((group) => group.jobs.some((job) => job.warnings)),
+        groups,
+      },
+    ];
+  });
 }
 
 /** The host's job total, or the jobs shown when it gave none. */

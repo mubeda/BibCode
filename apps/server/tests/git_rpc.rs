@@ -1965,17 +1965,17 @@ async fn subscribed_remote_poller_fetches_real_upstream_changes() {
 #[test]
 fn source_control_parsers_match_cli_shapes() {
     let github = source_control::parse_github_auth_status(
-        r#"{"hosts":{"github.com":[{"state":"success","active":true,"host":"GitHub.COM","login":"test-user"}]}}"#,
+        r#"{"hosts":{"github.com":[{"state":"success","active":true,"host":"GitHub.COM","login":"user"}]}}"#,
     );
     assert!(github.parsed);
     assert_eq!(github.accounts[0].host, "github.com");
-    assert_eq!(github.accounts[0].account, "test-user");
+    assert_eq!(github.accounts[0].account, "user");
 
     let gitlab = source_control::parse_gitlab_auth_status(
-        "gitlab.com\n  x Logged in to gitlab.com as test-user (keyring)\n",
+        "gitlab.com\n  x Logged in to gitlab.com as user (keyring)\n",
     );
     assert_eq!(gitlab[0].host, "gitlab.com");
-    assert_eq!(gitlab[0].account.as_deref(), Some("test-user"));
+    assert_eq!(gitlab[0].account.as_deref(), Some("user"));
     assert_eq!(
         source_control::provider_from_remote("git@github.com:owner/repo.git").kind,
         source_control::ProviderKind::Github

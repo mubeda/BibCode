@@ -240,6 +240,34 @@ describe("PipelinesPanel", () => {
     expect(usePipelinesStore.getState().selectViewState(ref).filters.scope).toBe("running");
   });
 
+  it("keeps an open job log in the route, so Back closes it and a copied link reopens it", async () => {
+    await act(async () =>
+      root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={2} jobId={null} />),
+    );
+    expect(h.detailProps).toMatchObject({ jobId: null });
+    const onJobChange = h.detailProps!.onJobChange as (jobId: number | null) => void;
+    act(() => onJobChange(998));
+    expect(h.navigate).toHaveBeenLastCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+      params: { environmentId: "env", projectId: "project", pipelineId: "4821" },
+      search: { attempt: 2, job: 998 },
+      replace: false,
+    });
+    await act(async () =>
+      root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={null} jobId={998} />),
+    );
+    expect(h.detailProps).toMatchObject({ jobId: 998 });
+    // Switching logs replaces the step; closing is a step of its own.
+    act(() => (h.detailProps!.onJobChange as (jobId: number | null) => void)(997));
+    expect(h.navigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: { job: 997 }, replace: true }),
+    );
+    act(() => (h.detailProps!.onJobChange as (jobId: number | null) => void)(null));
+    expect(h.navigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: {}, replace: false }),
+    );
+  });
+
   it("opens the pipeline's jobs on their job pages in BiBCode", async () => {
     await act(async () =>
       root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={null} />),

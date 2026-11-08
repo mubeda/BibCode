@@ -99,7 +99,7 @@ impl ProviderStub {
         write_json(
             root,
             "gh-auth.json",
-            &json!({"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"mubeda"}]}}),
+            &json!({"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"test-user"}]}}),
         );
         fs::write(root.join("glab-auth"), "gitlab.com\n  x HTTP 401\ngit.acme.example\n  ✓ Logged in to git.acme.example as alice\n").unwrap();
         fs::write(
@@ -155,7 +155,7 @@ case "$1 $2" in
   'auth status')
     if [ -e "$FIXTURE_DIR/gh-unauthenticated" ]; then echo 'You are not logged into any GitHub hosts' >&2; exit 1; fi
     cat "$FIXTURE_DIR/gh-auth.json" ;;
-  'api user') echo '{"login":"mubeda","name":""}' ;;
+  'api user') echo '{"login":"test-user","name":""}' ;;
   'api graphql')
     cat > "$FIXTURE_DIR/graphql-input"
     if [ -e "$FIXTURE_DIR/rate-limited" ]; then echo 'API rate limit exceeded TOKEN secret' >&2; exit 1; fi
@@ -1110,4 +1110,163 @@ async fn pull_requests_rpc_registry_round_trips_context_list_and_typed_failure()
     socket.close(None).await.unwrap();
     server.shutdown();
     server.join().await.unwrap();
+}
+
+/// #332: snapshot and subscription reads need only the repository's identity. For an
+/// unrecorded named GitLab host over scp, whose web port only glab could tell, the
+/// Pull Requests and Pipelines `readSnapshot` and `subscribe` spawn no `glab` at all
+/// (without a database each stops right after resolving the scope).
+#[tokio::test]
+async fn pull_requests_and_pipelines_snapshot_reads_of_a_named_ssh_host_spawn_no_glab() {
+    let f = Fixture::new(Some("git@gitlab.example.test:group/project.git")).await;
+    let list = json!({"cwd":f.cwd,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"number":null,"tab":null});
+    let pipelines = json!({"cwd":f.cwd,"scope":"all","ref":null,"workflowId":null,"cursor":null,"refresh":"user","pipelineId":null,"attempt":null,"jobId":null});
+    let c = CancellationToken::new();
+    for _ in 0..2 {
+        let _ = f
+            .service
+            .read_snapshot(serde_json::from_value(list.clone()).unwrap(), &c)
+            .await;
+        let _ = f
+            .service
+            .subscribe(serde_json::from_value(list.clone()).unwrap(), &|_| true, &c)
+            .await;
+        let _ = f
+            .service
+            .pipelines()
+            .read_snapshot(serde_json::from_value(pipelines.clone()).unwrap(), &c)
+            .await;
+        let _ = f
+            .service
+            .pipelines()
+            .subscribe(
+                serde_json::from_value(pipelines.clone()).unwrap(),
+                &|_| true,
+                &c,
+            )
+            .await;
+    }
+    assert_eq!(f.calls("glab"), "", "identity reads spawned glab");
+}
+
+/// #332: glab knows a named HTTPS host only as `gitlab.tls.test:443`. The first context
+/// read checks the origin's own spelling alongside its reads, as for every named host;
+/// its failed login places the host and says to rescan. Rescan then uses the placement
+/// and stores rows under it, and the identity-only path that snapshot reads and
+/// subscriptions take reuses the recorded spelling, so it finds those rows.
+#[tokio::test]
+async fn pull_requests_named_host_on_a_written_default_port_keeps_its_snapshot_host() {
+    let origin = "https://gitlab.tls.test/team/sub/repo.git";
+    let f = Fixture::new(Some(origin)).await;
+    fs::write(
+        f.root.path().join("glab-auth"),
+        "gitlab.tls.test:443\n  ✓ Logged in to gitlab.tls.test:443 as alice\n",
+    )
+    .unwrap();
+    let database = bibcode_server::persistence::Database::open_in_memory()
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            Ok(bibcode_server::persistence::run_migrations(
+                connection, None,
+            )?)
+        })
+        .await
+        .unwrap();
+    let service = PullRequestsService::with_runner(f.runner.clone()).with_database(database);
+    let c = CancellationToken::new();
+    let read = |read| {
+        let service = service.clone();
+        let cwd = f.cwd.clone();
+        let c = c.clone();
+        async move { serde_json::to_value(service.context(&cwd, read, &c).await.unwrap()).unwrap() }
+    };
+    let first = read(ContextRead::Open).await;
+    assert_eq!(first["code"], "not_authenticated", "{first}");
+    assert!(
+        first["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`gitlab.tls.test:443`. Rescan")),
+        "{first}"
+    );
+    assert!(first["authCommand"].is_null(), "{first}");
+    let context = read(ContextRead::Rescan).await;
+    assert_eq!(context["host"], "gitlab.tls.test:443", "{context}");
+    service.list(&f.cwd, f.query(), &c).await.unwrap();
+    let snapshot = service
+        .read_snapshot(
+            serde_json::from_value(json!({"cwd":f.cwd,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"number":null,"tab":null})).unwrap(),
+            &c,
+        )
+        .await
+        .unwrap();
+    assert!(snapshot.list.is_some(), "the snapshot read missed the rows");
+}
+
+/// #332 against a real GitLab, such as the local Docker kit on `localhost:8929`:
+/// `pullRequests.getContext`, `pullRequests.list` and `pipelines.list` through the
+/// real `glab`, `gh` and `git` on `PATH`. Set `BIBCODE_LIVE_GITLAB_CHECKOUT` to a
+/// clone of the kit's project and `BIBCODE_LIVE_GITLAB_HOST` to the host glab lists
+/// (with `GLAB_CONFIG_DIR` pointing at the kit's isolated glab config).
+#[tokio::test]
+async fn pull_requests_live_gitlab_on_a_web_port_loads_context_requests_and_pipelines() {
+    let (Ok(checkout), Ok(host)) = (
+        std::env::var("BIBCODE_LIVE_GITLAB_CHECKOUT"),
+        std::env::var("BIBCODE_LIVE_GITLAB_HOST"),
+    ) else {
+        return;
+    };
+    let state = TempDir::new().unwrap();
+    // The hermetic guard admits only test-owned executables; these hand over to `PATH`.
+    let [gh, glab] = ["gh", "glab"].map(|cli| {
+        let path = state.path().join(cli);
+        fs::write(&path, format!("#!/bin/sh\nexec {cli} \"$@\"\n")).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    });
+    let runner = HostCommandRunner::new(state.path().join("state")).with_commands(gh, glab, "git");
+    let service = PullRequestsService::with_runner(runner);
+    let services = ConfiguredPullRequestsRpcServices {
+        service: service.clone(),
+        repositories: None,
+        worktrees: None,
+    };
+    let context = services
+        .read_unary(
+            rpc_request("pullRequests.getContext", json!({"cwd":checkout})),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(context["status"], "available", "{context}");
+    assert_eq!(context["provider"], "gitlab", "{context}");
+    assert_eq!(context["host"], host, "{context}");
+    let query = json!({"cwd":checkout,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null});
+    let page = services
+        .read_unary(
+            rpc_request("pullRequests.list", query),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(page["rows"].is_array(), "{page}");
+    let pipelines = service
+        .pipelines()
+        .list(
+            serde_json::from_value(json!({"cwd":checkout,"scope":"all","ref":null,"workflowId":null,"cursor":null,"refresh":"user"})).unwrap(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pipelines.rows.is_empty(),
+        "the kit's project has pipelines"
+    );
+    eprintln!(
+        "live {host}: context {}, {} open requests, {} pipelines",
+        context["status"],
+        page["rows"].as_array().map_or(0, Vec::len),
+        pipelines.rows.len()
+    );
 }

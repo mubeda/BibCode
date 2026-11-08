@@ -103,7 +103,7 @@ What the relay does, in order:
    on the recorded port, or a forwarder from another address, fails the proof.
 3. **Mints its own credential** on the first request, directly in the data root's store: an
    `mcp-client` session labelled `MCP · <clientInfo.name>` (the name your `initialize`
-   sends), with the scopes and ceiling described in
+   sends), or `MCP · <name>` with `--client <name>`, with the scopes and ceiling described in
    [The credential](#the-credential). The token lives only in the relay's memory: never in
    argv, the environment, a file or a log.
 4. **Relays** each request as `POST /mcp` with the bearer, and each response back as one
@@ -120,6 +120,45 @@ What the relay does, in order:
    middle of a sign-in is cleaned up only by a relay from v0.15 or later. When
    `<state>/mcp-clients/` cannot be written, the sign-in fails ("Could not record this MCP
    connection in …") and no credential is sent.
+
+### Named clients: `--client <name>`
+
+`bibcode mcp --client <name>` signs each run in as one named client, so a restarted agent
+keeps:
+
+- its `clientRequestId` retries: a retry with the same id after a restart, within 24 hours
+  of the first call, replays the stored request or recorded outcome and does not run the
+  work again;
+- the panels and threads its earlier runs opened (`send_panel_message`'s ownership rule);
+- a webhook endpoint paired with it, which stays on when a run exits.
+
+The name is trimmed and must be 1 to 60 characters with no control characters; anything
+else exits 1 before any credential exists ("Choose a client name of 1 to 60 characters with
+no control characters."). It applies to the stdio server only: with `authorize`, `call` or
+`tools` it is a usage error (exit 1). Against an older BiBCode whose store has no named
+clients, the relay exits 1 before any credential exists ("Update BiBCode to use --client:
+this server does not know named clients yet.").
+
+Each run still mints its own credential, revokes it when it exits, and is swept if it
+crashes; none of that ends the identity, and no token is stored. Two runs with one name at
+once share their retries and each has its own Authorized clients row. A person's **Revoke**
+or **Stop** on any of its rows ends the identity: every run of it is revoked, its paired
+endpoints turn off (`client-revoked`), and the next run with that name starts a new
+identity. An agent without `--client`, even one whose `clientInfo.name` matches, never joins
+a named client's scope.
+
+A named client with no run live still has a row in Authorized clients and in **Agents**
+(`MCP · <name>`, "Not running"), with **Revoke** only. That Revoke ends the identity as
+above. The Revoke route takes the named client's id (`nc_` plus a UUID) in `sessionId`.
+**Revoke others** ends idle named clients too. The access stream's snapshot lists every
+named client not yet ended in `mcpNamedClients`; one that no `clientSessions` entry runs is
+idle.
+
+**Take over** on any run takes over the identity: every live run goes read-only, and each
+later run starts read-only, with Hand back offered at the level that run was started with.
+**Hand back** on any run releases the identity and restores every live run to its own level.
+A run started `read-only` has nothing to hand back and shows plain read-only. Revoking the
+identity also ends a Take over.
 
 Limits: one stdio line is at most 4 MiB (a longer line is skipped and answered with a
 JSON-RPC parse error); connecting times out after 5 s and one request after 120 s (longer
@@ -225,7 +264,8 @@ and signs in as `bibcode mcp` does, with its own credential labelled
 
 Each run mints a new credential, but every `bibcode thread` run shares one `clientRequestId`
 scope, so the `--request-id` retry above works across runs. Only the "thread this agent
-opened or last drove" rule of `send_panel_message` does not carry over between runs.
+opened or last drove" rule of `send_panel_message` does not carry over between runs (it does
+for a [named client](#named-clients---client-name)).
 
 ### One tool from a shell: `bibcode mcp call` and `bibcode mcp tools`
 
@@ -620,7 +660,8 @@ It never holds `access:read`, `access:write`, `relay:*`, `review:write` or
 `diagnostics:read`, so an agent cannot change settings, manage clients or webhooks, pair
 devices or reach the relay. The credential is accepted only on `/mcp`. Each running relay
 shows as one row in **Settings → Agents → Agent integrations → Authorized clients**
-(`MCP · <agent name>`), and that row's **Revoke** ends it.
+(`MCP · <agent name>`), and that row's **Revoke** ends it. For a
+[named client](#named-clients---client-name) it ends the identity and every run of it.
 
 ### Access levels
 
@@ -783,13 +824,16 @@ Every `tools/call` is checked in this order, and the first refusal is the answer
 | Owned mutation's stream budget                                         | 30 minutes                    | `McpOutcomeUnknownError`      |
 
 Codex stops a tool call after 60 seconds by default, which is why one wait lasts at most
-50 seconds. Call the wait again to keep waiting.
+50 seconds. Call the wait again to keep waiting. When the server stops, a
+`wait_for_thread` in flight ends at once with `McpServerStoppingError` and does not hold up
+the stop.
 
 ### Retries and `clientRequestId`
 
 A tool that changes something takes an optional `clientRequestId` when a repeat could do
-the work twice. It is a string you choose, 1 to 256 characters, kept per credential for 24
-hours. A tool works in one of three ways; each tool's **Retries** line says which:
+the work twice. It is a string you choose, 1 to 256 characters, kept for 24 hours per
+credential, or per [named client](#named-clients---client-name) across its runs. A tool
+works in one of three ways; each tool's **Retries** line says which:
 
 - **Receipt-backed** (thread, worktree, approval and panel tools). The first call stores the
   engine commands it builds; a retry with the same id dispatches those same commands, and
@@ -813,7 +857,8 @@ Rules for both keyed kinds:
 - The same id with any different argument is `idempotency_conflict`. Use a new id for a new
   request.
 - The id is bound to the credential: another connection, or a new `bibcode mcp` process,
-  does not see it.
+  does not see it. A run of the same named client (`--client`) does, and so does every
+  `bibcode thread` run.
 - A call cancelled while its keyed work goes on answers `McpCancelledError`; call again with
   the same id to get the outcome.
 - After 24 hours the id starts a new request.
@@ -972,12 +1017,16 @@ indicator, or **Agents** in Agent integrations):
   `McpOutcomeUnknownError`, `reason: "revoked"`), and interrupts each running turn that the
   agent's own message started. The agent's next call fails: over stdio
   `McpCredentialRefusedError`, over HTTP a 401. Restarting its MCP server signs in again,
-  which the person may then revoke.
+  which the person may then revoke. For a named client, Stop on any of its rows (also the
+  row of an earlier run that exited) ends the identity: it revokes every run and interrupts
+  the turns each run started.
 - **Take over** makes the agent read-only without revoking it: reads still work, every
   change is refused with `McpAccessCeilingError` ("A person took over this agent; it is
   read-only until they hand it back."), owned work stops (`reason: "revoked"`), and an
   upload URL stops; a download URL goes on.
 - **Hand back** restores exactly the level Take over replaced.
+- For a [named client](#named-clients---client-name), Take over and Hand back apply to the
+  identity: every live run, and every later run until Hand back.
 - **Revoke** in **Authorized clients** ends the credential like Stop but leaves running
   turns alone.
 - **MCP server off** stops every agent of the environment at once without revoking anyone.
@@ -1373,7 +1422,7 @@ Starts a new thread in a project with a first prompt and returns its `threadId` 
 | `interactionMode`    | string | no       | `default` or `plan`; default `default`                                                             | Plan mode makes the provider plan before acting.                                                              |
 | `attachments`        | array  | no       | see Attachments below                                                                              | Files for the provider.                                                                                       |
 | `purpose`            | string | no       | at most 200 characters                                                                             | See family rules.                                                                                             |
-| `clientRequestId`    | string | no       | 1 to 256 characters; remembered 24 hours per MCP connection                                        | Retry id.                                                                                                     |
+| `clientRequestId`    | string | no       | 1 to 256 characters; remembered 24 hours per MCP connection, or per named client                   | Retry id.                                                                                                     |
 
 **Attachments** (the same for `send_message`): an array of at most 8 objects `{ name, mimeType, data }`, all three non-empty strings and no other keys. `data` is base64. `mimeType` is lowercased; `image/png`, `image/jpeg`, `image/gif` and `image/webp` are sent as images; any other `image/*` type is refused; every non-image type is sent as a file. The total decoded size is at most 3 MiB (3,145,728 bytes) per call. Because a whole request, including the JSON-RPC envelope and base64 overhead, must fit in 4 MiB (the HTTP body or one stdio line), the usable total is a little under 3 MiB in practice; a stdio line over 4 MiB is a parse error before the tool runs (and the HTTP body is held to the same size). Larger files must be sent another way. Each attachment is staged through the upload service under this MCP session before the turn is sent.
 
@@ -1587,20 +1636,23 @@ Reverts a thread to its checkpoint after turn `turnCount` (0 means before its fi
 - **Retries:** receipt-backed with `clientRequestId`. A replay does not revert twice; it waits again for the recorded outcome of the same request. Use this to follow up a `reverted: null` result.
 - **Runs long / waits:** long-running (does not hold a wait slot). Waits at most 30 seconds for the effects worker to record the outcome. Cancelling the call or a server shutdown ends the wait the same way as the timeout.
 
-| Argument          | Type    | Required | Limits and default                                     | Meaning                                                           |
-| ----------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
-| `threadId`        | string  | yes      | a live thread                                          | The thread.                                                       |
-| `turnCount`       | integer | yes      | 0 up to the thread's latest turn that has a checkpoint | The last turn to keep, numbered as `get_turn_diff` numbers turns. |
-| `clientRequestId` | string  | no       | 1 to 256 characters                                    | Retry id.                                                         |
+| Argument              | Type    | Required | Limits and default                                     | Meaning                                                           |
+| --------------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
+| `threadId`            | string  | yes      | a live thread                                          | The thread.                                                       |
+| `turnCount`           | integer | yes      | 0 up to the thread's latest turn that has a checkpoint | The last turn to keep, numbered as `get_turn_diff` numbers turns. |
+| `mode`                | string  | no       | `full` (default) or `conversationOnly`                 | `conversationOnly` rewinds the conversation and keeps every file. |
+| `siblingChangesToken` | string  | no       | the token `McpSharedCheckoutChangedError` returned     | Acknowledges the outside changes it describes.                    |
+| `clientRequestId`     | string  | no       | 1 to 256 characters                                    | Retry id.                                                         |
 
 **Result** (`structuredContent`), one of:
 
-- Done: `{ threadId, turnCount, reverted: true, conversationRewound }`. `conversationRewound` is false when the provider could not rewind its conversation: the files were restored but the later messages are kept.
+- Done: `{ threadId, turnCount, reverted: true, conversationRewound, filesRestored }`. `conversationRewound` is false when the provider could not rewind its conversation: the files were restored but the later messages are kept. `filesRestored` is false for `mode: "conversationOnly"`.
 - Not finished within 30 seconds: `{ threadId, turnCount, reverted: null, detail }`. The revert was requested and is still running; it is not a failure. Inspect with `read_thread` or `get_turn_diff`, or repeat the call with the same `clientRequestId` to wait again.
 
 **Errors:**
 
-- `McpTurnRunningError`: a turn is running on the thread. Stop it with `interrupt_turn`, then revert.
+- `McpTurnRunningError`: a turn is running on the thread, or (for a file restore) another chat in the thread's checkout is running a turn or starting one, named in the message. Stop it with `interrupt_turn`, wait, or use `mode: "conversationOnly"`.
+- `McpSharedCheckoutChangedError`: another chat shares the thread's checkout and files there changed outside this thread since `turnCount`. The structured error carries `restoredPaths` (every file the restore changes), `siblingChanges` (`paths` changed since the thread's last turn, and `turns` of other chats with their files) and `siblingChangesToken`. Repeat the call with that token and a new `clientRequestId` to restore anyway, or with `mode: "conversationOnly"`. The worker returns it too when files changed after the check.
 - `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail; a turn's checkpoint still being recorded is retried in a moment), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
 - `McpInvalidArgumentError`: `turnCount` is above the latest turn that has a checkpoint.
 - `McpAccessCeilingError`: the thread runs above this connection's limit.
@@ -3997,7 +4049,7 @@ The Clone tools let an agent clone a public Git repository (or, over SSH with th
 - An `https://` URL must be written canonically, exactly as `https://host/owner/repo`: no user name or password (a credential never sits in tool arguments; Git uses the credentials it already has, which in this isolated environment means none), no spaces, no percent-encoded characters, no unicode or numeric (decimal, octal, hex) host spelling, no explicit default port (`:443`), no trailing dot on the host. The URL must equal what a URL parser would write for it (case is ignored; a trailing `/` is allowed). IPv6 literals in brackets are allowed if the address is public. Anything else is `clone_url_refused`.
 - Public hosts only. The host name is resolved (10 second limit) and every resolved address must be globally reachable (not loopback, private, link-local, shared CGNAT, documentation, multicast, reserved, and so on; IPv4-mapped, NAT64 and 6to4 addresses are judged by the IPv4 address they embed). If any address is not public: `clone_host_refused`. If the name does not resolve: `clone_host_unresolved`. The first checked address is pinned for Git's connection (`http.curloptResolve` for HTTPS), so DNS cannot change after the check. Git's own `url.<base>.insteadOf` rewrites are expanded first (`git ls-remote --get-url`, which reads the repository around the clone folder; `git clone` reads none, so Git clones the URL as written): an HTTPS URL's expansion must pass the same checks and may not be SSH, and an SSH URL whose expansion differs from it is `clone_url_refused`. Redirects are not followed, and only the URL's protocol is allowed (`protocol.allow=never` with `protocol.https.allow` or `protocol.ssh.allow`, and `GIT_ALLOW_PROTOCOL`).
 - SSH pinned and isolated. An SSH clone runs ssh through `GIT_SSH_COMMAND` (above any `core.sshCommand`; the server's own `GIT_SSH_COMMAND`, `GIT_SSH` and `GIT_SSH_VARIANT` are never inherited) with `GIT_SSH_VARIANT=ssh` and: `-F none` (no `~/.ssh/config` or system file, so no `Include`, `ProxyJump`, `ProxyCommand`, `Match exec`, `LocalCommand`, multiplexing or custom identity of the person's), `HostName=<first checked address>`, `HostKeyAlias=<host>` (or `[<host>]:<port>` off port 22, as known_hosts files it), `StrictHostKeyChecking=yes`, `BatchMode=yes`, `UpdateHostKeys=no`, `CheckHostIP=no`, `UserKnownHostsFile=<home>/.ssh/known_hosts <home>/.ssh/known_hosts2` (the server process's home), `IdentityFile=none`, `IdentityAgent=SSH_AUTH_SOCK`, `ProxyCommand=none`, `ControlMaster=no`, `ControlPath=none`, `ForwardAgent=no`, `ClearAllForwardings=yes`, `ConnectTimeout=30`, `ServerAliveInterval=15` and `ServerAliveCountMax=4`. ssh connects to the checked address and checks the key the person trusts for the host name; BiBCode never adds or rewrites a known_hosts entry for an agent. Only keys loaded in the person's SSH agent are offered. ssh ends a server that is silent for 60 seconds at any point after the connect; a server that keeps answering but trickles data holds the clone until `cancel_clone` or the 24-hour bound. The agent: on Linux and macOS, the server process's `SSH_AUTH_SOCK` when it names a socket; on Windows, Git's bundled `ssh` with `SSH_AUTH_SOCK` when it is set, else the Windows OpenSSH client with the OpenSSH Authentication Agent service. Without one, or when the home folder's path holds `${` or a control character, the clone is `clone_ssh_unavailable`; so is an ssh too old for one of the options. A server started over SSH or in WSL has an agent only when its own environment carries one. A known_hosts file set elsewhere in the person's `ssh_config` is not read, a jump host is not used, and a host certificate verifies on port 22 only (on another port, trust the host's plain key).
-- Isolated environment: Git starts from an allowlisted environment (`PATH`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TZ`, plus the Windows system variables), with no global or system Git configuration and `HOME` pointing at the null device, so no credential helper, proxy, rewrite, hook, filter or `.netrc` of the person's applies. Proxy variables are cleared. Consequently an HTTPS clone reaches only public repositories; a private one fails with a Git error. Hooks are disabled (`core.hooksPath` is the null device, `core.fsmonitor=false`), submodules are not cloned (`submodule.recurse=false`), and Git LFS smudge is off (`GIT_LFS_SKIP_SMUDGE=1` and an empty optional `lfs` filter), so LFS files stay pointer files.
+- Isolated environment: Git starts from an allowlisted environment (`PATH`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TZ`, plus the Windows system variables), with no global or system Git configuration and `HOME` pointing at the null device, so no credential helper, proxy, rewrite, hook, filter or `.netrc` of the person's applies. Proxy variables are cleared. Consequently an HTTPS clone reaches only public repositories; a private one fails with a Git error. Hooks are disabled (`core.hooksPath` is the null device, `\\.\nul` on Windows, and `core.fsmonitor=false`), submodules are not cloned (`submodule.recurse=false`), and Git LFS smudge is off (`GIT_LFS_SKIP_SMUDGE=1` and an empty optional `lfs` filter), so LFS files stay pointer files.
 - Git 2.37 or later is required (`http.curloptResolve`); older Git gives `clone_git_too_old`.
 - Destination: the clone goes into the folder that holds a live (not deleted) registered project, as a sibling of that project's folder. A project whose folder is a filesystem root has no such folder (`McpCloneRefusedError`). A finished clone of the same URL already at the destination is reused, not cloned again.
 
@@ -4546,6 +4598,7 @@ the tool ran, as the app sees it (for example `GitOperationFailedError`,
 | `McpRequestKindError`                   | The request id names an approval where a question was expected, or the reverse.                                                                                                                      | Use the tool its answerWith names.                                                                                                                    |
 | `McpTurnRunningError`                   | A turn is running, and this change needs the thread idle.                                                                                                                                            | Wait for it (wait_for_thread) or interrupt it (interrupt_turn) first.                                                                                 |
 | `McpCheckpointRevertError`              | Reverting to a checkpoint failed; the message says why.                                                                                                                                              | Read the thread, fix what the message names, then retry.                                                                                              |
+| `McpSharedCheckoutChangedError`         | Files in the thread's checkout changed outside the thread since that turn; the error lists them with a siblingChangesToken.                                                                          | Review the changes, then call again with siblingChangesToken and a new clientRequestId, or use mode conversationOnly.                                 |
 | `McpAttachmentExpiredError`             | A stored request's attachment upload is gone (it expires after 10 minutes idle, or on restart).                                                                                                      | Send it again without the clientRequestId.                                                                                                            |
 | `McpNoTurnDiffError`                    | This thread has no turn with recorded changes yet, or the turn asked for has no captured checkpoint (its capture failed or timed out).                                                               | Ask again after a turn changed files, or ask for another turn.                                                                                        |
 | `McpNotAWorktreeError`                  | This thread works in its project's folder, or in a worktree another thread hosts.                                                                                                                    | Pass the hosting thread's id, as the message says.                                                                                                    |

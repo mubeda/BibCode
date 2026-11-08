@@ -135,6 +135,10 @@ enum ProcessFailureKind {
 }
 
 impl ProcessFailureFacts {
+    pub(crate) const fn timed_out(self) -> bool {
+        matches!(self.kind, ProcessFailureKind::TimedOut(_))
+    }
+
     pub(crate) fn exited(code: i32) -> Self {
         Self {
             kind: ProcessFailureKind::Exited(code),

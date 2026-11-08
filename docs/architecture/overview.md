@@ -733,7 +733,8 @@ file handle before copying it into recovery staging; on Windows, directories
 remain attributes-only while database files explicitly request generic read
 access. `bibcode storage start-empty` is the separate destructive choice. Both
 mutating commands first acquire an exclusive runtime lock and the storage
-operation lock, publish a version-2 recovery journal (written to a temporary
+operation lock, publish a version-3 recovery journal, which records each staged
+file's identity, size and SHA-256 (written to a temporary
 file, synced, then renamed into place), and preserve every existing database,
 WAL, SHM, and marker entry in a private recovery generation, syncing it, before
 installing a verified database or allowing the next startup to create a new
@@ -747,10 +748,14 @@ CLI and the MCP relay call `ensure_no_interrupted_recovery` under the shared
 runtime lock and refuse to open SQLite while a recovery journal or strict
 recovery-staging entry remains; the refusal names
 `bibcode storage restore --resume`. That command, under both locks, finishes the
-operation from the files: it preserves every live file whose identity is not one
-the journal recorded as staged, syncs the preserved directory, installs the
-staged files and removes staging and the journal, or refuses and changes nothing
-when the journal or files match no known state. A crash, kill or cancellation
+operation from the files. It first checks every staged file, in staging or
+already installed, against the journal's size and SHA-256 and refuses with
+nothing moved on a mismatch (#289). It then preserves every live file whose
+identity is not one the journal recorded as staged, syncs the preserved
+directory, installs the staged files and removes staging and the journal, or
+refuses and changes nothing when the journal or files match no known state. A
+version-2 restore journal is refused because it recorded identities only; a
+version-2 start-empty journal, which stages nothing, is finished. A crash, kill or cancellation
 after the commit point therefore leaves recoverable files and an explicit
 incomplete operation instead of silently converting the root into a first-run
 store.
@@ -2034,6 +2039,12 @@ it.
   operation tag, never the path. The per-worktree repeat window lives only in
   memory, and the evidence carries the worktree with the home directory as
   `~`. A refused request, a lost workspace, and a cancellation raise nothing.
+- **Git sign-in (#325).** Each `git.signIn` that ran its probe writes one
+  `git.signInEnded` event with its direction, outcome (`signedIn`, `failed`,
+  `timedOut` at the 10-minute cap, or `cancelled`) and wait time. It records no
+  remote, URL, host, user name or Git output. `git.signIn` is long-running, so
+  it raises no `rpc.slow`, and its 660 s hang budget (the cap plus cleanup)
+  raises `rpc.hang` only for a sign-in that outlives its cap.
 
 ### Profiler off
 
@@ -2859,7 +2870,11 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   `unknown`, never success, when interrupted.
 - **Attribution.** An agent's commands stamp an `mcp-client` actor on their
   events; each mutating call writes a content-free `mcp_activity` row
-  (`mcp/activity.rs`); Stop, Take over and Hand back act on the session.
+  (`mcp/activity.rs`); Stop, Take over and Hand back act on the session. For a
+  named client (`bibcode mcp --client`, #280, #324) they act on the identity:
+  retries share one request scope across its runs within the 24-hour window, and
+  Take over is stored on the identity (`mcp_named_clients.taken_over_at`,
+  migration 71), so each later run starts read-only until Hand back.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
   the activity log by a monotonic cursor without reading payload text other than
   an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same

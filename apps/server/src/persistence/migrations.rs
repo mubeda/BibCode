@@ -64,6 +64,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (62, "mcp_oauth_clients"),
     (62, "mcp_oauth_authorizations"),
     (62, "mcp_oauth_refresh_tokens"),
+    (70, "mcp_named_clients"),
 ];
 
 #[derive(Debug, Error)]
@@ -668,6 +669,8 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(67, "ProjectionThreadSideChat", migration_067),
     Migration::new(68, "WebhookStatusKinds", migration_068),
     Migration::new(69, "ProjectionThreadMessagesQueuedIndex", migration_069),
+    Migration::new(70, "McpNamedClients", migration_070),
+    Migration::new(71, "McpNamedClientTakeOver", migration_071),
 ];
 
 impl Migration {
@@ -3002,6 +3005,50 @@ fn migration_069(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_070(transaction: &Transaction<'_>) -> Result<()> {
+    // Named MCP clients (#280): a durable, non-secret identity `bibcode mcp --client <name>`
+    // opts into. Its links and sessions carry its id; existing rows stay unnamed.
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS mcp_named_clients (
+          client_id  TEXT PRIMARY KEY,
+          name       TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          revoked_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_named_clients_live_name
+          ON mcp_named_clients(name) WHERE revoked_at IS NULL;
+        "#,
+    )?;
+    for table in ["auth_pairing_links", "auth_sessions"] {
+        if table_exists(transaction, table)?
+            && !table_has_column(transaction, table, "mcp_named_client_id")?
+        {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN mcp_named_client_id TEXT"
+            ))?;
+        }
+    }
+    if table_exists(transaction, "auth_sessions")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_auth_sessions_mcp_named_client
+               ON auth_sessions(mcp_named_client_id) WHERE mcp_named_client_id IS NOT NULL;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migration_071(transaction: &Transaction<'_>) -> Result<()> {
+    // Take over of a named MCP client (#324): set while a person has taken the identity over,
+    // so each later run starts read-only until Hand back.
+    if table_exists(transaction, "mcp_named_clients")?
+        && !table_has_column(transaction, "mcp_named_clients", "taken_over_at")?
+    {
+        transaction.execute_batch("ALTER TABLE mcp_named_clients ADD COLUMN taken_over_at TEXT")?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3231,7 +3278,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
+            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3264,7 +3311,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68, 69]
+            [65, 66, 67, 68, 69, 70, 71]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3300,7 +3347,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66, 67, 68, 69]
+            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3342,7 +3389,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68, 69]
+            [66, 67, 68, 69, 70, 71]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3373,7 +3420,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [69]
+            [69, 70, 71]
         );
         let index_sql: String = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
@@ -3405,6 +3452,83 @@ mod tests {
     }
 
     #[test]
+    fn migration_70_adds_named_clients_and_nullable_link_columns() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(69))?;
+        connection.execute_batch(
+            "INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, created_at, expires_at) VALUES ('l', 'c', 'one-time-token', '[]', 'mcp-client', '2026-11-07T00:00:00Z', '2026-11-07T00:01:00Z');
+             INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, expires_at) VALUES ('s', 'mcp-client', '[]', 'bearer-access-token', '2026-11-07T00:00:00Z', '2026-11-08T00:00:00Z');",
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [70, 71]
+        );
+        let unnamed: (Option<String>, Option<String>) = connection.query_row(
+            "SELECT (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = 'l'), (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = 's')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(unnamed, (None, None), "existing rows stay unnamed");
+        connection.execute(
+            "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES ('nc_1', 'a', '2026-11-07T00:00:00Z')",
+            [],
+        )?;
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES ('nc_2', 'a', '2026-11-07T00:00:00Z')",
+                    [],
+                )
+                .is_err(),
+            "one live identity per name"
+        );
+        connection.execute(
+            "UPDATE mcp_named_clients SET revoked_at = '2026-11-07T00:00:01Z' WHERE client_id = 'nc_1'",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES ('nc_2', 'a', '2026-11-07T00:00:02Z')",
+            [],
+        )?;
+        let transaction = connection.transaction()?;
+        super::migration_070(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_71_adds_taken_over_at_to_named_clients() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(70))?;
+        connection.execute(
+            "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES ('nc_1', 'a', '2026-11-07T00:00:00Z')",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [71]
+        );
+        let taken_over: Option<String> = connection.query_row(
+            "SELECT taken_over_at FROM mcp_named_clients WHERE client_id = 'nc_1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(taken_over, None, "an existing identity is not taken over");
+        let transaction = connection.transaction()?;
+        super::migration_071(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_068_adds_a_null_status_filter_to_existing_endpoints() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(67))?;
@@ -3418,7 +3542,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68, 69]
+            [68, 69, 70, 71]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3446,7 +3570,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68, 69]
+            [67, 68, 69, 70, 71]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -3472,7 +3596,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68, 69]
+            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3527,7 +3651,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
+            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3572,7 +3696,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
+            [
+                55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+            ]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3614,7 +3740,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(69));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(71));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4346,7 +4472,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=69).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=71).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4420,6 +4546,8 @@ mod tests {
                 (67, "ProjectionThreadSideChat"),
                 (68, "WebhookStatusKinds"),
                 (69, "ProjectionThreadMessagesQueuedIndex"),
+                (70, "McpNamedClients"),
+                (71, "McpNamedClientTakeOver"),
             ],
         );
         assert_eq!(
@@ -4570,7 +4698,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 53);
+        assert_eq!(second.len(), 55);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4593,7 +4721,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 39);
+        assert_eq!(application_table_count, 40);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -4690,7 +4818,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65, 66, 67, 68, 69
+                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
             ]
         );
         let policy = connection.query_row(
@@ -4730,7 +4858,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65, 66, 67, 68, 69
+                62, 63, 64, 65, 66, 67, 68, 69, 70, 71
             ]
         );
         let pin = connection.query_row(
@@ -4761,7 +4889,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65, 66, 67, 68, 69
+                63, 64, 65, 66, 67, 68, 69, 70, 71
             ]
         );
         let pin = connection.query_row(
@@ -4904,7 +5032,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-                69
+                69, 70, 71
             ]
         );
         assert_eq!(
@@ -4934,7 +5062,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 36);
+        assert_eq!(applied.len(), 38);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);

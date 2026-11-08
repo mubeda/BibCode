@@ -942,16 +942,18 @@ async fn a_capability_set_turned_off_hides_and_refuses_its_tools_live() {
     harness.shutdown().await;
 }
 
-async fn event_count(harness: &Harness) -> i64 {
+/// Interrupts the engine accepted. Not every event: turn delivery appends its own after
+/// `start_thread` returns, on its own schedule.
+async fn interrupt_requests(harness: &Harness) -> i64 {
     harness
         .repositories
         .database()
         .call(|connection| {
-            Ok(
-                connection.query_row("SELECT COUNT(*) FROM orchestration_events", [], |row| {
-                    row.get(0)
-                })?,
-            )
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.turn-interrupt-requested'",
+                [],
+                |row| row.get(0),
+            )?)
         })
         .await
         .unwrap()
@@ -973,15 +975,14 @@ async fn interrupt_turn_dispatches_only_for_a_running_turn_and_is_not_idempotent
     assert_eq!(interrupt["annotations"]["idempotentHint"], false);
 
     let (thread_id, _) = start(&harness, &agent, basic_start()).await;
-    let before = event_count(&harness).await;
     let idle = harness
         .call(&agent, "interrupt_turn", json!({ "threadId": thread_id }))
         .await;
     assert_eq!(structured(&idle)["interruptRequested"], false);
     assert_eq!(structured(&idle)["turnRunning"], false);
     assert_eq!(
-        event_count(&harness).await,
-        before,
+        interrupt_requests(&harness).await,
+        0,
         "nothing was dispatched"
     );
 
@@ -1009,13 +1010,13 @@ async fn interrupt_turn_dispatches_only_for_a_running_turn_and_is_not_idempotent
     );
 
     harness.provider_turn(&thread_id, "turn-1", "", true).await;
-    let settled = event_count(&harness).await;
+    let settled = interrupt_requests(&harness).await;
     let again = harness
         .call(&agent, "interrupt_turn", json!({ "threadId": thread_id }))
         .await;
     assert_eq!(structured(&again)["turnRunning"], false);
     assert_eq!(
-        event_count(&harness).await,
+        interrupt_requests(&harness).await,
         settled,
         "a repeat holds nothing"
     );

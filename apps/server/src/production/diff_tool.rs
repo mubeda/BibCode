@@ -734,6 +734,23 @@ fn spawn_difftool(cwd: &Path, args: &[String], log: &std::fs::File) -> std::io::
     spawn_difftool_once(cwd, args, log)
 }
 
+/// `git difftool` with `args` in `cwd`. Only the shared system-configuration variable joins
+/// it (#283), the same policy `--tool-help` lists the tools under: the prompt guards and the
+/// C locale of `git_environment()` would reach the diff app itself.
+fn difftool_command(cwd: &Path, args: &[String]) -> Command {
+    let (name, value) = crate::git::system_config::system_config_variable();
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env(name, value)
+        // Paths after `--` are literal: pathspec magic such as `:(top)` does not apply.
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 fn spawn_difftool_once(
     cwd: &Path,
     args: &[String],
@@ -741,14 +758,8 @@ fn spawn_difftool_once(
     #[cfg(windows)] breakaway: bool,
 ) -> std::io::Result<Child> {
     let stderr = log.try_clone()?;
-    let mut command = Command::new("git");
+    let mut command = difftool_command(cwd, args);
     command
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        // Paths after `--` are literal: pathspec magic such as `:(top)` does not apply.
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
@@ -936,6 +947,19 @@ environment. If run in a terminal-only session, they will fail.
     }
 
     #[test]
+    fn the_launched_difftool_takes_the_shared_system_configuration_variable() {
+        let command = difftool_command(Path::new("repo"), &["difftool".to_owned()]);
+        let (name, value) = crate::git::system_config::system_config_variable();
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, set)| key == name && set == Some(value.as_os_str())),
+            "{name:?} missing from the difftool launch"
+        );
+    }
+
+    #[test]
     fn difftool_args_name_the_tool_the_revisions_and_literal_paths() {
         let cwd = Path::new("repo");
         let head = ["HEAD".to_owned()];
@@ -1063,8 +1087,13 @@ environment. If run in a terminal-only session, they will fail.
         }
     }
 
+    /// A launcher whose window outlasts any start, so `open` returns once a tool that ends
+    /// at once has ended, and its calls and exit code are final however slow the host is.
     fn launcher() -> DiffToolLauncher {
-        DiffToolLauncher::new(ProcessAttributionRegistry::new())
+        DiffToolLauncher::with_launch_window(
+            ProcessAttributionRegistry::new(),
+            Duration::from_secs(60),
+        )
     }
 
     #[tokio::test]
@@ -1146,9 +1175,9 @@ environment. If run in a terminal-only session, they will fail.
         assert_eq!(reason(error).0, ReviewDiffToolFailureReason::ShuttingDown);
     }
 
-    /// A fake tool `fake` in the repository's Git config. It appends its process group, which
-    /// is its `git difftool`'s ID, to `pgids`, and the path and both sides' contents to
-    /// `calls.log`, then runs `then`.
+    /// A fake tool `fake` in the repository's Git config. It appends the path and both sides'
+    /// contents to `calls.log`, then its process group, which is its `git difftool`'s ID, to
+    /// `pgids`, then runs `then`. A recorded process group means its call is logged too.
     #[cfg(unix)]
     struct FakeTool {
         directory: TempDir,
@@ -1164,7 +1193,6 @@ environment. If run in a terminal-only session, they will fail.
                 format!(
                     r#"#!/bin/sh
 dir=$(dirname "$0")
-ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
 {{
   printf '%s\n' "$3"
   if [ -f "$1" ]; then cat "$1"; fi
@@ -1172,6 +1200,7 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
   if [ -f "$2" ]; then cat "$2"; fi
   printf '==\n'
 }} >> "$dir/calls.log"
+ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
 {then}
 "#
                 ),
@@ -1244,6 +1273,8 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
             .await
             .expect("opened");
         assert_eq!(launcher.running(), 1);
+        // The window can end before a slow host has run the tool at all.
+        wait_until("the tool started", || !tool.pgids().is_empty()).await;
         assert_eq!(tool.take_calls(), "tracked.txt\nbefore\n--\nafter\n==\n");
         let ownership = registry.freeze_and_snapshot_ownership();
         assert!(ownership.roots.is_empty(), "{ownership:?}");
@@ -1460,7 +1491,7 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
         let repository = Repository::new();
         repository.write("tracked.txt", "after\n");
         let tool = FakeTool::install(&repository, "exec sleep 30");
-        let launcher = launcher();
+        let launcher = DiffToolLauncher::new(ProcessAttributionRegistry::new());
         let input = repository.open(file("tracked.txt", None), ReviewDiffToolScope::WorkingTree);
 
         let launches = futures_util::future::join_all(
@@ -1478,6 +1509,11 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
             "{}",
             failure.message
         );
+        // A launch is open once its window ends, which can be before a slow host runs its tool.
+        wait_until("every tool started", || {
+            tool.pgids().len() >= MAX_RUNNING_DIFF_TOOLS
+        })
+        .await;
         assert_eq!(tool.pgids().len(), MAX_RUNNING_DIFF_TOOLS);
 
         // Each slot frees when its app exits.

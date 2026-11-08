@@ -1,5 +1,6 @@
 pub(crate) mod activity;
 pub mod model;
+pub mod quiet;
 pub mod runtime;
 pub(crate) mod sse;
 pub(crate) mod v2;
