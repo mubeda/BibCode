@@ -205,6 +205,16 @@ impl PendingScope {
             }
             _ => {}
         }
+        // A recorded spelling other than the origin's own (`host:8929`) is only a
+        // placement: any failed login, a timeout included, drops it so the next read
+        // or Rescan tries the origin's own spelling. A cancelled request proves nothing.
+        if result.is_err()
+            && !c.is_cancelled()
+            && matches!(self.authentication, ScopeAuthentication::Recorded)
+            && remote_web_host(&self.remote).as_deref() != Some(self.scope.host.as_str())
+        {
+            runner.provider_hosts().forget(&self.scope.host);
+        }
         result
     }
 }
@@ -1366,5 +1376,37 @@ esac"#;
                 );
             }
         }
+    }
+
+    /// A recorded alternate spelling whose login check times out is dropped, so Rescan
+    /// tries the origin's own spelling instead of picking the stale one forever.
+    #[tokio::test]
+    async fn pull_requests_a_failing_recorded_spelling_is_dropped_for_the_bare_host() {
+        const GLAB: &str = r#"case "$1 $2 $3 $4" in
+  '--version   ') echo 'glab 1.126.0' ;;
+  'auth status --hostname gitlab.example.test:8929') sleep 6 ;;
+  'auth status --hostname gitlab.example.test') printf 'gitlab.example.test\n  ✓ Logged in to gitlab.example.test as test-user\n' ;;
+  *) printf '  x unreachable\n' >&2; exit 1 ;;
+esac"#;
+        let s = TestSandbox::new("pr-stale-spelling");
+        let runner = runner(
+            &s,
+            Some("git@gitlab.example.test:group/project.git"),
+            GH,
+            GLAB,
+        );
+        runner
+            .provider_hosts()
+            .record("gitlab.example.test:8929", ProviderKind::Gitlab);
+        let c = CancellationToken::new();
+        let none = DiscoveredHosts::default();
+        let rescan = || resolve_checked_scope(&runner, s.root(), &none, ContextRead::Rescan, &c);
+        assert_eq!(rescan().await.unwrap_err().code, "timeout");
+        assert_eq!(
+            runner.provider_hosts().provider("gitlab.example.test:8929"),
+            None
+        );
+        runner.clear_context_probes();
+        assert_eq!(rescan().await.unwrap().host, "gitlab.example.test");
     }
 }
