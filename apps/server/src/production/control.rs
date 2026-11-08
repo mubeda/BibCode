@@ -3307,7 +3307,6 @@ mod tests {
         )
         .await;
         let log = stub_state.join("probe-log");
-        std::fs::write(&log, "").expect("probe log");
         // Each probe logs its start, then waits for the other's before it logs its end. Probes
         // that overlap end as soon as both have started, however late a loaded host starts the
         // second (#329); serial probes give up after about 5 s, inside the 10 s probe timeout,
@@ -3334,19 +3333,28 @@ mod tests {
             json!(provider.to_string_lossy());
         let tools = control.tools_with(setup);
 
-        probe_startup_inventory(
-            &settings,
-            sandbox.root(),
-            &control.provider_maintenance,
-            &tools,
-        )
-        .await;
-
-        let events: Vec<String> = std::fs::read_to_string(&log)
-            .expect("read probe log")
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        // A starved host can keep a probe's child from starting before the 10 s probe timeout
+        // ends it. A run in which either never started says nothing about overlap, so it is
+        // retried; serial probes still log a start, an end and a second start every time.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            std::fs::write(&log, "").expect("probe log");
+            probe_startup_inventory(
+                &settings,
+                sandbox.root(),
+                &control.provider_maintenance,
+                &tools,
+            )
+            .await;
+            events = std::fs::read_to_string(&log)
+                .expect("read probe log")
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if events.iter().filter(|event| *event == "start").count() == 2 {
+                break;
+            }
+        }
         assert_eq!(events.len(), 4, "both probes ran: {events:?}");
         assert_eq!(
             events[..2],
@@ -3658,25 +3666,41 @@ mod tests {
         .await
         .unwrap();
         let payload = json!({"instanceId":"codex","cwd":sandbox.root()});
-        let request = tokio::spawn(control.call(
-            "server.getProviderCapabilities",
-            payload.clone(),
-            CancellationToken::new(),
-        ));
-        // A hang guard, not a timing assertion (#329): a loaded host can start the child seconds
-        // late, and discovery's own 10 s probe timeout ends it before this bound anyway.
-        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
-                    && let Ok(pid) = raw.parse()
-                {
-                    break pid;
+        // A starved host can keep the discovery child from starting until discovery's own 10 s
+        // probe timeout ends the request (#329). Such a request was never abandoned with a live
+        // child, so it is reissued; the 60 s bound is a hang guard, not a timing assertion.
+        let mut attempts = 0;
+        let (request, pid) = loop {
+            attempts += 1;
+            let _ = tokio::fs::remove_file(&pid_file).await;
+            let request = tokio::spawn(control.call(
+                "server.getProviderCapabilities",
+                payload.clone(),
+                CancellationToken::new(),
+            ));
+            let pid: Option<libc::pid_t> = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
+                        && let Ok(pid) = raw.parse()
+                    {
+                        break Some(pid);
+                    }
+                    if request.is_finished() {
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            })
+            .await
+            .expect("discovery child started");
+            match pid {
+                Some(pid) if !request.is_finished() => break (request, pid),
+                _ => assert!(
+                    attempts < 3,
+                    "no discovery child ran while its request was open"
+                ),
             }
-        })
-        .await
-        .expect("discovery child started");
+        };
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         tokio::time::timeout(
