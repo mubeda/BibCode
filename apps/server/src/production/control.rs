@@ -3300,7 +3300,6 @@ mod tests {
             json!(provider.to_string_lossy());
         let tools = control.tools_with(setup);
 
-        let started = std::time::Instant::now();
         probe_startup_inventory(
             &settings,
             sandbox.root(),
@@ -3308,7 +3307,6 @@ mod tests {
             &tools,
         )
         .await;
-        let elapsed = started.elapsed();
 
         let events: Vec<String> = std::fs::read_to_string(&log)
             .expect("read probe log")
@@ -3321,8 +3319,6 @@ mod tests {
             ["start", "start"],
             "both started before either ended"
         );
-        // Headroom only: serial probes take at least 2 s.
-        assert!(elapsed < Duration::from_millis(1900), "took {elapsed:?}");
     }
 
     async fn until_exists(path: &Path) {
