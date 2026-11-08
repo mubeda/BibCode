@@ -55,6 +55,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.getThreadShells"
         | "orchestration.getTurnDiff"
         | "orchestration.listOlderThreads"
+        | "orchestration.previewCheckpointRevert"
         | "orchestration.replayEvents"
         | "orchestration.subscribeShell"
         | "orchestration.subscribeThread"

@@ -1235,6 +1235,18 @@ impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
     fn launch_setup_script<'a>(&'a self, input: SetupScriptLaunch) -> BoxEffectFuture<'a, ()> {
         Box::pin(async move { self.terminals.launch_setup_script(input).await })
     }
+
+    fn revert_probe(
+        &self,
+    ) -> Option<Box<dyn crate::production::orchestration_effects::RevertProbe + '_>> {
+        Some(Box::new(
+            crate::production::provider_runtime::SupervisorRevertProbe {
+                supervisor: &self.provider,
+                settings_root: &self.settings_root,
+                engine: &self.engine,
+            },
+        ))
+    }
 }
 
 #[derive(Clone)]

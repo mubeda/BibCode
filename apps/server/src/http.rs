@@ -758,6 +758,9 @@ struct EnvironmentCapabilities {
     /// `preview.tunnelOpen`, `preview.tunnelWrite` and `preview.tunnelClose` (#69): what a
     /// desktop reads before routing an environment's previews through SOCKS.
     preview_tunnels: bool,
+    /// `thread.checkpoint.revert` takes `mode: "conversationOnly"` and a sibling-changes
+    /// token, and `orchestration.previewCheckpointRevert` exists (#279).
+    conversation_only_rewind: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -785,6 +788,7 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             terminal_ordered_input: true,
             terminal_size_ownership: true,
             preview_tunnels: true,
+            conversation_only_rewind: true,
         },
     })
 }

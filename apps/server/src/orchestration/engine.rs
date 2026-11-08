@@ -99,6 +99,22 @@ impl ProjectionContext {
     }
 }
 
+/// What a checkpoint revert restores (#279): files and conversation, or only the conversation,
+/// which leaves the working tree as it is.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevertMode {
+    #[default]
+    Full,
+    ConversationOnly,
+}
+
+impl RevertMode {
+    fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum OptionalNullable<T> {
     #[default]
@@ -717,6 +733,16 @@ pub enum OrchestrationCommand {
         thread_id: String,
         #[serde(rename = "turnCount")]
         turn_count: i64,
+        /// `full` (files and conversation) unless the client asks for the conversation only.
+        #[serde(default, skip_serializing_if = "RevertMode::is_full")]
+        mode: RevertMode,
+        /// The preview's token for the changes other chats made in a shared checkout (#279).
+        #[serde(
+            rename = "siblingChangesToken",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        sibling_changes_token: Option<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -1837,6 +1863,137 @@ impl ThreadTurnFence {
     }
 }
 
+/// One read/write gate per checkout key (#279): each turn delivery and compaction holds it
+/// shared until its provider has the turn, and a file restore holds it exclusively from its
+/// planning until it is recorded. Taken after the thread's own `ThreadTurnFence`, never before.
+/// In memory only, for the reason `ThreadTurnFence` gives. Tokio's `RwLock` is fair, so a
+/// stream of deliveries cannot starve a restore.
+#[derive(Clone, Default)]
+struct CheckoutTurnFence {
+    checkouts: Arc<StdMutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>>,
+}
+
+impl CheckoutTurnFence {
+    fn gate(&self, key: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut checkouts = self
+            .checkouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        checkouts.retain(|_, gate| gate.strong_count() > 0);
+        checkouts.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::RwLock::new(()));
+            checkouts.insert(key.to_owned(), Arc::downgrade(&gate));
+            gate
+        })
+    }
+}
+
+/// Held by a turn delivery or compaction from before its claim until the provider has the turn.
+/// It also registers the thread as admitted, which a restore of its checkout counts as writing.
+pub(crate) struct CheckoutTurnAdmission {
+    engine: OrchestrationEngine,
+    thread_id: String,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl Drop for CheckoutTurnAdmission {
+    fn drop(&mut self) {
+        let mut holds = self.engine.lock_restore_holds();
+        decrement(&mut holds.admitted, &self.thread_id);
+    }
+}
+
+/// Another chat's state that keeps a file restore from marking it (#279).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RestoreHoldConflict {
+    /// A provider session of the thread is launching.
+    Launching(String),
+    /// A turn delivery or compaction of the thread is admitted, possibly under another key.
+    Admitted(String),
+}
+
+/// Held by a file restore from its planning until it is recorded. It also marks the
+/// checkout's other threads, so delivery skips them and no provider session of theirs launches;
+/// dropping it clears the marks and wakes delivery.
+pub(crate) struct CheckoutRestore {
+    engine: OrchestrationEngine,
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    held_threads: Vec<String>,
+}
+
+impl CheckoutRestore {
+    /// Marks `threads` held for this restore, unless one of them is launching a provider session
+    /// or has a turn admitted now. Under the same mutex as `begin_session_launch` and
+    /// `admit_checkout_turn`, so each of those either registers before the marks and the restore
+    /// refuses, or comes after and sees the marks.
+    pub(crate) fn hold_threads(&mut self, threads: &[String]) -> Result<(), RestoreHoldConflict> {
+        let mut holds = self.engine.lock_restore_holds();
+        for thread in threads {
+            if holds.launching.contains_key(thread) {
+                return Err(RestoreHoldConflict::Launching(thread.clone()));
+            }
+            if holds.admitted.contains_key(thread) {
+                return Err(RestoreHoldConflict::Admitted(thread.clone()));
+            }
+        }
+        for thread in threads {
+            *holds.held.entry(thread.clone()).or_default() += 1;
+            self.held_threads.push(thread.clone());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CheckoutRestore {
+    fn drop(&mut self) {
+        if self.held_threads.is_empty() {
+            return;
+        }
+        {
+            let mut holds = self.engine.lock_restore_holds();
+            for thread in &self.held_threads {
+                decrement(&mut holds.held, thread);
+            }
+        }
+        self.engine.wake_turn_delivery();
+    }
+}
+
+/// Threads a file restore holds, threads launching a provider session and threads with a turn
+/// admitted to their checkout, each with a count. One mutex over all three is what serializes
+/// launches and admissions against a restore's marks (#279).
+#[derive(Default)]
+struct RestoreHolds {
+    held: HashMap<String, usize>,
+    launching: HashMap<String, usize>,
+    admitted: HashMap<String, usize>,
+}
+
+fn decrement(counts: &mut HashMap<String, usize>, thread_id: &str) {
+    if let Some(count) = counts.get_mut(thread_id) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(thread_id);
+        }
+    }
+}
+
+/// Registered while a provider session of the thread launches; dropping it ends the launch.
+pub(crate) struct SessionLaunch {
+    engine: OrchestrationEngine,
+    thread_id: String,
+}
+
+impl Drop for SessionLaunch {
+    fn drop(&mut self) {
+        let mut holds = self.engine.lock_restore_holds();
+        decrement(&mut holds.launching, &self.thread_id);
+    }
+}
+/// Why a provider session cannot launch while another chat restores files in its checkout.
+pub(crate) const RESTORING_FILES_DETAIL: &str =
+    "Another chat in this checkout is restoring files. Try again in a moment.";
+
 #[derive(Clone, Default)]
 struct WorkspaceOwnershipFence {
     keys: Arc<StdMutex<HashMap<String, Weak<WorkspaceOwnershipKey>>>>,
@@ -2067,6 +2224,8 @@ pub struct OrchestrationEngine {
     command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
+    checkout_turns: CheckoutTurnFence,
+    restore_holds: Arc<StdMutex<RestoreHolds>>,
     compaction_waiters: CompactionWaiters,
     ask_recovery_holds: AskRecoveryHolds,
     checkpoint_holds: CheckpointHolds,
@@ -2165,6 +2324,8 @@ impl OrchestrationEngine {
             command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
+            checkout_turns: CheckoutTurnFence::default(),
+            restore_holds: Arc::default(),
             compaction_waiters: CompactionWaiters::default(),
             ask_recovery_holds: AskRecoveryHolds::default(),
             checkpoint_holds: CheckpointHolds::default(),
@@ -2817,6 +2978,73 @@ impl OrchestrationEngine {
     /// Whether a revert or turn delivery of the thread runs now.
     pub(crate) fn thread_turns_reserved(&self, thread_id: &str) -> bool {
         self.thread_turns.is_reserved(thread_id)
+    }
+
+    /// Shared admission of a turn delivery or compaction of `thread_id` to the checkout `key`;
+    /// waits while a file restore holds the checkout. `None` when a restore of another chat in
+    /// the checkout holds the thread, though the thread keyed its checkout elsewhere: it waits
+    /// for that restore's end, which wakes delivery. See `CheckoutTurnFence`.
+    pub(crate) async fn admit_checkout_turn(
+        &self,
+        thread_id: &str,
+        key: &str,
+    ) -> Option<CheckoutTurnAdmission> {
+        let guard = self.checkout_turns.gate(key).read_owned().await;
+        let mut holds = self.lock_restore_holds();
+        if holds.held.contains_key(thread_id) {
+            return None;
+        }
+        *holds.admitted.entry(thread_id.to_owned()).or_default() += 1;
+        Some(CheckoutTurnAdmission {
+            engine: self.clone(),
+            thread_id: thread_id.to_owned(),
+            _guard: guard,
+        })
+    }
+
+    /// The checkout `key` held exclusively for a file restore, once every turn admitted to it
+    /// has its provider. Dropping the future before then gives up the place in line.
+    pub(crate) async fn hold_checkout_for_restore(&self, key: &str) -> CheckoutRestore {
+        CheckoutRestore {
+            engine: self.clone(),
+            _guard: self.checkout_turns.gate(key).write_owned().await,
+            held_threads: Vec::new(),
+        }
+    }
+
+    /// Whether a file restore of another chat in its checkout holds the thread.
+    pub(crate) fn thread_held_for_restore(&self, thread_id: &str) -> bool {
+        self.lock_restore_holds().held.contains_key(thread_id)
+    }
+
+    /// Whether a turn delivery or compaction of the thread is admitted to its checkout now.
+    pub(crate) fn thread_turn_admitted(&self, thread_id: &str) -> bool {
+        self.lock_restore_holds().admitted.contains_key(thread_id)
+    }
+
+    /// Whether a provider session of the thread is launching now.
+    pub(crate) fn thread_session_launching(&self, thread_id: &str) -> bool {
+        self.lock_restore_holds().launching.contains_key(thread_id)
+    }
+
+    /// Registers a provider session launch of the thread, or refuses it while a file restore of
+    /// another chat in its checkout holds the thread. See `CheckoutRestore::hold_threads`.
+    pub(crate) fn begin_session_launch(&self, thread_id: &str) -> Result<SessionLaunch, String> {
+        let mut holds = self.lock_restore_holds();
+        if holds.held.contains_key(thread_id) {
+            return Err(RESTORING_FILES_DETAIL.to_owned());
+        }
+        *holds.launching.entry(thread_id.to_owned()).or_default() += 1;
+        Ok(SessionLaunch {
+            engine: self.clone(),
+            thread_id: thread_id.to_owned(),
+        })
+    }
+
+    fn lock_restore_holds(&self) -> std::sync::MutexGuard<'_, RestoreHolds> {
+        self.restore_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Holds the thread's automatic queue promotion until its resumed session has read the asks
@@ -5304,17 +5532,25 @@ async fn plan_command(
             command_id,
             thread_id,
             turn_count,
+            mode,
+            sibling_changes_token,
             created_at,
-        } => simple_thread_event(
-            model,
-            command,
-            "thread.checkpoint-revert-requested",
-            command_id,
-            thread_id,
-            created_at,
-            metadata,
-            json!({"threadId":thread_id,"turnCount":turn_count,"createdAt":created_at}),
-        ),
+        } => {
+            let mut payload = json!({"threadId":thread_id,"turnCount":turn_count,"mode":mode,"createdAt":created_at});
+            if let Some(token) = sibling_changes_token {
+                payload["siblingChangesToken"] = json!(token);
+            }
+            simple_thread_event(
+                model,
+                command,
+                "thread.checkpoint-revert-requested",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                payload,
+            )
+        }
         OrchestrationCommand::ThreadSessionStop {
             command_id,
             thread_id,
