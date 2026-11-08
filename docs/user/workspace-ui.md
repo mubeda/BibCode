@@ -972,6 +972,22 @@ The toolbar has three segments:
    repository usable; ahead/behind remain unknown at zero until Fetch obtains
    that ref instead of making the complete Git Manager unavailable.
 
+**Signing in with Git Credential Manager.** In the desktop app on this computer, when a
+fetch, pull, push, publish, force push, tag push or remote branch delete fails because Git
+Credential Manager needs you to sign in, the operation banner asks **Sign in to
+`github.com/owner/repo`?** and names the remote. Nothing opens until you choose **Sign in**;
+**Not now** keeps the authentication error. Git Credential Manager then shows its own window
+or a browser page, and the banner waits with **Cancel**. After you sign in, the operation
+runs again on its own, against the same address you approved; if the remote's address
+changed in the meantime, it stops instead. A sign-in times out after 10 minutes, and only
+one can be open at a time. Cancel stops BiBCode's Git command, but a sign-in you already
+finished may already be saved, and a browser tab Git Credential Manager opened stays open.
+The Source Control panel offers the same sign-in for its pull and push, and its progress
+shows **Cancel** while it pulls or pushes. The offer needs an `https://` remote with one URL
+in that direction; SSH remotes, `osxkeychain`-only setups, the browser app, paired devices,
+WSL and remote servers, and agents' Git tools never get it and show the authentication
+error as before.
+
 The manager keeps the chosen tab for the session but does not save it, so it
 opens on **History** after a reload. A reconnect keeps the chosen tab and is not
 an opening. Opening it, or switching to another

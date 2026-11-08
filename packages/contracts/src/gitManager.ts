@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, PositiveInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { GitSignInDestinationFields } from "./git.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 
@@ -203,6 +204,12 @@ const GitManagerOperationBase = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   projectId: ProjectId,
 });
+/**
+ * Set on a request resumed after a Git Credential Manager sign-in (#325): the destination the
+ * person approved. The server refuses with `destination-changed` unless the remote still has
+ * exactly that one URL.
+ */
+const ExpectedDestination = Schema.optional(TrimmedNonEmptyStringSchema);
 const GitManagerBranchPushBase = {
   ...GitManagerOperationBase.fields,
   remote: TrimmedNonEmptyStringSchema,
@@ -210,6 +217,7 @@ const GitManagerBranchPushBase = {
   remoteBranch: Schema.NullOr(TrimmedNonEmptyStringSchema),
   /** Push every local tag with the branch (`--tags --atomic`). Older clients omit it. */
   pushTags: Schema.optional(Schema.Boolean),
+  expectedDestination: ExpectedDestination,
 };
 const GitManagerStashSelectionBase = {
   ...GitManagerOperationBase.fields,
@@ -244,14 +252,17 @@ export const GitManagerOperationRequest = Schema.Union([
     ...GitManagerOperationBase.fields,
     remote: TrimmedNonEmptyStringSchema,
     branch: TrimmedNonEmptyStringSchema,
+    expectedDestination: ExpectedDestination,
   }),
   Schema.TaggedStruct("fetch", {
     ...GitManagerOperationBase.fields,
     remote: TrimmedNonEmptyStringSchema,
+    expectedDestination: ExpectedDestination,
   }),
   Schema.TaggedStruct("pull", {
     ...GitManagerOperationBase.fields,
     remote: TrimmedNonEmptyStringSchema,
+    expectedDestination: ExpectedDestination,
   }),
   Schema.TaggedStruct("push", GitManagerBranchPushBase),
   Schema.TaggedStruct("publish-branch", GitManagerBranchPushBase),
@@ -343,6 +354,7 @@ export const GitManagerOperationRequest = Schema.Union([
     ...GitManagerOperationBase.fields,
     name: TrimmedNonEmptyStringSchema,
     remote: TrimmedNonEmptyStringSchema,
+    expectedDestination: ExpectedDestination,
   }),
 ]);
 export type GitManagerOperationRequest = typeof GitManagerOperationRequest.Type;
@@ -365,6 +377,13 @@ export const GitManagerOperationEvent = Schema.Union([
     code: TrimmedNonEmptyStringSchema,
     message: TrimmedNonEmptyStringSchema,
     blocked: Schema.NullOr(GitManagerBlockedReason),
+    /**
+     * Set with code `sign-in-required` (#325), only by the desktop's in-process server to its
+     * own session: where the sign-in goes and the request to send after it.
+     */
+    signIn: Schema.optional(
+      Schema.Struct({ ...GitSignInDestinationFields, resume: GitManagerOperationRequest }),
+    ),
   }),
 ]);
 export type GitManagerOperationEvent = typeof GitManagerOperationEvent.Type;

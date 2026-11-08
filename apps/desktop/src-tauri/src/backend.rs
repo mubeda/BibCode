@@ -2302,6 +2302,8 @@ fn server_config_for_launch(
     server_config.mode = bibcode_server::ServerMode::Desktop;
     server_config.no_browser = true;
     server_config.desktop_bootstrap_token = Some(config.desktop_bootstrap_token.clone());
+    // Only this in-process backend may open Git Credential Manager's sign-in (#325).
+    server_config.interactive_git_sign_in = true;
     server_config.environment_id = config.environment_id.clone();
     server_config.environment_label = config.label.clone();
     server_config
@@ -4882,6 +4884,7 @@ exit /b 9
         );
         assert_eq!(server_config.environment_id, "primary");
         assert_eq!(server_config.environment_label, "Local");
+        assert!(server_config.interactive_git_sign_in);
     }
 
     #[cfg(unix)]

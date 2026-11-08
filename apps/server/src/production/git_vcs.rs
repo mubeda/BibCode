@@ -26,6 +26,10 @@ use crate::{
             ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, DETACH_REFUSED, DETACHED,
             NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
         },
+        sign_in::{
+            CredentialPrompt, Destination, SignInDirection, SignInRequired, current_branch_remote,
+            has_gcm_refusal, resolve_destination,
+        },
         validate_pathspecs,
     },
     maintenance::RpcPermit,
@@ -44,6 +48,7 @@ use crate::{
 };
 
 use super::clone_operations::{CloneRequest, CloneRuntime};
+use super::git_manager_rpc::credential_prompt;
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
@@ -261,6 +266,9 @@ pub struct GitVcsRpcServices {
     /// The live MCP settings, for the Terminals gate an agent's SSH clone needs (#217). Without
     /// them no agent may clone over SSH.
     mcp_settings: Option<watch::Receiver<crate::mcp::control::McpServerSettings>>,
+    /// Set only on the desktop's in-process server: the desktop app's own session may be offered a
+    /// Git Credential Manager sign-in (#325).
+    interactive_git_sign_in: bool,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -417,6 +425,7 @@ impl GitVcsRpcServices {
             clone_operations,
             clone_policy: ClonePolicy::default(),
             mcp_settings: None,
+            interactive_git_sign_in: false,
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
@@ -512,6 +521,13 @@ impl GitVcsRpcServices {
         self
     }
 
+    /// `ServerConfig::interactive_git_sign_in` (#325).
+    #[must_use]
+    pub fn with_interactive_git_sign_in(mut self, enabled: bool) -> Self {
+        self.interactive_git_sign_in = enabled;
+        self
+    }
+
     #[must_use]
     pub fn with_availability_registry(
         mut self,
@@ -589,9 +605,12 @@ pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, mut services: GitVcsRpcS
     registry.register_latest_stream(GIT_VCS_STREAM_METHODS[1], move |request, cancellation| {
         summary_services.summary_stream(request, cancellation)
     });
-    registry.register_stream(GIT_VCS_STREAM_METHODS[2], move |request, cancellation| {
-        services.stacked_action_stream(request, cancellation)
-    });
+    registry.register_stream_with_context(
+        GIT_VCS_STREAM_METHODS[2],
+        move |request, context, cancellation| {
+            services.stacked_action_stream(request, context, cancellation)
+        },
+    );
 }
 
 async fn await_server_owned_rpc(
@@ -616,17 +635,18 @@ impl GitVcsRpcServices {
         let operation_cancellation = cancellation.child_token();
         match request.tag.as_str() {
             "vcs.pull" => {
-                let input: CwdInput = decode(request.payload, "vcs.pull")?;
+                let input: PullInput = decode(request.payload, "vcs.pull")?;
                 let repository = Arc::clone(&self.repository);
                 let token = operation_cancellation.clone();
+                let prompt = credential_prompt(self.interactive_git_sign_in, &context);
+                // The pull's token is a child of this request's, so Cancel (an interrupt) or a
+                // lost connection kills its Git process even though the work runs server-owned.
                 self.run_owned_git_mutation(
                     "vcs.pull",
                     input.cwd.clone(),
                     workspace_admission,
                     operation_cancellation,
-                    async move {
-                        encode_result(repository.pull_current_branch(&input.cwd, &token).await)
-                    },
+                    async move { pull_offering_sign_in(&repository, &input, prompt, &token).await },
                 )
                 .await
             }
@@ -1582,9 +1602,19 @@ impl GitVcsRpcServices {
         receiver
     }
 
+    #[cfg(test)]
+    fn stacked_action_stream_without_session(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        self.stacked_action_stream(request, RpcSessionContext::unauthenticated(), cancellation)
+    }
+
     fn stacked_action_stream(
         &self,
         request: RpcRequest,
+        context: RpcSessionContext,
         cancellation: CancellationToken,
     ) -> mpsc::Receiver<RpcStreamChunk> {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
@@ -1594,8 +1624,10 @@ impl GitVcsRpcServices {
         let created_request_observer = self.created_request_observer.clone();
         let availability = self.availability_registry.clone();
         let trace_diagnostics = self.trace_diagnostics.clone();
+        let prompt = credential_prompt(self.interactive_git_sign_in, &context);
         tokio::spawn(async move {
             let started = tokio::time::Instant::now();
+            let payload = request.payload.clone();
             let input = match decode::<StackedActionInput>(request.payload, "git.runStackedAction")
             {
                 Ok(input) => input,
@@ -1638,6 +1670,7 @@ impl GitVcsRpcServices {
             }
             let mut safe_failure = None;
             let mut failed_phase = None;
+            let mut sign_in = None;
             let result = match validate_stacked_action_input(&input) {
                 Err(error) => Err(error),
                 Ok(()) => {
@@ -1673,11 +1706,37 @@ impl GitVcsRpcServices {
                                 )
                                 .await;
                             }
-                            result.map_err(|failure| {
+                            let mut result = result.map_err(|failure| {
                                 safe_failure = Some(failure.diagnostic);
                                 failed_phase = failure.phase;
                                 failure.wire
-                            })
+                            });
+                            if let Err(wire) = &mut result
+                                && failed_phase == Some("push")
+                            {
+                                let detail = wire
+                                    .get("detail")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                match stacked_sign_in_offer(
+                                    &repository,
+                                    &input,
+                                    &payload,
+                                    prompt,
+                                    &detail,
+                                    &operation_cancellation,
+                                )
+                                .await
+                                {
+                                    Some(Ok(offer)) => sign_in = Some(offer),
+                                    Some(Err(note)) => {
+                                        wire["detail"] = json!(format!("{detail} {note}"));
+                                    }
+                                    None => {}
+                                }
+                            }
+                            result
                         },
                     )
                     .await
@@ -1722,12 +1781,28 @@ impl GitVcsRpcServices {
                     "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
                     "kind": "action_finished", "result": result,
                 }),
-                Err(error) => json!({
-                    "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
-                    // The step that failed, or null for a request refused before any (#174).
-                    "kind": "action_failed", "phase": failed_phase,
-                    "message": error.get("detail").and_then(Value::as_str).unwrap_or("Git action failed."),
-                }),
+                Err(error) => {
+                    let message =
+                        if failed_phase == Some("push") && operation_cancellation.is_cancelled() {
+                            // Cancel stops the push only; a commit this action made stays.
+                            "Push cancelled. Your commit is saved locally."
+                        } else {
+                            error
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Git action failed.")
+                        };
+                    let mut event = json!({
+                        "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
+                        // The step that failed, or null for a request refused before any (#174).
+                        "kind": "action_failed", "phase": failed_phase,
+                        "message": message,
+                    });
+                    if let Some(sign_in) = sign_in {
+                        event["signIn"] = json!(sign_in);
+                    }
+                    event
+                }
             };
             if let Err(error) = await_git_rpc_operation(
                 workspace_admission.as_ref(),
@@ -2458,6 +2533,9 @@ struct StackedActionInput {
     pull_request_base_branch: Option<String>,
     pull_request_head_branch: Option<String>,
     pull_request_options: Option<CreatePullRequestOptions>,
+    /// A resumed push after a sign-in (#325); it can only add a refusal.
+    #[serde(default)]
+    expected_destination: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2624,6 +2702,78 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
         ));
     }
     Ok(())
+}
+
+/// The remote a stacked action's push contacts: `origin` for a selected source branch, as the
+/// push step names it, otherwise the current branch's push remote.
+async fn stacked_push_remote(
+    repository: &GitRepository,
+    input: &StackedActionInput,
+    cancellation: &CancellationToken,
+) -> Option<String> {
+    if input.action == "create_pr" && input.pull_request_head_branch.is_some() {
+        return Some("origin".to_owned());
+    }
+    current_branch_remote(repository, &input.cwd, SignInDirection::Push, cancellation).await
+}
+
+/// The `signIn` object of a stacked action whose push failed on GCM's refusal (#325), or the
+/// several-URLs note to append. The resume request is the original payload without the commit
+/// it already made: `commit_push` and `push` resume as `push`, the pull request actions as
+/// `create_pr`.
+async fn stacked_sign_in_offer(
+    repository: &GitRepository,
+    input: &StackedActionInput,
+    payload: &Value,
+    prompt: CredentialPrompt,
+    detail: &str,
+    cancellation: &CancellationToken,
+) -> Option<Result<SignInRequired, &'static str>> {
+    let direction = SignInDirection::Push;
+    if prompt != CredentialPrompt::OfferSignIn
+        || cancellation.is_cancelled()
+        || !has_gcm_refusal(detail)
+    {
+        return None;
+    }
+    let remote = stacked_push_remote(repository, input, cancellation).await?;
+    match resolve_destination(repository, &input.cwd, &remote, direction, cancellation).await {
+        Destination::Offer { destination, host } => {
+            let mut resume = payload.clone();
+            let fields = resume.as_object_mut()?;
+            for key in [
+                "commitMessage",
+                "filePaths",
+                "featureBranch",
+                "commitStagedIndexAsIs",
+            ] {
+                fields.remove(key);
+            }
+            let action = if matches!(input.action.as_str(), "create_pr" | "commit_push_pr") {
+                "create_pr"
+            } else {
+                "push"
+            };
+            if action == "push" {
+                fields.retain(|key, _| !key.starts_with("pullRequest"));
+            } else if input.action == "commit_push_pr" {
+                // Commit and create a pull request pushes the current branch; a `create_pr`
+                // with a head branch would push to `origin` instead.
+                fields.remove("pullRequestHeadBranch");
+            }
+            fields.insert("action".to_owned(), json!(action));
+            fields.insert("expectedDestination".to_owned(), json!(destination));
+            Some(Ok(SignInRequired {
+                remote,
+                destination,
+                host,
+                direction,
+                resume,
+            }))
+        }
+        Destination::Several => Some(Err(direction.several_urls_message())),
+        Destination::None => None,
+    }
 }
 
 /// Keeps diagnostic facts separate from the unchanged client error envelope.
@@ -2964,6 +3114,19 @@ async fn run_stacked_action_steps(
     };
     let push = if wants_push {
         *phase = Some("push");
+        if input.expected_destination.is_some() {
+            let remote = stacked_push_remote(repository, input, cancellation).await;
+            check_expected_destination(
+                repository,
+                &input.cwd,
+                remote.as_deref(),
+                SignInDirection::Push,
+                input.expected_destination.as_deref(),
+                cancellation,
+            )
+            .await
+            .map_err(StackedActionFailure::from)?;
+        }
         let branch = if let Some(head) = selected_head {
             let mut args = vec![
                 "push".to_owned(),
@@ -3430,6 +3593,141 @@ async fn run_provider_json(
 fn decode<T: for<'de> Deserialize<'de>>(payload: Value, method: &str) -> Result<T, Value> {
     serde_json::from_value(payload).map_err(|error| request_error(method, &error.to_string()))
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullInput {
+    cwd: PathBuf,
+    /// A resumed pull after a sign-in (#325); it can only add a refusal.
+    #[serde(default)]
+    expected_destination: Option<String>,
+}
+
+/// Refuses a resumed request unless `remote` still has exactly the approved destination.
+async fn check_expected_destination(
+    repository: &GitRepository,
+    cwd: &Path,
+    remote: Option<&str>,
+    direction: SignInDirection,
+    expected: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(), Value> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let current = match remote {
+        Some(remote) => resolve_destination(repository, cwd, remote, direction, cancellation).await,
+        None => Destination::None,
+    };
+    match current {
+        Destination::Offer { destination, .. } if destination == expected => Ok(()),
+        Destination::Offer { destination, .. } => {
+            Err(destination_changed_error(Some(&destination)))
+        }
+        Destination::Several | Destination::None => Err(destination_changed_error(None)),
+    }
+}
+
+fn destination_changed_error(destination: Option<&str>) -> Value {
+    json!({
+        "_tag": "GitSignInDestinationChangedError",
+        "message": "The remote's address changed after you approved the sign-in, so nothing was sent. Try again.",
+        "destination": destination,
+    })
+}
+
+/// What a Source Control network step that failed with `error` may offer (#325): the remote's
+/// frozen destination when the failure carries GCM's refusal. The refusal is an untrusted
+/// hint; the destination comes from `git remote get-url`.
+async fn sign_in_offer(
+    repository: &GitRepository,
+    cwd: &Path,
+    remote: Option<String>,
+    direction: SignInDirection,
+    prompt: CredentialPrompt,
+    error: &GitCommandError,
+    cancellation: &CancellationToken,
+) -> Option<(String, Destination)> {
+    if prompt != CredentialPrompt::OfferSignIn
+        || cancellation.is_cancelled()
+        || !has_gcm_refusal(&error.detail)
+    {
+        return None;
+    }
+    let remote = remote?;
+    let destination = resolve_destination(repository, cwd, &remote, direction, cancellation).await;
+    Some((remote, destination))
+}
+
+async fn pull_offering_sign_in(
+    repository: &GitRepository,
+    input: &PullInput,
+    prompt: CredentialPrompt,
+    cancellation: &CancellationToken,
+) -> RpcResult {
+    let direction = SignInDirection::Fetch;
+    if input.expected_destination.is_some() {
+        let remote = current_branch_remote(repository, &input.cwd, direction, cancellation).await;
+        check_expected_destination(
+            repository,
+            &input.cwd,
+            remote.as_deref(),
+            direction,
+            input.expected_destination.as_deref(),
+            cancellation,
+        )
+        .await?;
+    }
+    let error = match repository
+        .pull_current_branch(&input.cwd, cancellation)
+        .await
+    {
+        Ok(result) => return Ok(encode_value(result)),
+        Err(error) => error,
+    };
+    let remote = if prompt == CredentialPrompt::OfferSignIn {
+        current_branch_remote(repository, &input.cwd, direction, cancellation).await
+    } else {
+        None
+    };
+    match sign_in_offer(
+        repository,
+        &input.cwd,
+        remote,
+        direction,
+        prompt,
+        &error,
+        cancellation,
+    )
+    .await
+    {
+        Some((remote, Destination::Offer { destination, host })) => {
+            let resume = json!({ "cwd": input.cwd, "expectedDestination": destination });
+            let mut wire = serde_json::to_value(SignInRequired {
+                remote,
+                destination,
+                host,
+                direction,
+                resume,
+            })
+            .unwrap_or_default();
+            wire["_tag"] = json!("GitSignInRequiredError");
+            wire["message"] =
+                json!("Git Credential Manager needs you to sign in before Git can pull.");
+            Err(wire)
+        }
+        Some((_, Destination::Several)) => {
+            let mut wire = serialize_error(&error);
+            wire["detail"] = json!(format!(
+                "{} {}",
+                error.detail,
+                direction.several_urls_message()
+            ));
+            Err(wire)
+        }
+        _ => Err(serialize_error(error)),
+    }
+}
+
 fn encode_result<T: serde::Serialize, E: serde::Serialize>(result: Result<T, E>) -> RpcResult {
     result.map(encode_value).map_err(serialize_error)
 }
@@ -4049,7 +4347,7 @@ mod mutation_ownership_tests {
                 .await,
             1
         );
-        let mut stream = services.stacked_action_stream(
+        let mut stream = services.stacked_action_stream_without_session(
             RpcRequest {
                 id: RequestId::try_from("2").expect("request id"),
                 tag: "git.runStackedAction".to_owned(),
@@ -4531,7 +4829,7 @@ mod mutation_ownership_tests {
             ))),
             Arc::default(),
         );
-        let mut stream = services.stacked_action_stream(
+        let mut stream = services.stacked_action_stream_without_session(
             RpcRequest {
                 id: RequestId::try_from("4").expect("request id"),
                 tag: "git.runStackedAction".to_owned(),
@@ -5433,13 +5731,13 @@ printf '%s\n' '[{"number":42,"title":"Fixture PR","url":"https://github.com/acme
             CancellationToken::new(),
         );
         assert!(invalid_status.recv().await.expect("status error").is_err());
-        let mut invalid_action = services.stacked_action_stream(
+        let mut invalid_action = services.stacked_action_stream_without_session(
             rpc_request("git.runStackedAction", json!({"actionId":"invalid"})),
             CancellationToken::new(),
         );
         assert!(invalid_action.recv().await.expect("action error").is_err());
 
-        let mut unsupported_action = services.stacked_action_stream(
+        let mut unsupported_action = services.stacked_action_stream_without_session(
             rpc_request(
                 "git.runStackedAction",
                 json!({
@@ -5644,6 +5942,7 @@ esac
             pull_request_base_branch: Some("main".to_owned()),
             pull_request_head_branch: None,
             pull_request_options: None,
+            expected_destination: None,
         };
         assert!(
             run_stacked_action(
@@ -5758,7 +6057,7 @@ esac
             ))),
             Arc::default(),
         );
-        let mut stream = services.stacked_action_stream(
+        let mut stream = services.stacked_action_stream_without_session(
             rpc_request(
                 "git.runStackedAction",
                 json!({"actionId": "push-without-remote", "cwd": repository, "action": "push"}),
@@ -6560,7 +6859,7 @@ esac
             "unused-az",
         );
         let run = || async {
-            let mut stream = services.stacked_action_stream(
+            let mut stream = services.stacked_action_stream_without_session(
                 rpc_request(
                     "git.runStackedAction",
                     json!({
@@ -6685,6 +6984,7 @@ esac
             pull_request_base_branch: Some("main".to_owned()),
             pull_request_head_branch: None,
             pull_request_options: None,
+            expected_destination: None,
         };
 
         let error = run_stacked_action(
@@ -7801,3 +8101,7 @@ mod stacked_failure_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "git_vcs_sign_in_tests.rs"]
+mod sign_in_tests;

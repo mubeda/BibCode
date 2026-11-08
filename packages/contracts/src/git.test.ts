@@ -15,6 +15,14 @@ import {
   GitRunStackedActionInput,
   GitRunStackedActionResult,
   GitResolvePullRequestResult,
+  GitActionProgressEvent,
+  GitSignInBusyError,
+  GitSignInDestinationChangedError,
+  GitSignInInput,
+  GitSignInRequiredError,
+  GitSignInResult,
+  GitSignInRewrittenError,
+  GitSignInUnavailableError,
   TextGenerationError,
   VcsStatusLocalResult,
   VcsStatusResult,
@@ -544,5 +552,80 @@ describe("VCS conflict state", () => {
     });
     expect(Object.hasOwn(decoded, "operationInProgress")).toBe(false);
     expect(Object.hasOwn(decoded.workingTree.files[0]!, "status")).toBe(false);
+  });
+});
+
+const decodeSignInRequired = Schema.decodeUnknownSync(GitSignInRequiredError);
+const decodeActionProgress = Schema.decodeUnknownSync(GitActionProgressEvent);
+const decodeSignInInput = Schema.decodeUnknownSync(GitSignInInput);
+const decodeSignInResult = Schema.decodeUnknownSync(GitSignInResult);
+const decodeDestinationChanged = Schema.decodeUnknownSync(GitSignInDestinationChangedError);
+const decodeSignInRefusal = Schema.decodeUnknownSync(
+  Schema.Union([GitSignInUnavailableError, GitSignInBusyError, GitSignInRewrittenError]),
+);
+
+describe("Git Credential Manager sign-in schemas (#325)", () => {
+  const destination = "https://github.com/owner/repo.git";
+  const where = { remote: "origin", destination, host: "github.com" };
+
+  it("decodes vcs.pull's sign-in error with its resume request", () => {
+    const error = decodeSignInRequired({
+      _tag: "GitSignInRequiredError",
+      ...where,
+      direction: "fetch",
+      resume: { cwd: "/repo", expectedDestination: destination },
+      message: "Git Credential Manager needs you to sign in before Git can pull.",
+    });
+    expect(error.resume.expectedDestination).toBe(destination);
+  });
+
+  it("decodes a stacked push's signIn, and a failure without one", () => {
+    const decode = decodeActionProgress;
+    const base = { actionId: "a1", cwd: "/repo", action: "commit_push", kind: "action_failed" };
+    const failed = decode({
+      ...base,
+      phase: "push",
+      message: "Authentication failed.",
+      signIn: {
+        ...where,
+        direction: "push",
+        resume: { actionId: "a1", cwd: "/repo", action: "push", expectedDestination: destination },
+      },
+    });
+    expect(failed.kind === "action_failed" && failed.signIn?.resume.action).toBe("push");
+    const plain = decode({
+      ...base,
+      phase: "push",
+      message: "Push cancelled. Your commit is saved locally.",
+    });
+    expect(plain.kind === "action_failed" && plain.signIn).toBeUndefined();
+  });
+
+  it("decodes git.signIn's input, result and errors", () => {
+    expect(
+      decodeSignInInput({
+        cwd: "/repo",
+        remote: "origin",
+        direction: "push",
+        destination,
+      }).projectId,
+    ).toBeUndefined();
+    for (const outcome of ["signedIn", "failed", "timedOut", "cancelled"]) {
+      expect(decodeSignInResult({ outcome, message: "Done." }).outcome).toBe(outcome);
+    }
+    expect(
+      decodeDestinationChanged({
+        _tag: "GitSignInDestinationChangedError",
+        message: "Changed.",
+        destination: null,
+      }).destination,
+    ).toBeNull();
+    for (const tag of [
+      "GitSignInUnavailableError",
+      "GitSignInBusyError",
+      "GitSignInRewrittenError",
+    ]) {
+      expect(decodeSignInRefusal({ _tag: tag, message: "No." })._tag).toBe(tag);
+    }
   });
 });

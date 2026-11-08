@@ -35,10 +35,14 @@ use crate::{
             stash::{self, GitManagerStashError},
             tags::{self, GitManagerTagError},
         },
+        sign_in::{
+            CredentialPrompt, Destination, SIGN_IN_TIMEOUT, SignInDirection, SignInOutcome,
+            SignInRefusal, SignInSlot, resolve_destination,
+        },
         validate_pathspecs,
     },
     persistence::Repositories,
-    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
+    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcSessionContext, RpcStreamChunk},
     source_control::{
         ProviderKind as SourceControlProviderKind, PullRequestService, ResolvePullRequestInput,
         checks::ProviderChecksResult,
@@ -102,6 +106,7 @@ impl GitManagerRpcServices {
             availability: Some(availability),
             trash,
             pull_requests: PullRequestService::default(),
+            sign_in: None,
         }
     }
 }
@@ -115,6 +120,37 @@ pub struct ConfiguredGitManagerRpcServices {
     availability: Option<WorkspaceAvailabilityRegistry>,
     trash: Arc<dyn FileTrash>,
     pull_requests: PullRequestService,
+    /// Set only on the desktop's in-process server (#325).
+    sign_in: Option<InteractiveSignIn>,
+}
+
+/// `git.signIn`'s server state: where its neutral repositories go, the single slot, the cap.
+#[derive(Clone)]
+struct InteractiveSignIn {
+    neutral_parent: PathBuf,
+    slot: SignInSlot,
+    timeout: Duration,
+}
+
+/// Whether this request may offer, or run, a Git Credential Manager sign-in (#325): the server
+/// is the desktop's in-process backend and the caller is the desktop app's own session. A
+/// header, payload field or scope never grants it.
+pub(crate) fn sign_in_eligible(interactive_git_sign_in: bool, context: &RpcSessionContext) -> bool {
+    interactive_git_sign_in
+        && context
+            .principal()
+            .is_some_and(|principal| principal.subject == crate::auth::DESKTOP_BOOTSTRAP_SUBJECT)
+}
+
+pub(crate) fn credential_prompt(
+    interactive_git_sign_in: bool,
+    context: &RpcSessionContext,
+) -> CredentialPrompt {
+    if sign_in_eligible(interactive_git_sign_in, context) {
+        CredentialPrompt::OfferSignIn
+    } else {
+        CredentialPrompt::Never
+    }
 }
 
 /// For tests and stand-alone registration: its repository has no shared host
@@ -131,6 +167,7 @@ impl Default for ConfiguredGitManagerRpcServices {
             availability: None,
             trash: Arc::new(NativeFileTrash::default()),
             pull_requests: PullRequestService::default(),
+            sign_in: None,
         }
     }
 }
@@ -148,17 +185,184 @@ impl ConfiguredGitManagerRpcServices {
         self
     }
 
+    /// Turns on Git Credential Manager sign-in (#325). Only the desktop's in-process server
+    /// calls this, from `ServerConfig::interactive_git_sign_in`; neutral sign-in repositories
+    /// are created under `state_dir`.
+    #[must_use]
+    pub fn with_interactive_git_sign_in(mut self, state_dir: &std::path::Path) -> Self {
+        self.sign_in = Some(InteractiveSignIn {
+            neutral_parent: state_dir.join("git-sign-in"),
+            slot: SignInSlot::default(),
+            timeout: SIGN_IN_TIMEOUT,
+        });
+        self
+    }
+
+    /// `git.signIn` (#325): checks the approved destination again, then runs one probe against
+    /// it outside every project lock, capped at 10 minutes, one at a time per server.
+    async fn sign_in(
+        &self,
+        request: RpcRequest,
+        context: RpcSessionContext,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        let Some(sign_in) = self
+            .sign_in
+            .as_ref()
+            .filter(|_| sign_in_eligible(true, &context))
+        else {
+            return Err(sign_in_error(
+                "GitSignInUnavailableError",
+                "Signing in with Git Credential Manager is available only in the BiBCode desktop app on this computer.",
+            ));
+        };
+        let input = decode::<GitSignInInput>(request.payload, &request.tag)?;
+        if input.remote.is_empty() || input.remote.starts_with('-') {
+            return Err(sign_in_error(
+                "GitSignInUnavailableError",
+                "The remote name is not valid.",
+            ));
+        }
+        // Validated as the operation that failed was: Git Manager's requests name their project,
+        // Source Control's `vcs.pull` and stacked push take workspace admission only.
+        if let Some(project_id) = &input.project_id {
+            let owned = match &self.repositories {
+                Some(repositories) => {
+                    resolve_project_id(repositories, &input.cwd)
+                        .await
+                        .as_deref()
+                        == Ok(project_id)
+                }
+                None => false,
+            };
+            if !owned {
+                return Err(sign_in_error(
+                    "GitSignInUnavailableError",
+                    "The selected checkout is not owned by exactly one BiBCode project.",
+                ));
+            }
+        }
+        let admission = match &self.availability {
+            Some(availability) => Some(
+                availability
+                    .acquire_path_admission([input.cwd.as_path()])
+                    .await
+                    .map_err(|_| {
+                        sign_in_error(
+                            "GitSignInUnavailableError",
+                            "The selected checkout is unavailable.",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let current = resolve_destination(
+            &self.repository,
+            &input.cwd,
+            &input.remote,
+            input.direction,
+            &cancellation,
+        )
+        .await;
+        drop(admission);
+        match current {
+            Destination::Offer { destination, .. } if destination == input.destination => {}
+            Destination::Offer { destination, .. } => {
+                return Err(json!({
+                    "_tag": "GitSignInDestinationChangedError",
+                    "message": "The remote's address changed since you approved the sign-in.",
+                    "destination": destination,
+                }));
+            }
+            Destination::Several => {
+                return Err(json!({
+                    "_tag": "GitSignInDestinationChangedError",
+                    "message": input.direction.several_urls_message(),
+                    "destination": null,
+                }));
+            }
+            Destination::None => {
+                return Err(json!({
+                    "_tag": "GitSignInDestinationChangedError",
+                    "message": "The remote no longer has an HTTPS address BiBCode can sign in to.",
+                    "destination": null,
+                }));
+            }
+        }
+        let Some(_slot) = sign_in.slot.try_acquire() else {
+            return Err(sign_in_error(
+                "GitSignInBusyError",
+                "Another sign-in is open. Finish or cancel it first.",
+            ));
+        };
+        // Records `git.signInEnded` once, also when an interrupt drops this handler.
+        let mut ended =
+            crate::diagnostics::profiler::git_actions::SignInEnded::start(input.direction.as_str());
+        let result = crate::git::sign_in::sign_in(
+            &self.repository,
+            &sign_in.neutral_parent,
+            &input.destination,
+            input.direction,
+            sign_in.timeout,
+            &cancellation,
+        )
+        .await;
+        match result {
+            Err(SignInRefusal::Rewritten) => {
+                ended.discard();
+                Err(sign_in_error(
+                    "GitSignInRewrittenError",
+                    "Git rewrites this remote's address (url.<base>.insteadOf), so BiBCode cannot show where the sign-in goes. Sign in with your own Git.",
+                ))
+            }
+            Err(SignInRefusal::Unavailable) => {
+                ended.discard();
+                Err(sign_in_error(
+                    "GitSignInUnavailableError",
+                    "BiBCode could not prepare the sign-in. Try again.",
+                ))
+            }
+            Ok(outcome) => {
+                ended.finish(outcome.as_str());
+                let message = match outcome {
+                    SignInOutcome::SignedIn => "Signed in.",
+                    SignInOutcome::Failed(message) => message,
+                    SignInOutcome::TimedOut => {
+                        "Sign-in timed out after 10 minutes. Nothing was fetched or pushed."
+                    }
+                    SignInOutcome::Cancelled => "Sign-in cancelled. Nothing was fetched or pushed.",
+                };
+                Ok(json!({ "outcome": outcome.as_str(), "message": message }))
+            }
+        }
+    }
+
     async fn not_implemented_unary(&self, request: RpcRequest) -> RpcResult {
         Err(not_implemented_error(&request.tag))
     }
 
+    /// `gitManager.runOperation` for a caller with no session; it is never offered a sign-in.
     pub fn operation_stream(
         &self,
         request: RpcRequest,
         cancellation: CancellationToken,
     ) -> mpsc::Receiver<RpcStreamChunk> {
+        self.operation_stream_with_context(
+            request,
+            RpcSessionContext::unauthenticated(),
+            cancellation,
+        )
+    }
+
+    pub(crate) fn operation_stream_with_context(
+        &self,
+        request: RpcRequest,
+        context: RpcSessionContext,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
         let (sender, receiver) = mpsc::channel(OPERATION_STREAM_CAPACITY);
         let services = self.clone();
+        let prompt = credential_prompt(self.sign_in.is_some(), &context);
         tokio::spawn(async move {
             let input = match decode::<GitManagerOperationRequest>(request.payload, &request.tag) {
                 Ok(input) => input,
@@ -184,6 +388,7 @@ impl ConfiguredGitManagerRpcServices {
                             .to_owned(),
                         blocked: None,
                         outputs: Vec::new(),
+                        sign_in: None,
                     },
                 )
                 .await;
@@ -202,6 +407,7 @@ impl ConfiguredGitManagerRpcServices {
                                     .to_owned(),
                             blocked: None,
                             outputs: Vec::new(),
+                            sign_in: None,
                         },
                     )
                     .await;
@@ -218,6 +424,7 @@ impl ConfiguredGitManagerRpcServices {
                                     .to_owned(),
                             blocked: None,
                             outputs: Vec::new(),
+                            sign_in: None,
                         },
                     )
                     .await;
@@ -235,6 +442,7 @@ impl ConfiguredGitManagerRpcServices {
                             message: "The selected checkout is unavailable.".to_owned(),
                             blocked: None,
                             outputs: Vec::new(),
+                            sign_in: None,
                         },
                     )
                     .await;
@@ -260,6 +468,7 @@ impl ConfiguredGitManagerRpcServices {
                 services.broadcaster.clone(),
                 catalog,
                 input,
+                prompt,
                 operation_cancellation.clone(),
             );
             tokio::pin!(operation_future);
@@ -275,6 +484,7 @@ impl ConfiguredGitManagerRpcServices {
                             .to_owned(),
                         blocked: None,
                         outputs: Vec::new(),
+                        sign_in: None,
                     })
                 }
                 result = &mut operation_future => result,
@@ -1020,8 +1230,18 @@ pub fn register_git_manager_rpc(
     }
 
     let operation_services = services.clone();
-    registry.register_stream("gitManager.runOperation", move |request, cancellation| {
-        operation_services.operation_stream(request, cancellation)
+    registry.register_stream_with_context(
+        "gitManager.runOperation",
+        move |request, context, cancellation| {
+            operation_services.operation_stream_with_context(request, context, cancellation)
+        },
+    );
+    // Not spawned: an interrupt drops the handler, and the supervised runner kills the probe's
+    // process group or Job.
+    let sign_in_services = services.clone();
+    registry.register_unary_with_context("git.signIn", move |request, context, cancellation| {
+        let services = sign_in_services.clone();
+        async move { services.sign_in(request, context, cancellation).await }
     });
     registry.register_stream("subscribeGitManagerSignal", move |request, cancellation| {
         services.git_manager_signal_stream(request, cancellation)
@@ -1062,20 +1282,38 @@ async fn send_terminal_operation_error(
     {
         return;
     }
-    let _ = sender
-        .send(Ok(vec![json!({
-            "_tag": "failed",
-            "operation": error.operation,
-            "code": error.code,
-            "message": error.message,
-            "blocked": error.blocked,
-        })]))
-        .await;
+    let mut event = json!({
+        "_tag": "failed",
+        "operation": error.operation,
+        "code": error.code,
+        "message": error.message,
+        "blocked": error.blocked,
+    });
+    if let Some(sign_in) = error.sign_in {
+        event["signIn"] = json!(sign_in);
+    }
+    let _ = sender.send(Ok(vec![event])).await;
 }
 
 #[derive(Deserialize)]
 struct GitManagerCwdInput {
     cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitSignInInput {
+    #[serde(default)]
+    project_id: Option<String>,
+    cwd: PathBuf,
+    remote: String,
+    direction: SignInDirection,
+    /// The destination the person approved.
+    destination: String,
+}
+
+fn sign_in_error(tag: &str, message: &str) -> Value {
+    json!({ "_tag": tag, "message": message })
 }
 
 #[derive(Deserialize)]
@@ -2443,3 +2681,7 @@ mod tests {
         held.await.expect("held catalog mutation joins");
     }
 }
+
+#[cfg(test)]
+#[path = "git_manager_rpc_sign_in_tests.rs"]
+mod sign_in_tests;

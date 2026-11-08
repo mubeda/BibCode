@@ -79,6 +79,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("git.preparePullRequestThread"),
     mutation_unary("git.resolvePullRequest"),
     mutation_stream("git.runStackedAction"),
+    mutation_unary("git.signIn"),
     mutation_unary("gitManager.commit"),
     mutation_unary("gitManager.discard"),
     mutation_unary("gitManager.discardPartial"),

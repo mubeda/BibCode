@@ -384,6 +384,13 @@ pub struct GitCommandDiagnostics {
 }
 
 impl GitCommandError {
+    pub(crate) fn timed_out(&self) -> bool {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.failure)
+            .is_some_and(super::process::ProcessFailureFacts::timed_out)
+    }
+
     pub(crate) fn safe_failure_message(&self) -> Option<String> {
         let diagnostics = self.diagnostics.as_deref()?;
         let failure = diagnostics.failure.or_else(|| {

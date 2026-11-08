@@ -215,9 +215,74 @@ impl RepeatBook {
     }
 }
 
+/// One `git.signIn` (#325) from its probe to its outcome. Dropping it unfinished, as an
+/// interrupt does, records `cancelled`. Logs carry the direction only.
+pub struct SignInEnded {
+    direction: &'static str,
+    started: Instant,
+    outcome: Option<&'static str>,
+}
+
+impl SignInEnded {
+    #[must_use]
+    pub fn start(direction: &'static str) -> Self {
+        tracing::info!(direction, "Git sign-in started");
+        Self {
+            direction,
+            started: Instant::now(),
+            outcome: Some("cancelled"),
+        }
+    }
+
+    pub fn finish(&mut self, outcome: &'static str) {
+        self.outcome = Some(outcome);
+    }
+
+    /// No probe ran (a refusal before it); nothing is recorded.
+    pub fn discard(&mut self) {
+        self.outcome = None;
+    }
+}
+
+impl Drop for SignInEnded {
+    fn drop(&mut self) {
+        let Some(outcome) = self.outcome else { return };
+        let direction = self.direction;
+        if matches!(outcome, "failed" | "timedOut") {
+            tracing::warn!(direction, outcome, "Git sign-in did not complete");
+        }
+        if is_enabled() {
+            emit(
+                "git.signInEnded",
+                sign_in_ended_payload(direction, outcome, self.started.elapsed()),
+            );
+        }
+    }
+}
+
+/// No remote name, URL, host, user name or Git output.
+fn sign_in_ended_payload(direction: &str, outcome: &str, wait: Duration) -> serde_json::Value {
+    json!({
+        "direction": direction,
+        "outcome": outcome,
+        "waitMs": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sign_in_event_carries_direction_outcome_and_wait_only() {
+        for outcome in ["signedIn", "failed", "cancelled", "timedOut"] {
+            let payload = sign_in_ended_payload("push", outcome, Duration::from_millis(1500));
+            assert_eq!(
+                payload,
+                json!({ "direction": "push", "outcome": outcome, "waitMs": 1500 })
+            );
+        }
+    }
 
     fn book() -> RepeatBook {
         RepeatBook { failures: None }
