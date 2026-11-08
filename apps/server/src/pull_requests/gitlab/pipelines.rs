@@ -1754,11 +1754,7 @@ fi"#;
         )
         .unwrap();
         for (index, page) in pages.iter().enumerate() {
-            std::fs::write(
-                s.path(&format!("needs{}.json", index + 1)),
-                page.to_string(),
-            )
-            .unwrap();
+            std::fs::write(s.path(format!("needs{}.json", index + 1)), page.to_string()).unwrap();
         }
         let glab = s.executable_script("glab", NEEDS_GLAB, "");
         let host = GitLabHost::new(Arc::new(
