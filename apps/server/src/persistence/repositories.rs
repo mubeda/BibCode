@@ -2757,6 +2757,24 @@ impl Repositories {
             })
             .await
     }
+    /// Whether the named client `client_id` exists and a person ended it (#324).
+    pub async fn mcp_named_client_is_revoked(&self, client_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                if !table_has_named_clients(connection)? {
+                    return Ok(false);
+                }
+                Ok(connection
+                    .query_row(
+                        "SELECT revoked_at IS NOT NULL FROM mcp_named_clients WHERE client_id = ?",
+                        [&client_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false))
+            })
+            .await
+    }
     pub async fn confirm_pending_auth_session(
         &self,
         session_id: String,

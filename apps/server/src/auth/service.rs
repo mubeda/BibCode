@@ -41,6 +41,8 @@ use crate::persistence::{
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// Reads a session refresh makes before it keeps the cached record instead (#324).
+const MAX_REFRESH_READS: usize = 8;
 const DPOP_SESSION_TTL_MS: i64 = 60 * 60 * 1_000;
 const WEBSOCKET_TICKET_TTL_MS: i64 = 5 * 60 * 1_000;
 /// Pending pairing sessions and offer reservations older than this are crash
@@ -134,6 +136,8 @@ pub(crate) struct AuthTestHooks {
     pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
     /// After a session refresh read its row, before it takes the state lock (#324).
     pub(crate) after_refresh_read: std::sync::Mutex<Option<TestHold>>,
+    /// Bumps the generation on every refresh read, as constant local churn would (#324).
+    pub(crate) churn_refresh: std::sync::atomic::AtomicBool,
     /// Immediately before issuance sends its ClientUpserted, wherever that send sits (#294).
     pub(crate) before_session_upsert_event: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
@@ -1366,9 +1370,9 @@ impl AuthService {
         };
         // Publish only a read no local change overtook: a Take over that commits and updates
         // the cache after this read must not have its level replaced by the older row (#324).
-        // shortcut: no retry cap, since local auth changes are person or sign-in actions;
-        // add one if a hot path ever bumps the generation continuously.
+        let mut reads = 0;
         let (mut refreshed, mut state) = loop {
+            reads += 1;
             let generation = self.state.lock().await.authority_generation;
             let persisted = repositories
                 .get_auth_session(session_id.to_owned())
@@ -1387,9 +1391,23 @@ impl AuthService {
             let refreshed = session_record_from_persisted(persisted)?;
             #[cfg(test)]
             reach_hold(&self.test_hooks.after_refresh_read).await;
-            let state = self.state.lock().await;
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut state = self.state.lock().await;
+            #[cfg(test)]
+            if self
+                .test_hooks
+                .churn_refresh
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                state.bump_authority_generation();
+            }
             if state.authority_generation == generation {
                 break (refreshed, state);
+            }
+            if reads == MAX_REFRESH_READS {
+                // Keep the cache, which every local change keeps current, rather than spin.
+                tracing::warn!("a session refresh was overtaken on every read; kept the cache");
+                return Ok(());
             }
         };
         let change = if let Some(current) = state.sessions.get(session_id) {
@@ -2380,6 +2398,13 @@ impl AuthService {
         let Some(repositories) = &self.repositories else {
             return Ok(false);
         };
+        // An identity ended earlier stays stoppable, so a later Stop still reaches its turns.
+        if session_id.starts_with(crate::persistence::NAMED_CLIENT_ID_PREFIX) {
+            return repositories
+                .mcp_named_client_is_revoked(session_id.to_owned())
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()));
+        }
         let session = repositories
             .get_auth_session(session_id.to_owned())
             .await
@@ -8211,6 +8236,22 @@ mod tests {
                 cached_access(&service, &first).await,
                 levels("read-only", Some("full-access"))
             );
+        }
+
+        /// Constant local churn cannot spin a refresh: after its reads it keeps the cache.
+        #[tokio::test]
+        async fn a_refresh_overtaken_on_every_read_keeps_the_cache() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            service
+                .test_hooks()
+                .churn_refresh
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let access =
+                tokio::time::timeout(Duration::from_secs(5), service.mcp_client_access(&first))
+                    .await
+                    .expect("the refresh gives up instead of spinning");
+            assert_eq!(access.as_deref(), Some("full-access"));
         }
 
         /// The flag and each run's level are in the store, so a restarted server keeps them.
