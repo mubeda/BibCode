@@ -3,12 +3,28 @@
   "requestId": "900719925474099312345",
   "values": [
     {
-      "actionId": "k?^9KeF",
-      "cwd": "__proto__",
-      "action": "commit",
+      "actionId": "?^9KeFAX",
+      "cwd": "prototype",
+      "action": "commit_push_pr",
       "kind": "action_failed",
-      "phase": null,
-      "message": "Q"
+      "phase": "push",
+      "message": "avk{*,~!@Q",
+      "signIn": {
+        "remote": "prototype",
+        "destination": "\u0000",
+        "host": "",
+        "direction": "push",
+        "resume": {
+          "actionId": "__proto__",
+          "cwd": "rQxrCzU$CQ",
+          "action": "commit_push",
+          "commitMessage": "1^",
+          "featureBranch": false,
+          "commitStagedIndexAsIs": false,
+          "pullRequestBody": "😀",
+          "pullRequestBaseBranch": "\u0000"
+        }
+      }
     }
   ]
 }

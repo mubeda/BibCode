@@ -101,6 +101,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
+        | "git.signIn"
         | "gitManager.commit"
         | "gitManager.discard"
         | "gitManager.discardPartial"
@@ -445,6 +446,7 @@ mod tests {
             "gitManager.discard",
             "gitManager.discardPartial",
             "gitManager.runOperation",
+            "git.signIn",
             "gitManager.stagePartial",
             "gitManager.undoCommit",
             "gitManager.unstagePartial",

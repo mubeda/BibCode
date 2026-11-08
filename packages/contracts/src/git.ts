@@ -1,6 +1,12 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
 import { VcsDriverKind, VcsRepositoryUnavailableReasonField } from "./vcs.ts";
 
@@ -122,10 +128,52 @@ export const VcsStatusInput = Schema.Struct({
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
 
+/**
+ * A resumed request after a Git Credential Manager sign-in (#325) names the destination the
+ * person approved; the server refuses unless the remote still has exactly that one URL.
+ */
+const ExpectedDestinationField = Schema.optional(TrimmedNonEmptyStringSchema);
+
 export const VcsPullInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  expectedDestination: ExpectedDestinationField,
 });
 export type VcsPullInput = typeof VcsPullInput.Type;
+
+export const GitSignInDirection = Schema.Literals(["fetch", "push"]);
+export type GitSignInDirection = typeof GitSignInDirection.Type;
+
+/**
+ * Where a Git Credential Manager sign-in goes (#325): the remote, its frozen `https://` URL
+ * without user information, that URL's host, and the direction that needs it. Each failure
+ * that offers a sign-in adds its own `resume` request.
+ */
+export const GitSignInDestinationFields = {
+  remote: TrimmedNonEmptyStringSchema,
+  destination: TrimmedNonEmptyStringSchema,
+  host: TrimmedNonEmptyStringSchema,
+  direction: GitSignInDirection,
+};
+
+export const GitSignInInput = Schema.Struct({
+  /** Git Manager names the project, which must own `cwd`; Source Control, like `vcs.pull`, does not. */
+  projectId: Schema.optional(ProjectId),
+  cwd: TrimmedNonEmptyStringSchema,
+  remote: TrimmedNonEmptyStringSchema,
+  direction: GitSignInDirection,
+  /** The destination the person approved. */
+  destination: TrimmedNonEmptyStringSchema,
+});
+export type GitSignInInput = typeof GitSignInInput.Type;
+
+export const GitSignInOutcome = Schema.Literals(["signedIn", "failed", "timedOut", "cancelled"]);
+export type GitSignInOutcome = typeof GitSignInOutcome.Type;
+
+export const GitSignInResult = Schema.Struct({
+  outcome: GitSignInOutcome,
+  message: TrimmedNonEmptyStringSchema,
+});
+export type GitSignInResult = typeof GitSignInResult.Type;
 
 export const VcsStageFilesInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -172,6 +220,8 @@ export const GitRunStackedActionInput = Schema.Struct({
   pullRequestHeadBranch: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Create-time options; requires capability `pullRequestCreateOptions`. */
   pullRequestOptions: Schema.optional(GitPullRequestCreateOptions),
+  /** Set on a push resumed after a sign-in; see `ExpectedDestinationField`. */
+  expectedDestination: ExpectedDestinationField,
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 
@@ -463,6 +513,39 @@ export class GitCommandError extends Schema.TaggedError<GitCommandError>()("GitC
   }
 }
 
+/** `vcs.pull` refused by Git Credential Manager on the desktop's own session (#325). */
+export class GitSignInRequiredError extends Schema.TaggedError<GitSignInRequiredError>()(
+  "GitSignInRequiredError",
+  { ...GitSignInDestinationFields, resume: VcsPullInput, message: Schema.String },
+) {}
+
+/** `git.signIn` is not available to this caller or for this checkout. */
+export class GitSignInUnavailableError extends Schema.TaggedError<GitSignInUnavailableError>()(
+  "GitSignInUnavailableError",
+  { message: Schema.String },
+) {}
+
+/** Another sign-in is open on this server. */
+export class GitSignInBusyError extends Schema.TaggedError<GitSignInBusyError>()(
+  "GitSignInBusyError",
+  { message: Schema.String },
+) {}
+
+/** A Git URL rewrite (`insteadOf`) would change where the sign-in goes. */
+export class GitSignInRewrittenError extends Schema.TaggedError<GitSignInRewrittenError>()(
+  "GitSignInRewrittenError",
+  { message: Schema.String },
+) {}
+
+/**
+ * The remote no longer has exactly the approved destination. `destination` is its one new URL,
+ * or null when it has none BiBCode can sign in to, or several.
+ */
+export class GitSignInDestinationChangedError extends Schema.TaggedError<GitSignInDestinationChangedError>()(
+  "GitSignInDestinationChangedError",
+  { message: Schema.String, destination: Schema.NullOr(TrimmedNonEmptyStringSchema) },
+) {}
+
 export const GitCloneOperationReason = Schema.Literals([
   "busy",
   "capacity",
@@ -580,6 +663,10 @@ const GitActionFailedEvent = Schema.Struct({
   kind: Schema.Literal("action_failed"),
   phase: Schema.NullOr(GitActionProgressPhase),
   message: TrimmedNonEmptyStringSchema,
+  /** A push that Git Credential Manager refused on the desktop's own session (#325). */
+  signIn: Schema.optional(
+    Schema.Struct({ ...GitSignInDestinationFields, resume: GitRunStackedActionInput }),
+  ),
 });
 
 export const GitActionProgressEvent = Schema.Union([

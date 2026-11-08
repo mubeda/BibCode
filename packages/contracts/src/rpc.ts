@@ -168,6 +168,13 @@ import {
   VcsPullResult,
   GitResolvePullRequestResult,
   GitRunStackedActionInput,
+  GitSignInBusyError,
+  GitSignInDestinationChangedError,
+  GitSignInInput,
+  GitSignInRequiredError,
+  GitSignInResult,
+  GitSignInRewrittenError,
+  GitSignInUnavailableError,
   VcsStageFilesInput,
   VcsStatusInput,
   VcsStatusResult,
@@ -622,6 +629,7 @@ export const WS_METHODS = {
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
+  gitSignIn: "git.signIn",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
 
@@ -1249,6 +1257,8 @@ export const WsVcsPullRpc = Rpc.make(WS_METHODS.vcsPull, {
   success: VcsPullResult,
   error: Schema.Union([
     GitCommandError,
+    GitSignInRequiredError,
+    GitSignInDestinationChangedError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
@@ -1276,6 +1286,23 @@ export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction,
     EnvironmentRpcError,
   ]),
   stream: true,
+});
+
+/**
+ * Signs in with Git Credential Manager to a destination the person approved (#325). Desktop
+ * in-process server and the desktop app's own session only; capped at 10 minutes by the server,
+ * so its client command sets no timeout. Interrupt cancels it.
+ */
+export const WsGitSignInRpc = Rpc.make(WS_METHODS.gitSignIn, {
+  payload: GitSignInInput,
+  success: GitSignInResult,
+  error: Schema.Union([
+    GitSignInUnavailableError,
+    GitSignInDestinationChangedError,
+    GitSignInBusyError,
+    GitSignInRewrittenError,
+    EnvironmentRpcError,
+  ]),
 });
 
 export const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequest, {
@@ -2366,6 +2393,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,
+  WsGitSignInRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
   WsVcsListRefsRpc,

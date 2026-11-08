@@ -7,12 +7,15 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "WorkspaceUnavailableError",
-          "reason": "workspace-unavailable",
-          "message": "7d[3Ya:Ey",
-          "threadId": "",
-          "path": "\\",
-          "availability": "missing-registered"
+          "_tag": "GitSignInRequiredError",
+          "remote": "7d[3Ya:Ey",
+          "destination": "",
+          "host": "\\",
+          "direction": "push",
+          "resume": {
+            "cwd": ",FPw%Y.#Iz"
+          },
+          "message": "😀"
         }
       }
     ]
