@@ -15,7 +15,7 @@ const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"))
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, filesReveal: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -1407,5 +1407,49 @@ describe("rightPanelStore device surface", () => {
         },
       },
     });
+  });
+});
+
+describe("rightPanelStore revealInFiles", () => {
+  it("reopens a closed Files tab, activates it and records the reveal", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "files");
+    store.openFile(refA, "src/a.ts");
+    store.closeSurface(refA, "files");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (s) => s.id,
+      ),
+    ).toEqual(["file:src/a.ts"]);
+
+    useRightPanelStore.getState().revealInFiles(refA, "src");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.surfaces.map((s) => s.id)).toEqual(["file:src/a.ts", "files"]);
+    expect(state.activeSurfaceId).toBe("files");
+    expect(state.isOpen).toBe(true);
+    expect(Object.values(useRightPanelStore.getState().filesReveal)).toEqual([
+      { path: "src", requestId: 1 },
+    ]);
+  });
+
+  it("numbers repeated requests and clears only the handled one", () => {
+    useRightPanelStore.getState().revealInFiles(refA, "src/");
+    useRightPanelStore.getState().revealInFiles(refA, "src");
+    const key = Object.keys(useRightPanelStore.getState().filesReveal)[0]!;
+    expect(useRightPanelStore.getState().filesReveal[key]).toEqual({ path: "src", requestId: 2 });
+
+    useRightPanelStore.getState().clearFilesReveal(refA, 1);
+    expect(useRightPanelStore.getState().filesReveal[key]?.requestId).toBe(2);
+    useRightPanelStore.getState().clearFilesReveal(refA, 2);
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
+  });
+
+  it("never persists the request", () => {
+    useRightPanelStore.getState().revealInFiles(refA, "src");
+    const persisted = useRightPanelStore.persist
+      .getOptions()
+      .partialize?.(useRightPanelStore.getState());
+    expect(Object.keys(persisted ?? {})).toEqual(["byThreadKey"]);
   });
 });

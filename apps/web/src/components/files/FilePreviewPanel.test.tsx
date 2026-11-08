@@ -1,5 +1,6 @@
 import { EnvironmentId, ThreadId, type ResolvedKeybindingsConfig } from "@bibcode/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
+import { useRightPanelStore } from "~/rightPanelStore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 /**
@@ -864,8 +865,8 @@ describe("panel layout states", () => {
     setFileData("const value = 1;\n");
     const markup = renderPanel(baseProps());
 
-    expect(markup).toContain(">demo</span>");
-    expect(markup).toContain(">src</span>");
+    expect(markup).toContain(">demo</button>");
+    expect(markup).toContain(">src</button>");
     expect(markup).toContain(">app.ts</span>");
     expect(markup).toContain('data-current-file-crumb="true"');
     expect(markup).toContain('data-file="src/app.ts"');
@@ -936,6 +937,19 @@ describe("panel layout states", () => {
       savePhase: "saving",
       canSave: false,
     });
+  });
+});
+
+describe("show in files", () => {
+  it("offers a labelled action that reveals the open file in the Files tab", () => {
+    setFileData("const value = 1;\n");
+    const reveal = vi.spyOn(useRightPanelStore.getState(), "revealInFiles");
+    const markup = renderPanel(baseProps());
+    expect(markup).toContain('aria-label="Show in Files"');
+
+    (ui.byLabel("Toggle", "Show in Files").onPressedChange as () => void)();
+    expect(reveal).toHaveBeenCalledWith(threadRef, "src/app.ts");
+    reveal.mockRestore();
   });
 });
 

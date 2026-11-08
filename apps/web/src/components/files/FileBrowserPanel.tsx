@@ -1,3 +1,4 @@
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@bibcode/contracts";
 import type {
   EditorId,
@@ -299,6 +300,10 @@ export default function FileBrowserPanel({
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const [preferredEditor] = usePreferredEditor(availableEditors);
 
+  const revealRequest = useRightPanelStore(
+    (state) => state.filesReveal[scopedThreadKey(threadRef)],
+  );
+  const clearFilesReveal = useRightPanelStore((state) => state.clearFilesReveal);
   const remapFileSurfaces = useRightPanelStore((state) => state.remapFileSurfaces);
   const closeFileSurfacesUnder = useRightPanelStore((state) => state.closeFileSurfacesUnder);
 
@@ -806,6 +811,33 @@ export default function FileBrowserPanel({
       }
     }
   }, [entryKinds, expandedTreePaths, model, treePaths]);
+
+  // A breadcrumb or "Show in Files" asked for a path: open its folders, select it, scroll to it.
+  // Runs after the path effect above so a request that beats the entry list waits for it.
+  useEffect(() => {
+    if (revealRequest === undefined || !treeLoadedRef.current) return;
+    const target = revealRequest.path;
+    const kind = entryKinds.get(target);
+    if (kind !== undefined) {
+      const key = kind === "directory" ? `${target}/` : target;
+      // Selecting would open a file again, and a request must not replace the Files tab.
+      restoringSelectionRef.current = true;
+      try {
+        for (let i = target.indexOf("/"); i !== -1; i = target.indexOf("/", i + 1)) {
+          const folder = model.getItem(`${target.slice(0, i)}/`);
+          if (folder && "expand" in folder) folder.expand();
+        }
+        for (const path of model.getSelectedPaths()) {
+          if (path !== key) model.getItem(path)?.deselect();
+        }
+        model.getItem(key)?.select();
+      } finally {
+        restoringSelectionRef.current = false;
+      }
+      model.scrollToPath(key, { offset: "nearest" });
+    }
+    clearFilesReveal(threadRef, revealRequest.requestId);
+  }, [clearFilesReveal, entryKinds, model, revealRequest, threadRef]);
 
   // A native listener: the rows live in the tree's shadow root, where React finds no fiber to
   // deliver a click to. The tree reports a selection only when it changes, so a click on the row
