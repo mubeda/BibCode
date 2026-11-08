@@ -445,6 +445,10 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
   return { byThreadKey };
 }
 
+// Never reused, even after a request is cleared: a mounted Files tree remembers the last ID it
+// refreshed for. Not persisted, like the requests themselves.
+let lastFilesRevealId = 0;
+
 export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set) => ({
@@ -461,7 +465,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               ...state.filesReveal,
               [key]: {
                 path: relativePath.replace(/^\/+|\/+$/g, ""),
-                requestId: (state.filesReveal[key]?.requestId ?? 0) + 1,
+                requestId: ++lastFilesRevealId,
               },
             },
           };

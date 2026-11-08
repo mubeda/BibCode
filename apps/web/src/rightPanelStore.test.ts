@@ -1435,14 +1435,21 @@ describe("rightPanelStore revealInFiles", () => {
 
   it("numbers repeated requests and clears only the handled one", () => {
     useRightPanelStore.getState().revealInFiles(refA, "src/");
-    useRightPanelStore.getState().revealInFiles(refA, "src");
     const key = Object.keys(useRightPanelStore.getState().filesReveal)[0]!;
-    expect(useRightPanelStore.getState().filesReveal[key]).toEqual({ path: "src", requestId: 2 });
+    const first = useRightPanelStore.getState().filesReveal[key]!.requestId;
+    useRightPanelStore.getState().revealInFiles(refA, "src");
+    const second = useRightPanelStore.getState().filesReveal[key]!.requestId;
+    expect(useRightPanelStore.getState().filesReveal[key]?.path).toBe("src");
+    expect(second).toBeGreaterThan(first);
 
-    useRightPanelStore.getState().clearFilesReveal(refA, 1);
-    expect(useRightPanelStore.getState().filesReveal[key]?.requestId).toBe(2);
-    useRightPanelStore.getState().clearFilesReveal(refA, 2);
+    useRightPanelStore.getState().clearFilesReveal(refA, first);
+    expect(useRightPanelStore.getState().filesReveal[key]?.requestId).toBe(second);
+    useRightPanelStore.getState().clearFilesReveal(refA, second);
     expect(useRightPanelStore.getState().filesReveal).toEqual({});
+
+    // A request after the clear gets a new ID; the mounted tree may remember the last one.
+    useRightPanelStore.getState().revealInFiles(refA, "docs");
+    expect(useRightPanelStore.getState().filesReveal[key]!.requestId).toBeGreaterThan(second);
   });
 
   it("never persists the request", () => {
