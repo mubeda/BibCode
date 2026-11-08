@@ -1316,8 +1316,12 @@ async fn execute_branch_or_sync_operation(
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
     refuse_option_like_operands(operation, request)?;
-    let network = network_step(snapshot, request);
-    let expected = expected_destination_mut(&mut request.clone()).and_then(Option::take);
+    let mut network = network_step(snapshot, request);
+    // Taken from the resume copy: a later offer sets the newly frozen destination there.
+    let expected = network
+        .as_mut()
+        .and_then(|(_, _, resume)| expected_destination_mut(resume))
+        .and_then(Option::take);
     if let (Some(expected), Some((remote, direction, _))) = (expected, &network) {
         let current =
             resolve_destination(repository, request.cwd(), remote, *direction, cancellation).await;
