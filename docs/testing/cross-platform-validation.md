@@ -1036,7 +1036,11 @@ persistence). In a packaged build with a project that has pipelines, check the
 list and a pipeline page at about 600, 900 and 1600 px of panel width: columns
 line up across rows with and without Retry or Cancel, a column edge resizes by
 drag and by arrow keys and survives a reload, a second repository keeps its own
-widths and hidden columns, and stage columns fill the page.
+widths and hidden columns, and stage columns fill the page. On the pipeline
+page, **Wrap stages** moves stages that do not fit onto more rows with no
+sideways scroll, and choosing a job opens its log beside the stages at 1600 px
+(stages and log scroll separately, the log follows a running GitLab job) and
+under them at 600 px; Close and Escape return focus to the job's row.
 
 `PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
 must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`

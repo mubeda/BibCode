@@ -15,9 +15,11 @@ import {
   useEffectEvent,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
   type Ref,
 } from "react";
+import { cn } from "../../../lib/utils";
 import { DEFAULT_PIPELINES_FILTERS, usePipelinesStore } from "../../../pipelinesStore";
 import { pipelinesEnvironment } from "../../../state/pipelines";
 import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
@@ -40,6 +42,8 @@ import { useFinishedAnnouncement } from "../shared/useFinishedAnnouncement";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 import { PipelineAttemptSelect } from "./PipelineAttemptSelect";
 import { PipelineDetailHeader } from "./PipelineDetailHeader";
+import { PipelineJobLogPanel } from "./PipelineJobLogPanel";
+import { PipelineLinksProvider, usePipelineLinks } from "./PipelineLinks";
 import { PipelineStageColumns } from "./PipelineStageColumns";
 import {
   QUIET_AFTER_MS,
@@ -421,6 +425,21 @@ export function PipelinesDetailView({
     () => (shown === null ? null : pipelineStageColumns(shown, provider)),
     [provider, shown],
   );
+  // The job whose log shows beside the stages; the page is keyed by pipeline, so a
+  // different pipeline starts with none.
+  const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
+  const outerLinks = usePipelineLinks();
+  const links = useMemo(
+    () => ({ ...outerLinks, selectJob: setSelectedJobId, selectedJobId }),
+    [outerLinks, selectedJobId],
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
+  const closeLog = useCallback(() => {
+    // Focus goes back to the job's row, which stays on the page.
+    rootRef.current?.querySelector<HTMLElement>('a[aria-current="true"]')?.focus();
+    setSelectedJobId(null);
+  }, []);
+  const logShown = selectedJobId !== null && shown !== null;
   return (
     <PipelineActions.Provider
       scope={scope}
@@ -429,52 +448,80 @@ export function PipelinesDetailView({
       onSettled={onActionSettled}
     >
       <div
+        ref={rootRef}
         className="@container/pipeline flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto"
         data-text-surface="background"
       >
-        <div className="px-4 pt-2">
-          <BackToPipelines projectRef={projectRef} />
-        </div>
-        {alert}
-        {shown !== null ? (
-          <>
-            <PipelineDetailHeader
-              detail={shown}
-              provider={provider}
-              projectRef={projectRef}
-              mutationsDisabledReason={mutationsDisabledReason}
-              repositoryPermission={context.repositoryPermission}
-            >
-              {attemptOptions ? (
-                <PipelineAttemptSelect
-                  options={attemptOptions}
-                  projectRef={projectRef}
-                  pipelineId={pipelineId}
-                />
-              ) : null}
-            </PipelineDetailHeader>
-            <div className="space-y-4 p-4">
-              <TruncationNotice detail={shown} provider={provider} />
-              {columns === null ? (
-                <p className="text-sm text-muted-foreground">
-                  You can't view this pipeline's jobs.
-                </p>
-              ) : (
-                <PipelineStageColumns
-                  stages={columns}
-                  mutationsDisabledReason={mutationsDisabledReason}
-                />
-              )}
-              <PipelineArtifacts detail={shown} />
+        {/* With a log open on a wide page, the stages and the log scroll on their own. */}
+        <div
+          className={cn(
+            "flex min-w-0 flex-col",
+            logShown &&
+              "@min-[960px]/pipeline:min-h-0 @min-[960px]/pipeline:flex-1 @min-[960px]/pipeline:flex-row",
+          )}
+        >
+          <div
+            className={cn(
+              "min-w-0",
+              logShown &&
+                "@min-[960px]/pipeline:min-h-0 @min-[960px]/pipeline:flex-1 @min-[960px]/pipeline:overflow-y-auto",
+            )}
+          >
+            <div className="px-4 pt-2">
+              <BackToPipelines projectRef={projectRef} />
             </div>
-          </>
-        ) : message === null ? (
-          <div role="status" className="space-y-3 p-4">
-            <span className="sr-only">Loading pipeline…</span>
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-40 w-full" />
+            {alert}
+            {shown !== null ? (
+              <>
+                <PipelineDetailHeader
+                  detail={shown}
+                  provider={provider}
+                  projectRef={projectRef}
+                  mutationsDisabledReason={mutationsDisabledReason}
+                  repositoryPermission={context.repositoryPermission}
+                >
+                  {attemptOptions ? (
+                    <PipelineAttemptSelect
+                      options={attemptOptions}
+                      projectRef={projectRef}
+                      pipelineId={pipelineId}
+                    />
+                  ) : null}
+                </PipelineDetailHeader>
+                <div className="space-y-4 p-4">
+                  <TruncationNotice detail={shown} provider={provider} />
+                  {columns === null ? (
+                    <p className="text-sm text-muted-foreground">
+                      You can't view this pipeline's jobs.
+                    </p>
+                  ) : (
+                    <PipelineLinksProvider value={links}>
+                      <PipelineStageColumns
+                        stages={columns}
+                        mutationsDisabledReason={mutationsDisabledReason}
+                      />
+                    </PipelineLinksProvider>
+                  )}
+                  <PipelineArtifacts detail={shown} />
+                </div>
+              </>
+            ) : message === null ? (
+              <div role="status" className="space-y-3 p-4">
+                <span className="sr-only">Loading pipeline…</span>
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-40 w-full" />
+              </div>
+            ) : null}
           </div>
-        ) : null}
+          {logShown ? (
+            <PipelineJobLogPanel
+              key={selectedJobId}
+              detail={shown}
+              jobId={selectedJobId}
+              onClose={closeLog}
+            />
+          ) : null}
+        </div>
         <p aria-live="polite" className="sr-only">
           {announcement}
         </p>

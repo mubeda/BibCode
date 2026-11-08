@@ -67,7 +67,7 @@ const GITHUB_JOB_PAGE_RUN_FACTOR = 3;
 const NO_STEPS: PipelinesJobDetail["steps"] = [];
 const isOperationError = Schema.is(PullRequestsOperationError);
 
-function operationError(query: EnvironmentQueryView<unknown>) {
+export function operationError(query: EnvironmentQueryView<unknown>) {
   const failure =
     query.emission._tag === "Failure" ? squashAtomCommandFailure(query.emission) : null;
   return isOperationError(failure) ? failure : null;
@@ -588,7 +588,7 @@ function JobBody({ details, inPlaceOfLog }: { details: ReactNode; inPlaceOfLog: 
   );
 }
 
-function JobReadError({
+export function JobReadError({
   error,
   hostName,
   url,

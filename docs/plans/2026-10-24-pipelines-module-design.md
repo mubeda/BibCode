@@ -1264,8 +1264,25 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   stages** toggle above the wide row (issue #322, `aria-pressed`, stored
   globally under `bibcode:pipelines-stage-wrap`, a corrupt value reads as off)
   swaps the row's sideways scroll for `flex-wrap`, so stages that do not fit at
-  256 px move to more rows; it is hidden below 720 px, where stages stack. An
-  inline log panel and a `needs` view are not built. A column has the stage icon, name and
+  256 px move to more rows; it is hidden below 720 px, where stages stack. A
+  `needs` view is not built.
+- **Inline job log (issue #322):** on the pipeline page a plain click on a job
+  row opens that job's log in a panel beside the stages
+  (`detail/PipelineJobLogPanel.tsx`); a modified or middle click still opens
+  the job page, whose link the row keeps. `PipelineLinks.selectJob` carries
+  the click, so a view without a panel (the merge request tab) keeps links.
+  The selection is component state, keyed with the page, so it is not in the
+  URL: Back does not close it and a copied link opens the pipeline without it.
+  The panel reads the job once (`pipelines.getJob`, for the attempt, erasure
+  and raw log link), takes status from the page's polled detail, and picks its
+  log with the job page's `jobLogSource`. Header: status, name, **Open job
+  page**, **Close**; then the log's toolbar, lines and status. A line link
+  opens the job page at that line (`?at=`). Focus moves to the panel heading
+  on open; Close or an unclaimed Escape closes it and focuses the job's row,
+  which carries `aria-current`. From 960 px of page width the page stops
+  scrolling as a whole: the stages column and the 45 % log column scroll on
+  their own; below that the log sits under the stages at 70 vh. Details,
+  steps and job actions stay on the job page. A column has the stage icon, name and
   job count; a job row is a full-width link to the job route: icon, name,
   duration, and one trailing action (Retry, Cancel or Play). A parallel group
   (`size > 1`) is one row "rspec 3" that expands to its jobs. A trigger job
