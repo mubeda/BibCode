@@ -120,6 +120,22 @@ describe("buildRevertCheckpointDialog", () => {
     expect(model.dismissLabel).toBe("Close");
   });
 
+  it("names a sibling on an unmarked external OpenCode server by its quoted title", () => {
+    const model = buildRevertCheckpointDialog({
+      turnCount: 3,
+      provider: codex,
+      preview: preview({
+        writingSiblings: [
+          { threadId: ThreadId.make("oc"), title: "Panel, OpenCode", reason: "unmanagedServer" },
+        ],
+      }),
+    });
+    expect(model.description).toBe(
+      '"Panel, OpenCode" uses an OpenCode server that other apps may also use, so BiBCode can\'t make sure it has stopped working in this checkout. You can rewind only this conversation now; files stay as they are.',
+    );
+    expect(labels(model)).toEqual(["Rewind conversation only"]);
+  });
+
   it("refuses turn 0's HEAD fallback on a shared checkout", () => {
     const model = buildRevertCheckpointDialog({
       turnCount: 0,
