@@ -6689,11 +6689,6 @@ mod tests {
         dispatch_registered_command(&mut socket, "9", durable_after_disconnect)
             .await
             .expect("interrupted durable command replays exactly");
-        let event_count_before_loss_turn = engine
-            .read_events(0)
-            .await
-            .expect("events before loss turn")
-            .len();
 
         let pause = hooks.pause_before_next_command_finalization();
         socket
@@ -6781,11 +6776,18 @@ mod tests {
             .get_provider_turn_delivery("loss-turn".to_owned())
             .await
             .expect("outbox lookup");
-        let event_count_after_loss_turn = engine
+        // The earlier turn's delivery keeps committing events in the background, so the loss
+        // turn's own events are counted, by its command id and message id, not the log length.
+        let loss_turn_events = engine
             .read_events(0)
             .await
             .expect("events after loss turn")
-            .len();
+            .into_iter()
+            .filter(|event| {
+                event.event.command_id.as_deref() == Some("loss-turn")
+                    || event.event.payload.to_string().contains("loss-message")
+            })
+            .count();
         let messages = thread_snapshot(&engine, &thread_id)
             .await
             .expect("thread snapshot")["thread"]["messages"]
@@ -6800,11 +6802,11 @@ mod tests {
         assert!(
             receipt.is_none()
                 && outbox.is_none()
-                && event_count_after_loss_turn == event_count_before_loss_turn
+                && loss_turn_events == 0
                 && !messages
                     .iter()
                     .any(|message| message["id"] == "loss-message"),
-            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, events_before={event_count_before_loss_turn}, events_after={event_count_after_loss_turn}, message={} ",
+            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, loss_turn_events={loss_turn_events}, message={} ",
             receipt.is_some(),
             outbox.is_some(),
             messages

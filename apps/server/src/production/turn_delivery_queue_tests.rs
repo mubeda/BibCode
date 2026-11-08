@@ -1346,9 +1346,10 @@ async fn a_first_turn_left_pending_across_a_restart_gets_its_baseline_before_del
 }
 
 /// A thread that already has its checkpoints is delivered with no workspace lookup and no Git
-/// for a baseline (#261: no added latency once the baseline exists).
+/// for a baseline (#261: no added latency once the baseline exists). Its checkout admission
+/// runs one `git rev-parse --show-toplevel` (#279), and nothing else.
 #[tokio::test]
-async fn a_turn_on_a_thread_with_checkpoints_is_delivered_without_git_or_wait() {
+async fn a_turn_on_a_thread_with_checkpoints_is_delivered_without_a_baseline_or_workspace_lookup() {
     let fixture = RevertFixture::new().await;
     fixture.rewind.hold_thread("t");
     let (service, mut routes) = service(&fixture.engine);

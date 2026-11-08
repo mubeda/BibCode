@@ -6,8 +6,10 @@
 import type {
   CheckpointRevertMode,
   CheckpointRevertWritingReason,
+  EnvironmentId,
   OrchestrationPreviewCheckpointRevertResult,
   ServerProvider,
+  ThreadId,
 } from "@bibcode/contracts";
 
 import { providerDriverLabel } from "../../providerInstances";
@@ -32,6 +34,35 @@ export type RevertDialogModel = {
   readonly dismissLabel: "Cancel" | "Close";
   readonly siblingChangesToken: string | null;
 };
+
+/** The thread a revert dialog was opened for. */
+export type RevertTarget = {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+};
+
+/** An open revert dialog, bound to its thread and turn. */
+export type PendingRevert = RevertTarget & {
+  readonly turnCount: number;
+  readonly model: RevertDialogModel;
+};
+
+export function isSameRevertTarget(a: RevertTarget | null, b: RevertTarget | null): boolean {
+  return (
+    a !== null && b !== null && a.environmentId === b.environmentId && a.threadId === b.threadId
+  );
+}
+
+/**
+ * The dialog to show for the thread on screen: none when it was opened for another thread, so
+ * a confirmation never reverts a thread it was not asked about.
+ */
+export function pendingRevertFor(
+  pending: PendingRevert | null,
+  active: RevertTarget | null,
+): PendingRevert | null {
+  return pending !== null && isSameRevertTarget(pending, active) ? pending : null;
+}
 
 const MAX_FILES_PER_LINE = 3;
 /** How many restored files show before "and N more". */

@@ -255,6 +255,8 @@ impl Fixture {
             .checkpoints("a", &[(1, "one\n", T1), (2, "two\n", T2)])
             .await;
         fixture.session("a", "ready").await;
+        // A chat that never started cannot have written a file and is not a sibling (#279 Q1).
+        fixture.session("b", "ready").await;
         fixture
     }
 
@@ -778,6 +780,7 @@ async fn an_unresolvable_sibling_refuses_the_restore() {
     // A chat whose folder is gone.
     let gone = fixture.repo.join("gone");
     fixture.thread("g", "p", "Gone chat", Some(&gone)).await;
+    fixture.session("g", "ready").await;
     let failure = fixture
         .revert("a", 2, "full", None)
         .await
@@ -792,6 +795,7 @@ async fn an_unresolvable_sibling_refuses_the_restore() {
     std::fs::create_dir(&broken).unwrap();
     std::fs::write(broken.join(".git"), "not a gitdir line\n").unwrap();
     fixture.thread("r", "p", "Broken chat", Some(&broken)).await;
+    fixture.session("r", "ready").await;
     let failure = fixture
         .revert("a", 2, "full", None)
         .await
@@ -1002,6 +1006,44 @@ async fn turn_zero_head_fallback_is_refused_on_a_shared_checkout() {
         .await
         .unwrap();
     assert_eq!(fixture.tracked(), "two\n");
+    fixture.shutdown().await;
+}
+
+/// The maintainer (#279 Q1): a chat that never started a provider session and has no turns cannot have
+/// written a file, so it neither refuses the restore nor needs the token, and it is not
+/// suspended. A restore still holds it: its first message waits for the restore.
+#[tokio::test]
+async fn a_chat_that_never_started_is_not_a_sibling_but_its_first_message_waits() {
+    let fixture = Fixture::new().await;
+    let linked = fixture.alone().await;
+    fixture
+        .thread("fresh", "p", "New panel", Some(&linked))
+        .await;
+    // An edit outside the thread needs no token: nobody else could have written it.
+    std::fs::write(linked.join("notes.txt"), "mine\n").unwrap();
+    let preview = fixture.preview("z", 1).await;
+    assert_eq!(preview["siblingChangesToken"], Value::Null, "{preview}");
+    assert_eq!(preview["writingSiblings"], json!([]));
+    let gate = fixture.provider.pause_at(Stage::Prepare);
+    let (service, mut routes) = delivery(&fixture.engine, Arc::default());
+    let outcome = fixture.request_revert("z", 0, "full", None).await;
+    entered(&gate).await;
+    send_message(&fixture.engine, "fresh", "fresh-first").await;
+    service.wake();
+    not_delivered(&mut routes).await;
+    gate.release.notify_one();
+    outcome.await.unwrap().expect("the restore needs no token");
+    assert!(
+        !fixture
+            .provider
+            .quieted
+            .lock()
+            .unwrap()
+            .contains(&"fresh".to_owned()),
+        "a chat that never started is not suspended"
+    );
+    delivered(&mut routes, "fresh").await;
+    service.shutdown().await;
     fixture.shutdown().await;
 }
 

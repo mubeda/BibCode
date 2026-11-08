@@ -55,7 +55,6 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.getThreadShells"
         | "orchestration.getTurnDiff"
         | "orchestration.listOlderThreads"
-        | "orchestration.previewCheckpointRevert"
         | "orchestration.replayEvents"
         | "orchestration.subscribeShell"
         | "orchestration.subscribeThread"
@@ -123,6 +122,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "uploads.get"
         | "uploads.cancel"
         | "orchestration.dispatchCommand"
+        // The revert preview runs `git add` into a temporary index, which runs the repository's
+        // clean filters, so it needs the scope a revert itself needs (#279).
+        | "orchestration.previewCheckpointRevert"
         | "preview.claimOpenRequest"
         | "preview.close"
         | "preview.gatewayOpen"

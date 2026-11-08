@@ -48,6 +48,7 @@ impl Fixture {
             ("external", "opencode-external"),
             ("owned", "opencode-owned"),
             ("files", "claudeAgent"),
+            ("removed", "opencode-removed"),
         ] {
             engine.dispatch(serde_json::from_value(json!({"type":"thread.create", "commandId":format!("thread-{thread}"), "threadId":thread, "projectId":"p1", "title":thread, "kind":"workspace", "modelSelection":{"instanceId":instance, "model":"m"}, "runtimeMode":"full-access", "interactionMode":"default", "branch":null, "worktreePath":null, "createdAt":TIME})).unwrap()).await.unwrap();
         }
@@ -240,6 +241,11 @@ async fn an_unmanaged_opencode_sibling_refuses_live_and_suspended() {
     );
     // A session on a server BiBCode started has no live session here and is quiet.
     assert_eq!(fixture.probe().quiet_sibling("owned").await.unwrap(), None);
+    // An instance removed from the settings may still name an external server: not quiet.
+    assert_eq!(
+        fixture.probe().quiet_sibling("removed").await.unwrap(),
+        Some(WritingReason::Unobservable)
+    );
 }
 
 #[tokio::test]
@@ -316,4 +322,121 @@ async fn a_launch_in_flight_makes_the_restore_refuse() {
     release.notify_one();
     launch.await.unwrap().unwrap();
     assert!(restore.hold_threads(&["t1".to_owned()]).is_ok());
+}
+
+/// A driver that cannot change its runtime mode live, so a mode change restarts the session.
+struct RestartingDriver(RemovalTestDriver);
+
+impl ProviderDriverFactory for RestartingDriver {
+    fn create(
+        &self,
+        _: ProviderLaunchRequest,
+    ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+        let driver = RestartingDriver(self.0.clone());
+        Box::pin(async move { Ok(Arc::new(driver) as Arc<dyn ProviderDriver>) })
+    }
+}
+
+impl ProviderDriver for RestartingDriver {
+    fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+        self.0.start()
+    }
+    fn send(
+        &self,
+        message: String,
+        attachments: Vec<Value>,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+        self.0.send(message, attachments, delivery_key)
+    }
+    fn interrupt(
+        &self,
+        turn_id: Option<String>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.interrupt(turn_id)
+    }
+    fn approve(
+        &self,
+        request_id: String,
+        decision: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.approve(request_id, decision)
+    }
+    fn answer(
+        &self,
+        request_id: String,
+        answers: Value,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.answer(request_id, answers)
+    }
+    fn set_mode(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async {
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "claude".to_owned(),
+                capability: "live runtime mode",
+            })
+        })
+    }
+    fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.set_model(model)
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.set_options(options)
+    }
+    fn rollback(
+        &self,
+        turn_count: i64,
+        rewind_key: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.rollback(turn_count, rewind_key)
+    }
+    fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+        self.0.next_event()
+    }
+    fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.0.shutdown()
+    }
+}
+
+/// `restart_session` (a mode change the live session can't apply) relaunches through
+/// `launch_session`, so a sibling held by a restore is not restarted (#279).
+#[tokio::test]
+async fn a_restart_is_refused_while_a_sibling_restore_holds_the_thread() {
+    let fixture = Fixture::with_factory(Some(Arc::new(RestartingDriver(
+        RemovalTestDriver::default(),
+    ))))
+    .await;
+    fixture
+        .supervisor
+        .launch(fixture.launch("t1", "claude", None))
+        .await
+        .unwrap();
+    let mut restore = fixture.engine.hold_checkout_for_restore("checkout").await;
+    restore.hold_threads(&["t1".to_owned()]).unwrap();
+    let error = fixture
+        .supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({"type":"thread.runtime-mode.set", "commandId":"mode", "threadId":"t1", "runtimeMode":"approval-required", "createdAt":TIME}))
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Another chat in this checkout is restoring files"),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .is_none(),
+        "no session of the held thread runs after the refused restart"
+    );
 }
