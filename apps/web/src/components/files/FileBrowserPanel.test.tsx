@@ -205,11 +205,15 @@ vi.mock("~/rightPanelStore", () => ({
     selector: (state: {
       remapFileSurfaces: (...args: unknown[]) => void;
       closeFileSurfacesUnder: (...args: unknown[]) => void;
+      filesReveal: Record<string, never>;
+      clearFilesReveal: () => void;
     }) => unknown,
   ) =>
     selector({
       remapFileSurfaces: (...args: unknown[]) => testState.remapFileSurfaces(...args),
       closeFileSurfacesUnder: (...args: unknown[]) => testState.closeFileSurfacesUnder(...args),
+      filesReveal: {},
+      clearFilesReveal: () => {},
     }),
 }));
 
