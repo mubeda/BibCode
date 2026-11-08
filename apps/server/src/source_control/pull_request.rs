@@ -413,7 +413,7 @@ impl Default for PullRequestService {
             client: Client::new(),
             bitbucket: BitbucketConfiguration::default(),
             git_command: PathBuf::from("git"),
-            git_environment: Vec::new(),
+            git_environment: crate::git::git_read_environment(),
             github_command: ProviderCommandSpec::plain("gh"),
             gitlab_command: ProviderCommandSpec::plain("glab"),
             azure_command: ProviderCommandSpec::plain("az"),
@@ -2617,6 +2617,15 @@ esac
                 .unwrap_err()
                 .detail
                 .contains("unrecognized pull-request payload")
+        );
+    }
+
+    /// The production Bitbucket remote read takes the shared system-configuration policy (#283).
+    #[test]
+    fn the_default_git_environment_is_the_shared_read_environment() {
+        assert_eq!(
+            super::PullRequestService::default().git_environment,
+            crate::git::git_read_environment()
         );
     }
 
