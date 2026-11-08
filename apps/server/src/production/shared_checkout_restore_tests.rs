@@ -228,7 +228,8 @@ impl Fixture {
             "the restore fixture runs production Git: unset {discovery:?} first"
         );
         let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
+        // Git cannot create worktrees under Windows' `\\?\` spelling of a canonical path (#264).
+        let root = crate::git::without_verbatim_prefix(std::fs::canonicalize(temp.path()).unwrap());
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo);
@@ -663,6 +664,7 @@ async fn reverts_of_one_checkout_still_restore_in_request_order_under_the_gate()
 }
 
 /// Whether the file system under `dir` ignores case: create `a`, look for `A`.
+#[cfg(unix)]
 fn case_insensitive(dir: &Path) -> bool {
     let probe = dir.join("case-probe-a");
     std::fs::write(&probe, "").unwrap();
