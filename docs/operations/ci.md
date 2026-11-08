@@ -182,21 +182,21 @@ the merge.
   0.27.0 are installed with `cargo install --locked`, and Rust Cache keeps them
   in `~/.cargo/bin`. A failed run uploads the dump, its sidecar, the symbol
   store, and the stack walk as the `crash-smoke-<os>` artifact. The Windows
-  ARM64 dump path stays disabled, so the job has no ARM64 rows.
+  ARM64 dump path stays disabled, so the job has no Windows ARM64 row; the
+  `macos-26` row is ARM64.
   The crash step adds `CARGO_PROFILE_RELEASE_LTO=off` and
-  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile. With the shipped
-  thin-LTO single codegen unit, rustc spent most of the build optimising the
-  `bibcode-server` crate on one core: the crash step took 52 minutes on
-  `39356f37`, and `macos-26` runs reached the 90-minute limit, which also
-  meant no cache was saved. The planted frames are `#[inline(never)]`, and the
-  symbol format, line tables, and unwind tables do not depend on LTO or codegen
-  units, so the smoke still proves the release symbol path. `Cargo.toml`'s
-  shipped profile is unchanged. A cold
-  `cargo test -p bibcode-server --test crash_smoke --release --no-run` with
-  the symbol environment, pinned to 4 cores, took 666 seconds with the shipped
-  profile and 293 seconds with these overrides. The job budget is 60 minutes:
-  90 minutes divided by that 2.3x speedup is about 40 for a macOS run, plus
-  room for a cold cache.
+  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile; optimisation, line
+  tables, symbols and the packed dSYM stay. With the shipped thin-LTO single
+  codegen unit, rustc spent most of the build optimising the `bibcode-server`
+  crate on one core, and `macos-26` runs took 40 to 79 minutes or hit the
+  90-minute limit. Commit `546648ee5f` added the overrides: a cold
+  `cargo test -p bibcode-server --test crash_smoke --release --no-run` pinned to
+  4 cores took 666 seconds with the shipped profile and 293 seconds with them,
+  and the job timeout is 60 minutes. The planted frames are
+  `#[inline(never)]`, and the symbol format, line tables, and unwind tables do
+  not depend on LTO or codegen units, so the smoke still proves the release
+  symbol path. `Cargo.toml`'s shipped profile is unchanged. The step prints its
+  elapsed seconds as a `::notice::`.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's
