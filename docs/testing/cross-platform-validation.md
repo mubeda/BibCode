@@ -2345,6 +2345,12 @@ change shrinks a payload. Time at 3G is a reported number, never a gate.
 
 ## Git Manager validation scenario
 
+Any step that needs a real GitLab host, merge requests or a running CI pipeline
+uses the local Docker GitLab from the
+[`gitlab-local-test` skill](../skills/gitlab-local-test/SKILL.md), never a real
+GitLab server or account. Start BiBCode with the `GLAB_CONFIG_DIR` that
+`seed.sh` exports, and run `down.sh` afterwards.
+
 Run this scenario only against the exact packaged application and disposable
 repositories. Destructive Git Manager scenarios must never run against a user
 repository. Record the resulting paths, revisions, screenshots, command output,

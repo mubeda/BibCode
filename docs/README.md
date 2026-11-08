@@ -71,7 +71,8 @@ current behavior.
 - [Workspace layout](./reference/workspace-layout.md)
 - [Repository scripts](./reference/scripts.md)
 - [Repository skills](./skills/): the source of the agent skills
-  (`bibcode-mcp`, `bibcode-profiler`, `bibcode-release`, `issue-delivery`) that the
+  (`bibcode-mcp`, `bibcode-profiler`, `bibcode-release`, `gitlab-local-test`,
+  `issue-delivery`) that the
   `.agents/skills/` and `.claude/skills/` stubs point to
 
 ## Historical material
