@@ -385,3 +385,24 @@ the debug test binary about 0.4 s of CPU on an idle Mac, against the 1 s the
 panic test allowed; it now waits the module's 5 s hang bound. The linker warns
 that the test binary's `__eh_frame` is too large for the compact unwind table,
 which is a likely reason unwinding is that slow.
+
+Two full lib runs under 12 CPU hogs took 745 s and 1,186 s, and in each a group
+of tests that start child processes failed in the same few minutes while
+in-process tests kept passing (#335). On macOS the first exec of a new file
+waits for a system check: on a loaded Mac, a fresh copy of the compiled Cursor
+fixture or a freshly written script took about 0.17 s to run, against 0.015 s
+for a file that had run before. A few of these first execs never finish.
+Copies of the Cursor fixture were found hours later at `_dyld_start`,
+launched-suspended and reparented to launchd, and no other kind of process was
+found stuck that way. The Cursor fixture tests therefore hard-link the compiled
+fixture, which runs once when it is built, instead of copying it; the probes
+inside `update_provider` have a 10 s timeout and no relaunch. Nothing may open
+that shared file for writing, because macOS kills an exec of a file that
+another process holds open for writing, so the busy-executable test runs on
+Linux only. The startup probe test runs both probe scripts once, with
+relaunch, before it measures overlap. The isolated-case runner in
+`test_support/sandbox.rs` gives a case 10 s from its first stdout byte, which
+libtest writes before any test runs, and waits up to 60 s for that byte. The
+clone outcome retention test answers for Git instead of running it: outcomes
+expire on the wall clock after 3 s, so a slow Git between two outcomes let the
+first expire, and one Git run took longer than the 20 s test deadline.
