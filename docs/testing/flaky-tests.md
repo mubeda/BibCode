@@ -359,3 +359,12 @@ that proves two probes overlap makes each wait for the other's start rather than
 sleeping, and retries a run in which a child never started before the 10 s probe
 timeout. The device RPC harness waits longer than the boot timeout for each
 catalog frame, because a booting device sends none until it is ready (#329).
+
+Native Git watcher tests fence before they assert quiet. Under load, FSEvents
+can deliver changes that a fixture made before the stream started, after the
+watch reports ready. `settle_native_subscription` (`git/watcher.rs` tests)
+writes round-numbered sentinels in every watched root, waits for each, and then
+drains what setup published. Each root's stream delivers in order, so nothing
+earlier can arrive later. A test that requires no event writes its change,
+fences again, and then checks `try_recv() == None`. It never waits a fixed time
+for silence (#330).
