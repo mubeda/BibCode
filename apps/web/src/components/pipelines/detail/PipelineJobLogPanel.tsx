@@ -77,7 +77,21 @@ export function PipelineJobLogPanel({
   );
   const headingRef = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    headingRef.current?.focus();
+    const heading = headingRef.current;
+    const panel = heading?.closest("aside");
+    if (!heading || !panel) return;
+    // Stacked under the stages the panel opens below the fold: bring it into view, as a
+    // deep link does. Side by side it is already visible.
+    const stacked = getComputedStyle(panel.parentElement ?? panel).flexDirection === "column";
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    if (stacked)
+      panel.scrollIntoView?.({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+    // Never take focus from a field the reader is typing in (a filter, say).
+    const active = document.activeElement;
+    const typing =
+      active instanceof HTMLElement &&
+      (active.isContentEditable || active.matches("input, textarea, select"));
+    if (!typing) heading.focus({ preventScroll: true });
   }, []);
   const status = job ? pipelineStatusText(job.status, job.warnings, job.reason) : "";
   return (

@@ -27,7 +27,8 @@ export const COLUMN_BOUNDS = {
   stages: { default: 160, min: 72, max: 360 },
 } as const;
 
-const STATUS_WIDTH = 144;
+/** Fits "Passed with warnings" in full beside its icon at text-sm. */
+const STATUS_WIDTH = 168;
 const STATUS_ICON_WIDTH = 24;
 /** Three icon-sm buttons (32 px) and two 4 px gaps, so empty slots keep their space. */
 export const ACTIONS_WIDTH = 104;
