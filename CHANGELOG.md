@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [v0.15.3] - 2026-11-08
+
+BiBCode v0.15.3 guards checkpoint restores in shared checkouts, offers Git Credential Manager sign-in on the desktop, keeps named MCP clients across runs, reworks the Pipelines and Files views, loads pipelines for self-hosted GitLab on any port, and hardens load-sensitive tests and secret scanning. This release includes PR #337 since v0.15.2.
 
 ### Checkpoints and Git
 
@@ -20,6 +22,10 @@
 - The pipeline list has an aligned header, resizable and hideable columns and a "+N" stage overflow; widths are remembered per repository. The pipeline page's stages fill the panel, can wrap, open a job's log beside them, and GitLab pipelines that use `needs` can group jobs by dependency. (#285, #286, #321, #322)
 - The list's Status column shows "Passed with warnings" in full, and opening a job in the narrow, stacked layout brings its log into view. (#334)
 - Pipelines and Pull requests load for a self-hosted GitLab or GitHub Enterprise on a non-default web port, and SSH remotes to such a host match it by name. (#332)
+
+### Providers
+
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.319.
 
 ### Reliability
 
