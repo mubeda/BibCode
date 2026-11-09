@@ -97,7 +97,7 @@ const MIN_PROVEN_HTTP_HOOK_VERSION: (u64, u64, u64) = (2, 1, 63);
 /// (`tests::live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`, a release step
 /// in docs/operations/release.md). A newer build runs unhooked until a release raises it.
 const MIN_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 220);
-const MAX_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 314);
+const MAX_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 319);
 /// The `--version` line of a genuine build ends in this marker. A multi-call shim such as mise
 /// answers with its own dotted version, which must never pass as a Claude version.
 const CLAUDE_VERSION_MARKER: &str = "(Claude Code)";
@@ -3642,8 +3642,9 @@ mod tests {
         assert!(additive_hook_version("2.1.220"));
         assert!(additive_hook_version("2.1.312"));
         assert!(additive_hook_version("2.1.314"));
+        assert!(additive_hook_version("2.1.319"));
         assert!(
-            !additive_hook_version("2.1.315"),
+            !additive_hook_version("2.1.320"),
             "a build newer than the last proven one runs unhooked until the ceiling is raised"
         );
         assert!(!additive_hook_version("2026.10.19.1"));
