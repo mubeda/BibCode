@@ -108,7 +108,7 @@ import {
 import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironmentSettings, usePrimarySettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
-import { getTheme } from "../themes/customThemes";
+import { useThemeLibrary } from "../themes/customThemes";
 import { ensureBundledTerminalFontLoaded, resolveTerminalFontFamily } from "../lib/terminalFont";
 import {
   mergeTerminalSpawnEnv,
@@ -836,7 +836,7 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
 }: TerminalViewportProps) {
-  const { resolvedTheme: appTheme, resolvedThemeId, themeRevision } = useTheme();
+  const { resolvedTheme: appTheme, resolvedThemeId } = useTheme();
   const terminalThemePreference = usePrimarySettings(
     (settings) => settings.terminalThemePreference,
   );
@@ -846,15 +846,14 @@ export function TerminalViewport({
   // Everything downstream — the xterm theme and the OSC colours the PTY reports
   // to providers — is derived from this, never from the app theme directly.
   const resolvedTheme = resolveTerminalThemeMode(terminalThemePreference, appTheme);
-  // themeRevision changes when a theme with the same id is saved with new colors.
+  // The library snapshot changes when a theme with the same id is saved with new colors.
+  const { themes } = useThemeLibrary();
+  const activeTheme =
+    themes.find((theme) => theme.id === resolvedThemeId) ??
+    themes.find((theme) => theme.id === appTheme)!;
   const terminalPalette = useMemo(
-    () =>
-      resolveTerminalPalette(
-        terminalThemePreference,
-        getTheme(resolvedThemeId) ?? { version: 1, id: appTheme, name: appTheme, base: appTheme },
-      ),
-    // oxlint-disable-next-line react/memo-dependencies -- getTheme reads the store, which themeRevision versions.
-    [appTheme, resolvedThemeId, terminalThemePreference, themeRevision],
+    () => resolveTerminalPalette(terminalThemePreference, activeTheme),
+    [activeTheme, terminalThemePreference],
   );
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
