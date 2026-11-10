@@ -7,7 +7,7 @@ import {
   UI_COLOR_TOKENS,
   UI_KEYWORD_TOKENS,
   UI_LENGTH_TOKENS,
-} from "../../packages/contracts/src/theme.ts";
+} from "@bibcode/contracts";
 import {
   assertNoInlineScripts,
   themeBootstrapPlugins,
