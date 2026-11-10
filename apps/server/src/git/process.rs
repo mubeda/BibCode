@@ -568,12 +568,23 @@ impl WriteSettlement {
         if !(report.requested && report.forced && report.exited) {
             return;
         }
-        if watch.after_forced_stop().await == LockCleanup::Removed {
-            tracing::warn!(
+        let worktree = redact_path(&self.cwd.to_string_lossy());
+        match watch.after_forced_stop().await {
+            LockCleanup::Removed => tracing::warn!(
                 operation = %self.operation,
-                worktree = %redact_path(&self.cwd.to_string_lossy()),
+                %worktree,
                 "removed index.lock left by a Git process BiBCode had to force to stop"
-            );
+            ),
+            LockCleanup::RemoveFailed(kind) => {
+                self._ticket.lock_left();
+                tracing::warn!(
+                    operation = %self.operation,
+                    %worktree,
+                    error = %kind,
+                    "could not remove index.lock left by a Git process BiBCode had to force to stop"
+                );
+            }
+            LockCleanup::NotOurs | LockCleanup::Changed => {}
         }
     }
 }
@@ -603,6 +614,8 @@ pub(crate) enum LockCleanup {
     /// The lock changed or went away during the wait: another Git process has it now.
     Changed,
     Removed,
+    /// The lock stayed unchanged but deleting it failed, so it is still there.
+    RemoveFailed(std::io::ErrorKind),
 }
 
 /// Whether a Git command's `index.lock` existed before the command started, so a lock its
@@ -638,7 +651,9 @@ impl IndexLockWatch {
         }
         match std::fs::remove_file(&self.lock) {
             Ok(()) => LockCleanup::Removed,
-            Err(_) => LockCleanup::Changed,
+            // Gone between the check and the delete: another Git process took and released it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockCleanup::Changed,
+            Err(error) => LockCleanup::RemoveFailed(error.kind()),
         }
     }
 }
@@ -662,6 +677,8 @@ struct GitWriteRegistryState {
     closed: std::sync::Mutex<bool>,
     writes: TaskTracker,
     stop: CancellationToken,
+    /// Leftover locks of forced writes that could not be deleted.
+    locks_left: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One admitted write. Dropping it, after the write's outcome and lock cleanup, releases it.
@@ -669,6 +686,15 @@ struct GitWriteRegistryState {
 pub(crate) struct GitWriteTicket {
     _write: TaskTrackerToken,
     cancellation: CancellationToken,
+    locks_left: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl GitWriteTicket {
+    /// Records that this write's leftover `index.lock` could not be removed.
+    fn lock_left(&self) {
+        self.locks_left
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -676,6 +702,8 @@ pub(crate) enum QuiesceOutcome {
     Clean,
     /// This many writes had not finished their stop and cleanup within the limit.
     Pending(usize),
+    /// Every write finished, but this many leftover locks could not be removed.
+    LocksLeft(usize),
 }
 
 impl GitWriteRegistry {
@@ -689,6 +717,7 @@ impl GitWriteRegistry {
         (!*closed).then(|| GitWriteTicket {
             _write: self.state.writes.token(),
             cancellation: self.state.stop.child_token(),
+            locks_left: self.state.locks_left.clone(),
         })
     }
 
@@ -706,9 +735,19 @@ impl GitWriteRegistry {
     pub(crate) async fn stop_all_and_wait(&self, limit: Duration) -> QuiesceOutcome {
         self.close_admission();
         self.state.stop.cancel();
-        match tokio::time::timeout(limit, self.state.writes.wait()).await {
-            Ok(()) => QuiesceOutcome::Clean,
-            Err(_) => QuiesceOutcome::Pending(self.state.writes.len()),
+        if tokio::time::timeout(limit, self.state.writes.wait())
+            .await
+            .is_err()
+        {
+            return QuiesceOutcome::Pending(self.state.writes.len());
+        }
+        match self
+            .state
+            .locks_left
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => QuiesceOutcome::Clean,
+            locks => QuiesceOutcome::LocksLeft(locks),
         }
     }
 }
@@ -1233,7 +1272,10 @@ mod tests {
 
         std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o755))
             .expect("writable Git directory");
-        assert_eq!(cleanup, LockCleanup::RemoveFailed);
+        assert_eq!(
+            cleanup,
+            LockCleanup::RemoveFailed(std::io::ErrorKind::PermissionDenied)
+        );
         assert!(lock.exists(), "the lock could not be removed");
         assert_eq!(outcome, QuiesceOutcome::LocksLeft(1));
     }

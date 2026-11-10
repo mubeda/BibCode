@@ -83,11 +83,17 @@ lock stays unchanged for another 2 seconds, the server removes it and writes
 one `warn` line, `removed index.lock left by a Git process BiBCode had to
 force to stop`, with the operation name and the worktree path after the
 Profiler's path redaction. A lock that existed before the command started, or
-that changes during the wait, is never removed. At shutdown the server refuses
+that changes during the wait, is never removed. If deleting the lock fails, the
+server writes one `warn` line, `could not remove index.lock left by a Git
+process BiBCode had to force to stop`, with the same fields and the error kind,
+and the lock stays. At shutdown the server refuses
 new Git writes and stops the running ones this way before the Profiler's
 teardown. If a write is still stopping after the wait, it writes `Git writes
 were still stopping at shutdown` (`error`) with the count, waits once more, and
-reports the shutdown as incomplete if one is still pending.
+reports the shutdown as incomplete if one is still pending. If every write has
+stopped but a lock could not be deleted, it writes `leftover index.lock files
+could not be removed` (`error`) with the count and reports the shutdown as
+incomplete.
 
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the

@@ -1045,14 +1045,25 @@ impl ProductionRuntime {
         // teardown: later writes are refused, and each running write is stopped and its
         // leftover `index.lock` removed (R17). On Windows, where the stop is forced, only this
         // cleanup removes the lock.
-        if let Err(pending) = self.git_repository.stop_writes().await {
+        let mut writes = self.git_repository.stop_writes().await;
+        if let Err(pending) = writes {
             tracing::error!(pending, "Git writes were still stopping at shutdown");
-            if let Err(pending) = self.git_repository.stop_writes().await {
+            writes = self.git_repository.stop_writes().await;
+        }
+        match writes {
+            Ok(0) => {}
+            Err(pending) => {
                 tracing::error!(
                     pending,
                     "Git writes were still stopping after a second wait"
                 );
                 first_error.get_or_insert_with(|| format!("{pending} Git writes had not stopped"));
+            }
+            Ok(locks) => {
+                tracing::error!(locks, "leftover index.lock files could not be removed");
+                first_error.get_or_insert_with(|| {
+                    format!("{locks} leftover Git index locks could not be removed")
+                });
             }
         }
         steps.mark("git-writes");

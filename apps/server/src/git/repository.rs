@@ -474,12 +474,14 @@ impl GitRepository {
     }
 
     /// Shutdown (R17): refuses further Git writes, stops the running ones and waits until each
-    /// has exited and any `index.lock` its forced stop left is handled. `Err` carries how many
-    /// writes were still stopping after the wait; calling again waits once more.
-    pub(crate) async fn stop_writes(&self) -> Result<(), usize> {
+    /// has exited and any `index.lock` its forced stop left is handled. `Ok` carries how many
+    /// leftover locks could not be removed. `Err` carries how many writes were still stopping
+    /// after the wait; calling again waits once more.
+    pub(crate) async fn stop_writes(&self) -> Result<usize, usize> {
         let limit = GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(1);
         match self.writes.stop_all_and_wait(limit).await {
-            QuiesceOutcome::Clean => Ok(()),
+            QuiesceOutcome::Clean => Ok(0),
+            QuiesceOutcome::LocksLeft(locks) => Ok(locks),
             QuiesceOutcome::Pending(pending) => Err(pending),
         }
     }
