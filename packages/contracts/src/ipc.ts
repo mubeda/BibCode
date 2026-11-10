@@ -1371,6 +1371,11 @@ export interface DesktopBridge {
    */
   onCloseRequest?: (listener: (request: DesktopCloseRequest) => void) => () => void;
   replyCloseRequest?: (requestId: number, reply: DesktopCloseReply) => Promise<void>;
+  /**
+   * After the web allowed a close request with reason `update`, the desktop fires this when the
+   * install ends without restarting the app, so Files editing can run again.
+   */
+  onUpdateInstallEnded?: (listener: () => void) => () => void;
   pickFiles?: (options?: { title?: string }) => Promise<readonly string[]>;
   downloadToFolder?: (input: {
     url: string;
