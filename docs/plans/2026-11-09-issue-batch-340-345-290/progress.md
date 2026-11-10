@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 f67a4b9d4cdb)
+Spec: spec.md (sha256 91dd16c2aaa7)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -48,6 +48,8 @@ Branch: claude/next-pr-planning-13d367
 | 8.3 | User guide, runbooks and notices | 8 | Open | | |
 | 8.4 | Last token switch and changelog | 8 | Open | | |
 | 8.5 | Final gates, follow-up issue and report | 8 | Open | | |
+| 9.1 | Export a theme through the native Save dialog | 9 | Open | | Added by amendment A5 |
+| 9.2 | Ask before closing with unsaved Files edits | 9 | Open | | Added by amendment A5 |
 
 ## Log
 - 2026-11-09 22:30 Executor set to mstack-codex-review-workflow on branch claude/next-pr-planning-13d367. Round 1 lanes started: A (phase 1, sonnet medium), B (phase 2, opus medium), C (phase 6, opus medium), D (phase 7, opus medium). Codex reviews run through the codex CLI directly; the skill-codex `codex` skill is not installed.
@@ -64,3 +66,10 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 05:40 Lane D3 fixed the revised A3 rule on worktree-agent-af111e7a6ff44cb08 (f86b63d98; src/themes and settings 958 tests). Codex review of Phase 7 Tasks 7.9-7.12 and D3 running.
 - 2026-11-10 05:55 Codex re-review of C2: 1 finding accepted with the advisor (deliverPendingEdit cleared the flusher before calling it, so a throwing delivery lost the edit). The whole-body fallback in markdownReconcile.ts predates C2 and is allowed by R33's scenario "edit cannot be placed"; no user decision needed. Lane C3 (opus medium) fixed the flusher, pinned the refusal of `&copy;` and linked images with real-editor tests, gave too-large files their own notice, and re-checks a refused file however rendered view returns (worktree-agent-a04e9482591266fcf, cb1e2f636..0738410e7; files 590 tests). C3 measured that only fault injection reaches the fallback; table-cell, inserted-paragraph and split-paragraph edits do not. Codex review of C3 running.
 - 2026-11-10 05:55 Codex review of 7.9-7.12 and D3 (gpt-6.1-sol high), triaged with the advisor: accepted (2) BOM size bypass, (3) stale conflict flag at commit, (5) double focus indicator on ring-owning wrappers; rejected (4) surface reset after a text reset, because the user's revised A3 says a derived placeholder never strips a background. R55 wording corrected to match (surface step only where the base pair passes) with a new scenario; spec hash refreshed, check-plan passes. (1) Desktop export does nothing: wry 0.55.1 cancels webview downloads without a handler (wkwebview/navigation.rs:73) and apps/desktop registers none. The user chose a new save-file desktop bridge; it runs as its own lane after lane B2 finishes, because it compiles Rust. Lane D4 (opus medium) fixes 2, 3, 5, the touch half of the button finding, the D3 mutation check and the stale A1 row.
+- 2026-11-10 06:10 Codex review of C3 (triaged with the advisor): accepted (1) dispose-all ignores a failed settle, (3) test misses a reverted reconcileRead guard. Not blocking (2) native Close Window loses an undelivered edit: parity with source view, whose active session runs without autosave and no window-close handler exists, so R29 is met; ticketed below. Lane C4 (opus medium) is the last fix round on the delivery-failure path, plus C3's split-paragraph blank line and a toast for refused actions. Stop rule: later findings that need fault injection go to residual risk.
+
+## Follow-ups to ticket
+- Read-only Markdown files: a task checkbox click in rendered view discards source undo history (lane C Codex 5; R34 keeps today's behavior).
+- `apps/web/src/proposedPlan.ts` download is cancelled in the desktop app for the same reason as theme export; the new save-file bridge can serve it.
+- Profiler events reference does not name the new `git-writes` shutdown step; `docs/testing/cross-platform-validation.md` lacks the new `background_status_`, `git_stop_` and `index_lock_cleanup_` filters (Phase 8).
+- 2026-11-10 06:20 Ruling: amendment A5, approved by the user: desktop theme export uses a new save-file bridge (R53 desktop scenario), and closing the window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62, fixed in this PR at the user's request). Added Phase 9 (Tasks 9.1, 9.2), round 2, after phases 6 and 7, run only when no other lane compiles Rust; Phase 8 now depends on it. Window close removed from the follow-ups list.

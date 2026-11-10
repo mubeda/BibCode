@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 and A4 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3, A4 and A5 approved in chat during execution)
 Size: full    Mode: gated    Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -641,6 +641,11 @@ WHEN a person exports a custom theme, the Appearance section SHALL save it as a 
 - WHEN it is validated
 - THEN both fields are listed with their errors and no theme is stored
 
+#### Scenario: export in the desktop app (amendment A5)
+- GIVEN a custom theme in the desktop app
+- WHEN the person clicks Export
+- THEN the native Save dialog opens with `<id>.theme.json`, the chosen file holds the exported JSON, Cancel writes nothing and shows no error, and a failed write shows an error
+
 ### R54. The editor warns about low contrast and never blocks saving  [Must]
 WHILE a person edits a theme, the theme editor SHALL show the contrast ratio of each fixed pair and SHALL mark every pair below 4.5:1 with a warning that names both colors, without preventing Save.
 #### Scenario: unreadable pair
@@ -710,6 +715,25 @@ WHEN the theme library or a slot changes in one window, the app SHALL apply the 
 - GIVEN two windows open
 - WHEN a custom theme is edited and saved in the first
 - THEN the second repaints with the saved values without a reload
+
+### R62. Closing the window with unsaved Files edits asks first  [Must]
+WHEN the person closes the desktop window or quits the app while any Files edit is unsaved, in source or rendered view, the app SHALL keep the window open and show a dialog that lists the unsaved files with Save all, Discard and Cancel (amendment A5). Save all SHALL save every listed file through the existing save path and close only when every save succeeded; Discard SHALL close without saving; Cancel SHALL keep the window open with every edit intact. In browser mode the app SHALL ask the browser to warn before the page is left.
+#### Scenario: save all
+- GIVEN an unsaved rendered edit in one file and an unsaved source edit in another
+- WHEN the window is closed and Save all is chosen
+- THEN both files are written and the window closes
+#### Scenario: a save is blocked
+- GIVEN an unsaved edit to a file that changed on disk
+- WHEN the window is closed and Save all is chosen
+- THEN the window stays open, nothing overwrites the disk file, and the file shows the existing reload-or-overwrite choice
+#### Scenario: discard and cancel
+- GIVEN an unsaved edit
+- WHEN the window is closed and Discard is chosen, the window closes without writing; WHEN Cancel is chosen instead
+- THEN the window stays open and the edit is still there
+#### Scenario: nothing unsaved
+- GIVEN no unsaved Files edit
+- WHEN the window is closed
+- THEN it closes at once with no dialog
 
 ## Constraints and assumptions
 

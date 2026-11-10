@@ -2,7 +2,7 @@
 
 - Goal: The combined branch is proven in the packaged desktop app, the user guide, runbooks, notices and changelog describe the seven changes, every repository gate passes, and the split-out follow-up issue exists.
 - Round: 5
-- Depends on: 1, 2, 3, 4, 5, 6, 7
+- Depends on: 1, 2, 3, 4, 5, 6, 7, 9
 - Owns: `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts`, `apps/desktop/e2e/wdio.conf.ts`, `docs/user/workspace-ui.md`, `docs/testing/**`, `apps/web/THIRD_PARTY_NOTICES.md`, `CHANGELOG.md`, and the one selected-state class in `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx`
 - Must not touch: source files of Phases 2 to 7 except to fix a defect an end-to-end test or a gate exposes, which reopens the owning task
 - Skills: issue-delivery (acceptance evidence per issue before any costly run)

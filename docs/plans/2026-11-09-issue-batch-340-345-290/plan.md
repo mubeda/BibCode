@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 f67a4b9d4cdb)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 91dd16c2aaa7)
 Repository: this repository
 Base: main
 
@@ -34,6 +34,7 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A1 (R58). Diagrams take their colors from the info, background and foreground tokens, not from primary, and both preview bridges ignore the annotation theme today. R58's scenario now checks diagrams on the tokens they use and checks the annotation reader's values; wiring the bridges is left to a follow-up issue.
 - A3 (R55, approved by the user in chat on 2026-11-09 during execution). Built-in Light already fails placeholder on background at about 3.1:1, so the literal rule would strip the background of nearly every light import. Revised by the user on 2026-11-10 after lane D2 measured that any off-white background (`#fffdf8` gives 3.08 against Light's 3.11) still counted as worse: a pair the base already fails is reset only when the import overrides that pair's text token; pairs the base passes keep the 4.5:1 rule.
 - A4 (R34, approved by the user in chat on 2026-11-10 during execution). Lane C measured remark parse times of 116 ms at 50 kB, 537 ms at 200 kB and 7.1 s at 1 MB, with two or three parses per open. A Markdown file larger than 128 KiB opens read-only in rendered view with the notice.
+- A5 (approved by the user in chat on 2026-11-10 during execution). Theme export in the desktop app uses a new save-file desktop bridge command with the native Save dialog, because wry cancels webview downloads when no download handler exists (R53 gains a desktop scenario). Closing the desktop window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62), filed into this PR by the user instead of a separate issue. Both are Phase 9.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus
@@ -83,7 +84,8 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 | 5 | phases/PHASE-05-orphan-worktree-warnings.md | Orphan warnings need worktree evidence (#344) | 4 | 4 | most capable |
 | 6 | phases/PHASE-06-rich-markdown-editing.md | Markdown is editable in rendered view (#342) | 1 | none | most capable |
 | 7 | phases/PHASE-07-custom-themes.md | Built-in and custom color themes (#290) | 1 | none | most capable |
-| 8 | phases/PHASE-08-end-to-end-docs-gates.md | End-to-end proof, documents, gates, follow-up issue | 5 | 1, 2, 3, 4, 5, 6, 7 | standard |
+| 8 | phases/PHASE-08-end-to-end-docs-gates.md | End-to-end proof, documents, gates, follow-up issue | 5 | 1, 2, 3, 4, 5, 6, 7, 9 | standard |
+| 9 | phases/PHASE-09-desktop-save-and-close.md | Desktop theme export and asking before closing with unsaved edits (A5) | 2 | 6, 7 | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds. Tasks inside a phase run one after another, in the order their Depends on lines give: one lane per phase, never one lane per task. The four server phases (2, 3, 4, 5) are a chain because they share `repository.rs`, `git_vcs.rs` and `manager/operations.rs`. Run at most one lane that compiles Rust at a time, and check `df -h .` for at least 60 GB free before a lane starts a build.
 
@@ -140,6 +142,7 @@ Phases in the same round run in parallel. A phase depends only on phases in earl
 | `docs/user/workspace-ui.md`, `docs/testing/cross-platform-validation.md` | modify | 8 | `vp run check:markdown-links` |
 | `apps/web/THIRD_PARTY_NOTICES.md` | modify | 8 | read against the two design notes |
 | `CHANGELOG.md` | modify | 8 | read |
+| `packages/contracts/src/ipc.ts`, `apps/desktop/src-tauri/src/bridge.rs`, `apps/desktop/src-tauri/src/window.rs`, `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` (export call only), `apps/web/src/components/files/**` (close guard only), `docs/plans/2026-11-10-desktop-save-and-close-design.md` | create and modify | 9 | `cargo test -p bibcode-desktop`, web tests |
 | One new GitHub issue for the sidebar-hierarchy extension (external change) | create | 8 | `gh issue list --search "sidebar hierarchy in:title"` |
 
 Three files have a second, later owner by design, and the phases are in different rounds so they never run together: `apps/server/src/production/git_vcs.rs` (Phase 3, then Phase 4 for the failure message, then Phase 5 for the creation-record calls) and `apps/server/src/git/manager/operations.rs` (Phase 3, then Phase 4), and `apps/server/src/production/runtime.rs` (Phase 2 for shutdown, then Phase 4 for the service construction). `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx` and its test are changed again by Task 8.4 in round 5.
@@ -204,7 +207,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R50 | 7.3, 8.4 |
 | R51 | 7.7, 7.14 |
 | R52 | 7.9 |
-| R53 | 7.10 |
+| R53 | 7.10, 9.1 |
 | R54 | 7.9 |
 | R55 | 7.10 |
 | R56 | 7.4 |
@@ -213,6 +216,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R59 | 7.12 |
 | R60 | 7.8 |
 | R61 | 7.5 |
+| R62 | 9.2 |
 
 ## End-to-end verification
 
