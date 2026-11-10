@@ -3,11 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  UI_COLOR_TOKENS,
-  UI_KEYWORD_TOKENS,
-  UI_LENGTH_TOKENS,
-} from "@bibcode/contracts";
+import { UI_COLOR_TOKENS, UI_KEYWORD_TOKENS, UI_LENGTH_TOKENS } from "@bibcode/contracts";
 import {
   assertNoInlineScripts,
   themeBootstrapPlugins,
