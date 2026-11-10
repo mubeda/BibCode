@@ -9134,6 +9134,72 @@ esac
         cancellation.cancel();
     }
 
+    #[tokio::test]
+    async fn a_local_change_during_a_lookup_replaces_its_outdated_answer() {
+        let fixture = Fixture::new("pr-lookup-local-again");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        // This lookup reads the open request, then answers slowly.
+        fixture.set("slow", "2");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The request is closed, and a local change on the same branch reports it.
+        fixture.clear("open");
+        std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        subscriber
+            .until(
+                "the closed request must clear after the outdated answer",
+                |s| s.pr().is_null(),
+            )
+            .await;
+        assert_eq!(
+            fixture.lookups(),
+            ["main", "main", "main"],
+            "one follow-up lookup runs after the outdated one"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_queued_publication_shows_the_known_pull_request_at_once() {
+        let fixture = Fixture::new("pr-queued-publication");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        let from = subscriber.events.len();
+
+        // A remote publication read before the lookup answered carries no request.
+        let mut remote: VcsStatusRemoteResult =
+            serde_json::from_value(subscriber.remote.clone()).expect("shown remote");
+        remote.pr = None;
+        fixture
+            .services
+            .broadcaster
+            .publish_status_event_for_test(
+                &fixture.repository,
+                VcsStatusStreamEvent::RemoteUpdated {
+                    remote: Some(remote),
+                },
+            )
+            .await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        assert_eq!(
+            subscriber.shown_since(from),
+            [json!(42)],
+            "one event that keeps the known request: {:?}",
+            &subscriber.events[from..]
+        );
+        cancellation.cancel();
+    }
+
     /// A subscriber, then a refresh that stops waiting for a 30 second lookup at its bound.
     async fn a_refresh_past_its_bound(
         fixture: &Fixture,
