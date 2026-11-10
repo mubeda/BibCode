@@ -486,6 +486,12 @@ impl GitRepository {
         }
     }
 
+    /// Admits a stand-in write that stays pending until the returned ticket is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_write_for_test(&self) -> impl std::fmt::Debug + use<> {
+        self.writes.track().expect("Git writes are admitted")
+    }
+
     /// Shares the server's host observation, which provider probes fill elsewhere.
     #[must_use]
     pub fn with_provider_hosts(mut self, provider_hosts: Arc<ProviderHosts>) -> Self {

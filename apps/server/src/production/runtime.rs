@@ -5464,9 +5464,7 @@ mod tests {
 
     /// R17: a Git write still running at shutdown is stopped, and its `index.lock` is gone when
     /// quiescence returns. The write is a `git add` whose clean filter never finishes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn index_lock_cleanup_quiesce_stops_a_running_git_write() {
-        let state = TempDir::new().expect("state");
+    async fn start_quiesce_runtime(state: &TempDir) -> ProductionRuntime {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
@@ -5479,7 +5477,7 @@ mod tests {
             })
             .await
             .expect("migrations");
-        let runtime = ProductionRuntime::start(
+        ProductionRuntime::start(
             &config,
             database,
             AuthService::new(&config, vec![7_u8; 32]),
@@ -5487,7 +5485,36 @@ mod tests {
             Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
         )
         .await
-        .expect("runtime");
+        .expect("runtime")
+    }
+
+    /// A write whose stop outlasts both shutdown waits keeps quiescence incomplete: a later
+    /// call waits for it again and succeeds only once it has settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_never_succeeds_while_a_write_is_pending() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let write = runtime.git_repository.hold_write_for_test();
+
+        let first = runtime.quiesce_for_update().await;
+        let second = runtime.quiesce_for_update().await;
+
+        assert!(first.is_err(), "the first quiesce reports the pending write");
+        assert!(
+            second.is_err(),
+            "a second quiesce must not succeed while the write is pending"
+        );
+        drop(write);
+        runtime
+            .quiesce_for_update()
+            .await
+            .expect("quiesced once the write settled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_stops_a_running_git_write() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
 
         let git_config = crate::test_support::isolated_git_config::IsolatedGitConfig::new();
         let repository = state.path().join("repository");
