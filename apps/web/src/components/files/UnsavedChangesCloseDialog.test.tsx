@@ -257,6 +257,19 @@ describe("UnsavedChangesCloseHost", () => {
     await expect(answer).resolves.toBe("stay");
   });
 
+  it("Cancel returns focus to the element that had it", async () => {
+    const session = openFile(newRegistry(), "notes.md");
+    session.changeFromRichEditor("my edit");
+    const editor = document.createElement("textarea");
+    document.body.append(editor);
+    editor.focus();
+
+    const [answer] = await leave();
+    await click("Cancel");
+    await expect(answer).resolves.toBe("stay");
+    await vi.waitFor(() => expect(document.activeElement).toBe(editor));
+  });
+
   it("focus lands on Save all and Escape cancels", async () => {
     const session = openFile(newRegistry(), "notes.md");
     session.changeFromRichEditor("my edit");

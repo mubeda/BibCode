@@ -97,9 +97,17 @@ export function askBeforeLeaving(reason: LeaveReason): Promise<"proceed" | "stay
   return pendingAsk;
 }
 
-async function ask(_reason: LeaveReason): Promise<"proceed" | "stay"> {
+async function ask(reason: LeaveReason): Promise<"proceed" | "stay"> {
   // Blurring commits an IME composition into the editor before the registries are read.
-  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  focused?.blur();
+  const answer = await askUnfocused(reason);
+  // Staying puts the person back where they were, after the dialog returned its own focus.
+  if (answer === "stay" && focused?.isConnected) setTimeout(() => focused.focus(), 0);
+  return answer;
+}
+
+async function askUnfocused(_reason: LeaveReason): Promise<"proceed" | "stay"> {
   await new Promise((resolve) => setTimeout(resolve, 0));
   const files = windowUnsavedFiles().map(({ path }) => path);
   if (files.length === 0) return "proceed";

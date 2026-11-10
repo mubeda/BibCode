@@ -73,6 +73,8 @@ function sanitizePlanFileSegment(input: string): string {
     .toLowerCase()
     .replace(/[`'".,!?()[\]{}]+/g, "")
     .replace(/[^a-z0-9]+/g, "-")
+    // The desktop Save dialog accepts names up to 255 bytes; a title can be any length.
+    .slice(0, 120)
     .replace(/^-+|-+$/g, "");
   return sanitized.length > 0 ? sanitized : "plan";
 }

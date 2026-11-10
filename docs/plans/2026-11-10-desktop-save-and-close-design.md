@@ -160,7 +160,8 @@ delivers a pending rendered edit, waits for a write in flight and writes the res
 result or a rejection (caught per session, so every settle finishes) makes Save all report
 `"blocked"`, and then:
 
-- the dialog closes, the window stays open and the leave is answered `stay`;
+- the dialog, which shows "Saving..." while the settles run, closes, the window stays open and
+  the leave is answered `stay`;
 - a toast lists the files that are still unsaved;
 - a file refused because it changed on disk shows the existing reload-or-overwrite bar, because
   the session set its conflict while saving;
@@ -229,8 +230,9 @@ web export cases each for the Appearance panel and `downloadPlanAsTextFile`.
 - Ruling: the quit is held before `app.exit(0)` in a BiBCode Quit menu item, not with
   `prevent_exit()` in `ExitRequested` as Task 9.3's Interfaces line says, because the predefined
   Quit item never raises `ExitRequested` and the SIGTERM exit does. Cost if wrong: a future
-  `app.exit` call skips the question. Task 9.3's prove-fail step mutates the order in the quit
-  item instead.
+  `app.exit` call skips the question. Task 9.3's prove-fail step mutates `CloseGuard`, which the
+  `close_request_*` tests drive. The menu item and the `CloseRequested` handler that call it have
+  no unit seam, so only Task 8.6's packaged run proves that wiring.
 - Ruling: `saveTextFile` takes no `mimeType`, because the native dialog filters by extension and
   the browser path never reaches the bridge, so nothing would read it. Cost if wrong: one
   optional field to add.
@@ -241,7 +243,20 @@ web export cases each for the Appearance panel and `downloadPlanAsTextFile`.
 - Ruling: registries join the window-wide set themselves, so `ChatView.tsx` needs no change,
   because a registry knows when it starts owning sessions and when its dispose ends, and an
   effect cleanup in `ChatView` runs before the dispose settles. Cost if wrong: none for the
-  behavior; `ChatView.tsx` stays untouched.
+  behavior, and `ChatView.tsx` stays untouched.
+- Ruling: `unsavedContents` and `getSnapshot` are optional on `ManagedFileEditingSession`, because
+  session fakes in `ChatView.test.tsx` and `FileBrowserPanel.test.tsx`, which Phase 9 does not own,
+  lack them. A session without them counts as saved. Cost if wrong: a future session type that
+  omits them is never asked about.
+- Ruling: the dialog has a `saving` prop beyond the phase's four, and it stays open with every
+  choice disabled while Save all runs, because UI.md asks for visible progress. Cost if wrong:
+  one prop to remove.
+- Ruling: the desktop subscription lives in `UnsavedChangesCloseHost`, which `__root.tsx` mounts,
+  not in `__root.tsx` itself, so the keepalives stop with the host (decision 2). Cost if wrong:
+  none for the behavior.
+- Ruling: `buildProposedPlanMarkdownFilename` caps the title part at 120 characters, because a long
+  plan title would otherwise fail the 255-byte name rule with an error the person cannot act on.
+  Cost if wrong: long plan file names are shorter than before.
 
 ## Alternatives
 

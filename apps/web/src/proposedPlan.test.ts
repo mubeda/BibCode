@@ -117,6 +117,12 @@ describe("buildProposedPlanMarkdownFilename", () => {
     );
   });
 
+  it("keeps a long title within what the desktop Save dialog accepts", () => {
+    const filename = buildProposedPlanMarkdownFilename(`# ${"word ".repeat(100)}`);
+    expect(filename.length).toBeLessThanOrEqual(124);
+    expect(filename).toMatch(/^word(-word)*\.md$/);
+  });
+
   it("falls back to a generic filename when the plan has no heading", () => {
     expect(buildProposedPlanMarkdownFilename("- step 1")).toBe("plan.md");
   });

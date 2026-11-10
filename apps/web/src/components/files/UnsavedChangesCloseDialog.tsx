@@ -49,7 +49,10 @@ export function UnsavedChangesCloseDialog({
               : `These ${files.length} files have changes that are not saved. Discard loses them.`}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <ul className="max-h-48 overflow-y-auto px-6 pb-4 font-mono text-sm">
+        <ul
+          className="max-h-48 overflow-y-auto px-6 pb-4 font-mono text-sm"
+          data-text-surface="popover"
+        >
           {files.map((file) => (
             <li key={file} className="truncate" title={file}>
               {file}
