@@ -28,14 +28,13 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(checkForUpdates).toBeDisplayed();
     await expect(checkForUpdates).toBeDisabled();
 
-    await browser.url(`${appOrigin}/#/settings/general`);
-    const themePreference = browser.$('[aria-label="Theme preference"]');
-    await themePreference.scrollIntoView();
-    await expect(themePreference).toBeDisplayed();
-    await themePreference.click();
-    const darkTheme = browser.$('//*[@role="option" and normalize-space()="Dark"]');
-    await darkTheme.waitForDisplayed();
-    await darkTheme.click();
+    await browser.url(`${appOrigin}/#/settings/appearance`);
+    const darkMode = browser.$(
+      '//*[@role="group" and @aria-label="Mode"]//button[normalize-space()="Dark"]',
+    );
+    await darkMode.scrollIntoView();
+    await expect(darkMode).toBeDisplayed();
+    await darkMode.click();
     await expect(browser.$("html")).toHaveElementClass(expect.stringContaining("dark"));
 
     const providers = browser.$(

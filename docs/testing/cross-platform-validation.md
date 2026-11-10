@@ -3646,7 +3646,7 @@ sizes. Cover relevant:
   reports no tools shows no Tools group. When Claude Code updates itself (or a
   stub `claude` reports a higher version after a refresh), one **Claude updated
   to `<version>`** notice appears per version;
-- with **Settings → General → Theme** on **System**, switch the operating system
+- with **Settings → Appearance → Mode** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
   **Light** or **Dark** selected, the app ignores the switch;

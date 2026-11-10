@@ -472,7 +472,7 @@ Record its `org.freedesktop.appearance` `color-scheme` and GTK theme name;
 Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
 `APPIMAGE_GTK_THEME` unset for the system-following checks:
 
-- With **Settings → General → Theme** on **System**, launch once with a dark
+- With **Settings → Appearance → Mode** on **System**, launch once with a dark
   system scheme and once with a light scheme. Switch both ways while each
   instance runs. The webview, native menubar, and native dialogs must match at
   launch and after every switch.
