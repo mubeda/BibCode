@@ -2520,6 +2520,38 @@ describe("rich markdown editing", () => {
     );
   });
 
+  it("Save, Reload and Overwrite explain in a toast that an undelivered edit refused them", async () => {
+    const { session } = await renderRich("Mine\n", fakeRichEditor());
+    testState.pendingWork = true;
+    session.changeFromRichEditor("Mine edited\n");
+    const token = session.beginDiskCheck()!;
+    session.reconcileVersion(token, { _tag: "present", version: "v2" });
+    session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
+    const reportError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    session.setPendingEditFlusher(() => {
+      throw new Error("reconcile failed");
+    });
+    renderPanel(baseProps({ relativePath: "README.md" }));
+    const refused = {
+      stacked: true,
+      type: "error",
+      title: "Your last edit could not be applied to the file.",
+      description: "Switch to source view to keep it.",
+    };
+
+    (ui.find("FileEditorToolbar").onSave as () => void)();
+    (ui.find("FileDiskConflictBar").onReload as () => void)();
+    (ui.find("FileDiskConflictBar").onOverwrite as () => void)();
+    reportError.mockRestore();
+
+    expect(testState.toastAdd.mock.calls).toEqual([[refused], [refused], [refused]]);
+    expect(session.documentContents).toBe("Mine edited\n");
+    testState.toastAdd.mockReset();
+    session.setPendingEditFlusher(() => session.changeFromRichEditor("Mine edited again\n"));
+    (ui.find("FileEditorToolbar").onSave as () => void)();
+    expect(testState.toastAdd).not.toHaveBeenCalled();
+  });
+
   it("leaving the file autosaves a rendered edit", async () => {
     const { session } = await renderRich("Mine\n", fakeRichEditor());
     const registry = new FileEditingSessionRegistry<FileEditingSession<unknown>>();

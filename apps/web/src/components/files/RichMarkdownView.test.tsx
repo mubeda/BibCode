@@ -39,6 +39,7 @@ describe("RichMarkdownView", () => {
   it("saves on the save shortcut once the editor's first lazy load resolves", async () => {
     const session = {
       flush: vi.fn(async () => "saved"),
+      getSnapshot: () => ({ editPending: false }),
       changeFromRichEditor: vi.fn(),
       setPendingEditFlusher: vi.fn(),
       commitRichEdits: vi.fn(),

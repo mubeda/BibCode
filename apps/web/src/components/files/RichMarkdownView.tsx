@@ -3,11 +3,11 @@ import { lazy, type ReactNode, Suspense, useRef } from "react";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
 import type { RichMarkdownSurfaceProps } from "./richMarkdown/RichMarkdownSurface";
-import { useFileSaveShortcut } from "./useFileSaveShortcut";
+import { type SavableSession, useFileSaveShortcut } from "./useFileSaveShortcut";
 
 const RichMarkdownSurface = lazy(() => import("./richMarkdown/RichMarkdownSurface"));
 
-type RichMarkdownViewSession = RichMarkdownSurfaceProps["session"] & { flush(): Promise<unknown> };
+type RichMarkdownViewSession = RichMarkdownSurfaceProps["session"] & SavableSession;
 
 /** The editable rendered view; until its editor loads, the read-only view shows the text. */
 export function RichMarkdownView({

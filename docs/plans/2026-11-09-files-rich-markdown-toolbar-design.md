@@ -642,3 +642,9 @@ was reproduced as a failing test before the fix.
   from TipTap's serialization whenever the block before it was new, and TipTap writes an
   extra line break before a table. Fixed: an original block that follows an inserted block
   keeps the separator that led into it in the original. A second visit adds no line either.
+- Coordinator check 5 (UI.md), while a delivery failed, Save, Reload and Overwrite did
+  nothing and only logged to the console. Fixed: when the edit is still pending after one of
+  them, the panel shows the Files error toast "Your last edit could not be applied to the
+  file." with "Switch to source view to keep it." The toolbar's Save and the save shortcut
+  share `saveFile` for this. Switching to source view unmounts the surface, which delivers
+  the editor's whole serialization when the reconcile still throws.

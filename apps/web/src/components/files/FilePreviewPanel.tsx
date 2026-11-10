@@ -83,7 +83,7 @@ import { useInsertImage } from "./richMarkdown/useInsertImage";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
 import { RichMarkdownView } from "./RichMarkdownView";
-import { useFileSaveShortcut } from "./useFileSaveShortcut";
+import { explainUndeliveredEdit, saveFile, useFileSaveShortcut } from "./useFileSaveShortcut";
 import {
   filePreviewKind,
   isMarkdownPreviewFile,
@@ -1103,7 +1103,7 @@ export default function FilePreviewPanel({
                 : undefined
           }
           onSave={() => {
-            if (session) void session.flush();
+            if (session) saveFile(session);
           }}
           onUndo={() => (activeRichEditor ? activeRichEditor.undo() : session?.undo())}
           onRedo={() => (activeRichEditor ? activeRichEditor.redo() : session?.redo())}
@@ -1121,8 +1121,12 @@ export default function FilePreviewPanel({
             // disk text the conflict's read put in the query.
             clearProjectFileQueryData(environmentId, cwd, session.relativePath);
             session.reloadFromDisk();
+            explainUndeliveredEdit(session);
           }}
-          onOverwrite={() => session.overwriteDisk()}
+          onOverwrite={() => {
+            session.overwriteDisk();
+            explainUndeliveredEdit(session);
+          }}
         />
       ) : null}
       {relativePath && file.data && truncatedPreview ? (
