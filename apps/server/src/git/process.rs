@@ -538,11 +538,14 @@ struct WriteSettlement {
 }
 
 impl WriteSettlement {
-    /// Inline when the report is in; in the background while a reap is still running, so the
-    /// caller gets its outcome as before.
+    /// Awaited when the report is in; in the background while a reap is still running, so the
+    /// caller gets its outcome as before. Either way a spawned task owns the cleanup and the
+    /// ticket, so a caller dropped during the wait cannot release the write early.
     async fn settle_now_or_later(mut self) {
         match self.received.try_recv() {
-            Ok(report) => self.clean_up(report).await,
+            Ok(report) => {
+                let _ = tokio::spawn(self.clean_up(report)).await;
+            }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 tokio::spawn(self.settle());
             }
