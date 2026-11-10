@@ -193,9 +193,13 @@ Both defaults equal `--foreground`, so Light and Dark do not change (R38, R50).
   preference picks the slot, and a change clears the previous theme's overrides (R39).
 - Clicking a theme's row (or Enter or Space on it) puts the theme in its base's slot and shows it
   at once (R40, amendment A8). If the resolved mode has the other base, System resolving to it
-  included, the mode is set to the theme's base and a toast offers Undo, which restores the
-  previous mode and the previous theme of that slot. A click on a theme of the base on screen
-  changes only the slot and offers no Undo. Amendment A8 replaced the earlier "fill the slot and
+  included, the mode is set to the theme's base and a status line above the theme list offers
+  Undo, which restores the previous mode and the previous theme of that slot. The panel derives
+  the offer from the mode and slots it reads, so the offer is withdrawn as soon as the mode or
+  that slot changes (a Mode click, another window, a newer row click) or the previous theme is
+  deleted or no longer has that base. An Undo whose slot write fails leaves the mode unchanged
+  and shows an error. A click on a theme of the base on screen changes only the slot and offers
+  no Undo. Amendment A8 replaced the earlier "fill the slot and
   offer Switch to dark now" model, because a slot change that left the screen unchanged read as
   "nothing happens".
 - A slot pointing at a theme that no longer exists, or that failed to decode, reads as the
