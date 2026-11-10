@@ -864,15 +864,18 @@ export default function FilePreviewPanel({
     // oxlint-disable-next-line react-hooks/exhaustive-deps
     [relativePath, session?.cacheKey, renderedText === null],
   );
-  // What the rich surface reported for this document: its editor, or null when it cannot edit it.
+  // What the rich surface reported for this document: its editor, or null when it cannot edit
+  // the text it opened.
   const [richEditorState, setRichEditorState] = useState<{
     key: string | null;
     editor: RichMarkdownEditor | null;
-  }>({ key: null, editor: null });
+    opened: string | null;
+  }>({ key: null, editor: null, opened: null });
   const richEditorKey = session?.cacheKey ?? "";
   const richEditor = richEditorState.key === richEditorKey ? richEditorState.editor : undefined;
   const onRichEditorChange = useCallback(
-    (editor: RichMarkdownEditor | null) => setRichEditorState({ key: richEditorKey, editor }),
+    (editor: RichMarkdownEditor | null, opened: string) =>
+      setRichEditorState({ key: richEditorKey, editor, opened }),
     [richEditorKey],
   );
   const richEditable = richMode?.editable === true && richEditor !== null;
@@ -1069,6 +1072,15 @@ export default function FilePreviewPanel({
                   onRenderedChange: (rendered) => {
                     // The rendered visit reaches the source editor's history as one step.
                     if (!rendered) session?.commitRichEdits();
+                    else {
+                      // A refusal holds for the text it was made on; a source edit may fix it.
+                      const text = session?.unsavedContents ?? file.data?.contents;
+                      setRichEditorState((state) =>
+                        state.editor === null && state.opened !== text
+                          ? { key: null, editor: null, opened: null }
+                          : state,
+                      );
+                    }
                     setSourceView({
                       path: rendered ? null : relativePath,
                       revealRequestId: rendered ? null : revealRequestId,

@@ -17,8 +17,11 @@ export interface RichMarkdownSurfaceProps {
   readonly session: RichEditingSession;
   /** The text to open, read once: later changes come from this surface or remount it. */
   readonly contents: string;
-  /** The editor once it is ready, or null when the file cannot be edited block for block. */
-  readonly onEditorChange: (editor: RichMarkdownEditor | null) => void;
+  /**
+   * The editor once it is ready, or null when the file cannot be edited block for block, with
+   * the text it opened.
+   */
+  readonly onEditorChange: (editor: RichMarkdownEditor | null, opened: string) => void;
 }
 
 /**
@@ -65,14 +68,14 @@ export default function RichMarkdownSurface({
     if (!canReconcile({ original: opened.body, before })) {
       // Saving would rewrite blocks the person did not touch; the panel shows the read-only view.
       editor.destroy();
-      onEditorChange(null);
+      onEditorChange(null, opened.source);
       return;
     }
     const startComposing = () => session.setComposing(true);
     const endComposing = () => session.setComposing(false);
     element.addEventListener("compositionstart", startComposing);
     element.addEventListener("compositionend", endComposing);
-    onEditorChange(editor);
+    onEditorChange(editor, opened.source);
     return () => {
       element.removeEventListener("compositionstart", startComposing);
       element.removeEventListener("compositionend", endComposing);

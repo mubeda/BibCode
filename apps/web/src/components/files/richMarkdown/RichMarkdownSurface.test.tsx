@@ -39,7 +39,7 @@ function createSession(contents: string, relativePath = "notes.md") {
 }
 
 async function mount(session: FileEditingSession<never>, contents: string) {
-  const onEditorChange = vi.fn<(editor: RichMarkdownEditor | null) => void>();
+  const onEditorChange = vi.fn<(editor: RichMarkdownEditor | null, opened: string) => void>();
   await act(async () => {
     root.render(
       <RichMarkdownSurface session={session} contents={contents} onEditorChange={onEditorChange} />,
@@ -101,7 +101,10 @@ describe("RichMarkdownSurface", () => {
     await act(async () => vi.advanceTimersByTime(1_000));
     await act(async () => root.render(null));
 
-    expect(onEditorChange).toHaveBeenCalledWith(expect.objectContaining({ canUndo: false }));
+    expect(onEditorChange).toHaveBeenCalledWith(
+      expect.objectContaining({ canUndo: false }),
+      original,
+    );
     expect(session.changeFromRichEditor).not.toHaveBeenCalled();
     expect(session.getSnapshot().save.phase).toBe("clean");
   });

@@ -2405,6 +2405,38 @@ describe("rich markdown editing", () => {
     expect(markup).toContain(readOnlyNotice);
   });
 
+  it("a file the editor refused opens editable again once a source edit repairs it", async () => {
+    testState.sessionSnapshot = {
+      save: { phase: "pending", canSave: true, confirmedRevision: 0 },
+      canUndo: true,
+      canRedo: false,
+    };
+    testState.pendingWork = true;
+    const { session } = await renderRich("&copy;\n", undefined);
+    const refused = { key: session.cacheKey, editor: null, opened: "&copy;\n" };
+    const isRichState = (initial: unknown) =>
+      typeof initial === "object" && initial !== null && "editor" in initial;
+    const enterRendered = () => {
+      harness.seedState(isRichState, refused);
+      renderPanel(baseProps({ relativePath: "README.md" }));
+      (
+        ui.find("FileEditorToolbar").markdownView as {
+          onRenderedChange: (rendered: boolean) => void;
+        }
+      ).onRenderedChange(true);
+      return harness.setStateCalls.find((call) => isRichState(call.initial))?.applied ?? refused;
+    };
+
+    expect(enterRendered()).toEqual(refused);
+
+    testState.session!.editor.options.onChange({ contents: "(c)\n" });
+    const next = enterRendered();
+    harness.seedState(isRichState, next);
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    expect(ui.find("RichMarkdownSurface")).toMatchObject({ contents: "(c)\n" });
+  });
+
   it("switching to source after a rich edit commits it as one step", async () => {
     const { session } = await renderRich("# Title\n", fakeRichEditor());
     const commitRichEdits = vi.spyOn(session, "commitRichEdits");

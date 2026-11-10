@@ -3,7 +3,6 @@ import { lazy, type ReactNode, Suspense, useRef } from "react";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
 import type { RichMarkdownSurfaceProps } from "./richMarkdown/RichMarkdownSurface";
-import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { useFileSaveShortcut } from "./useFileSaveShortcut";
 
 const RichMarkdownSurface = lazy(() => import("./richMarkdown/RichMarkdownSurface"));
@@ -19,7 +18,7 @@ export function RichMarkdownView({
 }: {
   session: RichMarkdownViewSession;
   contents: string;
-  onEditorChange: (editor: RichMarkdownEditor | null) => void;
+  onEditorChange: RichMarkdownSurfaceProps["onEditorChange"];
   fallback: ReactNode;
 }) {
   return (
@@ -37,7 +36,7 @@ function LoadedRichMarkdown({
 }: {
   session: RichMarkdownViewSession;
   contents: string;
-  onEditorChange: (editor: RichMarkdownEditor | null) => void;
+  onEditorChange: RichMarkdownSurfaceProps["onEditorChange"];
 }) {
   const surfaceRef = useRef<HTMLDivElement>(null);
   useFileSaveShortcut(surfaceRef, session);

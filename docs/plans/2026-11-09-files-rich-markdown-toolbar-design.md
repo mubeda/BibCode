@@ -335,8 +335,11 @@ editor change, reconciles, prepends the frontmatter, and calls `changeFromRichEd
 when the result differs from the text it last delivered, so opening a file never marks it
 changed (R31). The surface is keyed by `session.cacheKey`, which changes when a reload
 from disk discards the document, so a reload or a disk change on a clean file remounts it
-with the new text. IME composition reaches `session.setComposing` as in the source
-surface.
+with the new text. When `canReconcile` refuses the text, the surface reports `null` with
+the text it opened, and the panel shows the read-only view. Switching to rendered view
+with different text, for example after a fix in source view, clears that refusal, so the
+surface opens the new text and checks it again. IME composition reaches
+`session.setComposing` as in the source surface.
 
 A disk change or a deletion while a rich edit waits on the timer: `beginDiskCheck`,
 `reconcileVersion` and `reconcileRead` call the flusher first, so an edit that starts
@@ -556,3 +559,11 @@ was reproduced as a failing test before the fix.
   no element, and never ran again. Fixed: `RichMarkdownView` moved to its own file, with the
   shortcut installed inside the boundary, and `useFileSaveShortcut` moved to its own file
   for both callers.
+- Codex review 2, item 5, a file refused for rich editing (for example `&copy;`) stayed
+  read-only after a fix in source view. The panel cached the refusal under
+  `session.cacheKey`, which a source edit does not change. Fixed: the refusal records the
+  text it was made on, and entering rendered view with other text clears it.
+- Codex review 2, item 6, a read-only file's task checkbox discards the source history.
+  Kept as it is (R34 "read-only as today", listed under Risks). The
+  `FilePreviewPanel.test.tsx` case for a footnote file still asserts that the checkbox goes
+  through `changeOutsideEditor` and not `changeFromRichEditor`.
