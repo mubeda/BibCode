@@ -11,10 +11,12 @@ import {
   useThemeLibrary,
 } from "../../themes/customThemes";
 import { resolveToken } from "../../themes/themeColor";
+import { exportThemeJson } from "../../themes/themeTransfer";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { ThemeEditor } from "./ThemeEditor";
+import { ThemeImportDialog } from "./ThemeImportDialog";
 
 type Base = "light" | "dark";
 
@@ -26,6 +28,16 @@ const MODE_OPTIONS = [
 
 const SWATCH_TOKENS = ["background", "card", "primary", "foreground", "border"] as const;
 const BASE_LABEL: Record<Base, string> = { light: "Light", dark: "Dark" };
+
+/** Saves the theme as `<id>.theme.json`; the id grammar has no path characters. */
+function downloadTheme(theme: ThemeFile) {
+  const url = URL.createObjectURL(new Blob([exportThemeJson(theme)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${theme.id}.theme.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
 
 function subtitleOf(theme: ThemeFile): string {
   return BUILTIN_THEMES.find((builtin) => builtin.id === theme.id)?.subtitle ?? "Custom";
@@ -136,7 +148,7 @@ function NewThemeForm({
 }
 
 /** Settings > Appearance: the mode, the theme list and its actions (#290, R43 to R47). */
-export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: ThemeFile) => void }) {
+export function AppearanceSettingsPanel() {
   const { theme: mode, setTheme, resolvedTheme } = useTheme();
   const { themes, slots } = useThemeLibrary();
   const [switchOffer, setSwitchOffer] = useState<Base | null>(null);
@@ -144,6 +156,7 @@ export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: Theme
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const returnFocusTo = useRef<string | null>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const existingIds = new Set(themes.map((theme) => theme.id));
@@ -224,9 +237,14 @@ export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: Theme
       <SettingsSection
         title="Themes"
         headerAction={
-          <Button size="xs" variant="ghost" onClick={() => setCreating(true)}>
-            New theme
-          </Button>
+          <div className="flex gap-1">
+            <Button size="xs" variant="ghost" onClick={() => setImporting(true)}>
+              Import theme
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setCreating(true)}>
+              New theme
+            </Button>
+          </div>
         }
       >
         <div className="grid gap-3 p-3">
@@ -334,7 +352,7 @@ export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: Theme
                             variant="ghost"
                             data-theme-action="export"
                             aria-label={`Export ${theme.name}`}
-                            onClick={() => onExport?.(theme)}
+                            onClick={() => downloadTheme(theme)}
                           >
                             Export
                           </Button>
@@ -360,6 +378,7 @@ export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: Theme
           </p>
         </div>
       </SettingsSection>
+      <ThemeImportDialog open={importing} onOpenChange={setImporting} />
     </SettingsPageContainer>
   );
 }

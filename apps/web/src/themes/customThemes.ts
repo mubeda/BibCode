@@ -276,17 +276,26 @@ export function deleteCustomTheme(
   return result.ok ? result : { ok: false, reason: "storage-failed" };
 }
 
-/** Stores an editable copy named "<name> copy" under a new id. Throws when it cannot be saved. */
-export function duplicateTheme(id: string): ThemeFile {
-  const source = getTheme(id);
-  if (!source) throw new Error(`Unknown theme ${id}`);
+/** `<id>-copy`, then `<id>-copy-2` and so on: an id no theme uses and no built-in reserves. */
+export function copyThemeId(id: string): string {
   const taken = new Set(listThemes().map((theme) => theme.id));
-  const stem = `${source.id.slice(0, 36)}-copy`;
+  const stem = `${id.slice(0, 36)}-copy`;
   let candidate = stem;
   for (let suffix = 2; taken.has(candidate) || isBuiltinThemeId(candidate); suffix += 1) {
     candidate = `${stem}-${suffix}`;
   }
-  const copy: ThemeFile = { ...source, id: candidate, name: `${source.name} copy`.slice(0, 48) };
+  return candidate;
+}
+
+/** Stores an editable copy named "<name> copy" under a new id. Throws when it cannot be saved. */
+export function duplicateTheme(id: string): ThemeFile {
+  const source = getTheme(id);
+  if (!source) throw new Error(`Unknown theme ${id}`);
+  const copy: ThemeFile = {
+    ...source,
+    id: copyThemeId(source.id),
+    name: `${source.name} copy`.slice(0, 48),
+  };
   const result = saveCustomTheme(copy);
   if (!result.ok) throw new Error(result.errors.map((error) => error.message).join(" "));
   return copy;

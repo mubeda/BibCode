@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { AppearanceSettingsPanel } from "./AppearanceSettingsPanel";
 import {
@@ -53,6 +53,7 @@ beforeEach(() => {
   root = createRoot(container);
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await act(async () => root.unmount());
   container.remove();
   window.localStorage.clear();
@@ -162,6 +163,30 @@ describe("AppearanceSettingsPanel", () => {
     await click(button("Cancel"));
     expect(container.querySelector("[data-theme-editor]")).toBeNull();
     expect(document.activeElement).toBe(button("Edit Night shift"));
+  });
+
+  it("Export downloads the theme as <id>.theme.json", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:theme");
+    const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    let downloaded: string | null = null;
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloaded = this.download;
+    });
+    await mount();
+    await click(button("Export Mine"));
+    expect(downloaded).toBe("mine.theme.json");
+    const blob = (createObjectURL.mock.calls[0] as unknown as [Blob])[0];
+    expect(JSON.parse(await blob.text())).toMatchObject({ id: "mine", name: "Mine" });
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:theme");
+  });
+
+  it("Import theme opens the import dialog", async () => {
+    await mount();
+    await click(button("Import theme"));
+    expect(document.body.textContent).toContain("Choose a .json theme file or paste its contents.");
   });
 
   it("with no custom themes the six built-ins and the New theme action are shown", async () => {
