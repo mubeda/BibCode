@@ -498,7 +498,75 @@ describe("PipelinesDetailView attempts (GitHub)", () => {
   });
 });
 
+/** Every stage header is a muted group label, and no job row shares its surface or text style. */
+function expectHeadersToBeGroupLabels() {
+  const headers = [...container.querySelectorAll('[aria-label="Stages"] > li h3')];
+  const rows = [...container.querySelectorAll('[aria-label$=" jobs"] .min-h-9')];
+  expect(headers.length).toBeGreaterThan(0);
+  expect(rows.length).toBeGreaterThan(0);
+  for (const header of headers) {
+    const classes = header.className.split(" ");
+    for (const name of ["bg-muted", "text-xs", "font-semibold", "uppercase", "tracking-wide"])
+      expect(classes).toContain(name);
+    for (const name of ["text-sm", "hover:bg-accent"]) expect(classes).not.toContain(name);
+  }
+  for (const row of rows) {
+    expect(row.className.split(" ")).not.toContain("bg-muted");
+    expect(row.className.split(" ")).not.toContain("uppercase");
+  }
+}
+
 describe("PipelinesDetailView stages", () => {
+  it("stage headers use a header surface and text style no job row uses", async () => {
+    await render();
+    expectHeadersToBeGroupLabels();
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render({ provider: "github" });
+    expectHeadersToBeGroupLabels();
+  });
+
+  it("stage header keeps one treatment when columns stack", async () => {
+    await render();
+    const headers = [...container.querySelectorAll('[aria-label="Stages"] > li h3')];
+    expect(headers.length).toBeGreaterThan(0);
+    for (const header of headers)
+      expect(header.className).not.toMatch(/@min-\[720px\]\/pipeline:\S*(?:bg-|uppercase|text-)/);
+  });
+
+  it("stage header is a heading with status, name and count", async () => {
+    const detail = pipelineDetail();
+    const job = (name: string) => ({
+      ...pipelineJob,
+      id: name.length,
+      name,
+      status: "success" as const,
+    });
+    h.detail = {
+      ...detail,
+      stages: [
+        {
+          name: "test",
+          status: "success",
+          warnings: false,
+          groups: ["a", "bb", "ccc"].map((name) => ({
+            name,
+            size: 1,
+            status: "success" as const,
+            jobs: [job(name)],
+          })),
+        },
+      ],
+    };
+    await render();
+    const heading = container.querySelector('[aria-label="Stages"] > li h3')!;
+    // The status icon is an image named by its label; the name and count are text.
+    const name = [...heading.children]
+      .map((part) => part.getAttribute("aria-label") ?? part.textContent)
+      .join(" ");
+    expect(name).toMatch(/passed.*test.*3 jobs/i);
+  });
+
   it("shows GitLab's stages in order, each job opening on the host without a job page link", async () => {
     await render();
     const stages = [...container.querySelectorAll('[aria-label="Stages"] > li')];
@@ -1144,6 +1212,7 @@ describe("PipelinesDetailView job dependencies", () => {
     h.detail = needsDetail();
     await render();
     expect(headers()).toEqual(["Layer 1", "Layer 2"]);
+    expectHeadersToBeGroupLabels();
     localStorage.setItem("bibcode:pipelines-job-grouping", "oops");
     await act(async () => root.unmount());
     root = createRoot(container);

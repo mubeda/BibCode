@@ -27,6 +27,10 @@ const NAME_CLASS = "min-w-0 flex-1 break-words @max-[257px]/stage:truncate";
 const ROW_CLASS =
   "flex min-h-9 min-w-0 items-center gap-2 rounded-md px-2 text-sm hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring";
 
+/** A stage or layer name reads as a group label on a muted strip, unlike the job rows below it. */
+const STAGE_HEADER_CLASS =
+  "flex min-h-7 min-w-0 items-center gap-2 rounded-md bg-muted px-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase";
+
 /**
  * The job's own page: in BiBCode once the view provides one, on the host until then.
  * Where the view shows logs in place, a plain click opens the job's log there instead.
@@ -186,12 +190,12 @@ const PipelineStage = memo(function PipelineStage({
   return (
     <li className="@container/stage relative flex min-w-0 flex-col gap-1 @min-[720px]/pipeline:min-w-64 @min-[720px]/pipeline:max-w-(--pipeline-stage-max) @min-[720px]/pipeline:flex-1 @min-[720px]/pipeline:basis-0">
       {separator}
-      <h3 className="flex min-w-0 items-center gap-2 px-2 text-sm font-medium">
+      <h3 className={STAGE_HEADER_CLASS}>
         <span role="img" aria-label={status} title={status} className="inline-flex">
           <PipelineStatusIcon status={stage.status} warnings={stage.warnings} />
         </span>
         <span className="min-w-0 truncate">{stage.name}</span>
-        <span className="ms-auto shrink-0 text-xs font-normal text-muted-foreground tabular-nums">
+        <span className="ms-auto shrink-0 text-xs font-medium normal-case tabular-nums">
           {jobCountLabel(stage)}
         </span>
       </h3>
