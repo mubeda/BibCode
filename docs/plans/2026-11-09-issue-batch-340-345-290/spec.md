@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A7 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A8 approved in chat during execution)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -690,15 +690,33 @@ The app SHALL keep one theme for the light slot and one for the dark slot, each 
 - WHEN it is offered for the dark slot
 - THEN it cannot be chosen there
 
-### R40. Picking a theme for the other mode fills its slot and offers a switch [Must]
+### R40. Clicking a theme applies it at once, switching the mode when needed [Must] (amendment A8)
 
-WHEN a person picks a theme whose base differs from the current mode, the app SHALL put it in that base's slot, SHALL leave the mode unchanged, and SHALL offer a "Switch to dark now" or "Switch to light now" action.
+WHEN a person clicks anywhere on a theme's row (or presses Enter or Space on it), the app SHALL put the theme in its base's slot and SHALL show it at once: if the mode shown on screen differs from the theme's base (including System resolving to the other base), the app SHALL set the mode to the theme's base and SHALL offer an Undo that restores the previous mode and slot. The list SHALL group themes into Light themes and Dark themes, SHALL mark the theme in use in each group visibly and with a selected state for assistive technology, and SHALL keep the secondary actions (Duplicate, Edit, Export, Delete) out of the row's click target.
 
 #### Scenario: dark theme in Light mode
 
 - GIVEN Light mode
-- WHEN the person picks Tokyo Night
-- THEN the dark slot holds Tokyo Night, the app stays light, and "Switch to dark now" is offered and sets the mode to Dark when used
+- WHEN the person clicks the Tokyo Night row
+- THEN the dark slot holds Tokyo Night, the mode is Dark, the app shows Tokyo Night, and an Undo returns the mode to Light and the dark slot to its previous theme
+
+#### Scenario: dark theme while System shows light
+
+- GIVEN System mode while the system is light
+- WHEN the person clicks the Matrix Dark row
+- THEN the mode is Dark, the app shows Matrix Dark, and Undo returns the mode to System
+
+#### Scenario: same-base theme
+
+- GIVEN Dark mode showing Dark
+- WHEN the person clicks the Tokyo Night row
+- THEN the app shows Tokyo Night, the mode stays Dark, and no Undo is offered
+
+#### Scenario: secondary action
+
+- GIVEN any theme row
+- WHEN the person uses Duplicate (or Edit, Export, Delete) on it
+- THEN that action runs and the row's theme is not applied
 
 ### R41. A theme applies to the whole app and clears cleanly [Must]
 
@@ -1068,7 +1086,7 @@ D7. The rendered view uses the TipTap editor family with its Markdown support, a
 
 D8. Insert image copies the picked file into the Markdown file's folder and inserts a relative link, with a numbered suffix when the name is taken. Alternatives considered: linking to the file where it is (breaks when the repository moves); a shared assets folder (a new convention nobody asked for). Decided by: user. Source: round 1, question 8.
 
-D9. #290 follows its issue's recommended answers: warn about contrast in the editor and fall back to base values on import; picking a theme for the other mode fills its slot and offers a switch; a curated token list; per-device storage; radius and "no sidebar shadow" first, then focus ring and control shadow. Alternatives considered: blocking Save on low contrast (stops deliberate choices); switching mode automatically (surprising); exposing every CSS variable (a larger contract to keep stable); syncing through the server (cannot paint before first frame). Decided by: user. Source: round 1, question 9.
+D9. #290 follows its issue's recommended answers: warn about contrast in the editor and fall back to base values on import; picking a theme for the other mode fills its slot and offers a switch; a curated token list; per-device storage; radius and "no sidebar shadow" first, then focus ring and control shadow. Alternatives considered: blocking Save on low contrast (stops deliberate choices); switching mode automatically (surprising); exposing every CSS variable (a larger contract to keep stable); syncing through the server (cannot paint before first frame). Decided by: user. Source: round 1, question 9. Amended by A8 (2026-11-10, user, after trying the dev build): clicking a theme row applies it and switches the mode to its base, with Undo, because a slot change that leaves the screen unchanged read as "nothing happens".
 
 D10. The stage header uses a quiet muted strip with a smaller, heavier, uppercase label, the pattern the app already uses for group labels. Alternatives considered: a bottom rule only (too weak in dark mode); the bordered accordion of the pull-request checks tab (changes the column layout). Decided by: agent's call. Source: #340 open question 1 and existing group-label styles.
 
