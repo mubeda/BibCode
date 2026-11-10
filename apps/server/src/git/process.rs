@@ -576,8 +576,8 @@ impl WriteSettlement {
                 %worktree,
                 "removed index.lock left by a Git process BiBCode had to force to stop"
             ),
-            LockCleanup::RemoveFailed(kind) => {
-                self._ticket.lock_left(lock, worktree.clone());
+            LockCleanup::RemoveFailed { kind, state } => {
+                self._ticket.lock_left(lock, state, worktree.clone());
                 tracing::warn!(
                     operation = %self.operation,
                     %worktree,
@@ -615,8 +615,12 @@ pub(crate) enum LockCleanup {
     /// The lock changed or went away during the wait: another Git process has it now.
     Changed,
     Removed,
-    /// The lock stayed unchanged but deleting it failed, so it is still there.
-    RemoveFailed(std::io::ErrorKind),
+    /// The lock stayed unchanged but deleting it failed, so it is still there. `state` is the
+    /// one that passed the unchanged check.
+    RemoveFailed {
+        kind: std::io::ErrorKind,
+        state: LockState,
+    },
 }
 
 /// Whether a Git command's `index.lock` existed before the command started, so a lock its
@@ -654,13 +658,19 @@ impl IndexLockWatch {
             Ok(()) => LockCleanup::Removed,
             // Gone between the check and the delete: another Git process took and released it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockCleanup::Changed,
-            Err(error) => LockCleanup::RemoveFailed(error.kind()),
+            Err(error) => LockCleanup::RemoveFailed {
+                kind: error.kind(),
+                state: before,
+            },
         }
     }
 }
 
+/// A lock's length and modification time.
+type LockState = (u64, Option<std::time::SystemTime>);
+
 /// The lock's length and modification time, read without following a link.
-fn lock_state(lock: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+fn lock_state(lock: &Path) -> Option<LockState> {
     let metadata = lock.symlink_metadata().ok()?;
     Some((metadata.len(), metadata.modified().ok()))
 }
@@ -689,7 +699,7 @@ type LeftLocks = Arc<std::sync::Mutex<Vec<LeftLock>>>;
 #[derive(Debug)]
 struct LeftLock {
     lock: PathBuf,
-    state: Option<(u64, Option<std::time::SystemTime>)>,
+    state: LockState,
     worktree: String,
 }
 
@@ -697,9 +707,7 @@ impl LeftLock {
     /// Deletes the lock if it is still the one BiBCode left. `false` once it is gone or
     /// changed (another Git process has it now, so it is not BiBCode's to delete).
     fn still_left(&self) -> bool {
-        let state = lock_state(&self.lock);
-        state.is_some()
-            && state == self.state
+        lock_state(&self.lock) == Some(self.state)
             && std::fs::remove_file(&self.lock)
                 .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
     }
@@ -715,8 +723,9 @@ pub(crate) struct GitWriteTicket {
 
 impl GitWriteTicket {
     /// Records that this write's leftover `lock` in `worktree` (redacted) could not be removed.
-    fn lock_left(&self, lock: PathBuf, worktree: String) {
-        let state = lock_state(&lock);
+    /// `state` is the one that passed the unchanged check: the file is not read again, because
+    /// another Git process may have replaced it since.
+    fn lock_left(&self, lock: PathBuf, state: LockState, worktree: String) {
         record_left_lock(
             &self.locks_left,
             LeftLock {
@@ -802,7 +811,7 @@ impl GitWriteRegistry {
             &self.state.locks_left,
             LeftLock {
                 lock: lock.to_path_buf(),
-                state: lock_state(lock),
+                state: lock_state(lock).expect("the leftover lock exists"),
                 worktree: redact_path(&worktree.to_string_lossy()),
             },
         );
@@ -1745,9 +1754,15 @@ mod tests {
         let second = registry.stop_all_and_wait(Duration::from_secs(1)).await;
 
         writable(&git_dir);
-        assert_eq!(
-            cleanup,
-            LockCleanup::RemoveFailed(std::io::ErrorKind::PermissionDenied)
+        assert!(
+            matches!(
+                cleanup,
+                LockCleanup::RemoveFailed {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    ..
+                }
+            ),
+            "{cleanup:?}"
         );
         assert!(lock.exists(), "the lock could not be removed");
         let reported =
@@ -1827,14 +1842,13 @@ mod tests {
         std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o555))
             .expect("read-only Git directory");
         let cleanup = watch.after_forced_stop().await;
-        assert!(
-            matches!(cleanup, LockCleanup::RemoveFailed(..)),
-            "{cleanup:?}"
-        );
+        let LockCleanup::RemoveFailed { state, .. } = cleanup else {
+            panic!("the delete fails: {cleanup:?}");
+        };
         std::fs::write(&lock, "another Git process").expect("another Git takes the lock");
         let ticket = registry.track().expect("an admitted write");
 
-        ticket.lock_left(lock.clone(), "worktree".to_owned());
+        ticket.lock_left(lock.clone(), state, "worktree".to_owned());
         drop(ticket);
         writable(&git_dir);
         let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
