@@ -180,7 +180,7 @@ describe("AppearanceSettingsPanel", () => {
     expect(downloaded).toBe("mine.theme.json");
     const blob = (createObjectURL.mock.calls[0] as unknown as [Blob])[0];
     expect(JSON.parse(await blob.text())).toMatchObject({ id: "mine", name: "Mine" });
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:theme");
+    await vi.waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:theme"));
   });
 
   it("Import theme opens the import dialog", async () => {

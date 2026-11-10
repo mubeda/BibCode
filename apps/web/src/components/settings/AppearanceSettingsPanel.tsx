@@ -36,7 +36,8 @@ function downloadTheme(theme: ThemeFile) {
   link.href = url;
   link.download = `${theme.id}.theme.json`;
   link.click();
-  URL.revokeObjectURL(url);
+  // Revoked after the click is handled; WebKit can drop a download whose URL is revoked at once.
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function subtitleOf(theme: ThemeFile): string {
