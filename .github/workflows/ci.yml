@@ -411,9 +411,18 @@ jobs:
         if: matrix.platform == 'win'
         run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_system_config -j 2
 
+      # #341 was reported on Windows: background Git must not lock the index there either.
+      - name: Run background Git index lock tests (Windows)
+        if: matrix.platform == 'win'
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 background_status_
+
       - name: Run Git system configuration tests (macOS)
         if: matrix.platform == 'mac'
         run: cargo test -p bibcode-server --test git_system_config -j 2
+
+      - name: Run background Git index lock tests (macOS)
+        if: matrix.platform == 'mac'
+        run: cargo test -p bibcode-server --lib -j 2 background_status_
 
       # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
       # keeps ~/.cargo/bin, so a restored runner skips the compile.

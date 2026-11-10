@@ -2406,7 +2406,7 @@ impl GitRepository {
                     "--cached",
                     "--numstat",
                 ]);
-                let unstaged_args = strings(&["-c", "core.quotePath=false", "diff", "--numstat"]);
+                let unstaged_args = strings(UNSTAGED_NUMSTAT_ARGS);
                 let (staged, unstaged) = tokio::try_join!(
                     self.run_read(
                         "GitVcsDriver.statusDetailsLocal.stagedNumstat",
@@ -2448,7 +2448,7 @@ impl GitRepository {
                     .run_read(
                         "GitVcsDriver.statusDetailsLocal.unstagedNumstat",
                         cwd,
-                        &strings(&["-c", "core.quotePath=false", "diff", "--numstat"]),
+                        &strings(UNSTAGED_NUMSTAT_ARGS),
                         cancellation,
                     )
                     .await?;
@@ -8073,6 +8073,18 @@ pub(super) fn prompt_guard_environment() -> Vec<(OsString, OsString)> {
     .map(|(key, value)| (key.into(), value.into()))
     .collect()
 }
+
+/// `git diff` refreshes the index for files whose timestamp changed but whose content did
+/// not, taking `index.lock` even under `GIT_OPTIONAL_LOCKS=0` (#341). The porcelain status
+/// read already decides which files changed, so this read skips the refresh.
+const UNSTAGED_NUMSTAT_ARGS: &[&str] = &[
+    "-c",
+    "core.quotePath=false",
+    "-c",
+    "diff.autoRefreshIndex=false",
+    "diff",
+    "--numstat",
+];
 
 pub(crate) fn git_read_environment() -> Vec<(OsString, OsString)> {
     let mut environment = git_environment();
