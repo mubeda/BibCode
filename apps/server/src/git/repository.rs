@@ -14808,6 +14808,33 @@ mod index_lock_free_status_tests {
         assert_eq!(inspection.untracked_file_count, 0);
     }
 
+    /// Codex review finding 5: the staged patch a commit message is written from.
+    #[tokio::test]
+    async fn background_status_staged_commit_context_leaves_the_index_untouched() {
+        let fixture = stat_dirty_worktree(false);
+        fixture.checked_git(&["add", "edited.txt"]);
+        fixture.make_stable_stat_dirty();
+        let watch = IndexWatch::start(&fixture);
+
+        let context = fixture
+            .repository()
+            .commit_context(&fixture.worktree, &CancellationToken::new())
+            .await
+            .expect("commit context");
+
+        watch
+            .assert_untouched("the staged commit context read")
+            .await;
+        assert!(
+            context.contains("edited.txt") && context.contains("+three"),
+            "{context}"
+        );
+        assert!(
+            !context.contains("stable.txt"),
+            "a timestamp-only change is not a change: {context}"
+        );
+    }
+
     /// Codex review finding 5: the working-tree patch a commit message is written from.
     #[tokio::test]
     async fn background_status_commit_context_leaves_the_index_untouched() {
