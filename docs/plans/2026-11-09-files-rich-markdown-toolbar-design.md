@@ -164,10 +164,11 @@ read-only, instead of losing the link in the block the person edits.
 structure, level by level, starting at the root.
 
 1. Pair `before` children with `after` children by the longest common subsequence of a
-   key. The key is the node's source text, except for a list item, whose key is the text
-   after its head plus its checkbox state, so a renumbered ordered item still matches. A
-   common prefix and suffix are trimmed first, so a one-block edit costs one comparison
-   per block.
+   key. The key is the node's normalized tree (the same form `canReconcile` compares), not
+   its text, so a renumbered ordered item still matches, and so does a table row that
+   TipTap re-padded because another cell in its column grew (found in Task 6.4). A common
+   prefix and suffix are trimmed first, so a one-block edit costs one comparison per
+   block.
 2. A matched child is emitted with `original`'s bytes for the `before` child in the same
    position (`canReconcile` guarantees the positions line up). One exception: when the
    match is ambiguous, because a deleted or inserted neighbour has the same key and a
@@ -213,9 +214,11 @@ The surface keeps `original` and `before` for the whole visit and reconciles the
 `after` on each serialization, so every save of the visit is computed from the file as it
 was opened. `original` and `before` are parsed once per visit. Each serialization costs
 `getMarkdown()`, one `remark` parse of `after` and a parse of each rebuilt top-level block.
-Task 6.3 measures this on a fixture near the 1 MB read limit. If it is too slow for the
-300 ms debounce, a size limit for rich editing is an open question for the spec, not a
-ruling.
+Task 6.3 measured `remark` with GFM on 2026-11-09 (one run each, measured): 116 ms to parse
+50 kB, 537 ms for 200 kB and 7.1 s for 1 MB. Opening a 1 MB file in rendered view
+therefore blocks for about 14 s (two parses for `canReconcile`), and each serialization
+for about as long. A size limit for rich editing is an open question for the spec, not a
+ruling, so this change sets none.
 
 ## Frontmatter
 
