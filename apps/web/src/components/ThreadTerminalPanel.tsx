@@ -108,15 +108,19 @@ import {
 import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironmentSettings, usePrimarySettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
+import { getTheme } from "../themes/customThemes";
 import { ensureBundledTerminalFontLoaded, resolveTerminalFontFamily } from "../lib/terminalFont";
 import {
   mergeTerminalSpawnEnv,
   resolveTerminalThemeMode,
+  isBuiltinTerminalPalette,
+  resolveTerminalPalette,
   retainTerminalLaunchTheme,
   terminalAnsiColors,
   terminalExtendedAnsiPalette,
   usesPersistentWindowsConsoleTheme,
   type TerminalLaunchThemeState,
+  type TerminalPalette,
   type TerminalThemeMode,
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
@@ -635,8 +639,9 @@ function repaintTerminalTheme(
   terminal: Terminal,
   resolvedTheme: TerminalThemeMode,
   mountElement?: HTMLElement | null,
+  palette?: TerminalPalette,
 ): void {
-  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement);
+  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement, palette);
   const currentTheme = terminal.options.theme;
   if (currentTheme && terminalThemesEqual(currentTheme, nextTheme)) return;
   terminal.options.theme = nextTheme;
@@ -646,8 +651,24 @@ function repaintTerminalTheme(
 function terminalThemeFromApp(
   resolvedTheme: TerminalThemeMode,
   mountElement?: HTMLElement | null,
+  palette?: TerminalPalette,
 ): ITheme {
   const isDark = resolvedTheme === "dark";
+  // A theme's own terminal colors (preference "Follow app theme"), as the session launched them.
+  if (palette && palette.mode === resolvedTheme && !isBuiltinTerminalPalette(palette)) {
+    return {
+      background: palette.background,
+      foreground: palette.foreground,
+      extendedAnsi: terminalExtendedAnsiPalette(resolvedTheme),
+      cursor: palette.cursor,
+      selectionBackground: palette.selectionBackground,
+      selectionForeground: palette.selectionForeground,
+      scrollbarSliderBackground: isDark ? "rgba(255, 255, 255, 0.1)" : "rgba(0, 0, 0, 0.15)",
+      scrollbarSliderHoverBackground: isDark ? "rgba(255, 255, 255, 0.18)" : "rgba(0, 0, 0, 0.25)",
+      scrollbarSliderActiveBackground: isDark ? "rgba(255, 255, 255, 0.22)" : "rgba(0, 0, 0, 0.3)",
+      ...palette.ansi,
+    };
+  }
   const fallbackBackground = isDark ? "rgb(14, 18, 24)" : "rgb(255, 255, 255)";
   const fallbackForeground = isDark ? "rgb(237, 241, 247)" : "rgb(28, 33, 41)";
   const panelSurface =
@@ -815,7 +836,7 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
 }: TerminalViewportProps) {
-  const { resolvedTheme: appTheme } = useTheme();
+  const { resolvedTheme: appTheme, resolvedThemeId, themeRevision } = useTheme();
   const terminalThemePreference = usePrimarySettings(
     (settings) => settings.terminalThemePreference,
   );
@@ -825,6 +846,16 @@ export function TerminalViewport({
   // Everything downstream — the xterm theme and the OSC colours the PTY reports
   // to providers — is derived from this, never from the app theme directly.
   const resolvedTheme = resolveTerminalThemeMode(terminalThemePreference, appTheme);
+  // themeRevision changes when a theme with the same id is saved with new colors.
+  const terminalPalette = useMemo(
+    () =>
+      resolveTerminalPalette(
+        terminalThemePreference,
+        getTheme(resolvedThemeId) ?? { version: 1, id: appTheme, name: appTheme, base: appTheme },
+      ),
+    // oxlint-disable-next-line react/memo-dependencies -- getTheme reads the store, which themeRevision versions.
+    [appTheme, resolvedThemeId, terminalThemePreference, themeRevision],
+  );
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -996,10 +1027,12 @@ export function TerminalViewport({
   const [attachmentLaunchThemeState, setAttachmentLaunchThemeState] = useState<{
     readonly targetKey: string;
     readonly theme: TerminalThemeMode;
+    readonly palette: TerminalPalette;
     readonly pinned: boolean;
   }>(() => ({
     targetKey: terminalTargetKey,
     theme: resolvedTheme,
+    palette: terminalPalette,
     pinned: shouldPinAttachmentTheme,
   }));
   let attachmentLaunchThemeEntry = attachmentLaunchThemeState;
@@ -1010,10 +1043,12 @@ export function TerminalViewport({
     attachmentLaunchThemeEntry = {
       targetKey: terminalTargetKey,
       theme: resolvedTheme,
+      palette: terminalPalette,
       pinned: shouldPinAttachmentTheme,
     };
   }
   const attachmentLaunchTheme = attachmentLaunchThemeEntry.theme;
+  const attachmentLaunchPalette = attachmentLaunchThemeEntry.palette;
   // Launch-command env supplies provider defaults and the thread's runtime env
   // wins ordinary conflicts. Theme colors and the Codex-only Windows console
   // theme are authoritative because the PTY consumes them during spawn.
@@ -1022,10 +1057,17 @@ export function TerminalViewport({
       commandEnv: command?.env,
       runtimeEnv,
       resolvedTheme: attachmentLaunchTheme,
+      palette: attachmentLaunchPalette,
       windowsConsoleTheme: hasPersistentWindowsConsoleTheme,
     });
     return Object.keys(merged).length > 0 ? merged : undefined;
-  }, [attachmentLaunchTheme, command, hasPersistentWindowsConsoleTheme, runtimeEnv]);
+  }, [
+    attachmentLaunchPalette,
+    attachmentLaunchTheme,
+    command,
+    hasPersistentWindowsConsoleTheme,
+    runtimeEnv,
+  ]);
   const terminalSession = useAttachedTerminalSession({
     environmentId,
     terminal: {
@@ -1064,6 +1106,7 @@ export function TerminalViewport({
     resolvedTheme: hasPersistentWindowsConsoleTheme ? attachmentLaunchTheme : resolvedTheme,
     authoritativeTheme: terminalSession.consoleTheme,
     restartRequest: themeRestartRequest,
+    palette: terminalPalette,
   };
   const [launchThemeState, setLaunchThemeState] = useState<TerminalLaunchThemeState>(() =>
     retainTerminalLaunchTheme(null, launchThemeInput),
@@ -1071,7 +1114,8 @@ export function TerminalViewport({
   const launchTheme = retainTerminalLaunchTheme(launchThemeState, launchThemeInput);
   if (
     launchTheme.generation !== launchThemeState.generation ||
-    launchTheme.theme !== launchThemeState.theme
+    launchTheme.theme !== launchThemeState.theme ||
+    launchTheme.palette !== launchThemeState.palette
   ) {
     setLaunchThemeState(launchTheme);
   }
@@ -1090,6 +1134,7 @@ export function TerminalViewport({
   if (
     attachmentLaunchThemeEntry.targetKey !== attachmentLaunchThemeState.targetKey ||
     attachmentLaunchThemeEntry.theme !== attachmentLaunchThemeState.theme ||
+    attachmentLaunchThemeEntry.palette.key !== attachmentLaunchThemeState.palette.key ||
     attachmentLaunchThemeEntry.pinned !== attachmentLaunchThemeState.pinned
   ) {
     setAttachmentLaunchThemeState(attachmentLaunchThemeEntry);
@@ -1098,6 +1143,7 @@ export function TerminalViewport({
     ? launchTheme.theme
     : resolvedTheme;
   const readEffectiveTerminalTheme = useEffectEvent(() => effectiveTerminalTheme);
+  const readLaunchPalette = useEffectEvent(() => launchTheme.palette);
   const nativeThemeMismatch =
     hasPersistentWindowsConsoleTheme &&
     terminalStatus === "running" &&
@@ -1262,7 +1308,7 @@ export function TerminalViewport({
       fontSize: 12,
       scrollback: 5_000,
       fontFamily: readTerminalFontFamily(),
-      theme: terminalThemeFromApp(readEffectiveTerminalTheme(), mount),
+      theme: terminalThemeFromApp(readEffectiveTerminalTheme(), mount, readLaunchPalette()),
       // OSC 8 activations bypass the link provider, so apply the same activation guard here.
       linkHandler: {
         activate: (event, uri, range) => {
@@ -1954,7 +2000,12 @@ export function TerminalViewport({
       // <html> class/style churn (tooltips, scroll locks) fires this observer
       // far more often than the theme changes; a repaint rebuilds the glyph
       // atlas, so skip it unless the resolved theme actually differs.
-      repaintTerminalTheme(activeTerminal, readEffectiveTerminalTheme(), containerRef.current);
+      repaintTerminalTheme(
+        activeTerminal,
+        readEffectiveTerminalTheme(),
+        containerRef.current,
+        readLaunchPalette(),
+      );
     });
     themeObserver.observe(document.documentElement, {
       attributes: true,

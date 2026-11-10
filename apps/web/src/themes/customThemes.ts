@@ -240,6 +240,11 @@ export function readSlots(): ThemeSlots {
   return getThemesSnapshot().slots;
 }
 
+/** The theme in the slot of `base`; slots always hold an existing theme of their base. */
+export function slotTheme(base: ThemeBaseName): ThemeFile {
+  return getTheme(readSlots()[base])!;
+}
+
 export function setSlot(
   base: ThemeBaseName,
   id: string,

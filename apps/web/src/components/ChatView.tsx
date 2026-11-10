@@ -168,8 +168,10 @@ import {
   type TurnDiffSummary,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
+import { slotTheme } from "../themes/customThemes";
 import {
   mergeTerminalSpawnEnv,
+  resolveTerminalPalette,
   resolveTerminalThemeMode,
   usesPersistentWindowsConsoleTheme,
   type TerminalThemeMode,
@@ -4678,6 +4680,10 @@ function ChatViewContent(props: ChatViewProps) {
               runtimeEnv: baseLaunch.env,
               commandEnv: launchCommand?.env,
               resolvedTheme: terminalTheme,
+              palette: resolveTerminalPalette(
+                settings.terminalThemePreference,
+                slotTheme(resolvedTheme === "dark" ? "dark" : "light"),
+              ),
               windowsConsoleTheme: usesPersistentWindowsConsoleTheme(launchCommand),
             }),
             ...(options?.label !== undefined ? { label: options.label } : {}),
@@ -4863,6 +4869,10 @@ function ChatViewContent(props: ChatViewProps) {
         const scriptSpawnEnv = mergeTerminalSpawnEnv({
           runtimeEnv,
           resolvedTheme: scriptTerminalTheme,
+          palette: resolveTerminalPalette(
+            settings.terminalThemePreference,
+            slotTheme(resolvedTheme === "dark" ? "dark" : "light"),
+          ),
           windowsConsoleTheme: false,
         });
         const dimensions = readTerminalFittedSize(
