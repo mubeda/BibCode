@@ -649,7 +649,7 @@ WHILE a person edits a theme, the theme editor SHALL show the contrast ratio of 
 - THEN that pair shows a ratio of 1:1 with a warning, and Save still works
 
 ### R55. An imported theme cannot paint unreadable text  [Must]
-IF an imported theme has a fixed pair below 4.5:1, and either the same pair at the theme's base values meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails, and SHALL tell the person which pairs were reset to base values.
+IF an imported theme has a fixed pair below 4.5:1, and either the same pair at the theme's base values meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails and the same pair at the base values meets 4.5:1, and SHALL tell the person which pairs were reset to base values.
 #### Scenario: low-contrast import
 - GIVEN an import whose muted text on background is 2.1:1
 - WHEN it is imported
@@ -659,6 +659,11 @@ IF an imported theme has a fixed pair below 4.5:1, and either the same pair at t
 - GIVEN a light-based import that sets only a background override of `#fffdf8`, with the default placeholder, whose placeholder on background is below 4.5:1 like the same pair in built-in Light
 - WHEN it is imported
 - THEN the background override is kept and no notice is shown
+
+#### Scenario: a failing text override on a pair the base already fails (amendment A3)
+- GIVEN a light-based import that sets `background: #fffdf8` and `placeholder: #cccccc`
+- WHEN it is imported
+- THEN the placeholder override is removed and named in the notice, and the background override is kept
 
 ### R56. Every built-in theme meets contrast minimums  [Must]
 Tokyo Night, Matrix Dark, Matrix Light and Verdant Light SHALL keep every fixed pair at or above 4.5:1; Matrix Light and Verdant Light SHALL keep their control border (the input token) at or above 3:1 on the background and every ANSI color at or above 4.5:1 on the terminal background.
