@@ -1860,6 +1860,29 @@ mod tests {
         );
     }
 
+    /// Codex review: a leftover lock that cannot be inspected is not gone, so it stays
+    /// reported.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_reporting_a_lock_it_cannot_inspect() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable Git directory");
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        writable(&git_dir);
+        assert_eq!(
+            outcome,
+            QuiesceOutcome::LocksLeft(vec![redact_path(&git_dir.path().to_string_lossy())])
+        );
+        assert!(lock.exists(), "the lock is still there");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
         let registry = GitWriteRegistry::default();
