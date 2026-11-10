@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 f2e9f8422896)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 c6b1062039a1)
 Repository: this repository
 Base: main
 
@@ -32,6 +32,7 @@ Base: main
 Both were found by the plan review and approved by the user on 2026-11-09; `spec.md` carries them.
 
 - A1 (R58). Diagrams take their colors from the info, background and foreground tokens, not from primary, and both preview bridges ignore the annotation theme today. R58's scenario now checks diagrams on the tokens they use and checks the annotation reader's values; wiring the bridges is left to a follow-up issue.
+- A3 (R55, approved by the user in chat on 2026-11-09 during execution). Built-in Light already fails placeholder on background at about 3.1:1, so the literal rule would strip the background of nearly every light import. A fixed pair is reset only when it is below 4.5:1 and below the same pair at the base theme's values.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus

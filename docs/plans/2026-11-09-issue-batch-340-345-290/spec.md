@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendment A3 approved in chat during execution)
 Size: full    Mode: gated    Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -644,11 +644,16 @@ WHILE a person edits a theme, the theme editor SHALL show the contrast ratio of 
 - THEN that pair shows a ratio of 1:1 with a warning, and Save still works
 
 ### R55. An imported theme cannot paint unreadable text  [Must]
-IF an imported theme has a fixed pair below 4.5:1, THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails, and SHALL tell the person which pairs were reset to base values.
+IF an imported theme has a fixed pair below 4.5:1 and below that pair's ratio at the theme's base values (amendment A3), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails, and SHALL tell the person which pairs were reset to base values.
 #### Scenario: low-contrast import
 - GIVEN an import whose muted text on background is 2.1:1
 - WHEN it is imported
 - THEN the stored theme has no muted text override, a notice names the pair, the other overrides are kept, and exporting the stored theme and importing it again changes nothing further
+
+#### Scenario: a pair the base already fails (amendment A3)
+- GIVEN a light-based import that sets only a background override, with the default placeholder, whose placeholder on background is below 4.5:1 but not below the same pair in built-in Light
+- WHEN it is imported
+- THEN the background override is kept and no notice is shown
 
 ### R56. Every built-in theme meets contrast minimums  [Must]
 Tokyo Night, Matrix Dark, Matrix Light and Verdant Light SHALL keep every fixed pair at or above 4.5:1; Matrix Light and Verdant Light SHALL keep their control border (the input token) at or above 3:1 on the background and every ANSI color at or above 4.5:1 on the terminal background.
