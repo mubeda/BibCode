@@ -45,8 +45,8 @@ so a preview window's close (`preview/platform/linux.rs:392`) is not intercepted
 | Last window destroyed                          | `ExitRequested { code: None }` (tauri-runtime-wry `lib.rs:4316`)        | none needed, because it follows an approved close               |
 | `desktop_bridge_restart_app`                   | web `restartApp` (`bridge.rs:1104`)                                     | the web asks first (Task 9.2)                                   |
 | Update install from this window                | web `installUpdate`, then `app.restart()` (`updates.rs:935`)            | the web asks first (Task 9.2)                                   |
-| Update install requested by another device     | server RPC `updater.install`, `remote_update_delegate.rs:146` and `200` | open question 1                                                 |
-| Dock Quit and the app switcher's Quit on macOS | `terminate:`, then `RunEvent::Exit`                                     | open question 2                                                 |
+| Update install requested by another device     | server RPC `updater.install`, `remote_update_delegate.rs:146` and `200` | close protocol, reason `update`, before `install_update`        |
+| Dock Quit and the app switcher's Quit on macOS | `terminate:`, then `RunEvent::Exit`                                     | outside R62 (stated limit, user decision)                       |
 | SIGTERM on Unix                                | `backend.rs:2060` stops the backend, then `app.exit(0)`                 | none, because the OS is ending the app                          |
 | Windows session end, macOS logout              | `RunEvent::Exit` without `ExitRequested`                                | outside R62                                                     |
 
@@ -80,7 +80,24 @@ sources and is checked by the packaged run in Task 8.6.
 
 Proven by the Rust tests `close_request_on_quit_waits_for_the_web_before_the_server_stops` and
 `close_request_closes_when_the_web_allows_it`, the web test `restart and update install ask
-first`, and Task 8.6's packaged close cases. The Dock Quit and remote install rows are open.
+first`, and Task 8.6's packaged close cases.
+
+An update install that another device requests through the server's `updater.install` starts
+natively and restarts the app (`remote_update_delegate.rs:200`, then `updates.rs:935`). After the
+download and before `install_update`, `run_remote_install` asks this window through
+`CloseGuard::ask_before_update` (reason `update`) and installs only on `allow`. `stay` logs a
+`tracing::warn!` line and leaves the update downloaded. The question waits for the person like a
+local install does, so a remote install waits while nobody answers the open dialog. Proven by
+`close_request_on_remote_update_proceeds_only_when_the_web_allows_it` and
+`close_request_remote_install_asks_the_window_first`.
+
+Dock Quit and the app switcher's Quit on macOS send `terminate:`, and tao has no
+`applicationShouldTerminate` hook, so they cannot wait for an answer. The user decided on
+2026-11-10 that they are a stated limit of R62, like logging out, and the spec says so.
+
+Quit with nothing unsaved now runs the `ExitRequested` teardown (above). Task 8.6 adds the case
+"Quit with nothing unsaved exits promptly", and the Rust slot confirms the teardown with a test
+or a probe.
 
 ### 2. Escape when the web does not answer
 
@@ -225,6 +242,30 @@ Proven by `save_text_file_writes_the_contents_to_the_chosen_path`,
 `save_text_file_returns_none_when_cancelled`, `save_text_file_reports_a_failed_write` and the four
 web export cases each for the Appearance panel and `downloadPlanAsTextFile`.
 
+### 8. Ending an end-to-end session with an unsaved edit
+
+Every packaged spec ends by calling `desktop_e2e_prepare_for_exit` and then closing the window
+(`apps/desktop/e2e/support/app-lifecycle.ts:29`). A spec that leaves an edit unsaved (Task 8.1
+types edits), or whose renderer died, would then wait on the dialog or the native prompt.
+
+`desktop_e2e_prepare_for_exit` disarms the `CloseGuard` first, so every later close or quit
+leaves at once, as if allowed. The command exists only in a `desktop-e2e` build, and so does
+`CloseGuard::disarm`.
+
+The other choice, the lifecycle helper answering Discard through WebDriver, was rejected. It
+needs a responsive renderer, so a dead or hung page still meets the native prompt, which WebDriver
+cannot drive. It also needs the helper to know whether a dialog will appear, which makes every
+teardown depend on the dialog's timing. The disarm needs no knowledge of the spec's edits and no
+dialog. Limit: the helper reaches `desktop_e2e_prepare_for_exit` through `browser.execute`
+(`app-lifecycle.ts:35`), so it still needs a renderer that runs scripts. A hung renderer blocks
+that teardown before and after this change, and handling it needs a native route that Task 8.6
+owns.
+
+The close cases of Task 8.6 (Save all, Discard, Cancel and a clean close) close the window
+before they call the teardown, so they exercise the real protocol. Proven by
+`close_request_disarmed_for_end_to_end_teardown_leaves_at_once`. Task 8.6 runs it in the
+packaged app.
+
 ## Rulings against the phase text
 
 - Ruling: the quit is held before `app.exit(0)` in a BiBCode Quit menu item, not with
@@ -289,33 +330,20 @@ Rust (`cargo test -p bibcode-desktop`): `save_text_file_*` through a seam for th
 and `close_request_*` against the pure request state machine with an injected clock, a recorded
 leave action and a scripted prompt.
 
-End-to-end teardown: every packaged spec now ends through the close protocol. A spec that ends
-with an unsaved edit, or with a dead renderer, waits on a dialog or a native prompt that nobody
-answers. Task 8.6 owns the lifecycle helper and must account for it.
+End-to-end teardown: decision 8.
 
 ## Open questions
 
-1. An update install requested by another device (`remote_update_delegate.rs:146`, then
-   `install_update` at line 200 and `app.restart()` at `updates.rs:935`) starts natively and never
-   asks the web. Guarding it needs one call to the close protocol (reason `update`) in
-   `remote_update_delegate.rs` before `install_update`, which Phase 9 does not own. Until that
-   file is granted, R62's "installing an update SHALL ask" holds only for an install started in
-   this window.
-2. Dock Quit and the app switcher's Quit on macOS send `terminate:`, and tao has no
-   `applicationShouldTerminate` hook, so they cannot wait for an answer. R62 exempts only logging
-   out and shutting down. Covering them needs either an `applicationShouldTerminate:` method added
-   to tao's delegate class at startup (which must also tell a logout's quit event apart), or a
-   spec amendment that lists them as a limit.
+None. The remote update install and Dock Quit were resolved on 2026-11-10 (decision 1).
 
 ## Review handling
 
 Codex `gpt-6.1-sol`, effort high, read-only, one round. Verdict "Needs rework", seven findings.
 
-1. Remote update install is unguarded. Accepted as a fact and kept as open question 1, because
-   the fix needs `remote_update_delegate.rs`, which the phase does not own.
-2. Dock Quit is not a session end. Accepted: R62 exempts only logout and shutdown. Kept as open
-   question 2, because both fixes need a decision outside this phase (a tao delegate patch or a
-   spec amendment). The table no longer lists Dock Quit as outside R62.
+1. Remote update install is unguarded. Accepted. The coordinator granted
+   `remote_update_delegate.rs` for this change, and decision 1 now guards it.
+2. Dock Quit is not a session end. Accepted. The user decided on 2026-11-10 that it is a stated
+   limit of R62, and decision 1 records it.
 3. An IME composition counts as saved. Checked: `setComposing` keeps the flag private
    (`fileEditingSession.ts:303`), and Pierre applies composed text at `compositionend`. Fixed in
    decision 4: `askBeforeLeaving` blurs the focused element and waits one task before it reads
@@ -349,5 +377,15 @@ Advisor, one round, nine findings.
    spawns no process and adds no RPC method.
 9. Packaged teardown passes through the protocol. Recorded in the test plan for Task 8.6.
 
-The phase brief speaks of eight decisions, and the phase file lists seven. This note covers the
-seven.
+Codex `gpt-6.1-sol`, effort high, a second read-only pass on the delta (decisions 1 and 8).
+Verdict "Needs rework", two P2 findings, and no finding on the remote install guard, the guard's
+state, the end-to-end feature gate or compile defects.
+
+1. R62 lacks the Dock Quit exemption. Checked: this worktree's copy of `spec.md` predates it, and
+   the integration branch's `spec.md` line 1004 lists quitting from the Dock or the app switcher
+   as outside R62. Rejected: the spec already says so.
+2. Decision 8 overstated dead-renderer coverage. Checked: the helper calls the command through
+   `browser.execute` (`app-lifecycle.ts:35`). Fixed: decision 8 states the limit.
+
+Decision 8 was added on 2026-11-10 at the coordinator's request, because the phase file's edit
+that should have listed it was missed.
