@@ -31,14 +31,14 @@ colors (both preview bridges ignore the annotation theme, spec amendment A1).
 
 ## Alternatives
 
-| Option                                                      | Outcome       | Reason                                                                                                                                                                                        |
-| ----------------------------------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A base plus overrides on the existing CSS variables         | Chosen        | One schema for built-in and custom themes. An unset token keeps its base definition, including derived ones (R36, D20). It matches the issue's prior art (Orca, Zed, T3 Code's short format). |
-| A full palette per theme                                    | Rejected      | Every theme would copy about 40 values and drift from the base when the base changes. Derived tokens such as `panel-separator` would stop following `ring`.                                   |
-| Server-side storage in `settings.json`                      | Rejected (D9) | The pre-paint step cannot wait for a server round trip, so the first frame would flash the base colors. Export and import move themes between devices.                                        |
-| Exposing every CSS variable                                 | Rejected (D9) | A larger contract to keep stable. The format covers the supported tokens only (D20).                                                                                                          |
-| Blocking Save on low contrast                               | Rejected (D9) | It stops deliberate choices. The editor warns, and import resets failing pairs (R54, R55).                                                                                                    |
-| Switching the mode when a theme of the other base is picked | Rejected (D9) | Surprising. The slot is filled and a switch is offered (R40).                                                                                                                                 |
+| Option                                                      | Outcome       | Reason                                                                                                                                                                   |
+| ----------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A base plus overrides on the existing CSS variables         | Chosen        | One schema for built-in and custom themes. An unset token keeps its base definition, including derived ones (R36, D20). It matches the issue's prior art (Orca and Zed). |
+| A full palette per theme                                    | Rejected      | Every theme would copy about 40 values and drift from the base when the base changes. Derived tokens such as `panel-separator` would stop following `ring`.              |
+| Server-side storage in `settings.json`                      | Rejected (D9) | The pre-paint step cannot wait for a server round trip, so the first frame would flash the base colors. Export and import move themes between devices.                   |
+| Exposing every CSS variable                                 | Rejected (D9) | A larger contract to keep stable. The format covers the supported tokens only (D20).                                                                                     |
+| Blocking Save on low contrast                               | Rejected (D9) | It stops deliberate choices. The editor warns, and import resets failing pairs (R54, R55).                                                                               |
+| Switching the mode when a theme of the other base is picked | Rejected (D9) | Surprising. The slot is filled and a switch is offered (R40).                                                                                                            |
 
 ## Theme file format
 

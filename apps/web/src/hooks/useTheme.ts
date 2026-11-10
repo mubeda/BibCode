@@ -1,14 +1,37 @@
-import type { DesktopBridge } from "@bibcode/contracts";
+import {
+  UI_COLOR_TOKENS,
+  UI_KEYWORD_TOKENS,
+  UI_LENGTH_TOKENS,
+  type DesktopBridge,
+  type ThemeFile,
+} from "@bibcode/contracts";
 import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
 import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useSyncExternalStore } from "react";
+
+import {
+  getTheme,
+  getThemeRevision,
+  handleThemesStorageEvent,
+  paintRecordFor,
+  readSlots,
+  subscribeThemes,
+} from "../themes/customThemes";
 
 const ThemePreference = Schema.Literals(["light", "dark", "system"]);
 type Theme = typeof ThemePreference.Type;
 type ThemeSnapshot = {
   theme: Theme;
   systemDark: boolean;
+  base: "light" | "dark";
+  themeId: string;
+  revision: number;
 };
+
+/** Every inline property a theme may set on the root element (#290). */
+const THEME_PROPERTIES = [...UI_COLOR_TOKENS, ...UI_LENGTH_TOKENS, ...UI_KEYWORD_TOKENS].map(
+  (token) => `--${token}`,
+);
 
 type DesktopThemeBridge = Pick<DesktopBridge, "setTheme">;
 
@@ -17,6 +40,9 @@ const MEDIA_QUERY = "(prefers-color-scheme: dark)";
 const DEFAULT_THEME_SNAPSHOT: ThemeSnapshot = {
   theme: "system",
   systemDark: false,
+  base: "light",
+  themeId: "light",
+  revision: 0,
 };
 const THEME_COLOR_META_NAME = "theme-color";
 const DYNAMIC_THEME_COLOR_SELECTOR = `meta[name="${THEME_COLOR_META_NAME}"][data-dynamic-theme-color="true"]`;
@@ -54,11 +80,30 @@ export const isDesktopThemeSyncError = Schema.is(DesktopThemeSyncError);
 let listeners: Array<() => void> = [];
 let lastSnapshot: ThemeSnapshot | null = null;
 let lastDesktopTheme: Theme | null = null;
-let lastAppliedTheme: ThemeSnapshot | null = null;
+let lastAppliedKey: string | null = null;
 let themeStorageReadFailure: ThemeStorageError | null = null;
+let previewTheme: ThemeFile | null = null;
+let previewRevision = 0;
+const appliedListeners = new Set<() => void>();
 
 function emitChange() {
   for (const listener of listeners) listener();
+}
+
+/** The theme on screen: an unsaved preview, else the slot of the resolved mode. */
+function activeTheme(theme: Theme, systemDark: boolean): ThemeFile {
+  if (previewTheme) return previewTheme;
+  const dark = theme === "dark" || (theme === "system" && systemDark);
+  const slots = readSlots();
+  return getTheme(dark ? slots.dark : slots.light) ?? getTheme(dark ? "dark" : "light")!;
+}
+
+/** Fires after every effective application of a theme, in this window. */
+export function subscribeAppliedTheme(listener: () => void): () => void {
+  appliedListeners.add(listener);
+  return () => {
+    appliedListeners.delete(listener);
+  };
 }
 
 function getSystemDark() {
@@ -159,13 +204,13 @@ function resolveBrowserChromeSurface(): HTMLElement {
   );
 }
 
-export function syncBrowserChromeTheme() {
+export function syncBrowserChromeTheme(themeBackground?: string) {
   if (typeof document === "undefined" || typeof getComputedStyle === "undefined") return;
   const surfaceColor = normalizeThemeColor(
     getComputedStyle(resolveBrowserChromeSurface()).backgroundColor,
   );
   const fallbackColor = normalizeThemeColor(getComputedStyle(document.body).backgroundColor);
-  const backgroundColor = surfaceColor ?? fallbackColor;
+  const backgroundColor = surfaceColor ?? fallbackColor ?? themeBackground;
   if (!backgroundColor) return;
 
   document.documentElement.style.backgroundColor = backgroundColor;
@@ -176,19 +221,29 @@ export function syncBrowserChromeTheme() {
 function applyTheme(theme: Theme, suppressTransitions = false) {
   if (typeof document === "undefined" || typeof window === "undefined") return;
   const systemDark = theme === "system" ? getSystemDark() : false;
-  if (lastAppliedTheme?.theme === theme && lastAppliedTheme.systemDark === systemDark) {
+  const active = activeTheme(theme, systemDark);
+  const record = paintRecordFor(active);
+  const key = `${theme}|${systemDark}|${active.id}|${record.stamp}`;
+  if (lastAppliedKey === key) {
     syncDesktopTheme(theme);
     return;
   }
 
+  const root = document.documentElement;
   if (suppressTransitions) {
-    document.documentElement.classList.add("no-transitions");
+    root.classList.add("no-transitions");
   }
-  const isDark = theme === "dark" || (theme === "system" && systemDark);
-  document.documentElement.classList.toggle("dark", isDark);
-  lastAppliedTheme = { theme, systemDark };
-  syncBrowserChromeTheme();
+  root.classList.toggle("dark", active.base === "dark");
+  // Clears every theme property the new theme does not set, including what the pre-paint
+  // script set, then sets the new overrides one property at a time (never as style text).
+  for (const name of THEME_PROPERTIES) {
+    if (!(name in record.vars)) root.style.removeProperty(name);
+  }
+  for (const [name, value] of Object.entries(record.vars)) root.style.setProperty(name, value);
+  lastAppliedKey = key;
+  syncBrowserChromeTheme(Object.keys(record.vars).length > 0 ? record.background : undefined);
   syncDesktopTheme(theme);
+  for (const listener of appliedListeners) listener();
   if (suppressTransitions) {
     // Force a reflow so the no-transitions class takes effect before removal
     // oxlint-disable-next-line no-unused-expressions
@@ -238,6 +293,7 @@ function handleSystemThemeChange() {
 }
 
 function handleThemeStorageChange(event: StorageEvent) {
+  handleThemesStorageEvent(event);
   if (event.key !== STORAGE_KEY) return;
   themeStorageReadFailure = null;
   applyTheme(getStored(), true);
@@ -260,6 +316,10 @@ if (typeof document !== "undefined" && typeof window !== "undefined") {
   if (typeof window.addEventListener === "function") {
     window.addEventListener("storage", handleThemeStorageChange);
   }
+  subscribeThemes(() => {
+    applyTheme(getStored(), true);
+    emitChange();
+  });
 }
 
 /** Applies the stored theme everywhere, including a desktop bridge installed after boot. */
@@ -271,12 +331,21 @@ function getSnapshot(): ThemeSnapshot {
   if (typeof window === "undefined") return DEFAULT_THEME_SNAPSHOT;
   const theme = getStored();
   const systemDark = theme === "system" ? getSystemDark() : false;
+  const active = activeTheme(theme, systemDark);
+  const revision = getThemeRevision() + previewRevision;
 
-  if (lastSnapshot && lastSnapshot.theme === theme && lastSnapshot.systemDark === systemDark) {
+  if (
+    lastSnapshot &&
+    lastSnapshot.theme === theme &&
+    lastSnapshot.systemDark === systemDark &&
+    lastSnapshot.themeId === active.id &&
+    lastSnapshot.base === active.base &&
+    lastSnapshot.revision === revision
+  ) {
     return lastSnapshot;
   }
 
-  lastSnapshot = { theme, systemDark };
+  lastSnapshot = { theme, systemDark, base: active.base, themeId: active.id, revision };
   return lastSnapshot;
 }
 
@@ -296,9 +365,8 @@ function subscribe(listener: () => void): () => void {
 export function useTheme() {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const theme = snapshot.theme;
-
-  const resolvedTheme: "light" | "dark" =
-    theme === "system" ? (snapshot.systemDark ? "dark" : "light") : theme;
+  // The active theme's base: a slot's theme always has the base of its mode.
+  const resolvedTheme = snapshot.base;
 
   const setTheme = useCallback((next: Theme) => {
     if (typeof window === "undefined") return;
@@ -330,5 +398,11 @@ export function useTheme() {
     applyTheme(theme);
   }, [theme]);
 
-  return { theme, setTheme, resolvedTheme } as const;
+  return {
+    theme,
+    setTheme,
+    resolvedTheme,
+    resolvedThemeId: snapshot.themeId,
+    themeRevision: snapshot.revision,
+  } as const;
 }

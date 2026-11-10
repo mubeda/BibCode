@@ -169,6 +169,7 @@ describe("theme failure handling", () => {
     vi.stubGlobal("document", {
       documentElement: {
         classList: { toggle: vi.fn() },
+        style: { removeProperty: vi.fn(), setProperty: vi.fn() },
       },
     });
 
@@ -182,9 +183,11 @@ describe("theme failure handling", () => {
         errorTag: "ThemeStorageError",
       }),
     );
-    const attributes = errorLog.mock.calls[0]?.[1];
-    expect(attributes).not.toHaveProperty("cause");
-    expect(JSON.stringify(attributes)).not.toContain(cause.message);
+    // The theme library logs its own read failure; neither log carries the raw cause.
+    for (const [, attributes] of errorLog.mock.calls) {
+      expect(attributes).not.toHaveProperty("cause");
+      expect(JSON.stringify(attributes)).not.toContain(cause.message);
+    }
   });
 
   it("retries a failed storage read only after a relevant storage event", async () => {
@@ -218,26 +221,33 @@ describe("theme failure handling", () => {
     vi.stubGlobal("document", {
       documentElement: {
         classList: { toggle: vi.fn() },
+        style: { removeProperty: vi.fn(), setProperty: vi.fn() },
       },
     });
 
+    // The theme library reads its own keys; only reads and logs of the mode count here.
+    const modeReads = () =>
+      getItem.mock.calls.filter((call) => (call as unknown[])[0] === "bibcode:theme").length;
+    const modeLogs = () =>
+      errorLog.mock.calls.filter(([message]) => String(message).includes("theme preference"))
+        .length;
     const { useTheme } = await import("./useTheme");
     useTheme();
     readSnapshot?.();
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(1);
-    expect(errorLog).toHaveBeenCalledTimes(1);
+    expect(modeReads()).toBe(1);
+    expect(modeLogs()).toBe(1);
 
     storageHandler?.({ key: "unrelated" } as StorageEvent);
     readSnapshot?.();
-    expect(getItem).toHaveBeenCalledTimes(1);
+    expect(modeReads()).toBe(1);
 
     storageHandler?.({ key: "bibcode:theme" } as StorageEvent);
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(2);
-    expect(errorLog).toHaveBeenCalledTimes(2);
+    expect(modeReads()).toBe(2);
+    expect(modeLogs()).toBe(2);
   });
 
   it("preserves desktop sync causes and retries after a failed cosmetic sync", async () => {
@@ -475,5 +485,151 @@ describe("app-wide theme subscription", () => {
     for (const unsubscribe of unsubscribers) unsubscribe();
     browser.switchOs(true);
     expect(browser.isDark()).toBe(true);
+  });
+});
+
+describe("theme slots and overrides", () => {
+  function seed(
+    browser: ReturnType<typeof installThemeBrowser>,
+    slots: { light?: string; dark?: string },
+    library: unknown[] = [],
+  ) {
+    browser.storage.setItem(
+      "bibcode:theme-slots:v1",
+      JSON.stringify({ light: "light", dark: "dark", ...slots, paintStamp: "seed" }),
+    );
+    browser.storage.setItem("bibcode:themes:v1", JSON.stringify(library));
+  }
+  const rootStyle = (browser: ReturnType<typeof installThemeBrowser>) =>
+    browser.browserWindow.document.documentElement.style;
+  function customProperties(browser: ReturnType<typeof installThemeBrowser>): string[] {
+    const style = rootStyle(browser);
+    return Array.from({ length: style.length }, (_, index) => style.item(index)).filter((name) =>
+      name.startsWith("--"),
+    );
+  }
+  function withDesktopBridge(browser: ReturnType<typeof installThemeBrowser>) {
+    const setTheme = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(browser.browserWindow, "desktopBridge", {
+      configurable: true,
+      value: { setTheme },
+    });
+    return setTheme;
+  }
+  const mine = {
+    version: 1,
+    id: "mine",
+    name: "Mine",
+    base: "dark",
+    ui: { primary: "#3b82f6" },
+  };
+
+  it("with no stored slots nothing but the dark class changes", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(customProperties(browser)).toEqual([]);
+    expect(browser.storage.getItem("bibcode:theme-paint:v1")).toBeNull();
+  });
+
+  it('Tokyo Night sets the dark class and --background #1a1b26, --primary #7aa2f7 and --border #414868 and calls setTheme("dark")', async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    const setTheme = withDesktopBridge(browser);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("#1a1b26");
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#7aa2f7");
+    expect(rootStyle(browser).getPropertyValue("--border")).toBe("#414868");
+    expect(setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("switching from Matrix Dark to Dark removes every Matrix Dark property", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "matrix-dark" });
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    expect(customProperties(browser).length).toBeGreaterThan(10);
+
+    store.setSlot("dark", "dark");
+    expect(customProperties(browser)).toEqual([]);
+    expect(browser.isDark()).toBe(true);
+  });
+
+  it('Matrix Light leaves the dark class off, sets --input #16a34a and calls setTheme("light")', async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "matrix-light" });
+    const setTheme = withDesktopBridge(browser);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(false);
+    expect(rootStyle(browser).getPropertyValue("--input")).toBe("#16a34a");
+    expect(setTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("Verdant Light sets --foreground #303840, --placeholder #667078, --selected #eaf5ef, --selected-foreground #065f46 and --panel-separator #dee3e6", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const style = rootStyle(browser);
+    expect(style.getPropertyValue("--foreground")).toBe("#303840");
+    expect(style.getPropertyValue("--placeholder")).toBe("#667078");
+    expect(style.getPropertyValue("--selected")).toBe("#eaf5ef");
+    expect(style.getPropertyValue("--selected-foreground")).toBe("#065f46");
+    expect(style.getPropertyValue("--panel-separator")).toBe("#dee3e6");
+  });
+
+  it("in System mode an operating-system change to light applies the light slot and clears the dark theme's properties", async () => {
+    const browser = installThemeBrowser({ stored: "system", prefersDark: true });
+    seed(browser, { dark: "mine" }, [mine]);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#3b82f6");
+
+    browser.switchOs(false);
+    expect(browser.isDark()).toBe(false);
+    expect(customProperties(browser)).toEqual([]);
+  });
+
+  it('a custom theme on a dark base resolves to "dark" and its id', async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "mine" }, [mine]);
+    mockReactForHookCalls(() => {});
+    const { useTheme } = await import("./useTheme");
+    expect(useTheme()).toMatchObject({ resolvedTheme: "dark", resolvedThemeId: "mine" });
+  });
+
+  it("the theme-color meta uses the theme's background", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    await import("./useTheme");
+    expect(
+      browser.browserWindow.document
+        .querySelector('meta[name="theme-color"]')
+        ?.getAttribute("content"),
+    ).toBe("#1a1b26");
+  });
+
+  it("subscribeAppliedTheme fires on a mode change, a System change, a slot change and a same-id saved edit, and stops after unsubscribing", async () => {
+    const browser = installThemeBrowser({ stored: "system", prefersDark: false });
+    seed(browser, {}, [mine]);
+    mockReactForHookCalls(() => {});
+    const { subscribeAppliedTheme, useTheme } = await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const listener = vi.fn();
+    const unsubscribe = subscribeAppliedTheme(listener);
+
+    browser.switchOs(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    store.setSlot("dark", "mine");
+    expect(listener).toHaveBeenCalledTimes(2);
+    store.saveCustomTheme({ ...mine, ui: { primary: "#ff0000" } } as never);
+    expect(listener).toHaveBeenCalledTimes(3);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#ff0000");
+    useTheme().setTheme("light");
+    expect(listener).toHaveBeenCalledTimes(4);
+
+    unsubscribe();
+    useTheme().setTheme("dark");
+    expect(listener).toHaveBeenCalledTimes(4);
   });
 });

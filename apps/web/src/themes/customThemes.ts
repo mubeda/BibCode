@@ -1,3 +1,4 @@
+import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
 import { UI_COLOR_TOKENS, type ThemeFile } from "@bibcode/contracts";
 import { useSyncExternalStore } from "react";
 
@@ -41,11 +42,20 @@ function storage(): Storage | null {
   }
 }
 
+// Unreadable storage leaves the built-in themes working; it is logged once and read again only
+// after a relevant storage event.
+let storageReadFailed = false;
+
 function readRaw(key: string): string | null {
+  if (storageReadFailed) return null;
   try {
     return storage()?.getItem(key) ?? null;
   } catch (cause) {
-    console.error("Could not read stored themes.", { storageKey: key, cause });
+    storageReadFailed = true;
+    console.error("Could not read stored themes.", {
+      storageKey: key,
+      ...safeErrorLogAttributes(cause),
+    });
     return null;
   }
 }
@@ -304,13 +314,15 @@ export function useThemeLibrary(): ThemesSnapshot {
   return useSyncExternalStore(subscribeThemes, getThemesSnapshot, getThemesSnapshot);
 }
 
-function handleStorage(event: StorageEvent) {
+/**
+ * Follows a change another window made (R61). `useTheme` owns the app's one `storage` listener
+ * and forwards every event here.
+ */
+export function handleThemesStorageEvent(event: Pick<StorageEvent, "key">): void {
   if (event.key !== null && !STORE_KEYS.has(event.key)) return;
+  storageReadFailed = false;
   repair();
   changed();
 }
 
-if (typeof window !== "undefined") {
-  repair();
-  window.addEventListener?.("storage", handleStorage);
-}
+if (typeof window !== "undefined") repair();

@@ -14,7 +14,6 @@ function installStorage(initial: Record<string, string> = {}) {
   const store = new Map(Object.entries(initial));
   const writes: string[] = [];
   let failWritesTo: string | null = null;
-  const storageListeners = new Set<(event: StorageEvent) => void>();
   const localStorage = {
     getItem: (key: string) => store.get(key) ?? null,
     setItem: (key: string, value: string) => {
@@ -24,15 +23,7 @@ function installStorage(initial: Record<string, string> = {}) {
     },
     removeItem: (key: string) => store.delete(key),
   };
-  vi.stubGlobal("window", {
-    localStorage,
-    addEventListener: (type: string, listener: (event: StorageEvent) => void) => {
-      if (type === "storage") storageListeners.add(listener);
-    },
-    removeEventListener: (type: string, listener: (event: StorageEvent) => void) => {
-      if (type === "storage") storageListeners.delete(listener);
-    },
-  });
+  vi.stubGlobal("window", { localStorage });
   return {
     store,
     writes,
@@ -40,10 +31,6 @@ function installStorage(initial: Record<string, string> = {}) {
       failWritesTo = key;
     },
     json: (key: string) => JSON.parse(store.get(key) ?? "null"),
-    fromOtherWindow: (key: string, value: string) => {
-      store.set(key, value);
-      for (const listener of storageListeners) listener({ key } as StorageEvent);
-    },
   };
 }
 
@@ -191,7 +178,10 @@ describe("theme library and slots store", () => {
     const listener = vi.fn();
     store.subscribeThemes(listener);
     const revision = store.getThemeRevision();
-    storage.fromOtherWindow(LIBRARY_KEY, JSON.stringify([custom("remote", "dark")]));
+    storage.store.set(LIBRARY_KEY, JSON.stringify([custom("remote", "dark")]));
+    store.handleThemesStorageEvent({ key: "unrelated" });
+    expect(listener).not.toHaveBeenCalled();
+    store.handleThemesStorageEvent({ key: LIBRARY_KEY });
     expect(listener).toHaveBeenCalled();
     expect(store.getThemeRevision()).toBeGreaterThan(revision);
     expect(store.getThemesSnapshot()).not.toBe(before);
