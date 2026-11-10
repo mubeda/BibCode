@@ -218,6 +218,19 @@ describe("AppearanceSettingsPanel", () => {
     expect(toastAdd).not.toHaveBeenCalled();
   });
 
+  it("clicking a light theme in Dark mode switches to Light, and a newer choice closes the older Undo", async () => {
+    window.localStorage.setItem("bibcode:theme", "dark");
+    await mount();
+    await click(select("verdant-light"));
+    expect(mode()).toBe("light");
+    expect(readSlots().light).toBe("verdant-light");
+    expect(showsDark()).toBe(false);
+    expect(toastClose).not.toHaveBeenCalled();
+
+    await click(button("Dark"));
+    expect(toastClose).toHaveBeenCalledWith("toast-1");
+  });
+
   it("a secondary action runs without applying the row's theme", async () => {
     await mount();
     await menuAction("Tokyo Night", "Duplicate");

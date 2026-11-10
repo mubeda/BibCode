@@ -192,6 +192,7 @@ export function AppearanceSettingsPanel() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const returnFocusTo = useRef<string | null>(null);
+  const undoToastId = useRef<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const existingIds = new Set(themes.map((theme) => theme.id));
 
@@ -221,21 +222,27 @@ export function AppearanceSettingsPanel() {
     );
   }
 
+  // An Undo only reverts the latest choice, so a newer choice closes the older offer.
+  const dismissUndo = () => {
+    if (undoToastId.current !== null) toastManager.close(undoToastId.current);
+    undoToastId.current = null;
+  };
   // R40: a row puts its theme in its base's slot and shows it, switching the mode if needed.
   const apply = (theme: ThemeFile) => {
+    dismissUndo();
     const previous = { mode, slot: slots[theme.base] };
     const result = setSlot(theme.base, theme.id);
     if (!result.ok) return setActionError("Could not save the theme choice.");
     setActionError(null);
     if (theme.base === resolvedTheme) return;
     setTheme(theme.base);
-    const toastId = toastManager.add({
+    undoToastId.current = toastManager.add({
       type: "info",
       title: `Switched to ${theme.base} mode to show ${theme.name}`,
       actionProps: {
         children: "Undo",
         onClick: () => {
-          toastManager.close(toastId);
+          dismissUndo();
           setSlot(theme.base, previous.slot);
           setTheme(previous.mode);
         },
@@ -270,7 +277,10 @@ export function AppearanceSettingsPanel() {
                   size="sm"
                   variant={mode === option.value ? "secondary" : "ghost"}
                   aria-pressed={mode === option.value}
-                  onClick={() => setTheme(option.value)}
+                  onClick={() => {
+                    dismissUndo();
+                    setTheme(option.value);
+                  }}
                 >
                   {option.label}
                 </Button>
