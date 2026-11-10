@@ -353,7 +353,14 @@ WHILE a stacked action for a worktree has finished its local writes and is waiti
 
 - GIVEN a worktree whose pull-request lookup (`gh` or `glab`) does not answer for longer than 10 seconds
 - WHEN status is refreshed
-- THEN the refresh answers with current local status within a few seconds, without the pull-request details, and subscribers receive the pull-request details on the status stream once the lookup finishes
+- THEN the refresh answers with current local status within a few seconds, and subscribers receive the lookup's result on the status stream once it finishes
+
+#### Scenario: the pull request a subscriber sees (amendment A7)
+
+- GIVEN a subscriber that shows a pull request for the current ref
+- WHEN a lookup for the same ref is still running, fails or is cancelled, or a status event with an equal or newer local status arrives, THEN the subscriber keeps showing that pull request
+- WHEN the lookup ends with an open request, THEN the subscriber shows it; WHEN it ends with no open request, THEN the subscriber clears it; WHEN the ref changes, THEN the subscriber clears it at once
+- AND a lookup result that arrives across a status epoch change is still delivered once
 
 ### R19. Status is delivered during Git Manager push-family operations [Must]
 
