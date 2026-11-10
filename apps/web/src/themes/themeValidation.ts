@@ -11,6 +11,8 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 
+import { parseColor } from "./themeColor";
+
 export const MAX_THEME_FILE_BYTES = 16 * 1024;
 export const MAX_CUSTOM_THEMES = 64;
 const MAX_COLOR_LENGTH = 64;
@@ -22,25 +24,21 @@ export type ThemeValidationResult =
   | { ok: false; errors: ThemeFieldError[] };
 
 const DENIED_COLOR_TEXT = /url\(|var\(|expression\(|[;{}<\\]/i;
-const HEX_COLOR = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
-const ARG = String.raw`[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:%|deg)?`;
-const MODERN_COLOR_FUNCTION = new RegExp(
-  String.raw`^(?:rgba?|hsla?|oklch)\(\s*${ARG}\s+${ARG}\s+${ARG}(?:\s*\/\s*${ARG})?\s*\)$`,
-  "i",
-);
-const LEGACY_COLOR_FUNCTION = new RegExp(
-  String.raw`^(?:rgba?|hsla?)\(\s*${ARG}\s*,\s*${ARG}\s*,\s*${ARG}(?:\s*,\s*${ARG})?\s*\)$`,
-  "i",
-);
 
-/** A hex color, `rgb()`, `hsl()` or `oklch()` with numeric arguments (plan decision P16). */
+/**
+ * A hex color, `rgb()`, `hsl()` or `oklch()` with numeric arguments (plan decision P16). The
+ * grammar is `parseColor`'s, so validation, contrast and the paint record read colors alike.
+ */
 export function isSafeCssColor(value: string): boolean {
-  if (value.length === 0 || value.length > MAX_COLOR_LENGTH || DENIED_COLOR_TEXT.test(value)) {
+  if (
+    value.length === 0 ||
+    value.length > MAX_COLOR_LENGTH ||
+    value !== value.trim() ||
+    DENIED_COLOR_TEXT.test(value)
+  ) {
     return false;
   }
-  return (
-    HEX_COLOR.test(value) || MODERN_COLOR_FUNCTION.test(value) || LEGACY_COLOR_FUNCTION.test(value)
-  );
+  return parseColor(value) !== null;
 }
 
 /** Allowed ranges in px; a rem is 16px. */
