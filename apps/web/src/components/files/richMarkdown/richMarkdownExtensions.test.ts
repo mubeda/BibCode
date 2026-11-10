@@ -108,6 +108,90 @@ describe("createRichMarkdownEditor", () => {
     });
   });
 
+  it("inserting a block at any boundary of any level keeps every untouched block's bytes", () => {
+    const table = "| a | b |\n|:--|--:|\n| one   |  two |\n| three | four |\n";
+    const quote = (text: string) => text.replace(/^(?=.)/gm, "> ");
+    const cases = [
+      ...supported,
+      ["tableBeforeParagraph", `${table}\nAfter.\n`],
+      ["crlfTable", `${table}\nAfter.\n`.replaceAll("\n", "\r\n")],
+      ["quotedTable", `${quote(table)}\nAfter.\n`],
+      ["tableInDetails", `<details>\n<summary>More</summary>\n\n${table}\n</details>\n\nAfter.\n`],
+    ] as const;
+    const containers = new Set([
+      "table",
+      "bulletList",
+      "orderedList",
+      "taskList",
+      "blockquote",
+      "detailsContent",
+    ]);
+    /** Every block the reconcile copies whole, plus list items, in document order. */
+    const untouchedBlocks = (original: string) => {
+      const blocks: string[] = [];
+      const visit = (node: Nodes) => {
+        const isLeaf = !["root", "list", "blockquote", "table"].includes(node.type);
+        if (isLeaf && node.position) {
+          blocks.push(original.slice(node.position.start.offset, node.position.end.offset));
+        }
+        if (node.type !== "listItem" && isLeaf) return;
+        if ("children" in node) node.children.forEach(visit);
+      };
+      visit(processor.parse(original));
+      return blocks;
+    };
+    const failures: string[] = [];
+    let insertions = 0;
+    for (const [name, original] of cases) {
+      const boundaries: { at: number; parent: number; index: number }[] = [];
+      const { tiptap: probe } = open(original);
+      expect(canReconcile({ original, before: probe.getMarkdown() }), name).toBe(true);
+      const collect = (node: typeof probe.state.doc, at: number, parent: number) => {
+        node.forEach((_child, offset, index) =>
+          boundaries.push({ at: at + offset, parent, index }),
+        );
+        boundaries.push({ at: at + node.content.size, parent, index: node.childCount });
+      };
+      collect(probe.state.doc, 0, -1);
+      probe.state.doc.descendants((node, pos) => {
+        // An empty details body is one leaf for the reconcile, not a level it recurses into.
+        if (containers.has(node.type.name) && node.textContent !== "") collect(node, pos + 1, pos);
+      });
+
+      for (const { at, parent, index } of boundaries) {
+        const { editor, tiptap } = open(original);
+        const before = editor.serialize();
+        const { schema, doc } = tiptap.state;
+        const container = parent < 0 ? doc : doc.nodeAt(parent)!;
+        const text = () => schema.nodes.paragraph!.create(null, schema.text("Inserted"));
+        const neighbour = container.child(Math.max(0, index - 1));
+        const inserted =
+          container.type.name === "table"
+            ? neighbour.type.create(
+                null,
+                neighbour.content.content.map((cell) => cell.type.create(cell.attrs, text())),
+              )
+            : container.type.name.endsWith("List")
+              ? neighbour.type.create(null, text())
+              : text();
+        tiptap.view.dispatch(tiptap.state.tr.insert(at, inserted));
+        const result = reconcileMarkdown({ original, before, after: editor.serialize() });
+        const where = `${name} at ${container.type.name} ${index}`;
+
+        if (!result.includes("Inserted")) failures.push(`${where} lost the inserted block`);
+        let cursor = 0;
+        for (const block of untouchedBlocks(original)) {
+          const found = result.indexOf(block, cursor);
+          if (found < 0) failures.push(`${where} changed ${JSON.stringify(block)}`);
+          else cursor = found;
+        }
+        insertions += 1;
+      }
+    }
+    expect(failures).toEqual([]);
+    expect(insertions).toBe(94);
+  });
+
   it("a ticked task checkbox changes only that item's marker, and Undo reverses it", () => {
     const original = "-   [ ] Keep\n- [ ] Other\n";
     const { editor, element } = open(original);
