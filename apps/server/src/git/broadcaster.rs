@@ -6567,6 +6567,83 @@ mod tests {
         broadcaster.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn an_equal_status_is_published_once_under_each_new_epoch() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let (local, remote) = {
+            let state = broadcaster.lock_state();
+            let entry = state.repositories.get(&cwd).expect("repository entry");
+            (
+                entry.local.clone(),
+                entry.remote.clone().flatten().expect("cached remote"),
+            )
+        };
+        let advance_epoch = || async {
+            broadcaster.begin_mutation(&cwd).await.finish().await;
+            broadcaster
+                .acquire_read_fence(&cwd, &CancellationToken::new())
+                .await
+                .expect("read fence")
+        };
+
+        let fence = broadcaster
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("read fence");
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "an equal status under the same epoch"
+        );
+
+        let fence = advance_epoch().await;
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("an equal status under a new epoch")
+                .value,
+            VcsStatusStreamEvent::LocalUpdated {
+                local: local.clone()
+            }
+        );
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "published twice under one epoch"
+        );
+
+        let fence = advance_epoch().await;
+        let status = VcsStatusResult {
+            local: local.clone(),
+            remote: remote.clone(),
+        };
+        broadcaster.publish_status(&cwd, &status, &fence);
+        assert!(
+            matches!(
+                events
+                    .try_recv()
+                    .expect("an equal snapshot under a new epoch")
+                    .value,
+                VcsStatusStreamEvent::Snapshot { .. }
+            ),
+            "the refresh path republishes too"
+        );
+        broadcaster.publish_status(&cwd, &status, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "a snapshot twice under one epoch"
+        );
+        broadcaster.shutdown().await;
+    }
+
     fn record_availability_nudges(broadcaster: &StatusBroadcaster) -> Arc<Mutex<Vec<PathBuf>>> {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed_calls = Arc::clone(&calls);
