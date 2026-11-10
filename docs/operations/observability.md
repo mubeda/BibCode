@@ -90,7 +90,9 @@ and the lock stays. At shutdown the server refuses
 new Git writes and stops the running ones this way before the Profiler's
 teardown. If a write is still stopping after the wait, it writes `Git writes
 were still stopping at shutdown` (`error`) with the count, waits once more, and
-reports the shutdown as incomplete if one is still pending. If every write has
+reports the shutdown as incomplete if one is still pending. The Profiler's
+session then stays open, and a later shutdown request waits for those writes
+again and ends the session only once they have stopped. If every write has
 stopped but a lock could not be deleted, it writes `leftover index.lock files
 could not be removed` (`error`) with the count and reports the shutdown as
 incomplete.

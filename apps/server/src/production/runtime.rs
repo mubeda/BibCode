@@ -151,7 +151,17 @@ pub struct ProductionRuntime {
     _resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
     profiler: Arc<ProfilerRuntime>,
-    update_quiesced: tokio::sync::Mutex<bool>,
+    update_quiesced: tokio::sync::Mutex<Quiescence>,
+}
+
+/// How far [`ProductionRuntime::quiesce_for_update`] got.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Quiescence {
+    Running,
+    /// Every service stopped except Git writes that outlasted both waits; the Profiler still
+    /// runs.
+    GitWritesPending,
+    Done,
 }
 
 pub fn finalize_rpc_registry(
@@ -833,7 +843,7 @@ impl ProductionRuntime {
             _resource_sampler: resource_sampler,
             process_monitor,
             profiler,
-            update_quiesced: tokio::sync::Mutex::new(false),
+            update_quiesced: tokio::sync::Mutex::new(Quiescence::Running),
         })
     }
 
@@ -965,8 +975,27 @@ impl ProductionRuntime {
 
     pub async fn quiesce_for_update(&self) -> Result<(), String> {
         let mut quiesced = self.update_quiesced.lock().await;
-        if *quiesced {
-            return Ok(());
+        match *quiesced {
+            Quiescence::Done => return Ok(()),
+            // Only the Git writes are left: the services above them stopped on the first call.
+            Quiescence::GitWritesPending => {
+                let locks = match self.git_repository.stop_writes().await {
+                    Ok(locks) => locks,
+                    Err(pending) => {
+                        tracing::error!(pending, "Git writes were still stopping at shutdown");
+                        return Err(format!("{pending} Git writes had not stopped"));
+                    }
+                };
+                self.profiler.end_session().await;
+                *quiesced = Quiescence::Done;
+                return match locks {
+                    0 => Ok(()),
+                    locks => Err(format!(
+                        "{locks} leftover Git index locks could not be removed"
+                    )),
+                };
+            }
+            Quiescence::Running => {}
         }
         // Each step is timed, so a slow stop names the step that took the time (#303).
         let mut steps = StopSteps::start("quiesce");
@@ -1082,11 +1111,17 @@ impl ProductionRuntime {
         steps.mark("orchestration");
         // Recorded while the profiler still runs; its own teardown below is logged only.
         steps.emit();
+        if writes.is_err() {
+            // The Profiler keeps running, so a later call can still record the writes' end. A
+            // stop that never completes reads as an incomplete shutdown on the next start.
+            *quiesced = Quiescence::GitWritesPending;
+            return Err(first_error.unwrap_or_default());
+        }
         // Last, so the events and panics of every other service's shutdown are recorded, and a
         // crash anywhere in the shutdown still reads as a crash on the next start.
         self.profiler.end_session().await;
         steps.mark("profiler-end-session");
-        *quiesced = true;
+        *quiesced = Quiescence::Done;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
