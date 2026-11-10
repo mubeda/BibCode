@@ -2802,12 +2802,202 @@ async fn a_real_commit_survives_a_held_and_failed_push() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_failed_push_leaves_subscribers_with_the_clean_status() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("a_failed_push_leaves_subscribers_with_the_clean_status") {
+        return;
+    }
+
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    run_git(&repository, &["config", "--global", "http.proxy", ""]);
+    initialize_repository(&repository);
+    commit_file(repository.path(), "base.txt", "base\n", "test: base");
+    let (remote, url) = stalled_http_remote().await;
+    run_git(&repository, &["remote", "add", "origin", &url]);
+    fs::write(repository.path().join("dirty.txt"), "dirty\n").expect("write dirty change");
+    let cwd = repository.path().to_string_lossy().into_owned();
+
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+    request(
+        server.socket(),
+        "9",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let snapshot = next_server_message_for(server.socket(), "the subscription snapshot").await;
+    assert!(
+        matches!(&snapshot, ServerMessage::Chunk { request_id, .. } if request_id.as_str() == "9"),
+        "{snapshot:?}"
+    );
+
+    // The snapshot stays unacknowledged, so the next 8 dirty states fill the stream's
+    // channel and the ones after wait in the stream task, as behind a slow client.
+    let mut ignored = Vec::new();
+    for index in 0..10 {
+        fs::write(
+            repository.path().join(format!("dirty-{index}.txt")),
+            "dirty\n",
+        )
+        .expect("write another dirty change");
+        let id = (100 + index).to_string();
+        request(
+            server.socket(),
+            &id,
+            "vcs.refreshStatus",
+            json!({ "cwd": cwd }),
+        )
+        .await;
+        let deadline = Instant::now() + GIT_STATUS_INTEGRATION_DEADLINE;
+        loop {
+            if let ServerMessage::Exit { request_id, exit } = pump_server_message_holding(
+                server.socket(),
+                deadline,
+                "a dirty status refresh",
+                &mut ignored,
+                Some("9"),
+            )
+            .await
+                && request_id.as_str() == id
+            {
+                assert!(matches!(exit, RpcExit::Success { .. }), "{exit:?}");
+                break;
+            }
+        }
+    }
+
+    request(
+        server.socket(),
+        "1",
+        "git.runStackedAction",
+        json!({
+            "actionId": "failed-push",
+            "cwd": cwd,
+            "action": "commit_push",
+            "commitMessage": "test: failed push",
+        }),
+    )
+    .await;
+    let connection = accept_git(&remote).await;
+    request(
+        server.socket(),
+        "2",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let mut action_events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match pump_server_message_holding(
+            server.socket(),
+            deadline,
+            "a status refresh while the push is held",
+            &mut action_events,
+            Some("9"),
+        )
+        .await
+        {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { value },
+            } if request_id.as_str() == "2" => break value.unwrap_or(Value::Null),
+            ServerMessage::Exit { request_id, exit } => {
+                panic!("request {request_id:?} ended while the push was held: {exit:?}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(
+        status["hasWorkingTreeChanges"], false,
+        "the clean status is in the broadcaster cache: {status}"
+    );
+
+    drop(connection);
+    drop(remote);
+    let deadline = Instant::now() + STACKED_ACTION_COMPLETION_INTEGRATION_DEADLINE;
+    loop {
+        if let ServerMessage::Exit { request_id, .. } = pump_server_message_holding(
+            server.socket(),
+            deadline,
+            "the failed push ending the action",
+            &mut action_events,
+            Some("9"),
+        )
+        .await
+            && request_id.as_str() == "1"
+        {
+            break;
+        }
+    }
+    assert!(
+        action_events
+            .iter()
+            .any(|event| event["kind"] == "action_failed" && event["phase"] == "push"),
+        "the push failed: {action_events:?}"
+    );
+    // Time for the settle-time trailing read to finish before forwarding resumes.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    send_json(server.socket(), json!({ "_tag": "Ack", "requestId": "9" })).await;
+    let mut status_events = Vec::new();
+    let latest_has_changes = |events: &[Value]| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| event.get("local"))
+            .map(|local| local["hasWorkingTreeChanges"].clone())
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while latest_has_changes(&status_events) != Some(Value::Bool(false)) {
+        if Instant::now() >= deadline {
+            let delivered = status_events
+                .iter()
+                .filter_map(|event| event.get("local"))
+                .map(|local| local["hasWorkingTreeChanges"].clone())
+                .collect::<Vec<_>>();
+            panic!(
+                "the subscriber kept the dirty status after the failed push; \
+                 hasWorkingTreeChanges per delivered local status: {delivered:?}"
+            );
+        }
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            timeout_at(deadline, next_frame_past_heartbeat(server.socket())).await
+            && let Ok(ServerMessage::Chunk { request_id, values }) =
+                serde_json::from_str::<ServerMessage>(&text)
+        {
+            status_events.extend(values);
+            send_json(
+                server.socket(),
+                json!({ "_tag": "Ack", "requestId": request_id.as_str() }),
+            )
+            .await;
+        }
+    }
+
+    server.shutdown().await;
+}
+
 /// Reads one message, acknowledging a stream chunk and keeping its values.
 async fn pump_server_message(
     socket: &mut TestSocket,
     deadline: Instant,
     context: &str,
     chunks: &mut Vec<Value>,
+) -> ServerMessage {
+    pump_server_message_holding(socket, deadline, context, chunks, None).await
+}
+
+/// Like `pump_server_message`, but a chunk of the `held` stream must not arrive, because
+/// its previous chunk is left unacknowledged.
+async fn pump_server_message_holding(
+    socket: &mut TestSocket,
+    deadline: Instant,
+    context: &str,
+    chunks: &mut Vec<Value>,
+    held: Option<&str>,
 ) -> ServerMessage {
     let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
         .await
@@ -2819,6 +3009,11 @@ async fn pump_server_message(
     };
     let message: ServerMessage = serde_json::from_str(&text).expect("valid server RPC message");
     if let ServerMessage::Chunk { request_id, values } = &message {
+        assert_ne!(
+            Some(request_id.as_str()),
+            held,
+            "{context}: the held stream sent a chunk before its Ack"
+        );
         chunks.extend(values.iter().cloned());
         send_json(
             socket,
