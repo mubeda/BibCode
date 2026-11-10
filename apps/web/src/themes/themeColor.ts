@@ -142,6 +142,13 @@ function parseOrThrow(value: string): Rgba {
   return color;
 }
 
+/** `top` painted over `bottom` (made opaque first), as opaque hex. */
+export function compositeHex(top: string, bottom: string): string {
+  return formatHex(over(parseOrThrow(top), over(parseOrThrow(bottom), WHITE)));
+}
+
+const WHITE: Rgba = { r: 255, g: 255, b: 255, a: 1 };
+
 function over(top: Rgba, bottom: Rgba): Rgba {
   return {
     r: top.r * top.a + bottom.r * (1 - top.a),
