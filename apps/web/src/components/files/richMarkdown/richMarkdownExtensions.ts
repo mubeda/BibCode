@@ -42,6 +42,12 @@ export type RichMarkdownEditor = {
   isActive(name: FormatName): boolean;
   run(command: FormatCommand): void;
   subscribe(listener: () => void): () => void;
+  /** The link under the caret or selection, or null. */
+  currentLink(): { href: string } | null;
+  /** Links the selection, or inserts `href` as linked text when nothing is selected. */
+  setLink(href: string): void;
+  /** Removes the link under the caret and keeps its text. */
+  removeLink(): void;
   serialize(): string;
   destroy(): void;
 };
@@ -202,6 +208,20 @@ export function createRichMarkdownEditor(input: {
     subscribe: (listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    currentLink: () =>
+      editor.isActive("link") ? { href: String(editor.getAttributes("link")["href"] ?? "") } : null,
+    setLink: (href) => {
+      const chain = editor.chain().focus();
+      if (editor.isActive("link")) chain.extendMarkRange("link").setLink({ href }).run();
+      else if (editor.state.selection.empty) {
+        chain
+          .insertContent({ type: "text", text: href, marks: [{ type: "link", attrs: { href } }] })
+          .run();
+      } else chain.setLink({ href }).run();
+    },
+    removeLink: () => {
+      editor.chain().focus().extendMarkRange("link").unsetLink().run();
     },
     serialize: () => editor.getMarkdown(),
     destroy: () => {

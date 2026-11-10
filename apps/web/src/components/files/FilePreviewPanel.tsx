@@ -82,6 +82,7 @@ import { LocalCommentAnnotation } from "./LocalCommentAnnotation";
 import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
 import { RichMarkdownFormatGroup } from "./richMarkdown/RichMarkdownFormatGroup";
+import { RichMarkdownLinkPopover } from "./richMarkdown/RichMarkdownLinkPopover";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
 import {
@@ -909,6 +910,7 @@ export default function FilePreviewPanel({
   );
   const richEditable = richMode?.editable === true && richEditor !== null;
   const activeRichEditor = renderMarkdown && richEditable ? (richEditor ?? null) : null;
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
   useSyncExternalStore(
     activeRichEditor?.subscribe ?? subscribeUnavailable,
     () => (activeRichEditor ? `${activeRichEditor.canUndo}:${activeRichEditor.canRedo}` : ""),
@@ -1085,7 +1087,7 @@ export default function FilePreviewPanel({
             isMarkdown ? (
               <RichMarkdownFormatGroup
                 editor={activeRichEditor}
-                onLink={() => {}}
+                onLink={() => setLinkDialogOpen(true)}
                 onImage={() => {}}
               />
             ) : undefined
@@ -1125,6 +1127,9 @@ export default function FilePreviewPanel({
           onUndo={() => (activeRichEditor ? activeRichEditor.undo() : session?.undo())}
           onRedo={() => (activeRichEditor ? activeRichEditor.redo() : session?.redo())}
         />
+      ) : null}
+      {activeRichEditor && linkDialogOpen ? (
+        <RichMarkdownLinkPopover editor={activeRichEditor} open onOpenChange={setLinkDialogOpen} />
       ) : null}
       {session && diskConflict ? (
         <FileDiskConflictBar
