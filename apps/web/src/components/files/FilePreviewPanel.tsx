@@ -724,6 +724,8 @@ function RichMarkdownFormatting({
 
 const READ_ONLY_MARKDOWN_NOTICE =
   "This file uses Markdown that the editor cannot change safely. Edit it in source view.";
+const TOO_LARGE_MARKDOWN_NOTICE =
+  "This file is too large to edit in rendered view. Edit it in source view.";
 
 function RenderedMarkdownSurface({
   session,
@@ -1205,7 +1207,11 @@ export default function FilePreviewPanel({
                   cwd={cwd}
                   threadRef={threadRef}
                   contents={file.data.contents}
-                  notice={READ_ONLY_MARKDOWN_NOTICE}
+                  notice={
+                    richMode?.editable === false && richMode.reason === "too-large"
+                      ? TOO_LARGE_MARKDOWN_NOTICE
+                      : READ_ONLY_MARKDOWN_NOTICE
+                  }
                 />
               )
             ) : truncatedPreview ? (

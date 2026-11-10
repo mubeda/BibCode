@@ -277,7 +277,8 @@ fixture to mark unsupported.
 
 A read-only rendered view keeps today's checkbox path (`setMarkdownTaskChecked` and
 `changeOutsideEditor`), shows "This file uses Markdown that the editor cannot change
-safely. Edit it in source view." above the text, and passes `editor: null` to the
+safely. Edit it in source view." above the text (for reason `"too-large"` the notice is
+"This file is too large to edit in rendered view. Edit it in source view."), and passes `editor: null` to the
 formatting group. That path still discards the source history, as it does today (R34
 "read-only as today"). Making it keep the history is a follow-up, listed under Risks.
 
@@ -599,3 +600,6 @@ was reproduced as a failing test before the fix.
   `&copy;`, a link around an image or an angle-bracket link target still fails
   `canReconcile`, and the surface reports no editor for it. The tests fail when the block key
   comparison is removed.
+- Coordinator check 3, a file refused only for its size showed the notice about Markdown the
+  editor cannot change. Fixed: reason `"too-large"` shows "This file is too large to edit in
+  rendered view. Edit it in source view."

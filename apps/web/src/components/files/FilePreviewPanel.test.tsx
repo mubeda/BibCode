@@ -2397,12 +2397,15 @@ describe("rich markdown editing", () => {
     expect(changeFromRichEditor).not.toHaveBeenCalled();
   });
 
-  it("a Markdown file of 129 KiB renders read-only with the notice and creates no rich editor", async () => {
+  it("a Markdown file of 129 KiB renders read-only with the size notice and creates no rich editor", async () => {
     const { markup } = await renderRich(`# Big\n\n${"a".repeat(129 * 1024)}\n`, undefined);
 
     expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
     expect(ui.filter("ChatMarkdown")).toHaveLength(1);
-    expect(markup).toContain(readOnlyNotice);
+    expect(markup).toContain(
+      "This file is too large to edit in rendered view. Edit it in source view.",
+    );
+    expect(markup).not.toContain(readOnlyNotice);
   });
 
   it("a file the editor refused opens editable again once a source edit repairs it", async () => {
