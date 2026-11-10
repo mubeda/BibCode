@@ -52,6 +52,9 @@ use super::git_manager_rpc::credential_prompt;
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
+/// How long `vcs.refreshStatus` waits for the pull-request lookup, well under the 10 second
+/// hang budget. A slower lookup keeps running and reaches the status streams when it ends.
+const REFRESH_PULL_REQUEST_LOOKUP_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub(crate) struct WorktreeRemovalTaskTracker {
@@ -886,17 +889,45 @@ impl GitVcsRpcServices {
                     .await
                     .map_err(serialize_error)?;
                 let fence = publication.fence;
-                let mut status = publication.value;
+                let status = publication.value;
+                // Its own task, so the lookup outlives a refresh that stops waiting for it at
+                // the bound. Until then a cancelled or dropped refresh still cancels it.
+                let lookup_cancellation = CancellationToken::new();
+                let lookup_guard = lookup_cancellation.clone().drop_guard();
+                let mut lookup = tokio::spawn({
+                    let pull_requests = self.pull_requests.clone();
+                    let cwd = input.cwd.clone();
+                    let mut status = status.clone();
+                    async move {
+                        enrich_remote_pull_request(
+                            &pull_requests,
+                            &cwd,
+                            &status.local,
+                            &mut status.remote,
+                            &lookup_cancellation,
+                        )
+                        .await;
+                        status
+                    }
+                });
                 let status = finish_fenced_enrichment(&self.broadcaster, fence, async {
-                    enrich_remote_pull_request(
-                        &self.pull_requests,
-                        &input.cwd,
-                        &status.local,
-                        &mut status.remote,
-                        &cancellation,
-                    )
-                    .await;
-                    status
+                    tokio::select! {
+                        () = cancellation.cancelled() => status,
+                        enriched = &mut lookup => enriched.unwrap_or(status),
+                        () = tokio::time::sleep(REFRESH_PULL_REQUEST_LOOKUP_BOUND) => {
+                            lookup_guard.disarm();
+                            let broadcaster = self.broadcaster.clone();
+                            let cwd = input.cwd.clone();
+                            tokio::spawn(async move {
+                                // The finished lookup is remembered, so each status stream
+                                // reads it at once when the remote is published again.
+                                if lookup.await.is_ok_and(|enriched| enriched.remote.pr.is_some()) {
+                                    broadcaster.notify_pull_request_change(&cwd).await;
+                                }
+                            });
+                            status
+                        }
+                    }
                 })
                 .await
                 .map_err(serialize_error)?;
@@ -8232,7 +8263,7 @@ esac
     async fn concurrent_refreshes_share_one_forge_lookup() {
         let fixture = Fixture::new("pr-lookup-coalesce");
         fixture.set("open", "");
-        fixture.set("slow", "1");
+        fixture.set("slow", "0.5");
         let (first, second, third) =
             tokio::join!(fixture.refresh(), fixture.refresh(), fixture.refresh());
         for status in [first, second, third] {

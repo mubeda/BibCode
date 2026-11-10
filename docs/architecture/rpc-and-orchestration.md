@@ -656,9 +656,12 @@ Creating a request through the service, every finished Git Manager or VCS
 mutation (pushes included), and every reported local change such as a terminal
 command exiting forget that worktree's entries; a run in flight across such an
 invalidation still answers its waiters but is not stored. At most 64 entries
-are held. `vcs.refreshStatus` keeps its contract and still waits for the
-lookup when nothing current is held, so a refresh more than 10 seconds after
-the last lookup pays one provider round trip. The passive summary, the
+are held. When nothing current is held, `vcs.refreshStatus` waits for the
+lookup for at most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). A slower
+lookup keeps running in its own task, and the refresh answers with local and
+remote status without the pull request. If that lookup then finds an open
+request, the server calls `notify_pull_request_change`, so each status stream
+reads the remembered answer and publishes the request. The passive summary, the
 pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 
