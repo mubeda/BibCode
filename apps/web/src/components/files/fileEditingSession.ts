@@ -305,12 +305,13 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
   }
 
   async flush(): Promise<FileSaveFlushResult> {
-    this.deliverPendingEdit();
+    // An edit that could not be delivered is not saved, so the caller must not treat it as such.
+    if (!this.deliverPendingEdit()) return "failed";
     return this.coordinator.flush();
   }
 
   async settle(): Promise<FileSaveSettleResult> {
-    this.deliverPendingEdit();
+    if (!this.deliverPendingEdit()) return "failed";
     return this.coordinator.settle();
   }
 
@@ -347,12 +348,23 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     this.publish();
   }
 
-  private deliverPendingEdit(): void {
+  /**
+   * Delivers an edit still waiting on the rendered view's debounce. Returns false when the
+   * delivery threw: the flusher stays registered, so the edit stays unsaved and a later call
+   * retries it.
+   */
+  private deliverPendingEdit(): boolean {
     const flush = this.pendingEditFlusher;
-    if (flush === null || this.disposed) return;
-    this.pendingEditFlusher = null;
-    flush();
+    if (flush === null || this.disposed) return true;
+    try {
+      flush();
+    } catch (error) {
+      console.error("[file-editing-session] delivering a rendered edit failed", error);
+      return false;
+    }
+    if (this.pendingEditFlusher === flush) this.pendingEditFlusher = null;
     this.publish();
+    return true;
   }
 
   private applyClosedRichVisits(): void {
@@ -445,8 +457,9 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * (no versions, a save in flight, or saving paused by a rename or delete in progress).
    */
   beginDiskCheck(): number | null {
-    // An edit still waiting must count as unsaved, so a disk change becomes a conflict.
-    this.deliverPendingEdit();
+    // An edit still waiting must count as unsaved, so a disk change becomes a conflict. One
+    // that cannot be delivered blocks the check, so no disk result replaces it.
+    if (!this.deliverPendingEdit()) return null;
     return this.canReconcile() ? this.saveGeneration : null;
   }
 
@@ -457,8 +470,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    */
   reconcileVersion(token: number, disk: ProjectFileVersion): "settled" | "read" | "stale" {
     // An edit that started waiting after the check began must also count as unsaved.
-    this.deliverPendingEdit();
-    if (!this.isCurrentCheck(token)) return "stale";
+    if (!this.deliverPendingEdit() || !this.isCurrentCheck(token)) return "stale";
     const base = this.base!;
     switch (disk._tag) {
       case "missing":
@@ -499,8 +511,9 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
 
   /** Reconciles with a disk read made for the check that `token` started. */
   reconcileRead(token: number, read: FileDiskRead): void {
-    this.deliverPendingEdit();
-    if (!this.isCurrentCheck(token) || read.version === undefined) return;
+    if (!this.deliverPendingEdit() || !this.isCurrentCheck(token) || read.version === undefined) {
+      return;
+    }
     const disk = { kind: "present", version: read.version, contents: read.contents } as const;
     if (read.contents === this.localText()) {
       // Our own save, or the same edit made elsewhere.
@@ -521,7 +534,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * source editor attached the reload is one undo step, so Undo brings the edits back.
    */
   reloadFromDisk(): void {
-    this.deliverPendingEdit();
+    if (!this.deliverPendingEdit()) return;
     const disk = this.conflict?.disk;
     if (this.disposed || disk == null) return;
     if (disk.kind === "present") this.applyDiskText(disk);
@@ -530,7 +543,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
 
   /** Resolves a conflict by saving the document over the disk state the user was shown. */
   overwriteDisk(): void {
-    this.deliverPendingEdit();
+    if (!this.deliverPendingEdit()) return;
     const disk = this.conflict?.disk;
     if (this.disposed || this.conflict === null) return;
     if (disk == null) {

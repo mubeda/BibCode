@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { FileEditingSession } from "../fileEditingSession";
-import { canReconcile, reconcileMarkdown } from "./markdownReconcile";
+import { canReconcile, detectDominantEol, reconcileMarkdown } from "./markdownReconcile";
 import { splitFrontmatter } from "./markdownSupport";
 import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
 import "./richMarkdown.css";
@@ -41,28 +41,31 @@ export default function RichMarkdownSurface({
     const element = editorRef.current;
     if (!element) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    // True from an edit until it is delivered, so an edit whose delivery threw stays unsaved.
+    let waiting = false;
     let delivered = opened.source;
     let before = "";
+    const send = (next: string) => {
+      waiting = false;
+      session.setPendingEditFlusher(null);
+      if (next === delivered) return;
+      delivered = next;
+      session.changeFromRichEditor(next);
+    };
     const deliver = () => {
       if (timer !== null) clearTimeout(timer);
       timer = null;
       const body = reconcileMarkdown({ original: opened.body, before, after: editor.serialize() });
-      const next = `${opened.frontmatter}${body}`;
-      if (next === delivered) return;
-      delivered = next;
-      session.changeFromRichEditor(next);
+      send(`${opened.frontmatter}${body}`);
     };
     const editor = createRichMarkdownEditor({
       body: opened.body,
       element,
       onUpdate: () => {
-        if (timer === null) session.setPendingEditFlusher(deliver);
-        else clearTimeout(timer);
-        timer = setTimeout(() => {
-          // Cleared only once delivered, so an edit that fails to deliver still shows as unsaved.
-          deliver();
-          session.setPendingEditFlusher(null);
-        }, SERIALIZE_DELAY_MS);
+        if (!waiting) session.setPendingEditFlusher(deliver);
+        waiting = true;
+        if (timer !== null) clearTimeout(timer);
+        timer = setTimeout(deliver, SERIALIZE_DELAY_MS);
       },
     });
     before = editor.serialize();
@@ -81,9 +84,17 @@ export default function RichMarkdownSurface({
       element.removeEventListener("compositionstart", startComposing);
       element.removeEventListener("compositionend", endComposing);
       session.setComposing(false);
-      if (timer !== null) {
-        session.setPendingEditFlusher(null);
-        deliver();
+      if (waiting) {
+        try {
+          deliver();
+        } catch (error) {
+          // The editor is going away: keep its whole serialization rather than lose the edit,
+          // with the body's line ending and final-newline state.
+          console.error("[rich-markdown] reconciling the last edit failed", error);
+          const eol = detectDominantEol(opened.body);
+          const text = editor.serialize().trim().replaceAll("\n", eol);
+          send(`${opened.frontmatter}${text}${opened.body.slice(opened.body.trimEnd().length)}`);
+        }
       }
       session.commitRichEdits();
       editor.destroy();

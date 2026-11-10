@@ -952,6 +952,27 @@ describe("FileEditingSession rich edits", () => {
     expect(session.documentContents).toBe("rich only\n");
   });
 
+  it("a delivery that throws is kept and retried, and flush and settle report it as failed", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const session = createSession(persist);
+    const reportError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let failures = 2;
+    session.setPendingEditFlusher(() => {
+      if (failures-- > 0) throw new Error("delivery failed");
+      session.changeFromRichEditor("retried\n");
+    });
+
+    await expect(session.flush()).resolves.toBe("failed");
+    await expect(session.settle()).resolves.toBe("failed");
+    expect(session.getSnapshot().editPending).toBe(true);
+    expect(persist).not.toHaveBeenCalled();
+    await expect(session.flush()).resolves.toBe("saved");
+    reportError.mockRestore();
+
+    expect(persist).toHaveBeenCalledWith("README.md", "retried\n", null);
+    expect(session.getSnapshot().editPending).toBe(false);
+  });
+
   it("the pending edit flusher runs before flush, settle, a view commit, a disk check, a file switch and a path mutation", async () => {
     const persist = vi.fn(async () => AsyncResult.success(undefined));
     const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();

@@ -220,7 +220,7 @@ export function canReconcile(input: { original: string; before: string }): boole
 }
 
 /** CRLF when CRLF lines are at least as many as bare LF lines (Orca's rule). */
-function detectDominantEol(text: string): "\n" | "\r\n" {
+export function detectDominantEol(text: string): "\n" | "\r\n" {
   if (!text.includes("\r")) return "\n";
   const totalLf = (text.match(/\n/g) ?? []).length;
   const crlf = (text.match(/\r\n/g) ?? []).length;

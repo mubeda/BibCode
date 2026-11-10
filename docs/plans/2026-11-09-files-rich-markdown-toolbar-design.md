@@ -307,6 +307,18 @@ The session gains three methods in `fileEditingSession.ts`.
   switch calls `flush()` and a path mutation calls `settle()`, so both deliver the edit
   without a registry change.
 
+  A failed delivery (the flusher throws) is logged and never thrown to the caller. The
+  flusher stays registered, `editPending` stays true, and the next call retries it. `flush()`
+  and `settle()` return `"failed"` without saving, so the registry keeps the session open
+  and a path mutation stops. `commitRichEdits()` and `rename()` go on with the text already
+  delivered.
+  `beginDiskCheck()` returns null, `reconcileVersion()` returns `"stale"`, `reconcileRead()`
+  applies nothing, and `reloadFromDisk()` and `overwriteDisk()` do nothing, so no disk result
+  replaces or overwrites an edit the session has not recorded. When the surface unmounts with
+  an edit still waiting, it delivers it, and if the reconcile still throws it delivers the
+  editor's whole serialization, with the original frontmatter, dominant line ending and
+  final-newline state, instead of dropping the edit.
+
 The Pierre editor is detached while rendered view is shown. `cleanUp` drops its text
 document, and `applyEdits` throws "Editor is not attached" (`editor.js:176-178` of
 `@pierre/diffs` 1.3.6). So a commit on a detached editor appends the session text to a
@@ -569,3 +581,16 @@ was reproduced as a failing test before the fix.
   Kept as it is (R34 "read-only as today", listed under Risks). The
   `FilePreviewPanel.test.tsx` case for a footnote file still asserts that the checkbox goes
   through `changeOutsideEditor` and not `changeFromRichEditor`.
+
+Codex reviewed lane C2's fixes, and the coordinator relayed the findings to lane C3. Each
+was reproduced as a failing test before the fix.
+
+- Codex review 3, item 1, an edit whose delivery threw was lost. `deliverPendingEdit` cleared
+  the flusher before calling it, so after a throw nothing retried it, and the surface's
+  cleanup delivered only while its timer was set. Typing, a failed timer delivery, Save, a fix
+  and leaving the file wrote nothing. Fixed: the session clears the flusher only after it
+  returns and logs a throw instead of passing it on. `flush()` and `settle()` return
+  `"failed"`, and the disk-check and conflict methods apply nothing, while the edit is
+  undelivered. The surface keeps a waiting flag until the
+  edit is delivered. On unmount it falls back to the editor's serialization with the body's
+  dominant line ending and final-newline state.

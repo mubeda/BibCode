@@ -271,4 +271,54 @@ describe("RichMarkdownSurface", () => {
 
     expect(session.getSnapshot().editPending).toBe(true);
   });
+
+  it("an edit whose delivery fails is still saved after Save, a fix and leaving the file", async () => {
+    const { session, persist } = createSession("Hello\n");
+    const { tiptap } = await mount(session, "Hello\n");
+    reconcile.fail = true;
+    typeAfter(tiptap!, "Hello", " world");
+    await act(async () => {
+      expect(() => vi.advanceTimersByTime(300)).toThrow("reconcile failed");
+    });
+
+    await act(async () => {
+      await expect(session.flush()).resolves.toBe("failed");
+    });
+    expect(session.getSnapshot().editPending).toBe(true);
+    reconcile.fail = false;
+    await act(async () => root.render(null));
+    await act(async () => void (await session.flush()));
+
+    expect(persist.mock.lastCall?.[1]).toBe("Hello world\n");
+  });
+
+  it("leaving the file while the reconcile still throws keeps the editor's text", async () => {
+    const source = "---\r\na: 1\r\n---\r\nOne\r\n\r\nHello\r\n";
+    const { session } = createSession(source);
+    const { tiptap } = await mount(session, source);
+    reconcile.fail = true;
+    typeAfter(tiptap!, "Hello", " world");
+
+    await act(async () => root.render(null));
+
+    expect(session.unsavedContents).toBe("---\r\na: 1\r\n---\r\nOne\r\n\r\nHello world\r\n");
+    expect(session.getSnapshot().editPending).toBe(false);
+  });
+
+  it("a disk check while delivery fails applies no result and keeps the edit", async () => {
+    const { session } = createSession("Mine\n");
+    const { tiptap } = await mount(session, "Mine\n");
+    const token = session.beginDiskCheck()!;
+    reconcile.fail = true;
+    typeAfter(tiptap!, "Mine", " edited");
+
+    expect(session.reconcileVersion(token, { _tag: "present", version: "v2" })).toBe("stale");
+    session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
+    expect(session.beginDiskCheck()).toBeNull();
+    reconcile.fail = false;
+    await act(async () => root.render(null));
+
+    expect(session.documentContents).toBe("Mine edited\n");
+    expect(session.getSnapshot().save.phase).toBe("pending");
+  });
 });
