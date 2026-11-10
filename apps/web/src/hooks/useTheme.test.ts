@@ -633,6 +633,40 @@ describe("theme slots and overrides", () => {
     expect(listener).toHaveBeenCalledTimes(4);
   });
 
+  it("a custom dark theme that sets muted and border derives the scrollbar thumb from its border and the sidebar card text from its muted-foreground, and Dark keeps today's values", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    const outlined = {
+      version: 1,
+      id: "outlined",
+      name: "Outlined",
+      base: "dark",
+      ui: { muted: "#222833", "muted-foreground": "#9aa5b8", border: "#3a4252" },
+    };
+    seed(browser, { dark: "outlined" }, [outlined, mine]);
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const style = rootStyle(browser);
+    expect(style.getPropertyValue("--scrollbar-thumb")).toBe(
+      "color-mix(in srgb, var(--border) 80%, transparent)",
+    );
+    expect(style.getPropertyValue("--scrollbar-thumb-hover")).toBe("var(--border)");
+    expect(style.getPropertyValue("--scrollbar-thumb-subtle")).toBe(
+      "color-mix(in srgb, var(--border) 60%, transparent)",
+    );
+    expect(style.getPropertyValue("--scrollbar-thumb-subtle-hover")).toBe(
+      "color-mix(in srgb, var(--border) 80%, transparent)",
+    );
+    expect(style.getPropertyValue("--sidebar-card-muted-foreground")).toBe(
+      "var(--muted-foreground)",
+    );
+
+    // A theme that leaves border and muted-foreground unset keeps the stylesheet's values.
+    store.setSlot("dark", "mine");
+    expect(customProperties(browser)).toEqual(["--primary"]);
+    store.setSlot("dark", "dark");
+    expect(customProperties(browser)).toEqual([]);
+  });
+
   it("a preview applies over the active theme and null restores the stored theme", async () => {
     const browser = installThemeBrowser({ stored: "dark" });
     seed(browser, { dark: "tokyo-night" });

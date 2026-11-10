@@ -148,3 +148,56 @@ describe("new color tokens", () => {
     }
   });
 });
+
+describe("colors outside the token set (#290, R57)", () => {
+  const thumbRules = () =>
+    [...css.matchAll(/([^{}]*::-webkit-scrollbar-thumb[^{}]*)\{([^}]*)\}/g)].map((match) => ({
+      selector: match[1]!.trim(),
+      body: match[2]!,
+    }));
+
+  it("scrollbar thumbs use the scrollbar tokens and no literal rgba remains in the scrollbar and model-picker rules", () => {
+    const rules = thumbRules();
+    expect(rules.length).toBeGreaterThan(4);
+    for (const rule of rules) expect(rule.body, rule.selector).not.toContain("rgba(");
+    const body = (selector: string) => rules.find((rule) => rule.selector === selector)?.body;
+    expect(body("::-webkit-scrollbar-thumb")).toContain("background: var(--scrollbar-thumb);");
+    expect(body("::-webkit-scrollbar-thumb:hover")).toContain(
+      "background: var(--scrollbar-thumb-hover);",
+    );
+    expect(body(".model-picker-list::-webkit-scrollbar-thumb")).toContain(
+      "background: var(--scrollbar-thumb-subtle);",
+    );
+    expect(body(".model-picker-list::-webkit-scrollbar-thumb:hover")).toContain(
+      "background: var(--scrollbar-thumb-subtle-hover);",
+    );
+  });
+
+  it("the scrollbar token defaults equal the previous literal values in the light and the dark block", () => {
+    expect(declarations(lightBlock())).toMatchObject({
+      "--scrollbar-thumb": "rgba(0, 0, 0, 0.15)",
+      "--scrollbar-thumb-hover": "rgba(0, 0, 0, 0.25)",
+      "--scrollbar-thumb-subtle": "rgba(0, 0, 0, 0.1)",
+      "--scrollbar-thumb-subtle-hover": "rgba(0, 0, 0, 0.2)",
+    });
+    expect(declarations(darkBlock())).toMatchObject({
+      "--scrollbar-thumb": "rgba(255, 255, 255, 0.1)",
+      "--scrollbar-thumb-hover": "rgba(255, 255, 255, 0.18)",
+      "--scrollbar-thumb-subtle": "rgba(255, 255, 255, 0.08)",
+      "--scrollbar-thumb-subtle-hover": "rgba(255, 255, 255, 0.15)",
+    });
+  });
+
+  it("the sidebar card rule sets muted-foreground from the sidebar-card token and the dark default is neutral-400", () => {
+    expect(css).toContain(
+      "[data-sidebar-card] {\n  --muted-foreground: var(--sidebar-card-muted-foreground);\n}",
+    );
+    expect(css).not.toContain(".dark [data-sidebar-card]");
+    expect(declarations(lightBlock())["--sidebar-card-muted-foreground"]).toBe(
+      "var(--muted-foreground)",
+    );
+    expect(declarations(darkBlock())["--sidebar-card-muted-foreground"]).toBe(
+      "var(--color-neutral-400)",
+    );
+  });
+});

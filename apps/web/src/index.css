@@ -300,6 +300,12 @@
   --find-match-foreground: var(--color-neutral-900);
   --find-match-active: var(--color-amber-500);
   --find-match-active-foreground: var(--color-neutral-950);
+  /* Not themable tokens: applyTheme derives them when a theme overrides their source (R57). */
+  --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+  --scrollbar-thumb-subtle: rgba(0, 0, 0, 0.1);
+  --scrollbar-thumb-subtle-hover: rgba(0, 0, 0, 0.2);
+  --sidebar-card-muted-foreground: var(--muted-foreground);
 
   @variant dark {
     color-scheme: dark;
@@ -342,6 +348,12 @@
     --find-match-foreground: var(--color-neutral-50);
     --find-match-active: var(--color-amber-300);
     --find-match-active-foreground: var(--color-neutral-950);
+    --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
+    --scrollbar-thumb-subtle: rgba(255, 255, 255, 0.08);
+    --scrollbar-thumb-subtle-hover: rgba(255, 255, 255, 0.15);
+    /* Brighter than the global muted grey, which falls just under 4.5:1 on the lifted card. */
+    --sidebar-card-muted-foreground: var(--color-neutral-400);
   }
 }
 
@@ -363,10 +375,9 @@
   outline-offset: 2px;
 }
 
-/* Secondary text on a dark sidebar card is brighter than the global muted grey,
-   which falls just under 4.5:1 on the lifted card surface. */
-.dark [data-sidebar-card] {
-  --muted-foreground: var(--color-neutral-400);
+/* Secondary text on a sidebar card; the dark default is brighter than the global muted grey. */
+[data-sidebar-card] {
+  --muted-foreground: var(--sidebar-card-muted-foreground);
 }
 
 body {
@@ -477,20 +488,12 @@ code {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.15);
+  background: var(--scrollbar-thumb);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.25);
-}
-
-.dark ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.dark ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--scrollbar-thumb-hover);
 }
 
 .turn-chip-strip {
@@ -1062,18 +1065,10 @@ label:has(> select#reasoning-effort) select {
 }
 
 .model-picker-list::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.1);
+  background: var(--scrollbar-thumb-subtle);
   border-radius: 2px;
 }
 
 .model-picker-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.2);
-}
-
-.dark .model-picker-list::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.dark .model-picker-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--scrollbar-thumb-subtle-hover);
 }

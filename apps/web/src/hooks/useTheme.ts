@@ -33,6 +33,30 @@ const THEME_PROPERTIES = [...UI_COLOR_TOKENS, ...UI_LENGTH_TOKENS, ...UI_KEYWORD
   (token) => `--${token}`,
 );
 
+/**
+ * Variables outside the token set that follow a theme only when it overrides their source token,
+ * so a theme that leaves the source unset keeps today's colors (R57, design note finding A9).
+ */
+const DERIVED_PROPERTIES: Record<string, { source: string; value: string }> = {
+  "--scrollbar-thumb": {
+    source: "--border",
+    value: "color-mix(in srgb, var(--border) 80%, transparent)",
+  },
+  "--scrollbar-thumb-hover": { source: "--border", value: "var(--border)" },
+  "--scrollbar-thumb-subtle": {
+    source: "--border",
+    value: "color-mix(in srgb, var(--border) 60%, transparent)",
+  },
+  "--scrollbar-thumb-subtle-hover": {
+    source: "--border",
+    value: "color-mix(in srgb, var(--border) 80%, transparent)",
+  },
+  "--sidebar-card-muted-foreground": {
+    source: "--muted-foreground",
+    value: "var(--muted-foreground)",
+  },
+};
+
 type DesktopThemeBridge = Pick<DesktopBridge, "setTheme">;
 
 const STORAGE_KEY = "bibcode:theme";
@@ -240,6 +264,10 @@ function applyTheme(theme: Theme, suppressTransitions = false) {
     if (!(name in record.vars)) root.style.removeProperty(name);
   }
   for (const [name, value] of Object.entries(record.vars)) root.style.setProperty(name, value);
+  for (const [name, { source, value }] of Object.entries(DERIVED_PROPERTIES)) {
+    if (source in record.vars) root.style.setProperty(name, value);
+    else root.style.removeProperty(name);
+  }
   lastAppliedKey = key;
   syncBrowserChromeTheme(Object.keys(record.vars).length > 0 ? record.background : undefined);
   syncDesktopTheme(theme);

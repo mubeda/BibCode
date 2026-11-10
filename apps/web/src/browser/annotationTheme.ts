@@ -1,5 +1,7 @@
 import type { DesktopPreviewAnnotationTheme } from "@bibcode/contracts";
 
+import { subscribeAppliedTheme } from "../hooks/useTheme";
+
 const readVariable = (styles: CSSStyleDeclaration, name: string, fallback: string): string =>
   styles.getPropertyValue(name).trim() || fallback;
 
@@ -25,4 +27,15 @@ export function readPreviewAnnotationTheme(): DesktopPreviewAnnotationTheme {
     fontSans: readVariable(styles, "--font-sans", styles.fontFamily || "system-ui, sans-serif"),
     fontMono: readVariable(styles, "--font-mono", "ui-monospace, monospace"),
   };
+}
+
+/**
+ * Pushes the annotation colors now and after every effective theme application (R58). Both
+ * preview bridges ignore them today (spec amendment A1).
+ */
+export function watchAnnotationTheme(
+  push: (theme: DesktopPreviewAnnotationTheme) => void,
+): () => void {
+  push(readPreviewAnnotationTheme());
+  return subscribeAppliedTheme(() => push(readPreviewAnnotationTheme()));
 }

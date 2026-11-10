@@ -220,6 +220,51 @@ describe("application theme tokens", () => {
     expect(themeTokens().getPropertyValue("--info-foreground").trim()).toBe("rgb(96, 165, 250)");
   });
 
+  function diagramColors(): Record<string, string> {
+    const chat = document.createElement("div");
+    chat.className = "chat-markdown";
+    const diagram = document.createElement("div");
+    diagram.className = "chat-markdown-mermaid";
+    chat.append(diagram);
+    document.body.append(chat);
+    const styles = getComputedStyle(diagram);
+    const colors = Object.fromEntries(
+      ["--pele-bg", "--pele-fg", "--pele-accent"].map((name) => [
+        name,
+        styles.getPropertyValue(name).trim(),
+      ]),
+    );
+    chat.remove();
+    return colors;
+  }
+
+  it("a rendered diagram container follows a change of info, background and foreground", () => {
+    document.documentElement.className = "dark";
+    const before = diagramColors();
+    const root = document.documentElement.style;
+    root.setProperty("--info", "#7dcfff");
+    root.setProperty("--background", "#1a1b26");
+    root.setProperty("--foreground", "#a9b1d6");
+    const after = diagramColors();
+    for (const name of ["--info", "--background", "--foreground"]) root.removeProperty(name);
+
+    expect(after).toEqual({
+      "--pele-bg": "#1a1b26",
+      "--pele-fg": "#a9b1d6",
+      "--pele-accent": "#7dcfff",
+    });
+    for (const name of Object.keys(after)) expect(after[name], name).not.toBe(before[name]);
+  });
+
+  it("a change of primary alone does not change the diagram colors", () => {
+    document.documentElement.className = "dark";
+    const before = diagramColors();
+    document.documentElement.style.setProperty("--primary", "#7aa2f7");
+    const after = diagramColors();
+    document.documentElement.style.removeProperty("--primary");
+    expect(after).toEqual(before);
+  });
+
   it("routes Tailwind link utilities and markdown anchors through blue link semantics", () => {
     const chat = document.createElement("div");
     chat.className = "chat-markdown";
