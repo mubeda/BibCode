@@ -745,6 +745,8 @@ function RenderedMarkdownSurface({
   const relativePath = session.relativePath;
   const surfaceRef = useRef<HTMLDivElement>(null);
   useFileSaveShortcut(surfaceRef, session);
+  // A line link opens source view without the toggle, so a ticked checkbox closes its visit here.
+  useEffect(() => () => session.commitRichEdits(), [session]);
 
   // Unsaved source edits win over the file; once saved, the file wins, so a
   // change made on disk after the save shows here and a task toggle keeps it.
@@ -771,7 +773,7 @@ function RenderedMarkdownSurface({
           const nextContents = setMarkdownTaskChecked(currentContents, markerOffset, checked);
           if (nextContents === currentContents) return;
           setProjectFileQueryData(environmentId, cwd, relativePath, nextContents);
-          session.changeOutsideEditor(nextContents);
+          session.changeFromRichEditor(nextContents);
         }}
       />
     </ScrollArea>

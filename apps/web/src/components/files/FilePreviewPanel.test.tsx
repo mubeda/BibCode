@@ -98,7 +98,7 @@ const testState = vi.hoisted(() => {
       undo: ReturnType<typeof vi.fn>;
       redo: ReturnType<typeof vi.fn>;
       setEditorChangeHandler: ReturnType<typeof vi.fn>;
-      changeOutsideEditor: ReturnType<typeof vi.fn>;
+      changeFromRichEditor: ReturnType<typeof vi.fn>;
     },
     editingSessions: null as unknown as {
       get: ReturnType<typeof vi.fn>;
@@ -201,7 +201,7 @@ const testState = vi.hoisted(() => {
       session.undo = vi.fn(session.undo.bind(session));
       session.redo = vi.fn(session.redo.bind(session));
       session.setEditorChangeHandler = vi.fn(session.setEditorChangeHandler.bind(session));
-      session.changeOutsideEditor = vi.fn(session.changeOutsideEditor.bind(session));
+      session.changeFromRichEditor = vi.fn(session.changeFromRichEditor.bind(session));
       sessions.set(relativePath, session);
       state.session = session;
       return session;
@@ -1078,7 +1078,7 @@ describe("markdown preview", () => {
       "README.mdx",
       "- [x] first\n- [x] second\n",
     );
-    expect(testState.session!.changeOutsideEditor).toHaveBeenCalledWith(
+    expect(testState.session!.changeFromRichEditor).toHaveBeenCalledWith(
       "- [x] first\n- [x] second\n",
     );
     const coordinator = testState.coordinators[testState.coordinators.length - 1]!;
@@ -1149,7 +1149,7 @@ describe("markdown preview", () => {
       expect(text).toBe("- [ ] first\n- [ ] typed\n");
 
       toggleTask({ markerOffset: 2, checked: true });
-      expect(session.changeOutsideEditor).toHaveBeenCalledWith("- [x] first\n- [ ] typed\n");
+      expect(session.changeFromRichEditor).toHaveBeenCalledWith("- [x] first\n- [ ] typed\n");
       expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
         environmentId,
         "/workspace/demo",
@@ -1167,7 +1167,7 @@ describe("markdown preview", () => {
       expect(text).toBe("- [ ] first\n- [ ] typed\n");
 
       toggleTask({ markerOffset: 2, checked: true });
-      expect(session.changeOutsideEditor).toHaveBeenCalledWith("- [x] first\n- [ ] typed\n");
+      expect(session.changeFromRichEditor).toHaveBeenCalledWith("- [x] first\n- [ ] typed\n");
     });
 
     it("renders and toggles the file on disk once the source edits are saved", () => {
@@ -1180,7 +1180,7 @@ describe("markdown preview", () => {
       expect(text).toBe("- [ ] first\n- [ ] typed\n- [ ] agent\n");
 
       toggleTask({ markerOffset: 2, checked: true });
-      expect(session.changeOutsideEditor).toHaveBeenCalledWith(
+      expect(session.changeFromRichEditor).toHaveBeenCalledWith(
         "- [x] first\n- [ ] typed\n- [ ] agent\n",
       );
     });
@@ -2381,7 +2381,8 @@ describe("rich markdown editing", () => {
   it("a file with a footnote renders read-only with a notice and its task checkboxes still work", async () => {
     const contents = "- [ ] task\n\nA claim.[^1]\n\n[^1]: The source.\n";
     const { markup, session } = await renderRich(contents, undefined);
-    const changeFromRichEditor = vi.spyOn(session, "changeFromRichEditor");
+    const sourceEditor = session.editor;
+    const cacheKey = session.cacheKey;
 
     expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
     expect(markup).toContain(readOnlyNotice);
@@ -2391,10 +2392,10 @@ describe("rich markdown editing", () => {
     }) => void;
     onTaskListChange({ markerOffset: 2, checked: true });
 
-    expect(testState.session!.changeOutsideEditor).toHaveBeenCalledWith(
-      "- [x] task\n\nA claim.[^1]\n\n[^1]: The source.\n",
-    );
-    expect(changeFromRichEditor).not.toHaveBeenCalled();
+    expect(session.documentContents).toBe("- [x] task\n\nA claim.[^1]\n\n[^1]: The source.\n");
+    // The source editor, and with it its Undo history, survives the tick.
+    expect(session.editor).toBe(sourceEditor);
+    expect(session.cacheKey).toBe(cacheKey);
   });
 
   it("a Markdown file of 129 KiB renders read-only with the size notice and creates no rich editor", async () => {

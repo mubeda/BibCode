@@ -283,12 +283,13 @@ tables, nested lists and hand-written `details` blocks are supported (R34). Each
 test corpus with `canReconcile` true, and a failure there is a schema defect to fix, not a
 fixture to mark unsupported.
 
-A read-only rendered view keeps today's checkbox path (`setMarkdownTaskChecked` and
-`changeOutsideEditor`), shows "This file uses Markdown that the editor cannot change
+A read-only rendered view keeps today's checkbox rewrite (`setMarkdownTaskChecked`), shows "This file uses Markdown that the editor cannot change
 safely. Edit it in source view." above the text (for reason `"too-large"` the notice is
 "This file is too large to edit in rendered view. Edit it in source view."), and passes `editor: null` to the
-formatting group. That path still discards the source history, as it does today (R34
-"read-only as today"). Making it keep the history is a follow-up, listed under Risks.
+formatting group. A ticked checkbox there is recorded with `changeFromRichEditor`, so the
+source history survives and the tick reaches it as one undo step when the visit closes
+(spec amendment A6). The view toggle closes the visit, and so does the read-only view's
+unmount, because a line link opens source view without the toggle.
 
 ## Undo and view switching
 
@@ -300,7 +301,7 @@ The session gains three methods in `fileEditingSession.ts`.
 
 - `changeFromRichEditor(contents)` records `contents` with `coordinator.change`, sets a
   pending-rich-edits flag and publishes. It does not touch or discard the Pierre editor.
-  `changeOutsideEditor` stays as it is for the read-only checkbox path.
+  The read-only view's checkbox uses it too.
 - `commitRichEdits()` first calls the registered flusher. If the flag is set and a Pierre
   editor instance exists, it closes the visit: it applies the difference between the
   editor's text and the session text with `editor.applyEdits(edits, true, true)`, the
@@ -457,9 +458,6 @@ view.
   browser resolves against the app, not the file. The saved Markdown is right.
   `ChatMarkdown` has no image source rewrite either (inferred: no match for an image
   handler in `ChatMarkdown.tsx` or `components/markdown/`), so this is not a regression.
-- A read-only file's checkbox still discards the source history, as today. Routing it
-  through `changeFromRichEditor` would keep the history, but R34 keeps read-only files as
-  they are and the plan's test says that path is not used. It is a follow-up.
 - `@tiptap/markdown` uses `marked`, whose parse can differ from `remark` on rare inputs.
   The `canReconcile` check at load compares the two, so a disagreement makes the file
   read-only.
@@ -678,3 +676,12 @@ was reproduced as a failing test before the fix.
   the serialization lost the blank line. This predates both separator fixes. Fixed: a
   separator taken from `after` starts where the block's last line of text ends, before
   any trailing lines that hold only a prefix.
+- Spec amendment A6 (approved by the user) reverses the rulings on Codex 5 and Codex review
+  2, item 6. A task checkbox ticked in a read-only file in rendered view now goes through
+  `changeFromRichEditor`, so the source editor and its Undo history survive. A test with
+  the real panel and Pierre editor makes two source edits in a file with a footnote, ticks
+  a checkbox in rendered view, returns to source, and undoes the tick and both edits in
+  order. It runs once through the view toggle and once through a line link. The line-link
+  case failed until the read-only view closed its visit on unmount, because the toggle is
+  then not used. The footnote case in `FilePreviewPanel.test.tsx` now asserts that the
+  session keeps its source editor and cache key.
