@@ -191,8 +191,13 @@ Both defaults equal `--foreground`, so Light and Dark do not change (R38, R50).
   only a theme of its base (R39); `setSlot` refuses another base with `wrong-base`.
 - The resolved theme is the slot of the resolved mode. In System mode the operating-system
   preference picks the slot, and a change clears the previous theme's overrides (R39).
-- Picking a theme whose base differs from the resolved mode fills that base's slot, leaves the
-  mode alone, and shows "Switch to dark now" or "Switch to light now" next to the list (R40).
+- Clicking a theme's row (or Enter or Space on it) puts the theme in its base's slot and shows it
+  at once (R40, amendment A8). If the resolved mode has the other base, System resolving to it
+  included, the mode is set to the theme's base and a toast offers Undo, which restores the
+  previous mode and the previous theme of that slot. A click on a theme of the base on screen
+  changes only the slot and offers no Undo. Amendment A8 replaced the earlier "fill the slot and
+  offer Switch to dark now" model, because a slot change that left the screen unchanged read as
+  "nothing happens".
 - A slot pointing at a theme that no longer exists, or that failed to decode, reads as the
   built-in of its base. Deleting a theme in a slot writes the built-in of its base into the slot
   (R45, R49).
@@ -204,9 +209,13 @@ Both defaults equal `--foreground`, so Light and Dark do not change (R38, R50).
 
 - The General section loses its Theme row. Appearance holds the mode select (System, Light,
   Dark), the theme list, "New theme" and "Import theme".
-- Each row shows a five-swatch preview (background, card, primary, foreground, border), the name,
-  the subtitle or "Custom", the base, and "Use for light" or "Use for dark". The row menu offers
-  Duplicate on every theme and Edit, Export and Delete only on custom themes (R44).
+- The list is grouped under "Light themes" and "Dark themes", and the group on screen says
+  "Showing now". Each row is one button (`aria-pressed` marks the theme in its slot) that shows a
+  five-swatch preview (background, card, primary, foreground, border), the name and the subtitle
+  or "Custom". The theme in use in each group has an accent border, a check icon and the text
+  "In use". Arrow Up and Arrow Down move focus between rows. A "More actions for <name>" menu
+  beside the row, outside its button, offers Duplicate on every theme and Edit, Export and Delete
+  only on custom themes (R44). These actions never apply the row's theme.
 - Delete opens a confirmation that names the theme. Cancel changes nothing. Confirm deletes it
   and puts the built-in of its base into its slot (R45).
 - New theme asks for a base and a name and refuses an empty name or one over 48 characters,

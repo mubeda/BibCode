@@ -32,8 +32,9 @@ export function SettingsSection({
 }) {
   return (
     <section {...sectionProps} className={cn("space-y-2.5", className)}>
-      <div className="flex items-center justify-between px-1">
-        <h2 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.08em] text-foreground-strong/50">
+      {/* Wraps the action under the title on narrow widths instead of drawing over it. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1">
+        <h2 className="flex shrink-0 items-center gap-2 text-xs font-semibold uppercase tracking-[0.08em] text-foreground-strong/50">
           <span className="inline-block h-px w-3 bg-border" aria-hidden />
           {icon}
           {title}

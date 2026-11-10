@@ -257,6 +257,7 @@ describe("AppearanceSettingsPanel", () => {
     await mount();
     await menuAction("Mine", "Delete");
     expect(container.textContent).toContain("Delete Mine?");
+    await vi.waitFor(() => expect(document.activeElement).toBe(button("Cancel")));
     await click(button("Cancel"));
     expect(getTheme("mine")).toBeDefined();
     expect(readSlots().dark).toBe("mine");

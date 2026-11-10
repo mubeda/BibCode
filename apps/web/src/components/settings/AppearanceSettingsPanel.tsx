@@ -1,5 +1,6 @@
 import type { ThemeFile } from "@bibcode/contracts";
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { CheckIcon, EllipsisIcon } from "lucide-react";
+import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 
 import { useTheme } from "../../hooks/useTheme";
 import { BUILTIN_THEMES, isBuiltinThemeId } from "../../themes/builtinThemes";
@@ -12,8 +13,10 @@ import {
 } from "../../themes/customThemes";
 import { resolveToken } from "../../themes/themeColor";
 import { exportThemeJson } from "../../themes/themeTransfer";
+import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { toastManager } from "../ui/toast";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { ThemeEditor } from "./ThemeEditor";
@@ -56,6 +59,21 @@ async function downloadTheme(theme: ThemeFile) {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
+const GROUPS = [
+  { base: "light", label: "Light themes" },
+  { base: "dark", label: "Dark themes" },
+] as const;
+
+function moveRowFocus(event: KeyboardEvent<HTMLElement>) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  const rows = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-theme-select]")];
+  const index = rows.indexOf(event.target as HTMLElement);
+  if (index < 0) return;
+  event.preventDefault();
+  const step = event.key === "ArrowDown" ? 1 : -1;
+  rows[(index + step + rows.length) % rows.length]?.focus();
+}
+
 function subtitleOf(theme: ThemeFile): string {
   return BUILTIN_THEMES.find((builtin) => builtin.id === theme.id)?.subtitle ?? "Custom";
 }
@@ -80,7 +98,7 @@ function ThemePreview({ theme }: { theme: ThemeFile }) {
         <span
           key={token}
           data-swatch={token}
-          className="size-5"
+          className="size-3.5 sm:size-5"
           style={{ backgroundColor: resolveToken(theme, token) }}
         />
       ))}
@@ -168,24 +186,23 @@ function NewThemeForm({
 export function AppearanceSettingsPanel() {
   const { theme: mode, setTheme, resolvedTheme } = useTheme();
   const { themes, slots } = useThemeLibrary();
-  const [switchOffer, setSwitchOffer] = useState<Base | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const returnFocusTo = useRef<string | null>(null);
-  const listRef = useRef<HTMLUListElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const existingIds = new Set(themes.map((theme) => theme.id));
 
-  // Focus goes back to the row's Edit button when the editor closes.
+  // Focus goes back to the row's menu button, where Edit was chosen, when the editor closes.
   useEffect(() => {
     const id = returnFocusTo.current;
     if (editingId !== null || id === null) return;
     returnFocusTo.current = null;
     listRef.current
       ?.querySelector<HTMLElement>(
-        `[data-theme-row="${CSS.escape(id)}"] [data-theme-action="edit"]`,
+        `[data-theme-row="${CSS.escape(id)}"] [data-theme-action="more"]`,
       )
       ?.focus();
   }, [editingId]);
@@ -204,11 +221,26 @@ export function AppearanceSettingsPanel() {
     );
   }
 
-  const use = (theme: ThemeFile) => {
+  // R40: a row puts its theme in its base's slot and shows it, switching the mode if needed.
+  const apply = (theme: ThemeFile) => {
+    const previous = { mode, slot: slots[theme.base] };
     const result = setSlot(theme.base, theme.id);
     if (!result.ok) return setActionError("Could not save the theme choice.");
     setActionError(null);
-    setSwitchOffer(theme.base === resolvedTheme ? null : theme.base);
+    if (theme.base === resolvedTheme) return;
+    setTheme(theme.base);
+    const toastId = toastManager.add({
+      type: "info",
+      title: `Switched to ${theme.base} mode to show ${theme.name}`,
+      actionProps: {
+        children: "Undo",
+        onClick: () => {
+          toastManager.close(toastId);
+          setSlot(theme.base, previous.slot);
+          setTheme(previous.mode);
+        },
+      },
+    });
   };
   const duplicate = (theme: ThemeFile) => {
     try {
@@ -238,10 +270,7 @@ export function AppearanceSettingsPanel() {
                   size="sm"
                   variant={mode === option.value ? "secondary" : "ghost"}
                   aria-pressed={mode === option.value}
-                  onClick={() => {
-                    setTheme(option.value);
-                    setSwitchOffer(null);
-                  }}
+                  onClick={() => setTheme(option.value)}
                 >
                   {option.label}
                 </Button>
@@ -265,24 +294,6 @@ export function AppearanceSettingsPanel() {
         }
       >
         <div className="grid gap-3 p-3">
-          {switchOffer ? (
-            <div
-              role="status"
-              className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted px-3 py-2 text-sm"
-            >
-              <span>This theme is used in {BASE_LABEL[switchOffer].toLowerCase()} mode.</span>
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={() => {
-                  setTheme(switchOffer);
-                  setSwitchOffer(null);
-                }}
-              >
-                {`Switch to ${switchOffer} now`}
-              </Button>
-            </div>
-          ) : null}
           {actionError ? (
             <p role="alert" className="text-sm text-destructive-foreground">
               {actionError}
@@ -298,98 +309,142 @@ export function AppearanceSettingsPanel() {
               }}
             />
           ) : null}
-          <ul ref={listRef} className="grid gap-1">
-            {themes.map((theme) => {
-              const custom = !isBuiltinThemeId(theme.id);
-              const inUse = slots[theme.base] === theme.id;
-              return (
-                <li
-                  key={theme.id}
-                  data-theme-row={theme.id}
-                  className="flex flex-wrap items-center gap-3 rounded-md px-2 py-2 hover:bg-accent/40"
-                >
-                  <ThemePreview theme={theme} />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-foreground">{theme.name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {subtitleOf(theme)} · {BASE_LABEL[theme.base]} base
-                      {inUse ? ` · In use for ${theme.base}` : ""}
-                    </p>
-                  </div>
-                  {confirmingDelete === theme.id ? (
-                    <div
-                      role="group"
-                      aria-label={`Delete ${theme.name}?`}
-                      className="flex items-center gap-2 text-sm"
-                    >
-                      <span>{`Delete ${theme.name}?`}</span>
-                      <Button size="xs" variant="ghost" onClick={() => setConfirmingDelete(null)}>
-                        Cancel
-                      </Button>
-                      <Button size="xs" variant="destructive" onClick={() => remove(theme)}>
-                        Delete theme
-                      </Button>
-                    </div>
-                  ) : (
-                    <div className="flex flex-wrap items-center gap-1">
-                      {inUse ? null : (
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          aria-label={`Use ${theme.name} for ${theme.base}`}
-                          onClick={() => use(theme)}
+          {/* Arrow keys move between rows; Enter and Space click the focused row's button. */}
+          <div ref={listRef} className="grid gap-4" onKeyDown={moveRowFocus}>
+            {GROUPS.map(({ base, label }) => (
+              <div key={base} role="group" aria-label={label} className="grid gap-1.5">
+                <div className="flex items-center gap-2 px-1">
+                  <h3 className="text-xs font-medium text-muted-foreground">{label}</h3>
+                  {resolvedTheme === base ? (
+                    <span className="rounded-sm border border-border px-1.5 text-xs text-foreground">
+                      Showing now
+                    </span>
+                  ) : null}
+                </div>
+                <ul className="grid gap-1">
+                  {themes
+                    .filter((theme) => theme.base === base)
+                    .map((theme) => {
+                      const custom = !isBuiltinThemeId(theme.id);
+                      const inUse = slots[base] === theme.id;
+                      return (
+                        <li
+                          key={theme.id}
+                          data-theme-row={theme.id}
+                          className="flex flex-wrap items-center gap-1"
                         >
-                          {`Use for ${theme.base}`}
-                        </Button>
-                      )}
-                      {custom ? (
-                        <Button
-                          size="xs"
-                          variant="ghost"
-                          data-theme-action="edit"
-                          aria-label={`Edit ${theme.name}`}
-                          onClick={() => setEditingId(theme.id)}
-                        >
-                          Edit
-                        </Button>
-                      ) : null}
-                      <Button
-                        size="xs"
-                        variant="ghost"
-                        data-theme-action="duplicate"
-                        aria-label={`Duplicate ${theme.name}`}
-                        onClick={() => duplicate(theme)}
-                      >
-                        Duplicate
-                      </Button>
-                      {custom ? (
-                        <>
-                          <Button
-                            size="xs"
-                            variant="ghost"
-                            data-theme-action="export"
-                            aria-label={`Export ${theme.name}`}
-                            onClick={() => void downloadTheme(theme)}
+                          <button
+                            type="button"
+                            data-theme-select
+                            aria-pressed={inUse}
+                            onClick={() => apply(theme)}
+                            className={cn(
+                              "flex min-w-0 flex-1 cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 rounded-md border px-2 py-2 text-left outline-none transition-colors hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring",
+                              inUse ? "border-primary bg-accent/30" : "border-transparent",
+                            )}
                           >
-                            Export
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="ghost"
-                            data-theme-action="delete"
-                            aria-label={`Delete ${theme.name}`}
-                            onClick={() => setConfirmingDelete(theme.id)}
-                          >
-                            Delete
-                          </Button>
-                        </>
-                      ) : null}
-                    </div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                            <ThemePreview theme={theme} />
+                            <span className="min-w-24 flex-1">
+                              <span className="block text-sm font-medium text-foreground">
+                                {theme.name}
+                              </span>
+                              <span className="block text-xs text-muted-foreground">
+                                {subtitleOf(theme)}
+                              </span>
+                            </span>
+                            {inUse ? (
+                              <span className="ms-auto flex shrink-0 items-center gap-1 text-xs font-medium text-foreground">
+                                <CheckIcon
+                                  aria-hidden
+                                  data-theme-in-use-icon
+                                  className="size-4 text-primary"
+                                />
+                                In use
+                              </span>
+                            ) : null}
+                          </button>
+                          <Menu>
+                            <MenuTrigger
+                              render={
+                                <Button
+                                  size="icon-sm"
+                                  variant="ghost"
+                                  data-theme-action="more"
+                                  aria-label={`More actions for ${theme.name}`}
+                                />
+                              }
+                            >
+                              <EllipsisIcon aria-hidden className="size-4" />
+                            </MenuTrigger>
+                            {/* After Delete, focus goes to the confirmation's Cancel. */}
+                            <MenuPopup
+                              align="end"
+                              finalFocus={() =>
+                                listRef.current?.querySelector<HTMLElement>(
+                                  `[data-theme-row="${CSS.escape(theme.id)}"] [data-delete-cancel]`,
+                                ) ?? true
+                              }
+                            >
+                              {custom ? (
+                                <MenuItem
+                                  data-theme-action="edit"
+                                  onClick={() => setEditingId(theme.id)}
+                                >
+                                  Edit
+                                </MenuItem>
+                              ) : null}
+                              <MenuItem
+                                data-theme-action="duplicate"
+                                onClick={() => duplicate(theme)}
+                              >
+                                Duplicate
+                              </MenuItem>
+                              {custom ? (
+                                <>
+                                  <MenuItem
+                                    data-theme-action="export"
+                                    onClick={() => void downloadTheme(theme)}
+                                  >
+                                    Export
+                                  </MenuItem>
+                                  <MenuItem
+                                    data-theme-action="delete"
+                                    variant="destructive"
+                                    onClick={() => setConfirmingDelete(theme.id)}
+                                  >
+                                    Delete
+                                  </MenuItem>
+                                </>
+                              ) : null}
+                            </MenuPopup>
+                          </Menu>
+                          {confirmingDelete === theme.id ? (
+                            <div
+                              role="group"
+                              aria-label={`Delete ${theme.name}?`}
+                              className="flex basis-full flex-wrap items-center justify-end gap-2 px-2 pb-1 text-sm"
+                            >
+                              <span>{`Delete ${theme.name}?`}</span>
+                              <Button
+                                size="xs"
+                                variant="ghost"
+                                data-delete-cancel
+                                onClick={() => setConfirmingDelete(null)}
+                              >
+                                Cancel
+                              </Button>
+                              <Button size="xs" variant="destructive" onClick={() => remove(theme)}>
+                                Delete theme
+                              </Button>
+                            </div>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                </ul>
+              </div>
+            ))}
+          </div>
           <p className="text-xs text-muted-foreground">
             Running terminals keep the colors they started with. New terminals use the theme.
           </p>
