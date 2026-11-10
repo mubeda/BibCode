@@ -3906,6 +3906,9 @@ mod mutation_ownership_tests {
         blocked_operation: Option<&'static str>,
         mutation_started: Notify,
         release_mutation: Semaphore,
+        /// What the blocked operation returns once released, instead of success.
+        blocked_failure: Mutex<Option<ProcessError>>,
+        commits: std::sync::atomic::AtomicUsize,
     }
 
     struct SuccessfulGithubRunner;
@@ -4020,6 +4023,8 @@ mod mutation_ownership_tests {
                 blocked_operation: None,
                 mutation_started: Notify::new(),
                 release_mutation: Semaphore::new(0),
+                blocked_failure: Mutex::new(None),
+                commits: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -4050,6 +4055,8 @@ mod mutation_ownership_tests {
                 "GitVcsDriver.initRepo"
                     | "GitVcsDriver.pushCurrentBranch"
                     | "GitVcsDriver.pushCurrentBranchToRemote"
+                    // Stands in for the commit becoming visible in status.
+                    | "GitVcsDriver.commit"
             );
             Box::pin(async move {
                 if self.blocked_operation == Some(request.operation.as_str()) {
@@ -4064,6 +4071,17 @@ mod mutation_ownership_tests {
                             operation: request.operation,
                         });
                     }
+                    if let Some(failure) = self
+                        .blocked_failure
+                        .lock()
+                        .expect("blocked failure lock")
+                        .take()
+                    {
+                        return Err(failure);
+                    }
+                }
+                if request.operation == "GitVcsDriver.commit" {
+                    self.commits.fetch_add(1, Ordering::SeqCst);
                 }
                 if marks_working_tree_dirty {
                     self.working_tree_dirty.store(true, Ordering::SeqCst);
@@ -4090,6 +4108,10 @@ mod mutation_ownership_tests {
                         (1, String::new())
                     }
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
+                    "GitVcsDriver.prepareCommitContext.stagedSummary" => {
+                        (0, "M\ttracked.txt\n".to_owned())
+                    }
+                    "GitVcsDriver.commit.sha" => (0, "0123abc\n".to_owned()),
                     "GitVcsDriver.defaultRef.candidate" => {
                         let is_main = request
                             .args
@@ -4966,6 +4988,334 @@ mod mutation_ownership_tests {
                 .await,
             1
         );
+    }
+
+    const HELD_PUSH: &str = "GitVcsDriver.pushCurrentBranch";
+    /// Longer than any local status read and far below the 10 s hang budget.
+    const ANSWER_WHILE_HELD: Duration = Duration::from_secs(3);
+
+    fn stacked_request(id: &str, cwd: &Path, action: &str) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from(id).expect("request id"),
+            tag: "git.runStackedAction".to_owned(),
+            payload: json!({
+                "actionId": format!("action-{id}"),
+                "cwd": cwd,
+                "action": action,
+                "commitMessage": "test: held push",
+            }),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    async fn refresh_within(
+        services: &GitVcsRpcServices,
+        cwd: &Path,
+        within: Duration,
+        context: &str,
+    ) -> RpcResult {
+        tokio::time::timeout(
+            within,
+            services.handle_unary_with_context(
+                request("vcs.refreshStatus", cwd),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{context}: vcs.refreshStatus was not answered in time"))
+    }
+
+    /// The action's terminal event, or the error that ended its stream.
+    async fn action_end(stream: &mut mpsc::Receiver<RpcStreamChunk>) -> Result<Value, Value> {
+        loop {
+            let values = stream.recv().await.expect("stacked stream ends with an event")?;
+            if let Some(event) = values.into_iter().find(|event| {
+                event["kind"] == "action_finished" || event["kind"] == "action_failed"
+            }) {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn held_push_services(runner: &Arc<ControlledMutationRunner>) -> GitVcsRpcServices {
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        GitVcsRpcServices::with_repository(repository, Arc::default())
+    }
+
+    #[tokio::test]
+    async fn held_push_delivers_status_to_refresh_and_subscribers() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut subscription = services
+            .broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("initial status subscription");
+        subscription.recv().await.expect("initial status snapshot");
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", root.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        let refreshed = refresh_within(
+            &services,
+            root.path(),
+            ANSWER_WHILE_HELD,
+            "held push, same worktree",
+        )
+        .await
+        .expect("refresh succeeds during the held push");
+        assert_eq!(
+            refreshed["hasWorkingTreeChanges"], true,
+            "the refresh reads the tree after the commit: {refreshed}"
+        );
+        let published = tokio::time::timeout(ANSWER_WHILE_HELD, async {
+            loop {
+                if let VcsStatusStreamEvent::LocalUpdated { local } =
+                    subscription.recv().await.expect("subscription stays open")
+                    && local.has_working_tree_changes
+                {
+                    return local;
+                }
+            }
+        })
+        .await;
+        assert!(
+            published.is_ok(),
+            "a subscriber received no post-commit status during the held push"
+        );
+
+        runner.release_mutation.add_permits(1);
+        let ended = action_end(&mut stream).await.expect("action event");
+        assert_eq!(ended["kind"], "action_finished", "{ended}");
+        assert_eq!(ended["result"]["commit"]["status"], "created", "{ended}");
+        assert_eq!(ended["result"]["push"]["status"], "pushed", "{ended}");
+    }
+
+    #[tokio::test]
+    async fn held_push_does_not_gate_another_worktree() {
+        let held = tempfile::tempdir().expect("held repository root");
+        let other = tempfile::tempdir().expect("other repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", held.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        refresh_within(
+            &services,
+            other.path(),
+            ANSWER_WHILE_HELD,
+            "held push, other worktree",
+        )
+        .await
+        .expect("the other worktree's refresh succeeds");
+
+        runner.release_mutation.add_permits(1);
+        action_end(&mut stream).await.expect("action event");
+    }
+
+    #[tokio::test]
+    async fn held_push_keeps_writes_serialized_and_the_commit_saved() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut first = services.stacked_action_stream_without_session(
+            stacked_request("2", root.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+        let mut second = services.stacked_action_stream_without_session(
+            stacked_request("3", root.path(), "commit"),
+            CancellationToken::new(),
+        );
+        refresh_within(
+            &services,
+            root.path(),
+            ANSWER_WHILE_HELD,
+            "held push with a queued write",
+        )
+        .await
+        .expect("refresh succeeds while a write is queued");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            runner.commits.load(Ordering::SeqCst),
+            1,
+            "the second write started before the held push ended"
+        );
+
+        *runner.blocked_failure.lock().expect("blocked failure lock") =
+            Some(ProcessError::NonZeroExit {
+                operation: HELD_PUSH.to_owned(),
+                exit_code: 1,
+                stdout_length: 0,
+                stderr_length: 13,
+                stdout: String::new().into_boxed_str(),
+                stderr: "push rejected".into(),
+            });
+        runner.release_mutation.add_permits(1);
+        let ended = action_end(&mut first).await.expect("first action event");
+        assert_eq!(ended["kind"], "action_failed", "{ended}");
+        assert_eq!(ended["phase"], "push", "{ended}");
+        let refreshed = refresh_within(&services, root.path(), ANSWER_WHILE_HELD, "after")
+            .await
+            .expect("refresh after the failed push");
+        assert_eq!(refreshed["hasWorkingTreeChanges"], true, "{refreshed}");
+        let second = action_end(&mut second).await.expect("second action event");
+        assert_eq!(second["kind"], "action_finished", "{second}");
+        assert_eq!(runner.commits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn held_push_every_outcome_releases_readers() {
+        for outcome in [
+            "success",
+            "refusal",
+            "timeout",
+            "cancellation",
+            "workspace loss",
+        ] {
+            let root = tempfile::tempdir().expect("repository root");
+            let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+            let registry = WorkspaceAvailabilityRegistry::new();
+            let services = held_push_services(&runner).with_availability_registry(registry.clone());
+            let cancellation = CancellationToken::new();
+            let mut stream = services.stacked_action_stream_without_session(
+                stacked_request("2", root.path(), "commit_push"),
+                cancellation.clone(),
+            );
+            runner.wait_for_mutation_start().await;
+            *runner.blocked_failure.lock().expect("blocked failure lock") = match outcome {
+                "refusal" => Some(ProcessError::NonZeroExit {
+                    operation: HELD_PUSH.to_owned(),
+                    exit_code: 128,
+                    stdout_length: 0,
+                    stderr_length: 60,
+                    stdout: String::new().into_boxed_str(),
+                    stderr: "fatal: Authentication failed for 'https://gitlab.example.test/'"
+                        .into(),
+                }),
+                "timeout" => Some(ProcessError::Timeout {
+                    operation: HELD_PUSH.to_owned(),
+                    timeout_ms: 600_000,
+                }),
+                _ => None,
+            };
+            match outcome {
+                "cancellation" => cancellation.cancel(),
+                "workspace loss" => assert!(
+                    registry
+                        .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                            thread_id: "thread-held-push".to_owned(),
+                            repository_key: "repository-held-push".to_owned(),
+                            generation: 1,
+                            path: root.path().to_path_buf(),
+                            availability:
+                                crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                        })
+                        .await
+                        .expect("physical identity resolves")
+                ),
+                _ => {}
+            }
+            runner.release_mutation.add_permits(1);
+            let ended = action_end(&mut stream).await;
+            match outcome {
+                "success" => assert_eq!(ended.expect("event")["kind"], "action_finished"),
+                "workspace loss" => assert_eq!(
+                    ended.expect_err("workspace loss ends the stream")["_tag"],
+                    "WorkspaceUnavailableError"
+                ),
+                _ => {
+                    let ended = ended.expect("event");
+                    assert_eq!(ended["kind"], "action_failed", "{outcome}: {ended}");
+                    if outcome == "timeout" {
+                        assert_eq!(ended["message"], "Git command timed out.", "{ended}");
+                    }
+                }
+            }
+
+            let refreshed = refresh_within(&services, root.path(), ANSWER_WHILE_HELD, outcome).await;
+            if outcome == "workspace loss" {
+                let error = refreshed.expect_err("a lost workspace refuses the refresh");
+                assert_eq!(error["_tag"], "WorkspaceUnavailableError", "{error}");
+            } else {
+                refreshed.unwrap_or_else(|error| panic!("{outcome}: refresh failed: {error}"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_push_does_not_block_pull_request_lookups() {
+        use crate::pull_requests::{
+            PullRequestsService, host::HostCommandRunner, model::VocabularyKind,
+        };
+
+        let sandbox = crate::test_support::TestSandbox::new("held-push-lookups");
+        let cwd = sandbox.path("checkout");
+        std::fs::create_dir(&cwd).expect("checkout directory");
+        let repository_json = sandbox.path("github-repository.json");
+        std::fs::write(
+            &repository_json,
+            include_str!("../../tests/fixtures/pull_requests/github_repository.json"),
+        )
+        .expect("repository fixture");
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n  '--version ') echo 'gh version 2.97.0' ;;\n  'auth status') echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"test-user\"}}]}}}}' ;;\n  'api user') echo '{{\"login\":\"test-user\",\"name\":\"\"}}' ;;\n  'api repos/example/repository') cat '{}' ;;\n  'api repos/example/repository/labels?per_page=100') echo '[{{\"name\":\"bug\",\"color\":\"d73a4a\",\"description\":\"Bug fix\"}}]' ;;\n  *) echo \"unexpected fixture command $*\" >&2; exit 64 ;;\nesac\n",
+                repository_json.display()
+            ),
+            "",
+        );
+        let host_runner = HostCommandRunner::new(sandbox.path("state")).with_commands(
+            gh,
+            "missing-glab",
+            sandbox.executable_on_path("git"),
+        );
+        let c = CancellationToken::new();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repository.git",
+            ],
+        ] {
+            host_runner.git(&cwd, args, &c).await.expect("fixture git");
+        }
+        let lookups = PullRequestsService::with_runner(host_runner);
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", &cwd, "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        let (vocabulary, defaults) = tokio::time::timeout(ANSWER_WHILE_HELD, async {
+            tokio::join!(
+                lookups.vocabulary(&cwd, VocabularyKind::Labels, None, &c),
+                lookups.create_defaults(&cwd, &c),
+            )
+        })
+        .await
+        .expect("pull-request lookups answered while the push is held");
+        assert_eq!(vocabulary.expect("vocabulary").entries.len(), 1);
+        defaults.expect("create defaults");
+
+        runner.release_mutation.add_permits(1);
+        action_end(&mut stream).await.expect("action event");
     }
 }
 
@@ -6092,6 +6442,108 @@ esac
             message.contains("origin") || message.contains("push destination"),
             "Git's own reason reaches the client: {message}"
         );
+    }
+
+    /// A create_pr action with no push: the provider's lookup is held open and
+    /// status for the worktree is still answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_pull_request_step_without_a_push_delivers_status() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-held-pr-step");
+        let repository = sandbox.root().join("repository");
+        let bare_remote = sandbox.root().join("remote.git");
+        for directory in [&repository, &bare_remote] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .expect("fixture directory");
+        }
+        let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+        git(&sandbox, &bare_remote, &["init", "--bare", "-b", "main"]).await;
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "fixture@example.test"],
+            &["config", "user.name", "Fixture"],
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+            &["remote", "add", "origin", bare_remote_text.as_str()],
+            &["push", "-q", "-u", "origin", "main"],
+            &["switch", "-q", "-c", "feature/held"],
+            &["commit", "-q", "--allow-empty", "-m", "feature"],
+            &["push", "-q", "-u", "origin", "feature/held"],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/name.git",
+            ],
+            &["remote", "set-url", "--push", "origin", bare_remote_text.as_str()],
+        ] {
+            git(&sandbox, &repository, args).await;
+        }
+        let listing = sandbox.root().join("pr-list-started");
+        let release = sandbox.root().join("pr-list-release");
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "case \"$1:$2\" in\n  pr:list) : > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf '[]\\n' ;;\n  pr:create) printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n",
+                listing.display(),
+                release.display()
+            ),
+            "",
+        );
+        let mut services =
+            GitVcsRpcServices::with_repository(Arc::new(GitRepository::default()), Arc::default());
+        services.pull_requests =
+            PullRequestService::with_provider_commands(gh.to_string_lossy(), "unused-glab", "unused-az");
+        let mut stream = services.stacked_action_stream_without_session(
+            rpc_request(
+                "git.runStackedAction",
+                json!({
+                    "actionId": "held-pr-step",
+                    "cwd": repository,
+                    "action": "create_pr",
+                    "pullRequestTitle": "feature",
+                    "pullRequestBaseBranch": "main",
+                }),
+            ),
+            CancellationToken::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !listing.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the provider lookup starts");
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(3),
+            services.handle_unary_with_context(
+                rpc_request("vcs.refreshStatus", json!({ "cwd": repository })),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("vcs.refreshStatus answered while the pull-request step is held")
+        .expect("refresh succeeds");
+        assert_eq!(refreshed["refName"], "feature/held", "{refreshed}");
+
+        std::fs::write(&release, "").expect("release the provider lookup");
+        let ended = loop {
+            let values = stream
+                .recv()
+                .await
+                .expect("stacked stream ends with an event")
+                .expect("stacked chunk");
+            if let Some(event) = values
+                .into_iter()
+                .find(|event| event["kind"] != "action_started")
+            {
+                break event;
+            }
+        };
+        assert_eq!(ended["kind"], "action_finished", "{ended}");
+        assert_eq!(ended["result"]["pr"]["status"], "created", "{ended}");
     }
 
     /// A reviewed pull request: the fixture repository tracks a local bare
