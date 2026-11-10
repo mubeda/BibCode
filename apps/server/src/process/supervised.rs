@@ -2122,6 +2122,50 @@ mod tests {
         assert!(report.forced, "{report:?}");
     }
 
+    /// A run dropped while it waits for an asked child keeps the first deadline: the forced
+    /// stop comes 2 seconds after the first request, not 2 seconds after the drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_a_run_dropped_while_asking_keeps_the_first_deadline() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("pid");
+        let cancellation = CancellationToken::new();
+        let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let mut run = Box::pin(run_supervised_reporting(
+            stop_policy_request(IGNORES_THE_REQUEST, &marker, StopPolicy::AskThenForce),
+            &cancellation,
+            Some(report_sender),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::select! {
+            () = async {
+                while !marker.exists() {
+                    assert!(tokio::time::Instant::now() < deadline, "the child never started");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            result = &mut run => panic!("the child must still be running, got {result:?}"),
+        }
+
+        let cancelled = Instant::now();
+        cancellation.cancel();
+        let waiting = tokio::time::timeout(Duration::from_millis(1500), &mut run).await;
+        drop(run);
+        let report = tokio::time::timeout(Duration::from_secs(10), report.recv())
+            .await
+            .expect("the report arrives")
+            .expect("the report is sent");
+        let elapsed = cancelled.elapsed();
+
+        assert!(waiting.is_err(), "the run was still asking when dropped");
+        assert!(report.forced, "{report:?}");
+        // 1 second of margin for the kill and the reap; a fresh wait after the drop takes 3.5 s.
+        assert!(
+            elapsed < GRACEFUL_STOP_WAIT + Duration::from_secs(1),
+            "forced {elapsed:?} after the first request"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn git_stop_reports_whether_the_stop_was_forced() {
