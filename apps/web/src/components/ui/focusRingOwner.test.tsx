@@ -1,13 +1,14 @@
 // @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - The focus ring checks read the checked-in stylesheet.
 import * as NodeFS from "node:fs";
-import { act } from "react";
+import { act, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import { Button } from "./button";
 import { Combobox, ComboboxChips, ComboboxChipsInput } from "./combobox";
+import { Command, CommandInput } from "./command";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "./input-group";
 import { NumberField, NumberFieldGroup, NumberFieldInput } from "./number-field";
 import { Textarea } from "./textarea";
@@ -64,58 +65,83 @@ function focusRingRules(): string {
   return css.slice(start, end).replace(/\s+/g, " ");
 }
 
+/** Renders `ui` under a theme focus ring of 2px with a 2px offset, as Verdant Light paints it. */
+async function mountUnderFocusRing(ui: ReactElement) {
+  const style = document.createElement("style");
+  style.textContent = focusRingRules();
+  document.head.append(style);
+  const html = document.documentElement;
+  html.setAttribute("data-theme-focus-ring", "");
+  html.style.setProperty("--ring", "#16a34a");
+  html.style.setProperty("--focus-ring-width", "2px");
+  html.style.setProperty("--focus-ring-offset", "2px");
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () => root.render(ui));
+  return {
+    host,
+    async unmount() {
+      await act(async () => root.unmount());
+      host.remove();
+      style.remove();
+      html.removeAttribute("data-theme-focus-ring");
+      for (const name of ["--ring", "--focus-ring-width", "--focus-ring-offset"]) {
+        html.style.removeProperty(name);
+      }
+    },
+  };
+}
+const outlineStyle = (element: Element) => getComputedStyle(element).outlineStyle;
+
 describe("an input group under a theme focus ring", () => {
   async function mountGroup() {
-    const style = document.createElement("style");
-    style.textContent = focusRingRules();
-    document.head.append(style);
-    const html = document.documentElement;
-    html.setAttribute("data-theme-focus-ring", "");
-    html.style.setProperty("--ring", "#16a34a");
-    html.style.setProperty("--focus-ring-width", "2px");
-    html.style.setProperty("--focus-ring-offset", "2px");
-    const host = document.createElement("div");
-    document.body.append(host);
-    const root = createRoot(host);
-    await act(async () =>
-      root.render(
-        <InputGroup>
-          <InputGroupInput aria-label="Address" />
-          <InputGroupAddon align="inline-end">
-            <Button aria-label="Open" size="icon-xs" variant="ghost" />
-          </InputGroupAddon>
-        </InputGroup>,
-      ),
+    const { host, unmount } = await mountUnderFocusRing(
+      <InputGroup>
+        <InputGroupInput aria-label="Address" />
+        <InputGroupAddon align="inline-end">
+          <Button aria-label="Open" size="icon-xs" variant="ghost" />
+        </InputGroupAddon>
+      </InputGroup>,
     );
     return {
       group: host.querySelector<HTMLElement>('[data-slot="input-group"]')!,
       input: host.querySelector("input")!,
       button: host.querySelector("button")!,
-      async unmount() {
-        await act(async () => root.unmount());
-        host.remove();
-        style.remove();
-        html.removeAttribute("data-theme-focus-ring");
-        for (const name of ["--ring", "--focus-ring-width", "--focus-ring-offset"]) {
-          html.style.removeProperty(name);
-        }
-      },
+      unmount,
     };
   }
 
   it("the group draws the outline for its text field", async () => {
     const { group, input, unmount } = await mountGroup();
     input.focus();
-    expect(getComputedStyle(group).outlineStyle).toBe("solid");
-    expect(getComputedStyle(input).outlineStyle).not.toBe("solid");
+    expect(outlineStyle(group)).toBe("solid");
+    expect(outlineStyle(input)).not.toBe("solid");
     await unmount();
   });
 
   it("a button in an addon keeps its own outline and the group draws none", async () => {
     const { group, button, unmount } = await mountGroup();
     button.focus();
-    expect(getComputedStyle(button).outlineStyle).toBe("solid");
-    expect(getComputedStyle(group).outlineStyle).not.toBe("solid");
+    expect(outlineStyle(button)).toBe("solid");
+    expect(outlineStyle(group)).not.toBe("solid");
+    await unmount();
+  });
+});
+
+describe("the command palette search under a theme focus ring", () => {
+  it("shows no outline, as the base shows no ring there", async () => {
+    const { host, unmount } = await mountUnderFocusRing(
+      <Command items={["one"]}>
+        <CommandInput aria-label="Search commands" />
+      </Command>,
+    );
+    const input = host.querySelector("input")!;
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    const owner = input.closest("[data-focus-ring-owner]")!;
+    expect(outlineStyle(owner)).not.toBe("solid");
+    expect(outlineStyle(input)).not.toBe("solid");
     await unmount();
   });
 });

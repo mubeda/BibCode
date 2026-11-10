@@ -401,6 +401,13 @@
   outline: none;
 }
 
+/* The command palette search sets ring-0, so it shows no ring in the base and the theme adds none. */
+:root[data-theme-focus-ring]
+  [data-slot="command-input"]
+  [data-focus-ring-owner]:has(:focus-visible) {
+  outline: none;
+}
+
 /* Removes the drop shadows and keeps a focus ring a theme without focus tokens still draws. */
 :root[data-theme-control-shadow="none"] [data-control-shadow],
 :root[data-theme-control-shadow="none"] [data-control-shadow]::before,
