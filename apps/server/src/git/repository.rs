@@ -21,6 +21,7 @@ use crate::source_control::{self, ProviderHosts};
 use super::clone_policy::ClonePlan;
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::manager::in_progress::detect_in_progress_operation;
+use super::process::{GitWriteRegistry, LOCK_UNCHANGED_WAIT, QuiesceOutcome};
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
@@ -33,6 +34,7 @@ use super::{
     canonical_worktree_path_key, git_worktree_prune_impact_digest, host_path_platform,
     normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
+use crate::process::supervised::GRACEFUL_STOP_WAIT;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPOSITORY_CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -126,6 +128,49 @@ pub(crate) trait GitProcessRunner: Send + Sync {
     ) -> BoxGitProcessFuture<'a> {
         self.run(request, cancellation)
     }
+
+    /// [`Self::run`] for a command that may write the index (one without
+    /// `GIT_OPTIONAL_LOCKS=0`). The server's runner tracks it for shutdown and lock cleanup;
+    /// the default runs it as [`Self::run`].
+    fn run_write<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        self.run(request, cancellation)
+    }
+}
+
+/// The server runtime's runner: [`ProcessRunner`], with each write admitted by the runtime's
+/// [`GitWriteRegistry`] (#341, R16, R17).
+struct RegisteredGitRunner {
+    writes: GitWriteRegistry,
+}
+
+impl GitProcessRunner for RegisteredGitRunner {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner.run(request, cancellation))
+    }
+
+    fn run_cleared<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner.run_cleared(request, cancellation))
+    }
+
+    fn run_write<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner.run_write(request, &self.writes, cancellation))
+    }
 }
 
 /// A chosen Source Control push of the current branch (see
@@ -204,6 +249,8 @@ pub struct GitRepository {
     /// flow) must share the server's observation through `with_worktree_settings`
     /// or `with_provider_hosts`.
     provider_hosts: Arc<ProviderHosts>,
+    /// The Git writes [`Self::stop_writes`] stops; the server runtime's runner shares it.
+    writes: GitWriteRegistry,
 }
 
 pub(crate) struct StatusObservation {
@@ -251,6 +298,7 @@ impl Default for GitRepository {
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
             provider_hosts: Arc::default(),
+            writes: GitWriteRegistry::default(),
         }
     }
 }
@@ -409,8 +457,11 @@ impl GitRepository {
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
         provider_hosts: Arc<ProviderHosts>,
     ) -> Self {
+        let writes = GitWriteRegistry::default();
         Self {
-            runner: Arc::new(ProcessRunner),
+            runner: Arc::new(RegisteredGitRunner {
+                writes: writes.clone(),
+            }),
             worktree_settings,
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             git_version: Arc::new(Mutex::new(None)),
@@ -418,6 +469,18 @@ impl GitRepository {
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
             provider_hosts,
+            writes,
+        }
+    }
+
+    /// Shutdown (R17): refuses further Git writes, stops the running ones and waits until each
+    /// has exited and any `index.lock` its forced stop left is handled. `Err` carries how many
+    /// writes were still stopping after the wait; calling again waits once more.
+    pub(crate) async fn stop_writes(&self) -> Result<(), usize> {
+        let limit = GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(1);
+        match self.writes.stop_all_and_wait(limit).await {
+            QuiesceOutcome::Clean => Ok(()),
+            QuiesceOutcome::Pending(pending) => Err(pending),
         }
     }
 
@@ -439,6 +502,7 @@ impl GitRepository {
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
             provider_hosts: Arc::default(),
+            writes: GitWriteRegistry::default(),
         }
     }
 
@@ -615,8 +679,10 @@ impl GitRepository {
         };
         let output = if input.cleared {
             self.runner.run_cleared(request, cancellation).await
-        } else {
+        } else if takes_no_optional_locks(&request.env) {
             self.runner.run(request, cancellation).await
+        } else {
+            self.runner.run_write(request, cancellation).await
         };
         output.map_err(|error| git_error(operation, cwd, argument_count, error))
     }
@@ -8085,6 +8151,14 @@ const UNSTAGED_NUMSTAT_ARGS: &[&str] = &[
     "diff",
     "--numstat",
 ];
+
+/// A background read ([`git_read_environment`]) never takes `index.lock`; every other command
+/// may, so it runs as a write.
+fn takes_no_optional_locks(environment: &[(OsString, OsString)]) -> bool {
+    environment
+        .iter()
+        .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+}
 
 pub(crate) fn git_read_environment() -> Vec<(OsString, OsString)> {
     let mut environment = git_environment();

@@ -144,6 +144,8 @@ pub struct ProductionRuntime {
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
     clone_operations: CloneRuntime,
+    /// The server's repository, whose Git writes shutdown stops (R17).
+    git_repository: Arc<GitRepository>,
     status_broadcaster: crate::git::StatusBroadcaster,
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
@@ -825,6 +827,7 @@ impl ProductionRuntime {
             worktree_runtime,
             worktree_removal_tasks,
             clone_operations,
+            git_repository,
             status_broadcaster,
             workspace,
             _resource_sampler: resource_sampler,
@@ -1021,6 +1024,21 @@ impl ProductionRuntime {
         // folder it created, before providers and terminals shut down.
         self.clone_operations.close_and_drain().await;
         steps.mark("clone-operations");
+        // After the owners above that start Git writes, and before the profiler's teardown:
+        // later writes are refused, and each running write is stopped and its leftover
+        // `index.lock` removed (R17). On Windows, where the stop is forced, only this cleanup
+        // removes the lock.
+        if let Err(pending) = self.git_repository.stop_writes().await {
+            tracing::error!(pending, "Git writes were still stopping at shutdown");
+            if let Err(pending) = self.git_repository.stop_writes().await {
+                tracing::error!(
+                    pending,
+                    "Git writes were still stopping after a second wait"
+                );
+                first_error.get_or_insert_with(|| format!("{pending} Git writes had not stopped"));
+            }
+        }
+        steps.mark("git-writes");
         self.provider_update_checks.shutdown().await;
         steps.mark("provider-update-checks");
         self.turn_delivery.shutdown().await;

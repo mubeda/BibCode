@@ -120,15 +120,15 @@ pub(crate) async fn run_supervised(
     run_supervised_with_observer(request, cancellation, None, None, |_| {}).await
 }
 
-/// [`run_supervised`] that sends one [`TerminationReport`] for the process it spawns, also
-/// when the run's future is dropped (then after the background stop has finished). A run
-/// that spawns nothing sends nothing.
+/// [`run_supervised`] that sends `reports` one [`TerminationReport`] for the process it spawns,
+/// also when the run's future is dropped (then after the background stop has finished). A
+/// run that spawns nothing sends nothing.
 pub(crate) async fn run_supervised_reporting(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
-    reports: TerminationReports,
+    reports: Option<TerminationReports>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    run_supervised_with_observer(request, cancellation, None, Some(reports), |_| {}).await
+    run_supervised_with_observer(request, cancellation, None, reports, |_| {}).await
 }
 
 pub(crate) async fn run_supervised_with_spawn_observer<F>(
@@ -1961,7 +1961,7 @@ mod tests {
     ) {
         let cancellation = CancellationToken::new();
         let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
-        let run = run_supervised_reporting(request, &cancellation, report_sender);
+        let run = run_supervised_reporting(request, &cancellation, Some(report_sender));
         tokio::pin!(run);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         tokio::select! {

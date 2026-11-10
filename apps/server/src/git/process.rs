@@ -1,12 +1,20 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
+use crate::diagnostics::profiler::redact::redact_path;
 use crate::process::supervised::{
     StopPolicy, SupervisedOverflow, SupervisedRunError, SupervisedRunOutput, SupervisedRunRequest,
-    SupervisedStreamOutput, run_supervised_reporting,
+    SupervisedStreamOutput, TerminationReport, TerminationReports, run_supervised_reporting,
 };
 use crate::process::{ChildCommand, EnvironmentInheritance, SpawnPlan};
 
@@ -249,7 +257,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit, None)
             .await
     }
 
@@ -261,9 +269,14 @@ impl ProcessRunner {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, EnvironmentInheritance::Inherit)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, EnvironmentInheritance::Inherit, cancellation)
-            .await
-            .map_err(|error| map_supervised_error(error, &request, command_label))?;
+        let output = run_request(
+            &request,
+            EnvironmentInheritance::Inherit,
+            cancellation,
+            None,
+        )
+        .await
+        .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
         let exit_code = output
             .status
@@ -306,7 +319,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared, None)
             .await
     }
 
@@ -316,7 +329,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared, None)
             .await
     }
 
@@ -325,11 +338,12 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
         inheritance: EnvironmentInheritance,
+        reports: Option<TerminationReports>,
     ) -> Result<ProcessOutput, ProcessError> {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, inheritance)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, inheritance, cancellation)
+        let output = run_request(&request, inheritance, cancellation, reports)
             .await
             .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
@@ -417,9 +431,9 @@ async fn run_request(
     request: &ProcessRequest,
     inheritance: EnvironmentInheritance,
     cancellation: &CancellationToken,
+    reports: Option<TerminationReports>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let result = SpawnPlan::new(&request.command, |program| {
+    SpawnPlan::new(&request.command, |program| {
         process_command(request, inheritance, program)
     })
     .start(
@@ -435,20 +449,265 @@ async fn run_request(
             _ => None,
         },
     )
-    .await;
-    // A report still pending belongs to a background reap; it is not awaited here.
-    if let Ok(report) = received.try_recv()
-        && report.requested
-        && report.forced
-        && runs_git(&request.command)
-    {
-        tracing::debug!(
-            operation = %request.operation,
-            exited = report.exited,
-            "Git did not stop when asked and was killed"
-        );
+    .await
+}
+
+impl ProcessRunner {
+    /// [`Self::run`] for a Git command that may write the index. `registry` admits it, its
+    /// shutdown stops it, and a stop that had to be forced is followed by
+    /// [`IndexLockWatch::after_forced_stop`] before the write is released (R16, R17). A write
+    /// refused because shutdown closed admission fails as cancelled.
+    pub(crate) async fn run_write(
+        &self,
+        request: ProcessRequest,
+        registry: &GitWriteRegistry,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        let Some(ticket) = registry.track() else {
+            return Err(ProcessError::Cancelled {
+                operation: request.operation,
+            });
+        };
+        // shortcut: one `rev-parse` per write; cache the Git directory per worktree if writes
+        // become a measured hot spot.
+        let watch = if runs_git(&request.command) {
+            self.resolve_git_dir(&request, cancellation)
+                .await
+                .map(|git_dir| IndexLockWatch::before_spawn(&git_dir))
+        } else {
+            None
+        };
+        let stop = ticket.cancellation.clone();
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        // Owns the release: a dropped run still settles it in the background.
+        let mut settlement = PendingSettlement(Some(WriteSettlement {
+            _ticket: ticket,
+            watch,
+            received,
+            operation: request.operation.clone(),
+            cwd: request.cwd.clone(),
+        }));
+        let output = tokio::select! {
+            output = self.run_with_environment(
+                request,
+                &stop,
+                EnvironmentInheritance::Inherit,
+                Some(reports),
+            ) => output,
+            () = async {
+                cancellation.cancelled().await;
+                stop.cancel();
+                std::future::pending::<()>().await;
+            } => unreachable!("the forwarding branch never completes"),
+        };
+        if let Some(settlement) = settlement.0.take() {
+            settlement.settle_now_or_later().await;
+        }
+        output
     }
-    result
+
+    /// The command's own Git directory, which for a linked worktree is
+    /// `<common-dir>/worktrees/<name>`. `None` where there is none yet (`init`, `clone`).
+    pub(crate) async fn resolve_git_dir(
+        &self,
+        request: &ProcessRequest,
+        cancellation: &CancellationToken,
+    ) -> Option<PathBuf> {
+        let mut probe = request.clone();
+        probe.operation = format!("{}.gitDir", request.operation);
+        probe.args = ["rev-parse", "--absolute-git-dir"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        probe.stdin = None;
+        probe.env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+        probe.allow_non_zero_exit = false;
+        let output = self.run(probe, cancellation).await.ok()?;
+        let git_dir = output.stdout.trim_end_matches(['\r', '\n']);
+        (!git_dir.is_empty()).then(|| PathBuf::from(git_dir))
+    }
+}
+
+/// What a write still owes after its process ends: the lock cleanup, then its release.
+struct WriteSettlement {
+    _ticket: GitWriteTicket,
+    watch: Option<IndexLockWatch>,
+    received: tokio::sync::mpsc::UnboundedReceiver<TerminationReport>,
+    operation: String,
+    cwd: PathBuf,
+}
+
+impl WriteSettlement {
+    /// Inline when the report is in; in the background while a reap is still running, so the
+    /// caller gets its outcome as before.
+    async fn settle_now_or_later(mut self) {
+        match self.received.try_recv() {
+            Ok(report) => self.clean_up(report).await,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                tokio::spawn(self.settle());
+            }
+            // No process started, so there is nothing to clean up.
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    async fn settle(mut self) {
+        if let Some(report) = self.received.recv().await {
+            self.clean_up(report).await;
+        }
+    }
+
+    /// A stop Git honoured needs nothing: Git removed its own lock.
+    async fn clean_up(self, report: TerminationReport) {
+        let Some(watch) = self.watch else {
+            return;
+        };
+        if !(report.requested && report.forced && report.exited) {
+            return;
+        }
+        if watch.after_forced_stop().await == LockCleanup::Removed {
+            tracing::warn!(
+                operation = %self.operation,
+                worktree = %redact_path(&self.cwd.to_string_lossy()),
+                "removed index.lock left by a Git process BiBCode had to force to stop"
+            );
+        }
+    }
+}
+
+/// Settles a write whose run future was dropped, on the current runtime.
+struct PendingSettlement(Option<WriteSettlement>);
+
+impl Drop for PendingSettlement {
+    fn drop(&mut self) {
+        if let Some(settlement) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(settlement.settle());
+        }
+    }
+}
+
+/// How long a lock left by a forced stop must stay unchanged before BiBCode removes it
+/// (R16, D13).
+pub(crate) const LOCK_UNCHANGED_WAIT: Duration = Duration::from_secs(2);
+
+/// What [`IndexLockWatch::after_forced_stop`] did with `index.lock`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LockCleanup {
+    /// The lock existed before the process started, or there is none: not BiBCode's.
+    NotOurs,
+    /// The lock changed or went away during the wait: another Git process has it now.
+    Changed,
+    Removed,
+}
+
+/// Whether a Git command's `index.lock` existed before the command started, so a lock its
+/// forced stop leaves behind can be told apart from someone else's.
+#[derive(Debug)]
+pub(crate) struct IndexLockWatch {
+    lock: PathBuf,
+    existed: bool,
+}
+
+impl IndexLockWatch {
+    /// `git_dir` is the command's own Git directory (see [`ProcessRunner::resolve_git_dir`]).
+    pub(crate) fn before_spawn(git_dir: &Path) -> Self {
+        let lock = git_dir.join("index.lock");
+        Self {
+            existed: lock.symlink_metadata().is_ok(),
+            lock,
+        }
+    }
+
+    /// Removes a lock that appeared during the command and stayed unchanged for
+    /// [`LOCK_UNCHANGED_WAIT`]. A lock that existed before the command is never removed.
+    pub(crate) async fn after_forced_stop(self) -> LockCleanup {
+        if self.existed {
+            return LockCleanup::NotOurs;
+        }
+        let Some(before) = lock_state(&self.lock) else {
+            return LockCleanup::NotOurs;
+        };
+        tokio::time::sleep(LOCK_UNCHANGED_WAIT).await;
+        if lock_state(&self.lock) != Some(before) {
+            return LockCleanup::Changed;
+        }
+        match std::fs::remove_file(&self.lock) {
+            Ok(()) => LockCleanup::Removed,
+            Err(_) => LockCleanup::Changed,
+        }
+    }
+}
+
+/// The lock's length and modification time, read without following a link.
+fn lock_state(lock: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let metadata = lock.symlink_metadata().ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+/// The Git commands that may write the index, one registry per server runtime, so shutdown
+/// can stop each running write and wait until its lock cleanup is done (plan decisions P15
+/// and P20).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GitWriteRegistry {
+    state: Arc<GitWriteRegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct GitWriteRegistryState {
+    closed: std::sync::Mutex<bool>,
+    writes: TaskTracker,
+    stop: CancellationToken,
+}
+
+/// One admitted write. Dropping it, after the write's outcome and lock cleanup, releases it.
+#[derive(Debug)]
+pub(crate) struct GitWriteTicket {
+    _write: TaskTrackerToken,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuiesceOutcome {
+    Clean,
+    /// This many writes had not finished their stop and cleanup within the limit.
+    Pending(usize),
+}
+
+impl GitWriteRegistry {
+    /// Admits one write, or `None` once shutdown closed admission.
+    pub(crate) fn track(&self) -> Option<GitWriteTicket> {
+        let closed = self
+            .state
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!*closed).then(|| GitWriteTicket {
+            _write: self.state.writes.token(),
+            cancellation: self.state.stop.child_token(),
+        })
+    }
+
+    pub(crate) fn close_admission(&self) {
+        *self
+            .state
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.writes.close();
+    }
+
+    /// Closes admission, cancels every admitted write and waits up to `limit` until each has
+    /// exited and finished its lock cleanup. Safe to call again after `Pending`.
+    pub(crate) async fn stop_all_and_wait(&self, limit: Duration) -> QuiesceOutcome {
+        self.close_admission();
+        self.state.stop.cancel();
+        match tokio::time::timeout(limit, self.state.writes.wait()).await {
+            Ok(()) => QuiesceOutcome::Clean,
+            Err(_) => QuiesceOutcome::Pending(self.state.writes.len()),
+        }
+    }
 }
 
 fn process_command(

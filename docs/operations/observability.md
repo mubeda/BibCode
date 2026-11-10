@@ -75,6 +75,20 @@ removed. A raw `PATH` is never logged. The
 [Claude guide](../providers/claude.md#activity-observation) explains each
 outcome.
 
+When the server stops a Git process because of a timeout, a cancellation or
+shutdown, Linux and macOS first send it `SIGTERM` and kill it only if it is
+still running 2 seconds later. Windows kills it at once. If a killed Git write
+leaves an `index.lock` that did not exist when the command started, and the
+lock stays unchanged for another 2 seconds, the server removes it and writes
+one `warn` line, `removed index.lock left by a Git process BiBCode had to
+force to stop`, with the operation name and the worktree path after the
+Profiler's path redaction. A lock that existed before the command started, or
+that changes during the wait, is never removed. At shutdown the server refuses
+new Git writes and stops the running ones this way before the Profiler's
+teardown. If a write is still stopping after the wait, it writes `Git writes
+were still stopping at shutdown` (`error`) with the count, waits once more, and
+reports the shutdown as incomplete if one is still pending.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
