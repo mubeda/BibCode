@@ -39,7 +39,7 @@ export function SettingsSection({
           {icon}
           {title}
         </h2>
-        <div className="flex h-5 min-w-5 items-center justify-end">{headerAction}</div>
+        <div className="ms-auto flex h-5 min-w-5 items-center justify-end">{headerAction}</div>
       </div>
       {contentVariant === "stack" ? (
         <div className="grid gap-3">{children}</div>
