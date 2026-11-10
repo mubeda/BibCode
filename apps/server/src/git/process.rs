@@ -470,7 +470,7 @@ impl ProcessRunner {
         };
         // shortcut: one `rev-parse` per write; cache the Git directory per worktree if writes
         // become a measured hot spot.
-        let watch = if runs_git(&request.command) {
+        let watch = if runs_git(&request.command) && takes_index_lock(&request.args) {
             self.resolve_git_dir(&request, cancellation)
                 .await
                 .map(|git_dir| IndexLockWatch::before_spawn(&git_dir))
@@ -803,6 +803,37 @@ fn runs_git(command: &std::path::Path) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
 }
 
+/// Whether the Git command takes `index.lock` itself, so a lock its forced stop leaves can be
+/// its own. A command not listed never has a lock removed, because a lock that appears while
+/// it runs belongs to someone else: a leftover lock is a nuisance, a deleted foreign lock can
+/// break a person's commit. `index_lock_cleanup_lists_only_commands_that_take_the_lock` checks
+/// every entry against the lock events of a real Git.
+fn takes_index_lock(args: &[OsString]) -> bool {
+    let mut words = args.iter().map(|arg| arg.to_str().unwrap_or_default());
+    let subcommand = loop {
+        match words.next() {
+            Some("-c" | "-C") => {
+                words.next();
+            }
+            Some(option) if option.starts_with('-') => {}
+            Some(subcommand) => break subcommand,
+            None => return false,
+        }
+    };
+    let rest = words.collect::<Vec<_>>();
+    let has = |flag: &str| rest.contains(&flag);
+    match subcommand {
+        "add" | "cherry-pick" | "commit" | "merge" | "rebase" | "restore" | "revert" | "rm" => true,
+        "reset" => !has("--soft"),
+        // Creating a branch at the current commit leaves the index alone.
+        "checkout" | "switch" => !["-b", "-B", "-c", "-C"].into_iter().any(has),
+        "apply" => has("--cached") || has("--index"),
+        "stash" => matches!(rest.first(), None | Some(&("push" | "apply" | "pop"))),
+        // `pull` holds no lock while it fetches, which is where it waits.
+        _ => false,
+    }
+}
+
 /// Windows answers a missing working directory with `ERROR_DIRECTORY` ("not a directory"); it is
 /// the same missing folder that Unix reports as not found.
 fn missing_cwd_as_not_found(source: std::io::Error, cwd: &std::path::Path) -> std::io::Error {
@@ -1126,6 +1157,152 @@ mod tests {
         );
         assert_eq!(settled, QuiesceOutcome::Clean);
         assert!(lock.exists(), "the person's index.lock is kept");
+    }
+
+    /// Every command shape the server runs as a write, with whether a real Git took
+    /// `index.lock` for it. [`takes_index_lock`] must agree with each observation.
+    #[test]
+    fn index_lock_cleanup_lists_only_commands_that_take_the_lock() {
+        use notify::Watcher;
+        enum Step {
+            Write(&'static str, &'static str),
+            Setup(&'static [&'static str]),
+            Watch(&'static [&'static str]),
+        }
+        use Step::{Setup, Watch, Write};
+        let sandbox = TestSandbox::new("index-lock-cleanup-allowlist");
+        let config = IsolatedGitConfig::new();
+        let work = sandbox.path("work");
+        let remote = sandbox.path("remote.git");
+        std::fs::create_dir_all(&work).expect("work folder");
+        fixture_git(
+            &config,
+            sandbox.root(),
+            &["init", "-q", "--bare", &remote.to_string_lossy()],
+        );
+        fixture_git(&config, &work, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &work,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let steps = [
+            Write("a.txt", "1\n"),
+            Setup(&["add", "a.txt"]),
+            Setup(&["commit", "-q", "-m", "one"]),
+            Setup(&["switch", "-q", "-c", "topic"]),
+            Write("b.txt", "b\n"),
+            Setup(&["add", "b.txt"]),
+            Setup(&["commit", "-q", "-m", "topic"]),
+            Setup(&["switch", "-q", "-c", "side", "main"]),
+            Write("s.txt", "s\n"),
+            Setup(&["add", "s.txt"]),
+            Setup(&["commit", "-q", "-m", "side"]),
+            Setup(&["switch", "-q", "main"]),
+            Setup(&["push", "-q", "origin", "main", "topic"]),
+            Write("a.txt", "2\n"),
+            Watch(&["add", "--", "a.txt"]),
+            Watch(&["--literal-pathspecs", "restore", "--staged", "--", "a.txt"]),
+            Watch(&[
+                "--literal-pathspecs",
+                "restore",
+                "--worktree",
+                "--",
+                "a.txt",
+            ]),
+            Write("a.txt", "2\n"),
+            Setup(&["add", "a.txt"]),
+            Watch(&["commit", "--no-edit", "-q", "-m", "two"]),
+            Watch(&["reset", "--soft", "HEAD~1"]),
+            Watch(&["reset", "--", "a.txt"]),
+            Watch(&["stash", "push"]),
+            Watch(&["stash", "list", "--format=%H"]),
+            Watch(&["stash", "show", "--name-only", "stash@{0}"]),
+            Watch(&["stash", "apply", "--quiet", "stash@{0}"]),
+            Watch(&["--literal-pathspecs", "checkout", "HEAD", "--", "a.txt"]),
+            Watch(&["stash", "pop", "--quiet"]),
+            Setup(&["checkout", "HEAD", "--", "a.txt"]),
+            Write("a.txt", "3\n"),
+            Setup(&["stash", "push"]),
+            Watch(&["stash", "drop", "stash@{0}"]),
+            Watch(&["checkout", "-b", "fresh"]),
+            Watch(&["switch", "main"]),
+            Watch(&["switch", "-c", "fresh2"]),
+            Setup(&["switch", "-q", "main"]),
+            Watch(&["merge", "--no-edit", "topic"]),
+            Watch(&["revert", "--no-edit", "HEAD"]),
+            Watch(&["cherry-pick", "--empty=keep", "topic"]),
+            Watch(&["rm", "--cached", "-r", "--ignore-unmatch", "--", "b.txt"]),
+            Setup(&["reset", "-q", "--", "b.txt"]),
+            Watch(&["reset", "--mixed", "HEAD"]),
+            Watch(&["-c", "rebase.backend=merge", "rebase", "main", "side"]),
+            Setup(&["switch", "-q", "main"]),
+            Watch(&["push", "-q", "origin", "main"]),
+            Watch(&["fetch", "-q", "origin"]),
+            Watch(&["pull", "--ff-only", "origin", "main"]),
+            Watch(&["update-ref", "refs/heads/extra", "HEAD"]),
+            Watch(&["tag", "probe-tag"]),
+            Watch(&["config", "probe.key", "value"]),
+        ];
+        let (events, received) = std::sync::mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                            let _ = events.send(name.to_owned());
+                        }
+                    }
+                }
+            })
+            .expect("Git directory watcher");
+        watcher
+            .watch(&work.join(".git"), notify::RecursiveMode::NonRecursive)
+            .expect("watch the Git directory");
+
+        let mut mismatches = Vec::new();
+        for (row, step) in steps.iter().enumerate() {
+            let watched = match step {
+                Write(file, contents) => {
+                    std::fs::write(work.join(file), contents).expect("fixture file");
+                    None
+                }
+                Setup(args) => {
+                    fixture_git(&config, &work, args);
+                    None
+                }
+                Watch(args) => {
+                    fixture_git(&config, &work, args);
+                    Some(args)
+                }
+            };
+            // Events arrive in order, so the sentinel's event closes this step's events.
+            let sentinel = format!("row-{row}-done");
+            let sentinel_path = work.join(".git").join(&sentinel);
+            std::fs::write(&sentinel_path, "").expect("sentinel file");
+            let mut took_lock = false;
+            loop {
+                let name = received
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the watcher reports the sentinel file");
+                took_lock |= name == "index.lock";
+                if name == sentinel {
+                    break;
+                }
+            }
+            std::fs::remove_file(&sentinel_path).expect("remove sentinel file");
+            let Some(args) = watched else {
+                continue;
+            };
+            let listed = takes_index_lock(&args.iter().map(OsString::from).collect::<Vec<_>>());
+            if listed != took_lock {
+                mismatches.push(format!(
+                    "git {args:?}: Git took the lock {took_lock}, listed {listed}"
+                ));
+            }
+        }
+
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[tokio::test]

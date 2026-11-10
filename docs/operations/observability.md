@@ -77,8 +77,10 @@ outcome.
 
 When the server stops a Git process because of a timeout, a cancellation or
 shutdown, Linux and macOS first send it `SIGTERM` and kill it only if it is
-still running 2 seconds later. Windows kills it at once. If a killed Git write
-leaves an `index.lock` that did not exist when the command started, and the
+still running 2 seconds later. Windows kills it at once. If a killed Git command
+that takes `index.lock` itself (such as `add`, `commit`, `reset` or `merge`, but
+not `push`, `fetch` or `pull`) leaves an `index.lock` that did not exist when
+the command started, and the
 lock stays unchanged for another 2 seconds, the server removes it and writes
 one `warn` line, `removed index.lock left by a Git process BiBCode had to
 force to stop`, with the operation name and the worktree path after the
