@@ -391,7 +391,12 @@ describe("UnsavedChangesCloseHost", () => {
       expect(dialogText()).toBeUndefined();
       await vi.waitFor(() => expect(editor.closest("[inert], [aria-hidden='true']")).toBeNull());
       expect(toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ type: "error", title: "The update did not install" }),
+        expect.objectContaining({
+          type: "error",
+          title: "The update did not install",
+          description:
+            "BiBCode did not restart. Files can be edited again. If saving fails, open the Update not installed dialog and choose Restart server.",
+        }),
       );
       session.changeFromRichEditor("next edit");
       await expect(session.flush()).resolves.toBe("saved");

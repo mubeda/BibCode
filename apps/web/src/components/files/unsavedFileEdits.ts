@@ -102,7 +102,8 @@ function endUpdateInstall(): void {
   toastManager.add({
     type: "error",
     title: "The update did not install",
-    description: "BiBCode did not restart. You can edit and save files again.",
+    description:
+      "BiBCode did not restart. Files can be edited again. If saving fails, open the Update not installed dialog and choose Restart server.",
   });
 }
 
