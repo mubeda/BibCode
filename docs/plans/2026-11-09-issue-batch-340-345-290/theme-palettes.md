@@ -55,7 +55,7 @@ Every mapping is proposed for the design note to confirm.
 | `secondary`, `accent`, `sidebar-env-band` | `#292e42` | `selection` |
 | `secondary-foreground`, `accent-foreground` | `#c0caf5` | `bright_foreground` |
 | `muted-foreground` | `#8c94bb` | Derived: 65% of the way from `dark_foreground` to `foreground`. `#565f89` is 2.76:1 on the background and fails. |
-| `border`, `input`, `sidebar-card-border` | `#414868` | `muted`, which Omarchy's T3 Code template uses for borders |
+| `border`, `input`, `sidebar-card-border` | `#414868` | `muted`, which Omarchy's template for another coding app uses for borders |
 | `panel-separator` | unset | Its default is `ring` at 25% (`index.css:268`), so it turns blue with `ring`. |
 | `sidebar-well` | `#13141c` | `dark_background` |
 | `sidebar-card-shadow` | `none` | The mockups use borders instead of shadows. |
