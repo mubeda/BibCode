@@ -9157,6 +9157,13 @@ esac
     async fn a_lookup_past_the_refresh_bound_stops_with_the_workspace() {
         let fixture = Fixture::new("pr-refresh-loss");
         let cancellation = CancellationToken::new();
+        // An open Git Manager keeps its signal subscription across a workspace loss.
+        let _git_manager = fixture
+            .services
+            .broadcaster
+            .subscribe_git_manager_signal(fixture.repository.clone(), cancellation.clone())
+            .await
+            .expect("Git Manager signal subscription");
         let _subscriber = a_refresh_past_its_bound(&fixture, &cancellation).await;
 
         assert!(
