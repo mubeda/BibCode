@@ -315,6 +315,25 @@ describe("RichMarkdownSurface", () => {
     expect(session.getSnapshot().editPending).toBe(false);
   });
 
+  it("Reload and Overwrite change nothing while a waiting edit cannot be delivered", async () => {
+    const { session, persist } = createSession("Mine\n");
+    const { tiptap } = await mount(session, "Mine\n");
+    typeAfter(tiptap!, "Mine", " edited");
+    const token = session.beginDiskCheck()!;
+    session.reconcileVersion(token, { _tag: "present", version: "v2" });
+    session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
+    reconcile.fail = true;
+    typeAfter(tiptap!, "Mine edited", " more");
+
+    act(() => session.reloadFromDisk());
+    act(() => session.overwriteDisk());
+
+    expect(session.getSnapshot().conflict).toMatchObject({ reason: "changed" });
+    expect(session.documentContents).toBe("Mine edited\n");
+    expect(session.getSnapshot().editPending).toBe(true);
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it("a disk check while delivery fails applies no result and keeps the edit", async () => {
     const { session } = createSession("Mine\n");
     const { tiptap } = await mount(session, "Mine\n");

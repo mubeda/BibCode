@@ -229,8 +229,8 @@ Task 6.3 measured `remark` with GFM on 2026-11-09 (one run each, measured): 116 
 50 kB, 537 ms for 200 kB and 7.1 s for 1 MB. Opening a 1 MB file in rendered view
 would therefore block for about 14 s (two parses for `canReconcile`), and each
 serialization for about as long. So a Markdown file larger than 128 KiB (131072 bytes of
-its UTF-8 text, frontmatter included) opens read-only in rendered view with the read-only
-notice. `richMarkdownMode` returns the reason `"too-large"` before it parses anything, so
+its UTF-8 text, frontmatter included) opens read-only in rendered view with the size
+notice (see Read-only rule). `richMarkdownMode` returns the reason `"too-large"` before it parses anything, so
 no rich editor is created and no reconcile parse runs for it. A file of exactly 128 KiB
 stays editable, and costs about 300 ms per parse by the measurements above (inferred by
 interpolation). The user approved this spec amendment (A4, R34) after the Codex review of
