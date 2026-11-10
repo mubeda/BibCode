@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 3ce787dbffce)
+Spec: spec.md (sha256 a4a571217c6e)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -13,9 +13,9 @@ Branch: claude/next-pr-planning-13d367
 | 2.1 | Prove the lock source and make background reads lock-free | 2 | In progress | B, opus | |
 | 2.2 | Ask Git to stop before killing it | 2 | In progress | B, opus | |
 | 2.3 | Remove BiBCode's own leftover lock and leave none at shutdown | 2 | In progress | B, opus | |
-| 3.1 | Let a mutation reopen status reads while it keeps the write lock | 3 | Open | | |
-| 3.2 | Stacked actions deliver status while the push waits | 3 | Open | | |
-| 3.3 | Git Manager push-family operations deliver status; pull and fetch do not | 3 | Open | | |
+| 3.1 | Let a mutation reopen status reads while it keeps the write lock | 3 | In progress | E, opus | |
+| 3.2 | Stacked actions deliver status while the push waits | 3 | In progress | E, opus | |
+| 3.3 | Git Manager push-family operations deliver status; pull and fetch do not | 3 | In progress | E, opus | |
 | 4.1 | Server guidance for a remote missing-credentials push | 4 | Open | | |
 | 4.2 | Show the guidance and keep Git's line readable in both surfaces | 4 | Open | | |
 | 5.1 | Record the worktrees BiBCode creates | 5 | Open | | |
@@ -76,3 +76,8 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 06:20 Ruling: amendment A5, approved by the user: desktop theme export uses a new save-file bridge (R53 desktop scenario), and closing the window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62, fixed in this PR at the user's request). Added Phase 9 (Tasks 9.1, 9.2), round 2, after phases 6 and 7, run only when no other lane compiles Rust; Phase 8 now depends on it. Window close removed from the follow-ups list.
 - 2026-11-10 06:25 Lane D4 fixed the Phase 7 review findings on worktree-agent-a6c0d74ab718b8e46 (165ad1a2f..9d08385b6; web suite 10893 passed, scripts 921 passed): size check before reading, id recheck at Import, ring-owner markers on textarea, input-group, number-field and combobox chips, the ungated touch press colors (compiled selectors quoted), the A3 mutation check and a new R55 guard test. Triaged with the advisor: accepted; the input-group addon-button concern was checked and refuted (its ring keys only on input or textarea focus). Last D4 round: command palette opt-out, the contenteditable surfaces including the Phase 6 editor, and a raw storage-event conflict test.
 - 2026-11-10 06:25 Phase 9 revised after the advisor review (full Owns traced from saveDiagnosticLogs, a packaged end-to-end spec per task, six close-guard cases for the design note, proposedPlan download folded into 9.1). Codex plan review 3 running; the Phase 9 lane waits for it.
+- 2026-11-10 07:45 Lane B2 fixed all five Phase 2 findings on worktree-agent-adf64c767d0b23c55 (95c24532b..6c1646820; lib suite 5278 passed, filters 29 passed, clippy and fmt clean). Lock removal is now armed only for an allowlist of subcommands that take index.lock, each confirmed by a watcher test. Residual risks for the final report (accepted with the advisor, R16 met): a forced stop while Git runs a hook without holding index.lock (pre-commit, post-checkout and similar) can still remove a person's lock taken meanwhile; `pull` is unlisted, so its own leftover lock after a forced stop mid-merge stays behind. Codex re-review of B2 running.
+- 2026-11-10 07:45 Ruling: Phase 3 started on B2's branch before B2's re-review returns, because Phase 3 consumes nothing from process.rs, supervised.rs or runtime.rs; a B2 follow-up touches only files Phase 3 may not edit. Lane E (opus medium) reuses lane B's target dir. Cost if wrong: a B2 fix that Phase 3 depends on would need a rebase of lane E.
+- 2026-11-10 07:45 Lane C4 closed the last delivery-failure round on worktree-agent-aa205c2e45e6188c6 (49f5edd40..671e52a34; files 599 tests): dispose retries a failed close and falls back to the whole serialization, guard mutations pinned, toast for refused actions, and two `join` fixes for blank lines after an inserted block. Codex review of the join and settle(true) changes running. Lane D4 closed Phase 7's fixes (worktree-agent-a6c0d74ab718b8e46 up to bd79a4942; web suite 10895 passed); accepted with the advisor.
+- 2026-11-10 07:45 Plan review 3 (Codex, Needs rework, 7 findings) all accepted; Phase 9 rewritten into Tasks 9.1 to 9.3, end-to-end Task 8.6 added, R62 gains the restart and update path, the escape rule and the OS session-end limit. Ruling: amendment A6 (R34), approved by the user: a checkbox in a read-only file keeps source history (Task 6.10). Plan check: 9 phases, 44 tasks, 62 requirements. Codex plan round 2 running.
+- 2026-11-10 08:05 Codex plan round 2 (last): Needs rework, 5 findings, all accepted and fixed by the coordinator (keepalive escape, one close responder in __root.tsx with a window-wide registry set, quit tests under the close_request filter, a Discard end-to-end case, Phase 8 docs steps). The advisor added: the end-to-end teardown item back into the design-note list, an escape that does not silently discard edits (auto-close versus a native prompt, decided in the design note), and the native restart check. R62's escape sentence reworded to the outcome. Codex did not re-check these fixes; the Phase 9 design note review in Task 9.1 is the next gate.

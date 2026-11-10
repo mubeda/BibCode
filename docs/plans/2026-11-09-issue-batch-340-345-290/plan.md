@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3, A4 and A5 approved in chat during execution), sha256 3ce787dbffce)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 a4a571217c6e)
 Repository: this repository
 Base: main
 
@@ -139,11 +139,12 @@ Phases in the same round run in parallel. A phase depends only on phases in earl
 | `apps/web/src/components/ui/input.tsx`, `select.tsx`, `button.tsx`, `badge.tsx`, `apps/web/src/components/chat/ComposerPrimaryActions.tsx` (marker attribute only), and the selected-state class in the files Task 7.3 step 1 lists | modify | 7 | web tests under `src/components/ui` |
 | `apps/web/src/browser/annotationTheme.ts` and its test | modify | 7 | web test `annotationTheme.test.ts` |
 | `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts` | create | 8 | `vp run test:ui:desktop` with `BIBCODE_E2E_SPEC` |
+| `apps/desktop/e2e/specs/desktop-save-and-close.e2e.ts`, `apps/desktop/e2e/support/app-lifecycle.ts` | create and modify | 8 | `vp run test:ui:desktop` with `BIBCODE_E2E_SPEC` |
 | `apps/desktop/e2e/wdio.conf.ts` | modify | 8 | `vp run test:ui:desktop` |
 | `docs/user/workspace-ui.md`, `docs/testing/cross-platform-validation.md` | modify | 8 | `vp run check:markdown-links` |
 | `apps/web/THIRD_PARTY_NOTICES.md` | modify | 8 | read against the two design notes |
 | `CHANGELOG.md` | modify | 8 | read |
-| `packages/contracts/src/ipc.ts`, `apps/desktop/src-tauri/src/bridge.rs`, `apps/desktop/src-tauri/src/window.rs`, `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` (export call only), `apps/web/src/components/files/**` (close guard only), `docs/plans/2026-11-10-desktop-save-and-close-design.md` | create and modify | 9 | `cargo test -p bibcode-desktop`, web tests |
+| `packages/contracts/src/ipc.ts`, `apps/web/src/tauriDesktopBridge.ts`, `apps/desktop/src-tauri/src/{bridge,window,lib}.rs`, `apps/desktop/src-tauri/permissions/desktop-bridge.toml`, `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` (export call), `apps/web/src/proposedPlan.ts` and its test, `apps/web/src/components/files/{fileEditingSessionRegistry,unsavedFileEdits,UnsavedChangesCloseDialog}` and tests, `apps/web/src/components/ChatView.tsx` (registry registration), `apps/web/src/routes/__root.tsx` (close responder), `apps/web/src/components/desktop/UpdateProtectionDialog.tsx` and `restartApp` call sites, `docs/plans/2026-11-10-desktop-save-and-close-design.md` | create and modify | 9 | `cargo test -p bibcode-desktop -j 2`, web tests under `src/components/files`, `settings`, `desktop` |
 | One new GitHub issue for the sidebar-hierarchy extension (external change) | create | 8 | `gh issue list --search "sidebar hierarchy in:title"` |
 
 Three files have a second, later owner by design, and the phases are in different rounds so they never run together: `apps/server/src/production/git_vcs.rs` (Phase 3, then Phase 4 for the failure message, then Phase 5 for the creation-record calls) and `apps/server/src/git/manager/operations.rs` (Phase 3, then Phase 4), and `apps/server/src/production/runtime.rs` (Phase 2 for shutdown, then Phase 4 for the service construction). `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx` and its test are changed again by Task 8.4 in round 5.

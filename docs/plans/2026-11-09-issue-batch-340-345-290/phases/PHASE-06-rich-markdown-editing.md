@@ -239,4 +239,3 @@ Steps
 2. [ ] Route the read-only checkbox tick through the history-keeping entry. Run the Done when command. Expected: PASS.
 3. [ ] Prove the test can fail: route the tick back through `changeOutsideEditor`. Expected: FAIL. Restore. Expected: PASS.
 4. [ ] Run `vp check` on the changed files and `pnpm --filter @bibcode/web exec tsc --noEmit`. Expected: no errors.
-

@@ -18,7 +18,7 @@ R62’s ordinary Save all, Discard, Cancel, conflict, and clean-close cases are 
 
 The export’s main wiring ownership is otherwise covered: contracts → `tauriDesktopBridge.ts` → Rust command → permission → production registration and audited command lists in `lib.rs`. Serializing desktop Cargo work is also correct because `bibcode-desktop` depends on `bibcode-server`.
 
-Read-only validation: reviewed the requested diff and source; `git diff --check 3075a1355 -- docs/plans/2026-11-09-issue-batch-340-345-290` passed. No files were written.  
+Read-only validation: reviewed the requested diff and source; `git diff --check 3075a1355 -- docs/plans/2026-11-09-issue-batch-340-345-290` passed. No files were written.
 Not run: tests, builds, native scenarios, or CodeGraph sync. Profiler-related risk is shutdown ordering and warning coverage, which Phase 9 must preserve and verify.
 
 
@@ -36,3 +36,15 @@ Reviewer: Codex gpt-6.1-sol, effort high, round 1 of 2 for the Phase 9 change. A
 7. Accepted. `plan.md` now records Phase 3 and Phase 9 in round 2, and the coordinator writes Phase 9's DesktopBridge paragraph in `docs/architecture/overview.md` at integration.
 
 Also folded in: amendment A6 (Task 6.10, read-only checkbox keeps source history), approved by the user.
+
+## Round 2 (Codex gpt-6.1-sol high, 2 of 2): Needs rework, 5 findings, all accepted and fixed by the coordinator
+
+Round 1 findings 4, 6 and 7 were confirmed handled.
+
+1. Accepted. After an acknowledge the web sends keepalives; when they stop for a few seconds the window closes with a logged warning (design-note item 2, test `close_request_closes_with_a_warning_when_keepalives_stop_after_an_acknowledge`).
+2. Accepted, confirmed in source (`ChatView.tsx` lines 994 and 1780 create one registry per panel; Settings routes have no `ChatView`). One close responder and dialog mount in `__root.tsx`; every registry registers in a window-wide set in `unsavedFileEdits.ts`; tests for a clean panel beside an unsaved host and for a Settings route.
+3. Accepted. The quit tests are renamed under the `close_request` filter, with a Cancel test that asserts a later server request succeeds, and the prove-fail step mutates the quit order.
+4. Accepted. Task 8.6 adds a Discard case in a fresh session that asserts the app exits and the file is unchanged.
+5. Accepted. Task 8.3 adds the third spec and the lifecycle change to the runbook and the close dialog and desktop Export to the user guide; Task 8.4 adds changelog lines for amendments A5 and A6; Task 8.5's report covers Phase 9's warnings, shutdown order and dialog review.
+
+Whitespace errors reported by `git diff --check` in this file and the Phase 6 file were fixed. No third round runs; the Phase 9 design note gets its own Codex and advisor review in Task 9.1.
