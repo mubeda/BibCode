@@ -53,9 +53,10 @@ function withoutOverride(theme: ThemeFile, token: string): ThemeFile | null {
 }
 
 /**
- * Removes the overrides that make a fixed pair unreadable (R55 with amendment A3). A pair is
- * reset only when it is under 4.5:1 and under the same pair at the theme's base values; the
- * text override goes first, then the surface override if the pair still fails.
+ * Removes the overrides that make a fixed pair unreadable (R55, amendment A3 revised). A pair
+ * under 4.5:1 is reset only when the same pair at the theme's base values meets 4.5:1 or the
+ * theme still overrides the pair's text token. A pair the base fails is left alone otherwise.
+ * The text override goes first, then the surface override if the pair still fails.
  */
 function resetUnreadablePairs(theme: ThemeFile): { theme: ThemeFile; resetPairs: FixedPair[] } {
   const base: ThemeFile = { version: 1, id: theme.base, name: theme.base, base: theme.base };
@@ -66,7 +67,8 @@ function resetUnreadablePairs(theme: ThemeFile): { theme: ThemeFile; resetPairs:
   for (let changed = true; changed;) {
     changed = false;
     for (const { pair, ratio } of pairRatios(current)) {
-      if (ratio >= MINIMUM_RATIO || ratio >= baseRatio.get(pair)!) continue;
+      if (ratio >= MINIMUM_RATIO) continue;
+      if (baseRatio.get(pair)! < MINIMUM_RATIO && !withoutOverride(current, pair.text)) continue; // no text override left
       const next = withoutOverride(current, pair.text) ?? withoutOverride(current, pair.surface);
       if (!next) continue;
       current = next;

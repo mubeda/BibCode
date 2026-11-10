@@ -363,9 +363,13 @@ fixed keyword (spec, Anti-goals; R48).
   `terminal.background`.
 - The editor lists each pair with its ratio to two decimals and marks a pair below 4.5:1 with a
   warning icon and the text "Low contrast", naming both tokens. Save stays enabled (R54).
-- Import: for each failing pair, the text token's override is removed; if the pair still fails,
-  the surface token's override is removed; this repeats until no fixed pair with an override
-  fails. The notice names every reset pair. The stored theme is the reset one, so exporting it
+- Import: a fixed pair below 4.5:1 is reset only when the same pair at the theme's base values
+  meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised). A pair the
+  base already fails, such as placeholder on background in built-in Light (about 3.1:1) and Dark
+  (about 3.0:1), is left alone unless the import sets its text token, so an off-white background
+  keeps its override. To reset a pair, the text token's override is removed; if the pair still
+  fails and the rule still applies, the surface token's override is removed; this repeats until
+  no such pair fails. The notice names only the pairs actually reset. The stored theme is the reset one, so exporting it
   and importing it again changes nothing further (R55, D20).
 - The four new built-ins meet every fixed pair at 4.5:1, and Matrix Light and Verdant Light keep
   `input` at 3:1 on the background and every ANSI color at 4.5:1 on the terminal background

@@ -151,4 +151,41 @@ describe("theme export and import", () => {
     const plan = transfer.planThemeImport(JSON.stringify(paper));
     expect(plan).toEqual({ ok: true, theme: paper, resetPairs: [], conflict: false });
   });
+
+  it.each([
+    ["light", "#fffdf8"],
+    ["dark", "#101820"],
+  ] as const)(
+    "a %s import that sets only background %s keeps it, with no notice (amendment A3, revised)",
+    async (base, background) => {
+      const { transfer } = await load();
+      const theme: ThemeFile = {
+        version: 1,
+        id: "tinted",
+        name: "Tinted",
+        base,
+        ui: { background },
+      };
+      const plan = transfer.planThemeImport(JSON.stringify(theme));
+      expect(plan).toEqual({ ok: true, theme, resetPairs: [], conflict: false });
+    },
+  );
+
+  it("a light import whose placeholder is under 4.5:1 loses that override and the pair is named, although the base fails the pair too", async () => {
+    const { transfer } = await load();
+    const theme: ThemeFile = {
+      version: 1,
+      id: "faint",
+      name: "Faint",
+      base: "light",
+      ui: { placeholder: "#cccccc" },
+    };
+    const plan = transfer.planThemeImport(JSON.stringify(theme));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`)).toEqual([
+      "placeholder:background",
+    ]);
+    expect(plan.theme.ui).toBeUndefined();
+  });
 });
