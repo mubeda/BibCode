@@ -676,11 +676,14 @@ for one more lookup when the running one ends, which reads a fresh answer
 after an invalidation. A branch change stops the lookup.
 
 When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
-most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it drops its
-lease on the lookup, calls `notify_pull_request_change` so each status stream
-looks again, and answers with the known request for the same branch. No lookup
-outlives the refresh without a status stream, and a stream's lookup ends with
-the stream at workspace loss and shutdown. The passive summary, the
+most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
+with the known request for the same branch. Only status subscribers need the
+late answer, so the lookup keeps its lease in a task of the worktree's status
+lifecycle, which the broadcaster cancels when the last subscriber leaves (a
+workspace loss ends every stream) and at shutdown. With no subscriber the
+lookup is dropped at the bound. When the lookup ends with an answer, that task
+records it and calls `notify_pull_request_change`, so each stream publishes it
+without starting the forge CLI again. The passive summary, the
 pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 

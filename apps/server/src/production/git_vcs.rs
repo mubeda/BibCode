@@ -53,7 +53,7 @@ use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
 /// How long `vcs.refreshStatus` waits for the pull-request lookup, well under the 10 second
-/// hang budget. A slower lookup is left to the status streams, which look again.
+/// hang budget. A slower lookup runs on for the status subscribers, if there are any.
 const REFRESH_PULL_REQUEST_LOOKUP_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
@@ -895,36 +895,61 @@ impl GitVcsRpcServices {
                     .unwrap_or_else(|_| input.cwd.clone());
                 let status = finish_fenced_enrichment(&self.broadcaster, fence, async {
                     let ref_name = status.local.ref_name.clone();
-                    let lookup = lookup_open_pull_request(
-                        &self.pull_requests,
-                        &input.cwd,
-                        &status.local,
-                        &cancellation,
-                    );
-                    status.remote.pr =
-                        match tokio::time::timeout(REFRESH_PULL_REQUEST_LOOKUP_BOUND, lookup).await
-                        {
-                            Ok(Some(pull_request)) => {
-                                self.broadcaster.record_pull_request(
-                                    &cwd,
-                                    ref_name.as_deref(),
-                                    pull_request.clone(),
-                                );
-                                pull_request
-                            }
-                            Ok(None) => self
-                                .broadcaster
-                                .known_pull_request(&cwd, ref_name.as_deref()),
-                            Err(_) => {
-                                // Dropping the lookup ends this refresh's lease on it. Each
-                                // status stream looks again and keeps the lookup alive.
-                                self.broadcaster
-                                    .notify_pull_request_change(&input.cwd)
-                                    .await;
-                                self.broadcaster
-                                    .known_pull_request(&cwd, ref_name.as_deref())
-                            }
-                        };
+                    // Owned, so the lookup can outlive the refresh with its lease intact.
+                    let mut lookup = Box::pin({
+                        let pull_requests = self.pull_requests.clone();
+                        let lookup_cwd = input.cwd.clone();
+                        let local = status.local.clone();
+                        async move {
+                            let cancellation = CancellationToken::new();
+                            lookup_open_pull_request(
+                                &pull_requests,
+                                &lookup_cwd,
+                                &local,
+                                &cancellation,
+                            )
+                            .await
+                        }
+                    });
+                    let found = tokio::select! {
+                        () = cancellation.cancelled() => Ok(None),
+                        found = tokio::time::timeout(
+                            REFRESH_PULL_REQUEST_LOOKUP_BOUND,
+                            &mut lookup,
+                        ) => found,
+                    };
+                    status.remote.pr = match found {
+                        Ok(Some(pull_request)) => {
+                            self.broadcaster.record_pull_request(
+                                &cwd,
+                                ref_name.as_deref(),
+                                pull_request.clone(),
+                            );
+                            pull_request
+                        }
+                        Ok(None) => self
+                            .broadcaster
+                            .known_pull_request(&cwd, ref_name.as_deref()),
+                        Err(_) => {
+                            // Only subscribers need the late answer, so the lookup keeps its
+                            // lease while the repository has one and then delivers to them.
+                            let broadcaster = self.broadcaster.clone();
+                            let late_cwd = cwd.clone();
+                            let late_ref = ref_name.clone();
+                            self.broadcaster.spawn_for_subscribers(&cwd, async move {
+                                if let Some(pull_request) = lookup.await {
+                                    broadcaster.record_pull_request(
+                                        &late_cwd,
+                                        late_ref.as_deref(),
+                                        pull_request,
+                                    );
+                                    broadcaster.notify_pull_request_change(&late_cwd).await;
+                                }
+                            });
+                            self.broadcaster
+                                .known_pull_request(&cwd, ref_name.as_deref())
+                        }
+                    };
                     status
                 })
                 .await
@@ -8941,7 +8966,7 @@ esac
         let cancellation = CancellationToken::new();
         let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
 
-        fixture.set("slow", "3");
+        fixture.set("slow", "6");
         git(&fixture.repository, &["switch", "-q", "-c", "feature"]);
         fixture
             .services
@@ -8960,7 +8985,7 @@ esac
             subscriber.events
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "the clear must not wait for the new branch's lookup"
         );
         subscriber
@@ -9019,9 +9044,9 @@ esac
         let cancellation = CancellationToken::new();
         let _subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
 
-        fixture.set("slow", "4");
+        fixture.set("slow", "6");
         fixture.forget_lookups();
-        let status = tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
             .await
             .expect("the refresh answers at its bound");
         assert_eq!(status["pr"]["number"], 42, "{status}");
@@ -9038,9 +9063,9 @@ esac
 
         // Nothing tells the stream to look again; only the refresh does.
         fixture.set("open", "");
-        fixture.set("slow", "3");
+        fixture.set("slow", "6");
         fixture.forget_lookups();
-        let status = tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
             .await
             .expect("the refresh answers at its bound");
         assert!(status["pr"].is_null(), "{status}");
@@ -9118,7 +9143,7 @@ esac
         let mut subscriber = fixture.subscribe(cancellation);
         subscriber.next().await;
         wait_for_lookups(fixture, "main", 1).await;
-        tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+        tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
             .await
             .expect("the refresh answers at its bound");
         assert!(

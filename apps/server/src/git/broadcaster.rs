@@ -929,6 +929,28 @@ impl StatusBroadcaster {
         entry.remote.clone().flatten()?.pr
     }
 
+    /// Runs `task` for the repository's status subscribers, until the last one leaves or the
+    /// broadcaster shuts down. With no subscriber, `task` is dropped at once.
+    pub(crate) fn spawn_for_subscribers(
+        &self,
+        cwd: &Path,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let state = self.lock_state();
+        if state.closed {
+            return;
+        }
+        if let Some(entry) = state.repositories.get(cwd) {
+            let stop = entry.poller_cancellation.clone();
+            entry.tasks.spawn(async move {
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = task => {}
+                }
+            });
+        }
+    }
+
     /// Remembers a finished lookup's answer for `ref_name`: an open request, or `None` for
     /// none open. A failed lookup is not recorded, and neither is one for a former branch.
     pub(crate) fn record_pull_request(
