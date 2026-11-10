@@ -31,6 +31,8 @@ export interface FileEditorToolbarProps {
    */
   readonly saveBlockedReason?: string | null;
   readonly markdownView?: FileEditorMarkdownView | undefined;
+  /** Controls shown between Redo and the view toggle, such as the Markdown formatting group. */
+  readonly formatting?: ReactNode;
   readonly onSave: () => void;
   readonly onUndo: () => void;
   readonly onRedo: () => void;
@@ -87,6 +89,7 @@ export function FileEditorToolbar({
   cleanStatus,
   saveBlockedReason = null,
   markdownView,
+  formatting,
   onSave,
   onUndo,
   onRedo,
@@ -181,6 +184,16 @@ export function FileEditorToolbar({
       >
         <Redo2 className="text-current" />
       </ToolbarAction>
+      {formatting ? (
+        <>
+          <span
+            aria-orientation="vertical"
+            className="mx-1 h-4 w-px bg-border/60"
+            role="separator"
+          />
+          {formatting}
+        </>
+      ) : null}
       {markdownView ? (
         <>
           <span

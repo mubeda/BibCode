@@ -273,4 +273,49 @@ describe("FileEditorToolbar", () => {
     expect(undo!.className.split(/\s+/)).not.toContain("text-muted-foreground");
     expect(redo!.className.split(/\s+/)).toContain("text-muted-foreground");
   });
+
+  const renderWithFormatting = (formatting?: React.ReactNode) =>
+    act(() => {
+      root.render(
+        <FileEditorToolbar
+          savePhase="clean"
+          confirmedRevision={0}
+          canSave={false}
+          canUndo={false}
+          canRedo={false}
+          cleanStatus={null}
+          formatting={formatting}
+          markdownView={{ rendered: true, onRenderedChange: vi.fn() }}
+          onSave={vi.fn()}
+          onUndo={vi.fn()}
+          onRedo={vi.fn()}
+        />,
+      );
+    });
+
+  it("the formatting group sits between Redo and the view toggle", () => {
+    renderWithFormatting(
+      <div role="group" aria-label="Formatting">
+        <button type="button" aria-label="Bold" />
+      </div>,
+    );
+
+    const labels = [...container.querySelectorAll("button, [role='group']")].map((element) =>
+      element.getAttribute("aria-label"),
+    );
+    expect(labels).toEqual([
+      "Save file",
+      "Undo",
+      "Redo",
+      "Formatting",
+      "Bold",
+      "Show markdown source",
+    ]);
+  });
+
+  it("no formatting group is rendered without the prop", () => {
+    renderWithFormatting();
+
+    expect(container.querySelector("[role='group']")).toBeNull();
+  });
 });

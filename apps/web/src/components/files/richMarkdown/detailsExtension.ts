@@ -25,6 +25,7 @@ import { Details, DetailsContent, DetailsSummary } from "@tiptap/extension-detai
 type DetailsToken = MarkdownToken & {
   summaryTokens?: MarkdownToken[];
   bodyTokens?: MarkdownToken[];
+  open?: boolean;
 };
 
 const OPENING_TAG = /^<details(?:\s+open(?:\s*=\s*(?:""|"open"|''|'open'|open))?)?\s*>/i;
@@ -91,7 +92,39 @@ export function escapeDetailsHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
+declare module "@tiptap/core" {
+  interface Commands<ReturnType> {
+    filesDetails: {
+      /** Inserts an open collapsible section titled "More", with the caret in its body. */
+      insertDetails: () => ReturnType;
+    };
+  }
+}
+
 const FilesDetails = Details.extend({
+  addCommands() {
+    return {
+      ...this.parent?.(),
+      insertDetails:
+        () =>
+        ({ state, chain }) => {
+          const at = state.selection.$from.after(1);
+          const section = {
+            type: "details",
+            attrs: { open: true },
+            content: [
+              { type: "detailsSummary", content: [{ type: "text", text: "More" }] },
+              { type: "detailsContent", content: [{ type: "paragraph" }] },
+            ],
+          };
+          // Body paragraph start: details, summary text "More" and its close, content, paragraph.
+          return chain()
+            .insertContentAt(at, section)
+            .setTextSelection(at + 1 + 6 + 1 + 1)
+            .run();
+        },
+    };
+  },
   markdownTokenizer: {
     name: "details",
     level: "block",
@@ -109,6 +142,7 @@ const FilesDetails = Details.extend({
         type: "details",
         raw: indent + block.raw,
         block: true,
+        open: /\sopen\b/i.test(OPENING_TAG.exec(block.raw)![0]),
         summaryTokens: lexer.inlineTokens(decodeHtmlEntities(summary[1]!.trim())),
         bodyTokens: lexer.blockTokens(block.inner.slice(summary[0].length).trim()),
       } as DetailsToken;
@@ -128,7 +162,7 @@ const FilesDetails = Details.extend({
       {},
       body.length > 0 ? body : [helpers.createNode("paragraph")],
     );
-    return helpers.createNode("details", {}, [summary, content]);
+    return helpers.createNode("details", { open: details.open === true }, [summary, content]);
   },
   renderMarkdown: (node, helpers) => {
     const summary = node.content?.find((child) => child.type === "detailsSummary");
@@ -145,6 +179,7 @@ const FilesDetails = Details.extend({
 const FilesDetailsSummary = DetailsSummary.extend({ content: "inline*" });
 
 export function createDetailsExtensions(): AnyExtension[] {
-  // The open state is the reader's view, not the file's: toggling a section never rewrites it.
-  return [FilesDetails.configure({ persist: false }), FilesDetailsSummary, DetailsContent];
+  // The open state lives in the document so a new section opens, but renderMarkdown never writes
+  // it: toggling a section does not change the file, and a hand-written `open` stays as written.
+  return [FilesDetails.configure({ persist: true }), FilesDetailsSummary, DetailsContent];
 }

@@ -81,6 +81,7 @@ import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
 import { LocalCommentAnnotation } from "./LocalCommentAnnotation";
 import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
+import { RichMarkdownFormatGroup } from "./richMarkdown/RichMarkdownFormatGroup";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
 import {
@@ -1080,6 +1081,15 @@ export default function FilePreviewPanel({
               : workspaceUnavailable
           }
           saveBlockedReason={diskConflict ? fileDiskConflictSaveReason(diskConflict) : null}
+          formatting={
+            isMarkdown ? (
+              <RichMarkdownFormatGroup
+                editor={activeRichEditor}
+                onLink={() => {}}
+                onImage={() => {}}
+              />
+            ) : undefined
+          }
           markdownView={
             isMarkdown
               ? {

@@ -162,6 +162,9 @@ function run(editor: Editor, command: FormatCommand): void {
       chain.toggleBlockquote().run();
       return;
     case "details":
+      chain.insertDetails().run();
+      return;
+    // The link dialog and the image picker take input first; the format group opens them.
     case "link":
     case "image":
       return;
