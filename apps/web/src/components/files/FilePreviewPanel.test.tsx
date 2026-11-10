@@ -372,6 +372,13 @@ vi.mock("~/components/ChatMarkdown", () => ({
   },
 }));
 
+vi.mock("./richMarkdown/RichMarkdownSurface", () => ({
+  default: (props: Record<string, unknown>) => {
+    ui.record("RichMarkdownSurface", props);
+    return <div data-rich-markdown-surface />;
+  },
+}));
+
 vi.mock("~/components/chat/OpenInPicker", () => ({
   OpenInPicker: (props: Record<string, unknown>) => {
     ui.record("OpenInPicker", props);
@@ -569,6 +576,7 @@ vi.mock("./fileSaveCoordinator", () => ({
     };
     readonly getSnapshot = () => testState.sessionSnapshot.save;
     readonly holdForConflict = vi.fn();
+    readonly setAutosaveEnabled = vi.fn();
     readonly releaseConflict = vi.fn();
     readonly adopt = vi.fn();
     readonly discardPendingSave = vi.fn();
@@ -613,7 +621,9 @@ vi.mock("./projectFilesQueryState", () => ({
 import { resolveDiffThemeName } from "~/lib/diffRendering";
 
 import type { FileEditingSession } from "./fileEditingSession";
+import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
 import FilePreviewPanel from "./FilePreviewPanel";
+import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 
 const environmentId = EnvironmentId.make("environment-1");
 const otherEnvironmentId = EnvironmentId.make("environment-2");
@@ -1008,7 +1018,7 @@ describe("file explorer toggle", () => {
 describe("markdown preview", () => {
   it("renders markdown formatted by default and offers the source toggle", () => {
     setFileData("# Title\n");
-    const markup = renderPanel(baseProps({ relativePath: "README.md" }));
+    const markup = renderPanel(baseProps({ relativePath: "README.mdx" }));
     expect(markup).not.toContain('aria-label="Show markdown source"');
     expect(ui.filter("ChatMarkdown")).toHaveLength(1);
 
@@ -1023,7 +1033,7 @@ describe("markdown preview", () => {
         (call) =>
           typeof call.next === "object" &&
           call.next !== null &&
-          (call.next as { path: string | null }).path === "README.md",
+          (call.next as { path: string | null }).path === "README.mdx",
       ),
     ).toBe(true);
 
@@ -1045,7 +1055,7 @@ describe("markdown preview", () => {
       canRedo: true,
     };
     setFileData("- [ ] first\n- [x] second\n");
-    const markup = renderPanel(baseProps({ relativePath: "README.md" }));
+    const markup = renderPanel(baseProps({ relativePath: "README.mdx" }));
     expect(markup).toContain("data-chat-markdown");
     expect(ui.find("FileEditorToolbar")).toMatchObject({
       canSave: true,
@@ -1065,7 +1075,7 @@ describe("markdown preview", () => {
     expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
       "/workspace/demo",
-      "README.md",
+      "README.mdx",
       "- [x] first\n- [x] second\n",
     );
     expect(testState.session!.changeOutsideEditor).toHaveBeenCalledWith(
@@ -1089,7 +1099,7 @@ describe("markdown preview", () => {
     expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
       "/workspace/demo",
-      "README.md",
+      "README.mdx",
       "- [ ] first\n- [x] second\n",
     );
     await flushPromises();
@@ -1112,15 +1122,15 @@ describe("markdown preview", () => {
           initial !== null &&
           "path" in initial &&
           "revealRequestId" in initial,
-        { path: "README.md", revealRequestId: 1 },
+        { path: "README.mdx", revealRequestId: 1 },
       );
-      renderPanel(baseProps({ relativePath: "README.md" }));
+      renderPanel(baseProps({ relativePath: "README.mdx" }));
       const session = testState.session!;
       testState.pendingWork = options.unsaved;
       testState.editors.at(-1)!.options.onChange({ contents: edited });
       if (options.changedOnDisk !== undefined) setFileData(options.changedOnDisk);
 
-      renderPanel(baseProps({ relativePath: "README.md" }));
+      renderPanel(baseProps({ relativePath: "README.mdx" }));
       expect(testState.session).toBe(session);
       const chatMarkdown = ui.find("ChatMarkdown");
       return {
@@ -1143,7 +1153,7 @@ describe("markdown preview", () => {
       expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
         environmentId,
         "/workspace/demo",
-        "README.md",
+        "README.mdx",
         "- [x] first\n- [ ] typed\n",
       );
     });
@@ -2308,5 +2318,154 @@ describe("effects wiring", () => {
     expect(ui.find("FileBrowserPanel")).toMatchObject({ workspaceUnavailable: reason });
     expect(markup).toContain('data-file="src/app.ts"');
     expect(testState.editingSessions.getOrCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe("rich markdown editing", () => {
+  const readOnlyNotice =
+    "This file uses Markdown that the editor cannot change safely. Edit it in source view.";
+
+  function fakeRichEditor(overrides: Partial<RichMarkdownEditor> = {}): RichMarkdownEditor {
+    return {
+      canUndo: false,
+      canRedo: false,
+      undo: vi.fn(),
+      redo: vi.fn(),
+      isActive: () => false,
+      run: vi.fn(),
+      subscribe: () => () => {},
+      serialize: () => "",
+      destroy: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  /** Renders README.md once to create its session, then again with the surface's report. */
+  async function renderRich(contents: string, editor: RichMarkdownEditor | null | undefined) {
+    setFileData(contents, { version: "v1" });
+    renderPanel(baseProps({ relativePath: "README.md" }));
+    // The surface is loaded lazily; once loaded it renders in place of the fallback.
+    await vi.dynamicImportSettled();
+    const session = testState.session as unknown as FileEditingSession<unknown>;
+    if (editor !== undefined) {
+      harness.seedState(
+        (initial) => typeof initial === "object" && initial !== null && "editor" in initial,
+        { key: session.cacheKey, editor },
+      );
+    }
+    const markup = renderPanel(baseProps({ relativePath: "README.md" }));
+    return { markup, session };
+  }
+
+  it("a markdown file opens editable in rendered view with undo enabled after an edit", async () => {
+    const editor = fakeRichEditor({ canUndo: true });
+    const { markup } = await renderRich("# Title\n", editor);
+
+    expect(markup).toContain("data-rich-markdown-surface");
+    expect(ui.find("RichMarkdownSurface")).toMatchObject({ contents: "# Title\n" });
+    expect(markup).not.toContain(readOnlyNotice);
+    const toolbar = ui.find("FileEditorToolbar");
+    expect(toolbar).toMatchObject({ canUndo: true, canRedo: false });
+    (toolbar.onUndo as () => void)();
+    expect(editor.undo).toHaveBeenCalledOnce();
+  });
+
+  it("a file the editor cannot map block for block opens read-only with the same notice", async () => {
+    const { markup } = await renderRich("# Title\n", null);
+
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    expect(ui.filter("ChatMarkdown")).toHaveLength(1);
+    expect(markup).toContain(readOnlyNotice);
+  });
+
+  it("a file with a footnote renders read-only with a notice and its task checkboxes still work", async () => {
+    const contents = "- [ ] task\n\nA claim.[^1]\n\n[^1]: The source.\n";
+    const { markup, session } = await renderRich(contents, undefined);
+    const changeFromRichEditor = vi.spyOn(session, "changeFromRichEditor");
+
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    expect(markup).toContain(readOnlyNotice);
+    const onTaskListChange = ui.find("ChatMarkdown").onTaskListChange as (input: {
+      markerOffset: number;
+      checked: boolean;
+    }) => void;
+    onTaskListChange({ markerOffset: 2, checked: true });
+
+    expect(testState.session!.changeOutsideEditor).toHaveBeenCalledWith(
+      "- [x] task\n\nA claim.[^1]\n\n[^1]: The source.\n",
+    );
+    expect(changeFromRichEditor).not.toHaveBeenCalled();
+  });
+
+  it("switching to source after a rich edit commits it as one step", async () => {
+    const { session } = await renderRich("# Title\n", fakeRichEditor());
+    const commitRichEdits = vi.spyOn(session, "commitRichEdits");
+    const toolbar = ui.find("FileEditorToolbar");
+
+    (toolbar.onSave as () => void)();
+    expect(testState.session!.flush).toHaveBeenCalledTimes(1);
+    (toolbar.markdownView as { onRenderedChange: (rendered: boolean) => void }).onRenderedChange(
+      false,
+    );
+    expect(commitRichEdits).toHaveBeenCalledOnce();
+
+    harness.seedState(
+      (initial) => typeof initial === "object" && initial !== null && "revealRequestId" in initial,
+      { path: "README.md", revealRequestId: 1 },
+    );
+    renderPanel(baseProps({ relativePath: "README.md" }));
+    (ui.find("FileEditorToolbar").onSave as () => void)();
+    expect(testState.session!.flush).toHaveBeenCalledTimes(2);
+  });
+
+  it("an unsaved source edit is shown after switching to rendered view and Undo there starts empty", async () => {
+    testState.sessionSnapshot = {
+      save: { phase: "pending", canSave: true, confirmedRevision: 0 },
+      canUndo: true,
+      canRedo: false,
+    };
+    testState.pendingWork = true;
+    setFileData("# Title\n", { version: "v1" });
+    renderPanel(baseProps({ relativePath: "README.md" }));
+    testState.session!.editor.options.onChange({ contents: "# Title edited\n" });
+    await vi.dynamicImportSettled();
+
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    expect(ui.find("RichMarkdownSurface")).toMatchObject({ contents: "# Title edited\n" });
+    expect(ui.find("FileEditorToolbar")).toMatchObject({ canUndo: false, canRedo: false });
+  });
+
+  it("a rendered edit on a file that changed on disk blocks the save and shows the reload-or-overwrite choice", async () => {
+    const { session } = await renderRich("Mine\n", fakeRichEditor());
+    testState.pendingWork = true;
+    session.changeFromRichEditor("Mine edited\n");
+    const token = session.beginDiskCheck()!;
+    expect(session.reconcileVersion(token, { _tag: "present", version: "v2" })).toBe("read");
+    session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
+
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    expect(ui.find("FileDiskConflictBar")).toMatchObject({
+      conflict: { reason: "changed", diskKnown: true, unreadable: null },
+      confirmReload: true,
+    });
+    expect(ui.find("FileEditorToolbar").saveBlockedReason).toBe(
+      "Changed on disk. Choose Reload from disk or Overwrite disk.",
+    );
+  });
+
+  it("leaving the file autosaves a rendered edit", async () => {
+    const { session } = await renderRich("Mine\n", fakeRichEditor());
+    const registry = new FileEditingSessionRegistry<FileEditingSession<unknown>>();
+    registry.getOrCreate("README.md", () => session);
+    registry.setActivePath("README.md");
+    session.setPendingEditFlusher(() => session.changeFromRichEditor("Mine edited\n"));
+    const coordinator = testState.coordinators.at(-1)!;
+
+    registry.setActivePath("other.md");
+
+    expect(coordinator.change).toHaveBeenCalledWith("Mine edited\n");
+    expect(coordinator.flush).toHaveBeenCalled();
   });
 });

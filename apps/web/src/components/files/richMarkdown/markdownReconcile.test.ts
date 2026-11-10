@@ -170,6 +170,10 @@ describe("canReconcile", () => {
     ).toBe(true);
   });
 
+  it("treats a wrapped CRLF paragraph as the same text as its LF serialization", () => {
+    expect(canReconcile({ original: "first\r\nsecond\r\n", before: "first\nsecond" })).toBe(true);
+  });
+
   it("is false when the serialization has one block fewer", () => {
     expect(canReconcile({ original: "A\n\nB\n\nC\n", before: "A\n\nB" })).toBe(false);
   });

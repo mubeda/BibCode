@@ -22,8 +22,8 @@ interface Block {
   readonly end: number;
   /** Null for a leaf: its text is emitted whole. */
   readonly children: readonly Block[] | null;
-  /** The task checkbox state of a list item, or null. */
-  readonly checked: boolean | null;
+  /** The block's content without its spelling: equal keys are the same block. */
+  readonly key: string;
 }
 
 interface Parsed {
@@ -93,7 +93,7 @@ function toBlocks(nodes: readonly RootContent[]): Block[] {
           start: startOf(node),
           end: endOf(nodes[close]!),
           children: toBlocks(nodes.slice(index + 1, close)),
-          checked: null,
+          key: JSON.stringify(normalizeNodes(nodes.slice(index, close + 1))),
         });
         index = close;
         continue;
@@ -108,7 +108,7 @@ function toBlocks(nodes: readonly RootContent[]): Block[] {
       start: startOf(node),
       end: endOf(node),
       children,
-      checked: node.type === "listItem" ? (node.checked ?? null) : null,
+      key: JSON.stringify(normalizeNodes([node])),
     });
   }
   return blocks;
@@ -165,6 +165,10 @@ function normalizeNodes(nodes: readonly RootContent[]): Normalized[] {
     };
     const { spread: _spread, ...rest } = fields as typeof fields & { spread?: unknown };
     const normalized: Record<string, unknown> = { ...rest };
+    // A line break inside a paragraph means the same with either line ending.
+    if (typeof normalized["value"] === "string") {
+      normalized["value"] = (normalized["value"] as string).replaceAll("\r\n", "\n");
+    }
     if ("children" in node) {
       normalized["children"] = normalizeNodes(node.children as RootContent[]);
     }
@@ -239,10 +243,12 @@ function textOf(parsed: Parsed, block: Block): string {
   return parsed.source.slice(block.start, block.end);
 }
 
-/** A list item matches on its body and checkbox, so a renumbered item still matches. */
-function keyOf(parsed: Parsed, block: Block): string {
-  if (block.kind !== "listItem" || block.children === null) return textOf(parsed, block);
-  return `${String(block.checked)}:${parsed.source.slice(block.children[0]!.start, block.end)}`;
+/**
+ * Blocks match on content, not spelling: a renumbered list item or a table row re-padded after
+ * an edit elsewhere in its table still matches.
+ */
+function keyOf(_parsed: Parsed, block: Block): string {
+  return block.key;
 }
 
 type Step =

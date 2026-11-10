@@ -1,0 +1,212 @@
+// @vitest-environment happy-dom
+
+import type { Editor } from "@tiptap/core";
+import { AsyncResult } from "effect/reactivity";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+vi.mock("@pierre/diffs/edit", () => ({
+  Editor: class {
+    readonly cleanUp = vi.fn();
+    readonly getFile = () => undefined;
+  },
+}));
+
+import { FileEditingSession } from "../fileEditingSession";
+import { FileEditingSessionRegistry } from "../fileEditingSessionRegistry";
+import type { RichMarkdownEditor } from "./richMarkdownExtensions";
+import RichMarkdownSurface from "./RichMarkdownSurface";
+
+let container: HTMLDivElement;
+let root: Root;
+
+function createSession(contents: string, relativePath = "notes.md") {
+  const persist = vi.fn(async (path: string, saved: string) =>
+    AsyncResult.success({ relativePath: path, version: `saved:${saved.length}` }),
+  );
+  const session = new FileEditingSession<never>({
+    cwd: "/repo",
+    relativePath,
+    debounceMs: 500,
+    base: { version: "v1", contents },
+    persist,
+    onPendingChange: vi.fn(),
+    onConfirmed: vi.fn(),
+  });
+  vi.spyOn(session, "changeFromRichEditor");
+  return { session, persist };
+}
+
+async function mount(session: FileEditingSession<never>, contents: string) {
+  const onEditorChange = vi.fn<(editor: RichMarkdownEditor | null) => void>();
+  await act(async () => {
+    root.render(
+      <RichMarkdownSurface session={session} contents={contents} onEditorChange={onEditorChange} />,
+    );
+  });
+  const element = container.querySelector(".ProseMirror") as
+    | (HTMLElement & { editor: Editor })
+    | null;
+  return { onEditorChange, tiptap: element?.editor ?? null };
+}
+
+/** Types `text` at the end of the first text block that contains `marker`. */
+function typeAfter(tiptap: Editor, marker: string, text: string) {
+  let position = -1;
+  tiptap.state.doc.descendants((node, pos) => {
+    if (position >= 0) return false;
+    if (node.isTextblock && node.textContent.includes(marker)) {
+      position = pos + 1 + node.content.size;
+      return false;
+    }
+    return true;
+  });
+  expect(position, marker).toBeGreaterThan(0);
+  act(() => {
+    tiptap.chain().setTextSelection(position).insertContent(text).run();
+  });
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.useRealTimers();
+});
+
+describe("RichMarkdownSurface", () => {
+  it("typing in a paragraph updates the session text", async () => {
+    const { session } = createSession("Hello world\n");
+    const { tiptap } = await mount(session, "Hello world\n");
+
+    typeAfter(tiptap!, "Hello world", " again");
+    await act(async () => vi.advanceTimersByTime(300));
+
+    expect(session.unsavedContents).toBe("Hello world again\n");
+    expect(session.getSnapshot().save.phase).toBe("pending");
+  });
+
+  it("opening a file does not mark it changed", async () => {
+    const original = "Title\n=====\n\n* one\n* two\n";
+    const { session } = createSession(original);
+    const { onEditorChange } = await mount(session, original);
+    await act(async () => vi.advanceTimersByTime(1_000));
+    await act(async () => root.render(null));
+
+    expect(onEditorChange).toHaveBeenCalledWith(expect.objectContaining({ canUndo: false }));
+    expect(session.changeFromRichEditor).not.toHaveBeenCalled();
+    expect(session.getSnapshot().save.phase).toBe("clean");
+  });
+
+  it("frontmatter is shown read-only and kept on edit", async () => {
+    const source = "---\ntitle:   Spaced\n---\nBody text.\n";
+    const { session } = createSession(source);
+    const { tiptap } = await mount(session, source);
+
+    const block = container.querySelector("[data-rich-markdown-frontmatter]");
+    expect(block?.textContent).toContain("Edit frontmatter in source view");
+    expect(block?.textContent).toContain("title:   Spaced");
+    expect(block?.closest("[contenteditable='true']")).toBeNull();
+    expect(tiptap!.getText()).not.toContain("Spaced");
+
+    typeAfter(tiptap!, "Body text.", " More.");
+    await act(async () => vi.advanceTimersByTime(300));
+
+    expect(session.unsavedContents).toBe("---\ntitle:   Spaced\n---\nBody text. More.\n");
+  });
+
+  it("undo and redo reverse a rich edit", async () => {
+    const { session } = createSession("Text\n");
+    const { tiptap, onEditorChange } = await mount(session, "Text\n");
+    const editor = onEditorChange.mock.lastCall![0]!;
+
+    typeAfter(tiptap!, "Text", "!");
+    expect(editor.canUndo).toBe(true);
+    act(() => editor.undo());
+    expect(editor.serialize()).toBe("Text");
+    act(() => editor.redo());
+    expect(editor.serialize()).toBe("Text!");
+  });
+
+  it("typing works in a list item, a block quote and a table cell", async () => {
+    const original = "* item\n\n> quoted\n\n| a | b |\n|---|---|\n| cell | 2 |\n";
+    const { session } = createSession(original);
+    const { tiptap } = await mount(session, original);
+
+    typeAfter(tiptap!, "item", " one");
+    typeAfter(tiptap!, "quoted", " two");
+    typeAfter(tiptap!, "cell", " three");
+    await act(async () => vi.advanceTimersByTime(300));
+
+    const saved = session.unsavedContents!;
+    expect(saved).toContain("* item one\n");
+    expect(saved).toContain("> quoted two\n");
+    expect(saved).toMatch(/\| cell three \|\s*2\s*\|/);
+    expect(saved).toContain("| a | b |\n|---|---|\n");
+  });
+
+  it("rapid typing serializes once after 300 ms", async () => {
+    const { session } = createSession("Fast\n");
+    const { tiptap } = await mount(session, "Fast\n");
+
+    for (const letter of ["a", "b", "c"]) {
+      typeAfter(tiptap!, "Fast", letter);
+      await act(async () => vi.advanceTimersByTime(100));
+    }
+    expect(session.changeFromRichEditor).not.toHaveBeenCalled();
+    expect(session.getSnapshot().editPending).toBe(true);
+    await act(async () => vi.advanceTimersByTime(300));
+
+    expect(session.changeFromRichEditor).toHaveBeenCalledOnce();
+    expect(session.changeFromRichEditor).toHaveBeenCalledWith("Fastabc\n");
+    expect(session.getSnapshot().editPending).toBe(false);
+  });
+
+  it.each([
+    ["Save", (session: FileEditingSession<never>) => void session.flush()],
+    ["a view switch", (session: FileEditingSession<never>) => session.commitRichEdits()],
+    [
+      "a file switch",
+      (session: FileEditingSession<never>) => {
+        const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+        registry.getOrCreate("notes.md", () => session);
+        registry.setActivePath("notes.md");
+        registry.setActivePath("other.md");
+      },
+    ],
+    ["a rename", (session: FileEditingSession<never>) => session.rename("renamed.md")],
+  ])("%s delivers a pending edit without advancing the clock", async (_name, operation) => {
+    const { session } = createSession("Pending\n");
+    const { tiptap } = await mount(session, "Pending\n");
+    typeAfter(tiptap!, "Pending", " edit");
+
+    act(() => operation(session));
+
+    expect(session.changeFromRichEditor).toHaveBeenCalledWith("Pending edit\n");
+    expect(session.documentContents).toBe("Pending edit\n");
+  });
+
+  it("a disk change during the 300 ms wait shows the conflict choice and loses neither version", async () => {
+    const { session } = createSession("Mine\n");
+    const { tiptap } = await mount(session, "Mine\n");
+    typeAfter(tiptap!, "Mine", " edited");
+
+    const token = session.beginDiskCheck();
+    expect(token).not.toBeNull();
+    expect(session.reconcileVersion(token!, { _tag: "present", version: "v2" })).toBe("read");
+    session.reconcileRead(token!, { version: "v2", contents: "Theirs\n" });
+
+    expect(session.getSnapshot().conflict).toMatchObject({ reason: "changed", diskKnown: true });
+    expect(session.documentContents).toBe("Mine edited\n");
+    act(() => session.reloadFromDisk());
+    expect(session.documentContents).toBe("Theirs\n");
+  });
+});

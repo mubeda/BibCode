@@ -1,0 +1,88 @@
+/* The editable rendered view: `.chat-markdown` supplies the typography; these rules cover what
+   only an editor has. */
+
+.rich-markdown-editor .ProseMirror {
+  outline: none;
+  min-height: 8rem;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.rich-markdown-editor .ProseMirror:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+
+.rich-markdown-editor ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+
+.rich-markdown-editor ul[data-type="taskList"] li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+
+.rich-markdown-editor ul[data-type="taskList"] li > label {
+  flex: none;
+  margin-top: 0.2rem;
+}
+
+.rich-markdown-editor ul[data-type="taskList"] li > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rich-markdown-editor [data-type="details"] {
+  display: flex;
+  gap: 0.25rem;
+  margin: 0.5rem 0;
+}
+
+.rich-markdown-editor [data-type="details"] > button {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  cursor: pointer;
+  color: var(--muted-foreground);
+}
+
+.rich-markdown-editor [data-type="details"] > button::before {
+  content: "\25B8";
+}
+
+.rich-markdown-editor [data-type="details"].is-open > button::before {
+  content: "\25BE";
+}
+
+.rich-markdown-editor [data-type="details"] > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rich-markdown-editor [data-type="details"]:not(.is-open) [data-type="detailsContent"] {
+  display: none;
+}
+
+.rich-markdown-editor summary {
+  font-weight: 600;
+  list-style: none;
+}
+
+.rich-markdown-frontmatter {
+  margin-bottom: 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--muted);
+}
+
+.rich-markdown-frontmatter pre {
+  margin: 0.25rem 0 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  user-select: text;
+}
