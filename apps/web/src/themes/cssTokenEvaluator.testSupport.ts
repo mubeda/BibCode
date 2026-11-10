@@ -2,6 +2,8 @@
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 
+import { UI_COLOR_TOKENS } from "@bibcode/contracts";
+
 import { mix, parseColor, toHex, type Rgba } from "./themeColor";
 
 /**
@@ -108,7 +110,11 @@ function formatRgba(color: Rgba): string {
 /** Every token declaration of a base block whose value refers to another token. */
 export function derivedDeclarations(base: "light" | "dark"): string[] {
   const block = base === "light" ? lightBlock : new Map([...lightBlock, ...darkBlock]);
-  return [...block]
-    .filter(([, value]) => /var\(--(?!color-)/.test(value))
-    .map(([name]) => name.slice(2));
+  return (
+    [...block]
+      .filter(([, value]) => /var\(--(?!color-)/.test(value))
+      .map(([name]) => name.slice(2))
+      // Variables outside the token set, such as the scrollbar ones, are not theme tokens.
+      .filter((name) => (UI_COLOR_TOKENS as readonly string[]).includes(name))
+  );
 }
