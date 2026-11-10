@@ -1264,7 +1264,7 @@ export const DESKTOP_DEEP_LINK_EVENT = "deep-link://new-url";
 
 export interface DesktopCloseRequest {
   readonly requestId: number;
-  readonly reason: "close" | "quit";
+  readonly reason: "close" | "quit" | "update";
 }
 
 export type DesktopCloseReply = "acknowledge" | "keepalive" | "allow" | "stay";

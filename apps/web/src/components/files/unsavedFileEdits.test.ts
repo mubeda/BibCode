@@ -190,6 +190,16 @@ describe("unsaved file edits across the window", () => {
       }
     });
 
+    it("a remote update install is asked about like a close", async () => {
+      register(fakeSource(["notes.md"]));
+      const bridge = fakeBridge();
+      cleanups.push(respondToDesktopCloseRequests(bridge));
+      bridge.send({ requestId: 6, reason: "update" });
+      await vi.waitFor(() => expect(getLeaveQuestion()?.files).toEqual(["notes.md"]));
+      getLeaveQuestion()!.answer("cancel");
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([6, "stay"]));
+    });
+
     it("Save all answers allow once every file is saved", async () => {
       const source = register(fakeSource(["notes.md"]));
       const bridge = fakeBridge();
