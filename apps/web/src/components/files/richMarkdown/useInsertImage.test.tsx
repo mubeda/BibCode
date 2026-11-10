@@ -101,6 +101,16 @@ describe("useInsertImage", () => {
     expect(insertImage).toHaveBeenCalledWith("diagram.png");
   });
 
+  it("passes the file name unencoded, because the editor encodes the link", async () => {
+    uploadFile.mockResolvedValue(created);
+    bridgePicks("pictures/my image#1.png");
+    await render({ markdownPath: "docs/guide.md", editor: fakeEditor() });
+
+    await act(async () => probe.pick());
+
+    await vi.waitFor(() => expect(insertImage).toHaveBeenCalledWith("my image#1.png"));
+  });
+
   it("a taken name gets a numbered suffix and nothing is overwritten", async () => {
     uploadFile.mockResolvedValueOnce(taken).mockResolvedValueOnce(created);
     bridgePicks("pictures/diagram.png");
