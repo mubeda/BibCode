@@ -42,14 +42,20 @@ export const DETAILS_CLOSE = /^<\/details>\s*$/i;
 const processor = unified().use(remarkParse).use(remarkGfm);
 const parseCache = new Map<string, Parsed>();
 
-function parse(source: string): Parsed {
+/**
+ * Parses `source`. With `keep`, the tree stays cached: `original` and `before` are the same for
+ * a whole visit, so only `after` and the reconcile's own output are parsed on each edit.
+ */
+function parse(source: string, keep = false): Parsed {
   const cached = parseCache.get(source);
   if (cached) return cached;
   const root = processor.parse(source) as Root;
   const parsed = { source, root, blocks: toBlocks(root.children) };
-  // The surface reparses only `after`; `original` and `before` stay for the whole visit.
-  if (parseCache.size >= 4) parseCache.delete(parseCache.keys().next().value as string);
-  parseCache.set(source, parsed);
+  if (keep) {
+    // Two visits' worth: the open file's `original` and `before`, and the previous file's.
+    if (parseCache.size >= 4) parseCache.delete(parseCache.keys().next().value as string);
+    parseCache.set(source, parsed);
+  }
   return parsed;
 }
 
@@ -182,16 +188,16 @@ function normalizeNodes(nodes: readonly RootContent[]): Normalized[] {
   return out;
 }
 
-function sameDocument(left: string, right: string): boolean {
+function sameDocument(left: string, right: string, keep = false): boolean {
   return (
-    JSON.stringify(normalizeNodes(parse(left).root.children)) ===
-    JSON.stringify(normalizeNodes(parse(right).root.children))
+    JSON.stringify(normalizeNodes(parse(left, keep).root.children)) ===
+    JSON.stringify(normalizeNodes(parse(right, keep).root.children))
   );
 }
 
 /** True when `before` describes the same document as `original`, so edits can be placed. */
 export function canReconcile(input: { original: string; before: string }): boolean {
-  return sameDocument(input.original, input.before);
+  return sameDocument(input.original, input.before, true);
 }
 
 /** CRLF when CRLF lines are at least as many as bare LF lines (Orca's rule). */
@@ -549,8 +555,8 @@ export function reconcileMarkdown(input: {
   after: string;
 }): string {
   if (input.before === input.after) return input.original;
-  const original = parse(input.original);
-  const before = parse(input.before);
+  const original = parse(input.original, true);
+  const before = parse(input.before, true);
   const after = parse(input.after);
   const eol = detectDominantEol(input.original);
   const level: Level = {

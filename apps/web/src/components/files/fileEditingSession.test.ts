@@ -896,6 +896,41 @@ describe("FileEditingSession rich edits", () => {
     expect(source.text()).toBe("start typed\n");
   });
 
+  it("a visit saved before the switch reaches the source editor without another save", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const session = createSession(persist);
+    const source = fakeSourceHistory(session, "start\n");
+    source.setAttached(false);
+
+    session.changeFromRichEditor("saved visit\n");
+    await expect(session.flush()).resolves.toBe("saved");
+    session.commitRichEdits();
+    source.setAttached(true);
+
+    expect(source.text()).toBe("saved visit\n");
+    expect(session.getSnapshot().save.phase).toBe("clean");
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it("a visit the source editor refuses drops that editor instead of keeping its old text", () => {
+    const session = createSession();
+    const source = fakeSourceHistory(session, "start\n");
+    source.setAttached(false);
+    (source.editor as unknown as Record<string, unknown>)["applyEdits"] = () => {
+      throw new Error("refused");
+    };
+    const reportError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    session.changeFromRichEditor("rich text\n");
+    session.commitRichEdits();
+    source.setAttached(true);
+    reportError.mockRestore();
+
+    expect(source.editor.cleanUp).toHaveBeenCalledOnce();
+    expect(session.editor).not.toBe(source.editor);
+    expect(session.documentContents).toBe("rich text\n");
+  });
+
   it("a rich edit marks the file as having unsaved changes and flush saves it", async () => {
     const persist = vi.fn(async () => AsyncResult.success(undefined));
     const session = createSession(persist);

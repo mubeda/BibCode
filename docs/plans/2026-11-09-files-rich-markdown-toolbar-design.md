@@ -50,7 +50,7 @@ or fix nothing this design needs. Licenses were read with
 | `@tiptap/pm`                   | MIT     | 15 kB    | ProseMirror, required by every extension (it pulls the `prosemirror-*` packages)    |
 | `@tiptap/starter-kit`          | MIT     | 54 kB    | Paragraph, headings, marks, lists, quote, code, hard break, history                 |
 | `@tiptap/markdown`             | MIT     | 483 kB   | Markdown parse and serialize through `marked` 17 (MIT, transitive)                  |
-| `@tiptap/extension-list`       | MIT     | 1.2 MB   | Task list and task item, imported directly                                          |
+| `@tiptap/extension-list`       | MIT     | 1.2 MB   | Task list and task item, and the bullet list and list item that keep their marker   |
 | `@tiptap/extension-table`      | MIT     | 773 kB   | GFM tables, which must stay editable (R25, R34)                                     |
 | `@tiptap/extension-image`      | MIT     | 66 kB    | Inline image nodes for Insert image (R28)                                           |
 | `@tiptap/extension-details`    | MIT     | 128 kB   | The `details`, `detailsSummary` and `detailsContent` nodes (R35)                    |
@@ -78,11 +78,12 @@ and `javascriptLedger` rise by the number added.
 `@tiptap/core` `Editor` with these extensions.
 
 - `StarterKit` with `underline` and `trailingNode` turned off. Underline has no Markdown
-  form, and a trailing empty paragraph would add a block the file does not have. It
-  supplies document, text, paragraph, heading (levels 1 to 6 parse, the toolbar offers 1
-  to 5), bold, italic, strike, inline code, code block, block quote, bullet list, ordered
-  list, list item, hard break, horizontal rule, gap cursor, drop cursor, Undo and Redo
-  history, and the link mark. The link is configured through
+  form, and a trailing empty paragraph would add a block the file does not have. Its
+  `bulletList`, `listItem` and `codeBlock` are also off, replaced by the extended versions
+  below. It supplies document, text, paragraph, heading (levels 1 to 6 parse, the toolbar
+  offers 1 to 5), bold, italic, strike, inline code, block quote, ordered list, hard
+  break, horizontal rule, gap cursor, drop cursor, Undo and Redo history, and the link
+  mark. The link is configured through
   `StarterKit.configure({ link: { openOnClick: false, autolink: false } })`, because
   `@tiptap/extension-link` is not a direct dependency and pnpm does not let the client
   import it. A click places the caret, and typing a URL does not create a link the person
@@ -101,7 +102,9 @@ and `javascriptLedger` rise by the number added.
   body, and serializes to `<details>\n<summary>...</summary>\n\nbody\n\n</details>` without
   Orca's `class="orca-details"` and `data-orca-toggle` attributes. A `details` block with
   any other attribute than `open`, or with HTML inside its body, is not parsed as a node;
-  the read-only rule catches it first.
+  the read-only rule catches it first. The node's `open` state is read from the file and
+  kept in the document (`persist: true`), so a new section opens, but `renderMarkdown`
+  never writes it: expanding a section does not change the file.
 - `Markdown` from `@tiptap/markdown`, with GFM on.
 
 One serializer change keeps adjacent lists apart. TipTap writes every bullet item as `- `
@@ -207,6 +210,8 @@ other block keeps its bytes. Second, the whole output is compared with `after` t
 way. If it still differs, the output is `after`. In both steps, each fenced code block in
 the replacement text whose content equals the original block's content apart from line
 endings gets the original content back, so mixed line endings inside a fence survive.
+This covers fences at the start of a line (top level); a fence inside a list or quote in a
+replaced block keeps the file's dominant line ending.
 Frontmatter is outside the body. The output therefore parses to the document the person
 saw and keeps fenced code contents and frontmatter (R33 "edit cannot be placed").
 
@@ -353,14 +358,14 @@ P5). `useInsertImage` in `richMarkdown/useInsertImage.ts`:
 Orca is MIT licensed, copyright 2026 Lovecast Inc. Every file below starts with a comment
 naming Orca, its copyright line and the MIT license. Nothing imports from an Orca clone.
 
-| Orca source                                                                                   | Target                                                                   | What changed                                                                                                                                                                                                                                  |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/renderer/src/components/editor/rich-markdown/details/rich-markdown-details-extension.ts` | `apps/web/src/components/files/richMarkdown/detailsExtension.ts`         | Keeps the `details` tokenizer, `parseMarkdown`, `renderMarkdown`, summary `inline*` content and the Enter and Backspace handling. Drops the toggle-heading variants, i18n placeholders and the `orca-details` class. Adds the insert command. |
-| `src/renderer/src/components/editor/rich-markdown/details/details-markdown-html.ts`           | `apps/web/src/components/files/richMarkdown/detailsExtension.ts`         | Keeps the `details` block matcher, the summary extractor and the editability check. Drops the variant and class attributes, so only `open` is accepted.                                                                                       |
-| `src/renderer/src/components/editor/rich-markdown/commands/RichMarkdownToolbar.tsx`           | `apps/web/src/components/files/richMarkdown/RichMarkdownFormatGroup.tsx` | Keeps the control set, order and commands. Rebuilt on this repository's `Button`, `Tooltip` and `Menu` components with `aria-pressed` and disabled reasons.                                                                                   |
-| `src/renderer/src/components/editor/rich-markdown/links/useLinkBubble.ts`                     | `apps/web/src/components/files/richMarkdown/RichMarkdownLinkPopover.tsx` | Keeps the rules: an empty URL removes the link, an empty selection inserts the URL as linked text. Rebuilt on this repository's `Popover`.                                                                                                    |
-| `src/renderer/src/components/editor/rich-markdown/document/rich-markdown-source-reconcile.ts` | `apps/web/src/components/files/richMarkdown/markdownReconcile.ts`        | Only `detectDominantEol` is ported. The reconcile itself is new and block based, not Orca's text-patch approach.                                                                                                                              |
-| `src/renderer/src/components/editor/rich-markdown/schema/rich-markdown-extensions.ts`         | `apps/web/src/components/files/richMarkdown/richMarkdownExtensions.ts`   | Keeps the StarterKit configuration idea and the inline image. Drops lowlight, math, literal HTML, document links, review highlights and the React node views.                                                                                 |
+| Orca source                                                                                   | Target                                                                   | What changed                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/renderer/src/components/editor/rich-markdown/details/rich-markdown-details-extension.ts` | `apps/web/src/components/files/richMarkdown/detailsExtension.ts`         | Keeps the `details` tokenizer, `parseMarkdown`, `renderMarkdown`, summary `inline*` content. Drops the Enter and Backspace handling, the toggle-heading variants, i18n placeholders and the `orca-details` class. Adds the insert command and reads `open` without writing it. |
+| `src/renderer/src/components/editor/rich-markdown/details/details-markdown-html.ts`           | `apps/web/src/components/files/richMarkdown/detailsExtension.ts`         | Keeps the `details` block matcher, the summary extractor and the editability check. Drops the variant and class attributes, so only `open` is accepted.                                                                                                                        |
+| `src/renderer/src/components/editor/rich-markdown/commands/RichMarkdownToolbar.tsx`           | `apps/web/src/components/files/richMarkdown/RichMarkdownFormatGroup.tsx` | Keeps the control set, order and commands. Rebuilt on this repository's `Button`, `Tooltip` and `Menu` components with `aria-pressed` and disabled reasons.                                                                                                                    |
+| `src/renderer/src/components/editor/rich-markdown/links/useLinkBubble.ts`                     | `apps/web/src/components/files/richMarkdown/RichMarkdownLinkPopover.tsx` | Keeps the rules: an empty URL removes the link, an empty selection inserts the URL as linked text. Rebuilt on this repository's `Popover`.                                                                                                                                     |
+| `src/renderer/src/components/editor/rich-markdown/document/rich-markdown-source-reconcile.ts` | `apps/web/src/components/files/richMarkdown/markdownReconcile.ts`        | Only `detectDominantEol` is ported. The reconcile itself is new and block based, not Orca's text-patch approach.                                                                                                                                                               |
+| `src/renderer/src/components/editor/rich-markdown/schema/rich-markdown-extensions.ts`         | `apps/web/src/components/files/richMarkdown/richMarkdownExtensions.ts`   | Keeps the StarterKit configuration idea and the inline image. Drops lowlight, math, literal HTML, document links, review highlights and the React node views.                                                                                                                  |
 
 Not ported. Orca's `markdown-frontmatter.ts`, because `splitFrontmatter` is new and D16
 requires the bytes unchanged. The tokenizer helpers the details files import

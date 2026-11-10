@@ -363,15 +363,20 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     const visits = this.closedRichVisits;
     this.closedRichVisits = [];
     this.applyingRichText = true;
+    let applied = false;
     try {
       for (const text of visits) {
         editor.applyEdits(diskReloadEdits(editor.getText(), text), true, true);
       }
+      applied = editor.getText() === this.localText();
     } catch (error) {
       console.error("[file-editing-session] applying rendered edits to the editor failed", error);
     } finally {
       this.applyingRichText = false;
     }
+    // An editor still holding older text would save it over the rendered edits: lose its
+    // history instead, and the next attach seeds from the session's text.
+    if (!applied) this.discardEditor();
   }
 
   setAutosaveEnabled(enabled: boolean): void {

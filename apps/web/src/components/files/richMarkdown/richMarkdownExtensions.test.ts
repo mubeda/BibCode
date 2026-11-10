@@ -92,6 +92,22 @@ describe("createRichMarkdownEditor", () => {
     });
   });
 
+  it("a ticked task checkbox changes only that item's marker, and Undo reverses it", () => {
+    const original = "-   [ ] Keep\n- [ ] Other\n";
+    const { editor, element } = open(original);
+    const before = editor.serialize();
+
+    const checkbox = element.querySelector<HTMLInputElement>("input[type='checkbox']")!;
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(reconcileMarkdown({ original, before, after: editor.serialize() })).toBe(
+      "-   [x] Keep\n- [ ] Other\n",
+    );
+    editor.undo();
+    expect(reconcileMarkdown({ original, before, after: editor.serialize() })).toBe(original);
+  });
+
   it("reports and performs undo and redo", () => {
     const { editor, tiptap } = open("Hello world\n");
     expect(editor.canUndo).toBe(false);
