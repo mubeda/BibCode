@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 91dd16c2aaa7)
+Spec: spec.md (sha256 3ce787dbffce)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -50,6 +50,9 @@ Branch: claude/next-pr-planning-13d367
 | 8.5 | Final gates, follow-up issue and report | 8 | Open | | |
 | 9.1 | Export a theme through the native Save dialog | 9 | Open | | Added by amendment A5 |
 | 9.2 | Ask before closing with unsaved Files edits | 9 | Open | | Added by amendment A5 |
+| 9.3 | The native close protocol | 9 | Open | | Added by plan review 3 |
+| 8.6 | Desktop end-to-end test for export and the close dialog | 8 | Open | | Added by plan review 3 |
+| 6.10 | A checkbox in a read-only file keeps source history | 6 | Open | | Added by amendment A6 |
 
 ## Log
 - 2026-11-09 22:30 Executor set to mstack-codex-review-workflow on branch claude/next-pr-planning-13d367. Round 1 lanes started: A (phase 1, sonnet medium), B (phase 2, opus medium), C (phase 6, opus medium), D (phase 7, opus medium). Codex reviews run through the codex CLI directly; the skill-codex `codex` skill is not installed.
@@ -69,7 +72,7 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 06:10 Codex review of C3 (triaged with the advisor): accepted (1) dispose-all ignores a failed settle, (3) test misses a reverted reconcileRead guard. Not blocking (2) native Close Window loses an undelivered edit: parity with source view, whose active session runs without autosave and no window-close handler exists, so R29 is met; ticketed below. Lane C4 (opus medium) is the last fix round on the delivery-failure path, plus C3's split-paragraph blank line and a toast for refused actions. Stop rule: later findings that need fault injection go to residual risk.
 
 ## Follow-ups to ticket
-- Read-only Markdown files: a task checkbox click in rendered view discards source undo history (lane C Codex 5; R34 keeps today's behavior).
-- `apps/web/src/proposedPlan.ts` download is cancelled in the desktop app for the same reason as theme export; the new save-file bridge can serve it.
 - Profiler events reference does not name the new `git-writes` shutdown step; `docs/testing/cross-platform-validation.md` lacks the new `background_status_`, `git_stop_` and `index_lock_cleanup_` filters (Phase 8).
 - 2026-11-10 06:20 Ruling: amendment A5, approved by the user: desktop theme export uses a new save-file bridge (R53 desktop scenario), and closing the window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62, fixed in this PR at the user's request). Added Phase 9 (Tasks 9.1, 9.2), round 2, after phases 6 and 7, run only when no other lane compiles Rust; Phase 8 now depends on it. Window close removed from the follow-ups list.
+- 2026-11-10 06:25 Lane D4 fixed the Phase 7 review findings on worktree-agent-a6c0d74ab718b8e46 (165ad1a2f..9d08385b6; web suite 10893 passed, scripts 921 passed): size check before reading, id recheck at Import, ring-owner markers on textarea, input-group, number-field and combobox chips, the ungated touch press colors (compiled selectors quoted), the A3 mutation check and a new R55 guard test. Triaged with the advisor: accepted; the input-group addon-button concern was checked and refuted (its ring keys only on input or textarea focus). Last D4 round: command palette opt-out, the contenteditable surfaces including the Phase 6 editor, and a raw storage-event conflict test.
+- 2026-11-10 06:25 Phase 9 revised after the advisor review (full Owns traced from saveDiagnosticLogs, a packaged end-to-end spec per task, six close-guard cases for the design note, proposedPlan download folded into 9.1). Codex plan review 3 running; the Phase 9 lane waits for it.

@@ -3,11 +3,11 @@
 - Goal: The combined branch is proven in the packaged desktop app, the user guide, runbooks, notices and changelog describe the seven changes, every repository gate passes, and the split-out follow-up issue exists.
 - Round: 5
 - Depends on: 1, 2, 3, 4, 5, 6, 7, 9
-- Owns: `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts`, `apps/desktop/e2e/wdio.conf.ts`, `docs/user/workspace-ui.md`, `docs/testing/**`, `apps/web/THIRD_PARTY_NOTICES.md`, `CHANGELOG.md`, and the one selected-state class in `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx`
+- Owns: `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts`, `apps/desktop/e2e/specs/desktop-save-and-close.e2e.ts`, `apps/desktop/e2e/support/app-lifecycle.ts`, `apps/desktop/e2e/wdio.conf.ts`, `docs/user/workspace-ui.md`, `docs/testing/**`, `apps/web/THIRD_PARTY_NOTICES.md`, `CHANGELOG.md`, and the one selected-state class in `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx`
 - Must not touch: source files of Phases 2 to 7 except to fix a defect an end-to-end test or a gate exposes, which reopens the owning task
 - Skills: issue-delivery (acceptance evidence per issue before any costly run)
 - Read first: `spec.md` sections Verification and Constraints; `docs/testing/README.md`, `docs/testing/macos-desktop.md` lines 233-259 and `docs/testing/linux-desktop.md` (how the packaged end-to-end suite is built and run on each system); `AGENTS.md` (Testing Runbook Maintenance, Task Completion Requirements, Sensitive Data)
-- Checkpoint: `vp check`, `vp run typecheck`, `vp run test`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p bibcode-server -j 2` all exit 0, and both new end-to-end specs pass. The branch is ready for a pull request that closes #340, #341, #342, #343, #344, #345 and #290.
+- Checkpoint: `vp check`, `vp run typecheck`, `vp run test`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p bibcode-server -j 2` all exit 0, and the three new end-to-end specs pass (`files-rich-markdown`, `appearance-themes` and Phase 9's `desktop-save-and-close`). The user guide, runbooks and changelog also describe the Phase 9 export and close dialog. The branch is ready for a pull request that closes #340, #341, #342, #343, #344, #345 and #290.
 
 Tasks run in this order: 8.4, 8.1, 8.2, 8.3, 8.5. If a later task changes product source, the packaged build and both specs are run again before Task 8.5 closes.
 
@@ -97,10 +97,28 @@ Steps
 6. [ ] Add seven lines to `CHANGELOG.md`, one per issue, in the file's existing voice, each ending with its issue number.
 7. [ ] Run `vp check`. Expected: no errors.
 
+### Task 8.6: Desktop end-to-end test for export and the close dialog
+
+- Satisfies: R53 (export in the desktop app), R62 (save all, discard and cancel, nothing unsaved)
+- Depends on: 8.2
+- Files: create `apps/desktop/e2e/specs/desktop-save-and-close.e2e.ts`; modify `apps/desktop/e2e/support/app-lifecycle.ts`; modify `apps/desktop/e2e/wdio.conf.ts`
+- Interfaces: consumes `saveTextFile` and its end-to-end seam (Task 9.1), the close request, reply and dialog (Tasks 9.2 and 9.3); produces the spec and a lifecycle change that runs the destructive close cases in their own app session and tolerates an app that has already closed during teardown.
+- Skills: none
+- Read first: `apps/desktop/e2e/wdio.conf.ts` near line 55 (specs share one session) and `apps/desktop/e2e/support/app-lifecycle.ts` near line 29 (the helper stops the backend before it closes the window); the Phase 9 design note (the export seam)
+- Tier: standard
+- TDD: exempt (an end-to-end proof of behavior Tasks 9.1 to 9.3 already drove red-green; a second packaged build only to see it fail costs tens of minutes, as decision P3 records)
+- Done when: `BIBCODE_E2E_SPEC=./specs/desktop-save-and-close.e2e.ts vp run test:ui:desktop` exits 0 against a packaged build of the integrated branch
+
+Steps
+
+1. [ ] Write the spec: export a custom theme through the real command with the end-to-end seam and assert the written file holds the exported JSON; type an unsaved edit, send a native close request, assert the dialog appears through the real DesktopBridge event, choose Cancel and assert the window, the server and the edit remain; choose Save all and assert the file on disk holds the edit and the app exits; with nothing unsaved, a close exits at once. Each closing case runs in its own app session.
+2. [ ] Change the lifecycle helper so a closing case requests the window close while the backend is still running, and teardown accepts an app that has already exited.
+3. [ ] Build the packaged app and run the Done when command. Expected: PASS. A failure that comes from Phase 9 code reopens the owning task.
+
 ### Task 8.5: Final gates, follow-up issue and report
 
 - Satisfies: support (closes the plan: the gates of AGENTS.md and the spec's open question)
-- Depends on: 8.3
+- Depends on: 8.3, 8.6
 - Files: modify `progress.md` of this plan folder (the executor's own record)
 - Interfaces: consumes every earlier task; produces the final report and one new GitHub issue.
 - Skills: none

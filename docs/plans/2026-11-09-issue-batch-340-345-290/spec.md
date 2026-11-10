@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3, A4 and A5 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution)
 Size: full    Mode: gated    Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -427,7 +427,7 @@ IF a Markdown file contains reference-style links or their definitions, footnote
 #### Scenario: unsupported construct
 - GIVEN a file with reference-style link definitions and a footnote
 - WHEN it is opened in rendered view
-- THEN it renders read-only with the notice, the formatting group cannot be activated, task checkboxes still work, and source view edits the file normally
+- THEN it renders read-only with the notice, the formatting group cannot be activated, task checkboxes still work and a tick keeps the file's source Undo history (amendment A6), and source view edits the file normally
 #### Scenario: representable variants stay editable
 - GIVEN a file with underlined (setext) headings, an aligned table and a hand-written `details` block
 - WHEN it is opened in rendered view
@@ -717,7 +717,7 @@ WHEN the theme library or a slot changes in one window, the app SHALL apply the 
 - THEN the second repaints with the saved values without a reload
 
 ### R62. Closing the window with unsaved Files edits asks first  [Must]
-WHEN the person closes the desktop window or quits the app while any Files edit is unsaved, in source or rendered view, the app SHALL keep the window open and show a dialog that lists the unsaved files with Save all, Discard and Cancel (amendment A5). Save all SHALL save every listed file through the existing save path and close only when every save succeeded; Discard SHALL close without saving; Cancel SHALL keep the window open with every edit intact. In browser mode the app SHALL ask the browser to warn before the page is left.
+WHEN the person closes the desktop window or quits the app while any Files edit is unsaved, in source or rendered view, the app SHALL keep the window open and show a dialog that lists the unsaved files with Save all, Discard and Cancel (amendment A5). Save all SHALL save every listed file through the existing save path and close only when every save succeeded; Discard SHALL close without saving; Cancel SHALL keep the window open with every edit intact. Restarting the app and installing an update SHALL ask the same way first. In browser mode the app SHALL ask the browser to warn before the page is left. If the web part of the app does not acknowledge the close request within a few seconds, the window SHALL close with a logged warning, so the app can always be closed. Ending the operating-system session (logging out or shutting down) cannot wait for an answer and is outside this requirement.
 #### Scenario: save all
 - GIVEN an unsaved rendered edit in one file and an unsaved source edit in another
 - WHEN the window is closed and Save all is chosen

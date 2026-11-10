@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 91dd16c2aaa7)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3, A4 and A5 approved in chat during execution), sha256 3ce787dbffce)
 Repository: this repository
 Base: main
 
@@ -35,6 +35,7 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A3 (R55, approved by the user in chat on 2026-11-09 during execution). Built-in Light already fails placeholder on background at about 3.1:1, so the literal rule would strip the background of nearly every light import. Revised by the user on 2026-11-10 after lane D2 measured that any off-white background (`#fffdf8` gives 3.08 against Light's 3.11) still counted as worse: a pair the base already fails is reset only when the import overrides that pair's text token; pairs the base passes keep the 4.5:1 rule.
 - A4 (R34, approved by the user in chat on 2026-11-10 during execution). Lane C measured remark parse times of 116 ms at 50 kB, 537 ms at 200 kB and 7.1 s at 1 MB, with two or three parses per open. A Markdown file larger than 128 KiB opens read-only in rendered view with the notice.
 - A5 (approved by the user in chat on 2026-11-10 during execution). Theme export in the desktop app uses a new save-file desktop bridge command with the native Save dialog, because wry cancels webview downloads when no download handler exists (R53 gains a desktop scenario). Closing the desktop window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62), filed into this PR by the user instead of a separate issue. Both are Phase 9.
+- A6 (R34, approved by the user in chat on 2026-11-10 during execution). A task checkbox ticked in a read-only Markdown file keeps that file's source Undo history (Task 6.10), instead of R34's "as today".
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus
@@ -149,7 +150,7 @@ Three files have a second, later owner by design, and the phases are in differen
 
 Shared files reserved for the executor: `progress.md` of this folder. Phase 6 alone changes `apps/web/package.json`, `pnpm-lock.yaml` and the dependency ledger. Phase 8 alone changes `CHANGELOG.md`, `apps/web/THIRD_PARTY_NOTICES.md`, `docs/user/workspace-ui.md` and `apps/desktop/e2e/wdio.conf.ts`.
 
-Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase 7 must not touch `components/pipelines/detail/**` (Phase 1) or `components/files/**` (Phase 6), and Phase 6 keeps its styles out of `index.css` (Phase 7). Rounds 2 to 5 have one phase each.
+Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase 7 must not touch `components/pipelines/detail/**` (Phase 1) or `components/files/**` (Phase 6), and Phase 6 keeps its styles out of `index.css` (Phase 7). Round 2 runs Phase 3 and Phase 9. They share `docs/architecture/overview.md`: Phase 3 owns its status-read text, and the coordinator writes Phase 9's DesktopBridge paragraph at integration. They also share the Rust build slot: Phase 9's cargo and contract-check steps run only when Phase 3 (or a later server phase) is not compiling. Rounds 3 to 5 have one phase each.
 
 ## Traceability
 
@@ -188,7 +189,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R31 | 6.3, 6.9, 8.1 |
 | R32 | 6.8, 6.4 |
 | R33 | 6.3 |
-| R34 | 6.8, 6.9, 6.4 |
+| R34 | 6.8, 6.9, 6.4, 6.10 |
 | R35 | 6.5 |
 | R36 | 7.2 |
 | R37 | 7.4, 7.6, 8.2 |
@@ -207,7 +208,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R50 | 7.3, 8.4 |
 | R51 | 7.7, 7.14 |
 | R52 | 7.9 |
-| R53 | 7.10, 9.1 |
+| R53 | 7.10, 9.1, 8.6 |
 | R54 | 7.9 |
 | R55 | 7.10 |
 | R56 | 7.4 |
@@ -216,7 +217,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R59 | 7.12 |
 | R60 | 7.8 |
 | R61 | 7.5 |
-| R62 | 9.2 |
+| R62 | 9.2, 9.3, 8.6 |
 
 ## End-to-end verification
 
@@ -225,6 +226,7 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 - `vp run check:contracts`, `vp run check:dependency-ledger` and `vp run check:markdown-links` exit 0, with no diff under `packages/contracts/fixtures`.
 - `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts vp run test:ui:desktop` and `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop` exit 0 against a packaged build of the final branch.
 - After the branch is pushed at the user's request, the Windows and macOS CI jobs pass the `background_status_` and `index_lock_cleanup_` steps added by Tasks 2.1 and 2.3.
+- `BIBCODE_E2E_SPEC=./specs/desktop-save-and-close.e2e.ts vp run test:ui:desktop` exits 0 against the packaged build (Phase 9's spec), and `cargo test -p bibcode-desktop -j 2` exits 0.
 - `vp test run scripts` exits 0, including the sensitive-data guard.
 - Both design notes exist with an Approved status line and a Review handling section.
 

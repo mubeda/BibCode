@@ -220,3 +220,23 @@ Steps
 5. [ ] Run the same command. Expected: PASS, at least 6 tests. A supported fixture for which `canReconcile` is false is a schema defect to fix here, not a reason to mark the fixture unsupported.
 6. [ ] Prove the test can fail: drop the table node from the schema, run the same command. Expected: FAIL in the table test. Restore and run again. Expected: PASS.
 7. [ ] Run `vp check` and the web-only typecheck `pnpm --filter @bibcode/web exec tsc --noEmit`. Expected: no errors.
+
+### Task 6.10: A checkbox in a read-only file keeps source history
+
+- Satisfies: R34 (task checkboxes still work, amendment A6)
+- Depends on: 6.4
+- Files: modify `apps/web/src/components/files/FilePreviewPanel.tsx`; modify `apps/web/src/components/files/FilePreviewPanel.test.tsx`; modify `apps/web/src/components/files/fileEditingSession.ts` and its test if the change needs a session entry point
+- Interfaces: consumes `changeFromRichEditor` or an equivalent session entry that keeps source Undo history (Task 6.2); changes the read-only rendered view's checkbox handler, which today calls `changeOutsideEditor` and discards source history.
+- Skills: none
+- Read first: the Task 6.4 test `a file with a footnote renders read-only with a notice and its task checkboxes still work`
+- Tier: standard
+- TDD: red-green
+- Done when: from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/files` exits 0 with the new test passing
+
+Steps
+
+1. [ ] Add `ticking a checkbox in a read-only Markdown file keeps the source Undo history`: make two source edits, switch to rendered view of a file with a footnote, tick a checkbox, switch back, and Undo three times; the tick and both edits are undone in order. Change the Task 6.4 test's assertion that `changeFromRichEditor` is not called to assert that the source history survives. Run the Done when command. Expected: FAIL.
+2. [ ] Route the read-only checkbox tick through the history-keeping entry. Run the Done when command. Expected: PASS.
+3. [ ] Prove the test can fail: route the tick back through `changeOutsideEditor`. Expected: FAIL. Restore. Expected: PASS.
+4. [ ] Run `vp check` on the changed files and `pnpm --filter @bibcode/web exec tsc --noEmit`. Expected: no errors.
+

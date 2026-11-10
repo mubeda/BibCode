@@ -1,57 +1,85 @@
 # Phase 9: Desktop save and close
 
-- Goal: In the desktop app, Export saves a theme file through the native Save dialog, and closing the window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel, with a reviewed design note and tests (amendment A5; R53, R62).
+- Goal: In the desktop app, Export saves a theme file through the native Save dialog, and closing the window, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel, with a reviewed design note and tests (amendment A5; R53, R62).
 - Round: 2
 - Depends on: 6, 7
-- Owns: `packages/contracts/src/ipc.ts`, `apps/desktop/src-tauri/src/bridge.rs`, `apps/desktop/src-tauri/src/window.rs`, `apps/desktop/src-tauri/src/lib.rs` (registration only), `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` and its test (the export call only), `apps/web/src/components/files/**` (the close guard only), a new close dialog component under `apps/web/src/components/files/`, `docs/plans/2026-11-10-desktop-save-and-close-design.md`
-- Must not touch: `apps/server/**` (Phases 3 to 5), `apps/web/src/index.css`, `apps/web/src/themes/**` except the export call site, `docs/plans/2026-11-09-issue-batch-340-345-290/**`
+- Owns: `packages/contracts/src/ipc.ts`, `apps/web/src/tauriDesktopBridge.ts`, `apps/desktop/src-tauri/src/bridge.rs`, `apps/desktop/src-tauri/src/window.rs`, `apps/desktop/src-tauri/src/lib.rs` (command registration and the exit-request path), `apps/desktop/src-tauri/permissions/desktop-bridge.toml`, `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` and its test (the export call only), `apps/web/src/proposedPlan.ts` and its test (the download helper only), `apps/web/src/components/files/fileEditingSessionRegistry.ts` and its test (the unsaved list and Save all only), a new `apps/web/src/components/files/UnsavedChangesCloseDialog.tsx` and its test, `apps/web/src/components/ChatView.tsx` (mounting the close guard next to the registry owner only), `apps/web/src/components/desktop/UpdateProtectionDialog.tsx` and the `restartApp` call sites (the unsaved check only), `docs/plans/2026-11-10-desktop-save-and-close-design.md`
+- Must not touch: `apps/server/**` (Phases 3 to 5), `apps/web/src/index.css`, `apps/web/src/themes/**`, `apps/desktop/e2e/**` (Phase 8, Task 8.6), `docs/architecture/overview.md` (the coordinator writes its DesktopBridge paragraph at integration), `docs/plans/2026-11-09-issue-batch-340-345-290/**`
 - Skills: test-driven-development (each behavior starts from a failing test); vercel-react-best-practices (AGENTS.md requires it for changed React components); better-accessibility (the close dialog and its focus order)
-- Read first: `spec.md` R53 (desktop export scenario) and R62; `AGENTS.md` (Architectural Decision Standards: privileged desktop operations cross `DesktopBridge` commands and events); `apps/web/src/diagnostics/downloadDiagnosticLogs.ts` lines 155-240 and `apps/web/src/components/files/fileTransfers.ts` lines 10-60 (the existing bridge save patterns); `apps/web/src/components/files/fileEditingSessionRegistry.ts` (settle and the `"failed"` result); `docs/plans/2026-11-09-files-rich-markdown-toolbar-design.md` (delivery contract)
-- Checkpoint: `cargo test -p bibcode-desktop -j 2` and, from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/files src/components/settings` exit 0. In the desktop app, Export opens the Save dialog, and closing with an unsaved edit shows the three-choice dialog.
+- Read first: `spec.md` R53 (desktop export scenario) and R62; `AGENTS.md` (Architectural Decision Standards: privileged desktop operations cross `DesktopBridge` commands and events); `apps/web/src/diagnostics/downloadDiagnosticLogs.ts` lines 155-240 and `apps/web/src/components/files/fileTransfers.ts` lines 10-60 (the existing bridge save patterns); `apps/web/src/components/files/fileEditingSessionRegistry.ts` (settle and the `"failed"` result); `apps/web/src/components/ChatView.tsx` near line 1810 (the registry owner) and near line 7279 (the conditional Files view); `apps/desktop/src-tauri/src/lib.rs` lines 280-330 (`ExitRequested` stops the embedded server at once; `Exit` without `ExitRequested` on Windows session end); `apps/desktop/src-tauri/src/bridge.rs` near line 1095 (`desktop_bridge_restart_app`) and `apps/desktop/src-tauri/src/updates.rs` lines 890-940 (the update install stops backends, then restarts); `docs/plans/2026-11-09-files-rich-markdown-toolbar-design.md` (delivery contract)
+- Checkpoint: `cargo test -p bibcode-desktop -j 2` and, from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/files src/components/settings src/components/desktop src/proposedPlan.test.ts` exit 0. In the desktop app, Export opens the Save dialog, and closing with an unsaved edit shows the three-choice dialog.
 
-Phase 9 compiles desktop Rust, so it runs only when no other lane compiles Rust. It starts from the integrated round 1 branch.
+Rust build slot: `bibcode-desktop` depends on `bibcode-server`, and `vp run check:contracts` runs `cargo test -p bibcode-server --test rpc_wire` (root `package.json` line 33). Every step that runs cargo, `vp run check:contracts`, workspace Clippy or desktop tests runs only when no other lane compiles Rust. Tasks 9.1 (web and contract code) and 9.2 are TypeScript and may run beside a server phase; their cargo and contract-check steps wait for the slot. Task 9.3 is Rust and waits for the slot. The phase starts from the integrated round 1 branch.
+
+The design note (Task 9.1 step 1) must decide, each with a test or a stated limit:
+
+1. Every exit path: window close, the Close Window menu action, app quit and `RunEvent::ExitRequested`, `desktop_bridge_restart_app`, update install, relaunch, and OS session end. Window close and quit ask through the native close protocol (Task 9.3). Restart and update install are started by the web through bridge calls, so the web asks before calling them (Task 9.2). OS session end (Windows `Exit` without `ExitRequested`, macOS logout) cannot wait for the person: it is stated in R62 as a limit, with whatever the app can still do (for example a best-effort save that does not block).
+2. One escape rule, so the app can never become unclosable: when the desktop asks the web and the web does not acknowledge within a few seconds (the renderer is gone or hung), the window closes with a logged warning; once the web has acknowledged, the desktop waits for the person's answer with no timeout.
+3. Approval happens before anything irreversible: the desktop must hold a close or quit before `ExitRequested` stops the embedded server (`lib.rs` line 286), and Cancel must leave the server and the window usable.
+4. "Unsaved" includes an edit still inside the 300 ms rendered-view delay and an undelivered edit; typing and closing at once shows the dialog.
+5. A save that fails for any reason (a disk conflict or another error) keeps the window open and shows the error on that file.
+6. The guard lives with the registry owner in `ChatView.tsx`, so it works while the Files view is hidden or unmounted.
+7. The end-to-end seam for Export bypasses only the native picker (for example a save path honored only in the end-to-end build) and keeps the real command and write; the note says why it cannot be used outside that build.
 
 ## Tasks
 
-### Task 9.1: Export a theme through the native Save dialog
+### Task 9.1: Export a theme and a plan through the native Save dialog
 
 - Satisfies: R53 (export in the desktop app)
 - Depends on: none
-- Files: modify `packages/contracts/src/ipc.ts`; modify `apps/desktop/src-tauri/src/bridge.rs`; modify `apps/desktop/src-tauri/src/lib.rs`; modify `apps/web/src/components/settings/AppearanceSettingsPanel.tsx`; test `apps/web/src/components/settings/AppearanceSettingsPanel.test.tsx`; create `docs/plans/2026-11-10-desktop-save-and-close-design.md`
-- Interfaces: produces a `DesktopBridge` method `saveTextFile(input: { suggestedName: string; contents: string; mimeType: string }): Promise<string | null>` (the saved path, or `null` when the person cancels; a rejection for a failed write) and its Tauri command. The web export calls it when `window.desktopBridge?.saveTextFile` exists and keeps the blob link in browser mode.
+- Files: create `docs/plans/2026-11-10-desktop-save-and-close-design.md`; modify `packages/contracts/src/ipc.ts`; modify `apps/web/src/tauriDesktopBridge.ts`; modify `apps/desktop/src-tauri/src/bridge.rs`; modify `apps/desktop/src-tauri/src/lib.rs`; modify `apps/desktop/src-tauri/permissions/desktop-bridge.toml`; modify `apps/web/src/components/settings/AppearanceSettingsPanel.tsx` and its test; modify `apps/web/src/proposedPlan.ts`; create or modify `apps/web/src/proposedPlan.test.ts`
+- Interfaces: produces a `DesktopBridge` method `saveTextFile(input: { suggestedName: string; contents: string; mimeType: string }): Promise<string | null>` (the saved path, `null` when the person cancels, a rejection for a failed write), its adapter in `tauriDesktopBridge.ts`, its permission entry and its Tauri command. The theme export and `downloadPlanAsTextFile` call it when `window.desktopBridge?.saveTextFile` exists and keep the blob link in browser mode. `downloadPlanAsTextFile` handles a rejection itself and reports it through the existing toast, because its two callers (`PlanSidebar.tsx`, `ProposedPlanCard.tsx`) ignore its result.
 - Skills: none
 - Read first: the diagnostics save path named in the phase's Read first line
 - Tier: most capable
 - TDD: red-green
-- Done when: `cargo test -p bibcode-desktop -j 2 save_text_file` and, from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/settings/AppearanceSettingsPanel.test.tsx` exit 0 with the new tests passing
+- Done when: from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/settings/AppearanceSettingsPanel.test.tsx src/proposedPlan.test.ts` exits 0 with the new tests passing, and, in the Rust slot, `cargo test -p bibcode-desktop -j 2 save_text_file` exits 0
 
 Steps
 
-1. [ ] Write the design note: the two new bridge parts (this command and Task 9.2's close event), the alternatives considered (a Tauri download handler, clipboard export, a beforeunload-only guard) and why they lost, the trust boundary (the command writes only to a path the person picked in the native dialog), and the follow-up that `apps/web/src/proposedPlan.ts` can use the same command. Get a read-only Codex review and an advisor review, process both with `receiving-review.md`, list each finding under "Review handling", and set `Status: Approved 2026-11-10 (pre-approved: reviewed by Codex and the advisor)`.
-2. [ ] In `AppearanceSettingsPanel.test.tsx`, add `Export in the desktop app saves through the bridge with <id>.theme.json`, `a cancelled save writes nothing and shows no error` and `a failed save shows an error`. Run the Done when web command. Expected: FAIL, the bridge is not called.
-3. [ ] Add a Rust unit test `save_text_file_writes_the_contents_to_the_chosen_path` and `save_text_file_returns_none_when_cancelled` with the dialog behind a test seam. Run `cargo test -p bibcode-desktop -j 2 save_text_file`. Expected: FAIL to compile, the command does not exist.
-4. [ ] Implement the contract method, the Tauri command (native Save dialog, then a write; a failed write is an error) and the web call.
-5. [ ] Run both Done when commands. Expected: PASS.
-6. [ ] Prove the tests can fail: make the web export ignore the bridge, run the web command. Expected: FAIL. Restore and run again. Expected: PASS.
-7. [ ] Run `vp run check:contracts`, `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: no errors and no fixture diff, or a regenerated fixture committed with the change.
+1. [ ] Write the design note covering the seven decisions above, the new bridge parts (this command, Task 9.3's close request and reply), the alternatives considered (a Tauri download handler, clipboard export, a `beforeunload`-only guard) and why they lost, and the trust boundary (the command writes only to a path the person picked in the native dialog, or to the end-to-end seam path in the end-to-end build). Get a read-only Codex review and an advisor review, process both with `receiving-review.md`, list each finding under "Review handling", and set `Status: Approved 2026-11-10 (pre-approved: reviewed by Codex and the advisor)`.
+2. [ ] Add web tests: in `AppearanceSettingsPanel.test.tsx`, `Export in the desktop app saves through the bridge with <id>.theme.json`, `a cancelled save writes nothing and shows no error`, `a failed save shows an error`, and `Export in the browser keeps the download link`; in `proposedPlan.test.ts`, the same four cases for `downloadPlanAsTextFile`. Run the Done when web command. Expected: FAIL, the bridge is not called.
+3. [ ] Implement the contract method, the adapter, the two web call sites and the helper's error handling. Run the Done when web command. Expected: PASS.
+4. [ ] In the Rust slot: add `save_text_file_writes_the_contents_to_the_chosen_path`, `save_text_file_returns_none_when_cancelled` and `save_text_file_reports_a_failed_write` with the dialog behind a test seam. Run `cargo test -p bibcode-desktop -j 2 save_text_file`. Expected: FAIL to compile. Implement the command, its registration and the permission entry. Run it again. Expected: PASS.
+5. [ ] Prove the tests can fail: make the theme export ignore the bridge, run the web command. Expected: FAIL. Restore and run again. Expected: PASS.
+6. [ ] In the Rust slot: run `vp run check:contracts`, `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: no errors, and no fixture diff or a regenerated fixture committed with the change.
 
-### Task 9.2: Ask before closing with unsaved Files edits
+### Task 9.2: Ask before leaving with unsaved Files edits (web)
 
-- Satisfies: R62 (save all, a save is blocked, discard and cancel, nothing unsaved)
+- Satisfies: R62 (save all, a save is blocked, discard and cancel, nothing unsaved, browser mode)
 - Depends on: 9.1
-- Files: modify `apps/desktop/src-tauri/src/window.rs`; modify `apps/desktop/src-tauri/src/bridge.rs`; modify `packages/contracts/src/ipc.ts`; modify `apps/web/src/components/files/fileEditingSessionRegistry.ts`; create `apps/web/src/components/files/UnsavedChangesCloseDialog.tsx` and its test; modify the design note
-- Interfaces: consumes the registry's sessions and `settle()` with its `"failed"` result; produces a desktop close-request event the web answers (close now, or keep open), a registry method `unsavedSessions(): { path: string }[]` and `saveAll(): Promise<"saved" | "blocked">`, and the dialog with props `{ files: string[]; onSaveAll(): void; onDiscard(): void; onCancel(): void }`. The Close Window menu action and app quit go through the same request. In browser mode the registry adds a `beforeunload` warning while a session is unsaved.
+- Files: modify `apps/web/src/components/files/fileEditingSessionRegistry.ts` and its test; create `apps/web/src/components/files/UnsavedChangesCloseDialog.tsx` and its test; modify `apps/web/src/components/ChatView.tsx`; modify `apps/web/src/components/desktop/UpdateProtectionDialog.tsx` and the `restartApp` call sites; modify the design note
+- Interfaces: consumes the registry's sessions, `flush()` and `settle()` with their `"failed"` result, and the pending-edit flusher; produces `unsavedSessions(): { path: string }[]` (an edit inside the 300 ms delay and an undelivered edit count as unsaved), `saveAll(): Promise<"saved" | "blocked">`, `askBeforeLeaving(reason: "close" | "quit" | "restart" | "update"): Promise<"proceed" | "stay">` (shows the dialog when anything is unsaved), and the dialog with props `{ files: string[]; onSaveAll(): void; onDiscard(): void; onCancel(): void }`, mounted next to the registry owner in `ChatView.tsx`. Restart and update install call `askBeforeLeaving` before their bridge call. In browser mode the registry adds a `beforeunload` warning while anything is unsaved.
 - Skills: better-accessibility (the dialog's focus lands on Save all and Escape cancels)
-- Read first: `apps/desktop/src-tauri/src/window.rs` lines 60-90 (the Close Window action calls `window.close()` today)
+- Read first: `apps/web/src/components/desktop/UpdateProtectionDialog.tsx` (the existing update confirmation)
 - Tier: most capable
 - TDD: red-green
-- Done when: `cargo test -p bibcode-desktop -j 2 close_request` and, from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/files` exit 0 with the new tests passing
+- Done when: from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/files src/components/desktop` exits 0 with the new tests passing
 
 Steps
 
-1. [ ] Add web tests for each R62 scenario: `closing with a rendered and a source edit and choosing Save all writes both and allows the close`, `Save all with a file changed on disk keeps the window open and shows the reload-or-overwrite choice`, `Discard allows the close without writing`, `Cancel keeps the window open and the edits`, `closing with nothing unsaved closes at once without a dialog`, and `browser mode warns before unload only while an edit is unsaved`. Add Rust tests `close_request_waits_for_the_web_answer` and `close_request_closes_when_the_web_allows_it`. Run both Done when commands. Expected: FAIL.
-2. [ ] Implement: the desktop intercepts the window's close request and app quit, asks the web, and closes only on an allow answer (with a timeout that keeps the window open and logs a warning when the web never answers); the web shows the dialog when `unsavedSessions()` is not empty.
+1. [ ] Add tests: `Save all writes a rendered and a source edit and proceeds`, `Save all with a file changed on disk stays and shows the reload-or-overwrite choice`, `a save that fails for another reason stays and shows the error`, `Discard proceeds without writing`, `Cancel stays and keeps the edits`, `nothing unsaved proceeds at once without a dialog`, `typing in rendered view and leaving at once shows the dialog`, `the guard works while the Files view is not mounted`, `restart and update install ask first`, and `browser mode warns before unload only while an edit is unsaved`. Run the Done when command. Expected: FAIL.
+2. [ ] Implement the registry methods, the dialog, its mount in `ChatView.tsx` and the restart and update checks.
+3. [ ] Run the Done when command. Expected: PASS.
+4. [ ] Prove the tests can fail: make `saveAll` report `"saved"` without saving. Expected: FAIL. Restore. Expected: PASS.
+5. [ ] Review the dialog and the mount against `vercel-react-best-practices` and `UI.md`, and record both results for the final report.
+
+### Task 9.3: The native close protocol
+
+- Satisfies: R62 (window close and quit ask through the web; the escape rule; Cancel keeps the server usable)
+- Depends on: 9.2
+- Files: modify `apps/desktop/src-tauri/src/window.rs`; modify `apps/desktop/src-tauri/src/lib.rs`; modify `apps/desktop/src-tauri/src/bridge.rs`; modify `packages/contracts/src/ipc.ts`; modify `apps/web/src/tauriDesktopBridge.ts`; modify `apps/web/src/components/ChatView.tsx` (the subscription only); modify the design note
+- Interfaces: consumes `askBeforeLeaving` (Task 9.2); produces a desktop close-request event (with a request id) and a reply command (`allow` or `stay`, plus an acknowledge step), the window-close and Close Window menu interception, and the quit interception that holds `ExitRequested` (`api.prevent_exit()`) before the embedded server stops, then exits once the web allows it.
+- Skills: none
+- Read first: `apps/desktop/src-tauri/src/lib.rs` lines 280-330 and `window.rs` lines 60-90
+- Tier: most capable
+- TDD: red-green
+- Done when: in the Rust slot, `cargo test -p bibcode-desktop -j 2 close_request` exits 0, and, from `apps/web`, the Task 9.2 command still exits 0
+
+Steps
+
+1. [ ] Add Rust tests: `close_request_waits_for_the_web_answer`, `close_request_closes_when_the_web_allows_it`, `close_request_keeps_the_window_and_the_server_when_the_web_says_stay`, `close_request_closes_with_a_warning_when_the_web_never_acknowledges`, `quit_waits_for_the_web_before_the_server_stops`. Run `cargo test -p bibcode-desktop -j 2 close_request`. Expected: FAIL to compile.
+2. [ ] Implement the event, the reply command and its permission, the interceptions and the escape rule; subscribe in `ChatView.tsx` through the adapter.
 3. [ ] Run both Done when commands. Expected: PASS.
-4. [ ] Prove the tests can fail: make `saveAll` report `"saved"` without saving, run the web command. Expected: FAIL. Restore and run again. Expected: PASS.
-5. [ ] Review the dialog against `vercel-react-best-practices` and `UI.md`, and record both results for the final report.
-6. [ ] Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `vp run check:contracts` and `vp run check:markdown-links`. Expected: no errors.
+4. [ ] Prove the tests can fail: make the reply ignore `stay`. Expected: FAIL. Restore. Expected: PASS.
+5. [ ] Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `vp run check:contracts` and `vp run check:markdown-links`. Expected: no errors.
