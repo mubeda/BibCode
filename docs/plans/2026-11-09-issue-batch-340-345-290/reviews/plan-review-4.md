@@ -14,5 +14,3 @@ Round 1 findings **4, 6 and 7 are handled**. Export ownership covers contracts â
 
 No files changed; the existing `progress.md` modification remains. `git diff --check 3075a1355..9ff6acd01 -- docs/plans/2026-11-09-issue-batch-340-345-290` reported whitespace errors.
 Not run: tests, builds, native scenarios or CodeGraph sync. Profiler-related risk remains shutdown ordering and renderer-failure warning coverage.
-
-

@@ -21,8 +21,6 @@ The export’s main wiring ownership is otherwise covered: contracts → `tauriD
 Read-only validation: reviewed the requested diff and source; `git diff --check 3075a1355 -- docs/plans/2026-11-09-issue-batch-340-345-290` passed. No files were written.
 Not run: tests, builds, native scenarios, or CodeGraph sync. Profiler-related risk is shutdown ordering and warning coverage, which Phase 9 must preserve and verify.
 
-
-
 ## Handling (coordinator with the advisor, 2026-11-10)
 
 Reviewer: Codex gpt-6.1-sol, effort high, round 1 of 2 for the Phase 9 change. All seven findings accepted.

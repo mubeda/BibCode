@@ -1,60 +1,61 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 da8ba820cde1)
+Spec: spec.md (sha256 170eb2432246)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
 Branch: claude/next-pr-planning-13d367
 
-| Task | Title | Phase | State | Owner | Note |
-|---|---|---|---|---|---|
-| 1.1 | Restyle the stage header as a group label | 1 | Closed | A, sonnet | 58 tests pass; Codex finding fixed |
-| 2.1 | Prove the lock source and make background reads lock-free | 2 | In progress | B, opus | |
-| 2.2 | Ask Git to stop before killing it | 2 | In progress | B, opus | |
-| 2.3 | Remove BiBCode's own leftover lock and leave none at shutdown | 2 | In progress | B, opus | |
-| 3.1 | Let a mutation reopen status reads while it keeps the write lock | 3 | In progress | E, opus | |
-| 3.2 | Stacked actions deliver status while the push waits | 3 | In progress | E, opus | |
-| 3.3 | Git Manager push-family operations deliver status; pull and fetch do not | 3 | In progress | E, opus | |
-| 4.1 | Server guidance for a remote missing-credentials push | 4 | Open | | |
-| 4.2 | Show the guidance and keep Git's line readable in both surfaces | 4 | Open | | |
-| 5.1 | Record the worktrees BiBCode creates | 5 | Open | | |
-| 5.2 | Warn only for folders with worktree evidence | 5 | Open | | |
-| 6.1 | Write and review the design note | 6 | In progress | C, opus | |
-| 6.2 | Let the session take rich edits without losing source history | 6 | In progress | C, opus | |
-| 6.3 | Source-preserving reconcile | 6 | In progress | C, opus | |
-| 6.4 | Editable rendered surface on the existing save path | 6 | In progress | C, opus | |
-| 6.5 | Formatting group and its commands | 6 | In progress | C, opus | |
-| 6.6 | Link dialog | 6 | In progress | C, opus | |
-| 6.7 | Insert image | 6 | In progress | C, opus | |
-| 6.8 | Frontmatter split and the read-only rule | 6 | In progress | C, opus | |
-| 6.9 | Editor packages, schema and a faithful round trip | 6 | In progress | C, opus | |
-| 7.1 | Write and review the design note | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.2 | Theme file format and validation | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.3 | New color tokens that default to today's look | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.4 | Built-in theme files and the contrast check | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.5 | Theme library and slots store | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.6 | Apply a theme, and paint it before the app appears | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.7 | New terminal sessions follow the theme when asked to | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.8 | Appearance section, theme list and its actions | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.9 | Theme editor with live preview, terminal colors and contrast warnings | 7 | In progress | D2, opus | |
-| 7.10 | Export and import | 7 | In progress | D2, opus | |
-| 7.11 | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7 | In progress | D2, opus | |
-| 7.12 | Focus ring and control shadow tokens | 7 | In progress | D2, opus | |
-| 7.13 | One color parser and one token resolver | 7 | In progress | D, opus | Done when green; Codex review running |
-| 7.14 | The pipeline job log follows the terminal palette | 7 | In progress | D, opus | Done when green; Codex review running |
-| 8.1 | Desktop end-to-end test for rich Markdown editing | 8 | Open | | |
-| 8.2 | Desktop end-to-end test for themes | 8 | Open | | |
-| 8.3 | User guide, runbooks and notices | 8 | Open | | |
-| 8.4 | Last token switch and changelog | 8 | Open | | |
-| 8.5 | Final gates, follow-up issue and report | 8 | Open | | |
-| 9.1 | Export a theme through the native Save dialog | 9 | Open | | Added by amendment A5 |
-| 9.2 | Ask before closing with unsaved Files edits | 9 | Open | | Added by amendment A5 |
-| 9.3 | The native close protocol | 9 | Open | | Added by plan review 3 |
-| 8.6 | Desktop end-to-end test for export and the close dialog | 8 | Open | | Added by plan review 3 |
-| 6.10 | A checkbox in a read-only file keeps source history | 6 | Open | | Added by amendment A6 |
+| Task | Title                                                                     | Phase | State       | Owner     | Note                                  |
+| ---- | ------------------------------------------------------------------------- | ----- | ----------- | --------- | ------------------------------------- |
+| 1.1  | Restyle the stage header as a group label                                 | 1     | Closed      | A, sonnet | 58 tests pass; Codex finding fixed    |
+| 2.1  | Prove the lock source and make background reads lock-free                 | 2     | In progress | B, opus   |                                       |
+| 2.2  | Ask Git to stop before killing it                                         | 2     | In progress | B, opus   |                                       |
+| 2.3  | Remove BiBCode's own leftover lock and leave none at shutdown             | 2     | In progress | B, opus   |                                       |
+| 3.1  | Let a mutation reopen status reads while it keeps the write lock          | 3     | In progress | E, opus   |                                       |
+| 3.2  | Stacked actions deliver status while the push waits                       | 3     | In progress | E, opus   |                                       |
+| 3.3  | Git Manager push-family operations deliver status; pull and fetch do not  | 3     | In progress | E, opus   |                                       |
+| 4.1  | Server guidance for a remote missing-credentials push                     | 4     | Open        |           |                                       |
+| 4.2  | Show the guidance and keep Git's line readable in both surfaces           | 4     | Open        |           |                                       |
+| 5.1  | Record the worktrees BiBCode creates                                      | 5     | Open        |           |                                       |
+| 5.2  | Warn only for folders with worktree evidence                              | 5     | Open        |           |                                       |
+| 6.1  | Write and review the design note                                          | 6     | In progress | C, opus   |                                       |
+| 6.2  | Let the session take rich edits without losing source history             | 6     | In progress | C, opus   |                                       |
+| 6.3  | Source-preserving reconcile                                               | 6     | In progress | C, opus   |                                       |
+| 6.4  | Editable rendered surface on the existing save path                       | 6     | In progress | C, opus   |                                       |
+| 6.5  | Formatting group and its commands                                         | 6     | In progress | C, opus   |                                       |
+| 6.6  | Link dialog                                                               | 6     | In progress | C, opus   |                                       |
+| 6.7  | Insert image                                                              | 6     | In progress | C, opus   |                                       |
+| 6.8  | Frontmatter split and the read-only rule                                  | 6     | In progress | C, opus   |                                       |
+| 6.9  | Editor packages, schema and a faithful round trip                         | 6     | In progress | C, opus   |                                       |
+| 7.1  | Write and review the design note                                          | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.2  | Theme file format and validation                                          | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.3  | New color tokens that default to today's look                             | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.4  | Built-in theme files and the contrast check                               | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.5  | Theme library and slots store                                             | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.6  | Apply a theme, and paint it before the app appears                        | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.7  | New terminal sessions follow the theme when asked to                      | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.8  | Appearance section, theme list and its actions                            | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.9  | Theme editor with live preview, terminal colors and contrast warnings     | 7     | In progress | D2, opus  |                                       |
+| 7.10 | Export and import                                                         | 7     | In progress | D2, opus  |                                       |
+| 7.11 | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7     | In progress | D2, opus  |                                       |
+| 7.12 | Focus ring and control shadow tokens                                      | 7     | In progress | D2, opus  |                                       |
+| 7.13 | One color parser and one token resolver                                   | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 7.14 | The pipeline job log follows the terminal palette                         | 7     | In progress | D, opus   | Done when green; Codex review running |
+| 8.1  | Desktop end-to-end test for rich Markdown editing                         | 8     | Open        |           |                                       |
+| 8.2  | Desktop end-to-end test for themes                                        | 8     | Open        |           |                                       |
+| 8.3  | User guide, runbooks and notices                                          | 8     | Open        |           |                                       |
+| 8.4  | Last token switch and changelog                                           | 8     | Open        |           |                                       |
+| 8.5  | Final gates, follow-up issue and report                                   | 8     | Open        |           |                                       |
+| 9.1  | Export a theme through the native Save dialog                             | 9     | Open        |           | Added by amendment A5                 |
+| 9.2  | Ask before closing with unsaved Files edits                               | 9     | Open        |           | Added by amendment A5                 |
+| 9.3  | The native close protocol                                                 | 9     | Open        |           | Added by plan review 3                |
+| 8.6  | Desktop end-to-end test for export and the close dialog                   | 8     | Open        |           | Added by plan review 3                |
+| 6.10 | A checkbox in a read-only file keeps source history                       | 6     | Open        |           | Added by amendment A6                 |
 
 ## Log
+
 - 2026-11-09 22:30 Executor set to mstack-codex-review-workflow on branch claude/next-pr-planning-13d367. Round 1 lanes started: A (phase 1, sonnet medium), B (phase 2, opus medium), C (phase 6, opus medium), D (phase 7, opus medium). Codex reviews run through the codex CLI directly; the skill-codex `codex` skill is not installed.
 - 2026-11-09 22:35 Ruling: spec amendment A3 to R55 (fixed pair resets only when below 4.5:1 and below the base's ratio), approved by the user in chat, because built-in Light fails placeholder on background. Spec hash updated to c6b1062039a1. Cost if wrong: imports could keep a low-contrast pair the base already has.
 - 2026-11-09 22:35 Ruling: lane D widens Task 7.3 to switch the selected-state class in 13 more files (bg-accent to bg-selected only), because R50's selected-row scenario needs real rows on the token and no running lane owns them. Cost if wrong: a selected row's look changes in a custom theme where it should not.
@@ -72,6 +73,7 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 06:10 Codex review of C3 (triaged with the advisor): accepted (1) dispose-all ignores a failed settle, (3) test misses a reverted reconcileRead guard. Not blocking (2) native Close Window loses an undelivered edit: parity with source view, whose active session runs without autosave and no window-close handler exists, so R29 is met; ticketed below. Lane C4 (opus medium) is the last fix round on the delivery-failure path, plus C3's split-paragraph blank line and a toast for refused actions. Stop rule: later findings that need fault injection go to residual risk.
 
 ## Follow-ups to ticket
+
 - Profiler events reference does not name the new `git-writes` shutdown step; `docs/testing/cross-platform-validation.md` lacks the new `background_status_`, `git_stop_` and `index_lock_cleanup_` filters (Phase 8).
 - 2026-11-10 06:20 Ruling: amendment A5, approved by the user: desktop theme export uses a new save-file bridge (R53 desktop scenario), and closing the window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62, fixed in this PR at the user's request). Added Phase 9 (Tasks 9.1, 9.2), round 2, after phases 6 and 7, run only when no other lane compiles Rust; Phase 8 now depends on it. Window close removed from the follow-ups list.
 - 2026-11-10 06:25 Lane D4 fixed the Phase 7 review findings on worktree-agent-a6c0d74ab718b8e46 (165ad1a2f..9d08385b6; web suite 10893 passed, scripts 921 passed): size check before reading, id recheck at Import, ring-owner markers on textarea, input-group, number-field and combobox chips, the ungated touch press colors (compiled selectors quoted), the A3 mutation check and a new R55 guard test. Triaged with the advisor: accepted; the input-group addon-button concern was checked and refuted (its ring keys only on input or textarea focus). Last D4 round: command palette opt-out, the contenteditable surfaces including the Phase 6 editor, and a raw storage-event conflict test.
@@ -83,3 +85,7 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 08:05 Codex plan round 2 (last): Needs rework, 5 findings, all accepted and fixed by the coordinator (keepalive escape, one close responder in __root.tsx with a window-wide registry set, quit tests under the close_request filter, a Discard end-to-end case, Phase 8 docs steps). The advisor added: the end-to-end teardown item back into the design-note list, an escape that does not silently discard edits (auto-close versus a native prompt, decided in the design note), and the native restart check. R62's escape sentence reworded to the outcome. Codex did not re-check these fixes; the Phase 9 design note review in Task 9.1 is the next gate.
 - 2026-11-10 08:20 Codex review of B2 (gpt-6.1-sol high), triaged with the advisor: 6 findings accepted (latched leftover-lock count, latched Done after a lock error, plain shutdown never ending the profiler after a pending write, `switch -c` with a start point unlisted, status and working diff reads outside the read policy, flag parsing after `--`). Ruling: the user decided a leftover index.lock BiBCode could not delete does not block an update; it is logged as an error and rechecked on each later quiesce and shutdown. Lane B3 (opus medium, on B2's branch) gets one outcome table for items 1 to 3; it starts when lane E reports, to keep one Rust lane at a time. Phase 4 then bases on E's accepted branch plus B3.
 - 2026-11-10 08:20 Codex review of C4: 1 finding accepted (inserting a table row before the first body row copies the alignment row, rewriting untouched rows). Lane C5 (opus medium) fixes `join` with a real-editor insertion sweep, with a revert of C4's two separator commits as the fallback if the sweep is not green, and does Task 6.10.
+- 2026-11-10 08:30 Lane C5 closed Phase 6's last round on worktree-agent-a4b4a6a9de96bcf2f (f85abbf49..595938f5d): table-row and quote-list separators fixed, a real-editor insertion sweep (126 insertions), a list-item children sweep (43, no defect) and a deletion sweep (81; deleting an ordered list's first item fixed), the quote prefix space kept, Task 6.10 done, `changeOutsideEditor` removed. Accepted with the advisor. Ruling: amendment A6 extended to `.mdx` ticks, measured by C5.
+- 2026-11-10 08:30 Integration: Phase 6 (38 commits from C to C5) and Phase 7 (31 commits from D to D4, skipping the plan-folder copies 2ee5c03c3 and 8ec5e0767) cherry-picked onto claude/next-pr-planning-13d367 with no conflicts. On the combined tree: `vp install` 0, `vp run --filter @bibcode/web test` 11028 passed, web tsc 0, `vp check --no-fmt` 0, `vp run check:dependency-ledger` 0, `vp run check:markdown-links` 0; `vp test run scripts` 2 failed (dependency count and privacy-contract pins predate the TipTap packages). Lane F (sonnet medium) updates the pins after a telemetry check. Lane G (opus medium) started Phase 9's design note and TypeScript work on the integrated branch, with no cargo until the Rust slot is free (ruling, like Phase 3's).
+- 2026-11-10 08:40 Lane F pinned the TipTap packages in scripts/privacy-contract.test.ts and scripts/check-dependency-upgrade-ledger.test.ts after a telemetry check (no network or telemetry calls in the nine @tiptap packages or marked), and closed the ledger at 269 rows and 144 green. Its second commit carried a wrong subject from a shared message file; reworded on integration. On the integrated tree `vp test run scripts` 921 passed, `vp run check:dependency-ledger` 0. Formatting fixed on the plan folder and CreateWorktreeDialog.tsx; `vp fmt --check` clean; spec hash refreshed (format only).
+- 2026-11-10 08:40 Phases 6 (6.1-6.10) and 7 (7.1-7.14) Closed. Evidence on the integrated branch: web suite 11028 passed, scripts 921 passed, web tsc 0, vp check --no-fmt 0, dependency ledger 0, markdown links 0. Every Codex finding was fixed or logged above. Not run yet: the Rust half of check:contracts (Phase 7 contracts) and the packaged end-to-end specs (Phase 8).

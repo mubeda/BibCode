@@ -46,11 +46,11 @@ Apply these steps to every review, in order.
 
 Every finding gets one log line: the finding, the outcome (fixed, rejected, deferred or kept for approval), and the reason or evidence.
 
-| Where | Log |
-|---|---|
-| A workflow | The lane report, then the final report's review section |
-| `mstack-plan` | The Handling section of `reviews/plan-review-<n>.md`, then the approval summary |
-| An inline `execute-plan.md` run | The log in `progress.md`, then the final report |
+| Where                           | Log                                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------- |
+| A workflow                      | The lane report, then the final report's review section                         |
+| `mstack-plan`                   | The Handling section of `reviews/plan-review-<n>.md`, then the approval summary |
+| An inline `execute-plan.md` run | The log in `progress.md`, then the final report                                 |
 
 ## Plan reviews
 
@@ -85,6 +85,7 @@ A review of a plan (not of code) follows the same pattern, with two outcomes for
    ```
 
    The `{id}` must be a top-level review comment, because GitHub does not support replies to replies. `gh` fills `{owner}` and `{repo}` from the current repository, and you replace `{pr}` and `{id}`. Write the body yourself and never paste review text into it.
+
 4. Test every fix locally and batch all of them into one push, because CI runs one at a time.
 5. Two rounds of disagreement on one finding end the discussion. Decide it yourself with the rules above, and log the decision. When it touches a user decision, the user's decision wins (rule 5).
 6. Answer every question a lane returns about a finding yourself, with these rules, and send the answer back to the lane.

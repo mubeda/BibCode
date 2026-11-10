@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution)
-Size: full    Mode: gated    Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
+Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
 This spec is longer than the usual 25 requirements because the maintainer chose one pull request for seven issues. Each issue has its own section and its requirements can be planned and reviewed on their own. Built-in theme values are in [theme-palettes.md](theme-palettes.md).
@@ -77,660 +77,946 @@ Anti-goals, which count as failure even if everything else works:
 
 ### A. Pipeline stage headers (#340)
 
-### R1. Stage headers look different from job rows  [Must]
+### R1. Stage headers look different from job rows [Must]
+
 The pipeline detail view SHALL render every stage header with a background surface and a text style that no job row in that view uses.
+
 #### Scenario: multi-stage pipeline
+
 - GIVEN a pipeline with stages `versioning`, `security` and `test`, each with at least one job, grouped by stage
 - WHEN the detail view is shown at a wide width and at a stacked width below 720px
 - THEN each stage header has a header surface and text style that differ from every job row, at both widths
+
 #### Scenario: other column kinds and neighbors stay as they are
+
 - GIVEN a pipeline grouped by job dependencies, and a GitHub pipeline with the single `Jobs` column
 - WHEN the detail view is shown
 - THEN `Layer N` headers and the `Jobs` header use the same treatment as stage headers, and job rows, column widths, resize, wrap and the pull-request checks tab are NOT changed
 
-### R2. Stage headers stay readable by assistive technology  [Must]
+### R2. Stage headers stay readable by assistive technology [Must]
+
 The pipeline detail view SHALL expose each stage header as a heading that carries the stage status label, the stage name and the job count.
+
 #### Scenario: heading content
+
 - GIVEN a stage `test` with status "passed" and 3 jobs
 - WHEN the accessibility tree is read
 - THEN one heading contains the status label, the name `test` and the count 3
 
 ### B. Orphan worktree warnings (#344)
 
-### R3. Each leftover keeps its own finding  [Must]
+### R3. Each leftover keeps its own finding [Must]
+
 WHEN the worktree audit reports a leftover folder, the profiler SHALL give each parent-and-name pair its own finding ID, SHALL keep absolute paths out of the ID, and SHALL include the folder name in the evidence, with the ID computed exactly as it is today.
+
 #### Scenario: same name under two parents
+
 - GIVEN leftovers named `feature-a` under two different managed worktree directories outside the home folder
 - WHEN the audit runs
 - THEN two findings with different IDs are raised, each evidence names `feature-a`, and neither ID changes when the audit runs again
 
-### R4. BiBCode records the worktrees it creates  [Must]
+### R4. BiBCode records the worktrees it creates [Must]
+
 WHEN BiBCode creates a worktree in a managed worktree directory, the server SHALL store a durable creation record for that path that survives restart.
+
 #### Scenario: record survives restart
+
 - GIVEN a worktree created through BiBCode at `<managed>/feature-a`
 - WHEN the server restarts
 - THEN the creation record for `<managed>/feature-a` is still present
+
 #### Scenario: failed creation
+
 - GIVEN a worktree creation that fails before the folder exists
 - WHEN the audit runs
 - THEN no creation record and no finding exist for that path
+
 #### Scenario: record ends with the worktree
+
 - GIVEN a worktree with a creation record
 - WHEN BiBCode removes it and its folder is gone, or an audit finds that the recorded folder no longer exists
 - THEN the creation record is deleted, and a new unrelated folder created later at the same path has no worktree evidence
 
-### R5. Leftovers with worktree evidence keep warning  [Must]
+### R5. Leftovers with worktree evidence keep warning [Must]
+
 WHILE a visible, unowned, unregistered direct child of a managed worktree directory has worktree evidence, the profiler SHALL raise `worktree.orphan-dir` for it on every audit, where worktree evidence is any of: a creation record (R4), a removal receipt for that path whose removal did not complete, a Git worktree pointer file at its root, or a BiBCode removal marker at its root.
+
 #### Scenario: leftover without `.git`
+
 - GIVEN a folder with a creation record whose `.git` pointer file is gone, unowned and unregistered
 - WHEN the audit runs twice
 - THEN the finding is raised both times and its count increases
+
 #### Scenario: pointer file only
+
 - GIVEN a folder with a Git worktree pointer file at its root and no creation record
 - WHEN the audit runs
 - THEN the finding is raised
 
-### R6. Folders that were never worktrees do not warn  [Must]
+### R6. Folders that were never worktrees do not warn [Must]
+
 IF a visible, unowned, unregistered direct child of a managed worktree directory has no worktree evidence, THEN the profiler SHALL NOT raise `worktree.orphan-dir` for it.
+
 #### Scenario: container folder
+
 - GIVEN a folder `container` holding a project-like tree in a subfolder, with no `.git` and no worktree evidence
 - WHEN the audit runs
 - THEN no finding is raised for `container`, the audit does NOT look inside its subfolders, and the result does NOT depend on the folder's name
 
-### R7. A warning stops when its cause is gone  [Must]
+### R7. A warning stops when its cause is gone [Must]
+
 WHEN a leftover folder is removed, becomes registered with Git, or becomes owned in the worktree catalog, the profiler SHALL stop raising `worktree.orphan-dir` for that path.
+
 #### Scenario: one of two removed
+
 - GIVEN two leftovers with worktree evidence
 - WHEN one is removed and the audit runs
 - THEN only the remaining path is raised, and hidden names stay excluded as before
 
 ### C. Remote push sign-in guidance (#343)
 
-### R8. A remote missing-credentials failure says where to recover  [Must]
+### R8. A remote missing-credentials failure says where to recover [Must]
+
 IF a person-started HTTPS push on a remote server fails because Git cannot read a username with prompts disabled, THEN the server SHALL report a failure that names the remote server as the place Git ran, tells the person to run `git push` in a terminal there in the same repository as the user that runs BiBCode, and tells them to retry in BiBCode afterwards.
+
 #### Scenario: known server name
+
 - GIVEN a remote server whose name is `example-server` and an empty credential store
 - WHEN a person pushes and Git prints `fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled`
 - THEN the failure text is "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode."
+
 #### Scenario: unknown server name
+
 - GIVEN the same failure on a remote server with no known name
 - WHEN the failure is shown
 - THEN it says "the remote server" in both places, and it does NOT invent a host name, a user name or a path, and does NOT tell the person to sign in on their own computer
 
-### R9. Both push surfaces show the guidance  [Must]
+### R9. Both push surfaces show the guidance [Must]
+
 WHEN the failure of R8 occurs, the app SHALL show the guidance in Git Manager and in Source Control, and SHALL keep Git's own error text available to the person.
+
 #### Scenario: Source Control stacked action
+
 - GIVEN the R8 failure during the push step of a stacked action
 - WHEN the failure toast is shown
 - THEN it shows the R8 guidance and Git's original line can still be read or copied
+
 #### Scenario: Git Manager push
+
 - GIVEN the R8 failure during a Git Manager push
 - WHEN the operation ends
 - THEN the panel shows the R8 guidance
 
-### R10. Remote, background and agent Git never prompt  [Must]
+### R10. Remote, background and agent Git never prompt [Must]
+
 IF a push fails authentication on a remote server, in background work or in agent-driven Git, THEN the server SHALL NOT offer or start a sign-in, open a browser, ask for a credential or retry on its own.
+
 #### Scenario: caller asks for sign-in anyway
+
 - GIVEN a remote session whose request claims to be eligible for interactive sign-in
 - WHEN the push fails with either Git refusal text
 - THEN no sign-in is offered or started
 
-### R11. Local desktop behavior is unchanged  [Must]
+### R11. Local desktop behavior is unchanged [Must]
+
 WHEN a push fails authentication on the local desktop, the app SHALL behave as it does today: the existing sign-in offer for a credential-manager refusal, and the existing authentication message otherwise.
+
 #### Scenario: credential manager refusal
+
 - GIVEN an eligible local desktop session and a helper that prints the credential manager's refusal
 - WHEN a person pushes
 - THEN the existing destination-specific sign-in offer appears
+
 #### Scenario: missing username on local desktop
+
 - GIVEN the local desktop and an empty credential store
 - WHEN the push fails with the missing-username text
 - THEN the failure does NOT mention a remote server and no sign-in offer appears for that helper
 
-### R12. Other failures and working credentials are unaffected  [Must]
+### R12. Other failures and working credentials are unaffected [Must]
+
 WHEN a push ends for any reason other than the missing-username refusal, the server SHALL report that outcome without the R8 guidance.
+
 #### Scenario: stored credential
+
 - GIVEN a remote server with a matching stored credential
 - WHEN a person pushes to a local test Git host that requires authentication
 - THEN the push succeeds with no prompt and no guidance
+
 #### Scenario: unrelated failure
+
 - GIVEN a refused connection, and separately a non-fast-forward rejection
 - WHEN the push fails
 - THEN the specific failure is shown and the R8 guidance is NOT shown
 
-### R13. Help text matches the failure  [Should]
+### R13. Help text matches the failure [Should]
+
 The user documentation SHALL describe remote-server recovery with the same wording as R8 and SHALL keep local desktop sign-in as a separate case.
+
 #### Scenario: documentation check
+
 - GIVEN the Git authentication help
 - WHEN it is compared with the R8 text
 - THEN the remote case names the server and the `git push` command, and neither case promises a sign-in window for a plain credential store
 
 ### D. Background Git and the person's own Git (#341)
 
-### R14. Background reads never lock the index  [Must]
+### R14. Background reads never lock the index [Must]
+
 WHILE BiBCode refreshes status or diff statistics in the background, the server SHALL NOT create `index.lock` in that worktree's Git directory.
+
 #### Scenario: a person's `git add` during polling
+
 - GIVEN a worktree with one tracked file whose timestamp changed but whose content did not, and one file with a real unstaged edit
 - WHEN BiBCode refreshes status 50 times in a row and a separate `git add` of the edited file runs at the same time, 50 times
 - THEN every `git add` exits 0
+
 #### Scenario: polling alone leaves the index untouched
+
 - GIVEN the same worktree and no other Git process
 - WHEN BiBCode refreshes status 50 times in a row
 - THEN the index file's bytes and modification time are unchanged, and a watcher on the Git directory sees no `index.lock` appear
+
 #### Scenario: statistics stay correct
+
 - GIVEN the same worktree
 - WHEN status is refreshed
 - THEN the unstaged insertions and deletions reported for the edited file are the same as before this change, and the timestamp-only file is NOT reported as changed
 
-### R15. Git is asked to stop before it is killed  [Must]
+### R15. Git is asked to stop before it is killed [Must]
+
 WHEN the server stops a Git process because of a timeout, a cancellation or shutdown, the server SHALL first ask the process to stop, on every platform that offers a way to ask, and SHALL force it to stop only if it is still running 2 seconds later.
+
 #### Scenario: Git stops cleanly
+
 - GIVEN a BiBCode Git process that holds `index.lock` and stops when asked
 - WHEN the server cancels it
 - THEN the process exits within 2 seconds and `index.lock` is gone
+
 #### Scenario: Git ignores the request
+
 - GIVEN a Git process that ignores the stop request
 - WHEN 2 seconds pass
 - THEN the server forces it to stop, and the caller still receives the timeout or cancellation outcome it receives today
+
 #### Scenario: Windows
+
 - GIVEN Windows, where a clean stop request may not reach a Git process without a console
 - WHEN the design note for this fix finds no dependable request
 - THEN the process is forced to stop as today and R16 and R17 remove its lock; the clean-stop scenario is then proven on Linux and macOS only
 
-### R16. BiBCode removes only a lock its own killed process left  [Must]
+### R16. BiBCode removes only a lock its own killed process left [Must]
+
 IF a Git process that BiBCode forced to stop leaves an `index.lock` that did not exist when the process started and that does not change for 2 seconds after the stop, THEN the server SHALL remove that lock and log the removal as a warning.
+
 #### Scenario: own lock
+
 - GIVEN a BiBCode Git write that created `index.lock` and was forced to stop
 - WHEN 2 seconds pass with the lock unchanged
 - THEN the lock is removed, a warning is logged, and a following `git add` in a terminal exits 0
+
 #### Scenario: someone else's lock
+
 - GIVEN an `index.lock` that existed before the BiBCode process started, and separately a lock that changes within the 2 seconds
 - WHEN the BiBCode process is forced to stop
 - THEN the lock is NOT removed
 
-### R17. Shutdown leaves no lock behind  [Must]
+### R17. Shutdown leaves no lock behind [Must]
+
 WHEN BiBCode shuts down, the server SHALL leave no `index.lock` created by its own Git processes in any worktree.
+
 #### Scenario: shutdown during a write
+
 - GIVEN a BiBCode Git write in progress
 - WHEN the server shuts down
 - THEN after shutdown completes no `index.lock` from that process remains
 
 ### E. Status during a push (#345)
 
-### R18. Status is delivered while a stacked push waits  [Must]
+### R18. Status is delivered while a stacked push waits [Must]
+
 WHILE a stacked action for a worktree has finished its local writes and is waiting on a push or on the pull-request step, the server SHALL deliver current local status for that worktree to a status refresh and to status subscribers.
+
 #### Scenario: held push
+
 - GIVEN a stacked commit-and-push whose push is held open for longer than 10 seconds, with pull-request lookups stubbed to succeed
 - WHEN status is refreshed for the same worktree and a subscriber is listening
 - THEN both receive status that shows the new commit before the push is released
+
 #### Scenario: another worktree
+
 - GIVEN a held push in worktree A
 - WHEN status is refreshed for worktree B
 - THEN B is answered without waiting for A
 
-### R19. Status is delivered during Git Manager push-family operations  [Must]
+### R19. Status is delivered during Git Manager push-family operations [Must]
+
 WHILE a Git Manager push, publish branch, force push or remote branch delete waits on the network, the server SHALL deliver current local status for that worktree.
+
 #### Scenario: held Git Manager push
+
 - GIVEN a Git Manager push held open for longer than 10 seconds
 - WHEN status is refreshed for the same worktree
 - THEN status is delivered before the push is released
+
 #### Scenario: pull and fetch keep waiting
+
 - GIVEN a pull in progress
 - WHEN status is refreshed for the same worktree
 - THEN the refresh waits for the pull as it does today
 
-### R20. Writes stay serialized and commits stay saved  [Must]
+### R20. Writes stay serialized and commits stay saved [Must]
+
 WHILE a push-family operation is in progress for a worktree, the server SHALL make every other write to that worktree wait until it ends, and SHALL keep a commit made earlier in the same stacked action if the push stalls or fails.
+
 #### Scenario: second write during a held push
+
 - GIVEN a held push after a commit in the same stacked action
 - WHEN a second write to the same worktree is requested
 - THEN the second write starts only after the first action ends, and the commit is present in history whether the push succeeds or fails
+
 #### Scenario: status read before the action ended
+
 - GIVEN status delivered during the push
 - WHEN the action ends
 - THEN a fresh status is published afterwards, and a status read that started before the action began is NOT published
 
-### R21. Readers are released after every outcome  [Must]
+### R21. Readers are released after every outcome [Must]
+
 IF a push-family operation ends by success, authentication refusal, timeout, cancellation or loss of the workspace, THEN the server SHALL release the worktree and publish fresh status.
+
 #### Scenario: each outcome
+
 - GIVEN each of the five outcomes in turn
 - WHEN the operation ends
 - THEN a following status refresh is answered, a timeout is reported as a timeout and NOT as a Git exit code, and no refresh fails with "status read owner stopped"
 
-### R22. Pull-request lookups stay independent of a push  [Must]
+### R22. Pull-request lookups stay independent of a push [Must]
+
 WHEN the pull-request vocabulary or create-defaults lookups run during a held push, the server SHALL answer them without waiting for the push.
+
 #### Scenario: lookup during a held push
+
 - GIVEN a held push and a provider that answers at once
 - WHEN both lookups run
 - THEN both complete while the push is still held
 
-### R23. A real status hang is still recorded  [Must]
+### R23. A real status hang is still recorded [Must]
+
 WHEN a status refresh waits more than 10 seconds on the server, the profiler SHALL record the hang finding for it.
+
 #### Scenario: refresh blocked by something else
+
 - GIVEN a status refresh blocked for more than 10 seconds by something other than a push-family operation
 - WHEN the hang detector runs
 - THEN a hang finding for the status refresh is recorded, and the status refresh is NOT reclassified as long-running
 
 ### F. Rich Markdown editing in Files (#342)
 
-### R24. The toolbar keeps its controls and gains a formatting group  [Must]
+### R24. The toolbar keeps its controls and gains a formatting group [Must]
+
 The Files toolbar SHALL show Save, Undo and Redo, then the formatting group, then the source/rendered toggle, and SHALL make the formatting group usable only in rendered view of an editable Markdown file.
+
 #### Scenario: order and availability
+
 - GIVEN a `.md` file open in rendered view
 - WHEN the toolbar is read left to right
 - THEN the order is Save, Undo, Redo, formatting group, view toggle, and every control has an accessible name
+
 #### Scenario: source view
+
 - GIVEN the same file in source view, and separately a non-Markdown file
 - WHEN the toolbar is shown
 - THEN no formatting control can be activated
 
-### R25. Rendered Markdown is editable  [Must]
+### R25. Rendered Markdown is editable [Must]
+
 WHILE a `.md` file is shown in rendered view, the Files editor SHALL let the person type, delete and select text in headings, paragraphs, lists, block quotes and table cells.
+
 #### Scenario: edit a paragraph
+
 - GIVEN a file with the paragraph "Hello world"
 - WHEN the person types " again" at its end in rendered view
 - THEN the file's text contains "Hello world again" and the file shows as having unsaved changes
+
 #### Scenario: task checkbox still works
+
 - GIVEN a task list item
 - WHEN the person clicks its checkbox
 - THEN only that item's marker changes, and Undo reverses it
 
-### R26. The formatting group applies Orca's toolbar set  [Must]
+### R26. The formatting group applies Orca's toolbar set [Must]
+
 WHEN a person activates a formatting control, the Files editor SHALL apply that format to the selection or current block, for: paragraph, heading 1 to 3, bold, italic, strikethrough, bullet list, numbered list, task list, block quote, link, image, and a More menu with heading 4, heading 5 and collapsible section.
+
 #### Scenario: heading and mark
+
 - GIVEN the paragraph "Title" with the word selected
 - WHEN the person activates Heading 2 and then Bold
 - THEN the saved Markdown for that block is `## **Title**`
+
 #### Scenario: active state
+
 - GIVEN the caret inside a bullet list item
 - WHEN the toolbar is shown
 - THEN the bullet list control shows as active, and activating it again turns the item back into a paragraph
 
-### R27. Links are added, changed and removed from a dialog  [Must]
+### R27. Links are added, changed and removed from a dialog [Must]
+
 WHEN a person activates the link control, the Files editor SHALL open a dialog anchored to the selection in which they can enter a URL, change it or remove the link.
+
 #### Scenario: link selected text
+
 - GIVEN the selected text "docs"
 - WHEN the person enters `https://example.test/docs` and confirms
 - THEN the saved Markdown is `[docs](https://example.test/docs)`
+
 #### Scenario: empty URL
+
 - GIVEN the caret inside an existing link
 - WHEN the person clears the URL and confirms
 - THEN the link is removed, the text stays, and nothing else in the file changes
 
-### R28. Insert image copies the file next to the Markdown file  [Must]
+### R28. Insert image copies the file next to the Markdown file [Must]
+
 WHEN a person picks an image with the image control, the Files editor SHALL copy it into the Markdown file's folder and insert a relative image link at the caret.
+
 #### Scenario: new image
+
 - GIVEN `docs/guide.md` open and a picked file `diagram.png`
 - WHEN the copy completes
 - THEN `docs/diagram.png` exists and `![](diagram.png)` is inserted at the caret
+
 #### Scenario: name taken or copy fails
+
 - GIVEN `docs/diagram.png` already exists, and separately a copy that fails
 - WHEN the person picks `diagram.png`
 - THEN in the first case the copy is saved as `diagram-1.png` and the existing file is NOT overwritten, and in the second case an error is shown and no link is inserted
 
-### R29. Saving uses the existing save path  [Must]
+### R29. Saving uses the existing save path [Must]
+
 WHEN a file is edited in rendered view, the Files editor SHALL save it through the same explicit save, autosave, conflict detection and reload-or-overwrite choice as source view.
+
 #### Scenario: explicit save
+
 - GIVEN an unsaved rendered edit
 - WHEN the person presses Save or the save shortcut
 - THEN the file on disk contains the edit and the unsaved indicator clears
+
 #### Scenario: file changed on disk
+
 - GIVEN an unsaved rendered edit and a newer version of the file on disk
 - WHEN a save is attempted
 - THEN the save is blocked and the existing reload-or-overwrite choice is shown, and the disk file is NOT overwritten without that choice
 
-### R30. Undo and Redo work in rendered view and survive a view switch  [Must]
+### R30. Undo and Redo work in rendered view and survive a view switch [Must]
+
 WHILE a Markdown file is in rendered view, the Files editor SHALL enable Undo and Redo for edits made there, and WHEN the person switches view it SHALL carry pending edits over and keep the source view's earlier history.
+
 #### Scenario: undo a rich edit
+
 - GIVEN a heading applied in rendered view
 - WHEN the person presses Undo and then Redo
 - THEN the heading is removed and then applied again
+
 #### Scenario: switch to source after a rich edit
+
 - GIVEN two source edits, then a switch to rendered view and one rendered edit
 - WHEN the person switches back to source view and presses Undo three times
 - THEN the first Undo reverses the rendered edit as one step and the next two reverse the earlier source edits, and no history is discarded by the rendered edit
+
 #### Scenario: several rendered edits in one visit
+
 - GIVEN three rendered edits made without leaving rendered view
 - WHEN the person switches to source view and presses Undo once
 - THEN all three are reversed together, because one visit to rendered view arrives in source view as one step
+
 #### Scenario: switch to rendered after a source edit
+
 - GIVEN an unsaved source edit
 - WHEN the person switches to rendered view
 - THEN the rendered view shows the edit, and Undo there is available only for edits made in rendered view since the switch
 
-### R31. Opening and saving without editing changes nothing  [Must]
+### R31. Opening and saving without editing changes nothing [Must]
+
 WHEN a Markdown file is opened in rendered view and not edited, the Files editor SHALL NOT mark it as changed, and a save SHALL write the original bytes.
+
 #### Scenario: untouched file
+
 - GIVEN a file with frontmatter, a table, a fenced code block, mixed list markers and no final newline
 - WHEN it is opened in rendered view, switched to source and back, and saved
 - THEN the bytes on disk are identical to the original and no unsaved indicator appeared
 
-### R32. Frontmatter is preserved and not editable in rendered view  [Must]
+### R32. Frontmatter is preserved and not editable in rendered view [Must]
+
 WHILE a Markdown file with YAML or TOML frontmatter is in rendered view, the Files editor SHALL keep the frontmatter bytes unchanged on save and SHALL show it as a read-only block that says to edit it in source view.
+
 #### Scenario: edit below frontmatter
+
 - GIVEN a file starting with a `---` frontmatter block
 - WHEN the person edits a paragraph below it and saves
 - THEN the frontmatter bytes are identical to the original
 
-### R33. A local edit leaves the rest of the file as written  [Must]
+### R33. A local edit leaves the rest of the file as written [Must]
+
 WHEN a person edits one block in rendered view, the Files editor SHALL save every block they did not edit with its original bytes.
+
 #### Scenario: fence next to an edited paragraph
+
 - GIVEN a fenced code block with unusual spacing followed by a paragraph
 - WHEN the person edits only the paragraph and saves
 - THEN the fenced block's bytes, including its fence spelling, are identical to the original
+
 #### Scenario: edit cannot be placed
+
 - GIVEN an edit that cannot be matched back to a single place in the original text
 - WHEN the file is saved
 - THEN frontmatter and fenced code contents are still identical to the original, and the result parses to the same rendered document the person saw
 
-### R34. Files the rich editor cannot represent stay read-only in rendered view  [Must]
+### R34. Files the rich editor cannot represent stay read-only in rendered view [Must]
+
 IF a Markdown file contains reference-style links or their definitions, footnotes, raw HTML other than a `details` block, HTML comments or math, or is an `.mdx` file, or is larger than 128 KiB (amendment A4), THEN the Files editor SHALL show rendered view read-only as today, with a notice that says to edit in source view, and SHALL NOT rewrite the file.
+
 #### Scenario: unsupported construct
+
 - GIVEN a file with reference-style link definitions and a footnote
 - WHEN it is opened in rendered view
 - THEN it renders read-only with the notice, the formatting group cannot be activated, task checkboxes still work and a tick keeps the file's source Undo history (amendment A6), and source view edits the file normally
+
 #### Scenario: representable variants stay editable
+
 - GIVEN a file with underlined (setext) headings, an aligned table and a hand-written `details` block
 - WHEN it is opened in rendered view
 - THEN it is editable, and R31 and R33 hold for it
+
 #### Scenario: `.mdx`
+
 - GIVEN an `.mdx` file
 - WHEN it is opened
 - THEN it behaves as it does today, except that a task checkbox tick keeps the file's source Undo history (amendment A6)
 
 #### Scenario: a large file (amendment A4)
+
 - GIVEN a supported Markdown file of 129 KiB
 - WHEN it is opened in rendered view
 - THEN it renders read-only with the notice, and no rich editor is created
 
-### R35. A collapsible section is saved as HTML details  [Must]
+### R35. A collapsible section is saved as HTML details [Must]
+
 WHEN a person inserts a collapsible section, the Files editor SHALL save it as a `details` element with a `summary`.
+
 #### Scenario: insert and reopen
+
 - GIVEN a collapsible section inserted with summary "More" and body "Text"
 - WHEN the file is saved and reopened in rendered view
 - THEN the source contains a `details` element with `summary` "More", and the rendered view shows it as an editable collapsible section
 
 ### G. Custom color themes (#290)
 
-### R36. A theme is a base plus optional overrides  [Must]
+### R36. A theme is a base plus optional overrides [Must]
+
 The theme format SHALL describe a theme as a version, an ID, a name of 1 to 48 characters, a light or dark base, optional UI token values and optional terminal colors, and the app SHALL leave every supported token a theme does not set as its base defines it, including base tokens that are derived from other tokens.
+
 #### Scenario: one-color theme
+
 - GIVEN a theme with a dark base that sets only the primary color to `#3b82f6`
 - WHEN it is selected
 - THEN the primary color is `#3b82f6`, tokens the base derives from primary (primary hover and primary pressed) follow the new primary, and every other token equals the built-in Dark theme
+
 #### Scenario: unknown token
+
 - GIVEN a theme file that sets a token outside the supported tokens, or has an unknown top-level field
 - WHEN it is validated
 - THEN it is rejected with an error that names the token
 
-### R37. Six built-in themes ship and cannot be changed  [Must]
+### R37. Six built-in themes ship and cannot be changed [Must]
+
 The app SHALL ship Light, Dark, Tokyo Night, Matrix Dark, Matrix Light and Verdant Light as read-only themes with the values in theme-palettes.md, and SHALL refuse to edit, delete or replace them.
+
 #### Scenario: Tokyo Night values
+
 - GIVEN Tokyo Night selected for the dark slot in dark mode
 - WHEN the app is painted
 - THEN the background is `#1a1b26`, the primary color is `#7aa2f7`, the border is `#414868`, and the desktop window uses the dark window theme
+
 #### Scenario: Verdant Light values
+
 - GIVEN Verdant Light selected in light mode
 - WHEN the app is painted
 - THEN the background is `#ffffff`, the text color is `#303840`, the primary color is `#087f5b`, the control border is `#87939b`, the placeholder color is `#667078`, the selected surface is `#eaf5ef` with selected text `#065f46`, and the panel separator is `#dee3e6`
+
 #### Scenario: built-in protection
+
 - GIVEN any built-in theme
 - WHEN a delete is requested for its ID, or a file with its ID is imported
 - THEN the request is refused as reserved, and the theme list offers only Duplicate for it
 
-### R38. Upgrading changes nothing until a person picks a theme  [Must]
+### R38. Upgrading changes nothing until a person picks a theme [Must]
+
 WHEN the app starts with no stored slots, the app SHALL use Light for the light slot and Dark for the dark slot and SHALL keep the stored System, Light or Dark mode as it is.
+
 #### Scenario: existing user
+
 - GIVEN a stored mode of Dark and no stored slots or custom themes
 - WHEN the app starts after the upgrade
 - THEN every color equals the value before the upgrade, including the new tokens of R50
 
-### R39. The mode chooses between a light slot and a dark slot  [Must]
+### R39. The mode chooses between a light slot and a dark slot [Must]
+
 The app SHALL keep one theme for the light slot and one for the dark slot, each with a matching base, and SHALL paint the slot that matches the current mode, following the operating system in System mode.
+
 #### Scenario: System mode with a custom dark theme
+
 - GIVEN System mode, a custom theme in the dark slot and Light in the light slot
 - WHEN the operating system switches from dark to light
 - THEN the light slot's colors are applied and every override of the dark theme is cleared
+
 #### Scenario: wrong base
+
 - GIVEN a theme with a light base
 - WHEN it is offered for the dark slot
 - THEN it cannot be chosen there
 
-### R40. Picking a theme for the other mode fills its slot and offers a switch  [Must]
+### R40. Picking a theme for the other mode fills its slot and offers a switch [Must]
+
 WHEN a person picks a theme whose base differs from the current mode, the app SHALL put it in that base's slot, SHALL leave the mode unchanged, and SHALL offer a "Switch to dark now" or "Switch to light now" action.
+
 #### Scenario: dark theme in Light mode
+
 - GIVEN Light mode
 - WHEN the person picks Tokyo Night
 - THEN the dark slot holds Tokyo Night, the app stays light, and "Switch to dark now" is offered and sets the mode to Dark when used
 
-### R41. A theme applies to the whole app and clears cleanly  [Must]
+### R41. A theme applies to the whole app and clears cleanly [Must]
+
 WHEN the resolved theme changes, the app SHALL apply the new theme's overrides, clear every override of the previous theme, set the desktop window theme and the code highlighter from the new base, and update the browser chrome color to the new background.
+
 #### Scenario: switch back to a built-in
+
 - GIVEN Matrix Dark active
 - WHEN the person selects Dark
 - THEN no Matrix Dark override remains and every color equals built-in Dark
+
 #### Scenario: light custom theme
+
 - GIVEN a custom theme on a light base
 - WHEN it becomes active
 - THEN the light code highlighter and the light window theme are used
 
-### R42. The theme is painted before the app appears  [Must]
+### R42. The theme is painted before the app appears [Must]
+
 WHEN the app loads, the app SHALL apply the stored theme's mode, overrides and background before the first frame is shown.
+
 #### Scenario: reload with a custom theme
+
 - GIVEN a stored custom dark theme with background `#101820`
 - WHEN the page loads
 - THEN the mode, the overrides and the background `#101820` are already set on the page when the app's own code starts, before the app renders anything
+
 #### Scenario: stored theme is corrupt
+
 - GIVEN stored theme data that cannot be read
 - WHEN the page loads
 - THEN the built-in theme for the stored mode is painted and the app starts normally
 
-### R43. Settings has an Appearance section  [Must]
+### R43. Settings has an Appearance section [Must]
+
 The Settings screen SHALL have an Appearance section that holds the mode and the theme list, and the General section SHALL no longer hold the theme row.
+
 #### Scenario: navigation
+
 - GIVEN Settings open
 - WHEN the section list is read
 - THEN Appearance is listed, it shows System, Light and Dark, and General has no theme control
 
-### R44. The theme list shows every theme with the actions it allows  [Must]
+### R44. The theme list shows every theme with the actions it allows [Must]
+
 The Appearance section SHALL list the six built-in themes and then the custom themes, each with a color preview, its base, and a control to use it for its slot, and SHALL offer Duplicate on every theme and Edit, Export and Delete only on custom themes.
+
 #### Scenario: duplicate a built-in
+
 - GIVEN Tokyo Night
 - WHEN the person chooses Duplicate
 - THEN a custom theme named "Tokyo Night copy" with the same values and a new ID appears and can be edited
+
 #### Scenario: empty custom list
+
 - GIVEN no custom themes
 - WHEN the list is shown
 - THEN the six built-ins are listed and a "New theme" action is available
 
-### R45. Deleting a theme asks first and falls back safely  [Must]
+### R45. Deleting a theme asks first and falls back safely [Must]
+
 WHEN a person deletes a custom theme, the Appearance section SHALL ask for confirmation, and IF the theme was in a slot THEN the app SHALL put the built-in theme of the same base in that slot.
+
 #### Scenario: delete the active theme
+
 - GIVEN a custom dark theme active in the dark slot
 - WHEN the person confirms Delete
 - THEN the theme is gone, the dark slot holds Dark, and the app repaints with Dark
+
 #### Scenario: cancel
+
 - GIVEN the confirmation
 - WHEN the person cancels
 - THEN nothing changes
 
-### R46. A new theme starts from a base and a name  [Must]
+### R46. A new theme starts from a base and a name [Must]
+
 WHEN a person chooses "New theme", the Appearance section SHALL ask for a base and a name and SHALL open the editor on a new custom theme with no overrides.
+
 #### Scenario: name rules
+
 - GIVEN the New theme form
 - WHEN the name is empty or longer than 48 characters
 - THEN the theme is NOT created and the form says which rule failed
 
-### R47. The editor previews live and saves only on Save  [Must]
+### R47. The editor previews live and saves only on Save [Must]
+
 WHILE a person edits a custom theme, the theme editor SHALL repaint the app on every change, SHALL show every supported token, grouped as Surfaces, Text, Accent and focus, Status, Sidebar and Terminal with a color picker and a text field each, and SHALL offer Save, Cancel, Reset for one token and Reset for all tokens.
+
 #### Scenario: edit and cancel
+
 - GIVEN a saved custom theme with primary `#3b82f6`
 - WHEN the person changes primary to `#ff0000` and then chooses Cancel
 - THEN the app showed `#ff0000` during the edit and shows `#3b82f6` afterwards, and the stored theme is unchanged
+
 #### Scenario: reset one token
+
 - GIVEN an overridden background
 - WHEN the person resets that token
 - THEN the background returns to the base value and other overrides stay
+
 #### Scenario: invalid text
+
 - GIVEN the text field of a color token
 - WHEN the person types `url(x)`
 - THEN the field shows an error, the app is NOT repainted with that value, and Save is disabled until it is fixed
 
-### R48. Theme data is validated at every entry point  [Must]
+### R48. Theme data is validated at every entry point [Must]
+
 IF a theme value is not a CSS color, or a length outside its range for a length token, or a keyword outside its list for a keyword token, or a theme file is larger than 16 KiB, or an ID is reserved or is not lowercase letters, digits and hyphens, THEN the app SHALL reject it with an error that names the field.
+
 #### Scenario: injection attempts
+
 - GIVEN color values `url(https://example.test/x)`, `var(--x)` and `red; background: blue`
 - WHEN each is validated
 - THEN each is rejected and nothing from it reaches the page
+
 #### Scenario: limits
+
 - GIVEN a radius of `2rem`, a 17 KiB file, the ID `dark`, and a 65th custom theme
 - WHEN each is submitted
 - THEN the radius is rejected because the range is 0 to 1rem, the file because of size, the ID as reserved, and the 65th theme because the library holds at most 64
 
-### R49. One bad stored theme does not lose the others  [Must]
+### R49. One bad stored theme does not lose the others [Must]
+
 IF a stored custom theme cannot be read, THEN the app SHALL skip it, log it, and keep every other stored theme and both slots.
+
 #### Scenario: one corrupt entry
+
 - GIVEN three stored themes of which the second is corrupt
 - WHEN the app starts
 - THEN the first and third are listed, the corrupt one is not, and a slot that pointed at it falls back to the built-in of its base
 
-### R50. New color roles default to today's look  [Must]
+### R50. New color roles default to today's look [Must]
+
 The app SHALL provide color tokens for strong text, placeholder text, primary hover, primary pressed, selected surface and selected text, and in Light and Dark each SHALL resolve to the color the app shows today for that role.
+
 #### Scenario: defaults
+
 - GIVEN Light, and separately Dark
 - WHEN an input placeholder, a hovered primary button, a pressed primary button and a selected row are painted
 - THEN each color equals the color before this change
+
 #### Scenario: a theme sets them
+
 - GIVEN Verdant Light
 - WHEN the same elements are painted
 - THEN the placeholder is `#667078`, primary hover is `#066649`, primary pressed is `#05543d`, and a selected row is `#eaf5ef` with text `#065f46`
 
-### R51. The terminal follows the theme only when asked to  [Must]
+### R51. The terminal follows the theme only when asked to [Must]
+
 WHILE the terminal theme preference is "Follow app theme", the terminal SHALL use the active theme's terminal colors for new sessions and SHALL take unset colors from the base's built-in terminal palette; WHILE the preference is Dark or Light, it SHALL use the built-in palette.
+
 #### Scenario: Tokyo Night terminal
+
 - GIVEN "Follow app theme" and Tokyo Night active
 - WHEN a new terminal session starts
 - THEN its ANSI green is `#9ece6a` and its background is reported to the shell as `26,27,38`
+
 #### Scenario: fixed preference and running sessions
+
 - GIVEN the preference Dark, and separately a session started before a theme change
 - WHEN the theme changes
 - THEN the built-in dark palette is used in the first case, and in the second the running session keeps the colors it started with and the Appearance section says so
+
 #### Scenario: job log
+
 - GIVEN "Follow app theme" and Matrix Dark active
 - WHEN a pipeline job log is shown
 - THEN its ANSI colors come from the Matrix Dark terminal palette
 
-### R52. Custom themes can set terminal colors  [Must]
+### R52. Custom themes can set terminal colors [Must]
+
 The theme editor SHALL let a person set the terminal background, foreground, cursor, selection colors and the 16 ANSI colors of a custom theme.
+
 #### Scenario: custom ANSI red
+
 - GIVEN a custom theme whose ANSI red is `#ff5555` and the preference "Follow app theme"
 - WHEN a new terminal session starts
 - THEN its ANSI red is `#ff5555`
 
-### R53. Themes are exported to and imported from JSON  [Must]
+### R53. Themes are exported to and imported from JSON [Must]
+
 WHEN a person exports a custom theme, the Appearance section SHALL save it as a JSON file, and WHEN a person imports a file or pasted JSON it SHALL show every validation error by field before anything is stored.
+
 #### Scenario: round trip
+
 - GIVEN an exported custom theme whose fixed pairs all meet 4.5:1
 - WHEN the file is imported on a device without it
 - THEN the imported theme equals the exported one
+
 #### Scenario: ID already exists
+
 - GIVEN an import whose ID matches an existing custom theme
 - WHEN it is validated
 - THEN the person chooses between replacing the existing theme and keeping both, and nothing is stored before they choose
+
 #### Scenario: invalid file
+
 - GIVEN pasted JSON with two invalid colors
 - WHEN it is validated
 - THEN both fields are listed with their errors and no theme is stored
 
 #### Scenario: export in the desktop app (amendment A5)
+
 - GIVEN a custom theme in the desktop app
 - WHEN the person clicks Export
 - THEN the native Save dialog opens with `<id>.theme.json`, the chosen file holds the exported JSON, Cancel writes nothing and shows no error, and a failed write shows an error
 
-### R54. The editor warns about low contrast and never blocks saving  [Must]
+### R54. The editor warns about low contrast and never blocks saving [Must]
+
 WHILE a person edits a theme, the theme editor SHALL show the contrast ratio of each fixed pair and SHALL mark every pair below 4.5:1 with a warning that names both colors, without preventing Save.
+
 #### Scenario: unreadable pair
+
 - GIVEN text color equal to the background color
 - WHEN the editor is shown
 - THEN that pair shows a ratio of 1:1 with a warning, and Save still works
 
-### R55. An imported theme cannot paint unreadable text  [Must]
+### R55. An imported theme cannot paint unreadable text [Must]
+
 IF an imported theme has a fixed pair below 4.5:1, and either the same pair at the theme's base values meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails and the same pair at the base values meets 4.5:1, and SHALL tell the person which pairs were reset to base values.
+
 #### Scenario: low-contrast import
+
 - GIVEN an import whose muted text on background is 2.1:1
 - WHEN it is imported
 - THEN the stored theme has no muted text override, a notice names the pair, the other overrides are kept, and exporting the stored theme and importing it again changes nothing further
 
 #### Scenario: a pair the base already fails (amendment A3)
+
 - GIVEN a light-based import that sets only a background override of `#fffdf8`, with the default placeholder, whose placeholder on background is below 4.5:1 like the same pair in built-in Light
 - WHEN it is imported
 - THEN the background override is kept and no notice is shown
 
 #### Scenario: a failing text override on a pair the base already fails (amendment A3)
+
 - GIVEN a light-based import that sets `background: #fffdf8` and `placeholder: #cccccc`
 - WHEN it is imported
 - THEN the placeholder override is removed and named in the notice, and the background override is kept
 
-### R56. Every built-in theme meets contrast minimums  [Must]
+### R56. Every built-in theme meets contrast minimums [Must]
+
 Tokyo Night, Matrix Dark, Matrix Light and Verdant Light SHALL keep every fixed pair at or above 4.5:1; Matrix Light and Verdant Light SHALL keep their control border (the input token) at or above 3:1 on the background and every ANSI color at or above 4.5:1 on the terminal background.
+
 #### Scenario: computed check
+
 - GIVEN each built-in theme's values
 - WHEN the ratios are computed
 - THEN every pair meets its minimum, including Tokyo Night muted text on background (5.75), Matrix Dark muted text on accent (4.81), Verdant Light placeholder on white (5.06) and the Verdant Light control border (3.15), and Light and Dark are NOT changed to meet these minimums
 
-### R57. Colors outside the token set follow the theme  [Must]
+### R57. Colors outside the token set follow the theme [Must]
+
 The app SHALL take the scrollbar colors, the model picker scrollbar colors and the sidebar card's muted text color from theme tokens, so that a theme's overrides reach them.
+
 #### Scenario: scrollbar under a custom theme
+
 - GIVEN a custom dark theme that sets the muted and border colors
 - WHEN a scrollbar and a sidebar card are painted
 - THEN their colors derive from the theme's values, and under built-in Dark they equal today's colors
 
-### R58. Diagrams and browser annotations follow a theme change  [Must]
+### R58. Diagrams and browser annotations follow a theme change [Must]
+
 WHEN the resolved theme changes, the app SHALL repaint Mermaid diagrams with the new theme's colors and SHALL report the new theme's colors to the browser preview annotation layer, without a reload.
+
 #### Scenario: theme colors change
+
 - GIVEN a rendered Mermaid diagram and a listener on the annotation colors
 - WHEN the info, background, foreground and primary colors change from one dark theme to another dark theme
 - THEN the diagram uses the new info, background and foreground colors, which are the colors diagrams are drawn with, and the listener receives annotation colors that contain the new primary color
 
-### R59. Focus rings and control shadows can be themed  [Should]
+### R59. Focus rings and control shadows can be themed [Should]
+
 WHERE a theme sets a focus ring width of 1 to 3px, a focus ring offset of 0 to 3px or a control shadow of "none" or "default", the app SHALL use those values for focus outlines and for button and composer shadows.
+
 #### Scenario: Verdant Light
+
 - GIVEN Verdant Light active
 - WHEN a button is focused
 - THEN the focus outline is 2px wide with a 2px offset, and buttons and the composer have no shadow
+
 #### Scenario: defaults
+
 - GIVEN Light or Dark
 - WHEN a button is focused
 - THEN the outline and shadows equal today's
 
-### R60. Restore defaults resets the choice, not the library  [Must]
+### R60. Restore defaults resets the choice, not the library [Must]
+
 WHEN a person restores default settings, the app SHALL set the mode to System and both slots to their built-in themes and SHALL keep every custom theme.
+
 #### Scenario: restore
+
 - GIVEN two custom themes, one of them active
 - WHEN defaults are restored
 - THEN the mode is System, the slots hold Light and Dark, and both custom themes are still listed
 
-### R61. Theme changes reach other open windows  [Must]
+### R61. Theme changes reach other open windows [Must]
+
 WHEN the theme library or a slot changes in one window, the app SHALL apply the change in every other open window and tab on the same device.
+
 #### Scenario: second window
+
 - GIVEN two windows open
 - WHEN a custom theme is edited and saved in the first
 - THEN the second repaints with the saved values without a reload
 
-### R62. Closing the window with unsaved Files edits asks first  [Must]
+### R62. Closing the window with unsaved Files edits asks first [Must]
+
 WHEN the person closes the desktop window or quits the app while any Files edit is unsaved, in source or rendered view, the app SHALL keep the window open and show a dialog that lists the unsaved files with Save all, Discard and Cancel (amendment A5). Save all SHALL save every listed file through the existing save path and close only when every save succeeded; Discard SHALL close without saving; Cancel SHALL keep the window open with every edit intact. Restarting the app and installing an update SHALL ask the same way first. In browser mode the app SHALL ask the browser to warn before the page is left. If the web part of the app stops answering, the person SHALL still be able to close the app. Ending the operating-system session (logging out or shutting down) cannot wait for an answer and is outside this requirement.
+
 #### Scenario: save all
+
 - GIVEN an unsaved rendered edit in one file and an unsaved source edit in another
 - WHEN the window is closed and Save all is chosen
 - THEN both files are written and the window closes
+
 #### Scenario: a save is blocked
+
 - GIVEN an unsaved edit to a file that changed on disk
 - WHEN the window is closed and Save all is chosen
 - THEN the window stays open, nothing overwrites the disk file, and the file shows the existing reload-or-overwrite choice
+
 #### Scenario: discard and cancel
+
 - GIVEN an unsaved edit
 - WHEN the window is closed and Discard is chosen, the window closes without writing; WHEN Cancel is chosen instead
 - THEN the window stays open and the edit is still there
+
 #### Scenario: nothing unsaved
+
 - GIVEN no unsaved Files edit
 - WHEN the window is closed
 - THEN it closes at once with no dialog
