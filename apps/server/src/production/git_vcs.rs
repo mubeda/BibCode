@@ -8113,6 +8113,7 @@ mod open_pull_request_lookup_tests {
 case "$1:$2" in
   pr:list)
     printf '%s\n' "$4" >> 'CALLS'
+    printf '%s\n' "$$" >> 'PIDS'
     if [ -f 'STATE/fail' ]; then echo 'forge unavailable' >&2; exit 1; fi
     if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
     if [ -f 'STATE/open' ]; then
@@ -8130,6 +8131,8 @@ esac
         repository: PathBuf,
         state: PathBuf,
         calls: PathBuf,
+        pids: PathBuf,
+        registry: WorkspaceAvailabilityRegistry,
         services: GitVcsRpcServices,
     }
 
@@ -8157,25 +8160,80 @@ esac
                 ],
             );
             let calls = sandbox.path("gh-calls");
+            let pids = sandbox.path("gh-pids");
             TestSandbox::write_executable(
                 &bin.join("gh"),
                 &FAKE_GH
                     .replace("CALLS", &calls.to_string_lossy())
+                    .replace("PIDS", &pids.to_string_lossy())
                     .replace("STATE", &state.to_string_lossy()),
             );
             let hosts = Arc::new(ProviderHosts::default());
+            let registry = WorkspaceAvailabilityRegistry::new();
             let services = GitVcsRpcServices::with_repository(
                 Arc::new(GitRepository::default().with_provider_hosts(hosts.clone())),
                 hosts,
             )
-            .with_hosting_executable_dir_for_integration_test(bin);
+            .with_hosting_executable_dir_for_integration_test(bin)
+            .with_availability_registry(registry.clone());
             Self {
                 _sandbox: sandbox,
                 repository,
                 state,
                 calls,
+                pids,
+                registry,
                 services,
             }
+        }
+
+        /// Whether any fake `gh` this fixture started is still running.
+        fn a_forge_cli_is_running(&self) -> bool {
+            std::fs::read_to_string(&self.pids)
+                .unwrap_or_default()
+                .lines()
+                .any(|pid| {
+                    let stat = std::process::Command::new("ps")
+                        .args(["-o", "stat=", "-p", pid])
+                        .output()
+                        .expect("ps runs");
+                    let stat = String::from_utf8_lossy(&stat.stdout);
+                    !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+                })
+        }
+
+        async fn wait_until_no_forge_cli_runs(&self, why: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.a_forge_cli_is_running() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{why}: a gh lookup is still running"));
+        }
+
+        fn subscribe(&self, cancellation: &CancellationToken) -> Subscriber {
+            Subscriber {
+                stream: self.services.status_stream(
+                    subscribe_request(&self.repository),
+                    cancellation.clone(),
+                ),
+                ref_name: Value::Null,
+                remote: Value::Null,
+                events: Vec::new(),
+            }
+        }
+
+        /// Forgets the remembered lookups without telling any status stream.
+        fn forget_lookups(&self) {
+            self.services
+                .pull_requests
+                .invalidate_open_pull_request_lookups(&self.repository);
+        }
+
+        /// What a finished `gh pr create` or merge from outside BiBCode reports.
+        fn report_pull_request_change(&self) {
+            self.services.pull_request_change_reporter()(&self.repository);
         }
 
         fn set(&self, marker: &str, contents: &str) {
@@ -8217,6 +8275,76 @@ esac
         async fn refresh(&self) -> Value {
             self.unary("vcs.refreshStatus", json!({ "cwd": self.repository }))
                 .await
+        }
+    }
+
+    /// The status a client shows, folded from the stream the way the client's
+    /// `applyGitStatusStreamEvent` folds it.
+    struct Subscriber {
+        stream: mpsc::Receiver<RpcStreamChunk>,
+        ref_name: Value,
+        remote: Value,
+        /// Each event with the pull request shown after it.
+        events: Vec<(Value, Value)>,
+    }
+
+    impl Subscriber {
+        fn pr(&self) -> Value {
+            self.remote.get("pr").cloned().unwrap_or(Value::Null)
+        }
+
+        async fn next(&mut self) {
+            let chunk = self
+                .stream
+                .recv()
+                .await
+                .expect("status stream stays open")
+                .expect("status stream event");
+            for event in chunk {
+                match event["_tag"].as_str() {
+                    Some("snapshot") => {
+                        self.ref_name = event["local"]["refName"].clone();
+                        self.remote = event["remote"].clone();
+                    }
+                    Some("localUpdated") => {
+                        if event["local"]["refName"] != self.ref_name {
+                            self.remote = Value::Null;
+                        }
+                        self.ref_name = event["local"]["refName"].clone();
+                    }
+                    Some("remoteUpdated") => self.remote = event["remote"].clone(),
+                    tag => panic!("unexpected status event {tag:?}"),
+                }
+                self.events.push((event, self.pr()));
+            }
+        }
+
+        async fn until(&mut self, why: &str, done: impl Fn(&Self) -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !done(self) {
+                    self.next().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{why}; events: {:?}", self.events));
+        }
+
+        /// Folds every event that arrives within `window`.
+        async fn drain(&mut self, window: Duration) {
+            let _ = tokio::time::timeout(window, async {
+                loop {
+                    self.next().await;
+                }
+            })
+            .await;
+        }
+
+        /// The pull request shown after each event since event `from`.
+        fn shown_since(&self, from: usize) -> Vec<Value> {
+            self.events[from..]
+                .iter()
+                .map(|(_, pr)| pr["number"].clone())
+                .collect()
         }
     }
 
@@ -8611,6 +8739,306 @@ esac
         let recovered = fixture.refresh().await;
         assert_eq!(recovered["pr"]["number"], 42, "{recovered}");
         assert_eq!(fixture.lookups(), ["main", "main"]);
+    }
+
+    /// Subscribes and waits until the subscriber shows the open pull request.
+    async fn subscriber_showing_the_pull_request(
+        fixture: &Fixture,
+        cancellation: &CancellationToken,
+    ) -> Subscriber {
+        fixture.set("open", "");
+        let mut subscriber = fixture.subscribe(cancellation);
+        subscriber
+            .until("the subscriber shows the open pull request", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        subscriber
+    }
+
+    #[tokio::test]
+    async fn pr_row_same_ref_keeps_the_pull_request_while_a_lookup_runs() {
+        let fixture = Fixture::new("pr-row-same-ref");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        // The forge answers slowly now. A remote publication, a local update and a mutation
+        // that republishes the equal status under new epochs all arrive while it answers.
+        fixture.set("slow", "3");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        fixture
+            .services
+            .broadcaster
+            .begin_mutation(&fixture.repository)
+            .await
+            .finish()
+            .await;
+        subscriber.drain(Duration::from_millis(1500)).await;
+
+        assert!(
+            subscriber.events.len() > from,
+            "the test drove no status event"
+        );
+        assert!(
+            subscriber.shown_since(from).iter().all(|pr| *pr == 42),
+            "the pull request must stay shown while its lookup runs: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_an_open_request_is_shown_when_the_lookup_ends() {
+        let fixture = Fixture::new("pr-row-open");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        assert!(subscriber.pr().is_null(), "{:?}", subscriber.events);
+
+        fixture.set("open", "");
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the open pull request must be shown", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_no_open_request_clears_it_when_the_lookup_ends() {
+        let fixture = Fixture::new("pr-row-none");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        // The request was merged on the web.
+        fixture.clear("open");
+        fixture.set("slow", "1");
+        let reported = tokio::time::Instant::now();
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the subscriber must clear the closed request", |s| {
+                s.pr().is_null()
+            })
+            .await;
+
+        assert!(
+            reported.elapsed() >= Duration::from_millis(900),
+            "only the lookup's own answer clears the request: {:?}",
+            &subscriber.events[from..]
+        );
+        assert_eq!(fixture.lookups(), ["main", "main"]);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_failed_lookup_keeps_the_pull_request() {
+        let fixture = Fixture::new("pr-row-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        fixture.set("fail", "");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        assert!(
+            subscriber.events.len() > from,
+            "the test drove no status event"
+        );
+        assert!(
+            subscriber.shown_since(from).iter().all(|pr| *pr == 42),
+            "a failed lookup must keep the pull request: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_ref_change_clears_the_pull_request_at_once() {
+        let fixture = Fixture::new("pr-row-ref-change");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        fixture.set("slow", "3");
+        git(&fixture.repository, &["switch", "-q", "-c", "feature"]);
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        let started = tokio::time::Instant::now();
+        subscriber
+            .until("the subscriber must see the new branch", |s| {
+                s.ref_name == "feature"
+            })
+            .await;
+        assert!(
+            subscriber.pr().is_null(),
+            "the old branch's request must clear with the branch change: {:?}",
+            subscriber.events
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the clear must not wait for the new branch's lookup"
+        );
+        subscriber
+            .until("the new branch's request must be shown", |s| {
+                s.pr()["headRef"] == "feature"
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_result_across_an_epoch_change_is_delivered_once() {
+        let fixture = Fixture::new("pr-row-epoch");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        assert!(subscriber.pr().is_null(), "{:?}", subscriber.events);
+
+        // The lookup answers while a mutation holds the status gate, so its fence is old.
+        fixture.set("open", "");
+        fixture.set("slow", "1");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        let mutation = fixture
+            .services
+            .broadcaster
+            .begin_mutation(&fixture.repository)
+            .await;
+        subscriber.drain(Duration::from_millis(2000)).await;
+        assert!(
+            subscriber.pr().is_null(),
+            "nothing is published while the gate is closed: {:?}",
+            subscriber.events
+        );
+        let from = subscriber.events.len();
+        mutation.finish().await;
+        subscriber
+            .until("the late result must be delivered", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        let deliveries = subscriber.events[from..]
+            .iter()
+            .filter(|(event, _)| event["remote"]["pr"]["number"] == 42)
+            .count();
+        assert_eq!(
+            deliveries, 1,
+            "delivered once: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_at_its_bound_returns_the_last_known_pull_request() {
+        let fixture = Fixture::new("pr-refresh-bound");
+        let cancellation = CancellationToken::new();
+        let _subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        fixture.set("slow", "4");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert_eq!(status["pr"]["number"], 42, "{status}");
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_reaches_the_subscriber() {
+        let fixture = Fixture::new("pr-refresh-late");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // Nothing tells the stream to look again; only the refresh does.
+        fixture.set("open", "");
+        fixture.set("slow", "3");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert!(status["pr"].is_null(), "{status}");
+        subscriber
+            .until("the subscriber must receive the late lookup", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    /// A subscriber, then a refresh that stops waiting for a 30 second lookup at its bound.
+    async fn a_refresh_past_its_bound(
+        fixture: &Fixture,
+        cancellation: &CancellationToken,
+    ) -> Subscriber {
+        fixture.set("slow", "30");
+        let mut subscriber = fixture.subscribe(cancellation);
+        subscriber.next().await;
+        wait_for_lookups(fixture, "main", 1).await;
+        tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert!(fixture.a_forge_cli_is_running(), "the subscriber still looks");
+        subscriber
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_stops_with_the_workspace() {
+        let fixture = Fixture::new("pr-refresh-loss");
+        let cancellation = CancellationToken::new();
+        let _subscriber = a_refresh_past_its_bound(&fixture, &cancellation).await;
+
+        assert!(
+            fixture
+                .registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-lookup".to_owned(),
+                    repository_key: "repository-lookup".to_owned(),
+                    generation: 1,
+                    path: fixture.repository.clone(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+        fixture
+            .wait_until_no_forge_cli_runs("after the workspace was lost")
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_stops_at_quiesce() {
+        let fixture = Fixture::new("pr-refresh-quiesce");
+        let cancellation = CancellationToken::new();
+        let _subscriber = a_refresh_past_its_bound(&fixture, &cancellation).await;
+
+        fixture.services.broadcaster.shutdown().await;
+        fixture
+            .wait_until_no_forge_cli_runs("after the status broadcaster shut down")
+            .await;
+        cancellation.cancel();
     }
 }
 

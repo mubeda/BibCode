@@ -6644,6 +6644,69 @@ mod tests {
         broadcaster.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_new_subscriber_republishes_an_equal_status_once_under_each_new_epoch() {
+        let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let output = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("fixture Git");
+        assert!(output.status.success(), "{output:?}");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        // An entry without status workers, so only the subscribe path can publish.
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let local = broadcaster
+            .inner
+            .repository
+            .local_status(&cwd, &CancellationToken::new())
+            .await
+            .expect("local status");
+        broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(&cwd)
+            .expect("repository entry")
+            .local = local.clone();
+        let subscribe = || async {
+            broadcaster
+                .subscribe(cwd.clone(), CancellationToken::new())
+                .await
+                .expect("subscription")
+        };
+
+        let _same_epoch = subscribe().await;
+        assert!(
+            events.try_recv().is_err(),
+            "an equal status under the same epoch"
+        );
+        broadcaster.begin_mutation(&cwd).await.finish().await;
+        let _new_epoch = subscribe().await;
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("an equal status under a new epoch")
+                .value,
+            VcsStatusStreamEvent::LocalUpdated {
+                local: local.clone()
+            }
+        );
+        let _again = subscribe().await;
+        assert!(
+            events.try_recv().is_err(),
+            "published twice under one epoch"
+        );
+        broadcaster.shutdown().await;
+    }
+
     fn record_availability_nudges(broadcaster: &StatusBroadcaster) -> Arc<Mutex<Vec<PathBuf>>> {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed_calls = Arc::clone(&calls);
