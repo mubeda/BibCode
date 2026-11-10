@@ -6694,6 +6694,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_under_a_new_epoch_keeps_the_known_pull_request() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let (local, remote) = {
+            let state = broadcaster.lock_state();
+            let entry = state.repositories.get(&cwd).expect("repository entry");
+            (
+                entry.local.clone(),
+                entry.remote.clone().flatten().expect("cached remote"),
+            )
+        };
+        let pull_request = ChangeRequest {
+            number: 7,
+            title: "Feature".to_owned(),
+            url: "https://forge.example.test/pull/7".to_owned(),
+            base_ref: "main".to_owned(),
+            head_ref: "old".to_owned(),
+            state: "open".to_owned(),
+        };
+        broadcaster.record_pull_request(&cwd, Some("old"), Some(pull_request.clone()));
+        broadcaster.begin_mutation(&cwd).await.finish().await;
+        let fence = broadcaster
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("read fence");
+
+        // A status read never finds the pull request.
+        broadcaster.publish_status(&cwd, &VcsStatusResult { local, remote }, &fence);
+        let VcsStatusStreamEvent::Snapshot { remote, .. } = events
+            .try_recv()
+            .expect("an equal snapshot under a new epoch")
+            .value
+        else {
+            panic!("a snapshot");
+        };
+        assert_eq!(remote.expect("remote").pr, Some(pull_request));
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_new_subscriber_republishes_an_equal_status_once_under_each_new_epoch() {
         let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
         let root = tempfile::tempdir().expect("repository folder");

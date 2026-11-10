@@ -9045,6 +9045,40 @@ esac
         cancellation.cancel();
     }
 
+    #[tokio::test]
+    async fn refreshes_past_the_bound_do_not_restart_the_subscriber_lookup() {
+        let fixture = Fixture::new("pr-refresh-repeated");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // Each refresh joins the lookup and stops waiting at its bound, again and again,
+        // while the lookup takes twice that bound.
+        fixture.set("open", "");
+        fixture.set("slow", "4");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        let refreshes = async {
+            loop {
+                fixture.refresh().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::select! {
+            () = subscriber.until("the lookup must finish while refreshes repeat", |s| {
+                s.pr()["number"] == 42
+            }) => {}
+            () = refreshes => {}
+        }
+        assert_eq!(
+            fixture.lookups(),
+            ["main", "main"],
+            "the refreshes must not restart the subscriber's lookup"
+        );
+        cancellation.cancel();
+    }
+
     /// A subscriber, then a refresh that stops waiting for a 30 second lookup at its bound.
     async fn a_refresh_past_its_bound(
         fixture: &Fixture,
