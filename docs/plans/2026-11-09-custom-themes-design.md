@@ -473,3 +473,12 @@ was checked against the code and the spec before any change. C is Codex, A is th
 | A12. happy-dom may not resolve `color-mix` in computed custom properties.                                                         | Accepted as a test-plan risk. Task 7.13 checks it first and compares resolved values where happy-dom cannot compute a color.                                                                                                                             |
 
 Codex found no injection path under the stated validation rules.
+
+### Implementation review (lane D4)
+
+Codex reviewed the built phase (read-only), the coordinator triaged it, and lane D4 reproduced
+each finding with a failing test before the fix.
+
+| Finding                                                                                                                                                | Outcome                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C11. Import theme read the first 16 KiB plus one byte of a chosen file, so a file with a byte order mark and over 1 MB after it passed the size check. | Fixed. `ThemeImportDialog` refuses a file by `file.size` before reading it and shows the size error under `file`. The pasted text stays as it was. |

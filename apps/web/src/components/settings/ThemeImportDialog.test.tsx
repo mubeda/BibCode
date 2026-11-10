@@ -81,6 +81,25 @@ describe("ThemeImportDialog", () => {
     expect(() => button("Import")).toThrow();
   });
 
+  it("a file over 16 KiB is refused by its size before it is read", async () => {
+    await mount();
+    const file = new File([JSON.stringify(night)], "night.theme.json", {
+      type: "application/json",
+    });
+    Object.defineProperty(file, "size", { value: 16 * 1024 + 1 });
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {});
+    const items = [...document.querySelectorAll("[data-import-error]")].map(
+      (item) => item.textContent,
+    );
+    expect(items).toEqual(["file: A theme file can be at most 16 KiB."]);
+    expect(() => button("Import")).toThrow();
+  });
+
   it("a valid file with a conflict asks Replace or Keep both before storing", async () => {
     saveCustomTheme({ ...night, ui: { primary: "#00ff00" } });
     await mount();

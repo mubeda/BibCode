@@ -1,7 +1,7 @@
 import type { ThemeFile } from "@bibcode/contracts";
 import { useId, useState } from "react";
 
-import { MAX_THEME_FILE_BYTES } from "../../themes/themeValidation";
+import { MAX_THEME_FILE_BYTES, validateThemeFile } from "../../themes/themeValidation";
 import { commitThemeImport, planThemeImport, type ImportPlan } from "../../themes/themeTransfer";
 import type { FixedPair } from "../../themes/themeColor";
 import { Button } from "../ui/button";
@@ -54,8 +54,14 @@ export function ThemeImportDialog({
   };
   const readFile = async (file: File | undefined) => {
     if (!file) return;
-    // Larger files are refused by size; reading only one byte past the limit keeps that cheap.
-    changeText(await file.slice(0, MAX_THEME_FILE_BYTES + 1).text());
+    // Refused by its size before reading; the pasted text stays as it was.
+    if (file.size > MAX_THEME_FILE_BYTES) {
+      const refused = validateThemeFile(null, { allowReservedId: false, byteLength: file.size });
+      setSaveError(null);
+      if (!refused.ok) setPlan(refused);
+      return;
+    }
+    changeText(await file.text());
   };
   const commit = (choice: "replace" | "keep-both") => {
     if (!plan?.ok) return;
