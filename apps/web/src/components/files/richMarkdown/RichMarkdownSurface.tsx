@@ -59,8 +59,9 @@ export default function RichMarkdownSurface({
         if (timer === null) session.setPendingEditFlusher(deliver);
         else clearTimeout(timer);
         timer = setTimeout(() => {
-          session.setPendingEditFlusher(null);
+          // Cleared only once delivered, so an edit that fails to deliver still shows as unsaved.
           deliver();
+          session.setPendingEditFlusher(null);
         }, SERIALIZE_DELAY_MS);
       },
     });

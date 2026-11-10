@@ -551,7 +551,8 @@ was reproduced as a failing test before the fix.
   one block, but the block list counted its opener and closer as two, so `canReconcile`
   accepted a file whose blocks did not line up. Fixed: the empty form is one leaf block,
   `canReconcile` compares the block lists level by level, and a throw while placing an edit
-  falls back to `after`.
+  falls back to `after`. The surface clears its pending-edit flusher only after the edit is
+  delivered, so an edit that fails to deliver still shows as unsaved.
 - Codex review 2, item 4, an inserted image named `diagram#1.png` linked a fragment, a
   `?` started a query and an unmatched parenthesis broke the destination. The hook used
   `encodeURI`, which leaves `#`, `?` and parentheses as they are. Fixed: `insertImage` encodes each path segment.

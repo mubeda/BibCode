@@ -13,6 +13,19 @@ vi.mock("@pierre/diffs/edit", () => ({
   },
 }));
 
+const reconcile = vi.hoisted(() => ({ fail: false }));
+
+vi.mock("./markdownReconcile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./markdownReconcile")>();
+  return {
+    ...actual,
+    reconcileMarkdown: (input: Parameters<typeof actual.reconcileMarkdown>[0]) => {
+      if (reconcile.fail) throw new Error("reconcile failed");
+      return actual.reconcileMarkdown(input);
+    },
+  };
+});
+
 import { FileEditingSession } from "../fileEditingSession";
 import { FileEditingSessionRegistry } from "../fileEditingSessionRegistry";
 import type { RichMarkdownEditor } from "./richMarkdownExtensions";
@@ -77,6 +90,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  reconcile.fail = false;
   await act(async () => root.unmount());
   container.remove();
   vi.useRealTimers();
@@ -211,5 +225,50 @@ describe("RichMarkdownSurface", () => {
     expect(session.documentContents).toBe("Mine edited\n");
     act(() => session.reloadFromDisk());
     expect(session.documentContents).toBe("Theirs\n");
+  });
+
+  it("an edit typed while a disk check is out makes a newer disk version a conflict", async () => {
+    const { session, persist } = createSession("Mine\n");
+    const { tiptap } = await mount(session, "Mine\n");
+    const token = session.beginDiskCheck()!;
+
+    typeAfter(tiptap!, "Mine", " edited");
+    expect(session.reconcileVersion(token, { _tag: "present", version: "v2" })).toBe("read");
+    session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
+    await act(async () => vi.advanceTimersByTime(300));
+    await act(async () => root.render(null));
+    await act(async () => session.flush());
+
+    expect(session.getSnapshot().conflict).toMatchObject({ reason: "changed" });
+    expect(session.documentContents).toBe("Mine edited\n");
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it("an edit after an empty details block reaches the session and survives leaving", async () => {
+    const original = "<details><summary>More</summary></details>\n\nHello\n";
+    const { session } = createSession(original);
+    const { tiptap, onEditorChange } = await mount(session, original);
+    expect(onEditorChange.mock.lastCall![0]).not.toBeNull();
+
+    typeAfter(tiptap!, "Hello", " world");
+    await act(async () => vi.advanceTimersByTime(300));
+    await act(async () => root.render(null));
+
+    expect(session.unsavedContents).toBe(
+      "<details><summary>More</summary></details>\n\nHello world\n",
+    );
+  });
+
+  it("an edit the reconcile throws on stays pending and visible", async () => {
+    const { session } = createSession("Hello\n");
+    const { tiptap } = await mount(session, "Hello\n");
+    reconcile.fail = true;
+
+    typeAfter(tiptap!, "Hello", " world");
+    await act(async () => {
+      expect(() => vi.advanceTimersByTime(300)).toThrow("reconcile failed");
+    });
+
+    expect(session.getSnapshot().editPending).toBe(true);
   });
 });
