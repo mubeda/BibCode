@@ -858,8 +858,8 @@ describe("dependency upgrade ledger validation", () => {
 
     expect(validateDependencyLedger(inventory, ledger)).toEqual([]);
     expect(ledger.inventorySummary).toEqual({
-      javascriptDirect: 90,
-      javascriptLedger: 92,
+      javascriptDirect: 99,
+      javascriptLedger: 101,
       rustRegistry: 141,
       rustPath: 3,
       rustGit: 1,
