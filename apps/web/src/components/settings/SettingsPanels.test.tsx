@@ -54,6 +54,8 @@ const h = vi.hoisted(() => {
     sections: [] as Array<Record<string, unknown>>,
     theme: "system" as string,
     setTheme: vi.fn(),
+    slots: { light: "light", dark: "dark" },
+    resetSlots: vi.fn(),
     settings: null as unknown,
     updateSettings: vi.fn(),
     observability: null as unknown,
@@ -116,6 +118,11 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("../../hooks/useTheme", () => ({
   useTheme: () => ({ theme: h.theme, setTheme: h.setTheme, resolvedTheme: "light" }),
+}));
+
+vi.mock("../../themes/customThemes", () => ({
+  useThemeLibrary: () => ({ themes: [], slots: h.slots }),
+  resetSlots: h.resetSlots,
 }));
 
 vi.mock("../../hooks/useSettings", () => ({
@@ -622,6 +629,8 @@ beforeEach(() => {
   clearRegistries();
   h.theme = "system";
   h.setTheme.mockReset();
+  h.slots = { light: "light", dark: "dark" };
+  h.resetSlots.mockReset();
   h.settings = { ...DEFAULT_UNIFIED_SETTINGS };
   h.updateSettings.mockReset();
   h.observability = null;
@@ -804,18 +813,12 @@ describe("GeneralSettingsPanel", () => {
 
     const markup = renderedText();
 
-    expect(markup).toContain("Theme");
     expect(markup).toContain("Time format");
     expect(renderedText()).toContain(
       'Leave empty to use "~/" for Clone and Create in Add Project.',
     );
     expect(findControls("button", "Reset ")).toHaveLength(0);
     expect(findControls("switch", "Start new worktrees from origin by default")).toHaveLength(0);
-
-    invoke(control("select", "system"), "onValueChange", "dark");
-    expect(h.setTheme).toHaveBeenCalledWith("dark");
-    invoke(control("select", "system"), "onValueChange", "bogus");
-    expect(h.setTheme).toHaveBeenCalledTimes(1);
 
     invoke(control("select", "locale"), "onValueChange", "12-hour");
     expect(h.updateSettings).toHaveBeenCalledWith({ timestampFormat: "12-hour" });
@@ -899,9 +902,6 @@ describe("GeneralSettingsPanel", () => {
 
     expect(markup).toContain("Start from origin");
     expect(findControls("switch", "Start new worktrees from origin by default")).toHaveLength(1);
-
-    invoke(control("button", "Reset theme to default"), "onClick");
-    expect(h.setTheme).toHaveBeenCalledWith("system");
 
     invoke(control("button", "Reset time format to default"), "onClick");
     expect(h.updateSettings).toHaveBeenCalledWith({
@@ -1299,6 +1299,31 @@ describe("useGeneralSettingsRestore", () => {
     await restore.restoreDefaults();
     expect(confirmSpy).not.toHaveBeenCalled();
     expect(h.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("General no longer has a theme control", () => {
+    h.theme = "dark";
+    const markup = renderedText();
+
+    expect(markup).not.toContain("Choose how BiBCode looks");
+    expect(findControls("select", "system")).toHaveLength(0);
+    expect(findControls("button", "Reset theme to default")).toHaveLength(0);
+  });
+
+  it("Restore is offered in System mode when only a non-default built-in is selected", () => {
+    h.slots = { light: "light", dark: "tokyo-night" };
+    expect(captureRestore().changedSettingLabels).toEqual(["Theme"]);
+  });
+
+  it("restore defaults sets the mode to System and both slots to the built-ins and keeps custom themes", async () => {
+    h.theme = "dark";
+    h.slots = { light: "light", dark: "mine" };
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    await restore.restoreDefaults();
+    expect(h.setTheme).toHaveBeenCalledWith("system");
+    expect(h.resetSlots).toHaveBeenCalledOnce();
   });
 
   it("lists only changed General setting labels", () => {

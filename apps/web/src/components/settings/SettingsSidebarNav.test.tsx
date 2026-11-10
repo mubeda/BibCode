@@ -45,6 +45,7 @@ describe("settings navigation", () => {
   it("lists the settings sections in the approved order", () => {
     expect(BASE_SETTINGS_NAV_ITEMS.map(({ label, to }) => [label, to])).toEqual([
       ["General", "/settings/general"],
+      ["Appearance", "/settings/appearance"],
       ["Remote Servers", "/settings/remote-servers"],
       ["Agents", "/settings/agents"],
       ["Status Bar", "/settings/status-bar"],
@@ -57,6 +58,11 @@ describe("settings navigation", () => {
       ["Diagnostics", "/settings/diagnostics"],
       ["About", "/settings/about"],
     ]);
+  });
+
+  it("Appearance is listed after General", () => {
+    const labels = BASE_SETTINGS_NAV_ITEMS.map(({ label }) => label);
+    expect(labels.indexOf("Appearance")).toBe(labels.indexOf("General") + 1);
   });
 
   it("adds Local environment only for Windows desktop", () => {
@@ -79,9 +85,10 @@ describe("settings navigation", () => {
     expect(
       settingsNavItemsFor(windowsPolicy)
         .map(({ label, to }) => [label, to])
-        .slice(0, 3),
+        .slice(0, 4),
     ).toEqual([
       ["General", "/settings/general"],
+      ["Appearance", "/settings/appearance"],
       ["Remote Servers", "/settings/remote-servers"],
       ["Local environment", "/settings/local-environment"],
     ]);

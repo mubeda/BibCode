@@ -51,6 +51,7 @@ import {
 import { isDesktopHost } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
 import { useTheme } from "../../hooks/useTheme";
+import { resetSlots, useThemeLibrary } from "../../themes/customThemes";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "../WorktreeRemovalDialog";
@@ -112,21 +113,6 @@ import { AgentIntegrationsSection } from "./AgentIntegrationsSection";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { StatusBarSettingsSection } from "./StatusBarSettingsSection";
-
-const THEME_OPTIONS = [
-  {
-    value: "system",
-    label: "System",
-  },
-  {
-    value: "light",
-    label: "Light",
-  },
-  {
-    value: "dark",
-    label: "Dark",
-  },
-] as const;
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return (
@@ -425,6 +411,7 @@ function AboutVersionSection() {
 
 export function useGeneralSettingsRestore(onRestored?: () => void) {
   const { theme, setTheme } = useTheme();
+  const { slots } = useThemeLibrary();
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
   // The link target row is hidden where the BiBCode browser can't open every
@@ -433,7 +420,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
 
   const changedSettingLabels = useMemo(
     () => [
-      ...(theme !== "system" ? ["Theme"] : []),
+      ...(theme !== "system" || slots.light !== "light" || slots.dark !== "dark" ? ["Theme"] : []),
       ...(settings.timestampFormat !== DEFAULT_UNIFIED_SETTINGS.timestampFormat
         ? ["Time format"]
         : []),
@@ -492,6 +479,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       settings.verboseChat,
       settings.wordWrap,
       linkTargetShown,
+      slots,
       theme,
     ],
   );
@@ -507,6 +495,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
     if (!confirmed) return;
 
     setTheme("system");
+    resetSlots();
     updateSettings({
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
       ...(linkTargetShown ? { browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget } : {}),
@@ -533,7 +522,6 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
 }
 
 export function GeneralSettingsPanel() {
-  const { theme, setTheme } = useTheme();
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
   const linkTargetShown = canPreviewAnyUrlInRuntime();
@@ -541,39 +529,6 @@ export function GeneralSettingsPanel() {
   return (
     <SettingsPageContainer>
       <SettingsSection title="General">
-        <SettingsRow
-          title="Theme"
-          description="Choose how BiBCode looks across the app."
-          resetAction={
-            theme !== "system" ? (
-              <SettingResetButton label="theme" onClick={() => setTheme("system")} />
-            ) : null
-          }
-          control={
-            <Select
-              value={theme}
-              onValueChange={(value) => {
-                if (value === "system" || value === "light" || value === "dark") {
-                  setTheme(value);
-                }
-              }}
-            >
-              <SelectTrigger className="w-full sm:w-40" aria-label="Theme preference">
-                <SelectValue>
-                  {THEME_OPTIONS.find((option) => option.value === theme)?.label ?? "System"}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectPopup align="end" alignItemWithTrigger={false}>
-                {THEME_OPTIONS.map((option) => (
-                  <SelectItem hideIndicator key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectPopup>
-            </Select>
-          }
-        />
-
         <SettingsRow
           title="Time format"
           description="System default follows your browser or OS clock preference."
