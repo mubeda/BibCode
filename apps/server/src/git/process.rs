@@ -1142,6 +1142,48 @@ mod tests {
         }
     }
 
+    /// A caller dropped during the lock-unchanged wait must not release the write while its
+    /// lock remains: the cleanup finishes on its own and shutdown waits for it.
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_survives_a_caller_dropped_during_the_wait() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let registry = GitWriteRegistry::default();
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        reports
+            .send(TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true,
+            })
+            .expect("the stop report");
+        let settlement = WriteSettlement {
+            _ticket: registry.track().expect("an admitted write"),
+            watch: Some(watch),
+            received,
+            operation: "fixture-write".to_owned(),
+            cwd: git_dir.path().to_path_buf(),
+        }
+        .settle_now_or_later();
+
+        let dropped = tokio::time::timeout(Duration::from_secs(1), settlement).await;
+
+        assert!(dropped.is_err(), "the caller left during the wait");
+        assert!(lock.exists(), "the lock is not yet two seconds old");
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_millis(500)).await,
+            QuiesceOutcome::Pending(1),
+            "the write is held while its cleanup runs"
+        );
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(5)).await,
+            QuiesceOutcome::Clean
+        );
+        assert!(!lock.exists(), "the cleanup still removed the lock");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
         let registry = GitWriteRegistry::default();
