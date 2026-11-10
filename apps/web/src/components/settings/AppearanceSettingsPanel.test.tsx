@@ -4,10 +4,13 @@ import { createRoot, type Root } from "react-dom/client";
 import type { DesktopBridge } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-const { toastAdd } = vi.hoisted(() => ({ toastAdd: vi.fn() }));
+const { toastAdd, toastClose } = vi.hoisted(() => ({
+  toastAdd: vi.fn((_toast: unknown) => "toast-1"),
+  toastClose: vi.fn(),
+}));
 vi.mock("../ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ui/toast")>()),
-  toastManager: { add: toastAdd },
+  toastManager: { add: toastAdd, close: toastClose },
 }));
 
 import { AppearanceSettingsPanel } from "./AppearanceSettingsPanel";
@@ -18,6 +21,7 @@ import {
   saveCustomTheme,
   setSlot,
 } from "../../themes/customThemes";
+import { resolveToken } from "../../themes/themeColor";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -26,8 +30,9 @@ async function mount() {
   await act(async () => root.render(<AppearanceSettingsPanel />));
 }
 
-const buttons = () => [...container.querySelectorAll("button")];
-function button(name: string): HTMLButtonElement {
+// The row menu renders in a portal, so buttons and menu items are looked up in the document.
+const buttons = () => [...document.querySelectorAll<HTMLElement>("button, [role=menuitem]")];
+function button(name: string): HTMLElement {
   const found = buttons().find(
     (element) =>
       element.getAttribute("aria-label") === name || element.textContent?.trim() === name,
@@ -43,6 +48,23 @@ const row = (id: string) => container.querySelector(`[data-theme-row="${id}"]`)!
 async function click(element: HTMLElement) {
   await act(async () => element.click());
 }
+/** The row's own control: the whole row applies the theme. */
+const select = (id: string) => row(id).querySelector<HTMLButtonElement>("[data-theme-select]")!;
+async function menuAction(themeName: string, action: string) {
+  await click(button(`More actions for ${themeName}`));
+  await click(button(action));
+}
+const mode = () => window.localStorage.getItem("bibcode:theme");
+type UndoToast = { title: string; actionProps: { children: string; onClick: () => void } };
+const undoToast = () => toastAdd.mock.calls.at(-1)?.[0] as UndoToast | undefined;
+async function undo() {
+  const toast = undoToast();
+  if (!toast) throw new Error("No Undo offered");
+  expect(toast.actionProps.children).toBe("Undo");
+  await act(async () => toast.actionProps.onClick());
+}
+const rootStyle = (name: string) => document.documentElement.style.getPropertyValue(name);
+const showsDark = () => document.documentElement.classList.contains("dark");
 async function type(input: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   await act(async () => {
@@ -61,7 +83,8 @@ beforeEach(() => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
-  toastAdd.mockReset();
+  toastAdd.mockClear();
+  toastClose.mockClear();
   await act(async () => root.unmount());
   container.remove();
   window.localStorage.clear();
@@ -81,53 +104,150 @@ describe("AppearanceSettingsPanel", () => {
     expect(window.localStorage.getItem("bibcode:theme")).toBe("dark");
   });
 
-  it("the six built-ins are listed in order, then custom themes, each with its base and a preview", async () => {
+  it("the six built-ins are listed in order within their base's group, then custom themes, each with a preview", async () => {
     saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
     await mount();
     expect(rowNames()).toEqual([
       "light",
+      "matrix-light",
+      "verdant-light",
       "dark",
       "tokyo-night",
       "matrix-dark",
-      "matrix-light",
-      "verdant-light",
       "mine",
     ]);
-    expect(row("tokyo-night").textContent).toContain("Dark base");
-    expect(row("verdant-light").textContent).toContain("Light base");
     expect(row("mine").textContent).toContain("Custom");
     expect(row("tokyo-night").querySelectorAll("[data-swatch]")).toHaveLength(5);
   });
 
-  it("a built-in row offers Duplicate only, a custom row offers Edit, Duplicate, Export and Delete", async () => {
+  it("a built-in row offers Duplicate only, a custom row offers Edit, Duplicate, Export and Delete, in a menu outside the row's control", async () => {
     saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
     await mount();
-    const actions = (id: string) =>
-      [...row(id).querySelectorAll("[data-theme-action]")].map((element) =>
-        element.getAttribute("data-theme-action"),
+    const actions = async (name: string) => {
+      await click(button(`More actions for ${name}`));
+      const items = [...document.querySelectorAll("[role=menuitem][data-theme-action]")].map(
+        (element) => element.getAttribute("data-theme-action"),
       );
-    expect(actions("tokyo-night")).toEqual(["duplicate"]);
-    expect(actions("mine")).toEqual(["edit", "duplicate", "export", "delete"]);
+      await act(async () => {
+        document.activeElement?.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      return items;
+    };
+    expect(await actions("Tokyo Night")).toEqual(["duplicate"]);
+    expect(await actions("Mine")).toEqual(["edit", "duplicate", "export", "delete"]);
+    expect(select("mine").contains(button("More actions for Mine"))).toBe(false);
   });
 
-  it("Use for dark puts the theme in the dark slot and marks the row", async () => {
+  it("themes are grouped under Light themes and Dark themes, and the group on screen says Showing now", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
     await mount();
-    await click(button("Use Tokyo Night for dark"));
+    const group = (label: string) =>
+      container.querySelector<HTMLElement>(`[role="group"][aria-label="${label}"]`)!;
+    const ids = (label: string) =>
+      [...group(label).querySelectorAll("[data-theme-row]")].map((element) =>
+        element.getAttribute("data-theme-row"),
+      );
+    expect(ids("Light themes")).toEqual(["light", "matrix-light", "verdant-light"]);
+    expect(ids("Dark themes")).toEqual(["dark", "tokyo-night", "matrix-dark", "mine"]);
+    expect(group("Light themes").textContent).toContain("Showing now");
+    expect(group("Dark themes").textContent).not.toContain("Showing now");
+  });
+
+  it("the theme in use in each group is marked with a check, In use and aria-pressed", async () => {
+    await mount();
+    expect(select("light").getAttribute("aria-pressed")).toBe("true");
+    expect(select("dark").getAttribute("aria-pressed")).toBe("true");
+    expect(select("tokyo-night").getAttribute("aria-pressed")).toBe("false");
+    expect(select("dark").textContent).toContain("In use");
+    expect(select("dark").querySelector("[data-theme-in-use-icon]")).not.toBeNull();
+    expect(select("tokyo-night").textContent).not.toContain("In use");
+    expect(select("tokyo-night").querySelector("[data-theme-in-use-icon]")).toBeNull();
+  });
+
+  it("clicking a dark theme in Light mode applies it, switches to Dark, and Undo restores Light and the previous dark theme", async () => {
+    setSlot("dark", "matrix-dark");
+    await mount();
+    await click(select("tokyo-night"));
     expect(readSlots().dark).toBe("tokyo-night");
-    expect(row("tokyo-night").textContent).toContain("In use for dark");
+    expect(mode()).toBe("dark");
+    expect(showsDark()).toBe(true);
+    expect(rootStyle("--background")).toBe(resolveToken(getTheme("tokyo-night")!, "background"));
+    expect(select("tokyo-night").getAttribute("aria-pressed")).toBe("true");
+    expect(undoToast()?.title).toContain("Tokyo Night");
+
+    await undo();
+    expect(mode()).toBe("light");
+    expect(readSlots().dark).toBe("matrix-dark");
+    expect(showsDark()).toBe(false);
+    expect(toastClose).toHaveBeenCalledWith("toast-1");
   });
 
-  it('picking a dark theme in Light mode keeps the mode and offers "Switch to dark now", which sets the mode to Dark', async () => {
+  it("clicking a dark theme while System shows light switches to Dark, and Undo returns to System", async () => {
+    window.localStorage.setItem("bibcode:theme", "system");
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: false,
+          media: query,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        }) as unknown as MediaQueryList,
+    );
     await mount();
-    await click(button("Use Matrix Dark for dark"));
-    expect(window.localStorage.getItem("bibcode:theme")).toBe("light");
-    await click(button("Switch to dark now"));
-    expect(window.localStorage.getItem("bibcode:theme")).toBe("dark");
+    expect(showsDark()).toBe(false);
+    await click(select("matrix-dark"));
+    expect(mode()).toBe("dark");
+    expect(readSlots().dark).toBe("matrix-dark");
+    expect(rootStyle("--background")).toBe(resolveToken(getTheme("matrix-dark")!, "background"));
+
+    await undo();
+    expect(mode()).toBe("system");
+    expect(readSlots().dark).toBe("dark");
+    expect(showsDark()).toBe(false);
+  });
+
+  it("clicking a theme of the base on screen applies it without changing the mode or offering Undo", async () => {
+    window.localStorage.setItem("bibcode:theme", "dark");
+    await mount();
+    await click(select("tokyo-night"));
+    expect(readSlots().dark).toBe("tokyo-night");
+    expect(mode()).toBe("dark");
+    expect(rootStyle("--background")).toBe(resolveToken(getTheme("tokyo-night")!, "background"));
+    expect(toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("a secondary action runs without applying the row's theme", async () => {
+    await mount();
+    await menuAction("Tokyo Night", "Duplicate");
+    expect(container.textContent).toContain("Tokyo Night copy");
+    expect(readSlots().dark).toBe("dark");
+    expect(mode()).toBe("light");
+    expect(toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("rows are native buttons (Enter and Space click them) and arrow keys move between rows", async () => {
+    window.localStorage.setItem("bibcode:theme", "dark");
+    await mount();
+    const key = async (target: HTMLElement, name: string) =>
+      act(async () => {
+        target.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true }));
+      });
+    select("dark").focus();
+    await key(select("dark"), "ArrowDown");
+    expect(document.activeElement).toBe(select("tokyo-night"));
+    await key(select("tokyo-night"), "ArrowUp");
+    expect(document.activeElement).toBe(select("dark"));
+    expect(select("tokyo-night").tagName).toBe("BUTTON");
+    expect(select("tokyo-night").type).toBe("button");
+    await click(select("tokyo-night"));
+    expect(readSlots().dark).toBe("tokyo-night");
   });
 
   it('Duplicate on Tokyo Night adds "Tokyo Night copy"', async () => {
     await mount();
-    await click(button("Duplicate Tokyo Night"));
+    await menuAction("Tokyo Night", "Duplicate");
     expect(container.textContent).toContain("Tokyo Night copy");
   });
 
@@ -135,13 +255,13 @@ describe("AppearanceSettingsPanel", () => {
     saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
     setSlot("dark", "mine");
     await mount();
-    await click(button("Delete Mine"));
+    await menuAction("Mine", "Delete");
     expect(container.textContent).toContain("Delete Mine?");
     await click(button("Cancel"));
     expect(getTheme("mine")).toBeDefined();
     expect(readSlots().dark).toBe("mine");
 
-    await click(button("Delete Mine"));
+    await menuAction("Mine", "Delete");
     await click(button("Delete theme"));
     expect(getTheme("mine")).toBeUndefined();
     expect(readSlots().dark).toBe("dark");
@@ -170,7 +290,7 @@ describe("AppearanceSettingsPanel", () => {
 
     await click(button("Cancel"));
     expect(container.querySelector("[data-theme-editor]")).toBeNull();
-    expect(document.activeElement).toBe(button("Edit Night shift"));
+    expect(document.activeElement).toBe(button("More actions for Night shift"));
   });
 
   it("Export downloads the theme as <id>.theme.json", async () => {
@@ -184,7 +304,7 @@ describe("AppearanceSettingsPanel", () => {
       downloaded = this.download;
     });
     await mount();
-    await click(button("Export Mine"));
+    await menuAction("Mine", "Export");
     expect(downloaded).toBe("mine.theme.json");
     const blob = (createObjectURL.mock.calls[0] as unknown as [Blob])[0];
     expect(JSON.parse(await blob.text())).toMatchObject({ id: "mine", name: "Mine" });
@@ -206,7 +326,7 @@ describe("AppearanceSettingsPanel", () => {
       saveTextFile.mockResolvedValue("/chosen/mine.theme.json");
       const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click");
       await mount();
-      await click(button("Export Mine"));
+      await menuAction("Mine", "Export");
       expect(saveTextFile).toHaveBeenCalledOnce();
       const input = saveTextFile.mock.calls[0]![0];
       expect(input.suggestedName).toBe("mine.theme.json");
@@ -218,7 +338,7 @@ describe("AppearanceSettingsPanel", () => {
     it("a cancelled save writes nothing and shows no error", async () => {
       saveTextFile.mockResolvedValue(null);
       await mount();
-      await click(button("Export Mine"));
+      await menuAction("Mine", "Export");
       expect(saveTextFile).toHaveBeenCalledOnce();
       expect(toastAdd).not.toHaveBeenCalled();
     });
@@ -226,7 +346,7 @@ describe("AppearanceSettingsPanel", () => {
     it("a failed save shows an error", async () => {
       saveTextFile.mockRejectedValue(new Error("Could not save the file: disk full"));
       await mount();
-      await click(button("Export Mine"));
+      await menuAction("Mine", "Export");
       await vi.waitFor(() => expect(toastAdd).toHaveBeenCalledOnce());
       expect(toastAdd.mock.calls[0]![0]).toMatchObject({
         type: "error",
@@ -242,7 +362,7 @@ describe("AppearanceSettingsPanel", () => {
     const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     expect(window.desktopBridge).toBeUndefined();
     await mount();
-    await click(button("Export Mine"));
+    await menuAction("Mine", "Export");
     expect(anchorClick).toHaveBeenCalledOnce();
   });
 
