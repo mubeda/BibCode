@@ -152,7 +152,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
   private applyingDiskText = false;
   private composing = false;
   /** Delivers a rendered-view edit that still waits on its debounce. */
-  private pendingEditFlusher: (() => void) | null = null;
+  private pendingEditFlusher: ((whole: boolean) => void) | null = null;
   /** Rendered-view edits not yet closed into the source editor's history. */
   private richEditsPending = false;
   /** The text each closed rendered visit ended with, applied when the source editor attaches. */
@@ -310,16 +310,23 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     return this.coordinator.flush();
   }
 
-  async settle(): Promise<FileSaveSettleResult> {
-    if (!this.deliverPendingEdit()) return "failed";
+  /**
+   * With `lastResort`, for a session about to be disposed, an edit that still cannot be
+   * reconciled is delivered whole rather than lost.
+   */
+  async settle(lastResort = false): Promise<FileSaveSettleResult> {
+    if (!this.deliverPendingEdit() && !(lastResort && this.deliverPendingEdit(true))) {
+      return "failed";
+    }
     return this.coordinator.settle();
   }
 
   /**
    * Registers the rendered view's function that delivers an edit still waiting on its
    * debounce, or clears it. Every operation that reads or replaces the document calls it first.
+   * Called with `whole`, it delivers the editor's whole serialization instead of a reconcile.
    */
-  setPendingEditFlusher(flush: (() => void) | null): void {
+  setPendingEditFlusher(flush: ((whole: boolean) => void) | null): void {
     if (this.disposed) return;
     this.pendingEditFlusher = flush;
     this.publish();
@@ -353,11 +360,11 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * delivery threw: the flusher stays registered, so the edit stays unsaved and a later call
    * retries it.
    */
-  private deliverPendingEdit(): boolean {
+  private deliverPendingEdit(whole = false): boolean {
     const flush = this.pendingEditFlusher;
     if (flush === null || this.disposed) return true;
     try {
-      flush();
+      flush(whole);
     } catch (error) {
       console.error("[file-editing-session] delivering a rendered edit failed", error);
       return false;

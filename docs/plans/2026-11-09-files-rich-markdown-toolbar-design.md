@@ -318,7 +318,10 @@ The session gains three methods in `fileEditingSession.ts`.
   replaces or overwrites an edit the session has not recorded. When the surface unmounts with
   an edit still waiting, it delivers it, and if the reconcile still throws it delivers the
   editor's whole serialization, with the original frontmatter, dominant line ending and
-  final-newline state, instead of dropping the edit.
+  final-newline state, instead of dropping the edit. The flusher takes a `whole` flag for
+  that serialization, and `settle(true)` uses it after a normal delivery fails again. The
+  registry's dispose calls `settle(true)` for every session whose close did not settle,
+  including a close that already failed, before it disposes the session.
 
 The Pierre editor is detached while rendered view is shown. `cleanUp` drops its text
 document, and `applyEdits` throws "Editor is not attached" (`editor.js:176-178` of
@@ -613,3 +616,16 @@ was reproduced as a failing test before the fix.
   reopened without one stayed read-only. Fixed: the panel derives the refusal at render,
   valid only while the rendered text equals the text it was made on, and the toggle handler
   no longer clears it.
+
+Codex reviewed lane C3's fixes, and the coordinator relayed the findings to lane C4. Each
+was reproduced as a failing test before the fix.
+
+- Codex review 4, item 1, disposing the registry lost an edit whose close had failed.
+  `settleAndDisposeSession` settled only a session with no close state, so a session whose
+  close returned `"failed"` was disposed without another delivery, and a `"failed"` settle
+  was disposed the same way. Fixed: the dispose calls `settle(true)` for every session whose
+  close did not settle. It retries the delivery, and if that throws again the surface's
+  flusher delivers the editor's whole serialization, as the unmount path does. The only
+  caller of `dispose()` is the ownership release, which defers it by a microtask. A removed
+  subtree runs the owner's cleanup first, so the surface's own unmount delivery still runs
+  before the dispose. A test pins that order.

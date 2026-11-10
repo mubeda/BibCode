@@ -52,9 +52,17 @@ export default function RichMarkdownSurface({
       delivered = next;
       session.changeFromRichEditor(next);
     };
-    const deliver = () => {
+    // `whole` is the last resort when the reconcile throws: the editor's whole serialization,
+    // with the body's line ending and final-newline state, rather than a lost edit.
+    const deliver = (whole = false) => {
       if (timer !== null) clearTimeout(timer);
       timer = null;
+      if (whole) {
+        const eol = detectDominantEol(opened.body);
+        const text = editor.serialize().trim().replaceAll("\n", eol);
+        send(`${opened.frontmatter}${text}${opened.body.slice(opened.body.trimEnd().length)}`);
+        return;
+      }
       const body = reconcileMarkdown({ original: opened.body, before, after: editor.serialize() });
       send(`${opened.frontmatter}${body}`);
     };
@@ -65,7 +73,7 @@ export default function RichMarkdownSurface({
         if (!waiting) session.setPendingEditFlusher(deliver);
         waiting = true;
         if (timer !== null) clearTimeout(timer);
-        timer = setTimeout(deliver, SERIALIZE_DELAY_MS);
+        timer = setTimeout(() => deliver(), SERIALIZE_DELAY_MS);
       },
     });
     before = editor.serialize();
@@ -88,12 +96,8 @@ export default function RichMarkdownSurface({
         try {
           deliver();
         } catch (error) {
-          // The editor is going away: keep its whole serialization rather than lose the edit,
-          // with the body's line ending and final-newline state.
           console.error("[rich-markdown] reconciling the last edit failed", error);
-          const eol = detectDominantEol(opened.body);
-          const text = editor.serialize().trim().replaceAll("\n", eol);
-          send(`${opened.frontmatter}${text}${opened.body.slice(opened.body.trimEnd().length)}`);
+          deliver(true);
         }
       }
       session.commitRichEdits();

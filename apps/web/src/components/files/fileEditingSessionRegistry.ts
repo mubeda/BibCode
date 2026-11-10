@@ -4,7 +4,8 @@ import type { FilePathMutationLease, FilePathMutationRequest } from "./filePathM
 export interface ManagedFileEditingSession {
   relativePath: string;
   flush(): Promise<FileSaveFlushResult>;
-  settle(): Promise<FileSaveSettleResult>;
+  /** `lastResort` is for a session about to be disposed: it keeps an edit it cannot place. */
+  settle(lastResort?: boolean): Promise<FileSaveSettleResult>;
   setAutosaveEnabled(enabled: boolean): void;
   pauseSaving(): void;
   resumeSaving(): void;
@@ -251,11 +252,11 @@ export class FileEditingSessionRegistry<
 
   private async settleAndDisposeSession(session: Session): Promise<void> {
     const closeState = this.sessionCloseStates.get(session);
-    if (closeState?.phase === "settling") {
-      await closeState.completion;
-    } else if (closeState === undefined) {
+    if (closeState?.phase === "settling") await closeState.completion;
+    // A close that failed still holds an edit, and nothing retries it after the dispose.
+    if (this.sessionCloseStates.get(session)?.phase !== "settled") {
       try {
-        await session.settle();
+        await session.settle(true);
       } catch (error) {
         this.reportSessionCleanupError(error);
       }

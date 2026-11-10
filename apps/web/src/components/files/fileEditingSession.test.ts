@@ -973,6 +973,41 @@ describe("FileEditingSession rich edits", () => {
     expect(session.getSnapshot().editPending).toBe(false);
   });
 
+  it("disposing the registry retries a close whose delivery failed and writes the edit", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+    const session = registry.getOrCreate("README.md", () => createSession(persist));
+    const reportError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let failures = 1;
+    session.setPendingEditFlusher(() => {
+      if (failures-- > 0) throw new Error("delivery failed");
+      session.changeFromRichEditor("kept\n");
+    });
+
+    await registry.reconcile([]);
+    expect(persist).not.toHaveBeenCalled();
+    await registry.dispose();
+    reportError.mockRestore();
+
+    expect(persist).toHaveBeenCalledWith("README.md", "kept\n", null);
+  });
+
+  it("disposing the registry takes the whole serialization when the delivery keeps failing", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+    const session = registry.getOrCreate("README.md", () => createSession(persist));
+    const reportError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    session.setPendingEditFlusher((whole) => {
+      if (!whole) throw new Error("reconcile failed");
+      session.changeFromRichEditor("whole\n");
+    });
+
+    await registry.dispose();
+    reportError.mockRestore();
+
+    expect(persist).toHaveBeenCalledWith("README.md", "whole\n", null);
+  });
+
   it("the pending edit flusher runs before flush, settle, a view commit, a disk check, a file switch and a path mutation", async () => {
     const persist = vi.fn(async () => AsyncResult.success(undefined));
     const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();

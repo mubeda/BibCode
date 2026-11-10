@@ -2,7 +2,7 @@
 
 import type { Editor } from "@tiptap/core";
 import { AsyncResult } from "effect/reactivity";
-import { act } from "react";
+import { act, type ReactNode, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -313,6 +313,48 @@ describe("RichMarkdownSurface", () => {
 
     expect(session.unsavedContents).toBe("---\r\na: 1\r\n---\r\nOne\r\n\r\nHello world\r\n");
     expect(session.getSnapshot().editPending).toBe(false);
+  });
+
+  it("disposing the registry while the reconcile still throws saves the editor's text", async () => {
+    const { session, persist } = createSession("One\r\n\r\nHello\r\n");
+    const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+    registry.getOrCreate("notes.md", () => session);
+    const { tiptap } = await mount(session, "One\r\n\r\nHello\r\n");
+    reconcile.fail = true;
+    typeAfter(tiptap!, "Hello", " world");
+
+    await act(async () => {
+      await registry.reconcile([]);
+      await registry.dispose();
+    });
+
+    expect(persist.mock.lastCall?.[1]).toBe("One\r\n\r\nHello world\r\n");
+  });
+
+  it("unmounting the registry's owner with the surface inside saves a waiting edit", async () => {
+    const { session, persist } = createSession("Hello\n");
+    const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+    registry.getOrCreate("notes.md", () => session);
+    // The owner's cleanup runs before the surface's, as in ChatView around the Files panel.
+    function Owner({ children }: { children: ReactNode }) {
+      useEffect(() => registry.acquireOwnership(), []);
+      return children;
+    }
+    await act(async () => {
+      root.render(
+        <Owner>
+          <RichMarkdownSurface session={session} contents={"Hello\n"} onEditorChange={vi.fn()} />
+        </Owner>,
+      );
+    });
+    const tiptap = (container.querySelector(".ProseMirror") as HTMLElement & { editor: Editor })
+      .editor;
+    typeAfter(tiptap, "Hello", " world");
+
+    await act(async () => root.render(null));
+    await act(async () => registry.dispose());
+
+    expect(persist.mock.lastCall?.[1]).toBe("Hello world\n");
   });
 
   it("Reload and Overwrite change nothing while a waiting edit cannot be delivered", async () => {
