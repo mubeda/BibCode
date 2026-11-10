@@ -193,7 +193,7 @@ Both defaults equal `--foreground`, so Light and Dark do not change (R38, R50).
   preference picks the slot, and a change clears the previous theme's overrides (R39).
 - Clicking a theme's row (or Enter or Space on it) puts the theme in its base's slot and shows it
   at once (R40, amendment A8). If the resolved mode has the other base, System resolving to it
-  included, the mode is set to the theme's base and a status line above the theme list offers
+  included, the mode is set to the theme's base and a status line under the theme's group offers
   Undo, which restores the previous mode and the previous theme of that slot. The panel derives
   the offer from the mode and slots it reads, so the offer is withdrawn as soon as the mode or
   that slot changes (a Mode click, another window, a newer row click) or the previous theme is

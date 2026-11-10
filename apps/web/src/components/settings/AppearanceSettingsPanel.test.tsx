@@ -57,8 +57,7 @@ async function menuAction(themeName: string, action: string) {
 }
 const mode = () => window.localStorage.getItem("bibcode:theme");
 /** The inline status line that offers Undo after a row switched the mode. */
-const undoStatus = () => container.querySelector<HTMLElement>('[role="status"]')!;
-const undoButton = () => undoStatus().querySelector<HTMLButtonElement>("button");
+const undoButton = () => container.querySelector<HTMLButtonElement>('[role="status"] button');
 async function undo() {
   const found = undoButton();
   if (!found) throw new Error("No Undo offered");
@@ -177,7 +176,14 @@ describe("AppearanceSettingsPanel", () => {
     expect(showsDark()).toBe(true);
     expect(rootStyle("--background")).toBe(resolveToken(getTheme("tokyo-night")!, "background"));
     expect(select("tokyo-night").getAttribute("aria-pressed")).toBe("true");
-    expect(undoStatus().textContent).toContain("Switched to dark mode to show Tokyo Night.");
+    // The line sits after the clicked row's group, so no row above the pointer moves.
+    const darkGroup = container.querySelector('[role="group"][aria-label="Dark themes"]')!;
+    const status = darkGroup.querySelector('[role="status"]')!;
+    expect(status.textContent).toContain("Switched to dark mode to show Tokyo Night.");
+    expect(
+      row("matrix-dark").compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(2);
 
     await undo();
     expect(mode()).toBe("light");

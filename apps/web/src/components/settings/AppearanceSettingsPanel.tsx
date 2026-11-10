@@ -338,16 +338,6 @@ export function AppearanceSettingsPanel() {
         }
       >
         <div className="grid gap-3 p-3">
-          <div role="status" className="empty:hidden">
-            {undoOffer ? (
-              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border px-3 py-2 text-sm text-foreground">
-                {`Switched to ${undoOffer.base} mode to show ${undoOffer.themeName}.`}
-                <Button size="xs" variant="outline" onClick={() => undo(undoOffer)}>
-                  Undo
-                </Button>
-              </p>
-            ) : null}
-          </div>
           {actionError ? (
             <p role="alert" className="text-sm text-destructive-foreground">
               {actionError}
@@ -367,7 +357,7 @@ export function AppearanceSettingsPanel() {
           <div ref={listRef} className="grid gap-4" onKeyDown={moveRowFocus}>
             {GROUPS.map(({ base, label }) => (
               <div key={base} role="group" aria-label={label} className="grid gap-1.5">
-                <div className="flex items-center gap-2 px-1">
+                <div className="flex h-5 items-center gap-2 px-1">
                   <h3 className="text-xs font-medium text-muted-foreground">{label}</h3>
                   {resolvedTheme === base ? (
                     <span className="rounded-sm border border-border px-1.5 text-xs text-foreground">
@@ -499,6 +489,18 @@ export function AppearanceSettingsPanel() {
                       );
                     })}
                 </ul>
+                {/* After the group, so a row click never moves the rows above the pointer. The
+                    region stays in the tree when empty (out of the grid, not display:none) so it is announced. */}
+                <div role="status" className="empty:absolute">
+                  {undoOffer?.base === base ? (
+                    <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border px-3 py-2 text-sm text-foreground">
+                      {`Switched to ${undoOffer.base} mode to show ${undoOffer.themeName}.`}
+                      <Button size="xs" variant="outline" onClick={() => undo(undoOffer)}>
+                        Undo
+                      </Button>
+                    </p>
+                  ) : null}
+                </div>
               </div>
             ))}
           </div>
