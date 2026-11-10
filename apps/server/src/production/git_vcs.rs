@@ -53,7 +53,7 @@ use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
 /// How long `vcs.refreshStatus` waits for the pull-request lookup, well under the 10 second
-/// hang budget. A slower lookup keeps running and reaches the status streams when it ends.
+/// hang budget. A slower lookup is left to the status streams, which look again.
 const REFRESH_PULL_REQUEST_LOOKUP_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
@@ -889,45 +889,43 @@ impl GitVcsRpcServices {
                     .await
                     .map_err(serialize_error)?;
                 let fence = publication.fence;
-                let status = publication.value;
-                // Its own task, so the lookup outlives a refresh that stops waiting for it at
-                // the bound. Until then a cancelled or dropped refresh still cancels it.
-                let lookup_cancellation = CancellationToken::new();
-                let lookup_guard = lookup_cancellation.clone().drop_guard();
-                let mut lookup = tokio::spawn({
-                    let pull_requests = self.pull_requests.clone();
-                    let cwd = input.cwd.clone();
-                    let mut status = status.clone();
-                    async move {
-                        enrich_remote_pull_request(
-                            &pull_requests,
-                            &cwd,
-                            &status.local,
-                            &mut status.remote,
-                            &lookup_cancellation,
-                        )
-                        .await;
-                        status
-                    }
-                });
+                let mut status = publication.value;
+                let cwd = tokio::fs::canonicalize(&input.cwd)
+                    .await
+                    .unwrap_or_else(|_| input.cwd.clone());
                 let status = finish_fenced_enrichment(&self.broadcaster, fence, async {
-                    tokio::select! {
-                        () = cancellation.cancelled() => status,
-                        enriched = &mut lookup => enriched.unwrap_or(status),
-                        () = tokio::time::sleep(REFRESH_PULL_REQUEST_LOOKUP_BOUND) => {
-                            lookup_guard.disarm();
-                            let broadcaster = self.broadcaster.clone();
-                            let cwd = input.cwd.clone();
-                            tokio::spawn(async move {
-                                // The finished lookup is remembered, so each status stream
-                                // reads it at once when the remote is published again.
-                                if lookup.await.is_ok_and(|enriched| enriched.remote.pr.is_some()) {
-                                    broadcaster.notify_pull_request_change(&cwd).await;
-                                }
-                            });
-                            status
-                        }
-                    }
+                    let ref_name = status.local.ref_name.clone();
+                    let lookup = lookup_open_pull_request(
+                        &self.pull_requests,
+                        &input.cwd,
+                        &status.local,
+                        &cancellation,
+                    );
+                    status.remote.pr =
+                        match tokio::time::timeout(REFRESH_PULL_REQUEST_LOOKUP_BOUND, lookup).await
+                        {
+                            Ok(Some(pull_request)) => {
+                                self.broadcaster.record_pull_request(
+                                    &cwd,
+                                    ref_name.as_deref(),
+                                    pull_request.clone(),
+                                );
+                                pull_request
+                            }
+                            Ok(None) => self
+                                .broadcaster
+                                .known_pull_request(&cwd, ref_name.as_deref()),
+                            Err(_) => {
+                                // Dropping the lookup ends this refresh's lease on it. Each
+                                // status stream looks again and keeps the lookup alive.
+                                self.broadcaster
+                                    .notify_pull_request_change(&input.cwd)
+                                    .await;
+                                self.broadcaster
+                                    .known_pull_request(&cwd, ref_name.as_deref())
+                            }
+                        };
+                    status
                 })
                 .await
                 .map_err(serialize_error)?;
@@ -1453,9 +1451,11 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let mut enrichment: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
-            // The remote and branch the latest enrichment was started for.
-            let mut enriching: Option<(VcsStatusRemoteResult, Option<String>)> = None;
+            let cwd = tokio::fs::canonicalize(&input.cwd)
+                .await
+                .unwrap_or_else(|_| input.cwd.clone());
+            let mut enrichment: Option<StatusStreamEnrichment> = None;
+            let mut shown = ShownStatus::default();
             loop {
                 tokio::select! {
                     biased;
@@ -1467,6 +1467,17 @@ impl GitVcsRpcServices {
                         break;
                     }
                     _ = cancellation.cancelled() => break,
+                    found = async {
+                        (&mut enrichment.as_mut().expect("lookup in flight").task).await
+                    }, if enrichment.is_some() => {
+                        let ref_name = enrichment.take().expect("lookup in flight").ref_name;
+                        if let Ok(Some(pull_request)) = found {
+                            broadcaster.record_pull_request(&cwd, ref_name.as_deref(), pull_request);
+                        }
+                        if !shown.reconcile(&sender, &broadcaster, &cwd).await {
+                            break;
+                        }
+                    }
                     publication = subscription.recv_publication() => {
                         let publication = match publication {
                             Some(Ok(publication)) => publication,
@@ -1476,40 +1487,37 @@ impl GitVcsRpcServices {
                             }
                             None => break,
                         };
-                        let interrupted = enrichment
-                            .as_ref()
-                            .is_some_and(|(_, task)| !task.is_finished());
-                        stop_status_stream_enrichment(&mut enrichment).await;
-                        // A local update on the same branch must not lose a lookup still in
-                        // flight: its fence is stale now, so the lookup starts again.
-                        let enrichment_remote = match &publication.value {
-                            VcsStatusStreamEvent::Snapshot { remote, .. }
-                            | VcsStatusStreamEvent::RemoteUpdated { remote } => remote.clone(),
-                            VcsStatusStreamEvent::LocalUpdated { local } => enriching
-                                .as_ref()
-                                .filter(|(_, ref_name)| interrupted && *ref_name == local.ref_name)
-                                .map(|(remote, _)| remote.clone()),
-                        };
-                        if !send_status_stream_event(
-                            &sender,
-                            &broadcaster,
-                            &publication.fence,
-                            publication.value,
-                        )
-                        .await
+                        // A local update on the same branch leaves the lookup running. Its
+                        // answer is delivered under the newest fence the subscriber received.
+                        let keeps_lookup = matches!(
+                            &publication.value,
+                            VcsStatusStreamEvent::LocalUpdated { local }
+                                if enrichment
+                                    .as_ref()
+                                    .is_some_and(|lookup| lookup.ref_name == local.ref_name)
+                        );
+                        if !keeps_lookup {
+                            stop_status_stream_enrichment(&mut enrichment).await;
+                        }
+                        let looks_up = matches!(
+                            &publication.value,
+                            VcsStatusStreamEvent::Snapshot { remote: Some(_), .. }
+                                | VcsStatusStreamEvent::RemoteUpdated { remote: Some(_) }
+                        );
+                        if !shown
+                            .send(&sender, &broadcaster, &publication.fence, publication.value)
+                            .await
+                            || !shown.reconcile(&sender, &broadcaster, &cwd).await
                         {
                             break;
                         }
-                        if let Some(remote) = enrichment_remote {
+                        if looks_up {
                             let task_cancellation = operation_cancellation.child_token();
                             let task_token = task_cancellation.clone();
-                            let task_sender = sender.clone();
-                            let task_broadcaster = broadcaster.clone();
                             let task_pull_requests = pull_requests.clone();
                             let task_cwd = input.cwd.clone();
                             let task_local = publication.local;
-                            let task_fence = publication.fence;
-                            enriching = Some((remote.clone(), task_local.ref_name.clone()));
+                            let ref_name = task_local.ref_name.clone();
                             #[cfg(test)]
                             let task_test_hook = enrichment_test_hook.clone();
                             let task = tokio::spawn(async move {
@@ -1518,31 +1526,21 @@ impl GitVcsRpcServices {
                                     hook.block(&task_token).await;
                                 }
                                 if task_token.is_cancelled() {
-                                    return;
+                                    return None;
                                 }
-                                let mut enriched = remote.clone();
-                                enrich_remote_pull_request(
+                                lookup_open_pull_request(
                                     &task_pull_requests,
                                     &task_cwd,
                                     &task_local,
-                                    &mut enriched,
                                     &task_token,
                                 )
-                                .await;
-                                if task_token.is_cancelled() || enriched == remote {
-                                    return;
-                                }
-                                let _ = send_status_stream_event(
-                                    &task_sender,
-                                    &task_broadcaster,
-                                    &task_fence,
-                                    VcsStatusStreamEvent::RemoteUpdated {
-                                        remote: Some(enriched),
-                                    },
-                                )
-                                .await;
+                                .await
                             });
-                            enrichment = Some((task_cancellation, task));
+                            enrichment = Some(StatusStreamEnrichment {
+                                cancellation: task_cancellation,
+                                task,
+                                ref_name,
+                            });
                         }
                     }
                 }
@@ -3454,50 +3452,117 @@ async fn finish_fenced_enrichment<T>(
     broadcaster.publish_if_fence_current(&fence, || value)
 }
 
-async fn send_status_stream_event(
-    sender: &mpsc::Sender<RpcStreamChunk>,
-    broadcaster: &StatusBroadcaster,
-    fence: &StatusReadFence,
-    event: VcsStatusStreamEvent,
-) -> bool {
-    let chunk = serde_json::to_value(event)
-        .map(|event| vec![event])
-        .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
-    let permit = match sender.reserve().await {
-        Ok(permit) => permit,
-        Err(_) => return false,
-    };
-    let _ = broadcaster.publish_if_fence_current(fence, || permit.send(chunk));
-    true
+/// The pull-request lookup a status stream has in flight, and the branch it is for.
+struct StatusStreamEnrichment {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<Option<Option<ChangeRequest>>>,
+    ref_name: Option<String>,
 }
 
-async fn stop_status_stream_enrichment(
-    enrichment: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
-) {
-    if let Some((cancellation, task)) = enrichment.take() {
-        cancellation.cancel();
-        task.abort();
-        let _ = task.await;
+async fn stop_status_stream_enrichment(enrichment: &mut Option<StatusStreamEnrichment>) {
+    if let Some(enrichment) = enrichment.take() {
+        enrichment.cancellation.cancel();
+        enrichment.task.abort();
+        let _ = enrichment.task.await;
     }
 }
 
-async fn enrich_remote_pull_request(
+/// What one status subscriber shows, folded from the events it received the way the
+/// client's `applyGitStatusStreamEvent` folds them, and the fence of the newest one.
+#[derive(Default)]
+struct ShownStatus {
+    ref_name: Option<Option<String>>,
+    remote: Option<VcsStatusRemoteResult>,
+    fence: Option<StatusReadFence>,
+}
+
+impl ShownStatus {
+    /// Sends `event` while `fence` is current and drops it otherwise. Returns false once the
+    /// stream is closed.
+    async fn send(
+        &mut self,
+        sender: &mpsc::Sender<RpcStreamChunk>,
+        broadcaster: &StatusBroadcaster,
+        fence: &StatusReadFence,
+        event: VcsStatusStreamEvent,
+    ) -> bool {
+        let chunk = serde_json::to_value(&event)
+            .map(|event| vec![event])
+            .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
+        let Ok(permit) = sender.reserve().await else {
+            return false;
+        };
+        if broadcaster
+            .publish_if_fence_current(fence, || permit.send(chunk))
+            .is_ok()
+        {
+            match event {
+                VcsStatusStreamEvent::Snapshot { local, remote } => {
+                    self.ref_name = Some(local.ref_name);
+                    self.remote = remote;
+                }
+                VcsStatusStreamEvent::LocalUpdated { local } => {
+                    if self.ref_name.as_ref() != Some(&local.ref_name) {
+                        self.remote = None;
+                    }
+                    self.ref_name = Some(local.ref_name);
+                }
+                VcsStatusStreamEvent::RemoteUpdated { remote } => self.remote = remote,
+            }
+            self.fence = Some(fence.clone());
+        }
+        true
+    }
+
+    /// Sends the pull request known for the shown branch when the subscriber shows another
+    /// one. A send under an old fence is dropped, so the next received event retries it.
+    async fn reconcile(
+        &mut self,
+        sender: &mpsc::Sender<RpcStreamChunk>,
+        broadcaster: &StatusBroadcaster,
+        cwd: &std::path::Path,
+    ) -> bool {
+        let (Some(ref_name), Some(remote), Some(fence)) =
+            (&self.ref_name, &self.remote, self.fence.clone())
+        else {
+            return true;
+        };
+        let known = broadcaster.known_pull_request(cwd, ref_name.as_deref());
+        if known == remote.pr {
+            return true;
+        }
+        let remote = VcsStatusRemoteResult {
+            pr: known,
+            ..remote.clone()
+        };
+        self.send(
+            sender,
+            broadcaster,
+            &fence,
+            VcsStatusStreamEvent::RemoteUpdated {
+                remote: Some(remote),
+            },
+        )
+        .await
+    }
+}
+
+async fn lookup_open_pull_request(
     pull_requests: &PullRequestService,
     cwd: &std::path::Path,
     local: &VcsStatusLocalResult,
-    remote: &mut VcsStatusRemoteResult,
     cancellation: &CancellationToken,
-) {
+) -> Option<Option<ChangeRequest>> {
     let Some(reference) = local.ref_name.as_deref() else {
-        return;
+        return Some(None);
     };
     let provider = local_provider_kind(local);
     if provider == ProviderKind::Unknown {
-        return;
+        return Some(None);
     }
     // Shared with the status stream and other refreshes for a few seconds;
     // see `PullRequestService::resolve_current_optional_shared`.
-    let Some(pull_request) = pull_requests
+    let pull_request = pull_requests
         .resolve_current_optional_shared(
             ResolvePullRequestInput {
                 cwd: cwd.to_path_buf(),
@@ -3507,20 +3572,19 @@ async fn enrich_remote_pull_request(
             cancellation,
         )
         .await
-        .ok()
-        .flatten()
-        .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
-    else {
-        return;
-    };
-    remote.pr = Some(ChangeRequest {
-        number: pull_request.number,
-        title: pull_request.title,
-        url: pull_request.url,
-        base_ref: pull_request.base_branch,
-        head_ref: pull_request.head_branch,
-        state: "open".to_owned(),
-    });
+        .ok()?;
+    Some(
+        pull_request
+            .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
+            .map(|pull_request| ChangeRequest {
+                number: pull_request.number,
+                title: pull_request.title,
+                url: pull_request.url,
+                base_ref: pull_request.base_branch,
+                head_ref: pull_request.head_branch,
+                state: "open".to_owned(),
+            }),
+    )
 }
 
 async fn local_branch_names(
@@ -8214,10 +8278,9 @@ esac
 
         fn subscribe(&self, cancellation: &CancellationToken) -> Subscriber {
             Subscriber {
-                stream: self.services.status_stream(
-                    subscribe_request(&self.repository),
-                    cancellation.clone(),
-                ),
+                stream: self
+                    .services
+                    .status_stream(subscribe_request(&self.repository), cancellation.clone()),
                 ref_name: Value::Null,
                 remote: Value::Null,
                 events: Vec::new(),
@@ -8939,11 +9002,7 @@ esac
             .iter()
             .filter(|(event, _)| event["remote"]["pr"]["number"] == 42)
             .count();
-        assert_eq!(
-            deliveries, 1,
-            "delivered once: {:?}",
-            subscriber.events
-        );
+        assert_eq!(deliveries, 1, "delivered once: {:?}", subscriber.events);
         cancellation.cancel();
     }
 
@@ -8998,7 +9057,10 @@ esac
         tokio::time::timeout(Duration::from_secs(3), fixture.refresh())
             .await
             .expect("the refresh answers at its bound");
-        assert!(fixture.a_forge_cli_is_running(), "the subscriber still looks");
+        assert!(
+            fixture.a_forge_cli_is_running(),
+            "the subscriber still looks"
+        );
         subscriber
     }
 

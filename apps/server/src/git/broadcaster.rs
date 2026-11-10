@@ -16,7 +16,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use super::watcher::test_timeout;
 
 use super::{
-    GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
+    ChangeRequest, GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
     GitWatcherHealth, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult,
     VcsStatusStreamEvent,
     fetch_owner::RepositoryFetchOwner,
@@ -914,6 +914,41 @@ impl StatusBroadcaster {
         }
     }
 
+    /// The open pull request last found for `ref_name`, while it is the canonical worktree's
+    /// branch. It lives in the cached remote, so every snapshot and remote update carries it.
+    pub(crate) fn known_pull_request(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+    ) -> Option<ChangeRequest> {
+        let state = self.lock_state();
+        let entry = state.repositories.get(cwd)?;
+        if entry.local.ref_name.as_deref() != ref_name {
+            return None;
+        }
+        entry.remote.clone().flatten()?.pr
+    }
+
+    /// Remembers a finished lookup's answer for `ref_name`: an open request, or `None` for
+    /// none open. A failed lookup is not recorded, and neither is one for a former branch.
+    pub(crate) fn record_pull_request(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+        pull_request: Option<ChangeRequest>,
+    ) {
+        let mut state = self.lock_state();
+        if let Some(remote) = state
+            .repositories
+            .get_mut(cwd)
+            .filter(|entry| entry.local.ref_name.as_deref() == ref_name)
+            .and_then(|entry| entry.remote.as_mut())
+            .and_then(Option::as_mut)
+        {
+            remote.pr = pull_request;
+        }
+    }
+
     /// Registers the observer that runs after a finished mutation or a
     /// reported local change (`notify_local_change`). Status reads, including
     /// watcher-driven reads, also reach it when repository availability changes.
@@ -1248,7 +1283,8 @@ impl StatusBroadcaster {
                     entry.pending_local_reconcile = true;
                     return Some((None, request_local_refresh));
                 }
-                let remote = observed.remote;
+                let mut remote = observed.remote;
+                keep_pull_request(&mut remote, entry);
                 let changed = std::mem::take(&mut entry.republish_remote)
                     || entry.remote.as_ref() != Some(&remote);
                 entry.remote = Some(remote.clone());
@@ -1337,17 +1373,20 @@ impl StatusBroadcaster {
         self.inner
             .fetch_owner
             .update_worktree_ref(cwd, status.local.ref_name.clone());
-        let remote = status.local.is_repo.then(|| status.remote.clone());
-        let event = VcsStatusStreamEvent::Snapshot {
-            local: status.local.clone(),
-            remote: remote.clone(),
-        };
+        let mut remote = status.local.is_repo.then(|| status.remote.clone());
         let mut state = self.lock_state();
         let mut remove_repository = false;
         let mut previous_local = None;
         let mut lifecycle_id = None;
         if let Some(entry) = state.repositories.get_mut(cwd) {
             lifecycle_id = Some(entry.lifecycle_id);
+            if entry.local.ref_name == status.local.ref_name {
+                keep_pull_request(&mut remote, entry);
+            }
+            let event = VcsStatusStreamEvent::Snapshot {
+                local: status.local.clone(),
+                remote: remote.clone(),
+            };
             let changed = entry.local != status.local
                 || entry.local_fence.as_ref() != Some(fence)
                 || entry.remote.as_ref() != Some(&remote);
@@ -2271,6 +2310,16 @@ fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
     entry
         .remote_refresh_requests
         .send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+/// A remote read never finds the pull request, so a newer remote for the same branch keeps
+/// the one the cache holds.
+fn keep_pull_request(remote: &mut Option<VcsStatusRemoteResult>, entry: &RepositoryState) {
+    if let (Some(remote), Some(Some(cached))) = (remote.as_mut(), entry.remote.as_ref())
+        && remote.pr.is_none()
+    {
+        remote.pr.clone_from(&cached.pr);
+    }
 }
 
 fn reconcile_remote_after_local_publication(entry: &mut RepositoryState, ref_changed: bool) {

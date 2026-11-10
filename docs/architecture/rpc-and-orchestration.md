@@ -656,12 +656,28 @@ Creating a request through the service, every finished Git Manager or VCS
 mutation (pushes included), and every reported local change such as a terminal
 command exiting forget that worktree's entries; a run in flight across such an
 invalidation still answers its waiters but is not stored. At most 64 entries
-are held. When nothing current is held, `vcs.refreshStatus` waits for the
-lookup for at most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). A slower
-lookup keeps running in its own task, and the refresh answers with local and
-remote status without the pull request. If that lookup then finds an open
-request, the server calls `notify_pull_request_change`, so each status stream
-reads the remembered answer and publishes the request. The passive summary, the
+are held.
+
+The broadcaster's cached remote for a worktree owns the open request known for
+its current branch. A remote read never finds a request, so a newer remote or
+snapshot for the same branch keeps the cached one, and a branch change clears
+it with the rest of the remote. A lookup that ends with an open request or with
+none open records its answer there. A failed or cancelled lookup records
+nothing, so the known request stays. Each status stream folds what it sent the
+way the client reducer does. After every event it sends, the stream compares
+the request its subscriber shows with the known one and sends a remote update
+when they differ. That send uses the fence of the newest event the subscriber
+received, so an answer that arrives across an epoch change waits for the next
+event that passes its fence and is delivered once. A same-branch local update
+leaves the stream's lookup running; a snapshot, a remote update or a branch
+change starts it again.
+
+When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
+most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it drops its
+lease on the lookup, calls `notify_pull_request_change` so each status stream
+looks again, and answers with the known request for the same branch. No lookup
+outlives the refresh without a status stream, and a stream's lookup ends with
+the stream at workspace loss and shutdown. The passive summary, the
 pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 
