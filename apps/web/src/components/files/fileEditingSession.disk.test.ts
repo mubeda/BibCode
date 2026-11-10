@@ -391,4 +391,36 @@ describe("FileEditingSession disk reconciliation", () => {
       version: "v1",
     });
   });
+
+  it("a rendered edit that starts waiting during a disk read makes a newer disk version a conflict", async () => {
+    const { session, persist } = createSession();
+    const token = session.beginDiskCheck()!;
+    expect(session.reconcileVersion(token, { _tag: "present", version: "v2" })).toBe("read");
+    session.setPendingEditFlusher(() => {
+      session.setPendingEditFlusher(null);
+      session.changeFromRichEditor("mine\n");
+    });
+
+    session.reconcileRead(token, { version: "v2", contents: "theirs\n" });
+
+    expect(session.getSnapshot().conflict?.reason).toBe("changed");
+    expect(session.unsavedContents).toBe("mine\n");
+    await session.flush();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it("a rendered edit that starts waiting during a disk check makes a deletion a conflict", () => {
+    const { session } = createSession();
+    const token = session.beginDiskCheck()!;
+    session.setPendingEditFlusher(() => {
+      session.setPendingEditFlusher(null);
+      session.changeFromRichEditor("mine\n");
+    });
+
+    expect(session.reconcileVersion(token, { _tag: "missing" })).toBe("settled");
+
+    expect(session.getSnapshot()).toMatchObject({ deletedOnDisk: false });
+    expect(session.getSnapshot().conflict?.reason).toBe("deleted");
+    expect(session.unsavedContents).toBe("mine\n");
+  });
 });

@@ -456,6 +456,8 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * the base, and the next check re-reads.
    */
   reconcileVersion(token: number, disk: ProjectFileVersion): "settled" | "read" | "stale" {
+    // An edit that started waiting after the check began must also count as unsaved.
+    this.deliverPendingEdit();
     if (!this.isCurrentCheck(token)) return "stale";
     const base = this.base!;
     switch (disk._tag) {
@@ -497,6 +499,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
 
   /** Reconciles with a disk read made for the check that `token` started. */
   reconcileRead(token: number, read: FileDiskRead): void {
+    this.deliverPendingEdit();
     if (!this.isCurrentCheck(token) || read.version === undefined) return;
     const disk = { kind: "present", version: read.version, contents: read.contents } as const;
     if (read.contents === this.localText()) {

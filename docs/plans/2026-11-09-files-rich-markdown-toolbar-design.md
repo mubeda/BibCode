@@ -290,8 +290,8 @@ The session gains three methods in `fileEditingSession.ts`.
 - `setPendingEditFlusher(flush)` registers the surface's function that delivers an edit
   still waiting on its 300 ms timer. The surface registers it when an edit starts waiting
   and clears it once the edit is delivered. `flush()`, `settle()`, `commitRichEdits()`,
-  `beginDiskCheck()` (before a disk check classifies a change or a deletion),
-  `reloadFromDisk()`, `overwriteDisk()` and `rename()` call it first. The registry's file
+  `beginDiskCheck()`, `reconcileVersion()` and `reconcileRead()` (before a disk check
+  classifies a change or a deletion), `reloadFromDisk()`, `overwriteDisk()` and `rename()` call it first. The registry's file
   switch calls `flush()` and a path mutation calls `settle()`, so both deliver the edit
   without a registry change.
 
@@ -327,8 +327,9 @@ from disk discards the document, so a reload or a disk change on a clean file re
 with the new text. IME composition reaches `session.setComposing` as in the source
 surface.
 
-A disk change or a deletion while a rich edit waits on the timer: `beginDiskCheck` calls
-the flusher first, so the session has pending work when `reconcileVersion` and
+A disk change or a deletion while a rich edit waits on the timer: `beginDiskCheck`,
+`reconcileVersion` and `reconcileRead` call the flusher first, so an edit that starts
+waiting while the check's request is out counts too, so the session has pending work when `reconcileVersion` and
 `reconcileRead` run, and records a conflict instead of reloading or marking the file
 deleted. Neither version is lost (R29).
 
@@ -511,3 +512,12 @@ Each finding was checked against the code, the spec or a prototype before it was
 - Advisor 10, the single-HTML-block `details` shape was undefined. Fixed: it is a leaf.
 - Advisor nits, several visits as one step and the exact Status text. Fixed: visits are
   separate steps, and the Status line matches the phase file.
+
+Codex (`gpt-6.1-sol`, high) reviewed lane C's finished Tasks 6.1 to 6.9. Each finding below
+was reproduced as a failing test before the fix.
+
+- Codex review 2, item 1, a disk check overwrote newer disk content. An edit that started
+  waiting after `beginDiskCheck` was delivered only after the check's result, so the
+  result reloaded the file as clean and the next save overwrote the newer version. Fixed:
+  `reconcileVersion` and `reconcileRead` deliver the waiting edit first, so the result is a
+  conflict.
