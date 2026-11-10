@@ -874,7 +874,13 @@ export default function FilePreviewPanel({
     opened: string | null;
   }>({ key: null, editor: null, opened: null });
   const richEditorKey = session?.cacheKey ?? "";
-  const richEditor = richEditorState.key === richEditorKey ? richEditorState.editor : undefined;
+  // A refusal holds only for the text it was made on, so a source edit that repairs the file
+  // reopens it editable however rendered view returns (the toggle or a cleared line link).
+  const richEditor =
+    richEditorState.key === richEditorKey &&
+    (richEditorState.editor !== null || richEditorState.opened === renderedText)
+      ? richEditorState.editor
+      : undefined;
   const onRichEditorChange = useCallback(
     (editor: RichMarkdownEditor | null, opened: string) =>
       setRichEditorState({ key: richEditorKey, editor, opened }),
@@ -1074,15 +1080,6 @@ export default function FilePreviewPanel({
                   onRenderedChange: (rendered) => {
                     // The rendered visit reaches the source editor's history as one step.
                     if (!rendered) session?.commitRichEdits();
-                    else {
-                      // A refusal holds for the text it was made on; a source edit may fix it.
-                      const text = session?.unsavedContents ?? file.data?.contents;
-                      setRichEditorState((state) =>
-                        state.editor === null && state.opened !== text
-                          ? { key: null, editor: null, opened: null }
-                          : state,
-                      );
-                    }
                     setSourceView({
                       path: rendered ? null : relativePath,
                       revealRequestId: rendered ? null : revealRequestId,

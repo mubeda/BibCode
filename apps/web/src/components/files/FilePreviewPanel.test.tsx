@@ -2350,7 +2350,7 @@ describe("rich markdown editing", () => {
     if (editor !== undefined) {
       harness.seedState(
         (initial) => typeof initial === "object" && initial !== null && "editor" in initial,
-        { key: session.cacheKey, editor },
+        { key: session.cacheKey, editor, opened: contents },
       );
     }
     const markup = renderPanel(baseProps({ relativePath: "README.md" }));
@@ -2427,15 +2427,37 @@ describe("rich markdown editing", () => {
           onRenderedChange: (rendered: boolean) => void;
         }
       ).onRenderedChange(true);
-      return harness.setStateCalls.find((call) => isRichState(call.initial))?.applied ?? refused;
+      harness.seedState(isRichState, refused);
+      renderPanel(baseProps({ relativePath: "README.md" }));
     };
 
-    expect(enterRendered()).toEqual(refused);
+    enterRendered();
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
 
     testState.session!.editor.options.onChange({ contents: "(c)\n" });
-    const next = enterRendered();
-    harness.seedState(isRichState, next);
-    renderPanel(baseProps({ relativePath: "README.md" }));
+    enterRendered();
+
+    expect(ui.find("RichMarkdownSurface")).toMatchObject({ contents: "(c)\n" });
+  });
+
+  it("a refused file repaired in source view opens editable when a line link is cleared", async () => {
+    testState.sessionSnapshot = {
+      save: { phase: "pending", canSave: true, confirmedRevision: 0 },
+      canUndo: true,
+      canRedo: false,
+    };
+    testState.pendingWork = true;
+    const { session } = await renderRich("&copy;\n", undefined);
+    const refused = { key: session.cacheKey, editor: null, opened: "&copy;\n" };
+    const isRichState = (initial: unknown) =>
+      typeof initial === "object" && initial !== null && "editor" in initial;
+
+    harness.seedState(isRichState, refused);
+    renderPanel(baseProps({ relativePath: "README.md", revealLine: 1, revealRequestId: 2 }));
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    testState.session!.editor.options.onChange({ contents: "(c)\n" });
+    harness.seedState(isRichState, refused);
+    renderPanel(baseProps({ relativePath: "README.md", revealLine: null, revealRequestId: 2 }));
 
     expect(ui.find("RichMarkdownSurface")).toMatchObject({ contents: "(c)\n" });
   });

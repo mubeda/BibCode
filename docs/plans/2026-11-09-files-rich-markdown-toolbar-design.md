@@ -350,9 +350,12 @@ when the result differs from the text it last delivered, so opening a file never
 changed (R31). The surface is keyed by `session.cacheKey`, which changes when a reload
 from disk discards the document, so a reload or a disk change on a clean file remounts it
 with the new text. When `canReconcile` refuses the text, the surface reports `null` with
-the text it opened, and the panel shows the read-only view. Switching to rendered view
-with different text, for example after a fix in source view, clears that refusal, so the
-surface opens the new text and checks it again. IME composition reaches
+the text it opened, and the panel shows the read-only view. The refusal holds only while the
+rendered text equals the text it was made on. Rendered view with different text, for
+example after a fix in source view, opens the surface on the new text and checks it again,
+whether rendered view returns through the toggle or because a line link was cleared. A
+checkbox click in a file the surface refused also changes the text, so it re-checks that
+file once. A file `richMarkdownMode` refuses never mounts the surface. IME composition reaches
 `session.setComposing` as in the source surface.
 
 A disk change or a deletion while a rich edit waits on the timer: `beginDiskCheck`,
@@ -603,3 +606,10 @@ was reproduced as a failing test before the fix.
 - Coordinator check 3, a file refused only for its size showed the notice about Markdown the
   editor cannot change. Fixed: reason `"too-large"` shows "This file is too large to edit in
   rendered view. Edit it in source view."
+- Coordinator check 4, a refused file was re-checked only through the toolbar toggle.
+  Rendered view also returns when a line link is cleared: `openFile` without a line on an
+  open file sets `revealLine` to null, and a file shown in source view only for its line link
+  returns to rendered view. A file refused, repaired in source view after a line link, and
+  reopened without one stayed read-only. Fixed: the panel derives the refusal at render,
+  valid only while the rendered text equals the text it was made on, and the toggle handler
+  no longer clears it.
