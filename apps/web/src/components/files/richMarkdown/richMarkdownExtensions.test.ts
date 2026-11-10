@@ -3,7 +3,7 @@
 import type { Editor } from "@tiptap/core";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { Nodes } from "mdast";
+import type { List, Nodes } from "mdast";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
@@ -108,90 +108,6 @@ describe("createRichMarkdownEditor", () => {
     });
   });
 
-  it("inserting a block at any boundary of any level keeps every untouched block's bytes", () => {
-    const table = "| a | b |\n|:--|--:|\n| one   |  two |\n| three | four |\n";
-    const quote = (text: string) => text.replace(/^(?=.)/gm, "> ");
-    const cases = [
-      ...supported,
-      ["tableBeforeParagraph", `${table}\nAfter.\n`],
-      ["crlfTable", `${table}\nAfter.\n`.replaceAll("\n", "\r\n")],
-      ["quotedTable", `${quote(table)}\nAfter.\n`],
-      ["tableInDetails", `<details>\n<summary>More</summary>\n\n${table}\n</details>\n\nAfter.\n`],
-    ] as const;
-    const containers = new Set([
-      "table",
-      "bulletList",
-      "orderedList",
-      "taskList",
-      "blockquote",
-      "detailsContent",
-    ]);
-    /** Every block the reconcile copies whole, plus list items, in document order. */
-    const untouchedBlocks = (original: string) => {
-      const blocks: string[] = [];
-      const visit = (node: Nodes) => {
-        const isLeaf = !["root", "list", "blockquote", "table"].includes(node.type);
-        if (isLeaf && node.position) {
-          blocks.push(original.slice(node.position.start.offset, node.position.end.offset));
-        }
-        if (node.type !== "listItem" && isLeaf) return;
-        if ("children" in node) node.children.forEach(visit);
-      };
-      visit(processor.parse(original));
-      return blocks;
-    };
-    const failures: string[] = [];
-    let insertions = 0;
-    for (const [name, original] of cases) {
-      const boundaries: { at: number; parent: number; index: number }[] = [];
-      const { tiptap: probe } = open(original);
-      expect(canReconcile({ original, before: probe.getMarkdown() }), name).toBe(true);
-      const collect = (node: typeof probe.state.doc, at: number, parent: number) => {
-        node.forEach((_child, offset, index) =>
-          boundaries.push({ at: at + offset, parent, index }),
-        );
-        boundaries.push({ at: at + node.content.size, parent, index: node.childCount });
-      };
-      collect(probe.state.doc, 0, -1);
-      probe.state.doc.descendants((node, pos) => {
-        // An empty details body is one leaf for the reconcile, not a level it recurses into.
-        if (containers.has(node.type.name) && node.textContent !== "") collect(node, pos + 1, pos);
-      });
-
-      for (const { at, parent, index } of boundaries) {
-        const { editor, tiptap } = open(original);
-        const before = editor.serialize();
-        const { schema, doc } = tiptap.state;
-        const container = parent < 0 ? doc : doc.nodeAt(parent)!;
-        const text = () => schema.nodes.paragraph!.create(null, schema.text("Inserted"));
-        const neighbour = container.child(Math.max(0, index - 1));
-        const inserted =
-          container.type.name === "table"
-            ? neighbour.type.create(
-                null,
-                neighbour.content.content.map((cell) => cell.type.create(cell.attrs, text())),
-              )
-            : container.type.name.endsWith("List")
-              ? neighbour.type.create(null, text())
-              : text();
-        tiptap.view.dispatch(tiptap.state.tr.insert(at, inserted));
-        const result = reconcileMarkdown({ original, before, after: editor.serialize() });
-        const where = `${name} at ${container.type.name} ${index}`;
-
-        if (!result.includes("Inserted")) failures.push(`${where} lost the inserted block`);
-        let cursor = 0;
-        for (const block of untouchedBlocks(original)) {
-          const found = result.indexOf(block, cursor);
-          if (found < 0) failures.push(`${where} changed ${JSON.stringify(block)}`);
-          else cursor = found;
-        }
-        insertions += 1;
-      }
-    }
-    expect(failures).toEqual([]);
-    expect(insertions).toBe(94);
-  });
-
   it("a ticked task checkbox changes only that item's marker, and Undo reverses it", () => {
     const original = "-   [ ] Keep\n- [ ] Other\n";
     const { editor, element } = open(original);
@@ -255,5 +171,236 @@ describe("createRichMarkdownEditor", () => {
     expect(tiptap.isDestroyed).toBe(true);
     expect(element.querySelector("[contenteditable='true']")).toBeNull();
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("an edit at any boundary of any level", () => {
+  const table = "| a | b |\n|:--|--:|\n| one   |  two |\n| three | four |\n";
+  const quote = (text: string) => text.replace(/^(?=.)/gm, "> ");
+  const cases = [
+    ...supported,
+    ["tableBeforeParagraph", `${table}\nAfter.\n`],
+    ["crlfTable", `${table}\nAfter.\n`.replaceAll("\n", "\r\n")],
+    ["quotedTable", `${quote(table)}\nAfter.\n`],
+    ["tableInDetails", `<details>\n<summary>More</summary>\n\n${table}\n</details>\n\nAfter.\n`],
+    ["orderedList", "1) one\n2) two\n3) three\n\nAfter.\n"],
+    ["nestedList", "- one\n  - nested a\n  - nested b\n- two\n\nAfter.\n"],
+    ["quotedOrderedList", `${quote("1. one\n2. two\n")}\nAfter.\n`],
+    ["quotedTaskList", `${quote("- [ ] open\n- [x] done\n")}\nAfter.\n`],
+  ] as const;
+  const containers = new Set([
+    "table",
+    "bulletList",
+    "orderedList",
+    "taskList",
+    "blockquote",
+    "detailsContent",
+  ]);
+  type Doc = Editor["state"]["doc"];
+  type Edit = { readonly where: string; readonly apply: (tiptap: Editor) => void };
+
+  interface Block {
+    readonly type: string;
+    readonly key: string;
+    readonly start: number;
+    readonly end: number;
+  }
+  /** Every block the reconcile copies whole, plus list items, in document order. */
+  const blocksOf = (source: string) => {
+    const blocks: Block[] = [];
+    const text = (node: Nodes): string =>
+      "value" in node ? node.value : "children" in node ? node.children.map(text).join(" ") : "";
+    const lists: List[] = [];
+    const summary = (html: string) => /<summary>([^<]*)<\/summary>/.exec(html)?.[1] ?? "";
+    const visit = (node: Nodes, index: number, siblings: readonly Nodes[]) => {
+      // A details block is one block too, written as one HTML node or as an opener and closer.
+      if (node.type === "html" && node.value.startsWith("<details")) {
+        const whole = node.value.includes("</details>");
+        const close = whole
+          ? index
+          : siblings.findIndex(
+              (other, at) => at > index && "value" in other && other.value === "</details>",
+            );
+        const body = siblings
+          .slice(index + 1, Math.max(index + 1, close))
+          .map(text)
+          .join(" ");
+        blocks.push({
+          type: "details",
+          key: `details:${summary(node.value)}:${body.replaceAll("\r\n", "\n")}`,
+          start: node.position!.start.offset!,
+          end: siblings[close]!.position!.end.offset!,
+        });
+        if (whole) return;
+      }
+      const isBlock = !["root", "list", "blockquote", "table"].includes(node.type);
+      if (isBlock && node.position) {
+        // The first item of an ordered list spells the number the list starts at.
+        const parent = siblings === lists.at(-1)?.children ? lists.at(-1) : undefined;
+        const start = parent?.ordered && index === 0 ? String(parent.start) : "";
+        const checked = node.type === "listItem" ? `${String(node.checked)}${start}` : "";
+        blocks.push({
+          type: node.type,
+          key: `${node.type}:${checked}:${text(node).replaceAll("\r\n", "\n")}`,
+          start: node.position.start.offset!,
+          end: node.position.end.offset!,
+        });
+      }
+      if (node.type !== "listItem" && isBlock) return;
+      if (node.type === "list") lists.push(node);
+      if ("children" in node) node.children.forEach(visit);
+      if (node.type === "list") lists.pop();
+    };
+    visit(processor.parse(source), 0, []);
+    return blocks;
+  };
+  /** Pairs of indexes matched by the longest common subsequence of the keys. */
+  const matches = (left: readonly Block[], right: readonly Block[]) => {
+    const table = Array.from({ length: left.length + 1 }, () =>
+      Array.from({ length: right.length + 1 }, () => 0),
+    );
+    for (let i = left.length - 1; i >= 0; i -= 1) {
+      for (let j = right.length - 1; j >= 0; j -= 1) {
+        table[i]![j] =
+          left[i]!.key === right[j]!.key
+            ? table[i + 1]![j + 1]! + 1
+            : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+      }
+    }
+    const pairs = new Map<number, number>();
+    for (let i = 0, j = 0; i < left.length && j < right.length;) {
+      if (left[i]!.key === right[j]!.key) pairs.set(i++, j++);
+      else if (table[i + 1]![j]! >= table[i]![j + 1]!) i += 1;
+      else j += 1;
+    }
+    return pairs;
+  };
+
+  /**
+   * Applies each edit to a fresh editor and reconciles. Every original block must keep its
+   * bytes, in order, except the edited ones: a block whose content the edit changed or
+   * removed, and everything inside a list item it changed (the receiving item and the items
+   * that hold it).
+   */
+  const sweep = (edits: (doc: Doc) => Edit[], inserts: boolean) => {
+    const failures: string[] = [];
+    let count = 0;
+    for (const [name, original] of cases) {
+      const { tiptap: probe } = open(original);
+      const before = probe.getMarkdown();
+      expect(canReconcile({ original, before }), name).toBe(true);
+      const originalBlocks = blocksOf(original);
+      const beforeBlocks = blocksOf(before);
+      const toBefore = matches(originalBlocks, beforeBlocks);
+      for (const { where, apply } of edits(probe.state.doc)) {
+        const { editor, tiptap } = open(original);
+        apply(tiptap);
+        const after = editor.serialize();
+        const result = reconcileMarkdown({ original, before, after });
+        const kept = new Set(matches(beforeBlocks, blocksOf(after)).keys());
+        const edited = originalBlocks.filter((_block, index) => {
+          const beforeIndex = toBefore.get(index);
+          return beforeIndex !== undefined && !kept.has(beforeIndex);
+        });
+        const inEditedItem = (block: Block) =>
+          edited.some(
+            (item) =>
+              item.type === "listItem" && item.start <= block.start && block.end <= item.end,
+          );
+        const label = `${name} ${where}`;
+        if (inserts && !result.includes("Inserted")) failures.push(`${label} lost the edit`);
+        let cursor = 0;
+        for (const block of originalBlocks) {
+          if (edited.includes(block) || inEditedItem(block)) continue;
+          const text = original.slice(block.start, block.end);
+          const found = result.indexOf(text, cursor);
+          if (found < 0) failures.push(`${label} changed ${JSON.stringify(text)}`);
+          else cursor = found;
+        }
+        count += 1;
+      }
+    }
+    return { failures, count };
+  };
+
+  /** The doc and every container the reconcile recurses into, with their positions. */
+  const levels = (doc: Doc) => {
+    const found: { node: Doc; at: number; parent: number }[] = [{ node: doc, at: 0, parent: -1 }];
+    doc.descendants((node, pos) => {
+      // An empty details body is one leaf for the reconcile, not a level it recurses into.
+      if (containers.has(node.type.name) && node.textContent !== "") {
+        found.push({ node, at: pos + 1, parent: pos });
+      }
+    });
+    return found;
+  };
+  const paragraph = (tiptap: Editor) =>
+    tiptap.schema.nodes.paragraph!.create(null, tiptap.schema.text("Inserted"));
+
+  it("inserting a block keeps every untouched block's bytes", () => {
+    const { failures, count } = sweep(
+      (doc) =>
+        levels(doc).flatMap(({ node, at, parent }) =>
+          Array.from({ length: node.childCount + 1 }, (_unused, index): Edit => {
+            let offset = 0;
+            for (let child = 0; child < index; child += 1) offset += node.child(child).nodeSize;
+            return {
+              where: `inserted at ${node.type.name} ${index}`,
+              apply: (tiptap) => {
+                const container = parent < 0 ? tiptap.state.doc : tiptap.state.doc.nodeAt(parent)!;
+                const neighbour = container.child(Math.max(0, index - 1));
+                const inserted =
+                  container.type.name === "table"
+                    ? neighbour.type.create(
+                        null,
+                        neighbour.content.content.map((cell) =>
+                          cell.type.create(cell.attrs, paragraph(tiptap)),
+                        ),
+                      )
+                    : container.type.name.endsWith("List")
+                      ? neighbour.type.create(null, paragraph(tiptap))
+                      : paragraph(tiptap);
+                tiptap.view.dispatch(tiptap.state.tr.insert(at + offset, inserted));
+              },
+            };
+          }),
+        ),
+      true,
+    );
+    expect(failures).toEqual([]);
+    expect(count).toBe(126);
+  });
+
+  it("inserting a paragraph or a first nested item inside a list item keeps every other block's bytes", () => {
+    const { failures, count } = sweep((doc) => {
+      const edits: Edit[] = [];
+      doc.descendants((node, pos) => {
+        if (node.type.name !== "listItem" && node.type.name !== "taskItem") return true;
+        const end = pos + 1 + node.content.size;
+        const list = doc.resolve(pos).parent;
+        edits.push({
+          where: `paragraph in ${list.type.name} item at ${pos}`,
+          apply: (tiptap) => tiptap.view.dispatch(tiptap.state.tr.insert(end, paragraph(tiptap))),
+        });
+        let nested = false;
+        node.forEach((child) => (nested ||= child.type.name.endsWith("List")));
+        if (!nested) {
+          edits.push({
+            where: `nested item in ${list.type.name} item at ${pos}`,
+            apply: (tiptap) =>
+              tiptap.view.dispatch(
+                tiptap.state.tr.insert(
+                  end,
+                  list.type.create(null, node.type.create(null, paragraph(tiptap))),
+                ),
+              ),
+          });
+        }
+        return true;
+      });
+      return edits;
+    }, true);
+    expect(failures).toEqual([]);
+    expect(count).toBe(43);
   });
 });

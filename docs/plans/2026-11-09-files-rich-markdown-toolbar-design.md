@@ -690,3 +690,12 @@ was reproduced as a failing test before the fix.
   without its trailing space, including the last line of a separator, which leads into the
   next block's text. Fixed: that last line keeps the whole prefix, so the saved line reads
   `> Inserted`.
+- Coordinator, the sweep did not insert inside a list item's own children. It now also adds
+  a second paragraph to every item and a first nested item under every item without one,
+  in bullet, ordered and task lists at the top level and inside a block quote. The check
+  pairs the blocks of the editor's text before and after the edit by content. Only a block
+  the edit changed, and everything inside a list item it changed (the receiving item and
+  the items that hold it), may lose its bytes. The first item of an ordered list counts its
+  start number as content. All 43 insertions kept every other block's bytes with no change
+  to the reconcile, so no defect was found at this level. A test run that wrote matched
+  items in the editor's spelling failed 24 of them, so the check can fail.
