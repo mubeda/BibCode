@@ -10428,6 +10428,60 @@ mod tests {
         );
     }
 
+    /// Codex review finding 5: the deleted-file read of undoing the initial commit runs as a
+    /// read, without the index refresh.
+    #[tokio::test]
+    async fn background_status_undo_initial_commit_reads_deleted_files_without_a_lock() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitManager.undoCommit.head".into(),
+                    process_output("2222222222222222222222222222222222222222\0\0subject\n"),
+                ),
+                (
+                    "GitManager.undoCommit.initial.deleted".into(),
+                    process_output(""),
+                ),
+                (
+                    "GitManager.undoCommit.initial.deleteHead".into(),
+                    process_output(""),
+                ),
+                (
+                    "GitManager.undoCommit.initial.unstage".into(),
+                    process_output(""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        GitRepository::with_runner_for_test(runner.clone())
+            .undo_head_commit(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("undo succeeds");
+
+        let deleted = runner
+            .requests()
+            .into_iter()
+            .find(|request| request.operation == "GitManager.undoCommit.initial.deleted")
+            .expect("the deleted-file read ran");
+        assert!(
+            deleted
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0"),
+            "{:?}",
+            deleted.env
+        );
+        assert!(
+            deleted
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "diff.autoRefreshIndex=false"),
+            "{:?}",
+            deleted.args
+        );
+    }
+
     #[tokio::test]
     async fn git_manager_undo_uses_a_mixed_reset_to_the_first_parent() {
         let runner = Arc::new(RecordingGitRunner {
@@ -14342,34 +14396,89 @@ mod index_lock_free_status_tests {
             .collect()
     }
 
+    /// The index's bytes and modification time, and every `index.lock` event in its Git
+    /// directory from the start of the watch.
+    struct IndexWatch {
+        index: PathBuf,
+        git_dir: PathBuf,
+        bytes: Vec<u8>,
+        modified: SystemTime,
+        locks_seen: Arc<Mutex<Vec<notify::EventKind>>>,
+        sentinel_seen: CancellationToken,
+        _watcher: notify::RecommendedWatcher,
+    }
+
+    impl IndexWatch {
+        fn start(fixture: &StatDirtyWorktree) -> Self {
+            let locks_seen = Arc::new(Mutex::new(Vec::new()));
+            let sentinel_seen = CancellationToken::new();
+            let (recorded, sentinel) = (locks_seen.clone(), sentinel_seen.clone());
+            let mut watcher =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    if let Ok(event) = event {
+                        for path in event.paths {
+                            match path.file_name().and_then(|name| name.to_str()) {
+                                Some("index.lock") => {
+                                    recorded.lock().expect("lock events").push(event.kind);
+                                }
+                                Some("reads-done") => sentinel.cancel(),
+                                _ => {}
+                            }
+                        }
+                    }
+                })
+                .expect("Git directory watcher");
+            watcher
+                .watch(&fixture.git_dir, notify::RecursiveMode::NonRecursive)
+                .expect("watch the Git directory");
+            Self {
+                index: fixture.index(),
+                git_dir: fixture.git_dir.clone(),
+                bytes: fs::read(fixture.index()).expect("index bytes"),
+                modified: fs::metadata(fixture.index())
+                    .and_then(|metadata| metadata.modified())
+                    .expect("index modification time"),
+                locks_seen,
+                sentinel_seen,
+                _watcher: watcher,
+            }
+        }
+
+        async fn assert_untouched(self, reads: &str) {
+            // Events arrive in order, so once the watcher reports this file it has reported
+            // every lock created before it.
+            let sentinel_path = self.git_dir.join("reads-done");
+            fs::write(&sentinel_path, "").expect("sentinel file");
+            tokio::time::timeout(Duration::from_secs(10), self.sentinel_seen.cancelled())
+                .await
+                .expect("the watcher reports the sentinel file");
+            fs::remove_file(&sentinel_path).expect("remove sentinel file");
+
+            let bytes_unchanged =
+                fs::read(&self.index).expect("index bytes after reads") == self.bytes;
+            let modified_unchanged = fs::metadata(&self.index)
+                .and_then(|metadata| metadata.modified())
+                .expect("index modification time after reads")
+                == self.modified;
+            let locks_seen = self.locks_seen.lock().expect("lock events").clone();
+            let created = locks_seen
+                .iter()
+                .filter(|kind| matches!(kind, notify::EventKind::Create(_)))
+                .count();
+            assert!(
+                bytes_unchanged && modified_unchanged && locks_seen.is_empty(),
+                "{reads} touched the index: bytes unchanged {bytes_unchanged}, modification \
+                 time unchanged {modified_unchanged}, {} index.lock events of which {created} \
+                 creations",
+                locks_seen.len()
+            );
+        }
+    }
+
     async fn polling_alone_leaves_the_index_untouched(linked: bool) {
         let fixture = stat_dirty_worktree(linked);
         let repository = fixture.repository();
-        let index_bytes = fs::read(fixture.index()).expect("index bytes");
-        let index_modified = fs::metadata(fixture.index())
-            .and_then(|metadata| metadata.modified())
-            .expect("index modification time");
-        let locks_seen = Arc::new(Mutex::new(Vec::new()));
-        let sentinel_seen = CancellationToken::new();
-        let (recorded, sentinel) = (locks_seen.clone(), sentinel_seen.clone());
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event {
-                    for path in event.paths {
-                        match path.file_name().and_then(|name| name.to_str()) {
-                            Some("index.lock") => {
-                                recorded.lock().expect("lock events").push(event.kind);
-                            }
-                            Some("polling-done") => sentinel.cancel(),
-                            _ => {}
-                        }
-                    }
-                }
-            })
-            .expect("Git directory watcher");
-        watcher
-            .watch(&fixture.git_dir, notify::RecursiveMode::NonRecursive)
-            .expect("watch the Git directory");
+        let watch = IndexWatch::start(&fixture);
 
         for round in 0..50 {
             if round > 0 {
@@ -14381,32 +14490,8 @@ mod index_lock_free_status_tests {
                 .expect("status read succeeds");
             assert!(status.has_working_tree_changes);
         }
-        // Events arrive in order, so once the watcher reports this file it has reported
-        // every lock created before it.
-        let sentinel_path = fixture.git_dir.join("polling-done");
-        fs::write(&sentinel_path, "").expect("sentinel file");
-        tokio::time::timeout(Duration::from_secs(10), sentinel_seen.cancelled())
-            .await
-            .expect("the watcher reports the sentinel file");
-        fs::remove_file(&sentinel_path).expect("remove sentinel file");
 
-        let bytes_unchanged =
-            fs::read(fixture.index()).expect("index bytes after polling") == index_bytes;
-        let modified_unchanged = fs::metadata(fixture.index())
-            .and_then(|metadata| metadata.modified())
-            .expect("index modification time after polling")
-            == index_modified;
-        let locks_seen = locks_seen.lock().expect("lock events").clone();
-        let created = locks_seen
-            .iter()
-            .filter(|kind| matches!(kind, notify::EventKind::Create(_)))
-            .count();
-        assert!(
-            bytes_unchanged && modified_unchanged && locks_seen.is_empty(),
-            "polling touched the index: bytes unchanged {bytes_unchanged}, modification time \
-             unchanged {modified_unchanged}, {} index.lock events of which {created} creations",
-            locks_seen.len()
-        );
+        watch.assert_untouched("polling").await;
     }
 
     #[tokio::test]
@@ -14597,6 +14682,124 @@ mod index_lock_free_status_tests {
     #[tokio::test]
     async fn background_status_keeps_unstaged_statistics_correct_in_a_linked_worktree() {
         keeps_unstaged_statistics_correct(true).await;
+    }
+
+    /// Codex review finding 5: the conflict reads (`status`, `diff --check` and
+    /// `diff --numstat`) left the index alone only when nothing was stat-dirty.
+    #[tokio::test]
+    async fn background_status_conflict_reads_leave_the_index_untouched() {
+        let fixture = stat_dirty_worktree(false);
+        fs::write(fixture.worktree.join("c.txt"), "base\n").expect("c.txt");
+        fixture.checked_git(&["add", "c.txt"]);
+        fixture.checked_git(&["commit", "-q", "-m", "base"]);
+        fixture.checked_git(&["switch", "-q", "-c", "other"]);
+        fs::write(fixture.worktree.join("c.txt"), "other\n").expect("c.txt on other");
+        fixture.checked_git(&["add", "c.txt"]);
+        fixture.checked_git(&["commit", "-q", "-m", "other"]);
+        fixture.checked_git(&["switch", "-q", "main"]);
+        fs::write(fixture.worktree.join("c.txt"), "main\n").expect("c.txt on main");
+        fixture.checked_git(&["add", "c.txt"]);
+        fixture.checked_git(&["commit", "-q", "-m", "main"]);
+        assert!(
+            !fixture
+                .git(&["merge", "--no-edit", "other"])
+                .status
+                .success(),
+            "the merge stops on a conflict"
+        );
+        fixture.make_stable_stat_dirty();
+        let repository = fixture.repository();
+        let cancellation = CancellationToken::new();
+        let watch = IndexWatch::start(&fixture);
+
+        let states = repository
+            .git_manager_conflict_states(&fixture.worktree, &cancellation)
+            .await
+            .expect("conflict states");
+        let ours_deleted = repository
+            .git_manager_conflict_side_deleted(
+                &fixture.worktree,
+                "c.txt",
+                crate::git::manager::conflicts::ConflictSide::Ours,
+                &cancellation,
+            )
+            .await
+            .expect("conflict side");
+
+        watch.assert_untouched("the conflict reads").await;
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| (state.path.as_str(), state.marker_count))
+                .collect::<Vec<_>>(),
+            [("c.txt", 3)]
+        );
+        assert_eq!(
+            states[0].kind,
+            crate::git::manager::conflicts::ConflictKind::Text
+        );
+        assert_eq!(ours_deleted, Some(false));
+    }
+
+    /// Codex review finding 5: the status read of a worktree removal check.
+    #[tokio::test]
+    async fn background_status_worktree_removal_check_leaves_the_index_untouched() {
+        let fixture = stat_dirty_worktree(true);
+        let anchor = fixture
+            .git_dir
+            .ancestors()
+            .nth(3)
+            .expect("the main worktree holds the common Git directory")
+            .to_path_buf();
+        let repository = fixture.repository();
+        let cancellation = CancellationToken::new();
+        let inventory = repository
+            .worktree_inventory(&anchor, &cancellation)
+            .await
+            .expect("worktree inventory");
+        let linked = fs::canonicalize(&fixture.worktree).expect("linked worktree");
+        let record = inventory
+            .records
+            .iter()
+            .find(|record| fs::canonicalize(&record.path).ok().as_ref() == Some(&linked))
+            .cloned()
+            .expect("linked worktree record");
+        let watch = IndexWatch::start(&fixture);
+
+        let inspection = repository
+            .inspect_worktree_removal(&anchor, &record, &cancellation)
+            .await
+            .expect("removal inspection");
+
+        watch.assert_untouched("the removal check").await;
+        assert_eq!(
+            inspection.tracked_change_count, 1,
+            "edited.txt is changed and stable.txt is not"
+        );
+        assert_eq!(inspection.untracked_file_count, 0);
+    }
+
+    /// Codex review finding 5: the working-tree patch a commit message is written from.
+    #[tokio::test]
+    async fn background_status_commit_context_leaves_the_index_untouched() {
+        let fixture = stat_dirty_worktree(false);
+        let watch = IndexWatch::start(&fixture);
+
+        let context = fixture
+            .repository()
+            .commit_context(&fixture.worktree, &CancellationToken::new())
+            .await
+            .expect("commit context");
+
+        watch.assert_untouched("the commit context read").await;
+        assert!(
+            context.contains("edited.txt") && context.contains("+three"),
+            "{context}"
+        );
+        assert!(
+            !context.contains("stable.txt"),
+            "a timestamp-only change is not a change: {context}"
+        );
     }
 
     #[tokio::test]
