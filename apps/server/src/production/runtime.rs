@@ -5608,10 +5608,121 @@ mod tests {
         runtime.quiesce_for_update().await.expect("quiesced");
 
         assert!(!lock.exists(), "no index.lock remains after quiescence");
+        assert_eq!(session_state(&state), "clean");
         let staged = timeout(std::time::Duration::from_secs(1), write)
             .await
             .expect("the write has returned")
             .expect("write task");
         assert!(staged.is_err(), "the stopped write failed: {staged:?}");
+    }
+
+    /// The Profiler session's recorded state: `clean`, or `stopping` for an incomplete
+    /// shutdown.
+    fn session_state(state: &TempDir) -> String {
+        let session = crate::diagnostics::profiler::profiler_dir(
+            &ServerConfig::new(state.path()).state_dir(),
+        )
+        .join("session.json");
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(session).expect("session record"))
+                .expect("session JSON");
+        record["state"].as_str().expect("session state").to_owned()
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A leftover lock BiBCode could not delete does not block an update. Quiescence succeeds,
+    /// logs an error naming the worktree, and a later quiesce checks the lock again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_succeeds_with_a_leftover_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return;
+        }
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let worktree = state.path().join("worktree");
+        let git_dir = worktree.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("Git directory");
+        let lock = git_dir.join("index.lock");
+        std::fs::write(&lock, "").expect("the leftover lock");
+        runtime.git_repository.leave_lock_for_test(&lock, &worktree);
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
+        let log = CapturedLog::default();
+        let logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let first = runtime.quiesce_for_update().await;
+        let second = runtime.quiesce_for_update().await;
+
+        drop(logging);
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("writable Git directory");
+        assert_eq!(first, Ok(()), "a leftover lock does not block the update");
+        assert_eq!(second, Ok(()), "a later quiesce still succeeds");
+        assert!(lock.exists(), "the lock could not be removed");
+        assert_eq!(
+            session_state(&state),
+            "stopping",
+            "the shutdown was incomplete"
+        );
+        let log = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("utf8");
+        let named = crate::diagnostics::profiler::redact::redact_path(&worktree.to_string_lossy());
+        assert_eq!(
+            log.matches(named.as_str()).count(),
+            2,
+            "each quiesce names the worktree in an error:\n{log}"
+        );
+    }
+
+    /// A plain shutdown whose Git write never stops still releases the Profiler, so the next
+    /// server can record to the same state directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_shutdown_with_a_pending_write_releases_the_profiler() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let _write = runtime.git_repository.hold_write_for_test();
+
+        runtime.shutdown().await;
+
+        assert_eq!(
+            session_state(&state),
+            "stopping",
+            "the shutdown was incomplete"
+        );
+        let state_dir = ServerConfig::new(state.path()).state_dir();
+        let status = tokio::task::spawn_blocking(move || {
+            ProfilerRuntime::start(&state_dir, tokio::sync::watch::channel(false).1, Vec::new())
+                .status()
+        })
+        .await
+        .expect("the next Profiler starts");
+        assert_eq!(status["capabilities"]["storage"], "ok", "{status}");
     }
 }

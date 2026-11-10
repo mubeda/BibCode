@@ -492,6 +492,12 @@ impl GitRepository {
         self.writes.track().expect("Git writes are admitted")
     }
 
+    /// Records a leftover `index.lock` of `worktree` that a forced write could not delete.
+    #[cfg(all(test, unix))]
+    pub(crate) fn leave_lock_for_test(&self, lock: &Path, worktree: &Path) {
+        self.writes.record_left_lock_for_test(lock, worktree);
+    }
+
     /// Shares the server's host observation, which provider probes fill elsewhere.
     #[must_use]
     pub fn with_provider_hosts(mut self, provider_hosts: Arc<ProviderHosts>) -> Self {

@@ -752,6 +752,15 @@ impl GitWriteRegistry {
     }
 }
 
+#[cfg(all(test, unix))]
+impl GitWriteRegistry {
+    pub(crate) fn record_left_lock_for_test(&self, _lock: &Path, _worktree: &Path) {
+        self.state
+            .locks_left
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn process_command(
     request: &ProcessRequest,
     inheritance: EnvironmentInheritance,
@@ -1502,24 +1511,24 @@ mod tests {
         assert!(!lock.exists(), "the cleanup still removed the lock");
     }
 
-    /// A lock that stayed unchanged but could not be deleted is not someone else's: the cleanup
-    /// says it failed, and shutdown does not report a clean stop.
+    /// Leaves an unchanged lock that a forced write could not delete, because its Git
+    /// directory is read-only. The directory stays read-only; `writable` undoes that.
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn index_lock_cleanup_reports_a_lock_it_could_not_remove() {
+    async fn leave_an_undeletable_lock(
+        registry: &GitWriteRegistry,
+    ) -> Option<(tempfile::TempDir, PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipped: root deletes from a read-only folder");
-            return;
+            return None;
         }
         let git_dir = tempfile::tempdir().expect("Git directory");
         let lock = git_dir.path().join("index.lock");
-        let registry = GitWriteRegistry::default();
         let watch = IndexLockWatch::before_spawn(git_dir.path());
         std::fs::write(&lock, "").expect("the forced write's lock");
-        let read_only = std::fs::Permissions::from_mode(0o555);
-        std::fs::set_permissions(git_dir.path(), read_only).expect("read-only Git directory");
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
         let (reports, received) = tokio::sync::mpsc::unbounded_channel();
         reports
             .send(TerminationReport {
@@ -1528,13 +1537,6 @@ mod tests {
                 exited: true,
             })
             .expect("the stop report");
-
-        let cleanup = IndexLockWatch {
-            lock: watch.lock.clone(),
-            existed: watch.existed,
-        }
-        .after_forced_stop()
-        .await;
         WriteSettlement {
             _ticket: registry.track().expect("an admitted write"),
             watch: Some(watch),
@@ -1544,16 +1546,96 @@ mod tests {
         }
         .settle_now_or_later()
         .await;
-        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+        Some((git_dir, lock))
+    }
 
+    #[cfg(unix)]
+    fn writable(git_dir: &tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o755))
             .expect("writable Git directory");
+    }
+
+    /// A lock that stayed unchanged but could not be deleted is not someone else's: every stop
+    /// reports it while it is still there.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_reports_a_lock_it_could_not_remove() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+
+        let cleanup = IndexLockWatch {
+            lock: lock.clone(),
+            existed: false,
+        }
+        .after_forced_stop()
+        .await;
+        let first = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+        let second = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        writable(&git_dir);
         assert_eq!(
             cleanup,
             LockCleanup::RemoveFailed(std::io::ErrorKind::PermissionDenied)
         );
         assert!(lock.exists(), "the lock could not be removed");
-        assert_eq!(outcome, QuiesceOutcome::LocksLeft(1));
+        let reported = QuiesceOutcome::LocksLeft(1);
+        assert_eq!(first, reported);
+        assert_eq!(second, reported, "a later stop still reports the lock");
+    }
+
+    /// Codex review finding 3: a leftover lock someone else deleted is no longer reported.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_forgets_a_leftover_lock_someone_removed() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+        std::fs::remove_file(&lock).expect("someone deletes the lock");
+
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Clean
+        );
+    }
+
+    /// Each stop tries once more to delete a leftover lock, so a lock left by a passing
+    /// permission problem goes away.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_retries_a_leftover_lock_on_the_next_stop() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!lock.exists(), "the retry deleted the leftover lock");
+    }
+
+    /// A leftover lock that changed since it was recorded belongs to another Git process now,
+    /// so the retry forgets it and leaves it alone.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_leftover_lock_that_changed() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+        std::fs::write(&lock, "another Git process").expect("another Git takes the lock");
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(lock.exists(), "a lock that changed is never deleted");
     }
 
     #[tokio::test(start_paused = true)]
