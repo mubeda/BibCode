@@ -1015,6 +1015,7 @@ staticDescribe("Sidebar full render", () => {
     expect(protectAndInstall).toBeDefined();
     invoke(protectAndInstall!.props, "onClick", mouseEvent());
     await flush();
+    expect(h.spies.askBeforeLeaving).toHaveBeenCalledWith("update");
     expect(installUpdate).toHaveBeenCalled();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not install update", description: "install failed" }),

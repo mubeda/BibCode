@@ -203,6 +203,8 @@ const h = vi.hoisted(() => {
     closestCorners: vi.fn(),
     copyToClipboard: vi.fn(),
     windowConfirm: vi.fn(),
+    askBeforeLeaving: vi.fn(),
+    releaseLeaveHolds: vi.fn(),
     openProjectDataRecovery: vi.fn(async () => undefined),
   };
 
@@ -514,6 +516,12 @@ vi.mock("../state/worktrees", () => ({
   useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
     h.state.discoveryFocusRefreshCalls.push([...projects]);
   },
+}));
+
+// The real module reads document.activeElement; these tests run without a DOM.
+vi.mock("./files/unsavedFileEdits", () => ({
+  askBeforeLeaving: h.spies.askBeforeLeaving,
+  releaseLeaveHolds: h.spies.releaseLeaveHolds,
 }));
 
 vi.mock("../state/projectDataSafety", () => ({
@@ -1228,6 +1236,7 @@ beforeEach(() => {
   h.spies.pointerWithin.mockReturnValue([]);
   h.spies.closestCorners.mockReturnValue([]);
   h.spies.windowConfirm.mockReturnValue(true);
+  h.spies.askBeforeLeaving.mockResolvedValue("proceed");
 
   if (!browserRuntime) {
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
