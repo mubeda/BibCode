@@ -1021,7 +1021,7 @@ pub async fn run_branch_or_sync_operation(
         .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
             // vcs.* writes take this per-worktree guard but not the project lock, so it is
             // held from the snapshot onward: validation and execution see the same HEAD.
-            let mutation = tokio::select! {
+            let mut mutation = tokio::select! {
                 biased;
                 () = operation_cancellation.cancelled() => {
                     return Err(cancelled_error(operation));
@@ -1054,6 +1054,9 @@ pub async fn run_branch_or_sync_operation(
                 }
                 if operation_cancellation.is_cancelled() {
                     return Err(cancelled_error(operation));
+                }
+                if releases_reads_during_transfer(&locked_request) {
+                    mutation.local_writes_finished();
                 }
                 execute_branch_or_sync_operation(
                     &locked_repository,
@@ -1268,6 +1271,19 @@ fn network_step(
         }
         _ => None,
     }
+}
+
+/// Operations whose only Git effect is a network transfer: status reads resume before it
+/// while the write lock stays held (#345). Pull and fetch keep reads waiting, because pull
+/// rewrites files at its end.
+fn releases_reads_during_transfer(request: &GitManagerOperationRequest) -> bool {
+    matches!(
+        request,
+        GitManagerOperationRequest::Push { .. }
+            | GitManagerOperationRequest::PublishBranch { .. }
+            | GitManagerOperationRequest::ForcePush { .. }
+            | GitManagerOperationRequest::RemoteBranchDelete { .. }
+    )
 }
 
 fn expected_destination_mut(

@@ -686,6 +686,20 @@ decode, path, mode, or pull-request resolution failures that have not reached a
 Git effect do not fence status. Stacked actions acquire one guard around the
 complete action and repository calls do not reacquire it.
 
+A push-family operation keeps the guard's write lock to the end but reopens
+status reads once its local writes are finished (#345). A stacked action calls
+`StatusMutationGuard::local_writes_finished` right before its push, or before
+its pull-request step when it does not push. A Git Manager push, branch
+publish, force push or remote branch delete calls it right before the network
+step. The call advances the epoch, so a read started earlier cannot publish,
+reopens the read gate even when other mutations are queued, and requests one
+local refresh. A mutation queued behind that lock closes the gate only when it
+acquires the lock, so background writes that take the guard cannot bring the
+wait back. Every other write still waits for the lock, and the worktree entry
+is never retired while the lock is held. Settlement advances the epoch again
+and publishes a fresh status whatever the gate state. Pull and fetch keep
+reads waiting to the end, because pull rewrites files at its end.
+
 `sourceControl.publishRepository` likewise validates its provider, repository,
 visibility, remote, and protocol before admission, then owns GitHub repository
 creation plus the push as one mutation through terminal success, partial
@@ -972,7 +986,9 @@ refs snapshot and hold it through execution, so `vcs.*` writes, which take the
 guard but not the project lock, cannot change the repository between validation
 and execution. Unlike `vcs.*` failures that reach no Git effect, a branch or
 sync operation that ends blocked still fences status reads, because it held the
-guard while validating. The non-waiting acquisition returns the structured
+guard while validating. Push, branch publish, force push and remote branch
+delete reopen status reads right before their network step and keep the guard's
+write lock to the end. Pull and fetch do not. The non-waiting acquisition returns the structured
 `operation-in-flight` blocked reason when either lock is occupied; there is no
 second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state

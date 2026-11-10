@@ -131,7 +131,15 @@ flowchart TB
   Local and full reads are shared independently, each caller retains its own
   cancellation lease, and only final-lease release or a lifecycle/mutation
   fence cancels the physical read. A read gate and checked mutation epoch
-  prevent work admitted before or during a mutation from publishing afterward;
+  prevent work admitted before or during a mutation's local writes from
+  publishing afterward. A push-family operation (a stacked push or
+  pull-request step, or a Git Manager push, branch publish, force push or
+  remote branch delete) reopens the gate once its local writes are finished,
+  advances the epoch, and keeps the write lock until it ends, so status is
+  delivered while it waits on the network and every other write still waits.
+  Pull and fetch keep reads waiting to the end, because pull rewrites files.
+  A mutation queued behind such a lock closes the gate only when it acquires
+  the lock;
   post-fetch remote reads and pull-request enrichment carry that same epoch
   through their final internal publication or delivery check without changing
   public status schemas. Stream and unary pull-request enrichment share one
@@ -142,7 +150,9 @@ flowchart TB
   ref identity; an external ref change clears it and resets branch-specific
   client remote fields before reconciliation;
   the final idle transition across a queued mutation burst requests one
-  coalesced trailing local refresh before reopening the gate. The local fallback
+  coalesced trailing local refresh, and reopens the gate if it is still
+  closed, so an operation that resumed reads early still publishes fresh
+  status when it ends. The local fallback
   scheduler remains independent from remote reconciliation, so a slow fetch or
   remote probe cannot delay editor-save status publication.
 
@@ -392,6 +402,14 @@ flowchart TB
   task, runtime shutdown, or a panic) kills its whole process group or Windows
   job while the root is unreaped, without waiting; see the cancellation
   invariants in [RPC and orchestration](./rpc-and-orchestration.md).
+  A Git process the server stops for a timeout, a cancellation or shutdown is
+  asked first: on Linux and macOS it gets `SIGTERM` and is killed only if it
+  still runs 2 seconds later, and on Windows it is killed at once. After a
+  forced stop of a command that takes `index.lock` itself, the server removes a
+  lock that command left only if the lock did not exist before the command and
+  stays unchanged for another 2 seconds. Shutdown refuses new Git writes and
+  waits for the running ones to stop before the Profiler's teardown; see
+  [Observability](../operations/observability.md).
 
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
@@ -1988,7 +2006,9 @@ it.
   matching core dump record is looked up in the background for up to about 5 s
   and attached when found. Providers and the tunnel connector count signals and non-zero exits,
   supervised commands such as git only signals, and terminals only signals
-  people do not type (not `Ctrl-\` or `kill -9`). SIGTERM, SIGHUP, and SIGINT (on
+  people do not type (not `Ctrl-\` or `kill -9`). Git's stop sequence (ask,
+  wait 2 seconds, force, then the `index.lock` cleanup) and its log lines are
+  in [Observability](../operations/observability.md). SIGTERM, SIGHUP, and SIGINT (on
   Windows the Ctrl-C status), and a provider's exit codes 129, 130, and 143,
   are deliberate and never count. A stop that BiBCode or the user requested in
   the last minute, after the process started, is not reported; the comparison
