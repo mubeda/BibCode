@@ -19,10 +19,6 @@ import {
 import { FolderSearch, FolderTree, Globe2, LoaderCircle } from "lucide-react";
 import * as Schema from "effect/Schema";
 import {
-  lazy,
-  type ReactNode,
-  type RefObject,
-  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -86,6 +82,8 @@ import { RichMarkdownLinkPopover } from "./richMarkdown/RichMarkdownLinkPopover"
 import { useInsertImage } from "./richMarkdown/useInsertImage";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
+import { RichMarkdownView } from "./RichMarkdownView";
+import { useFileSaveShortcut } from "./useFileSaveShortcut";
 import {
   filePreviewKind,
   isMarkdownPreviewFile,
@@ -428,32 +426,6 @@ function useFileDiskWatch({
 }
 
 /**
- * Wire an explicit Ctrl+S / Cmd+S save onto the file-surface container. The chord
- * flushes the pending debounced write immediately and always preventDefaults so
- * the browser's own save dialog can never open. The listener is scoped to the
- * container (capture phase, so it wins before the Pierre editor's own handlers)
- * and only fires while focus lives inside the surface.
- */
-function useFileSaveShortcut(
-  containerRef: RefObject<HTMLElement | null>,
-  session: { flush(): Promise<unknown> } | null,
-): void {
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !session) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      const isSaveChord =
-        (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "s";
-      if (!isSaveChord) return;
-      event.preventDefault();
-      void session.flush();
-    };
-    container.addEventListener("keydown", handleKeyDown, true);
-    return () => container.removeEventListener("keydown", handleKeyDown, true);
-  }, [containerRef, session]);
-}
-
-/**
  * Drops the worker pool's highlighted lines for a session's `cacheKey` when its editable surface
  * goes away. Pierre caches those lines by `cacheKey` alone, and a highlight still in the worker
  * when the first edit lands is stored after the edit cleared the entry. The next surface for the
@@ -750,37 +722,8 @@ function RichMarkdownFormatting({
   );
 }
 
-const RichMarkdownSurface = lazy(() => import("./richMarkdown/RichMarkdownSurface"));
-
 const READ_ONLY_MARKDOWN_NOTICE =
   "This file uses Markdown that the editor cannot change safely. Edit it in source view.";
-
-/** The editable rendered view; until its editor loads, the read-only view shows the text. */
-function RichMarkdownView({
-  session,
-  contents,
-  onEditorChange,
-  fallback,
-}: {
-  session: FileEditingSession<FileCommentAnnotationGroup>;
-  contents: string;
-  onEditorChange: (editor: RichMarkdownEditor | null) => void;
-  fallback: ReactNode;
-}) {
-  const surfaceRef = useRef<HTMLDivElement>(null);
-  useFileSaveShortcut(surfaceRef, session);
-  return (
-    <Suspense fallback={fallback}>
-      <ScrollArea ref={surfaceRef} className="min-h-0 flex-1">
-        <RichMarkdownSurface
-          session={session}
-          contents={contents}
-          onEditorChange={onEditorChange}
-        />
-      </ScrollArea>
-    </Suspense>
-  );
-}
 
 function RenderedMarkdownSurface({
   session,

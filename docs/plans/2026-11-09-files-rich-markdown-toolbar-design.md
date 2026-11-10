@@ -394,9 +394,12 @@ flusher.
 
 ## Loading
 
-`FilePreviewPanel` loads the surface with `lazy(() => import("./richMarkdown/RichMarkdownSurface"))`
-only when a `.md` file is shown editable in rendered view. The Suspense fallback is the
-existing read-only rendered view, so the text is on screen while the editor loads. The
+`RichMarkdownView` (`apps/web/src/components/files/RichMarkdownView.tsx`) loads the surface
+with `lazy(() => import("./richMarkdown/RichMarkdownSurface"))` only when a `.md` file is
+shown editable in rendered view. The Suspense fallback is the existing read-only rendered
+view, so the text is on screen while the editor loads. The save shortcut's listener is
+installed by a component inside the Suspense boundary, so it attaches when the loaded
+editor commits. The
 format group, link popover and image hook import only types from
 `richMarkdownExtensions.ts`, so TipTap stays in the lazy chunk.
 
@@ -548,3 +551,8 @@ was reproduced as a failing test before the fix.
 - Codex review 2, item 4, an inserted image named `diagram#1.png` linked a fragment, a
   `?` started a query and an unmatched parenthesis broke the destination. The hook used
   `encodeURI`, which leaves `#`, `?` and parentheses as they are. Fixed: `insertImage` encodes each path segment.
+- Codex review 2, item 3, the save shortcut did nothing in rendered view after the first
+  lazy load. Its effect ran outside the Suspense boundary while the fallback showed, found
+  no element, and never ran again. Fixed: `RichMarkdownView` moved to its own file, with the
+  shortcut installed inside the boundary, and `useFileSaveShortcut` moved to its own file
+  for both callers.
