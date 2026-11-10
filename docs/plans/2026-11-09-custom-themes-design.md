@@ -403,6 +403,17 @@ changes in the roughly 60 files that carry one.
   (`data-slot="command-input"` in `ui/command.tsx`) sets `ring-0`, so it shows no ring in the
   base, and the theme adds no outline there. The rules sit outside the utilities layer, so they
   win over `outline-none`.
+- Editable surfaces under the generic `:focus-visible` rule (checked by lane D4):
+  - The composer's Lexical editor (`ComposerPromptEditor.tsx`) sets `focus:outline-none`, and no
+    wrapper draws a focus indicator today. The theme outline on the editor is the intended
+    indicator, so nothing is excluded.
+  - The rich Markdown editor of Phase 6 (`.rich-markdown-editor .ProseMirror`) draws its own
+    2px outline on the editor itself, not on a wrapper. The theme rule restyles that same
+    outline with the theme's width and offset, so it keeps one indicator and nothing is excluded.
+  - `ComposerPendingUserInputPanel.tsx`, `ChatView.tsx` and `SlowRequestsIndicator.tsx` only
+    name `contenteditable` in key-handling selectors and render no editable surface.
+  - `LocalCommentAnnotation.tsx` sets `contentEditable={false}` on its cards, which take no
+    focus. Its `Textarea` is a marked ring owner.
 - Under `:root[data-theme-control-shadow="none"]`, `[data-control-shadow]`, its `::before` and
   `::after`, and `.chat-composer-glass` get `box-shadow: none`.
 - Without the attributes nothing changes, so Light and Dark keep today's ring and shadows (R59).
@@ -498,3 +509,4 @@ each finding with a failing test before the fix.
 | C14. Lane D changed the default button to `hover:` and `active:hover:` variants, which Tailwind wraps in `@media (hover: hover)`, so a touch press in Light and Dark lost the 90 percent primary of the base branch (R50). | Fixed. The compiled CSS showed the base selector `:is(:hover, [data-pressed])` with no media query and the new rules inside `@media (hover: hover)`. The button now uses `[:hover,[data-pressed]]:bg-primary-hover` and `[:active:hover,[data-pressed]]:bg-primary-active`, and `button.test.tsx` compiles the variant and checks that no rule is gated. A keyboard press without hover stays unthemed, a known limit. |
 | C15. The advisor checked the C13 fix and found that marking `InputGroup` made the group take the outline from a focused button in an addon (the address bar in `PreviewChromeRow.tsx` has one).                            | Fixed. `index.css` lets an input group claim the outline only for its `input` or `textarea`. `focusRingOwner.test.tsx` applies the rules in happy-dom and checks both cases.                                                                                                                                                                                                                                           |
 | C16. The command palette search, an `Input` with `has-focus-visible:ring-0`, got the theme outline from the `Input` marker, although the base shows no ring there.                                                         | Fixed. `CommandInput` marks its wrapper `data-slot="command-input"`, and an `index.css` rule removes the owner outline inside it. `focusRingOwner.test.tsx` checks that the focused search shows no outline.                                                                                                                                                                                                           |
+| C17. The coordinator asked whether the generic `:focus-visible` rule outlines editable surfaces that already draw an indicator on a wrapper.                                                                               | Checked. No editable surface draws its indicator on a wrapper, so no marker or exclusion is added. The decision for each surface is listed under Focus ring and control shadow. The Phase 8 end-to-end themes spec should look at the composer editor under Verdant Light.                                                                                                                                             |
