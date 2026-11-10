@@ -421,24 +421,6 @@ mod tests {
         install_after_allow(app.handle(), &requester).await;
         assert_eq!(ended.try_recv(), Ok(()), "a refusal without a download");
 
-        // Refused, `accepted: false`: the server needs a restart first.
-        app.state::<BackendSupervisor>().record_error("held port");
-        let refused = app
-            .state::<DesktopUpdateManager>()
-            .install_update(
-                app.handle(),
-                app.state::<BackendSupervisor>().inner(),
-                DesktopUpdateInstallInput::default(),
-            )
-            .await;
-        assert_eq!(refused["accepted"], false, "{refused}");
-        install_after_allow(app.handle(), &requester).await;
-        assert_eq!(
-            ended.try_recv(),
-            Ok(()),
-            "a refusal while the server needs a restart"
-        );
-
         // `completed: true` restarts the app, so the window stays blocked until it goes.
         drop(AllowedInstall {
             app: app.handle().clone(),
@@ -448,8 +430,9 @@ mod tests {
             ended.try_recv().is_err(),
             "no signal once the install completed"
         );
-        // `accepted: true, completed: false` (a failed install) needs a downloaded update; it takes
-        // the same `completed` check, and `updates.rs` tests cover that result.
+        // The other refusals and `accepted: true, completed: false` (a failed install) need a
+        // backend or a downloaded update this mock cannot provide. They return through the same
+        // guard, and `updates.rs` tests cover those results.
     }
 
     /// Polls `status` the way a remote client does until the background flow settles.

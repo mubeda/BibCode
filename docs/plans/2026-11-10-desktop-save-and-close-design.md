@@ -107,9 +107,12 @@ nothing, and the clearing of `requestedBy` also fires on exits before the window
 `completed: true`, which restarts the app (on Windows the installer ends it). The web then
 releases the block's holds and any Discard holds, closes the dialog and shows "The update did not
 install". Proven by `close_request_remote_install_signals_every_end_without_restart_after_allow`
-and the web tests under "a remote update install the window allowed". Limit: when the person
+and the web tests under "a remote update install the window allowed". When the person
 picks "Close anyway" in the native prompt for an `update` request, the web did not answer and is
-not blocked, as for any request the person forces.
+not blocked, as for any request the person forces. If that install then ends without a restart,
+the signal also drops the web's open `update` question, so a late answer cannot start a block
+that nothing ends. The question's title names the reason, for example "Save your changes before
+updating?".
 
 Dock Quit and the app switcher's Quit on macOS send `terminate:`, and tao has no
 `applicationShouldTerminate` hook, so they cannot wait for an answer. The user decided on

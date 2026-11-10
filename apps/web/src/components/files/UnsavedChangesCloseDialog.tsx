@@ -16,9 +16,18 @@ import {
   isUpdateInstalling,
   respondToDesktopCloseRequests,
   subscribeLeaveQuestion,
+  type LeaveReason,
 } from "./unsavedFileEdits";
 
+const TITLE: Record<LeaveReason, string> = {
+  close: "Save your changes before leaving?",
+  quit: "Save your changes before leaving?",
+  restart: "Save your changes before restarting?",
+  update: "Save your changes before updating?",
+};
+
 export interface UnsavedChangesCloseDialogProps {
+  reason?: LeaveReason;
   files: readonly string[];
   /** Save all is running: every choice waits for it. */
   saving?: boolean;
@@ -28,6 +37,7 @@ export interface UnsavedChangesCloseDialogProps {
 }
 
 export function UnsavedChangesCloseDialog({
+  reason = "close",
   files,
   saving = false,
   onSaveAll,
@@ -44,7 +54,7 @@ export function UnsavedChangesCloseDialog({
     >
       <AlertDialogPopup initialFocus={saveAllRef}>
         <AlertDialogHeader>
-          <AlertDialogTitle>Save your changes before leaving?</AlertDialogTitle>
+          <AlertDialogTitle>{TITLE[reason]}</AlertDialogTitle>
           <AlertDialogDescription>
             {files.length === 1
               ? "This file has changes that are not saved. Discard loses them."
@@ -117,6 +127,7 @@ export function UnsavedChangesCloseHost() {
   if (question === null) return installing ? <UpdateInstallingDialog /> : null;
   return (
     <UnsavedChangesCloseDialog
+      reason={question.reason}
       files={question.files}
       saving={question.saving}
       onSaveAll={() => question.answer("save")}

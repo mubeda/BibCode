@@ -410,6 +410,25 @@ describe("UnsavedChangesCloseHost", () => {
       expect(persist).not.toHaveBeenCalled();
     });
 
+    it("asks about the update by name", async () => {
+      openFile(newRegistry(), "notes.md").changeFromRichEditor("my edit");
+      await requestInstall(9);
+      expect(dialogText()).toContain("Save your changes before updating?");
+    });
+
+    it("an end signal while the question is open drops the request", async () => {
+      openFile(newRegistry(), "notes.md").changeFromRichEditor("my edit");
+      await requestInstall(10);
+      expect(dialogText()).toContain("notes.md");
+
+      // The person forced the install from the native prompt, and it failed.
+      await act(async () => endInstall());
+      expect(dialogText()).toBeUndefined();
+      await afterTheSaveDelay();
+      expect(dialogText()).toBeUndefined();
+      expect(replies).not.toContainEqual([10, "allow"]);
+    });
+
     it("cancelling another leave during the install keeps it blocked", async () => {
       const session = openFile(newRegistry(), "notes.md");
       session.changeFromRichEditor("kept edit");

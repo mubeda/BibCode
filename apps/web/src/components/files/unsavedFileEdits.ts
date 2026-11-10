@@ -1,4 +1,4 @@
-import type { DesktopBridge, DesktopCloseReply } from "@bibcode/contracts";
+import type { DesktopBridge, DesktopCloseReply, DesktopCloseRequest } from "@bibcode/contracts";
 
 import { toastManager } from "../ui/toast";
 
@@ -13,6 +13,7 @@ export type LeaveReason = "close" | "quit" | "restart" | "update";
 export type LeaveChoice = "save" | "discard" | "cancel";
 
 export interface LeaveQuestion {
+  readonly reason: LeaveReason;
   readonly files: readonly string[];
   /** True while Save all runs; the dialog stays open and shows it. */
   readonly saving: boolean;
@@ -148,7 +149,7 @@ async function ask(reason: LeaveReason): Promise<"proceed" | "stay"> {
   return answer;
 }
 
-async function askUnfocused(_reason: LeaveReason): Promise<"proceed" | "stay"> {
+async function askUnfocused(reason: LeaveReason): Promise<"proceed" | "stay"> {
   await new Promise((resolve) => setTimeout(resolve, 0));
   const files = windowUnsavedFiles().map(({ path }) => path);
   if (files.length === 0) return "proceed";
@@ -161,12 +162,13 @@ async function askUnfocused(_reason: LeaveReason): Promise<"proceed" | "stay"> {
   const choice = await new Promise<LeaveChoice>((resolve) => {
     let answered = false;
     setQuestion({
+      reason,
       files,
       saving: false,
       answer: (next) => {
         if (answered) return;
         answered = true;
-        setQuestion(next === "save" ? { files, saving: true, answer: () => {} } : null);
+        setQuestion(next === "save" ? { reason, files, saving: true, answer: () => {} } : null);
         resolve(next);
       },
     });
@@ -207,6 +209,7 @@ export function respondToDesktopCloseRequests(
   if (!onCloseRequest || !replyCloseRequest) return () => {};
   let active: {
     readonly requestId: number;
+    readonly reason: DesktopCloseRequest["reason"];
     readonly keepalive: ReturnType<typeof setInterval>;
   } | null = null;
   const reply = (requestId: number, answer: DesktopCloseReply) => {
@@ -226,6 +229,7 @@ export function respondToDesktopCloseRequests(
     reply(requestId, "acknowledge");
     const current = {
       requestId,
+      reason,
       keepalive: setInterval(() => reply(requestId, "keepalive"), KEEPALIVE_INTERVAL_MS),
     };
     active = current;
@@ -236,7 +240,16 @@ export function respondToDesktopCloseRequests(
       finish(answer === "proceed" ? "allow" : "stay");
     });
   });
-  const stopEnded = onUpdateInstallEnded?.(endUpdateInstall);
+  const stopEnded = onUpdateInstallEnded?.(() => {
+    // The person forced the install from the native prompt while this question was open; a late
+    // answer must not start a block that no signal will end.
+    if (active?.reason === "update") {
+      clearInterval(active.keepalive);
+      active = null;
+      question?.answer("cancel");
+    }
+    endUpdateInstall();
+  });
   return () => {
     unsubscribe();
     stopEnded?.();
