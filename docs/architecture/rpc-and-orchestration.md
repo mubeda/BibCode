@@ -697,7 +697,9 @@ local refresh. A mutation queued behind that lock closes the gate only when it
 acquires the lock, so background writes that take the guard cannot bring the
 wait back. Every other write still waits for the lock, and the worktree entry
 is never retired while the lock is held. Settlement advances the epoch again
-and publishes a fresh status whatever the gate state. Pull and fetch keep
+and publishes a fresh status whatever the gate state. The first local status
+read under a new epoch reaches subscribers even when it equals the cached one,
+because a status stream drops a copy it queued under an older epoch. Pull and fetch keep
 reads waiting to the end, because pull rewrites files at its end.
 
 `sourceControl.publishRepository` likewise validates its provider, repository,

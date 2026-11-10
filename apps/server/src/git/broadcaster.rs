@@ -90,6 +90,9 @@ struct RepositoryState {
     fetch_attachment_in_flight: bool,
     fetch_attachment_requested: bool,
     local: VcsStatusLocalResult,
+    /// The fence `local` was last published under. A stream drops a copy queued under an
+    /// older fence, so a read under a newer one publishes even an equal value again.
+    local_fence: Option<StatusReadFence>,
     remote: Option<Option<VcsStatusRemoteResult>>,
     remote_fence: Option<StatusReadFence>,
     remote_ref_name: Option<Option<String>>,
@@ -504,6 +507,7 @@ impl StatusBroadcaster {
                         fetch_attachment_in_flight: false,
                         fetch_attachment_requested: false,
                         local: local.clone(),
+                        local_fence: Some(fence.clone()),
                         remote: None,
                         remote_fence: None,
                         remote_ref_name: None,
@@ -520,9 +524,10 @@ impl StatusBroadcaster {
                         tasks,
                     }
                 });
-                if entry.local != *local {
+                if entry.local != *local || entry.local_fence.as_ref() != Some(&fence) {
                     let ref_changed = entry.local.ref_name != local.ref_name;
                     previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
+                    entry.local_fence = Some(fence.clone());
                     reconcile_remote_after_local_publication(entry, ref_changed);
                     publish(
                         entry,
@@ -810,9 +815,10 @@ impl StatusBroadcaster {
             .filter(|entry| entry.lifecycle_id == lifecycle_id)
         {
             accepted = true;
-            if entry.local != *local {
+            if entry.local != *local || entry.local_fence.as_ref() != Some(fence) {
                 let ref_changed = entry.local.ref_name != local.ref_name;
                 previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
+                entry.local_fence = Some(fence.clone());
                 reconcile_remote_after_local_publication(entry, ref_changed);
                 publish(entry, event, fence);
                 remove_repository = entry.subscribers.is_empty();
@@ -1342,12 +1348,15 @@ impl StatusBroadcaster {
         let mut lifecycle_id = None;
         if let Some(entry) = state.repositories.get_mut(cwd) {
             lifecycle_id = Some(entry.lifecycle_id);
-            let changed = entry.local != status.local || entry.remote.as_ref() != Some(&remote);
+            let changed = entry.local != status.local
+                || entry.local_fence.as_ref() != Some(fence)
+                || entry.remote.as_ref() != Some(&remote);
             previous_local = Some(std::mem::replace(&mut entry.local, status.local.clone()));
             entry.remote = Some(remote);
             entry.remote_fence = Some(fence.clone());
             entry.remote_ref_name = Some(status.local.ref_name.clone());
             if changed {
+                entry.local_fence = Some(fence.clone());
                 publish(entry, event, fence);
             }
             remove_repository = entry.subscribers.is_empty();
@@ -7312,6 +7321,14 @@ mod tests {
                     ahead_of_default_count: Some(0),
                     pr: None,
                 })),
+                // As if `local` was published under the current epoch.
+                local_fence: futures_util::FutureExt::now_or_never(
+                    broadcaster
+                        .inner
+                        .status_owner
+                        .acquire_read_fence(cwd, &CancellationToken::new()),
+                )
+                .and_then(Result::ok),
                 remote_fence: None,
                 remote_ref_name: None,
                 pending_local_reconcile: false,
