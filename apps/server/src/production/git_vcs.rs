@@ -20,8 +20,8 @@ use crate::{
     git::{
         ChangeRequest, CloneLeaf, CreateWorktreeInput, GitCommandError, GitProcessRunner,
         GitRepository, GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
-        STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
-        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
+        STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusMutationGuard, StatusReadFence,
+        VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
         clone_policy::{
             ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, DETACH_REFUSED, DETACHED,
             NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
@@ -1678,12 +1678,13 @@ impl GitVcsRpcServices {
                         workspace_admission.as_ref(),
                         operation_cancellation.clone(),
                         async {
-                            let mutation = broadcaster.begin_mutation(&input.cwd).await;
+                            let mut mutation = broadcaster.begin_mutation(&input.cwd).await;
                             let result = run_stacked_action(
                                 &repository,
                                 &pull_requests,
                                 &input,
                                 &operation_cancellation,
+                                Some(&mut mutation),
                             )
                             .await;
                             mutation.finish().await;
@@ -2881,19 +2882,30 @@ async fn run_stacked_action(
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
+    mutation: Option<&mut StatusMutationGuard>,
 ) -> Result<StackedActionResult, StackedActionFailure> {
     let mut phase = None;
-    run_stacked_action_steps(repository, pull_requests, input, cancellation, &mut phase)
-        .await
-        .map_err(|failure| StackedActionFailure { phase, ..failure })
+    run_stacked_action_steps(
+        repository,
+        pull_requests,
+        input,
+        cancellation,
+        &mut phase,
+        mutation,
+    )
+    .await
+    .map_err(|failure| StackedActionFailure { phase, ..failure })
 }
 
+/// `mutation`, when given, reopens status reads before the push and the pull-request
+/// step, which wait on the network while the write lock stays held (#345).
 async fn run_stacked_action_steps(
     repository: &GitRepository,
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
     phase: &mut Option<&'static str>,
+    mut mutation: Option<&mut StatusMutationGuard>,
 ) -> Result<StackedActionResult, StackedActionFailure> {
     validate_stacked_action_input(input)?;
     let wants_commit = matches!(
@@ -3117,6 +3129,9 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let push = if wants_push {
+        if let Some(mutation) = mutation.as_deref_mut() {
+            mutation.local_writes_finished();
+        }
         *phase = Some("push");
         // One choice of push: a resumed push validates the very remote it then pushes to.
         let current_push = match selected_head {
@@ -3200,6 +3215,9 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let pull_request = if let Some(provider) = pull_request_provider {
+        if let Some(mutation) = mutation.as_deref_mut() {
+            mutation.local_writes_finished();
+        }
         *phase = Some("pr");
         let current_local = repository
             .local_status(&input.cwd, cancellation)
@@ -4353,9 +4371,9 @@ mod mutation_ownership_tests {
     }
 
     #[tokio::test]
-    async fn stacked_push_runs_inside_the_shared_mutation_boundary() {
+    async fn stacked_push_keeps_the_write_lock_and_retires_stale_reads() {
         let root = tempfile::tempdir().expect("repository root");
-        let runner = Arc::new(ControlledMutationRunner::new());
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
         let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let mut subscription = services
@@ -4402,6 +4420,18 @@ mod mutation_ownership_tests {
             },
             CancellationToken::new(),
         );
+        runner.wait_for_mutation_start().await;
+        let mut second_write = services.stacked_action_stream_without_session(
+            stacked_request("3", root.path(), "commit"),
+            CancellationToken::new(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            runner.commits.load(Ordering::SeqCst),
+            0,
+            "a second write ran while the push held the write lock"
+        );
+        runner.release_mutation.add_permits(1);
 
         let started = stream
             .recv()
@@ -4417,6 +4447,11 @@ mod mutation_ownership_tests {
         assert_eq!(finished[0]["kind"], "action_finished");
         assert_eq!(finished[0]["result"]["push"]["status"], "pushed");
         assert!(stale.await.expect("stale read task").is_err());
+        let second = action_end(&mut second_write)
+            .await
+            .expect("second write event");
+        assert_eq!(second["kind"], "action_finished", "{second}");
+        assert_eq!(runner.commits.load(Ordering::SeqCst), 1);
         let trailing = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
                 let event = subscription.recv().await?;
@@ -5032,7 +5067,10 @@ mod mutation_ownership_tests {
     /// The action's terminal event, or the error that ended its stream.
     async fn action_end(stream: &mut mpsc::Receiver<RpcStreamChunk>) -> Result<Value, Value> {
         loop {
-            let values = stream.recv().await.expect("stacked stream ends with an event")?;
+            let values = stream
+                .recv()
+                .await
+                .expect("stacked stream ends with an event")?;
             if let Some(event) = values.into_iter().find(|event| {
                 event["kind"] == "action_finished" || event["kind"] == "action_failed"
             }) {
@@ -5243,7 +5281,8 @@ mod mutation_ownership_tests {
                 }
             }
 
-            let refreshed = refresh_within(&services, root.path(), ANSWER_WHILE_HELD, outcome).await;
+            let refreshed =
+                refresh_within(&services, root.path(), ANSWER_WHILE_HELD, outcome).await;
             if outcome == "workspace loss" {
                 let error = refreshed.expect_err("a lost workspace refuses the refresh");
                 assert_eq!(error["_tag"], "WorkspaceUnavailableError", "{error}");
@@ -6317,6 +6356,7 @@ esac
                 &services.pull_requests,
                 &invalid_action,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .is_err()
@@ -6444,7 +6484,7 @@ esac
         );
     }
 
-    /// A create_pr action with no push: the provider's lookup is held open and
+    /// A create_pr action with no push: the provider holds the request creation open and
     /// status for the worktree is still answered.
     #[cfg(unix)]
     #[tokio::test]
@@ -6475,25 +6515,34 @@ esac
                 "origin",
                 "https://github.com/owner/name.git",
             ],
-            &["remote", "set-url", "--push", "origin", bare_remote_text.as_str()],
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                bare_remote_text.as_str(),
+            ],
         ] {
             git(&sandbox, &repository, args).await;
         }
-        let listing = sandbox.root().join("pr-list-started");
-        let release = sandbox.root().join("pr-list-release");
+        let creating = sandbox.root().join("pr-create-started");
+        let release = sandbox.root().join("pr-create-release");
         let gh = sandbox.executable_script(
             "gh",
             &format!(
-                "case \"$1:$2\" in\n  pr:list) : > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf '[]\\n' ;;\n  pr:create) printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n",
-                listing.display(),
+                "case \"$1:$2\" in\n  pr:list) printf '[]\\n' ;;\n  pr:create) : > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n",
+                creating.display(),
                 release.display()
             ),
             "",
         );
         let mut services =
             GitVcsRpcServices::with_repository(Arc::new(GitRepository::default()), Arc::default());
-        services.pull_requests =
-            PullRequestService::with_provider_commands(gh.to_string_lossy(), "unused-glab", "unused-az");
+        services.pull_requests = PullRequestService::with_provider_commands(
+            gh.to_string_lossy(),
+            "unused-glab",
+            "unused-az",
+        );
         let mut stream = services.stacked_action_stream_without_session(
             rpc_request(
                 "git.runStackedAction",
@@ -6508,12 +6557,12 @@ esac
             CancellationToken::new(),
         );
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !listing.exists() {
+            while !creating.exists() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the provider lookup starts");
+        .expect("the pull-request creation starts");
 
         let refreshed = tokio::time::timeout(
             Duration::from_secs(3),
@@ -6528,7 +6577,7 @@ esac
         .expect("refresh succeeds");
         assert_eq!(refreshed["refName"], "feature/held", "{refreshed}");
 
-        std::fs::write(&release, "").expect("release the provider lookup");
+        std::fs::write(&release, "").expect("release the pull-request creation");
         let ended = loop {
             let values = stream
                 .recv()
@@ -6672,6 +6721,7 @@ esac
                     &pull_requests,
                     &input,
                     &CancellationToken::new(),
+                    None,
                 )
                 .await
                 .expect_err("target required and validated");
@@ -6706,6 +6756,7 @@ esac
             &pull_requests,
             &github_merge_options,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("GitLab-only merge options are refused for GitHub");
@@ -6727,6 +6778,7 @@ esac
             &pull_requests,
             &reviewed,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("reviewed pull request creates");
@@ -6776,6 +6828,7 @@ esac
             &pull_requests,
             &reviewed,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("retry resolves the existing pull request");
@@ -6802,6 +6855,7 @@ esac
             &pull_requests,
             &with_options,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("existing request resolves");
@@ -6852,6 +6906,7 @@ esac
                 &pull_requests,
                 &explicit_current,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .expect("explicit current-source publication");
@@ -6885,6 +6940,7 @@ esac
             &pull_requests,
             &explicit_current,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("an unmapped upstream stays configured");
@@ -6915,6 +6971,7 @@ esac
             &pull_requests,
             &misplaced,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("a target outside a pull request action is rejected");
@@ -7063,9 +7120,10 @@ esac
                 "featureBranch": feature_branch, "commitMessage": "Do not commit",
             }))
             .unwrap();
-            let error = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-                .await
-                .expect_err("invalid source rejected before mutations");
+            let error =
+                run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                    .await
+                    .expect_err("invalid source rejected before mutations");
             assert!(
                 error.wire["detail"].as_str().unwrap().contains("branch"),
                 "{error:?}"
@@ -7090,9 +7148,10 @@ esac
             "pullRequestHeadBranch": "feature/source", "pullRequestBaseBranch": "main",
         }))
         .unwrap();
-        let result = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-            .await
-            .expect("selected branch publishes with a dirty current checkout");
+        let result =
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                .await
+                .expect("selected branch publishes with a dirty current checkout");
         let result = serde_json::to_value(result).unwrap();
         assert_eq!(result["push"]["branch"], "feature/source");
         assert_eq!(result["pr"]["headBranch"], "feature/source");
@@ -7143,7 +7202,7 @@ esac
         )
         .await;
         tokio::fs::write(&calls, "").await.unwrap();
-        run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+        run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
             .await
             .expect_err("a diverged source is never force-pushed");
         assert_eq!(
@@ -7168,9 +7227,10 @@ esac
 
         tokio::fs::write(&existing_marker, "1").await.unwrap();
         tokio::fs::write(&calls, "").await.unwrap();
-        let retried = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-            .await
-            .expect("existing request resolves by selected head");
+        let retried =
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                .await
+                .expect("existing request resolves by selected head");
         assert_eq!(
             serde_json::to_value(retried).unwrap()["pr"]["status"],
             "opened_existing"
@@ -7199,7 +7259,7 @@ esac
         .await;
         tokio::fs::remove_file(&existing_marker).await.unwrap();
         let remote_only =
-            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
                 .await
                 .expect("origin-only source needs no push or checkout");
         let remote_only = serde_json::to_value(remote_only).unwrap();
@@ -7461,6 +7521,7 @@ esac
             &PullRequestService::with_provider_commands("unused-gh", "unused-glab", "unused-az"),
             &input,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("an unidentified host is refused");
