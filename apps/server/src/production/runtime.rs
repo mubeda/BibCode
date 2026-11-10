@@ -5431,4 +5431,92 @@ mod tests {
         quiesce_leaves_open_diff_apps_running(ProcessTreeCleanup::StandaloneServer).await;
         isolated.complete();
     }
+
+    /// R17: a Git write still running at shutdown is stopped, and its `index.lock` is gone when
+    /// quiescence returns. The write is a `git add` whose clean filter never finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_stops_a_running_git_write() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+
+        let git_config = crate::test_support::isolated_git_config::IsolatedGitConfig::new();
+        let repository = state.path().join("repository");
+        let started = state.path().join("filter-started");
+        std::fs::create_dir(&repository).expect("repository");
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            git_config.apply_to_command(&mut command);
+            let output = command
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "config",
+            "filter.slow.clean",
+            &format!(
+                "touch '{}'; sleep 30; cat",
+                started.to_string_lossy().replace('\\', "/")
+            ),
+        ]);
+        std::fs::write(repository.join(".gitattributes"), "held.txt filter=slow\n")
+            .expect(".gitattributes");
+        std::fs::write(repository.join("held.txt"), "held\n").expect("held.txt");
+        let lock = repository.join(".git").join("index.lock");
+
+        let write = tokio::spawn({
+            let (git_repository, repository) = (runtime.git_repository.clone(), repository.clone());
+            async move {
+                git_repository
+                    .stage_files(
+                        &repository,
+                        &["held.txt".to_owned()],
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.exists() {
+            assert!(std::time::Instant::now() < deadline, "the write started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(lock.exists(), "the write holds index.lock");
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        assert!(!lock.exists(), "no index.lock remains after quiescence");
+        let staged = timeout(std::time::Duration::from_secs(1), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(staged.is_err(), "the stopped write failed: {staged:?}");
+    }
 }

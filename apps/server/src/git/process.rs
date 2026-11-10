@@ -571,7 +571,287 @@ fn render_bytes(output: SupervisedStreamOutput, append_marker: bool) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::supervised::GRACEFUL_STOP_WAIT;
     use crate::test_support::TestSandbox;
+    use crate::test_support::isolated_git_config::IsolatedGitConfig;
+
+    fn git_environment(config: &IsolatedGitConfig) -> Vec<(OsString, OsString)> {
+        [
+            ("GIT_CONFIG_GLOBAL", config.path().into_os_string()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("GIT_AUTHOR_NAME", "test-user".into()),
+            ("GIT_AUTHOR_EMAIL", "user@example.test".into()),
+            ("GIT_COMMITTER_NAME", "test-user".into()),
+            ("GIT_COMMITTER_EMAIL", "user@example.test".into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect()
+    }
+
+    fn fixture_git(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) {
+        let mut command = std::process::Command::new("git");
+        config.apply_to_command(&mut command);
+        let output = command
+            .args(args)
+            .current_dir(cwd)
+            .envs(git_environment(config))
+            .output()
+            .expect("fixture Git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_request(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) -> ProcessRequest {
+        ProcessRequest {
+            operation: "fixture-write".to_owned(),
+            command: PathBuf::from("git"),
+            args: args.iter().map(OsString::from).collect(),
+            cwd: cwd.to_path_buf(),
+            env: git_environment(config),
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 64 * 1024,
+            output_policy: OutputPolicy::Truncate,
+            append_truncation_marker: false,
+            allow_non_zero_exit: false,
+        }
+    }
+
+    /// A `git add` that holds `index.lock` and never finishes: the clean filter of the added
+    /// file marks that it started and then sleeps.
+    struct HeldWrite {
+        request: ProcessRequest,
+        started: PathBuf,
+        lock: PathBuf,
+    }
+
+    fn held_write(sandbox: &TestSandbox, config: &IsolatedGitConfig) -> HeldWrite {
+        let repository = sandbox.path("repository");
+        std::fs::create_dir_all(&repository).expect("repository folder");
+        let started = sandbox.path("filter-started");
+        fixture_git(config, &repository, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            config,
+            &repository,
+            &[
+                "config",
+                "filter.slow.clean",
+                &format!(
+                    "touch '{}'; sleep 30; cat",
+                    started.to_string_lossy().replace('\\', "/")
+                ),
+            ],
+        );
+        std::fs::write(repository.join(".gitattributes"), "held.txt filter=slow\n")
+            .expect(".gitattributes");
+        std::fs::write(repository.join("held.txt"), "held\n").expect("held.txt");
+        HeldWrite {
+            request: git_request(config, &repository, &["add", "--", "held.txt"]),
+            started,
+            lock: repository.join(".git").join("index.lock"),
+        }
+    }
+
+    async fn wait_until_exists(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_removes_a_lock_our_forced_stop_left() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the stopped write's lock");
+
+        assert_eq!(watch.after_forced_stop().await, LockCleanup::Removed);
+        assert!(!lock.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_lock_that_existed_before_spawn() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        std::fs::write(&lock, "").expect("someone else's lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+
+        assert_eq!(watch.after_forced_stop().await, LockCleanup::NotOurs);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_lock_that_changes_during_the_wait() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the stopped write's lock");
+
+        let cleanup = tokio::spawn(watch.after_forced_stop());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::fs::write(&lock, "another Git process took it").expect("a new lock");
+
+        assert_eq!(cleanup.await.expect("cleanup"), LockCleanup::Changed);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_shutdown_stops_a_running_write_and_leaves_no_lock() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-shutdown");
+        let config = IsolatedGitConfig::new();
+        let held = held_write(&sandbox, &config);
+        let registry = GitWriteRegistry::default();
+        let write = tokio::spawn({
+            let (registry, request) = (registry.clone(), held.request.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &CancellationToken::new())
+                    .await
+            }
+        });
+        wait_until_exists(&held.started).await;
+        assert!(held.lock.exists(), "the write holds index.lock");
+
+        let outcome = registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(1))
+            .await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!held.lock.exists(), "no index.lock remains");
+        let result = tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_resolves_the_lock_of_a_linked_worktree() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-linked");
+        let config = IsolatedGitConfig::new();
+        let main = sandbox.path("main");
+        let linked = sandbox.path("linked");
+        std::fs::create_dir_all(&main).expect("main worktree");
+        fixture_git(&config, &main, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &main,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
+        fixture_git(
+            &config,
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        let git_dir = ProcessRunner
+            .resolve_git_dir(
+                &git_request(&config, &linked, &["add", "--", "file.txt"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the linked worktree's Git directory");
+
+        assert_eq!(
+            std::fs::canonicalize(&git_dir).expect("resolved Git directory"),
+            std::fs::canonicalize(main.join(".git").join("worktrees").join("linked"))
+                .expect("linked worktree Git directory")
+        );
+        assert_eq!(
+            IndexLockWatch::before_spawn(&git_dir).lock,
+            git_dir.join("index.lock")
+        );
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_shutdown_with_nothing_running_returns_at_once() {
+        let started = std::time::Instant::now();
+
+        let outcome = GitWriteRegistry::default()
+            .stop_all_and_wait(Duration::from_secs(10))
+            .await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_two_runtimes_do_not_share_writes() {
+        let stopping = GitWriteRegistry::default();
+        let running = GitWriteRegistry::default();
+        let write = running.track().expect("the other runtime admits a write");
+
+        let outcome = stopping.stop_all_and_wait(Duration::from_secs(10)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!write.cancellation.is_cancelled());
+        assert!(running.track().is_some());
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_refuses_a_write_after_admission_closed() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-refused");
+        let config = IsolatedGitConfig::new();
+        let registry = GitWriteRegistry::default();
+        registry.close_admission();
+
+        assert!(registry.track().is_none());
+        let refused = ProcessRunner
+            .run_write(
+                git_request(&config, sandbox.root(), &["init", "-q"]),
+                &registry,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ProcessError::Cancelled { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            !sandbox.path(".git").exists(),
+            "the refused write never ran"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
+        let registry = GitWriteRegistry::default();
+        let write = registry.track().expect("an admitted write");
+
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Pending(1)
+        );
+        assert!(
+            write.cancellation.is_cancelled(),
+            "the write was told to stop"
+        );
+        drop(write);
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Clean
+        );
+    }
 
     #[test]
     fn safe_spawn_failure_preserves_category_without_private_launch_data() {
