@@ -94,7 +94,9 @@ describe("richMarkdownMode", () => {
   it("keeps a file over 128 KiB of UTF-8 read-only before looking at its Markdown", () => {
     const limit = 128 * 1024;
     expect(richMarkdownMode("notes.md", "a".repeat(limit))).toEqual({ editable: true });
-    expect(richMarkdownMode("notes.md", `${"a".repeat(129 * 1024 - 20)}\n\n${corpus.footnote}`)).toEqual({
+    expect(
+      richMarkdownMode("notes.md", `${"a".repeat(129 * 1024 - 20)}\n\n${corpus.footnote}`),
+    ).toEqual({
       editable: false,
       reason: "too-large",
     });

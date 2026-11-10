@@ -268,8 +268,9 @@ A `details` block counts as supported when its opening tag has no attribute othe
 
 `richMarkdownMode(path, source)` in `filePreviewMode.ts` returns `{ editable: true }`, or
 `{ editable: false, reason }` with reason `"not-markdown"` (not `.md` or `.mdx`), `"mdx"`,
-`"too-large"` (over 128 KiB, see Source-preserving save), or the construct. `isMarkdownPreviewFile` is unchanged, so `.mdx` files still open in the
-rendered view by default, read-only as today, with the notice. Setext headings, aligned
+`"too-large"` (over 128 KiB, see Source-preserving save), or the construct.
+`isMarkdownPreviewFile` is unchanged, so `.mdx` files still open in the rendered view by
+default, read-only as today, with the notice. Setext headings, aligned
 tables, nested lists and hand-written `details` blocks are supported (R34). Each is in the
 test corpus with `canReconcile` true, and a failure there is a schema defect to fix, not a
 fixture to mark unsupported.
