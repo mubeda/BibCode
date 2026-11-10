@@ -225,6 +225,25 @@ describe("theme library and slots store", () => {
     }
   });
 
+  it("a paint record edited by hand with its stamps unchanged is rebuilt at start", async () => {
+    const seed = installStorage();
+    const seeded = await import("./customThemes");
+    seeded.saveCustomTheme(custom("mine", "dark", { primary: "#123456" }));
+    seeded.setSlot("dark", "mine");
+    const good = seed.store.get(PAINT_KEY)!;
+    const edited = JSON.parse(good);
+    edited.dark.vars["--primary"] = "url(x)";
+
+    vi.resetModules();
+    const storage = installStorage({
+      [LIBRARY_KEY]: seed.store.get(LIBRARY_KEY)!,
+      [SLOTS_KEY]: seed.store.get(SLOTS_KEY)!,
+      [PAINT_KEY]: JSON.stringify(edited),
+    });
+    await import("./customThemes");
+    expect(storage.json(PAINT_KEY)).toEqual(JSON.parse(good));
+  });
+
   it("a failure between the library write and the paint write is repaired at the next start", async () => {
     const storage = installStorage();
     const store = await import("./customThemes");

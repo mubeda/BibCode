@@ -148,19 +148,21 @@ export function paintRecordFor(theme: ThemeFile): PaintRecord {
 
 type WriteResult = { ok: true } | { ok: false; message: string };
 
-function write(library: ThemeFile[], slots: ThemeSlots): WriteResult {
-  const target = storage();
-  if (!target) return { ok: false, message: "Theme storage is not available in this browser." };
-  const stamp = computeStamp(library, slots);
+/** The stored paint record text for both slots, as every writer serializes it. */
+function paintText(library: ThemeFile[], slots: ThemeSlots, stamp: string): string {
   const record = (id: string): PaintRecord => ({
     ...paintRecordFor(findTheme(library, id)!),
     stamp,
   });
+  return JSON.stringify({ light: record(slots.light), dark: record(slots.dark) });
+}
+
+function write(library: ThemeFile[], slots: ThemeSlots): WriteResult {
+  const target = storage();
+  if (!target) return { ok: false, message: "Theme storage is not available in this browser." };
+  const stamp = computeStamp(library, slots);
   try {
-    target.setItem(
-      PAINT_KEY,
-      JSON.stringify({ light: record(slots.light), dark: record(slots.dark) }),
-    );
+    target.setItem(PAINT_KEY, paintText(library, slots, stamp));
     target.setItem(LIBRARY_KEY, JSON.stringify(library));
     target.setItem(SLOTS_KEY, JSON.stringify({ ...slots, paintStamp: stamp }));
   } catch (cause) {
@@ -178,35 +180,22 @@ function changed() {
   for (const listener of listeners) listener();
 }
 
-/** Rewrites the paint record and the slots' stamp when they do not match the library and slots. */
+/**
+ * Rewrites the paint record and the slots' stamp unless both equal what the library and slots
+ * derive, so a record edited by hand is rebuilt even when its stamps still match (P18).
+ */
 function repair() {
   if (readRaw(LIBRARY_KEY) === null && readRaw(SLOTS_KEY) === null) return;
   const library = readLibrary();
   const storedSlots = readStoredSlots();
   const slots = resolveSlots(library, storedSlots);
   const expected = computeStamp(library, slots);
-  const paint = parseJson(readRaw(PAINT_KEY)) as {
-    light?: { stamp?: unknown };
-    dark?: { stamp?: unknown };
-  } | null;
-  if (
-    paint?.light?.stamp === expected &&
-    paint.dark?.stamp === expected &&
-    storedSlots?.paintStamp === expected
-  ) {
-    return;
-  }
+  const expectedPaint = paintText(library, slots, expected);
+  if (readRaw(PAINT_KEY) === expectedPaint && storedSlots?.paintStamp === expected) return;
   const target = storage();
   if (!target) return;
-  const record = (id: string): PaintRecord => ({
-    ...paintRecordFor(findTheme(library, id)!),
-    stamp: expected,
-  });
   try {
-    target.setItem(
-      PAINT_KEY,
-      JSON.stringify({ light: record(slots.light), dark: record(slots.dark) }),
-    );
+    target.setItem(PAINT_KEY, expectedPaint);
     target.setItem(SLOTS_KEY, JSON.stringify({ ...slots, paintStamp: expected }));
   } catch (cause) {
     console.error("Could not repair the stored theme paint record.", { cause });
