@@ -1039,6 +1039,95 @@ mod tests {
         );
     }
 
+    /// A push never takes `index.lock`, so a lock that appears while it runs is someone else's,
+    /// such as a person's `git commit` waiting for its editor. A forced stop of the push, as
+    /// every stop is on Windows, must leave that lock alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_keeps_a_lock_taken_during_a_forced_push() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-forced-push");
+        let config = IsolatedGitConfig::new();
+        let repository = sandbox.path("repository");
+        let remote = sandbox.path("remote.git");
+        let hooks = sandbox.path("hooks");
+        let started = sandbox.path("hook-started");
+        let bin = sandbox.path("bin");
+        for folder in [&repository, &hooks, &bin] {
+            std::fs::create_dir_all(folder).expect("fixture folder");
+        }
+        fixture_git(
+            &config,
+            sandbox.root(),
+            &["init", "-q", "--bare", &remote.to_string_lossy()],
+        );
+        fixture_git(&config, &repository, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
+        fixture_git(
+            &config,
+            &repository,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        TestSandbox::write_executable(
+            &hooks.join("pre-push"),
+            &format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
+        );
+        let real_git = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate Git");
+        let real_git = String::from_utf8(real_git.stdout).expect("Git path");
+        // The wrapper ignores the request to stop and outlives Git, so the stop is forced, as
+        // every stop is on Windows.
+        let git = bin.join("git");
+        TestSandbox::write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM\n'{}' \"$@\"\nstatus=$?\n[ \"$1\" = push ] && exec sleep 30\nexit $status\n",
+                real_git.trim()
+            ),
+        );
+        let mut request = git_request(
+            &config,
+            &repository,
+            &["push", "-q", &remote.to_string_lossy(), "main"],
+        );
+        request.command = git;
+        let cancellation = CancellationToken::new();
+        let registry = GitWriteRegistry::default();
+        let push = tokio::spawn({
+            let (cancellation, registry) = (cancellation.clone(), registry.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &cancellation)
+                    .await
+            }
+        });
+        wait_until_exists(&started).await;
+        let lock = repository.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("a person's commit takes the lock");
+
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(20), push)
+            .await
+            .expect("the push has returned")
+            .expect("push task");
+        // Waits for the push's settlement, which may finish in the background.
+        let settled = registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(5))
+            .await;
+
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(lock.exists(), "the person's index.lock is kept");
+    }
+
     #[tokio::test]
     async fn index_lock_cleanup_resolves_the_lock_of_a_linked_worktree() {
         let sandbox = TestSandbox::new("index-lock-cleanup-linked");
