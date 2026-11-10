@@ -8,6 +8,16 @@ let windowInstance: Window;
 let originalDocument: Document | undefined;
 let originalGetComputedStyle: typeof getComputedStyle | undefined;
 let compiledStylesheet = "";
+const TEST_UTILITIES = [
+  "text-link",
+  "text-placeholder",
+  "bg-primary",
+  "bg-primary/90",
+  "bg-primary-hover",
+  "bg-primary-active",
+  "bg-selected",
+  "text-selected-foreground",
+];
 const applicationStylesheetPath = normalizePath(
   NodeURL.fileURLToPath(new URL("./index.css", import.meta.url)),
 );
@@ -22,7 +32,9 @@ async function loadApplicationStylesheet(): Promise<string> {
         enforce: "pre",
         name: "theme-token-test-utilities",
         transform: (code, id) =>
-          id === applicationStylesheetPath ? `${code}\n@source inline("text-link");` : undefined,
+          id === applicationStylesheetPath
+            ? `${code}\n@source inline("${TEST_UTILITIES.join(" ")}");`
+            : undefined,
       },
       {
         name: "theme-token-test-entry",
@@ -72,12 +84,37 @@ function compiledTextLinkColor(): string {
   return match[1] ?? "";
 }
 
+/**
+ * The color a utility paints inside `host`, with every variable substituted. happy-dom does not
+ * compute `color-mix()`, so the utility's declaration is resolved through a custom property and a
+ * mix with transparent is written as `<color> @ <percent>`; the color space does not matter for
+ * such a mix.
+ */
+function paintedValue(utility: string, host: Element = document.body): string {
+  const selector = `.${utility.replace(/[/:]/g, (character) => `\\${character}`)}{`;
+  const start = compiledStylesheet.lastIndexOf(selector);
+  if (start < 0) throw new Error(`The compiled stylesheet did not emit ${utility}.`);
+  const body = compiledStylesheet.slice(start + selector.length);
+  const value = body.slice(body.indexOf(":") + 1, body.search(/[;}]/));
+  const probe = document.createElement("span");
+  probe.style.setProperty("--painted-probe", value);
+  host.append(probe);
+  const resolved = getComputedStyle(probe).getPropertyValue("--painted-probe").trim();
+  probe.remove();
+  const mix = /^color-mix\(in [a-z]+,\s*(.+?)\s+(\d+%),\s*transparent\)$/.exec(resolved);
+  return mix ? `${mix[1]} @ ${mix[2]}` : resolved;
+}
+
 describe("application theme tokens", () => {
   beforeAll(async () => {
     const stylesheet = await loadApplicationStylesheet();
     compiledStylesheet = stylesheet;
     windowInstance = new Window();
     windowInstance.document.documentElement.style.setProperty("--color-white", "white");
+    windowInstance.document.documentElement.style.setProperty(
+      "--color-neutral-400",
+      "rgb(163, 163, 163)",
+    );
     windowInstance.document.documentElement.style.setProperty(
       "--color-blue-400",
       "rgb(96, 165, 250)",
@@ -127,6 +164,47 @@ describe("application theme tokens", () => {
     expect(themeTokens().getPropertyValue("--primary").trim()).toBe("#d8610e");
     expect(themeTokens().getPropertyValue("--ring").trim()).toBe("#d8610e");
     expect(themeTokens().getPropertyValue("--primary-foreground").trim()).toBe("white");
+  });
+
+  it("a placeholder inside a dark sidebar card resolves from the card's muted-foreground", () => {
+    document.documentElement.className = "dark";
+    const card = document.createElement("div");
+    card.setAttribute("data-sidebar-card", "");
+    document.body.append(card);
+
+    expect(paintedValue("text-placeholder", card)).toBe("rgb(163, 163, 163) @ 72%");
+
+    card.remove();
+  });
+
+  it("the default primary hover equals primary at 90 percent", () => {
+    for (const mode of ["", "dark"]) {
+      document.documentElement.className = mode;
+      expect(paintedValue("bg-primary-hover"), mode).toBe("#d8610e @ 90%");
+      expect(paintedValue("bg-primary-hover"), mode).toBe(paintedValue("bg-primary/90"));
+    }
+  });
+
+  it("button idle, hover and pressed colors are unchanged in Light and Dark", () => {
+    for (const mode of ["", "dark"]) {
+      document.documentElement.className = mode;
+      // Recorded before the change: idle bg-primary, hover and press bg-primary/90.
+      expect(paintedValue("bg-primary"), mode).toBe("#d8610e");
+      expect(paintedValue("bg-primary-hover"), mode).toBe("#d8610e @ 90%");
+      expect(paintedValue("bg-primary-active"), mode).toBe("#d8610e @ 90%");
+    }
+  });
+
+  it("Verdant Light hover and pressed values apply when the theme sets them", () => {
+    document.documentElement.className = "";
+    document.documentElement.style.setProperty("--primary-hover", "#066649");
+    document.documentElement.style.setProperty("--primary-active", "#05543d");
+
+    expect(paintedValue("bg-primary-hover")).toBe("#066649");
+    expect(paintedValue("bg-primary-active")).toBe("#05543d");
+
+    document.documentElement.style.removeProperty("--primary-hover");
+    document.documentElement.style.removeProperty("--primary-active");
   });
 
   it("keeps link and information semantics blue", () => {

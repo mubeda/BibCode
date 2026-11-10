@@ -116,7 +116,7 @@ const GitManagerCommitRow = memo(function GitManagerCommitRow({
       aria-selected={selected}
       className={cn(
         "flex h-[50px] w-full min-w-0 touch-manipulation items-center gap-2 border-b border-border/60 px-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
-        selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
+        selected ? "bg-selected text-selected-foreground" : "hover:bg-muted/45",
         isDragging && "select-none opacity-40",
       )}
       data-commit-drag-source={rewriteDisabledReason === null ? commit.sha : undefined}

@@ -257,7 +257,7 @@ function DiffFileListRow({
       title={row.previousPath ? `${row.previousPath} → ${row.path}` : row.path}
       className={cn(
         "flex h-full cursor-pointer select-none items-center gap-2 px-2 text-xs",
-        selected ? "bg-accent text-accent-foreground" : "text-foreground/80 hover:bg-muted/60",
+        selected ? "bg-selected text-selected-foreground" : "text-foreground/80 hover:bg-muted/60",
       )}
       onClick={() => onSelect(row)}
     >

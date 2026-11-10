@@ -383,7 +383,7 @@ function SourceControlFileRow({
         "group flex h-full items-center gap-2 rounded-md px-2 hover:bg-accent/50",
         // Indents a grouped row so its name lines up under the folder label.
         !showDirectory && "pl-7",
-        section.selectionMode && isSelected && "bg-accent/70",
+        section.selectionMode && isSelected && "bg-selected/70",
       )}
       onContextMenu={(event) => {
         event.preventDefault();

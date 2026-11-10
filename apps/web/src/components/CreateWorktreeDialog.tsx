@@ -684,7 +684,7 @@ export function CreateWorktreeDialog({
                     type="button"
                     className={cn(
                       "hover:bg-accent flex w-full items-center justify-between px-3 py-1.5 text-left text-sm",
-                      row.kind === "branch" && row.refName === selectedBranchRefName && "bg-accent",
+                      row.kind === "branch" && row.refName === selectedBranchRefName && "bg-selected",
                     )}
                     onClick={() => {
                       if (row.kind === "branch") {
@@ -720,7 +720,7 @@ export function CreateWorktreeDialog({
                     type="button"
                     className={cn(
                       "hover:bg-accent flex w-full items-center px-3 py-1.5 text-left text-sm",
-                      ref.name === selectedBranchRefName && "bg-accent",
+                      ref.name === selectedBranchRefName && "bg-selected",
                     )}
                     onClick={() => handleBranchRowPick(ref)}
                   >

@@ -50,6 +50,20 @@
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
   /* text-xs (12px) is the declared text-size floor: new UI never goes below it
      and older screens are being swept to it (UI.md, Typography). */
+  /* Theme-only color roles (#290): each default is a fallback here, not a root declaration,
+     so it follows a base token that a subtree overrides. */
+  --color-foreground-strong: var(--foreground-strong, var(--foreground));
+  --color-placeholder: var(
+    --placeholder,
+    color-mix(in srgb, var(--muted-foreground) 72%, transparent)
+  );
+  --color-primary-hover: var(--primary-hover, color-mix(in srgb, var(--primary) 90%, transparent));
+  --color-primary-active: var(
+    --primary-active,
+    color-mix(in srgb, var(--primary) 90%, transparent)
+  );
+  --color-selected: var(--selected, var(--accent));
+  --color-selected-foreground: var(--selected-foreground, var(--accent-foreground));
   --color-panel-separator: var(--panel-separator);
   --color-sidebar-well: var(--sidebar-well);
   --color-sidebar-card: var(--sidebar-card);
@@ -549,7 +563,7 @@ label:has(> select#reasoning-effort) select {
   margin: 1.25rem 0 0.5rem;
   font-weight: 600;
   line-height: 1.3;
-  color: var(--foreground);
+  color: var(--foreground-strong, var(--foreground));
 }
 
 .chat-markdown h1 {

@@ -50,9 +50,7 @@ function SelectButton({ className, size, variant, render, children, ...props }: 
   const defaultProps = {
     children: (
       <>
-        <span className="flex-1 truncate in-data-placeholder:text-muted-foreground/72">
-          {children}
-        </span>
+        <span className="flex-1 truncate in-data-placeholder:text-placeholder">{children}</span>
         {variant === "ghost" ? (
           <ChevronDownIcon className="-me-1 size-3 opacity-50" />
         ) : (

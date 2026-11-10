@@ -80,7 +80,7 @@ const FileTreeEntry = memo(function FileTreeEntry({
           : FileDiffIcon;
   return (
     <div
-      className={`flex h-14 items-center gap-2 border-b border-border px-3 ${selected ? "bg-accent" : ""}`}
+      className={`flex h-14 items-center gap-2 border-b border-border px-3 ${selected ? "bg-selected" : ""}`}
       style={{ paddingInlineStart: 12 + row.depth * 12 }}
     >
       <button
