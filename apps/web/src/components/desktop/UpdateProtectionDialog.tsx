@@ -15,6 +15,7 @@ import {
   getDesktopUpdateErrorMessage,
 } from "../desktopUpdate.logic";
 import { Button } from "../ui/button";
+import { askBeforeLeaving, releaseLeaveHolds } from "../files/unsavedFileEdits";
 import { Checkbox } from "../ui/checkbox";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
@@ -201,9 +202,11 @@ export function UpdateProtectionDialog({
       (busy) => setRestarting(busy ? "app" : null),
       async () => {
         setAppRestartError(null);
+        if ((await askBeforeLeaving("restart")) === "stay") return;
         try {
           await restartApp();
         } catch (error) {
+          releaseLeaveHolds();
           const message = getDesktopUpdateErrorMessage(
             error,
             "BiBCode couldn't restart. Try again.",
@@ -280,6 +283,8 @@ export function UpdateProtectionDialog({
 
   const handleInstallResult = (result: DesktopUpdateActionResult) => {
     if (result.completed) return;
+    // The install did not restart the app, so edits held after Discard may be saved again.
+    releaseLeaveHolds();
     if (result.state.backendRecovery?.length) {
       showRecoveryToast(result.state.backendRecovery);
     } else if (result.state.message) {
@@ -293,6 +298,7 @@ export function UpdateProtectionDialog({
       setRestartError(null);
       setAppRestartError(null);
       setDetailsOpen(false);
+      if ((await askBeforeLeaving("update")) === "stay") return;
       try {
         const exclusions = [...excludedEnvironmentIds];
         const result = await installUpdate(
@@ -300,6 +306,7 @@ export function UpdateProtectionDialog({
         );
         handleInstallResult(result);
       } catch (error) {
+        releaseLeaveHolds();
         onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
       }
     });
@@ -311,10 +318,12 @@ export function UpdateProtectionDialog({
       setRestartError(null);
       setAppRestartError(null);
       setDetailsOpen(false);
+      if ((await askBeforeLeaving("update")) === "stay") return;
       try {
         const result = await installUpdate({ skipProtection: true });
         handleInstallResult(result);
       } catch (error) {
+        releaseLeaveHolds();
         onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
       }
     });

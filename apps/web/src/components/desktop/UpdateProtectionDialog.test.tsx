@@ -17,6 +17,13 @@ const harness = vi.hoisted(() => ({
   toastAdd: vi.fn(),
   toastClose: vi.fn(),
   onDismiss: (_open: boolean) => undefined as void,
+  askBeforeLeaving: vi.fn(),
+  releaseLeaveHolds: vi.fn(),
+}));
+
+vi.mock("../files/unsavedFileEdits", () => ({
+  askBeforeLeaving: harness.askBeforeLeaving,
+  releaseLeaveHolds: harness.releaseLeaveHolds,
 }));
 
 vi.mock("../../state/shell", () => ({
@@ -142,6 +149,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   harness.retryProjectData.mockReset().mockResolvedValue(undefined);
   harness.restartApp.mockReset().mockResolvedValue(undefined);
+  harness.askBeforeLeaving.mockReset().mockResolvedValue("proceed");
   harness.retryEnvironment.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   harness.retryRegistries = [];
   harness.getUpdateState.mockReset().mockResolvedValue(baseState);
@@ -169,6 +177,36 @@ afterEach(async () => {
 });
 
 describe("UpdateProtectionDialog", () => {
+  describe("restart and update install ask first", () => {
+    it("installing waits for the answer and does nothing when the person stays", async () => {
+      harness.askBeforeLeaving.mockResolvedValue("stay");
+      const installUpdate = await render(baseState);
+      await act(async () => button("Retry installation").click());
+      expect(harness.askBeforeLeaving).toHaveBeenCalledWith("update");
+      expect(installUpdate).not.toHaveBeenCalled();
+    });
+
+    it("installing proceeds after the answer and lets saving run again when it did not complete", async () => {
+      const installUpdate = vi
+        .fn()
+        .mockResolvedValue({ accepted: false, completed: false, state: baseState });
+      await render(baseState, installUpdate);
+      await act(async () => button("Retry installation").click());
+      expect(installUpdate).toHaveBeenCalledOnce();
+      expect(harness.releaseLeaveHolds).toHaveBeenCalledOnce();
+    });
+
+    it("restarting BiBCode does nothing when the person stays", async () => {
+      harness.retryProjectData.mockRejectedValue("BiBCode's local server couldn't restart");
+      await render(recoveryState);
+      await act(async () => button("Restart server").click());
+      harness.askBeforeLeaving.mockResolvedValue("stay");
+      await act(async () => button("Restart BiBCode").click());
+      expect(harness.askBeforeLeaving).toHaveBeenCalledWith("restart");
+      expect(harness.restartApp).not.toHaveBeenCalled();
+    });
+  });
+
   it("shows recovery actions and explains why installation cannot be retried", async () => {
     const onOpenChange = vi.fn();
     await render(
