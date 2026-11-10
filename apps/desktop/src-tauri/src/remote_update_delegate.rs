@@ -194,6 +194,14 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>, requester: RemoteUpda
             return;
         }
     }
+    if !window_allows_install(&app).await {
+        tracing::warn!(
+            requester_label = requester.label.as_deref().unwrap_or("Another device"),
+            requester_session = requester.session_id_prefix.as_deref().unwrap_or(""),
+            "remote update install stopped because this window kept unsaved Files edits"
+        );
+        return;
+    }
     let backend = app.state::<BackendSupervisor>();
     // A successful install restarts the host on Linux and macOS, so a result that comes
     // back without `completed` is a refusal or a failure the host updater has recorded.
@@ -210,6 +218,19 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>, requester: RemoteUpda
             message = installed["state"]["message"].as_str().unwrap_or(""),
             "remote update install did not complete"
         );
+    }
+}
+
+/// R62: the install restarts the app, so this window is asked first, the same way as an install
+/// started here. Without the guard (no window in this process) nothing can hold an edit.
+async fn window_allows_install<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let answer = match app.try_state::<crate::window::CloseGuard>() {
+        None => return true,
+        Some(guard) => guard.ask_before_update(std::time::Instant::now()),
+    };
+    match answer {
+        Some(answer) => answer.await.unwrap_or(false),
+        None => false,
     }
 }
 
@@ -316,6 +337,19 @@ mod tests {
             .plugin(tauri_plugin_updater::Builder::new().build())
             .build(context)
             .expect("mock Tauri app")
+    }
+
+    #[tokio::test]
+    async fn close_request_remote_install_asks_the_window_first() {
+        let app = host_app("http://127.0.0.1:9/never".to_owned());
+        // No guard: nothing in this process can hold an edit.
+        assert!(window_allows_install(app.handle()).await);
+
+        app.manage(crate::window::close_guard_for_app(app.handle()));
+        // No main window: the guard allows at once.
+        assert!(window_allows_install(app.handle()).await);
+        // Allow, Stay and a pending close are covered by
+        // `close_request_on_remote_update_proceeds_only_when_the_web_allows_it` in `window.rs`.
     }
 
     /// Polls `status` the way a remote client does until the background flow settles.

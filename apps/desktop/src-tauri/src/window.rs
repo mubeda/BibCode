@@ -354,6 +354,15 @@ const CLOSE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) enum LeaveReason {
     Close,
     Quit,
+    /// An update install another device requested; it restarts the app once allowed.
+    Update,
+}
+
+/// How a request ended: `allowed` by the web or the person, or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloseAnswer {
+    reason: LeaveReason,
+    allowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -396,8 +405,8 @@ impl CloseRequests {
         Some(self.next_id)
     }
 
-    /// The reason to leave for once the web allowed it. A stale reply changes nothing.
-    fn reply(&mut self, request_id: u64, reply: CloseReply, now: Instant) -> Option<LeaveReason> {
+    /// How the request ended, once the web answered. A stale reply changes nothing.
+    fn reply(&mut self, request_id: u64, reply: CloseReply, now: Instant) -> Option<CloseAnswer> {
         let pending = self
             .pending
             .as_mut()
@@ -407,10 +416,11 @@ impl CloseRequests {
                 pending.deadline = now + CLOSE_ANSWER_TIMEOUT;
                 None
             }
-            CloseReply::Allow => self.pending.take().map(|pending| pending.reason),
-            CloseReply::Stay => {
-                self.pending = None;
-                None
+            CloseReply::Allow | CloseReply::Stay => {
+                self.pending.take().map(|pending| CloseAnswer {
+                    reason: pending.reason,
+                    allowed: reply == CloseReply::Allow,
+                })
             }
         }
     }
@@ -431,13 +441,16 @@ impl CloseRequests {
         request_id: u64,
         close_anyway: bool,
         now: Instant,
-    ) -> Option<LeaveReason> {
+    ) -> Option<CloseAnswer> {
         let pending = self
             .pending
             .as_mut()
             .filter(|pending| pending.request_id == request_id && pending.prompting)?;
         if close_anyway {
-            return self.pending.take().map(|pending| pending.reason);
+            return self.pending.take().map(|pending| CloseAnswer {
+                reason: pending.reason,
+                allowed: true,
+            });
         }
         pending.prompting = false;
         pending.deadline = now + CLOSE_ANSWER_TIMEOUT;
@@ -457,6 +470,10 @@ pub(crate) struct CloseGuard {
     ask_web: AskWeb,
     prompt_person: PromptPerson,
     leave: Leave,
+    /// Waits for the answer to a pending `Update` request.
+    update_answer: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    /// Set only by the end-to-end teardown, so a session ends without a dialog nobody answers.
+    disarmed: std::sync::atomic::AtomicBool,
 }
 
 impl CloseGuard {
@@ -466,6 +483,8 @@ impl CloseGuard {
             ask_web,
             prompt_person,
             leave,
+            update_answer: Mutex::new(None),
+            disarmed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -475,16 +494,58 @@ impl CloseGuard {
 
     /// Asks the web, or joins the request already pending.
     pub(crate) fn request(&self, reason: LeaveReason, now: Instant) {
+        if self.disarmed.load(std::sync::atomic::Ordering::Relaxed) {
+            (self.leave)(reason);
+            return;
+        }
         let request_id = self.lock().begin(reason, now);
         if let Some(request_id) = request_id {
             (self.ask_web)(request_id, reason);
         }
     }
 
+    /// End-to-end builds only: every later close or quit leaves at once, as if allowed.
+    #[cfg(any(feature = "desktop-e2e", test))]
+    pub(crate) fn disarm(&self) {
+        self.disarmed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Asks the web before a remote update install restarts the app. Resolves true once allowed,
+    /// false on stay. `None` when another request is pending, so the install does not start.
+    pub(crate) fn ask_before_update(
+        &self,
+        now: Instant,
+    ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
+        let request_id = self.lock().begin(LeaveReason::Update, now)?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .update_answer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        (self.ask_web)(request_id, LeaveReason::Update);
+        Some(receiver)
+    }
+
+    fn finish(&self, answer: CloseAnswer) {
+        if answer.reason == LeaveReason::Update {
+            let sender = self
+                .update_answer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(answer.allowed);
+            }
+        } else if answer.allowed {
+            (self.leave)(answer.reason);
+        }
+    }
+
     pub(crate) fn reply(&self, request_id: u64, reply: CloseReply, now: Instant) {
-        let leave = self.lock().reply(request_id, reply, now);
-        if let Some(reason) = leave {
-            (self.leave)(reason);
+        let answer = self.lock().reply(request_id, reply, now);
+        if let Some(answer) = answer {
+            self.finish(answer);
         }
     }
 
@@ -505,10 +566,10 @@ impl CloseGuard {
     }
 
     pub(crate) fn prompt_answered(&self, request_id: u64, close_anyway: bool, now: Instant) {
-        let leave = self.lock().prompt_answered(request_id, close_anyway, now);
-        if let Some(reason) = leave {
-            tracing::warn!(request_id, ?reason, "leaving without the window's answer");
-            (self.leave)(reason);
+        let answer = self.lock().prompt_answered(request_id, close_anyway, now);
+        if let Some(answer) = answer {
+            tracing::warn!(request_id, reason = ?answer.reason, "leaving without the window's answer");
+            self.finish(answer);
         }
     }
 }
@@ -592,6 +653,8 @@ fn leave_now<R: Runtime>(app: &AppHandle<R>, reason: LeaveReason) {
             }
         }
         LeaveReason::Quit => app.exit(0),
+        // The remote install waits on `ask_before_update` and restarts the app itself.
+        LeaveReason::Update => {}
     }
 }
 
@@ -772,6 +835,47 @@ mod tests {
         recorded.guard.reply(id, CloseReply::Stay, later(start, 1));
         assert!(!recorded.guard.tick(later(start, 30)));
         assert!(recorded.left().is_empty());
+    }
+
+    #[test]
+    fn close_request_on_remote_update_proceeds_only_when_the_web_allows_it() {
+        let recorded = RecordedGuard::new();
+        let start = Instant::now();
+        let mut allowed = recorded.guard.ask_before_update(start).expect("asked");
+        let (id, reason) = *recorded.asked.lock().unwrap().last().unwrap();
+        assert_eq!(reason, LeaveReason::Update);
+        recorded.guard.reply(id, CloseReply::Acknowledge, start);
+        assert!(
+            allowed.try_recv().is_err(),
+            "nothing is decided before the answer"
+        );
+        recorded.guard.reply(id, CloseReply::Allow, later(start, 1));
+        assert_eq!(allowed.try_recv(), Ok(true));
+        assert!(
+            recorded.left().is_empty(),
+            "an update never destroys the window or quits"
+        );
+
+        let mut stayed = recorded
+            .guard
+            .ask_before_update(later(start, 2))
+            .expect("asked");
+        let (id, _) = *recorded.asked.lock().unwrap().last().unwrap();
+        recorded.guard.reply(id, CloseReply::Stay, later(start, 3));
+        assert_eq!(stayed.try_recv(), Ok(false));
+
+        // A close already pending means the install does not start.
+        recorded.guard.request(LeaveReason::Close, later(start, 4));
+        assert!(recorded.guard.ask_before_update(later(start, 5)).is_none());
+    }
+
+    #[test]
+    fn close_request_disarmed_for_end_to_end_teardown_leaves_at_once() {
+        let recorded = RecordedGuard::new();
+        recorded.guard.disarm();
+        recorded.guard.request(LeaveReason::Close, Instant::now());
+        assert_eq!(recorded.left(), vec![LeaveReason::Close]);
+        assert!(recorded.asked.lock().unwrap().is_empty());
     }
 
     #[test]

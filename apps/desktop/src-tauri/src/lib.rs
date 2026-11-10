@@ -359,6 +359,8 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
 async fn desktop_e2e_prepare_for_exit(
     app_handle: tauri::AppHandle<bridge::DesktopRuntime>,
 ) -> Result<(), String> {
+    // The teardown closes the window next; an edit a spec left unsaved must not hold it (R62).
+    app_handle.state::<window::CloseGuard>().disarm();
     prepare_desktop_runtime_for_exit(&app_handle).await
 }
 
