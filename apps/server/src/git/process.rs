@@ -705,9 +705,14 @@ struct LeftLock {
 
 impl LeftLock {
     /// Deletes the lock if it is still the one BiBCode left. `false` once it is gone or
-    /// changed (another Git process has it now, so it is not BiBCode's to delete).
+    /// changed (another Git process has it now, so it is not BiBCode's to delete). A lock
+    /// that cannot be inspected is kept and reported: only `NotFound` means gone.
     fn still_left(&self) -> bool {
-        lock_state(&self.lock) == Some(self.state)
+        let metadata = match self.lock.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+        };
+        (metadata.len(), metadata.modified().ok()) == self.state
             && std::fs::remove_file(&self.lock)
                 .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
     }
