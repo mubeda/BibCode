@@ -18,6 +18,8 @@ import {
 
 export interface UnsavedChangesCloseDialogProps {
   files: readonly string[];
+  /** Save all is running: every choice waits for it. */
+  saving?: boolean;
   onSaveAll(): void;
   onDiscard(): void;
   onCancel(): void;
@@ -25,6 +27,7 @@ export interface UnsavedChangesCloseDialogProps {
 
 export function UnsavedChangesCloseDialog({
   files,
+  saving = false,
   onSaveAll,
   onDiscard,
   onCancel,
@@ -34,7 +37,7 @@ export function UnsavedChangesCloseDialog({
     <AlertDialog
       open
       onOpenChange={(open) => {
-        if (!open) onCancel();
+        if (!open && !saving) onCancel();
       }}
     >
       <AlertDialogPopup initialFocus={saveAllRef}>
@@ -54,14 +57,14 @@ export function UnsavedChangesCloseDialog({
           ))}
         </ul>
         <AlertDialogFooter>
-          <Button variant="outline" onClick={onCancel}>
+          <Button variant="outline" disabled={saving} onClick={onCancel}>
             Cancel
           </Button>
-          <Button variant="destructive-outline" onClick={onDiscard}>
+          <Button variant="destructive-outline" disabled={saving} onClick={onDiscard}>
             Discard
           </Button>
-          <Button ref={saveAllRef} onClick={onSaveAll}>
-            Save all
+          <Button ref={saveAllRef} disabled={saving} onClick={onSaveAll}>
+            {saving ? "Saving…" : "Save all"}
           </Button>
         </AlertDialogFooter>
       </AlertDialogPopup>
@@ -85,6 +88,7 @@ export function UnsavedChangesCloseHost() {
   return (
     <UnsavedChangesCloseDialog
       files={question.files}
+      saving={question.saving}
       onSaveAll={() => question.answer("save")}
       onDiscard={() => question.answer("discard")}
       onCancel={() => question.answer("cancel")}

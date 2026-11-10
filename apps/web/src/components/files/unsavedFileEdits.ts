@@ -14,6 +14,8 @@ export type LeaveChoice = "save" | "discard" | "cancel";
 
 export interface LeaveQuestion {
   readonly files: readonly string[];
+  /** True while Save all runs; the dialog stays open and shows it. */
+  readonly saving: boolean;
   answer(choice: LeaveChoice): void;
 }
 
@@ -111,10 +113,11 @@ async function ask(_reason: LeaveReason): Promise<"proceed" | "stay"> {
     let answered = false;
     setQuestion({
       files,
+      saving: false,
       answer: (next) => {
         if (answered) return;
         answered = true;
-        setQuestion(null);
+        setQuestion(next === "save" ? { files, saving: true, answer: () => {} } : null);
         resolve(next);
       },
     });
@@ -129,7 +132,9 @@ async function ask(_reason: LeaveReason): Promise<"proceed" | "stay"> {
     return "proceed";
   }
   releaseHolds();
-  if ((await saveAll()) === "saved") return "proceed";
+  const saved = await saveAll();
+  setQuestion(null);
+  if (saved === "saved") return "proceed";
   const unsaved = windowUnsavedFiles().map(({ path }) => path);
   toastManager.add({
     type: "error",

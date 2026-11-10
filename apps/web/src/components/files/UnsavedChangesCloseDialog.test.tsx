@@ -174,6 +174,28 @@ describe("UnsavedChangesCloseHost", () => {
     );
   });
 
+  it("Save all keeps the dialog open and shows that it is saving until the writes end", async () => {
+    let finishWrite!: (result: WriteResult) => void;
+    const persist = vi.fn<Persist>(
+      () =>
+        new Promise<WriteResult>((resolve) => {
+          finishWrite = resolve;
+        }),
+    );
+    const session = openFile(newRegistry(), "notes.md", persist);
+    session.changeFromRichEditor("my edit");
+
+    const [answer] = await leave();
+    await click("Save all");
+    expect(button("Saving…").disabled).toBe(true);
+    expect(button("Discard").disabled).toBe(true);
+    expect(button("Cancel").disabled).toBe(true);
+
+    await act(async () => finishWrite(saved()));
+    await expect(answer).resolves.toBe("proceed");
+    expect(dialogText()).toBeUndefined();
+  });
+
   it("Discard proceeds without writing", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
