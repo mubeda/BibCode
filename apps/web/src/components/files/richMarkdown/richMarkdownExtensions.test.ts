@@ -59,6 +59,16 @@ describe("createRichMarkdownEditor", () => {
     }
   });
 
+  it.each([
+    ["an entity", "Copyright &copy; 2026 and&nbsp;more.\n"],
+    ["a link around an image", "See [![logo](logo.png)](https://example.test) here.\n"],
+    ["an angle-bracket link target", "Read [a](<b c.md>) first.\n"],
+  ])("refuses a file with %s, which the editor cannot write back", (_name, original) => {
+    expect(findUnsupportedConstruct(original)).toBeNull();
+    const { editor } = open(original);
+    expect(canReconcile({ original, before: editor.serialize() })).toBe(false);
+  });
+
   it("reconciles an untouched editor to the original bytes", () => {
     for (const [name, original] of supported) {
       const { editor } = open(original);

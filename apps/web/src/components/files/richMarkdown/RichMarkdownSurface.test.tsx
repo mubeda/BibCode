@@ -244,6 +244,16 @@ describe("RichMarkdownSurface", () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["an entity", "Copyright &copy; 2026.\n"],
+    ["a link around an image", "See [![logo](logo.png)](https://example.test) here.\n"],
+  ])("a file with %s opens without an editor", async (_name, original) => {
+    const { session } = createSession(original);
+    const { onEditorChange } = await mount(session, original);
+
+    expect(onEditorChange).toHaveBeenCalledExactlyOnceWith(null, original);
+  });
+
   it("an edit after an empty details block reaches the session and survives leaving", async () => {
     const original = "<details><summary>More</summary></details>\n\nHello\n";
     const { session } = createSession(original);

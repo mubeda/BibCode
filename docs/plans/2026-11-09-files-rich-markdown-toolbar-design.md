@@ -594,3 +594,8 @@ was reproduced as a failing test before the fix.
   undelivered. The surface keeps a waiting flag until the
   edit is delivered. On unmount it falls back to the editor's serialization with the body's
   dominant line ending and final-newline state.
+- Coordinator check 2, files that TipTap writes back differently might be accepted by the
+  block-list `canReconcile`. Verified, no change needed. With the real editor, a file with
+  `&copy;`, a link around an image or an angle-bracket link target still fails
+  `canReconcile`, and the surface reports no editor for it. The tests fail when the block key
+  comparison is removed.
