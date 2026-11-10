@@ -648,27 +648,33 @@ function repaintTerminalTheme(
   terminal.refresh(0, terminal.rows - 1);
 }
 
-function terminalThemeFromApp(
+export function terminalThemeFromApp(
   resolvedTheme: TerminalThemeMode,
   mountElement?: HTMLElement | null,
   palette?: TerminalPalette,
 ): ITheme {
-  const isDark = resolvedTheme === "dark";
   // A theme's own terminal colors (preference "Follow app theme"), as the session launched them.
-  if (palette && palette.mode === resolvedTheme && !isBuiltinTerminalPalette(palette)) {
+  // A running session keeps them in their own mode whatever the app shows now (R51).
+  if (palette && !isBuiltinTerminalPalette(palette)) {
+    const paletteDark = palette.mode === "dark";
     return {
       background: palette.background,
       foreground: palette.foreground,
-      extendedAnsi: terminalExtendedAnsiPalette(resolvedTheme),
+      extendedAnsi: terminalExtendedAnsiPalette(palette.mode),
       cursor: palette.cursor,
       selectionBackground: palette.selectionBackground,
       selectionForeground: palette.selectionForeground,
-      scrollbarSliderBackground: isDark ? "rgba(255, 255, 255, 0.1)" : "rgba(0, 0, 0, 0.15)",
-      scrollbarSliderHoverBackground: isDark ? "rgba(255, 255, 255, 0.18)" : "rgba(0, 0, 0, 0.25)",
-      scrollbarSliderActiveBackground: isDark ? "rgba(255, 255, 255, 0.22)" : "rgba(0, 0, 0, 0.3)",
+      scrollbarSliderBackground: paletteDark ? "rgba(255, 255, 255, 0.1)" : "rgba(0, 0, 0, 0.15)",
+      scrollbarSliderHoverBackground: paletteDark
+        ? "rgba(255, 255, 255, 0.18)"
+        : "rgba(0, 0, 0, 0.25)",
+      scrollbarSliderActiveBackground: paletteDark
+        ? "rgba(255, 255, 255, 0.22)"
+        : "rgba(0, 0, 0, 0.3)",
       ...palette.ansi,
     };
   }
+  const isDark = resolvedTheme === "dark";
   const fallbackBackground = isDark ? "rgb(14, 18, 24)" : "rgb(255, 255, 255)";
   const fallbackForeground = isDark ? "rgb(237, 241, 247)" : "rgb(28, 33, 41)";
   const panelSurface =
@@ -2108,7 +2114,12 @@ export function TerminalViewport({
   useEffect(() => {
     const activeTerminal = terminalRef.current;
     if (!activeTerminal) return;
-    repaintTerminalTheme(activeTerminal, effectiveTerminalTheme, containerRef.current);
+    repaintTerminalTheme(
+      activeTerminal,
+      effectiveTerminalTheme,
+      containerRef.current,
+      readLaunchPalette(),
+    );
   }, [effectiveTerminalTheme]);
 
   useEffect(() => {
