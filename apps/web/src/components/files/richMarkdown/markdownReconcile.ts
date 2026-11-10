@@ -494,6 +494,11 @@ function reconcileChildren(
       beforeBlock.children!,
       afterBlock.children!,
     );
+    // An ordered list's first number is its start: after a deletion it must be `after`'s.
+    const start = /^\d+/.exec(textOf(level.after, afterBlock.children![0]!))?.[0];
+    if (original.kind === "list" && start !== undefined && /^\d/.test(children[0]!.text)) {
+      children[0] = { ...children[0]!, text: children[0]!.text.replace(/^\d+/, start) };
+    }
     return {
       text: `${head}${join(inner, original.children!, afterBlock.children!, children)}${tail}`,
       original: step.before,

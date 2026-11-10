@@ -403,4 +403,27 @@ describe("an edit at any boundary of any level", () => {
     expect(failures).toEqual([]);
     expect(count).toBe(43);
   });
+
+  it("deleting a block keeps every untouched block's bytes", () => {
+    const { failures, count } = sweep(
+      (doc) =>
+        levels(doc).flatMap(({ node, at }) => {
+          if (node.childCount < 2) return [];
+          const edits: Edit[] = [];
+          node.forEach((child, offset, index) =>
+            edits.push({
+              where: `deleted ${node.type.name} ${index}`,
+              apply: (tiptap) =>
+                tiptap.view.dispatch(
+                  tiptap.state.tr.delete(at + offset, at + offset + child.nodeSize),
+                ),
+            }),
+          );
+          return edits;
+        }),
+      false,
+    );
+    expect(failures).toEqual([]);
+    expect(count).toBe(81);
+  });
 });

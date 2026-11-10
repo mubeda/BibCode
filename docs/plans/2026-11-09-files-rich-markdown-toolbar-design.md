@@ -188,7 +188,8 @@ structure, level by level, starting at the root.
    `original`. Their head comes from `original`, patched where `before` and `after`
    differ: a list item keeps its original bullet character, delimiter and spacing and
    takes only the checkbox character from `after`, so ticking `-   [ ] Keep` gives
-   `-   [x] Keep`. A `details` head (the opening tag and summary) is taken from `after`
+   `-   [x] Keep`. In a rebuilt ordered list the first item takes `after`'s number, which
+   is the list's start. A `details` head (the opening tag and summary) is taken from `after`
    when the summary changed.
 4. Any other unmatched `after` child, a changed leaf or an inserted block, is emitted with
    `after`'s text. An inserted list item gets the list's original bullet character or
@@ -699,3 +700,11 @@ was reproduced as a failing test before the fix.
   start number as content. All 43 insertions kept every other block's bytes with no change
   to the reconcile, so no defect was found at this level. A test run that wrote matched
   items in the editor's spelling failed 24 of them, so the check can fail.
+- Coordinator, a deletion sweep with the same check deletes the block at every index of the
+  root, every table, list (nested ones included), block quote and details body that has
+  more than one child, 81 deletions in all. One class failed. Deleting the first item of
+  an ordered list kept the next item's original number, so the list started one higher
+  than the person saw, and the fallback rewrote the whole list, untouched items included,
+  in TipTap's spelling. Fixed: in a rebuilt list the first emitted item takes `after`'s
+  number and keeps the rest of its original bytes, so `1) one\n2) two\n3) three` loses its
+  first item as `1) two\n3) three`.
