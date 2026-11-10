@@ -24,6 +24,15 @@ import { ThemeImportDialog } from "./ThemeImportDialog";
 
 type Base = "light" | "dark";
 
+/** What a row click changed when it switched the mode, so Undo can put it back. */
+interface UndoOffer {
+  base: Base;
+  themeId: string;
+  themeName: string;
+  previousMode: ReturnType<typeof useTheme>["theme"];
+  previousSlot: string;
+}
+
 const MODE_OPTIONS = [
   { value: "system", label: "System" },
   { value: "light", label: "Light" },
@@ -191,10 +200,22 @@ export function AppearanceSettingsPanel() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [undoOffer, setUndoOffer] = useState<UndoOffer | null>(null);
   const returnFocusTo = useRef<string | null>(null);
-  const undoToastId = useRef<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const existingIds = new Set(themes.map((theme) => theme.id));
+
+  // Undo stays offered only while the mode and slot are what the click set and the previous
+  // theme still fits the slot. Any other change (a Mode click, another window, a delete)
+  // withdraws it for good, so it never applies half a revert.
+  if (
+    undoOffer !== null &&
+    (mode !== undoOffer.base ||
+      slots[undoOffer.base] !== undoOffer.themeId ||
+      themes.find((theme) => theme.id === undoOffer.previousSlot)?.base !== undoOffer.base)
+  ) {
+    setUndoOffer(null);
+  }
 
   // Focus goes back to the row's menu button, where Edit was chosen, when the editor closes.
   useEffect(() => {
@@ -222,32 +243,33 @@ export function AppearanceSettingsPanel() {
     );
   }
 
-  // An Undo only reverts the latest choice, so a newer choice closes the older offer.
-  const dismissUndo = () => {
-    if (undoToastId.current !== null) toastManager.close(undoToastId.current);
-    undoToastId.current = null;
-  };
+  const rowControl = (id: string, part: "select" | "more") =>
+    listRef.current?.querySelector<HTMLElement>(
+      `[data-theme-row="${CSS.escape(id)}"] ${part === "select" ? "[data-theme-select]" : '[data-theme-action="more"]'}`,
+    );
   // R40: a row puts its theme in its base's slot and shows it, switching the mode if needed.
   const apply = (theme: ThemeFile) => {
-    dismissUndo();
     const previous = { mode, slot: slots[theme.base] };
     const result = setSlot(theme.base, theme.id);
     if (!result.ok) return setActionError("Could not save the theme choice.");
     setActionError(null);
     if (theme.base === resolvedTheme) return;
     setTheme(theme.base);
-    undoToastId.current = toastManager.add({
-      type: "info",
-      title: `Switched to ${theme.base} mode to show ${theme.name}`,
-      actionProps: {
-        children: "Undo",
-        onClick: () => {
-          dismissUndo();
-          setSlot(theme.base, previous.slot);
-          setTheme(previous.mode);
-        },
-      },
+    setUndoOffer({
+      base: theme.base,
+      themeId: theme.id,
+      themeName: theme.name,
+      previousMode: previous.mode,
+      previousSlot: previous.slot,
     });
+  };
+  const undo = (offer: UndoOffer) => {
+    setUndoOffer(null);
+    if (!setSlot(offer.base, offer.previousSlot).ok) {
+      return setActionError("Could not undo the theme choice.");
+    }
+    setTheme(offer.previousMode);
+    rowControl(offer.themeId, "select")?.focus();
   };
   const duplicate = (theme: ThemeFile) => {
     try {
@@ -257,10 +279,25 @@ export function AppearanceSettingsPanel() {
       setActionError(cause instanceof Error ? cause.message : "Could not duplicate the theme.");
     }
   };
+  const cancelDelete = (theme: ThemeFile) => {
+    setConfirmingDelete(null);
+    rowControl(theme.id, "more")?.focus();
+  };
   const remove = (theme: ThemeFile) => {
+    const ids = GROUPS.flatMap(({ base }) =>
+      themes.filter((entry) => entry.base === base).map((entry) => entry.id),
+    );
+    const index = ids.indexOf(theme.id);
+    const survivor = ids[index + 1] ?? ids[index - 1];
     const result = deleteCustomTheme(theme.id);
     setConfirmingDelete(null);
-    setActionError(result.ok ? null : "Could not delete the theme.");
+    if (!result.ok) {
+      setActionError("Could not delete the theme.");
+      return rowControl(theme.id, "more")?.focus();
+    }
+    setActionError(null);
+    // The confirmation leaves with the row, so focus moves to the row that takes its place.
+    if (survivor !== undefined) rowControl(survivor, "select")?.focus();
   };
 
   return (
@@ -277,10 +314,7 @@ export function AppearanceSettingsPanel() {
                   size="sm"
                   variant={mode === option.value ? "secondary" : "ghost"}
                   aria-pressed={mode === option.value}
-                  onClick={() => {
-                    dismissUndo();
-                    setTheme(option.value);
-                  }}
+                  onClick={() => setTheme(option.value)}
                 >
                   {option.label}
                 </Button>
@@ -304,6 +338,16 @@ export function AppearanceSettingsPanel() {
         }
       >
         <div className="grid gap-3 p-3">
+          <div role="status" className="empty:hidden">
+            {undoOffer ? (
+              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border px-3 py-2 text-sm text-foreground">
+                {`Switched to ${undoOffer.base} mode to show ${undoOffer.themeName}.`}
+                <Button size="xs" variant="outline" onClick={() => undo(undoOffer)}>
+                  Undo
+                </Button>
+              </p>
+            ) : null}
+          </div>
           {actionError ? (
             <p role="alert" className="text-sm text-destructive-foreground">
               {actionError}
@@ -373,61 +417,64 @@ export function AppearanceSettingsPanel() {
                               </span>
                             ) : null}
                           </button>
-                          <Menu>
-                            <MenuTrigger
-                              render={
-                                <Button
-                                  size="icon-sm"
-                                  variant="ghost"
-                                  data-theme-action="more"
-                                  aria-label={`More actions for ${theme.name}`}
-                                />
-                              }
-                            >
-                              <EllipsisIcon aria-hidden className="size-4" />
-                            </MenuTrigger>
-                            {/* After Delete, focus goes to the confirmation's Cancel. */}
-                            <MenuPopup
-                              align="end"
-                              finalFocus={() =>
-                                listRef.current?.querySelector<HTMLElement>(
-                                  `[data-theme-row="${CSS.escape(theme.id)}"] [data-delete-cancel]`,
-                                ) ?? true
-                              }
-                            >
-                              {custom ? (
-                                <MenuItem
-                                  data-theme-action="edit"
-                                  onClick={() => setEditingId(theme.id)}
-                                >
-                                  Edit
-                                </MenuItem>
-                              ) : null}
-                              <MenuItem
-                                data-theme-action="duplicate"
-                                onClick={() => duplicate(theme)}
+                          {/* Reserves the Button's 44 px coarse-pointer target so it never covers the row. */}
+                          <span className="flex shrink-0 items-center justify-center pointer-coarse:size-11">
+                            <Menu>
+                              <MenuTrigger
+                                render={
+                                  <Button
+                                    size="icon-sm"
+                                    variant="ghost"
+                                    data-theme-action="more"
+                                    aria-label={`More actions for ${theme.name}`}
+                                  />
+                                }
                               >
-                                Duplicate
-                              </MenuItem>
-                              {custom ? (
-                                <>
+                                <EllipsisIcon aria-hidden className="size-4" />
+                              </MenuTrigger>
+                              {/* After Delete, focus goes to the confirmation's Cancel. */}
+                              <MenuPopup
+                                align="end"
+                                finalFocus={() =>
+                                  listRef.current?.querySelector<HTMLElement>(
+                                    `[data-theme-row="${CSS.escape(theme.id)}"] [data-delete-cancel]`,
+                                  ) ?? true
+                                }
+                              >
+                                {custom ? (
                                   <MenuItem
-                                    data-theme-action="export"
-                                    onClick={() => void downloadTheme(theme)}
+                                    data-theme-action="edit"
+                                    onClick={() => setEditingId(theme.id)}
                                   >
-                                    Export
+                                    Edit
                                   </MenuItem>
-                                  <MenuItem
-                                    data-theme-action="delete"
-                                    variant="destructive"
-                                    onClick={() => setConfirmingDelete(theme.id)}
-                                  >
-                                    Delete
-                                  </MenuItem>
-                                </>
-                              ) : null}
-                            </MenuPopup>
-                          </Menu>
+                                ) : null}
+                                <MenuItem
+                                  data-theme-action="duplicate"
+                                  onClick={() => duplicate(theme)}
+                                >
+                                  Duplicate
+                                </MenuItem>
+                                {custom ? (
+                                  <>
+                                    <MenuItem
+                                      data-theme-action="export"
+                                      onClick={() => void downloadTheme(theme)}
+                                    >
+                                      Export
+                                    </MenuItem>
+                                    <MenuItem
+                                      data-theme-action="delete"
+                                      variant="destructive"
+                                      onClick={() => setConfirmingDelete(theme.id)}
+                                    >
+                                      Delete
+                                    </MenuItem>
+                                  </>
+                                ) : null}
+                              </MenuPopup>
+                            </Menu>
+                          </span>
                           {confirmingDelete === theme.id ? (
                             <div
                               role="group"
@@ -439,7 +486,7 @@ export function AppearanceSettingsPanel() {
                                 size="xs"
                                 variant="ghost"
                                 data-delete-cancel
-                                onClick={() => setConfirmingDelete(null)}
+                                onClick={() => cancelDelete(theme)}
                               >
                                 Cancel
                               </Button>

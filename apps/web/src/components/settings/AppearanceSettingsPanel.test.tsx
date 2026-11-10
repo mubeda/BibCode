@@ -287,12 +287,12 @@ describe("AppearanceSettingsPanel", () => {
     setSlot("dark", "matrix-dark");
     await mount();
     await click(select("tokyo-night"));
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    const setItem = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
       throw new Error("quota");
     });
     vi.spyOn(console, "error").mockImplementation(() => {});
     await undo();
-    vi.mocked(Storage.prototype.setItem).mockRestore();
+    setItem.mockRestore();
     expect(mode()).toBe("dark");
     expect(readSlots().dark).toBe("tokyo-night");
     expect(container.querySelector('[role="alert"]')?.textContent).toBe(
