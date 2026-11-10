@@ -15,6 +15,7 @@ vi.mock("../ui/toast", async (importOriginal) => ({
 
 import { AppearanceSettingsPanel } from "./AppearanceSettingsPanel";
 import {
+  deleteCustomTheme,
   getTheme,
   handleThemesStorageEvent,
   readSlots,
@@ -55,13 +56,14 @@ async function menuAction(themeName: string, action: string) {
   await click(button(action));
 }
 const mode = () => window.localStorage.getItem("bibcode:theme");
-type UndoToast = { title: string; actionProps: { children: string; onClick: () => void } };
-const undoToast = () => toastAdd.mock.calls.at(-1)?.[0] as UndoToast | undefined;
+/** The inline status line that offers Undo after a row switched the mode. */
+const undoStatus = () => container.querySelector<HTMLElement>('[role="status"]')!;
+const undoButton = () => undoStatus().querySelector<HTMLButtonElement>("button");
 async function undo() {
-  const toast = undoToast();
-  if (!toast) throw new Error("No Undo offered");
-  expect(toast.actionProps.children).toBe("Undo");
-  await act(async () => toast.actionProps.onClick());
+  const found = undoButton();
+  if (!found) throw new Error("No Undo offered");
+  expect(found.textContent).toBe("Undo");
+  await click(found);
 }
 const rootStyle = (name: string) => document.documentElement.style.getPropertyValue(name);
 const showsDark = () => document.documentElement.classList.contains("dark");
@@ -175,13 +177,15 @@ describe("AppearanceSettingsPanel", () => {
     expect(showsDark()).toBe(true);
     expect(rootStyle("--background")).toBe(resolveToken(getTheme("tokyo-night")!, "background"));
     expect(select("tokyo-night").getAttribute("aria-pressed")).toBe("true");
-    expect(undoToast()?.title).toContain("Tokyo Night");
+    expect(undoStatus().textContent).toContain("Switched to dark mode to show Tokyo Night.");
 
     await undo();
     expect(mode()).toBe("light");
     expect(readSlots().dark).toBe("matrix-dark");
     expect(showsDark()).toBe(false);
-    expect(toastClose).toHaveBeenCalledWith("toast-1");
+    expect(undoButton()).toBeNull();
+    expect(document.activeElement).toBe(select("tokyo-night"));
+    expect(toastAdd).not.toHaveBeenCalled();
   });
 
   it("clicking a dark theme while System shows light switches to Dark, and Undo returns to System", async () => {
@@ -215,20 +219,102 @@ describe("AppearanceSettingsPanel", () => {
     expect(readSlots().dark).toBe("tokyo-night");
     expect(mode()).toBe("dark");
     expect(rootStyle("--background")).toBe(resolveToken(getTheme("tokyo-night")!, "background"));
-    expect(toastAdd).not.toHaveBeenCalled();
+    expect(undoButton()).toBeNull();
   });
 
-  it("clicking a light theme in Dark mode switches to Light, and a newer choice closes the older Undo", async () => {
+  it("a Mode change withdraws the Undo, and returning to the same mode does not bring it back", async () => {
     window.localStorage.setItem("bibcode:theme", "dark");
     await mount();
     await click(select("verdant-light"));
     expect(mode()).toBe("light");
     expect(readSlots().light).toBe("verdant-light");
     expect(showsDark()).toBe(false);
-    expect(toastClose).not.toHaveBeenCalled();
+    expect(undoButton()).not.toBeNull();
 
     await click(button("Dark"));
-    expect(toastClose).toHaveBeenCalledWith("toast-1");
+    expect(undoButton()).toBeNull();
+    await click(button("Light"));
+    expect(undoButton()).toBeNull();
+  });
+
+  it("a newer theme choice in the same slot withdraws the Undo", async () => {
+    await mount();
+    await click(select("tokyo-night"));
+    await click(select("matrix-dark"));
+    expect(undoButton()).toBeNull();
+    expect(readSlots().dark).toBe("matrix-dark");
+  });
+
+  it("another window changing the slot withdraws the Undo", async () => {
+    await mount();
+    await click(select("tokyo-night"));
+    await act(async () => {
+      setSlot("dark", "matrix-dark");
+      handleThemesStorageEvent({ key: null });
+    });
+    expect(undoButton()).toBeNull();
+    expect(mode()).toBe("dark");
+    expect(readSlots().dark).toBe("matrix-dark");
+  });
+
+  it("deleting the previous theme withdraws the Undo instead of reverting only the mode", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    setSlot("dark", "mine");
+    await mount();
+    await click(select("tokyo-night"));
+    expect(undoButton()).not.toBeNull();
+    await act(async () => {
+      deleteCustomTheme("mine");
+    });
+    expect(undoButton()).toBeNull();
+    expect(mode()).toBe("dark");
+    expect(readSlots().dark).toBe("tokyo-night");
+  });
+
+  it("replacing the previous theme with a light theme of the same id withdraws the Undo", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    setSlot("dark", "mine");
+    await mount();
+    await click(select("tokyo-night"));
+    await act(async () => {
+      saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "light" });
+    });
+    expect(undoButton()).toBeNull();
+    expect(mode()).toBe("dark");
+  });
+
+  it("an Undo that cannot save the slot keeps the mode and says so", async () => {
+    setSlot("dark", "matrix-dark");
+    await mount();
+    await click(select("tokyo-night"));
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await undo();
+    vi.mocked(Storage.prototype.setItem).mockRestore();
+    expect(mode()).toBe("dark");
+    expect(readSlots().dark).toBe("tokyo-night");
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      "Could not undo the theme choice.",
+    );
+  });
+
+  it("a remounted panel offers no Undo for an earlier click", async () => {
+    await mount();
+    await click(select("tokyo-night"));
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await mount();
+    expect(undoButton()).toBeNull();
+    expect(mode()).toBe("dark");
+  });
+
+  it("the row menu button reserves its touch target in the layout", async () => {
+    await mount();
+    const trigger = button("More actions for Tokyo Night");
+    expect(trigger.parentElement?.className).toContain("pointer-coarse:size-11");
+    expect(select("tokyo-night").contains(trigger.parentElement)).toBe(false);
   });
 
   it("a secondary action runs without applying the row's theme", async () => {
@@ -274,12 +360,26 @@ describe("AppearanceSettingsPanel", () => {
     await click(button("Cancel"));
     expect(getTheme("mine")).toBeDefined();
     expect(readSlots().dark).toBe("mine");
+    expect(document.activeElement).toBe(button("More actions for Mine"));
 
     await menuAction("Mine", "Delete");
     await click(button("Delete theme"));
     expect(getTheme("mine")).toBeUndefined();
     expect(readSlots().dark).toBe("dark");
     expect(rowNames()).not.toContain("mine");
+  });
+
+  it("after Delete theme, focus moves to the next row, else the previous one", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    saveCustomTheme({ version: 1, id: "mine-2", name: "Mine 2", base: "dark" });
+    await mount();
+    await menuAction("Mine", "Delete");
+    await click(button("Delete theme"));
+    expect(document.activeElement).toBe(select("mine-2"));
+
+    await menuAction("Mine 2", "Delete");
+    await click(button("Delete theme"));
+    expect(document.activeElement).toBe(select("matrix-dark"));
   });
 
   it("New theme asks for a base and a name, rejects an empty name and a name over 48 characters with the rule that failed, and opens the editor", async () => {
