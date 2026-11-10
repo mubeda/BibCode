@@ -679,9 +679,10 @@ When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
 most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
 with the known request for the same branch. Only status subscribers need the
 late answer, so the lookup keeps its lease in a task of the worktree's status
-lifecycle, which the broadcaster cancels when the last subscriber leaves (a
-workspace loss ends every stream) and at shutdown. With no subscriber the
-lookup is dropped at the bound. When the lookup ends with an answer, that task
+lifecycle. The broadcaster cancels that task when the last status subscriber
+leaves, even while a Git Manager signal subscription keeps the worktree's
+entry, and at shutdown. A workspace loss ends every status stream, so it ends
+the task too. With no status subscriber the lookup is dropped at the bound. When the lookup ends with an answer, that task
 records it and calls `notify_pull_request_change`, so each stream publishes it
 without starting the forge CLI again. The passive summary, the
 pre-creation existence check in `git.runStackedAction`, and

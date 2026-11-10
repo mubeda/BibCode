@@ -100,6 +100,9 @@ struct RepositoryState {
     /// The next remote read publishes even when unchanged: a pull request changed, which only
     /// a published remote makes the status streams look up again.
     republish_remote: bool,
+    /// Ends the work run for the status subscribers once the last one leaves, even while a
+    /// Git Manager signal subscriber keeps the entry.
+    status_lookups: CancellationToken,
     remote_refresh_requests: watch::Sender<u64>,
     git_manager_signature: Option<u64>,
     git_manager_signal: watch::Sender<GitManagerSignal>,
@@ -513,6 +516,7 @@ impl StatusBroadcaster {
                         remote_ref_name: None,
                         pending_local_reconcile: false,
                         republish_remote: false,
+                        status_lookups: CancellationToken::new(),
                         remote_refresh_requests,
                         git_manager_signature: None,
                         git_manager_signal,
@@ -930,7 +934,7 @@ impl StatusBroadcaster {
     }
 
     /// Runs `task` for the repository's status subscribers, until the last one leaves or the
-    /// broadcaster shuts down. With no subscriber, `task` is dropped at once.
+    /// broadcaster shuts down. With no status subscriber, `task` is dropped at once.
     pub(crate) fn spawn_for_subscribers(
         &self,
         cwd: &Path,
@@ -940,11 +944,18 @@ impl StatusBroadcaster {
         if state.closed {
             return;
         }
-        if let Some(entry) = state.repositories.get(cwd) {
+        if let Some(entry) = state.repositories.get(cwd).filter(|entry| {
+            entry
+                .subscribers
+                .values()
+                .any(|subscriber| matches!(subscriber, RepositorySubscriber::Status { .. }))
+        }) {
             let stop = entry.poller_cancellation.clone();
+            let unsubscribed = entry.status_lookups.clone();
             entry.tasks.spawn(async move {
                 tokio::select! {
                     () = stop.cancelled() => {}
+                    () = unsubscribed.cancelled() => {}
                     () = task => {}
                 }
             });
@@ -1906,6 +1917,13 @@ impl StatusBroadcaster {
             let mut state = self.lock_state();
             let should_remove = if let Some(entry) = state.repositories.get_mut(cwd) {
                 entry.subscribers.remove(&subscriber_id);
+                if !entry
+                    .subscribers
+                    .values()
+                    .any(|subscriber| matches!(subscriber, RepositorySubscriber::Status { .. }))
+                {
+                    std::mem::take(&mut entry.status_lookups).cancel();
+                }
                 entry.subscribers.is_empty()
             } else {
                 false
@@ -7590,6 +7608,7 @@ mod tests {
                 remote_ref_name: None,
                 pending_local_reconcile: false,
                 republish_remote: false,
+                status_lookups: CancellationToken::new(),
                 remote_refresh_requests,
                 git_manager_signature: None,
                 git_manager_signal,
