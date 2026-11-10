@@ -322,6 +322,17 @@ if (typeof document !== "undefined" && typeof window !== "undefined") {
   });
 }
 
+/**
+ * Paints an unsaved theme over the active one in this window only; `null` paints the stored
+ * theme again. The desktop window keeps the stored mode, so a Cancel does not flash it.
+ */
+export function setThemePreview(theme: ThemeFile | null): void {
+  previewTheme = theme;
+  previewRevision += 1;
+  applyTheme(getStored(), true);
+  emitChange();
+}
+
 /** Applies the stored theme everywhere, including a desktop bridge installed after boot. */
 export function applyStoredTheme(): void {
   applyTheme(getStored());

@@ -1,5 +1,5 @@
 import type { ThemeFile } from "@bibcode/contracts";
-import { useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 
 import { useTheme } from "../../hooks/useTheme";
 import { BUILTIN_THEMES, isBuiltinThemeId } from "../../themes/builtinThemes";
@@ -14,6 +14,7 @@ import { resolveToken } from "../../themes/themeColor";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
+import { ThemeEditor } from "./ThemeEditor";
 
 type Base = "light" | "dark";
 
@@ -134,21 +135,44 @@ function NewThemeForm({
   );
 }
 
-/** Settings > Appearance: the mode, the theme list and its actions (#290, R43 to R46). */
-export function AppearanceSettingsPanel({
-  onEdit,
-  onExport,
-}: {
-  onEdit?: (themeId: string) => void;
-  onExport?: (theme: ThemeFile) => void;
-}) {
+/** Settings > Appearance: the mode, the theme list and its actions (#290, R43 to R47). */
+export function AppearanceSettingsPanel({ onExport }: { onExport?: (theme: ThemeFile) => void }) {
   const { theme: mode, setTheme, resolvedTheme } = useTheme();
   const { themes, slots } = useThemeLibrary();
   const [switchOffer, setSwitchOffer] = useState<Base | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const returnFocusTo = useRef<string | null>(null);
+  const listRef = useRef<HTMLUListElement>(null);
   const existingIds = new Set(themes.map((theme) => theme.id));
+
+  // Focus goes back to the row's Edit button when the editor closes.
+  useEffect(() => {
+    const id = returnFocusTo.current;
+    if (editingId !== null || id === null) return;
+    returnFocusTo.current = null;
+    listRef.current
+      ?.querySelector<HTMLElement>(
+        `[data-theme-row="${CSS.escape(id)}"] [data-theme-action="edit"]`,
+      )
+      ?.focus();
+  }, [editingId]);
+
+  if (editingId !== null) {
+    return (
+      <SettingsPageContainer>
+        <ThemeEditor
+          themeId={editingId}
+          onClose={() => {
+            returnFocusTo.current = editingId;
+            setEditingId(null);
+          }}
+        />
+      </SettingsPageContainer>
+    );
+  }
 
   const use = (theme: ThemeFile) => {
     const result = setSlot(theme.base, theme.id);
@@ -235,11 +259,11 @@ export function AppearanceSettingsPanel({
               onCancel={() => setCreating(false)}
               onCreated={(id) => {
                 setCreating(false);
-                onEdit?.(id);
+                setEditingId(id);
               }}
             />
           ) : null}
-          <ul className="grid gap-1">
+          <ul ref={listRef} className="grid gap-1">
             {themes.map((theme) => {
               const custom = !isBuiltinThemeId(theme.id);
               const inUse = slots[theme.base] === theme.id;
@@ -289,7 +313,7 @@ export function AppearanceSettingsPanel({
                           variant="ghost"
                           data-theme-action="edit"
                           aria-label={`Edit ${theme.name}`}
-                          onClick={() => onEdit?.(theme.id)}
+                          onClick={() => setEditingId(theme.id)}
                         >
                           Edit
                         </Button>

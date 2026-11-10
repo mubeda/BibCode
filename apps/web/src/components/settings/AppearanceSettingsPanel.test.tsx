@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
 import { AppearanceSettingsPanel } from "./AppearanceSettingsPanel";
 import {
@@ -14,10 +14,9 @@ import {
 
 let container: HTMLDivElement;
 let root: Root;
-const onEdit = vi.fn();
 
 async function mount() {
-  await act(async () => root.render(<AppearanceSettingsPanel onEdit={onEdit} />));
+  await act(async () => root.render(<AppearanceSettingsPanel />));
 }
 
 const buttons = () => [...container.querySelectorAll("button")];
@@ -49,7 +48,6 @@ beforeEach(() => {
   window.localStorage.clear();
   window.localStorage.setItem("bibcode:theme", "light");
   handleThemesStorageEvent({ key: null });
-  onEdit.mockReset();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -150,15 +148,20 @@ describe("AppearanceSettingsPanel", () => {
     await type(name, "x".repeat(49));
     await click(button("Create theme"));
     expect(container.textContent).toContain("Use 48 characters or fewer.");
-    expect(onEdit).not.toHaveBeenCalled();
+    expect(container.querySelector("[data-theme-editor]")).toBeNull();
 
     await click(container.querySelector<HTMLInputElement>('input[value="dark"]')!);
     await type(name, "Night shift");
     await click(button("Create theme"));
-    expect(onEdit).toHaveBeenCalledOnce();
-    const created = getTheme(onEdit.mock.calls[0]![0] as string);
+    const editor = container.querySelector("[data-theme-editor]");
+    expect(editor).not.toBeNull();
+    const created = getTheme(editor!.getAttribute("data-theme-editor")!);
     expect(created).toMatchObject({ name: "Night shift", base: "dark" });
     expect(created?.ui).toBeUndefined();
+
+    await click(button("Cancel"));
+    expect(container.querySelector("[data-theme-editor]")).toBeNull();
+    expect(document.activeElement).toBe(button("Edit Night shift"));
   });
 
   it("with no custom themes the six built-ins and the New theme action are shown", async () => {

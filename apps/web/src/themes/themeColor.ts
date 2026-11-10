@@ -233,17 +233,22 @@ function baseValue(theme: ThemeFile, token: string): string {
   return value;
 }
 
-export function failingPairs(
-  theme: ThemeFile,
-  minimum: number,
-): { pair: FixedPair; ratio: number }[] {
-  return FIXED_PAIRS.flatMap((pair) => {
+/** Every fixed pair with its ratio under `theme`, in the spec's order. */
+export function pairRatios(theme: ThemeFile): { pair: FixedPair; ratio: number }[] {
+  return FIXED_PAIRS.map((pair) => {
     const behind = pair.surface.startsWith("terminal.") ? "terminal.background" : "background";
     const ratio = contrastRatio(
       resolveToken(theme, pair.text),
       resolveToken(theme, pair.surface),
       resolveToken(theme, behind),
     );
-    return ratio < minimum ? [{ pair, ratio }] : [];
+    return { pair, ratio };
   });
+}
+
+export function failingPairs(
+  theme: ThemeFile,
+  minimum: number,
+): { pair: FixedPair; ratio: number }[] {
+  return pairRatios(theme).filter(({ ratio }) => ratio < minimum);
 }

@@ -632,4 +632,25 @@ describe("theme slots and overrides", () => {
     useTheme().setTheme("dark");
     expect(listener).toHaveBeenCalledTimes(4);
   });
+
+  it("a preview applies over the active theme and null restores the stored theme", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    const { setThemePreview, subscribeAppliedTheme } = await import("./useTheme");
+    const listener = vi.fn();
+    subscribeAppliedTheme(listener);
+
+    setThemePreview({ version: 1, id: "draft", name: "Draft", base: "dark", ui: mine.ui });
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#3b82f6");
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("");
+    setThemePreview({ version: 1, id: "draft", name: "Draft", base: "light" });
+    expect(browser.isDark()).toBe(false);
+    expect(customProperties(browser)).toEqual([]);
+
+    setThemePreview(null);
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#7aa2f7");
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("#1a1b26");
+    expect(listener).toHaveBeenCalledTimes(3);
+  });
 });
