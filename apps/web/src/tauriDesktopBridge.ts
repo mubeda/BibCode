@@ -615,6 +615,11 @@ function createTauriDesktopBridge(
         filename,
         bytes: Array.from(bytes),
       }),
+    saveTextFile: (input) =>
+      tauriInvokeDesktop<string | null>("desktop_bridge_save_text_file", {
+        suggestedName: input.suggestedName,
+        contents: input.contents,
+      }),
     pickFiles: (options) =>
       tauriInvokeOr<readonly string[]>("desktop_bridge_pick_files", { options }, () => []),
     downloadToFolder: (input) =>

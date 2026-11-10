@@ -14,6 +14,7 @@ import { resolveToken } from "../../themes/themeColor";
 import { exportThemeJson } from "../../themes/themeTransfer";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { toastManager } from "../ui/toast";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { ThemeEditor } from "./ThemeEditor";
 import { ThemeImportDialog } from "./ThemeImportDialog";
@@ -30,11 +31,26 @@ const SWATCH_TOKENS = ["background", "card", "primary", "foreground", "border"] 
 const BASE_LABEL: Record<Base, string> = { light: "Light", dark: "Dark" };
 
 /** Saves the theme as `<id>.theme.json`; the id grammar has no path characters. */
-function downloadTheme(theme: ThemeFile) {
+async function downloadTheme(theme: ThemeFile) {
+  const suggestedName = `${theme.id}.theme.json`;
+  const saveTextFile = window.desktopBridge?.saveTextFile;
+  // The desktop webview cancels blob downloads, so the native Save dialog writes the file.
+  if (saveTextFile) {
+    try {
+      await saveTextFile({ suggestedName, contents: exportThemeJson(theme) });
+    } catch (error) {
+      toastManager.add({
+        type: "error",
+        title: `Could not export ${theme.name}`,
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return;
+  }
   const url = URL.createObjectURL(new Blob([exportThemeJson(theme)], { type: "application/json" }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${theme.id}.theme.json`;
+  link.download = suggestedName;
   link.click();
   // Revoked after the click is handled; WebKit can drop a download whose URL is revoked at once.
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
@@ -353,7 +369,7 @@ export function AppearanceSettingsPanel() {
                             variant="ghost"
                             data-theme-action="export"
                             aria-label={`Export ${theme.name}`}
-                            onClick={() => downloadTheme(theme)}
+                            onClick={() => void downloadTheme(theme)}
                           >
                             Export
                           </Button>

@@ -1352,6 +1352,11 @@ export interface DesktopBridge {
   setWslOnly: (enabled: boolean) => Promise<DesktopWslState>;
   pickFolder: (options?: PickFolderOptions) => Promise<string | null>;
   saveDiagnosticLogs?: (filename: string, bytes: Uint8Array) => Promise<string | null>;
+  /**
+   * Saves text through the native Save dialog, opened with `suggestedName`. Resolves the saved
+   * path, or `null` when the person cancels; rejects when the write fails.
+   */
+  saveTextFile?: (input: { suggestedName: string; contents: string }) => Promise<string | null>;
   pickFiles?: (options?: { title?: string }) => Promise<readonly string[]>;
   downloadToFolder?: (input: {
     url: string;

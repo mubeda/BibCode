@@ -1,7 +1,14 @@
 // @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import type { DesktopBridge } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+const { toastAdd } = vi.hoisted(() => ({ toastAdd: vi.fn() }));
+vi.mock("../ui/toast", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../ui/toast")>()),
+  toastManager: { add: toastAdd },
+}));
 
 import { AppearanceSettingsPanel } from "./AppearanceSettingsPanel";
 import {
@@ -54,6 +61,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  toastAdd.mockReset();
   await act(async () => root.unmount());
   container.remove();
   window.localStorage.clear();
@@ -181,6 +189,61 @@ describe("AppearanceSettingsPanel", () => {
     const blob = (createObjectURL.mock.calls[0] as unknown as [Blob])[0];
     expect(JSON.parse(await blob.text())).toMatchObject({ id: "mine", name: "Mine" });
     await vi.waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:theme"));
+  });
+
+  describe("Export in the desktop app", () => {
+    const saveTextFile = vi.fn<NonNullable<DesktopBridge["saveTextFile"]>>();
+    beforeEach(() => {
+      saveTextFile.mockReset();
+      window.desktopBridge = { saveTextFile } as unknown as DesktopBridge;
+      saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    });
+    afterEach(() => {
+      delete window.desktopBridge;
+    });
+
+    it("Export in the desktop app saves through the bridge with <id>.theme.json", async () => {
+      saveTextFile.mockResolvedValue("/chosen/mine.theme.json");
+      const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click");
+      await mount();
+      await click(button("Export Mine"));
+      expect(saveTextFile).toHaveBeenCalledOnce();
+      const input = saveTextFile.mock.calls[0]![0];
+      expect(input.suggestedName).toBe("mine.theme.json");
+      expect(JSON.parse(input.contents)).toMatchObject({ id: "mine", name: "Mine" });
+      expect(anchorClick).not.toHaveBeenCalled();
+      expect(toastAdd).not.toHaveBeenCalled();
+    });
+
+    it("a cancelled save writes nothing and shows no error", async () => {
+      saveTextFile.mockResolvedValue(null);
+      await mount();
+      await click(button("Export Mine"));
+      expect(saveTextFile).toHaveBeenCalledOnce();
+      expect(toastAdd).not.toHaveBeenCalled();
+    });
+
+    it("a failed save shows an error", async () => {
+      saveTextFile.mockRejectedValue(new Error("Could not save the file: disk full"));
+      await mount();
+      await click(button("Export Mine"));
+      await vi.waitFor(() => expect(toastAdd).toHaveBeenCalledOnce());
+      expect(toastAdd.mock.calls[0]![0]).toMatchObject({
+        type: "error",
+        description: "Could not save the file: disk full",
+      });
+    });
+  });
+
+  it("Export in the browser keeps the download link", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:theme");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    expect(window.desktopBridge).toBeUndefined();
+    await mount();
+    await click(button("Export Mine"));
+    expect(anchorClick).toHaveBeenCalledOnce();
   });
 
   it("Import theme opens the import dialog", async () => {
