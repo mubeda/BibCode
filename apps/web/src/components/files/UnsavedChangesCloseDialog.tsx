@@ -9,9 +9,11 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import {
   attachLeaveQuestionHost,
   getLeaveQuestion,
+  isUpdateInstalling,
   respondToDesktopCloseRequests,
   subscribeLeaveQuestion,
 } from "./unsavedFileEdits";
@@ -75,9 +77,34 @@ export function UnsavedChangesCloseDialog({
   );
 }
 
+/** Shown while an allowed update install runs, so no edit is made that the restart would lose. */
+function UpdateInstallingDialog() {
+  return (
+    <AlertDialog open>
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle className="flex items-center gap-2">
+            <Spinner className="size-4" aria-hidden />
+            Installing an update
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            Another device started this update. BiBCode restarts when it finishes, and you can work
+            again after that.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+      </AlertDialogPopup>
+    </AlertDialog>
+  );
+}
+
 /** The window's one place that shows the leave question. Mount it once on every route. */
 export function UnsavedChangesCloseHost() {
   const question = useSyncExternalStore(subscribeLeaveQuestion, getLeaveQuestion, getLeaveQuestion);
+  const installing = useSyncExternalStore(
+    subscribeLeaveQuestion,
+    isUpdateInstalling,
+    isUpdateInstalling,
+  );
   useEffect(() => {
     const detach = attachLeaveQuestionHost();
     const bridge = window.desktopBridge;
@@ -87,7 +114,7 @@ export function UnsavedChangesCloseHost() {
       detach();
     };
   }, []);
-  if (question === null) return null;
+  if (question === null) return installing ? <UpdateInstallingDialog /> : null;
   return (
     <UnsavedChangesCloseDialog
       files={question.files}

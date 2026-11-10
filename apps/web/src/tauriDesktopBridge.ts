@@ -38,6 +38,7 @@ const BACKEND_READY_EVENT = "desktop:backend-ready";
 const PROJECT_DATA_STATUS_CHANGED_EVENT = "desktop:project-data-status-changed";
 const MENU_ACTION_EVENT = "desktop:menu-action";
 const CLOSE_REQUEST_EVENT = "desktop:close-request";
+const UPDATE_INSTALL_ENDED_EVENT = "desktop:update-install-ended";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
 const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
 const UPDATE_STATE_EVENT = "desktop:update-state";
@@ -651,6 +652,8 @@ function createTauriDesktopBridge(
       tauriListen(CLOSE_REQUEST_EVENT, listener),
     replyCloseRequest: (requestId, reply) =>
       tauriInvokeDesktop("desktop_bridge_reply_close_request", { requestId, reply }),
+    onUpdateInstallEnded: (listener: () => void) =>
+      tauriListen(UPDATE_INSTALL_ENDED_EVENT, () => listener()),
     getUpdateState: () =>
       tauriInvokeOr<DesktopUpdateState>(
         "desktop_bridge_get_update_state",

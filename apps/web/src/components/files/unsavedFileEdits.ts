@@ -26,6 +26,12 @@ let pendingAsk: Promise<"proceed" | "stay"> | null = null;
 let hostCount = 0;
 /** Holds kept after Discard, released if the leave then fails. */
 let discardHolds: (() => void)[] = [];
+/**
+ * Set from the moment the window allows a desktop update install until the desktop says it ended
+ * without restarting. Saving is held and the installing dialog keeps edits out, so no edit made
+ * during the install is lost when it restarts the app.
+ */
+let updateInstall: { readonly release: () => void } | null = null;
 
 export function registerUnsavedSource(source: UnsavedSource): () => void {
   sources.add(source);
@@ -61,7 +67,42 @@ export function subscribeLeaveQuestion(listener: () => void): () => void {
 
 function setQuestion(next: LeaveQuestion | null): void {
   question = next;
+  notifyQuestionListeners();
+}
+
+function notifyQuestionListeners(): void {
   for (const listener of questionListeners) listener();
+}
+
+/** True while an allowed desktop update install runs; `subscribeLeaveQuestion` reports changes. */
+export function isUpdateInstalling(): boolean {
+  return updateInstall !== null;
+}
+
+function blockForUpdateInstall(): void {
+  if (updateInstall !== null) return;
+  const holds = [...sources].map((source) => source.holdSavingForLeave());
+  updateInstall = {
+    release: () => {
+      for (const release of holds) release();
+    },
+  };
+  notifyQuestionListeners();
+}
+
+/** The desktop install ended without a restart: saving and editing run again. */
+function endUpdateInstall(): void {
+  releaseLeaveHolds();
+  const install = updateInstall;
+  if (install === null) return;
+  updateInstall = null;
+  install.release();
+  notifyQuestionListeners();
+  toastManager.add({
+    type: "error",
+    title: "The update did not install",
+    description: "BiBCode did not restart. You can edit and save files again.",
+  });
 }
 
 /**
@@ -160,9 +201,9 @@ const KEEPALIVE_INTERVAL_MS = 1_000;
  * while this subscription holds a request, and stopping it with one pending answers stay.
  */
 export function respondToDesktopCloseRequests(
-  bridge: Pick<DesktopBridge, "onCloseRequest" | "replyCloseRequest">,
+  bridge: Pick<DesktopBridge, "onCloseRequest" | "replyCloseRequest" | "onUpdateInstallEnded">,
 ): () => void {
-  const { onCloseRequest, replyCloseRequest } = bridge;
+  const { onCloseRequest, replyCloseRequest, onUpdateInstallEnded } = bridge;
   if (!onCloseRequest || !replyCloseRequest) return () => {};
   let active: {
     readonly requestId: number;
@@ -189,11 +230,16 @@ export function respondToDesktopCloseRequests(
     };
     active = current;
     void askBeforeLeaving(reason).then((answer) => {
-      if (active === current) finish(answer === "proceed" ? "allow" : "stay");
+      if (active !== current) return;
+      // Only a remote install asks with "update"; it keeps running long after this answer.
+      if (answer === "proceed" && reason === "update") blockForUpdateInstall();
+      finish(answer === "proceed" ? "allow" : "stay");
     });
   });
+  const stopEnded = onUpdateInstallEnded?.(endUpdateInstall);
   return () => {
     unsubscribe();
+    stopEnded?.();
     if (active === null) return;
     finish("stay");
     question?.answer("cancel");
