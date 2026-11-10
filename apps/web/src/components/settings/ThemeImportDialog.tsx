@@ -63,10 +63,12 @@ export function ThemeImportDialog({
     }
     changeText(await file.text());
   };
-  const commit = (choice: "replace" | "keep-both") => {
+  const commit = (choice: "import" | "replace" | "keep-both") => {
     if (!plan?.ok) return;
     try {
-      setImported({ theme: commitThemeImport(plan, choice), resetPairs: plan.resetPairs });
+      const theme = commitThemeImport(plan, choice);
+      if (theme) setImported({ theme, resetPairs: plan.resetPairs });
+      else setPlan({ ...plan, conflict: true });
     } catch (cause) {
       setSaveError(cause instanceof Error ? cause.message : "Could not save the theme.");
     }
@@ -164,7 +166,7 @@ export function ThemeImportDialog({
                   <Button onClick={() => commit("replace")}>Replace</Button>
                 </>
               ) : plan?.ok ? (
-                <Button onClick={() => commit("replace")}>Import</Button>
+                <Button onClick={() => commit("import")}>Import</Button>
               ) : (
                 <Button onClick={() => setPlan(planThemeImport(text))}>Validate</Button>
               )}

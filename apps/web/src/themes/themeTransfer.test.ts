@@ -95,10 +95,22 @@ describe("theme export and import", () => {
     transfer.commitThemeImport(plan, "replace");
     expect(store.getTheme("night")?.ui?.primary).toBe("#1d4ed8");
 
-    const copy = transfer.commitThemeImport(plan, "keep-both");
+    const copy = transfer.commitThemeImport(plan, "keep-both")!;
     expect(copy.id).not.toBe("night");
     expect(store.getTheme(copy.id)).toEqual(copy);
     expect(store.getTheme("night")).toBeDefined();
+  });
+
+  it("an import with no conflict at validation stores nothing when another window stored that id before Import", async () => {
+    const { transfer, store } = await load();
+    const plan = transfer.planThemeImport(transfer.exportThemeJson(night));
+    expect(plan.ok && !plan.conflict).toBe(true);
+    if (!plan.ok) return;
+    store.saveCustomTheme({ ...night, ui: { primary: "#00ff00" } });
+
+    expect(transfer.commitThemeImport(plan, "import")).toBeNull();
+    expect(store.getTheme("night")?.ui?.primary).toBe("#00ff00");
+    expect(store.listThemes().filter((theme) => theme.name === "Night")).toHaveLength(1);
   });
 
   it("a muted text of 2.1:1 on background is reset, the pair is listed, other overrides are kept, and exporting and importing the result changes nothing more", async () => {
@@ -115,7 +127,7 @@ describe("theme export and import", () => {
     ]);
     expect(plan.theme).toEqual(night);
 
-    const stored = transfer.commitThemeImport(plan, "replace");
+    const stored = transfer.commitThemeImport(plan, "replace")!;
     expect(store.getTheme("night")).toEqual(night);
     const again = transfer.planThemeImport(transfer.exportThemeJson(stored));
     expect(again).toMatchObject({ ok: true, theme: night, resetPairs: [] });

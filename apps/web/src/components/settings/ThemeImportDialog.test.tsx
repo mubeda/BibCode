@@ -112,6 +112,19 @@ describe("ThemeImportDialog", () => {
     expect(dialogText()).toContain("Imported Night.");
   });
 
+  it("Import asks Replace or Keep both when another window stored the same id after Validate", async () => {
+    await mount();
+    await paste(JSON.stringify(night));
+    await click(button("Validate"));
+    saveCustomTheme({ ...night, ui: { primary: "#00ff00" } });
+    await click(button("Import"));
+    expect(getTheme("night")?.ui?.primary).toBe("#00ff00");
+    expect(dialogText()).toContain("A theme with the id night already exists.");
+    await click(button("Replace"));
+    expect(getTheme("night")?.ui?.primary).toBe("#1d4ed8");
+    expect(dialogText()).toContain("Imported Night.");
+  });
+
   it("Done and Cancel close the dialog and the next opening starts empty", async () => {
     await mount();
     await paste(JSON.stringify(night));

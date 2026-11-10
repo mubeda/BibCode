@@ -97,23 +97,24 @@ export function planThemeImport(text: string): ImportPlan {
   const validation = validateThemeFile(parsed, { allowReservedId: false, byteLength });
   if (!validation.ok) return validation;
   const { theme, resetPairs } = resetUnreadablePairs(validation.theme);
-  const existing = getTheme(theme.id);
-  return {
-    ok: true,
-    theme,
-    resetPairs,
-    conflict: existing !== undefined && !isBuiltinThemeId(theme.id),
-  };
+  return { ok: true, theme, resetPairs, conflict: hasCustomTheme(theme.id) };
+}
+
+function hasCustomTheme(id: string): boolean {
+  return getTheme(id) !== undefined && !isBuiltinThemeId(id);
 }
 
 /**
  * Stores a planned import. On an id conflict, "replace" overwrites the stored theme and
- * "keep-both" stores the import under a new id. Throws when the theme cannot be saved.
+ * "keep-both" stores the import under a new id. "import" is the choice-free path: it stores
+ * nothing and returns null when a custom theme took the id since validation (another window),
+ * so the person can choose (R53). Throws when the theme cannot be saved.
  */
 export function commitThemeImport(
   plan: Extract<ImportPlan, { ok: true }>,
-  choice: "replace" | "keep-both",
-): ThemeFile {
+  choice: "import" | "replace" | "keep-both",
+): ThemeFile | null {
+  if (choice === "import" && hasCustomTheme(plan.theme.id)) return null;
   const theme =
     plan.conflict && choice === "keep-both"
       ? { ...plan.theme, id: copyThemeId(plan.theme.id) }
