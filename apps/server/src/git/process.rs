@@ -1808,6 +1808,44 @@ mod tests {
         assert!(lock.exists(), "a lock that changed is never deleted");
     }
 
+    /// Codex review: the record keeps the lock that passed the unchanged check, so a lock
+    /// another Git process put there before the record was made is never deleted later.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_records_the_lock_that_passed_the_check() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return;
+        }
+        let registry = GitWriteRegistry::default();
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
+        let cleanup = watch.after_forced_stop().await;
+        assert!(
+            matches!(cleanup, LockCleanup::RemoveFailed(..)),
+            "{cleanup:?}"
+        );
+        std::fs::write(&lock, "another Git process").expect("another Git takes the lock");
+        let ticket = registry.track().expect("an admitted write");
+
+        ticket.lock_left(lock.clone(), "worktree".to_owned());
+        drop(ticket);
+        writable(&git_dir);
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(
+            lock.exists(),
+            "the other Git process's lock is never deleted"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
         let registry = GitWriteRegistry::default();
