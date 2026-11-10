@@ -125,6 +125,20 @@ describe("ThemeImportDialog", () => {
     expect(dialogText()).toContain("Imported Night.");
   });
 
+  it("Import asks Replace or Keep both and stores nothing when the same id arrives from another window's storage write", async () => {
+    await mount();
+    await paste(JSON.stringify(night));
+    await click(button("Validate"));
+    const other = [{ ...night, ui: { primary: "#00ff00" } }];
+    window.localStorage.setItem("bibcode:themes:v1", JSON.stringify(other));
+    handleThemesStorageEvent({ key: "bibcode:themes:v1" });
+    await click(button("Import"));
+    expect(dialogText()).toContain("A theme with the id night already exists.");
+    expect(button("Replace")).toBeDefined();
+    expect(button("Keep both")).toBeDefined();
+    expect(JSON.parse(window.localStorage.getItem("bibcode:themes:v1")!)).toEqual(other);
+  });
+
   it("Done and Cancel close the dialog and the next opening starts empty", async () => {
     await mount();
     await paste(JSON.stringify(night));
