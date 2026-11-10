@@ -6593,6 +6593,10 @@ esac
         };
         assert_eq!(ended["kind"], "action_finished", "{ended}");
         assert_eq!(ended["result"]["pr"]["status"], "created", "{ended}");
+        assert_eq!(
+            ended["result"]["push"]["status"], "skipped_not_requested",
+            "the pull-request step, not a push, released reads: {ended}"
+        );
     }
 
     /// A reviewed pull request: the fixture repository tracks a local bare

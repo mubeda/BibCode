@@ -6347,7 +6347,8 @@ mod transfer_gate_tests {
             "refusal",
             "timeout",
             "cancellation",
-            "workspace loss",
+            "cancellation from a lost workspace",
+            "dropped caller",
         ] {
             let harness = harness().await;
             let cancellation = CancellationToken::new();
@@ -6370,9 +6371,9 @@ mod transfer_gate_tests {
                 _ => None,
             };
             match outcome {
-                "cancellation" => cancellation.cancel(),
-                // The RPC layer drops the operation when its workspace is lost.
-                "workspace loss" => running.abort(),
+                // The RPC layer cancels and awaits the operation when its workspace is lost.
+                "cancellation" | "cancellation from a lost workspace" => cancellation.cancel(),
+                "dropped caller" => running.abort(),
                 _ => harness.runner.release.add_permits(1),
             }
             let ended = running.await;
@@ -6380,7 +6381,7 @@ mod transfer_gate_tests {
                 "success" => {
                     ended.expect("operation task").expect("push succeeds");
                 }
-                "workspace loss" => assert!(ended.is_err(), "the operation was dropped"),
+                "dropped caller" => assert!(ended.is_err(), "the operation was dropped"),
                 _ => {
                     let error = ended.expect("operation task").expect_err("the push fails");
                     if outcome == "timeout" {
