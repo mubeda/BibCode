@@ -877,18 +877,36 @@ fn takes_index_lock(args: &[OsString]) -> bool {
             None => return false,
         }
     };
-    let rest = words.collect::<Vec<_>>();
+    // Options end at `--`: what follows are paths, however they look.
+    let rest = words.take_while(|word| *word != "--").collect::<Vec<_>>();
     let has = |flag: &str| rest.contains(&flag);
     match subcommand {
         "add" | "cherry-pick" | "commit" | "merge" | "rebase" | "restore" | "revert" | "rm" => true,
         "reset" => !has("--soft"),
-        // Creating a branch at the current commit leaves the index alone.
-        "checkout" | "switch" => !["-b", "-B", "-c", "-C"].into_iter().any(has),
+        "checkout" | "switch" => checkout_takes_index_lock(&rest),
         "apply" => has("--cached"),
         "stash" => matches!(rest.first(), Some(&("push" | "apply" | "pop"))),
         // `pull` holds no lock while it fetches, which is where it waits.
         _ => false,
     }
+}
+
+/// Creating a branch with no start point leaves the index alone. Any other checkout, including
+/// a new branch at a start point, merges a tree into the index under the lock.
+fn checkout_takes_index_lock(options: &[&str]) -> bool {
+    let (mut new_branch, mut start_point) = (false, false);
+    let mut words = options.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "-b" | "-B" | "-c" | "-C" | "--orphan" => {
+                new_branch = true;
+                words.next();
+            }
+            option if option.starts_with('-') => {}
+            _ => start_point = true,
+        }
+    }
+    !new_branch || start_point
 }
 
 /// Windows answers a missing working directory with `ERROR_DIRECTORY` ("not a directory"); it is
