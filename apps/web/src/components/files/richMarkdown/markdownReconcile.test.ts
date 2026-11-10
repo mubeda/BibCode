@@ -47,6 +47,14 @@ describe("reconcileMarkdown", () => {
     );
   });
 
+  it("a paragraph inserted inside a block quote keeps the quote's `> ` prefix", () => {
+    const original = "> a\n>\n> b\n";
+    const before = "> a\n>\n> b";
+    const after = "> a\n>\n> new\n>\n> b";
+
+    expect(reconcileMarkdown({ original, before, after })).toBe("> a\n>\n> new\n>\n> b\n");
+  });
+
   it("writes a changed block with the original's CRLF line endings", () => {
     const original = corpus.crlfLineEndings;
     const before = "# Title\n\nFirst paragraph.\n\nSecond paragraph.";

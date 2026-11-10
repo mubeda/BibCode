@@ -685,3 +685,8 @@ was reproduced as a failing test before the fix.
   case failed until the read-only view closed its visit on unmount, because the toggle is
   then not used. The footnote case in `FilePreviewPanel.test.tsx` now asserts that the
   session keeps its source editor and cache key.
+- Coordinator, a paragraph inserted inside a block quote was saved as `>Inserted`.
+  `fromAfter` wrote every continuation line with no text after its prefix as the prefix
+  without its trailing space, including the last line of a separator, which leads into the
+  next block's text. Fixed: that last line keeps the whole prefix, so the saved line reads
+  `> Inserted`.

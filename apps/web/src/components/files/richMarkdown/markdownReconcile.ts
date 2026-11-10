@@ -253,15 +253,19 @@ interface Level {
 /** Text from `after`, moved into `original`'s container prefix and line endings. */
 function fromAfter(level: Level, text: string): string {
   const { afterPrefix, originalPrefix } = level;
-  const lines = text.split("\n").map((line, index) => {
+  const lines = text.split("\n");
+  const moved = lines.map((line, index) => {
     if (index === 0) return line;
     let rest = line;
     if (rest.startsWith(afterPrefix)) rest = rest.slice(afterPrefix.length);
     else if (rest.startsWith(afterPrefix.trimEnd()))
       rest = rest.slice(afterPrefix.trimEnd().length);
-    return rest === "" ? originalPrefix.trimEnd() : `${originalPrefix}${rest}`;
+    // The last line leads into the next block's text, so it keeps the whole prefix.
+    return rest === "" && index < lines.length - 1
+      ? originalPrefix.trimEnd()
+      : `${originalPrefix}${rest}`;
   });
-  return lines.join(level.eol);
+  return moved.join(level.eol);
 }
 
 function textOf(parsed: Parsed, block: Block): string {
