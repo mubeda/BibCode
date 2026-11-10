@@ -93,6 +93,19 @@ describe("ThemeImportDialog", () => {
     expect(dialogText()).toContain("Imported Night.");
   });
 
+  it("Done and Cancel close the dialog and the next opening starts empty", async () => {
+    await mount();
+    await paste(JSON.stringify(night));
+    await click(button("Validate"));
+    await click(button("Import"));
+    await click(button("Done"));
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+    expect(document.querySelector("textarea")?.value).toBe("");
+    await paste("{}");
+    await click(button("Cancel"));
+    expect(document.querySelector("textarea")?.value).toBe("");
+  });
+
   it("after import a notice names the pairs that were reset to base values", async () => {
     await mount();
     await paste(JSON.stringify({ ...night, ui: { ...night.ui, "muted-foreground": "#484d55" } }));

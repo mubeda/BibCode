@@ -42,6 +42,11 @@ export function ThemeImportDialog({
     setImported(null);
     setSaveError(null);
   };
+  // Every way out (Done, Cancel, Escape, the close button) leaves the next opening empty.
+  const close = () => {
+    reset();
+    onOpenChange(false);
+  };
   const changeText = (next: string) => {
     setText(next);
     setPlan(null);
@@ -62,13 +67,7 @@ export function ThemeImportDialog({
   };
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) reset();
-        onOpenChange(next);
-      }}
-    >
+    <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
       <DialogPopup>
         <DialogHeader>
           <DialogTitle>Import theme</DialogTitle>
@@ -145,10 +144,10 @@ export function ThemeImportDialog({
         </DialogPanel>
         <DialogFooter>
           {imported ? (
-            <Button onClick={() => onOpenChange(false)}>Done</Button>
+            <Button onClick={close}>Done</Button>
           ) : (
             <>
-              <Button variant="ghost" onClick={() => onOpenChange(false)}>
+              <Button variant="ghost" onClick={close}>
                 Cancel
               </Button>
               {plan?.ok && plan.conflict ? (
