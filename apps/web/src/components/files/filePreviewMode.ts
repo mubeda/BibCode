@@ -1,4 +1,21 @@
+import {
+  findUnsupportedConstruct,
+  splitFrontmatter,
+  type UnsupportedConstruct,
+} from "./richMarkdown/markdownSupport";
+
 export const isMarkdownPreviewFile = (path: string): boolean => /\.(?:md|mdx)$/i.test(path);
+
+/** Whether the rendered view of `path` may be edited, and why not when it may not (R34). */
+export function richMarkdownMode(
+  path: string,
+  source: string,
+): { editable: true } | { editable: false; reason: UnsupportedConstruct | "mdx" | "not-markdown" } {
+  if (!isMarkdownPreviewFile(path)) return { editable: false, reason: "not-markdown" };
+  if (/\.mdx$/i.test(path)) return { editable: false, reason: "mdx" };
+  const reason = findUnsupportedConstruct(splitFrontmatter(source).body);
+  return reason === null ? { editable: true } : { editable: false, reason };
+}
 
 /**
  * How the Files panel shows a file, chosen from its extension before any text read. The server's

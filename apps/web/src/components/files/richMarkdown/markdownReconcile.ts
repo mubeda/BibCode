@@ -33,11 +33,11 @@ interface Parsed {
 }
 
 const CONTAINER_KINDS = new Set(["list", "listItem", "blockquote", "table"]);
-const DETAILS_OPEN =
+export const DETAILS_OPEN =
   /^<details(?:\s+open(?:\s*=\s*(?:""|"open"|''|'open'|open))?)?\s*>\s*<summary>([^<]*)<\/summary>\s*$/i;
-const DETAILS_WHOLE =
+export const DETAILS_WHOLE =
   /^<details(?:\s+open(?:\s*=\s*(?:""|"open"|''|'open'|open))?)?\s*>\s*<summary>([^<]*)<\/summary>([\s\S]*?)<\/details>\s*$/i;
-const DETAILS_CLOSE = /^<\/details>\s*$/i;
+export const DETAILS_CLOSE = /^<\/details>\s*$/i;
 
 const processor = unified().use(remarkParse).use(remarkGfm);
 const parseCache = new Map<string, Parsed>();
