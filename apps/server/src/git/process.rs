@@ -704,6 +704,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn git_stop_only_git_gets_the_ask_first_policy() {
+        let sandbox = TestSandbox::new("git-stop-policy");
+        let policy = |command: &str| {
+            let request = fixture_request(&sandbox, "fixture-policy", PathBuf::from(command));
+            supervised_request(&request, Command::new(command)).stop_policy
+        };
+
+        assert_eq!(policy("git"), StopPolicy::AskThenForce);
+        assert_eq!(policy("/usr/bin/git"), StopPolicy::AskThenForce);
+        #[cfg(windows)]
+        assert_eq!(
+            policy("C:\\Program Files\\Git\\cmd\\git.exe"),
+            StopPolicy::AskThenForce
+        );
+        assert_eq!(policy("trash"), StopPolicy::Force);
+        assert_eq!(policy("gitk"), StopPolicy::Force);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn runner_uses_command_local_environment_for_parallel_children() {
         async fn run(label: &str) -> ProcessOutput {

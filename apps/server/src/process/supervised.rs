@@ -1749,4 +1749,184 @@ mod tests {
         .expect_err("closed stdin should fail");
         assert!(matches!(error, SupervisedRunError::Stdin(_)));
     }
+
+    /// Runs `request` with its stop report and cancels it once `ready` exists. Returns the
+    /// outcome, the report and the time from the cancellation to the outcome.
+    async fn cancel_when_ready(
+        request: SupervisedRunRequest,
+        ready: &std::path::Path,
+    ) -> (
+        Result<SupervisedRunOutput, SupervisedRunError>,
+        TerminationReport,
+        Duration,
+    ) {
+        let cancellation = CancellationToken::new();
+        let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let run = run_supervised_reporting(request, &cancellation, report_sender);
+        tokio::pin!(run);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::select! {
+            () = async {
+                while !ready.exists() {
+                    assert!(tokio::time::Instant::now() < deadline, "the child never started");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            result = &mut run => panic!("the child must still be running, got {result:?}"),
+        }
+        let cancelled = Instant::now();
+        cancellation.cancel();
+        let outcome = run.await;
+        let elapsed = cancelled.elapsed();
+        let report = tokio::time::timeout(Duration::from_secs(10), report.recv())
+            .await
+            .expect("the report arrives")
+            .expect("the report is sent");
+        (outcome, report, elapsed)
+    }
+
+    #[cfg(unix)]
+    fn stop_policy_request(
+        script: &str,
+        marker: &std::path::Path,
+        policy: StopPolicy,
+    ) -> SupervisedRunRequest {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script, "fixture"])
+            .arg(marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+            max_output_bytes: 1024,
+            overflow: SupervisedOverflow::Truncate,
+            stop_policy: policy,
+        }
+    }
+
+    /// Stops when asked: the trap removes the marker, as Git removes its lock.
+    #[cfg(unix)]
+    const STOPS_WHEN_ASKED: &str =
+        "trap 'rm -f \"$1\"; exit 0' TERM; touch \"$1\"; while :; do sleep 0.05; done";
+    /// Ignores the request: the group ignores TERM, and only a forced stop ends it.
+    #[cfg(unix)]
+    const IGNORES_THE_REQUEST: &str = "trap '' TERM; echo $$ > \"$1\"; exec sleep 30";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_asks_first_and_the_child_exits_cleanly() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("lock");
+
+        let (outcome, _, elapsed) = cancel_when_ready(
+            stop_policy_request(STOPS_WHEN_ASKED, &marker, StopPolicy::AskThenForce),
+            &marker,
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(!marker.exists(), "the child removed its marker when asked");
+        assert!(elapsed < GRACEFUL_STOP_WAIT, "stopped in {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_forces_after_two_seconds_when_ignored() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("pid");
+
+        let (outcome, _, elapsed) = cancel_when_ready(
+            stop_policy_request(IGNORES_THE_REQUEST, &marker, StopPolicy::AskThenForce),
+            &marker,
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(elapsed >= GRACEFUL_STOP_WAIT, "forced after {elapsed:?}");
+        let pid = std::fs::read_to_string(&marker)
+            .expect("child PID")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("numeric PID");
+        // SAFETY: signal 0 only checks whether the reaped fixture PID still names a process.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the ignoring child is gone");
+    }
+
+    #[tokio::test]
+    async fn git_stop_default_policy_still_forces_at_once() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("ready");
+        #[cfg(unix)]
+        let request = stop_policy_request(STOPS_WHEN_ASKED, &marker, StopPolicy::Force);
+        #[cfg(windows)]
+        let request = {
+            let mut command = Command::new("cmd");
+            command
+                .arg("/C")
+                .raw_arg(format!(
+                    "type nul > \"{}\" & ping -n 30 127.0.0.1 > nul",
+                    marker.display()
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            SupervisedRunRequest {
+                command,
+                stdin: None,
+                timeout: Duration::from_secs(30),
+                cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+                max_output_bytes: 1024,
+                overflow: SupervisedOverflow::Truncate,
+                stop_policy: StopPolicy::Force,
+            }
+        };
+
+        let (outcome, report, elapsed) = cancel_when_ready(request, &marker).await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(elapsed < GRACEFUL_STOP_WAIT, "forced in {elapsed:?}");
+        assert!(report.forced, "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_reports_whether_the_stop_was_forced() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let asked = directory.path().join("asked");
+        let ignored = directory.path().join("ignored");
+
+        let (_, stopped_when_asked, _) = cancel_when_ready(
+            stop_policy_request(STOPS_WHEN_ASKED, &asked, StopPolicy::AskThenForce),
+            &asked,
+        )
+        .await;
+        let (_, forced, _) = cancel_when_ready(
+            stop_policy_request(IGNORES_THE_REQUEST, &ignored, StopPolicy::AskThenForce),
+            &ignored,
+        )
+        .await;
+
+        assert_eq!(
+            stopped_when_asked,
+            TerminationReport {
+                requested: true,
+                forced: false,
+                exited: true
+            }
+        );
+        assert_eq!(
+            forced,
+            TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true
+            }
+        );
+    }
 }
