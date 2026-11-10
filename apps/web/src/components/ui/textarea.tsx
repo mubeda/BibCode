@@ -21,6 +21,7 @@ function Textarea({ className, size = "default", unstyled = false, ...props }: T
           className,
         ) || undefined
       }
+      data-focus-ring-owner=""
       data-size={size}
       data-slot="textarea-control"
     >
