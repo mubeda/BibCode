@@ -1187,6 +1187,57 @@ mod tests {
         assert!(!lock.exists(), "the cleanup still removed the lock");
     }
 
+    /// A lock that stayed unchanged but could not be deleted is not someone else's: the cleanup
+    /// says it failed, and shutdown does not report a clean stop.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_reports_a_lock_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return;
+        }
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let registry = GitWriteRegistry::default();
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(git_dir.path(), read_only).expect("read-only Git directory");
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        reports
+            .send(TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true,
+            })
+            .expect("the stop report");
+
+        let cleanup = IndexLockWatch {
+            lock: watch.lock.clone(),
+            existed: watch.existed,
+        }
+        .after_forced_stop()
+        .await;
+        WriteSettlement {
+            _ticket: registry.track().expect("an admitted write"),
+            watch: Some(watch),
+            received,
+            operation: "fixture-write".to_owned(),
+            cwd: git_dir.path().to_path_buf(),
+        }
+        .settle_now_or_later()
+        .await;
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("writable Git directory");
+        assert_eq!(cleanup, LockCleanup::RemoveFailed);
+        assert!(lock.exists(), "the lock could not be removed");
+        assert_eq!(outcome, QuiesceOutcome::LocksLeft(1));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
         let registry = GitWriteRegistry::default();
