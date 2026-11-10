@@ -1683,6 +1683,29 @@ mod tests {
         assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// The background stop of a dropped ask-first run may never be polled, when its runtime
+    /// ends first. The group must still be killed then, as a plain dropped run is.
+    #[cfg(unix)]
+    #[test]
+    fn git_stop_a_dropped_run_is_killed_even_if_its_background_stop_never_runs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (child, kill_calls, _wait_calls) = runtime.block_on(async { tracking_child(false) });
+
+        runtime.block_on(async {
+            drop(SupervisedChildGuard::arm_with(
+                child,
+                StopPolicy::AskThenForce,
+                None,
+            ));
+        });
+        drop(runtime);
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_guard_without_a_root_id_is_not_signalled() {
         let (child, kill_calls, wait_calls) = pending_child(None);
