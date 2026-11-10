@@ -195,7 +195,14 @@ structure, level by level, starting at the root.
    delimiter in its head. Unmatched `before` children are dropped.
 5. Between two emitted children that both have an original, the separator is
    `original`'s text after the first of them up to the next original node, so a deleted
-   block between them is not copied back. In every other case it is `after`'s separator.
+   block between them is not copied back. An original child after an inserted one keeps
+   the separator that led into it in `original` when that separator holds a blank line at
+   this depth (a line that is empty once the level's prefix, such as `>`, is removed). In
+   every other case it is `after`'s separator. Table rows have their own rule: the
+   separator after the first emitted row is `original`'s text between its first two rows,
+   which holds the delimiter row, and every other row separator is the line ending and the
+   level's prefix. So a row inserted above or below the header row never copies the
+   delimiter row a second time.
 6. Text taken from `after` inside a container has its continuation-line prefix (`> ` or
    the list indent, with markers read as spaces) replaced by `original`'s prefix at that
    place.
@@ -653,3 +660,14 @@ was reproduced as a failing test before the fix.
   file." with "Switch to source view to keep it." The toolbar's Save and the save shortcut
   share `saveFile` for this. Switching to source view unmounts the surface, which delivers
   the editor's whole serialization when the reconcile still throws.
+- Codex, reproduced with the real editor, the blank-line test of the previous fix (a match
+  of `\n[^\n]*\n`) accepted any line between two blocks, including a table's delimiter
+  row. A row added above the first body row copied the delimiter row again, the table
+  parsed differently, and the fallback rewrote the untouched rows with TipTap's padding.
+  This held with CRLF, in a block quote and in a details body. A sweep test now inserts a
+  block at every boundary of the root, every table, list, block quote and details body in
+  each editable corpus fixture, and checks that every untouched block keeps its bytes. It
+  also found that a row added above the header row copied the delimiter row in the branch
+  where both rows have an original, which predates the previous fix. Fixed: the separator
+  is kept only when one of its lines is blank at this depth, and table rows take the rule
+  in step 5, with exactly one delimiter separator.

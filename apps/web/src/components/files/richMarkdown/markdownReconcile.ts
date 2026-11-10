@@ -506,10 +506,27 @@ function join(
   afterBlocks: readonly Block[],
   emitted: readonly Emitted[],
 ): string {
+  const { eol, originalPrefix } = level;
+  const afterSeparator = (previous: Emitted, block: Emitted) =>
+    fromAfter(
+      level,
+      level.after.source.slice(afterBlocks[previous.after]!.end, afterBlocks[block.after]!.start),
+    );
+  const rows = originalBlocks[0]?.kind === "tableRow";
   let text = "";
   emitted.forEach((block, index) => {
     const previous = emitted[index - 1];
-    if (previous) {
+    if (previous && rows) {
+      // Exactly one separator holds the delimiter row: the one after the first emitted row.
+      if (index === 1) {
+        text +=
+          originalBlocks.length > 1
+            ? level.original.source.slice(originalBlocks[0]!.end, originalBlocks[1]!.start)
+            : afterSeparator(previous, block);
+      } else {
+        text += `${eol}${originalPrefix}`;
+      }
+    } else if (previous) {
       if (
         previous.original !== null &&
         block.original !== null &&
@@ -520,8 +537,6 @@ function join(
         const to = originalBlocks[previous.original + 1]!;
         text += level.original.source.slice(from.end, to.start);
       } else {
-        const from = afterBlocks[previous.after]!;
-        const to = afterBlocks[block.after]!;
         const leading =
           block.original !== null && block.original > 0
             ? level.original.source.slice(
@@ -530,10 +545,13 @@ function join(
               )
             : "";
         // After an inserted block, an original block keeps the blank lines that led into it.
-        // One without a blank line would join the inserted block to it, so it takes `after`'s.
-        text += /\n[^\n]*\n/.test(leading)
-          ? leading
-          : fromAfter(level, level.after.source.slice(from.end, to.start));
+        // One without a blank line at this depth would join the inserted block to it.
+        const quote = originalPrefix.trimEnd();
+        const blank = leading
+          .split(/\r?\n/)
+          .slice(1, -1)
+          .some((line) => line.startsWith(quote) && line.slice(quote.length).trim() === "");
+        text += blank ? leading : afterSeparator(previous, block);
       }
     }
     text += block.text;
