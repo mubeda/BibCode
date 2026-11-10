@@ -1092,6 +1092,56 @@ mod tests {
         );
     }
 
+    /// The write's settlement removes the lock only after a forced stop, and releases the write
+    /// either way. On Linux and macOS a real Git write stops when asked, so only this test
+    /// reaches the forced branch there.
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_settles_only_a_forced_stop() {
+        for (report, lock_remains) in [
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: true,
+                    exited: true,
+                },
+                false,
+            ),
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: false,
+                    exited: true,
+                },
+                true,
+            ),
+        ] {
+            let git_dir = tempfile::tempdir().expect("Git directory");
+            let lock = git_dir.path().join("index.lock");
+            let registry = GitWriteRegistry::default();
+            let watch = IndexLockWatch::before_spawn(git_dir.path());
+            std::fs::write(&lock, "").expect("the write's lock");
+            let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+            reports.send(report).expect("the stop report");
+
+            WriteSettlement {
+                _ticket: registry.track().expect("an admitted write"),
+                watch: Some(watch),
+                received,
+                operation: "fixture-write".to_owned(),
+                cwd: git_dir.path().to_path_buf(),
+            }
+            .settle_now_or_later()
+            .await;
+
+            assert_eq!(lock.exists(), lock_remains, "{report:?}");
+            assert_eq!(
+                registry.stop_all_and_wait(Duration::from_secs(1)).await,
+                QuiesceOutcome::Clean,
+                "the settled write is released"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
         let registry = GitWriteRegistry::default();

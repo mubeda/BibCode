@@ -387,7 +387,12 @@ impl Drop for SupervisedChildGuard {
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let asked = ask && signal_stop_request(&*child);
-            runtime.spawn(stop_dropped_child(child, asked, reports));
+            // Armed here, not in the task: a task dropped unpolled still kills the group.
+            runtime.spawn(stop_dropped_child(
+                SupervisedChildGuard::arm(child),
+                asked,
+                reports,
+            ));
             return;
         }
         terminate_dropped_child(&mut *child);
@@ -396,11 +401,10 @@ impl Drop for SupervisedChildGuard {
 
 /// The background half of a dropped [`StopPolicy::AskThenForce`] or reporting run.
 async fn stop_dropped_child(
-    child: Box<dyn ChildWrapper>,
+    mut guard: SupervisedChildGuard,
     asked: bool,
     reports: Option<TerminationReports>,
 ) {
-    let mut guard = SupervisedChildGuard::arm(child);
     let stopped_when_asked = asked && wait_for_exit(guard.child_mut(), GRACEFUL_STOP_WAIT).await;
     terminate_and_wait_owned(
         guard.disarm(),
