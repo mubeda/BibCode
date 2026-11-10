@@ -638,20 +638,27 @@ function terminalThemesEqual(left: ITheme, right: ITheme): boolean {
 function repaintTerminalTheme(
   terminal: Terminal,
   resolvedTheme: TerminalThemeMode,
-  mountElement?: HTMLElement | null,
-  palette?: TerminalPalette,
+  mountElement: HTMLElement | null,
+  palette: TerminalPalette | undefined,
+  appThemeIsBuiltin: boolean,
 ): void {
-  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement, palette);
+  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement, palette, appThemeIsBuiltin);
   const currentTheme = terminal.options.theme;
   if (currentTheme && terminalThemesEqual(currentTheme, nextTheme)) return;
   terminal.options.theme = nextTheme;
   terminal.refresh(0, terminal.rows - 1);
 }
 
+/**
+ * `appThemeIsBuiltin` is true while the app shows built-in Light or Dark. Only then does a
+ * built-in palette take the app's panel surfaces, as it always has; under a custom app theme it
+ * keeps the built-in colors the shell is told about (R51).
+ */
 export function terminalThemeFromApp(
   resolvedTheme: TerminalThemeMode,
-  mountElement?: HTMLElement | null,
-  palette?: TerminalPalette,
+  mountElement: HTMLElement | null | undefined,
+  palette: TerminalPalette | undefined,
+  appThemeIsBuiltin: boolean,
 ): ITheme {
   // A theme's own terminal colors (preference "Follow app theme"), as the session launched them.
   // A running session keeps them in their own mode whatever the app shows now (R51).
@@ -684,7 +691,7 @@ export function terminalThemeFromApp(
   const panelStyles = getComputedStyle(panelSurface);
   const bodyStyles = getComputedStyle(document.body);
   const requestedThemeMatchesDocument =
-    document.documentElement.classList.contains("dark") === isDark;
+    appThemeIsBuiltin && document.documentElement.classList.contains("dark") === isDark;
   const background = requestedThemeMatchesDocument
     ? normalizeComputedColor(
         panelStyles.backgroundColor,
@@ -1149,6 +1156,9 @@ export function TerminalViewport({
     : resolvedTheme;
   const readEffectiveTerminalTheme = useEffectEvent(() => effectiveTerminalTheme);
   const readLaunchPalette = useEffectEvent(() => launchTheme.palette);
+  const readAppThemeIsBuiltin = useEffectEvent(
+    () => resolvedThemeId === "light" || resolvedThemeId === "dark",
+  );
   const nativeThemeMismatch =
     hasPersistentWindowsConsoleTheme &&
     terminalStatus === "running" &&
@@ -1313,7 +1323,12 @@ export function TerminalViewport({
       fontSize: 12,
       scrollback: 5_000,
       fontFamily: readTerminalFontFamily(),
-      theme: terminalThemeFromApp(readEffectiveTerminalTheme(), mount, readLaunchPalette()),
+      theme: terminalThemeFromApp(
+        readEffectiveTerminalTheme(),
+        mount,
+        readLaunchPalette(),
+        readAppThemeIsBuiltin(),
+      ),
       // OSC 8 activations bypass the link provider, so apply the same activation guard here.
       linkHandler: {
         activate: (event, uri, range) => {
@@ -2010,6 +2025,7 @@ export function TerminalViewport({
         readEffectiveTerminalTheme(),
         containerRef.current,
         readLaunchPalette(),
+        readAppThemeIsBuiltin(),
       );
     });
     themeObserver.observe(document.documentElement, {
@@ -2119,6 +2135,7 @@ export function TerminalViewport({
       effectiveTerminalTheme,
       containerRef.current,
       readLaunchPalette(),
+      readAppThemeIsBuiltin(),
     );
   }, [effectiveTerminalTheme]);
 
