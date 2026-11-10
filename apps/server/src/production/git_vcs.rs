@@ -1454,6 +1454,32 @@ impl GitVcsRpcServices {
             let cwd = tokio::fs::canonicalize(&input.cwd)
                 .await
                 .unwrap_or_else(|_| input.cwd.clone());
+            let start_lookup = |local: VcsStatusLocalResult| {
+                let cancellation = operation_cancellation.child_token();
+                let task_token = cancellation.clone();
+                let task_pull_requests = pull_requests.clone();
+                let task_cwd = input.cwd.clone();
+                let ref_name = local.ref_name.clone();
+                #[cfg(test)]
+                let task_test_hook = enrichment_test_hook.clone();
+                let task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let Some(hook) = &task_test_hook {
+                        hook.block(&task_token).await;
+                    }
+                    if task_token.is_cancelled() {
+                        return None;
+                    }
+                    lookup_open_pull_request(&task_pull_requests, &task_cwd, &local, &task_token)
+                        .await
+                });
+                StatusStreamEnrichment {
+                    cancellation,
+                    task,
+                    ref_name,
+                    look_again: None,
+                }
+            };
             let mut enrichment: Option<StatusStreamEnrichment> = None;
             let mut shown = ShownStatus::default();
             loop {
@@ -1470,13 +1496,18 @@ impl GitVcsRpcServices {
                     found = async {
                         (&mut enrichment.as_mut().expect("lookup in flight").task).await
                     }, if enrichment.is_some() => {
-                        let ref_name = enrichment.take().expect("lookup in flight").ref_name;
+                        let finished = enrichment.take().expect("lookup in flight");
                         if let Ok(Some(pull_request)) = found {
-                            broadcaster.record_pull_request(&cwd, ref_name.as_deref(), pull_request);
+                            broadcaster.record_pull_request(
+                                &cwd,
+                                finished.ref_name.as_deref(),
+                                pull_request,
+                            );
                         }
                         if !shown.reconcile(&sender, &broadcaster, &cwd).await {
                             break;
                         }
+                        enrichment = finished.look_again.map(start_lookup);
                     }
                     publication = subscription.recv_publication() => {
                         let publication = match publication {
@@ -1487,23 +1518,23 @@ impl GitVcsRpcServices {
                             }
                             None => break,
                         };
-                        // A local update on the same branch leaves the lookup running. Its
-                        // answer is delivered under the newest fence the subscriber received.
-                        let keeps_lookup = matches!(
-                            &publication.value,
-                            VcsStatusStreamEvent::LocalUpdated { local }
-                                if enrichment
-                                    .as_ref()
-                                    .is_some_and(|lookup| lookup.ref_name == local.ref_name)
-                        );
-                        if !keeps_lookup {
-                            stop_status_stream_enrichment(&mut enrichment).await;
-                        }
-                        let looks_up = matches!(
+                        // A lookup for the same branch keeps running, so restarting it cannot
+                        // starve a slow forge. Its answer is delivered under the newest fence the
+                        // subscriber received, and an event that asks again looks once it ends.
+                        let mut looks_up = matches!(
                             &publication.value,
                             VcsStatusStreamEvent::Snapshot { remote: Some(_), .. }
                                 | VcsStatusStreamEvent::RemoteUpdated { remote: Some(_) }
-                        );
+                        )
+                        .then(|| publication.local.clone());
+                        match enrichment.as_mut() {
+                            Some(lookup) if lookup.ref_name == publication.local.ref_name => {
+                                if looks_up.is_some() {
+                                    lookup.look_again = looks_up.take();
+                                }
+                            }
+                            _ => stop_status_stream_enrichment(&mut enrichment).await,
+                        }
                         if !shown
                             .send(&sender, &broadcaster, &publication.fence, publication.value)
                             .await
@@ -1511,36 +1542,8 @@ impl GitVcsRpcServices {
                         {
                             break;
                         }
-                        if looks_up {
-                            let task_cancellation = operation_cancellation.child_token();
-                            let task_token = task_cancellation.clone();
-                            let task_pull_requests = pull_requests.clone();
-                            let task_cwd = input.cwd.clone();
-                            let task_local = publication.local;
-                            let ref_name = task_local.ref_name.clone();
-                            #[cfg(test)]
-                            let task_test_hook = enrichment_test_hook.clone();
-                            let task = tokio::spawn(async move {
-                                #[cfg(test)]
-                                if let Some(hook) = &task_test_hook {
-                                    hook.block(&task_token).await;
-                                }
-                                if task_token.is_cancelled() {
-                                    return None;
-                                }
-                                lookup_open_pull_request(
-                                    &task_pull_requests,
-                                    &task_cwd,
-                                    &task_local,
-                                    &task_token,
-                                )
-                                .await
-                            });
-                            enrichment = Some(StatusStreamEnrichment {
-                                cancellation: task_cancellation,
-                                task,
-                                ref_name,
-                            });
+                        if let Some(local) = looks_up {
+                            enrichment = Some(start_lookup(local));
                         }
                     }
                 }
@@ -3457,6 +3460,8 @@ struct StatusStreamEnrichment {
     cancellation: CancellationToken,
     task: tokio::task::JoinHandle<Option<Option<ChangeRequest>>>,
     ref_name: Option<String>,
+    /// The newest status whose publication asked for a lookup while this one ran.
+    look_again: Option<VcsStatusLocalResult>,
 }
 
 async fn stop_status_stream_enrichment(enrichment: &mut Option<StatusStreamEnrichment>) {
@@ -8171,16 +8176,18 @@ mod open_pull_request_lookup_tests {
     use crate::test_support::TestSandbox;
 
     /// Records the `--head` branch of every `pr list`, then answers from
-    /// marker files: `fail` exits 1, `slow` sleeps its contents in seconds,
-    /// and `open` returns one open PR for the requested branch.
+    /// marker files read when it starts: `fail` exits 1, `slow` sleeps its
+    /// contents in seconds, and `open` returns one open PR for the requested
+    /// branch.
     const FAKE_GH: &str = r#"#!/bin/sh
 case "$1:$2" in
   pr:list)
     printf '%s\n' "$4" >> 'CALLS'
     printf '%s\n' "$$" >> 'PIDS'
     if [ -f 'STATE/fail' ]; then echo 'forge unavailable' >&2; exit 1; fi
+    open=''; if [ -f 'STATE/open' ]; then open=1; fi
     if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
-    if [ -f 'STATE/open' ]; then
+    if [ -n "$open" ]; then
       printf '[{"number":42,"title":"PR for %s","url":"https://github.com/acme/repo/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
     else
       printf '[]\n'
@@ -9076,6 +9083,29 @@ esac
             ["main", "main"],
             "the refreshes must not restart the subscriber's lookup"
         );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_change_reported_during_a_lookup_is_looked_up_again() {
+        let fixture = Fixture::new("pr-lookup-again");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // A lookup that started before the request was created answers that none is open.
+        fixture.set("slow", "1");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        fixture.set("open", "");
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the reported request must be looked up again", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        assert_eq!(fixture.lookups(), ["main", "main", "main"]);
         cancellation.cancel();
     }
 

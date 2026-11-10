@@ -630,9 +630,10 @@ changes that occur only on an unmounted remote host are outside the native-watch
 boundary and likewise require an explicit invalidation or safety convergence.
 
 Post-fetch remote reconciliation acquires the same worktree epoch before Git
-work and rechecks it around publication. Stream and
-unary pull-request enrichment carry that producing epoch internally through
-their final delivery check; the public status schemas contain no epoch field.
+work and rechecks it around publication. Unary pull-request enrichment carries
+that producing epoch internally through its final delivery check. Stream
+enrichment delivers under the epoch of the newest event its subscriber
+received, as described below. The public status schemas contain no epoch field.
 Cached remote state is reused only with a local snapshot from the same epoch
 and ref identity. A watcher, safety, or explicit local observation of a ref
 change clears server cache,
@@ -668,9 +669,11 @@ way the client reducer does. After every event it sends, the stream compares
 the request its subscriber shows with the known one and sends a remote update
 when they differ. That send uses the fence of the newest event the subscriber
 received, so an answer that arrives across an epoch change waits for the next
-event that passes its fence and is delivered once. A same-branch local update
-leaves the stream's lookup running; a snapshot, a remote update or a branch
-change starts it again.
+event that passes its fence and is delivered once. An event for the same branch
+leaves the stream's lookup running, so repeated events cannot keep a slow
+forge from answering. A snapshot or remote update that arrives meanwhile asks
+for one more lookup when the running one ends, which reads a fresh answer
+after an invalidation. A branch change stops the lookup.
 
 When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
 most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it drops its
