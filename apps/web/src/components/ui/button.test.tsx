@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vite-plus/test";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vite-plus/test";
 
-import { buttonVariants } from "./button";
+import { ComposerPrimaryActions } from "../chat/ComposerPrimaryActions";
+import { Button, buttonVariants } from "./button";
 
 describe("buttonVariants default theme tokens", () => {
   it("the default button hovers with primary-hover and presses with primary-active", () => {
@@ -21,5 +23,31 @@ describe("buttonVariants content size", () => {
     expect(classes).toContain("sm:min-h-8");
     expect(classes).not.toMatch(/(?:^|\s)h-[^\s]+/);
     expect(classes).not.toMatch(/(?:^|\s)sm:h-[^\s]+/);
+  });
+});
+
+describe("control shadow markers (#290, R59)", () => {
+  it("the button and the Send button carry the control-shadow marker", () => {
+    expect(renderToStaticMarkup(<Button>Save</Button>)).toContain('data-control-shadow=""');
+    const send = renderToStaticMarkup(
+      <ComposerPrimaryActions
+        compact={false}
+        pendingAction={null}
+        isRunning={false}
+        showPlanFollowUpPrompt={false}
+        promptHasText
+        isSendBusy={false}
+        isConnecting={false}
+        isEnvironmentUnavailable={false}
+        isPreparingWorktree={false}
+        hasSendableContent
+        onPreviousPendingQuestion={vi.fn()}
+        onInterrupt={vi.fn()}
+        onImplementPlanInNewThread={vi.fn()}
+      />,
+    );
+    expect(send).toMatch(
+      /<button[^>]*type="submit"[^>]*data-control-shadow=""|<button[^>]*data-control-shadow=""[^>]*type="submit"/,
+    );
   });
 });

@@ -1,8 +1,14 @@
+// @effect-diagnostics nodeBuiltinImport:off - The token checks read the checked-in stylesheet.
+import * as NodeFS from "node:fs";
 import * as NodeURL from "node:url";
 import { build, normalizePath, type Rollup } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { Window } from "happy-dom";
 import tailwindcss from "@tailwindcss/vite";
+
+import { buttonVariants } from "./components/ui/button";
+
+const css = NodeFS.readFileSync(new URL("./index.css", import.meta.url), "utf8");
 
 let windowInstance: Window;
 let originalDocument: Document | undefined;
@@ -263,6 +269,120 @@ describe("application theme tokens", () => {
     const after = diagramColors();
     document.documentElement.style.removeProperty("--primary");
     expect(after).toEqual(before);
+  });
+
+  /** Paints Verdant Light's focus and shadow tokens on the root, as applyTheme does. */
+  function withVerdantFocusAndShadow(run: () => void) {
+    const root = document.documentElement;
+    root.className = "";
+    root.setAttribute("data-theme-focus-ring", "");
+    root.setAttribute("data-theme-control-shadow", "none");
+    root.style.setProperty("--focus-ring-width", "2px");
+    root.style.setProperty("--focus-ring-offset", "2px");
+    try {
+      run();
+    } finally {
+      root.removeAttribute("data-theme-focus-ring");
+      root.removeAttribute("data-theme-control-shadow");
+      root.style.removeProperty("--focus-ring-width");
+      root.style.removeProperty("--focus-ring-offset");
+    }
+  }
+  function mountButton(): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.className = buttonVariants({ variant: "default" });
+    button.setAttribute("data-control-shadow", "");
+    document.body.append(button);
+    return button;
+  }
+  const noShadow = (value: string) => /^(none|0 0 #0000(, 0 0 #0000)*|)$/.test(value.trim());
+
+  it("under Verdant Light a focused button has a 2px outline with a 2px offset and no ring shadow", () => {
+    withVerdantFocusAndShadow(() => {
+      const button = mountButton();
+      button.focus();
+      const styles = getComputedStyle(button);
+      expect(styles.outlineStyle).toBe("solid");
+      expect(styles.outlineWidth).toBe("2px");
+      expect(styles.outlineOffset).toBe("2px");
+      expect(styles.getPropertyValue("--tw-ring-shadow").trim()).toBe("0 0 #0000");
+      button.remove();
+    });
+  });
+
+  it("under Verdant Light a focused input shows the 2px outline on its wrapper and no 3px ring", () => {
+    withVerdantFocusAndShadow(() => {
+      const wrapper = document.createElement("span");
+      wrapper.setAttribute("data-focus-ring-owner", "");
+      wrapper.className = "has-focus-visible:ring-[3px]";
+      const input = document.createElement("input");
+      input.className = "outline-none";
+      wrapper.append(input);
+      document.body.append(wrapper);
+      input.focus();
+      const outer = getComputedStyle(wrapper);
+      expect(outer.outlineWidth).toBe("2px");
+      expect(outer.outlineOffset).toBe("2px");
+      expect(outer.getPropertyValue("--tw-ring-shadow").trim()).toBe("0 0 #0000");
+      expect(getComputedStyle(input).outlineStyle).not.toBe("solid");
+      wrapper.remove();
+    });
+  });
+
+  /**
+   * happy-dom applies no rule inside a cascade layer, so the layered button and composer shadows
+   * compute as empty. These unlayered stand-ins give each owner a shadow the theme must remove.
+   */
+  function withStandInShadows(run: () => void) {
+    const style = document.createElement("style");
+    style.textContent =
+      ".stand-in-shadow, .stand-in-shadow::before, .stand-in-shadow::after, .chat-composer-glass { box-shadow: 0 1px 2px rgb(0 0 0 / 30%); }";
+    document.head.append(style);
+    const button = mountButton();
+    button.classList.add("stand-in-shadow");
+    const send = document.createElement("button");
+    send.setAttribute("data-control-shadow", "");
+    send.className = "stand-in-shadow";
+    const composer = document.createElement("div");
+    composer.className = "chat-composer-glass";
+    document.body.append(send, composer);
+    try {
+      run();
+    } finally {
+      for (const element of [style, button, send, composer]) element.remove();
+    }
+  }
+  const shadowsOf = () =>
+    [...document.querySelectorAll(".stand-in-shadow, .chat-composer-glass")].map(
+      (element) => getComputedStyle(element).boxShadow,
+    );
+
+  it("under Verdant Light the button, its pseudo-elements, the Send button and the composer surface (.chat-composer-glass) have no box shadow", () => {
+    withVerdantFocusAndShadow(() =>
+      withStandInShadows(() => {
+        for (const shadow of shadowsOf()) expect(noShadow(shadow), shadow).toBe(true);
+        // happy-dom computes no pseudo-element styles, so the pseudo-element rule is read as text.
+        expect(css).toContain(
+          ':root[data-theme-control-shadow="none"] [data-control-shadow]::before',
+        );
+        expect(css).toContain(
+          ':root[data-theme-control-shadow="none"] [data-control-shadow]::after',
+        );
+      }),
+    );
+  });
+
+  it("under Light and Dark the focus ring and shadows equal the values recorded before the change", () => {
+    for (const mode of ["", "dark"]) {
+      document.documentElement.className = mode;
+      withStandInShadows(() => {
+        const button = document.querySelector<HTMLButtonElement>("button.stand-in-shadow")!;
+        button.focus();
+        expect(getComputedStyle(button).outlineStyle, mode).not.toBe("solid");
+        expect(getComputedStyle(button).outlineWidth, mode).not.toBe("2px");
+        for (const shadow of shadowsOf()) expect(shadow, mode).toBe("0 1px 2px rgb(0 0 0 / 30%)");
+      });
+    }
   });
 
   it("routes Tailwind link utilities and markdown anchors through blue link semantics", () => {

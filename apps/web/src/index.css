@@ -375,6 +375,36 @@
   outline-offset: 2px;
 }
 
+/* A theme's focus ring and control shadow (#290, R59). These rules sit outside the cascade
+   layers so they win over utilities such as outline-none; without the root attributes nothing
+   changes. The owner of an input's ring draws the outline for its inner control, and the popups
+   the base layer silences and the terminal's hidden text area stay as they are. */
+:root[data-theme-focus-ring]
+  :focus-visible:not(
+    [data-slot="menu-popup"],
+    [data-slot="select-popup"],
+    [data-slot="popover-popup"],
+    .xterm-helper-textarea
+  ),
+:root[data-theme-focus-ring] [data-focus-ring-owner]:has(:focus-visible) {
+  outline: var(--focus-ring-width, 2px) solid var(--ring);
+  outline-offset: var(--focus-ring-offset, 2px);
+  --tw-ring-shadow: 0 0 #0000;
+  --tw-ring-offset-shadow: 0 0 #0000;
+}
+
+:root[data-theme-focus-ring] [data-focus-ring-owner] :focus-visible {
+  outline: none;
+}
+
+/* Removes the drop shadows and keeps a focus ring a theme without focus tokens still draws. */
+:root[data-theme-control-shadow="none"] [data-control-shadow],
+:root[data-theme-control-shadow="none"] [data-control-shadow]::before,
+:root[data-theme-control-shadow="none"] [data-control-shadow]::after,
+:root[data-theme-control-shadow="none"] .chat-composer-glass {
+  box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000);
+}
+
 /* Secondary text on a sidebar card; the dark default is brighter than the global muted grey. */
 [data-sidebar-card] {
   --muted-foreground: var(--sidebar-card-muted-foreground);

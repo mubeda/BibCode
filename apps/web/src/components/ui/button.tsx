@@ -61,6 +61,7 @@ function Button({ className, variant, size, render, ...props }: ButtonProps) {
 
   const defaultProps = {
     className: cn(buttonVariants({ className, size, variant })),
+    "data-control-shadow": "",
     "data-slot": "button",
     type: typeValue,
   };

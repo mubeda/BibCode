@@ -62,6 +62,7 @@ function Input({
           className,
         ) || undefined
       }
+      data-focus-ring-owner=""
       data-size={size}
       data-slot="input-control"
     >

@@ -264,6 +264,16 @@ function applyTheme(theme: Theme, suppressTransitions = false) {
     if (!(name in record.vars)) root.style.removeProperty(name);
   }
   for (const [name, value] of Object.entries(record.vars)) root.style.setProperty(name, value);
+  if ("--focus-ring-width" in record.vars || "--focus-ring-offset" in record.vars) {
+    root.setAttribute("data-theme-focus-ring", "");
+  } else {
+    root.removeAttribute("data-theme-focus-ring");
+  }
+  if (record.vars["--control-shadow"] === "none") {
+    root.setAttribute("data-theme-control-shadow", "none");
+  } else {
+    root.removeAttribute("data-theme-control-shadow");
+  }
   for (const [name, { source, value }] of Object.entries(DERIVED_PROPERTIES)) {
     if (source in record.vars) root.style.setProperty(name, value);
     else root.style.removeProperty(name);

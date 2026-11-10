@@ -68,6 +68,14 @@ describe("built-in theme files", () => {
     });
   });
 
+  it("Verdant Light sets focus-ring-width 2px, focus-ring-offset 2px and control-shadow none", () => {
+    expect(builtin("verdant-light").ui).toMatchObject({
+      "focus-ring-width": "2px",
+      "focus-ring-offset": "2px",
+      "control-shadow": "none",
+    });
+  });
+
   it("Light and Dark have no overrides", () => {
     for (const id of ["light", "dark"]) {
       const theme = builtin(id);

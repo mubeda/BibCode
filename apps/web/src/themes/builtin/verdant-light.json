@@ -45,7 +45,10 @@
     "find-match": "#dac8a6",
     "find-match-foreground": "#181c20",
     "find-match-active": "#946200",
-    "find-match-active-foreground": "#ffffff"
+    "find-match-active-foreground": "#ffffff",
+    "focus-ring-width": "2px",
+    "focus-ring-offset": "2px",
+    "control-shadow": "none"
   },
   "terminal": {
     "background": "#ffffff",

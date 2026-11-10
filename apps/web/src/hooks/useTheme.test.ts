@@ -170,6 +170,8 @@ describe("theme failure handling", () => {
       documentElement: {
         classList: { toggle: vi.fn() },
         style: { removeProperty: vi.fn(), setProperty: vi.fn() },
+        setAttribute: vi.fn(),
+        removeAttribute: vi.fn(),
       },
     });
 
@@ -222,6 +224,8 @@ describe("theme failure handling", () => {
       documentElement: {
         classList: { toggle: vi.fn() },
         style: { removeProperty: vi.fn(), setProperty: vi.fn() },
+        setAttribute: vi.fn(),
+        removeAttribute: vi.fn(),
       },
     });
 
@@ -665,6 +669,33 @@ describe("theme slots and overrides", () => {
     expect(customProperties(browser)).toEqual(["--primary"]);
     store.setSlot("dark", "dark");
     expect(customProperties(browser)).toEqual([]);
+  });
+
+  it("Verdant Light sets the focus ring attribute, --focus-ring-width 2px and --focus-ring-offset 2px, and the control-shadow attribute", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const root = browser.browserWindow.document.documentElement;
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(true);
+    expect(root.style.getPropertyValue("--focus-ring-width")).toBe("2px");
+    expect(root.style.getPropertyValue("--focus-ring-offset")).toBe("2px");
+    expect(root.getAttribute("data-theme-control-shadow")).toBe("none");
+  });
+
+  it("Light and Dark set neither attribute", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const root = browser.browserWindow.document.documentElement;
+    store.setSlot("light", "light");
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(false);
+    expect(root.hasAttribute("data-theme-control-shadow")).toBe(false);
+    browser.storage.setItem("bibcode:theme", "dark");
+    browser.fireStorage("bibcode:theme");
+    expect(browser.isDark()).toBe(true);
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(false);
+    expect(root.hasAttribute("data-theme-control-shadow")).toBe(false);
   });
 
   it("a preview applies over the active theme and null restores the stored theme", async () => {
