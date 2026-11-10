@@ -5534,7 +5534,10 @@ mod tests {
         let first = runtime.quiesce_for_update().await;
         let second = runtime.quiesce_for_update().await;
 
-        assert!(first.is_err(), "the first quiesce reports the pending write");
+        assert!(
+            first.is_err(),
+            "the first quiesce reports the pending write"
+        );
         assert!(
             second.is_err(),
             "a second quiesce must not succeed while the write is pending"
