@@ -6,13 +6,21 @@ import {
 
 export const isMarkdownPreviewFile = (path: string): boolean => /\.(?:md|mdx)$/i.test(path);
 
+/** Larger files stay read-only: each rendered edit reparses the whole file (R34). */
+const RICH_MARKDOWN_MAX_BYTES = 128 * 1024;
+
 /** Whether the rendered view of `path` may be edited, and why not when it may not (R34). */
 export function richMarkdownMode(
   path: string,
   source: string,
-): { editable: true } | { editable: false; reason: UnsupportedConstruct | "mdx" | "not-markdown" } {
+):
+  | { editable: true }
+  | { editable: false; reason: UnsupportedConstruct | "mdx" | "not-markdown" | "too-large" } {
   if (!isMarkdownPreviewFile(path)) return { editable: false, reason: "not-markdown" };
   if (/\.mdx$/i.test(path)) return { editable: false, reason: "mdx" };
+  if (new TextEncoder().encode(source).length > RICH_MARKDOWN_MAX_BYTES) {
+    return { editable: false, reason: "too-large" };
+  }
   const reason = findUnsupportedConstruct(splitFrontmatter(source).body);
   return reason === null ? { editable: true } : { editable: false, reason };
 }

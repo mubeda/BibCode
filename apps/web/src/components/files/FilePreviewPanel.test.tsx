@@ -2397,6 +2397,14 @@ describe("rich markdown editing", () => {
     expect(changeFromRichEditor).not.toHaveBeenCalled();
   });
 
+  it("a Markdown file of 129 KiB renders read-only with the notice and creates no rich editor", async () => {
+    const { markup } = await renderRich(`# Big\n\n${"a".repeat(129 * 1024)}\n`, undefined);
+
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    expect(ui.filter("ChatMarkdown")).toHaveLength(1);
+    expect(markup).toContain(readOnlyNotice);
+  });
+
   it("switching to source after a rich edit commits it as one step", async () => {
     const { session } = await renderRich("# Title\n", fakeRichEditor());
     const commitRichEdits = vi.spyOn(session, "commitRichEdits");

@@ -221,9 +221,14 @@ was opened. `original` and `before` are parsed once per visit. Each serializatio
 `getMarkdown()`, one `remark` parse of `after` and a parse of each rebuilt top-level block.
 Task 6.3 measured `remark` with GFM on 2026-11-09 (one run each, measured): 116 ms to parse
 50 kB, 537 ms for 200 kB and 7.1 s for 1 MB. Opening a 1 MB file in rendered view
-therefore blocks for about 14 s (two parses for `canReconcile`), and each serialization
-for about as long. A size limit for rich editing is an open question for the spec, not a
-ruling, so this change sets none.
+would therefore block for about 14 s (two parses for `canReconcile`), and each
+serialization for about as long. So a Markdown file larger than 128 KiB (131072 bytes of
+its UTF-8 text, frontmatter included) opens read-only in rendered view with the read-only
+notice. `richMarkdownMode` returns the reason `"too-large"` before it parses anything, so
+no rich editor is created and no reconcile parse runs for it. A file of exactly 128 KiB
+stays editable, and costs about 300 ms per parse by the measurements above (inferred by
+interpolation). The user approved this spec amendment (A4, R34) after the Codex review of
+the finished phase.
 
 ## Frontmatter
 
@@ -257,7 +262,7 @@ A `details` block counts as supported when its opening tag has no attribute othe
 
 `richMarkdownMode(path, source)` in `filePreviewMode.ts` returns `{ editable: true }`, or
 `{ editable: false, reason }` with reason `"not-markdown"` (not `.md` or `.mdx`), `"mdx"`,
-or the construct. `isMarkdownPreviewFile` is unchanged, so `.mdx` files still open in the
+`"too-large"` (over 128 KiB, see Source-preserving save), or the construct. `isMarkdownPreviewFile` is unchanged, so `.mdx` files still open in the
 rendered view by default, read-only as today, with the notice. Setext headings, aligned
 tables, nested lists and hand-written `details` blocks are supported (R34). Each is in the
 test corpus with `canReconcile` true, and a failure there is a schema defect to fix, not a
@@ -521,3 +526,6 @@ was reproduced as a failing test before the fix.
   result reloaded the file as clean and the next save overwrote the newer version. Fixed:
   `reconcileVersion` and `reconcileRead` deliver the waiting edit first, so the result is a
   conflict.
+- Codex review 2, item A4, a large file blocked the panel for seconds on open and on each
+  edit. Fixed by the approved amendment: `richMarkdownMode` returns `"too-large"` for a
+  file over 128 KiB of UTF-8 before any parse, so it opens read-only with the notice.
