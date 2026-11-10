@@ -14032,3 +14032,489 @@ mod literal_pathspec_tests {
         );
     }
 }
+
+/// Background status reads must not take `index.lock` (#341, R14). Real Git, an isolated
+/// global configuration, and both a main and a linked worktree.
+#[cfg(test)]
+mod index_lock_free_status_tests {
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant, SystemTime},
+    };
+
+    use notify::Watcher;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        BoxGitProcessFuture, GitProcessRunner, GitRepository, ProcessRequest, VcsStagingArea,
+        VcsStatusLocalResult,
+    };
+    use crate::test_support::{TestSandbox, isolated_git_config::IsolatedGitConfig};
+
+    /// Runs the real Git runner under the fixture's global configuration only.
+    struct IsolatedGitRunner {
+        global_config: PathBuf,
+    }
+
+    impl GitProcessRunner for IsolatedGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            request.env.push((
+                "GIT_CONFIG_GLOBAL".into(),
+                self.global_config.clone().into(),
+            ));
+            request.env.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+            Box::pin(async move { super::ProcessRunner.run(request, cancellation).await })
+        }
+    }
+
+    struct StatDirtyWorktree {
+        _sandbox: TestSandbox,
+        config: IsolatedGitConfig,
+        worktree: PathBuf,
+        git_dir: PathBuf,
+    }
+
+    impl StatDirtyWorktree {
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            git_output(&self.config, &self.worktree, args)
+        }
+
+        fn checked_git(&self, args: &[&str]) -> String {
+            checked_git(&self.config, &self.worktree, args)
+        }
+
+        fn repository(&self) -> GitRepository {
+            GitRepository::with_runner_for_test(Arc::new(IsolatedGitRunner {
+                global_config: self.config.path(),
+            }))
+        }
+
+        /// Gives `stable.txt` a new whole-second modification time without changing its bytes,
+        /// so its index entry no longer matches the file's stat data even where Git compares
+        /// seconds only, and asserts that Git sees the entry as stat-dirty.
+        fn make_stable_stat_dirty(&self) {
+            self.touch_stable();
+            // `diff-files` compares stat data without refreshing or writing the index.
+            assert_eq!(
+                self.checked_git(&["diff-files", "--name-only", "--", "stable.txt"]),
+                "stable.txt",
+                "stable.txt must be stat-dirty"
+            );
+        }
+
+        /// The modification-time change alone, for loops where a concurrent `git restore`
+        /// may refresh the entry between the change and a check.
+        fn touch_stable(&self) {
+            static NEXT_SECOND: AtomicU64 = AtomicU64::new(0);
+            let second = NEXT_SECOND.fetch_add(1, Ordering::Relaxed);
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(self.worktree.join("stable.txt"))
+                .expect("open stable.txt");
+            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000 + second))
+                .expect("set stable.txt modification time");
+        }
+
+        fn index(&self) -> PathBuf {
+            self.git_dir.join("index")
+        }
+    }
+
+    fn git_output(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new("git");
+        config.apply_to_command(&mut command);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test-user")
+            .env("GIT_AUTHOR_EMAIL", "user@example.test")
+            .env("GIT_COMMITTER_NAME", "test-user")
+            .env("GIT_COMMITTER_EMAIL", "user@example.test")
+            .output()
+            .expect("fixture Git starts")
+    }
+
+    fn checked_git(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) -> String {
+        let output = git_output(config, cwd, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository whose `stable.txt` changed only its timestamp and whose `edited.txt` has
+    /// one appended line. With `linked`, the same state is in a linked worktree, whose index
+    /// and `index.lock` live under `<common-dir>/worktrees/<name>` (the #341 layout).
+    fn stat_dirty_worktree(linked: bool) -> StatDirtyWorktree {
+        let sandbox = TestSandbox::new("index-lock-free-status");
+        let config = IsolatedGitConfig::new();
+        let main = sandbox.path("main");
+        fs::create_dir_all(&main).expect("main worktree folder");
+        checked_git(&config, &main, &["init", "-q", "-b", "main"]);
+        checked_git(&config, &main, &["config", "core.autocrlf", "false"]);
+        fs::write(main.join("stable.txt"), "stable\n").expect("stable.txt");
+        fs::write(main.join("edited.txt"), "one\ntwo\n").expect("edited.txt");
+        checked_git(&config, &main, &["add", "stable.txt", "edited.txt"]);
+        checked_git(&config, &main, &["commit", "-q", "-m", "initial"]);
+        let worktree = if linked {
+            let linked = sandbox.path("linked");
+            checked_git(
+                &config,
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "linked",
+                    &linked.to_string_lossy(),
+                ],
+            );
+            linked
+        } else {
+            main
+        };
+        let git_dir = PathBuf::from(checked_git(
+            &config,
+            &worktree,
+            &["rev-parse", "--absolute-git-dir"],
+        ));
+        if linked {
+            assert!(
+                git_dir
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("worktrees")),
+                "a linked worktree keeps its index under worktrees/: {}",
+                git_dir.display()
+            );
+        }
+        let fixture = StatDirtyWorktree {
+            _sandbox: sandbox,
+            config,
+            worktree,
+            git_dir,
+        };
+        let mut edited = fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.worktree.join("edited.txt"))
+            .expect("open edited.txt");
+        std::io::Write::write_all(&mut edited, b"three\n").expect("append to edited.txt");
+        fixture.make_stable_stat_dirty();
+        fixture
+    }
+
+    fn numstat(output: &str) -> HashMap<String, (u64, u64)> {
+        output
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let insertions = fields.next()?.parse().ok()?;
+                let deletions = fields.next()?.parse().ok()?;
+                Some((fields.next()?.to_owned(), (insertions, deletions)))
+            })
+            .collect()
+    }
+
+    fn reported(
+        status: &VcsStatusLocalResult,
+        area: VcsStagingArea,
+    ) -> HashMap<String, (u64, u64)> {
+        status
+            .working_tree
+            .files
+            .iter()
+            .filter(|file| file.area == Some(area))
+            .map(|file| (file.path.clone(), (file.insertions, file.deletions)))
+            .collect()
+    }
+
+    async fn polling_alone_leaves_the_index_untouched(linked: bool) {
+        let fixture = stat_dirty_worktree(linked);
+        let repository = fixture.repository();
+        let index_bytes = fs::read(fixture.index()).expect("index bytes");
+        let index_modified = fs::metadata(fixture.index())
+            .and_then(|metadata| metadata.modified())
+            .expect("index modification time");
+        let locks_seen = Arc::new(Mutex::new(Vec::new()));
+        let sentinel_seen = CancellationToken::new();
+        let (recorded, sentinel) = (locks_seen.clone(), sentinel_seen.clone());
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        match path.file_name().and_then(|name| name.to_str()) {
+                            Some("index.lock") => {
+                                recorded.lock().expect("lock events").push(event.kind);
+                            }
+                            Some("polling-done") => sentinel.cancel(),
+                            _ => {}
+                        }
+                    }
+                }
+            })
+            .expect("Git directory watcher");
+        watcher
+            .watch(&fixture.git_dir, notify::RecursiveMode::NonRecursive)
+            .expect("watch the Git directory");
+
+        for round in 0..50 {
+            if round > 0 {
+                fixture.make_stable_stat_dirty();
+            }
+            let status = repository
+                .local_status(&fixture.worktree, &CancellationToken::new())
+                .await
+                .expect("status read succeeds");
+            assert!(status.has_working_tree_changes);
+        }
+        // Events arrive in order, so once the watcher reports this file it has reported
+        // every lock created before it.
+        let sentinel_path = fixture.git_dir.join("polling-done");
+        fs::write(&sentinel_path, "").expect("sentinel file");
+        tokio::time::timeout(Duration::from_secs(10), sentinel_seen.cancelled())
+            .await
+            .expect("the watcher reports the sentinel file");
+        fs::remove_file(&sentinel_path).expect("remove sentinel file");
+
+        let bytes_unchanged =
+            fs::read(fixture.index()).expect("index bytes after polling") == index_bytes;
+        let modified_unchanged = fs::metadata(fixture.index())
+            .and_then(|metadata| metadata.modified())
+            .expect("index modification time after polling")
+            == index_modified;
+        let locks_seen = locks_seen.lock().expect("lock events").clone();
+        let created = locks_seen
+            .iter()
+            .filter(|kind| matches!(kind, notify::EventKind::Create(_)))
+            .count();
+        assert!(
+            bytes_unchanged && modified_unchanged && locks_seen.is_empty(),
+            "polling touched the index: bytes unchanged {bytes_unchanged}, modification time \
+             unchanged {modified_unchanged}, {} index.lock events of which {created} creations",
+            locks_seen.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_status_polling_alone_leaves_the_index_untouched() {
+        polling_alone_leaves_the_index_untouched(false).await;
+    }
+
+    #[tokio::test]
+    async fn background_status_polling_alone_leaves_the_index_untouched_in_a_linked_worktree() {
+        polling_alone_leaves_the_index_untouched(true).await;
+    }
+
+    type Rounds = Arc<Mutex<Vec<(Instant, Instant)>>>;
+
+    fn began_during(rounds: &[(Instant, Instant)], others: &[(Instant, Instant)]) -> usize {
+        rounds
+            .iter()
+            .filter(|(start, _)| {
+                others
+                    .iter()
+                    .any(|(other_start, other_end)| other_start <= start && start <= other_end)
+            })
+            .count()
+    }
+
+    async fn does_not_break_a_concurrent_git_add(linked: bool) {
+        const ROUNDS: usize = 50;
+        const OVERLAPS: usize = 20;
+        let fixture = Arc::new(stat_dirty_worktree(linked));
+        let repository = fixture.repository();
+        let status_rounds: Rounds = Arc::default();
+        let add_rounds: Rounds = Arc::default();
+        let add_failures = Arc::new(Mutex::new(Vec::new()));
+        let stop = CancellationToken::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let adder = {
+            let (fixture, add_rounds, add_failures, stop, barrier) = (
+                fixture.clone(),
+                add_rounds.clone(),
+                add_failures.clone(),
+                stop.clone(),
+                barrier.clone(),
+            );
+            tokio::spawn(async move {
+                barrier.wait().await;
+                while !stop.is_cancelled() {
+                    let fixture = fixture.clone();
+                    let started = Instant::now();
+                    let outputs = tokio::task::spawn_blocking(move || {
+                        [
+                            fixture.git(&["add", "edited.txt"]),
+                            fixture.git(&["restore", "--staged", "edited.txt"]),
+                        ]
+                    })
+                    .await
+                    .expect("git add round");
+                    add_rounds
+                        .lock()
+                        .expect("add rounds")
+                        .push((started, Instant::now()));
+                    for output in outputs {
+                        if !output.status.success() {
+                            add_failures
+                                .lock()
+                                .expect("add failures")
+                                .push(String::from_utf8_lossy(&output.stderr).into_owned());
+                        }
+                    }
+                }
+            })
+        };
+        let poller = {
+            let (fixture, status_rounds, stop, barrier) = (
+                fixture.clone(),
+                status_rounds.clone(),
+                stop.clone(),
+                barrier.clone(),
+            );
+            tokio::spawn(async move {
+                barrier.wait().await;
+                while !stop.is_cancelled() {
+                    // A refresh would make the entry clean again; keep it stat-dirty.
+                    let dirty = fixture.clone();
+                    tokio::task::spawn_blocking(move || dirty.touch_stable())
+                        .await
+                        .expect("stat-dirty round");
+                    let started = Instant::now();
+                    repository
+                        .local_status(&fixture.worktree, &CancellationToken::new())
+                        .await
+                        .expect("status read succeeds");
+                    status_rounds
+                        .lock()
+                        .expect("status rounds")
+                        .push((started, Instant::now()));
+                }
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let (statuses, adds) = loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let statuses = status_rounds.lock().expect("status rounds").clone();
+            let adds = add_rounds.lock().expect("add rounds").clone();
+            let enough = statuses.len() >= ROUNDS
+                && adds.len() >= ROUNDS
+                && began_during(&statuses, &adds) >= OVERLAPS
+                && began_during(&adds, &statuses) >= OVERLAPS;
+            if enough || Instant::now() >= deadline {
+                break (statuses, adds);
+            }
+        };
+        stop.cancel();
+        adder.await.expect("adder task");
+        poller.await.expect("poller task");
+
+        let failures = add_failures.lock().expect("add failures").clone();
+        assert!(
+            failures.is_empty(),
+            "a git add failed during polling: {failures:?}"
+        );
+        assert!(
+            statuses.len() >= ROUNDS && adds.len() >= ROUNDS,
+            "{} status rounds and {} add rounds",
+            statuses.len(),
+            adds.len()
+        );
+        assert!(
+            began_during(&statuses, &adds) >= OVERLAPS
+                && began_during(&adds, &statuses) >= OVERLAPS,
+            "the loops did not overlap enough"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_status_does_not_break_a_concurrent_git_add() {
+        does_not_break_a_concurrent_git_add(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_status_does_not_break_a_concurrent_git_add_in_a_linked_worktree() {
+        does_not_break_a_concurrent_git_add(true).await;
+    }
+
+    async fn assert_statistics_match_plain_git(fixture: &StatDirtyWorktree) {
+        // Plain Git computes the baseline before the timestamp-only change is made again,
+        // so the stat-dirty file cannot influence it.
+        let staged = numstat(&fixture.checked_git(&["diff", "--cached", "--numstat"]));
+        let unstaged = numstat(&fixture.checked_git(&["diff", "--numstat"]));
+        assert!(!unstaged.is_empty(), "the fixture has an unstaged edit");
+        fixture.make_stable_stat_dirty();
+
+        let status = fixture
+            .repository()
+            .local_status(&fixture.worktree, &CancellationToken::new())
+            .await
+            .expect("status read succeeds");
+
+        assert_eq!(reported(&status, VcsStagingArea::Staged), staged);
+        assert_eq!(reported(&status, VcsStagingArea::Unstaged), unstaged);
+        assert!(
+            status
+                .working_tree
+                .files
+                .iter()
+                .all(|file| file.path != "stable.txt"),
+            "a timestamp-only change is not a change: {:?}",
+            status.working_tree.files
+        );
+    }
+
+    async fn keeps_unstaged_statistics_correct(linked: bool) {
+        let fixture = stat_dirty_worktree(linked);
+        // Only unstaged changes: the lone unstaged statistics read.
+        assert_statistics_match_plain_git(&fixture).await;
+        // Staged and unstaged changes: the joined statistics read.
+        fixture.checked_git(&["add", "edited.txt"]);
+        fs::write(fixture.worktree.join("edited.txt"), "one\nthree\nfour\n").expect("edit again");
+        assert_statistics_match_plain_git(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn background_status_keeps_unstaged_statistics_correct() {
+        keeps_unstaged_statistics_correct(false).await;
+    }
+
+    #[tokio::test]
+    async fn background_status_keeps_unstaged_statistics_correct_in_a_linked_worktree() {
+        keeps_unstaged_statistics_correct(true).await;
+    }
+
+    #[tokio::test]
+    async fn stash_statistics_do_not_depend_on_the_working_tree() {
+        let fixture = stat_dirty_worktree(false);
+        fixture.checked_git(&["stash", "push", "-q"]);
+        assert_eq!(fixture.checked_git(&["status", "--porcelain"]), "");
+        fixture.make_stable_stat_dirty();
+
+        let files = fixture
+            .repository()
+            .git_manager_stash_file_list(&fixture.worktree, "stash@{0}", &CancellationToken::new())
+            .await
+            .expect("stash file list");
+
+        assert!(
+            files.stdout.contains("edited.txt"),
+            "the stash lists its file: {:?}",
+            files.stdout
+        );
+    }
+}
