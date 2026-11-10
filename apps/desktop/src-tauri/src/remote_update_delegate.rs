@@ -346,9 +346,29 @@ mod tests {
         assert!(window_allows_install(app.handle()).await);
 
         app.manage(crate::window::close_guard_for_app(app.handle()));
-        // No main window: the guard allows at once.
+        // No main window: the guard allows at once (request 1).
         assert!(window_allows_install(app.handle()).await);
-        // Allow, Stay and a pending close are covered by
+
+        // With a main window the install waits for the web: Stay refuses it, Allow lets it run.
+        let _window = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::window::MAIN_WINDOW_LABEL,
+            Default::default(),
+        )
+        .build()
+        .expect("mock webview");
+        let guard = app.state::<crate::window::CloseGuard>();
+        for (request_id, reply, allowed) in [
+            (2, crate::window::CloseReply::Stay, false),
+            (3, crate::window::CloseReply::Allow, true),
+        ] {
+            // `join!` polls the install first, so it has asked before the reply arrives.
+            let (answer, ()) = tokio::join!(window_allows_install(app.handle()), async {
+                guard.reply(request_id, reply, std::time::Instant::now());
+            });
+            assert_eq!(answer, allowed, "{reply:?}");
+        }
+        // Stale ids and a pending close are covered by
         // `close_request_on_remote_update_proceeds_only_when_the_web_allows_it` in `window.rs`.
     }
 
