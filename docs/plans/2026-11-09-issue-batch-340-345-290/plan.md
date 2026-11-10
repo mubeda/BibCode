@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 c6b1062039a1)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2), sha256 295a5b4e58e6)
 Repository: this repository
 Base: main
 
@@ -32,7 +32,8 @@ Base: main
 Both were found by the plan review and approved by the user on 2026-11-09; `spec.md` carries them.
 
 - A1 (R58). Diagrams take their colors from the info, background and foreground tokens, not from primary, and both preview bridges ignore the annotation theme today. R58's scenario now checks diagrams on the tokens they use and checks the annotation reader's values; wiring the bridges is left to a follow-up issue.
-- A3 (R55, approved by the user in chat on 2026-11-09 during execution). Built-in Light already fails placeholder on background at about 3.1:1, so the literal rule would strip the background of nearly every light import. A fixed pair is reset only when it is below 4.5:1 and below the same pair at the base theme's values.
+- A3 (R55, approved by the user in chat on 2026-11-09 during execution). Built-in Light already fails placeholder on background at about 3.1:1, so the literal rule would strip the background of nearly every light import. Revised by the user on 2026-11-10 after lane D2 measured that any off-white background (`#fffdf8` gives 3.08 against Light's 3.11) still counted as worse: a pair the base already fails is reset only when the import overrides that pair's text token; pairs the base passes keep the 4.5:1 rule.
+- A4 (R34, approved by the user in chat on 2026-11-10 during execution). Lane C measured remark parse times of 116 ms at 50 kB, 537 ms at 200 kB and 7.1 s at 1 MB, with two or three parses per open. A Markdown file larger than 128 KiB opens read-only in rendered view with the notice.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus

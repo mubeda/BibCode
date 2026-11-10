@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendment A3 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 and A4 approved in chat during execution)
 Size: full    Mode: gated    Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -423,7 +423,7 @@ WHEN a person edits one block in rendered view, the Files editor SHALL save ever
 - THEN frontmatter and fenced code contents are still identical to the original, and the result parses to the same rendered document the person saw
 
 ### R34. Files the rich editor cannot represent stay read-only in rendered view  [Must]
-IF a Markdown file contains reference-style links or their definitions, footnotes, raw HTML other than a `details` block, HTML comments or math, or is an `.mdx` file, THEN the Files editor SHALL show rendered view read-only as today, with a notice that says to edit in source view, and SHALL NOT rewrite the file.
+IF a Markdown file contains reference-style links or their definitions, footnotes, raw HTML other than a `details` block, HTML comments or math, or is an `.mdx` file, or is larger than 128 KiB (amendment A4), THEN the Files editor SHALL show rendered view read-only as today, with a notice that says to edit in source view, and SHALL NOT rewrite the file.
 #### Scenario: unsupported construct
 - GIVEN a file with reference-style link definitions and a footnote
 - WHEN it is opened in rendered view
@@ -436,6 +436,11 @@ IF a Markdown file contains reference-style links or their definitions, footnote
 - GIVEN an `.mdx` file
 - WHEN it is opened
 - THEN it behaves as it does today
+
+#### Scenario: a large file (amendment A4)
+- GIVEN a supported Markdown file of 129 KiB
+- WHEN it is opened in rendered view
+- THEN it renders read-only with the notice, and no rich editor is created
 
 ### R35. A collapsible section is saved as HTML details  [Must]
 WHEN a person inserts a collapsible section, the Files editor SHALL save it as a `details` element with a `summary`.
@@ -644,14 +649,14 @@ WHILE a person edits a theme, the theme editor SHALL show the contrast ratio of 
 - THEN that pair shows a ratio of 1:1 with a warning, and Save still works
 
 ### R55. An imported theme cannot paint unreadable text  [Must]
-IF an imported theme has a fixed pair below 4.5:1 and below that pair's ratio at the theme's base values (amendment A3), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails, and SHALL tell the person which pairs were reset to base values.
+IF an imported theme has a fixed pair below 4.5:1, and either the same pair at the theme's base values meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised), THEN the app SHALL remove that pair's text-color override from the theme before storing it, SHALL also remove its surface override if the pair still fails, and SHALL tell the person which pairs were reset to base values.
 #### Scenario: low-contrast import
 - GIVEN an import whose muted text on background is 2.1:1
 - WHEN it is imported
 - THEN the stored theme has no muted text override, a notice names the pair, the other overrides are kept, and exporting the stored theme and importing it again changes nothing further
 
 #### Scenario: a pair the base already fails (amendment A3)
-- GIVEN a light-based import that sets only a background override, with the default placeholder, whose placeholder on background is below 4.5:1 but not below the same pair in built-in Light
+- GIVEN a light-based import that sets only a background override of `#fffdf8`, with the default placeholder, whose placeholder on background is below 4.5:1 like the same pair in built-in Light
 - WHEN it is imported
 - THEN the background override is kept and no notice is shown
 
