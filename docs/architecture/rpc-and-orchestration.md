@@ -665,15 +665,19 @@ snapshot for the same branch keeps the cached one, and a branch change clears
 it with the rest of the remote. A lookup that ends with an open request or with
 none open records its answer there. A failed or cancelled lookup records
 nothing, so the known request stays. Each status stream folds what it sent the
-way the client reducer does. After every event it sends, the stream compares
+way the client reducer does. A snapshot or remote update is sent with the
+request known for its branch, so a publication queued before a lookup answered
+does not briefly show an older request. After every event it sends, the stream compares
 the request its subscriber shows with the known one and sends a remote update
 when they differ. That send uses the fence of the newest event the subscriber
 received, so an answer that arrives across an epoch change waits for the next
 event that passes its fence and is delivered once. An event for the same branch
 leaves the stream's lookup running, so repeated events cannot keep a slow
-forge from answering. A snapshot or remote update that arrives meanwhile asks
-for one more lookup when the running one ends, which reads a fresh answer
-after an invalidation. A branch change stops the lookup.
+forge from answering. Any event for the same branch that arrives meanwhile,
+a local update included, asks for one more lookup when the running one ends,
+because it may follow an invalidation that made the running answer outdated.
+That lookup reads the cache unless the invalidation dropped it. A branch change
+stops the lookup.
 
 When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
 most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
