@@ -1545,7 +1545,8 @@ impl GitVcsRpcServices {
                         };
                         // A lookup for the same branch keeps running, so restarting it cannot
                         // starve a slow forge. Its answer is delivered under the newest fence the
-                        // subscriber received, and an event that asks again looks once it ends.
+                        // subscriber received. Any same-branch event may follow an invalidation
+                        // that made that answer outdated, so one more lookup runs once it ends.
                         let mut looks_up = matches!(
                             &publication.value,
                             VcsStatusStreamEvent::Snapshot { remote: Some(_), .. }
@@ -1554,14 +1555,24 @@ impl GitVcsRpcServices {
                         .then(|| publication.local.clone());
                         match enrichment.as_mut() {
                             Some(lookup) if lookup.ref_name == publication.local.ref_name => {
-                                if looks_up.is_some() {
-                                    lookup.look_again = looks_up.take();
-                                }
+                                looks_up.take();
+                                lookup.look_again = Some(publication.local.clone());
                             }
                             _ => stop_status_stream_enrichment(&mut enrichment).await,
                         }
+                        let mut value = publication.value;
+                        // A queued publication may predate a recorded lookup answer, so it shows
+                        // the request `reconcile` would send next instead of flickering.
+                        if let VcsStatusStreamEvent::Snapshot { remote: Some(remote), .. }
+                        | VcsStatusStreamEvent::RemoteUpdated {
+                            remote: Some(remote),
+                        } = &mut value
+                        {
+                            remote.pr = broadcaster
+                                .known_pull_request(&cwd, publication.local.ref_name.as_deref());
+                        }
                         if !shown
-                            .send(&sender, &broadcaster, &publication.fence, publication.value)
+                            .send(&sender, &broadcaster, &publication.fence, value)
                             .await
                             || !shown.reconcile(&sender, &broadcaster, &cwd).await
                         {
