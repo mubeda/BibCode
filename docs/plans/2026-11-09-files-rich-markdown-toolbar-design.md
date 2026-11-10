@@ -642,6 +642,11 @@ was reproduced as a failing test before the fix.
   from TipTap's serialization whenever the block before it was new, and TipTap writes an
   extra line break before a table. Fixed: an original block that follows an inserted block
   keeps the separator that led into it in the original. A second visit adds no line either.
+- Advisor, the first form of that fix also copied a separator with no blank line, as in a
+  heading followed directly by a paragraph. A block inserted between them joined the
+  paragraph, the result no longer parsed as the edit, and the fallback rewrote the untouched
+  list. Fixed: the original separator is kept only when it holds a blank line, and otherwise
+  the block takes `after`'s.
 - Coordinator check 5 (UI.md), while a delivery failed, Save, Reload and Overwrite did
   nothing and only logged to the console. Fixed: when the edit is still pending after one of
   them, the panel shows the Files error toast "Your last edit could not be applied to the

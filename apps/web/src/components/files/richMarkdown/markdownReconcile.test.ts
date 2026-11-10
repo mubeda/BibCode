@@ -37,6 +37,16 @@ describe("reconcileMarkdown", () => {
     );
   });
 
+  it("a block inserted between blocks the original wrote with no blank line keeps the rest's bytes", () => {
+    const original = "# Title\nPara\n\n*   a\n*   b\n";
+    const before = "# Title\n\nPara\n\n* a\n* b";
+    const after = "# Title\n\nnew\n\nPara\n\n* a\n* b";
+
+    expect(reconcileMarkdown({ original, before, after })).toBe(
+      "# Title\n\nnew\n\nPara\n\n*   a\n*   b\n",
+    );
+  });
+
   it("writes a changed block with the original's CRLF line endings", () => {
     const original = corpus.crlfLineEndings;
     const before = "# Title\n\nFirst paragraph.\n\nSecond paragraph.";
