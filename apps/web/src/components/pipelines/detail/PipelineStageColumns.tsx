@@ -29,7 +29,7 @@ const ROW_CLASS =
 
 /** A stage or layer name reads as a group label on a muted strip, unlike the job rows below it. */
 const STAGE_HEADER_CLASS =
-  "flex min-h-7 min-w-0 items-center gap-2 rounded-md bg-muted px-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase";
+  "flex min-h-7 min-w-0 items-center gap-2 rounded-md bg-muted px-2 text-xs font-semibold tracking-wide text-foreground uppercase";
 
 /**
  * The job's own page: in BiBCode once the view provides one, on the host until then.

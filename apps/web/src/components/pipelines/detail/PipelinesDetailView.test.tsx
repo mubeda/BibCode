@@ -506,9 +506,17 @@ function expectHeadersToBeGroupLabels() {
   expect(rows.length).toBeGreaterThan(0);
   for (const header of headers) {
     const classes = header.className.split(" ");
-    for (const name of ["bg-muted", "text-xs", "font-semibold", "uppercase", "tracking-wide"])
+    for (const name of [
+      "bg-muted",
+      "text-foreground",
+      "text-xs",
+      "font-semibold",
+      "uppercase",
+      "tracking-wide",
+    ])
       expect(classes).toContain(name);
-    for (const name of ["text-sm", "hover:bg-accent"]) expect(classes).not.toContain(name);
+    for (const name of ["text-sm", "hover:bg-accent", "text-muted-foreground"])
+      expect(classes).not.toContain(name);
   }
   for (const row of rows) {
     expect(row.className.split(" ")).not.toContain("bg-muted");
