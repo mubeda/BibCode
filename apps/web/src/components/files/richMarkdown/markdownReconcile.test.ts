@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import * as corpus from "./fixtures/corpus";
 import { canReconcile, reconcileMarkdown } from "./markdownReconcile";
@@ -140,6 +140,30 @@ describe("reconcileMarkdown", () => {
     expect(edit("A\n\nB")).toBe("A\n\nB2");
     expect(edit("A\n\nB\n")).toBe("A\n\nB2\n");
     expect(edit("A\n\nB\n\n\n")).toBe("A\n\nB2\n\n\n");
+  });
+});
+
+describe("an empty details block", () => {
+  // TipTap 3.31.4 writes `<details><summary>More</summary></details>` as the blank-line form.
+  const original = "<details><summary>More</summary></details>\n\nHello\n";
+  const before = "<details>\n<summary>More</summary>\n\n\n\n</details>\n\nHello";
+
+  it("opens editable and keeps its bytes when the paragraph after it is edited", () => {
+    expect(canReconcile({ original, before })).toBe(true);
+    expect(reconcileMarkdown({ original, before, after: `${before} world` })).toBe(
+      "<details><summary>More</summary></details>\n\nHello world\n",
+    );
+  });
+});
+
+describe("a reconcile whose blocks do not line up", () => {
+  it("saves the edit from the serialization instead of throwing", () => {
+    const failures = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(reconcileMarkdown({ original: "A\n", before: "A\n\nB", after: "A\n\nB x" })).toBe(
+      "A\n\nB x\n",
+    );
+    expect(failures).toHaveBeenCalledOnce();
+    failures.mockRestore();
   });
 });
 

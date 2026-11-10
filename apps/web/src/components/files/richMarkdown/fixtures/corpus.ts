@@ -41,6 +41,9 @@ export const inlineMath = "The area is $a^2$ here.\n";
 export const blockMath = "Before.\n\n$$\nE = mc^2\n$$\n\nAfter.\n";
 
 /** Every fixture the editor must keep editable (none of the read-only constructs). */
+/** One HTML block with no body: TipTap writes it back in the blank-line form. */
+export const emptyDetails = "<details><summary>More</summary></details>\n\nHello\n";
+
 export const supportedFixtures = {
   alignedTable,
   fourBacktickFence,
@@ -49,6 +52,7 @@ export const supportedFixtures = {
   blockquoteWithList,
   setextHeadings,
   handWrittenDetails,
+  emptyDetails,
   crlfLineEndings,
   taskList,
 } as const;

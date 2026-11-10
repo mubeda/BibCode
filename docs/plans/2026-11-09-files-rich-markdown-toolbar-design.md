@@ -150,11 +150,16 @@ the opening `<details>` and `<summary>`) and its tail is its text after the last
 
 A `details` written as one HTML block (no blank line between its tags and its body) is a
 leaf for the reconcile: an edit inside it rewrites that block only. The blank-line form,
-which the editor writes and which GitHub documents, is a container.
+which the editor writes and which GitHub documents, is a container. A blank-line form with
+an empty body (an opener followed directly by `</details>`) is one leaf block, the way the
+normalized tree counts it, because the editor writes an empty one-block `details` that way.
 
-`canReconcile({ original, before })` is true when the two documents are the same document:
-their trees, with positions, list `spread` and adjacent-text splits removed and `details`
-grouped, are deeply equal. That covers block kinds and order at every level and the inline
+`canReconcile({ original, before })` is true when the two documents are the same document
+block for block: at every level the two have the same number of blocks, and each pair has
+the same key, the block's tree with positions, list `spread` and adjacent-text splits
+removed and `details` grouped. Where both blocks of a pair are containers, their children
+are compared the same way. So every `before` block the reconcile visits has the `original`
+block it stands for. That covers block kinds and order at every level and the inline
 content of every leaf. The rendered view opens editable only when it is true. When it is
 false the panel shows today's read-only view with the read-only notice, so an edit can
 never cause a whole-file rewrite. The inline check matters: a prototype on 2026-11-09
@@ -207,7 +212,8 @@ top-level block that the reconcile rebuilt is parsed and compared, as a normaliz
 with the `after` block it stands for. A block that differs is replaced by that `after`
 block's text, so only the region that could not be placed comes from `after` and every
 other block keeps its bytes. Second, the whole output is compared with `after` the same
-way. If it still differs, the output is `after`. In both steps, each fenced code block in
+way. If it still differs, the output is `after`. If placing the edit throws, the output is
+also `after` and the error is logged, so a reconcile failure never drops the edit. In both steps, each fenced code block in
 the replacement text whose content equals the original block's content apart from line
 endings gets the original content back, so mixed line endings inside a fence survive.
 This covers fences at the start of a line (top level); a fence inside a list or quote in a
@@ -529,3 +535,9 @@ was reproduced as a failing test before the fix.
 - Codex review 2, item A4, a large file blocked the panel for seconds on open and on each
   edit. Fixed by the approved amendment: `richMarkdownMode` returns `"too-large"` for a
   file over 128 KiB of UTF-8 before any parse, so it opens read-only with the notice.
+- Codex review 2, item 2, an empty `details` before an edited paragraph threw in the
+  reconcile and the edit was lost. The normalized tree counted the empty blank-line form as
+  one block, but the block list counted its opener and closer as two, so `canReconcile`
+  accepted a file whose blocks did not line up. Fixed: the empty form is one leaf block,
+  `canReconcile` compares the block lists level by level, and a throw while placing an edit
+  falls back to `after`.

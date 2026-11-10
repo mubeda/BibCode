@@ -93,12 +93,13 @@ function toBlocks(nodes: readonly RootContent[]): Block[] {
     const value = htmlValue(node);
     if (value !== null && DETAILS_OPEN.test(value)) {
       const close = detailsClose(nodes, index);
-      if (close > index + 1) {
+      if (close > index) {
+        // An empty body is a leaf, as normalizeNodes counts it: one block, not an opener and a closer.
         blocks.push({
           kind: "details",
           start: startOf(node),
           end: endOf(nodes[close]!),
-          children: toBlocks(nodes.slice(index + 1, close)),
+          children: close > index + 1 ? toBlocks(nodes.slice(index + 1, close)) : null,
           key: JSON.stringify(normalizeNodes(nodes.slice(index, close + 1))),
         });
         index = close;
@@ -188,16 +189,34 @@ function normalizeNodes(nodes: readonly RootContent[]): Normalized[] {
   return out;
 }
 
-function sameDocument(left: string, right: string, keep = false): boolean {
+function sameDocument(left: string, right: string): boolean {
   return (
-    JSON.stringify(normalizeNodes(parse(left, keep).root.children)) ===
-    JSON.stringify(normalizeNodes(parse(right, keep).root.children))
+    JSON.stringify(normalizeNodes(parse(left).root.children)) ===
+    JSON.stringify(normalizeNodes(parse(right).root.children))
   );
 }
 
-/** True when `before` describes the same document as `original`, so edits can be placed. */
+/** Same keys at every level, so each `before` block has the `original` block it stands for. */
+function sameBlocks(left: readonly Block[], right: readonly Block[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((block, index) => {
+      const other = right[index]!;
+      if (block.key !== other.key) return false;
+      // A leaf on either side is copied or replaced whole, never recursed into.
+      return block.children === null || other.children === null
+        ? true
+        : sameBlocks(block.children, other.children);
+    })
+  );
+}
+
+/**
+ * True when `before` describes the same document as `original`, block for block, so edits can be
+ * placed. The keys are normalized trees, so this also compares inline content.
+ */
 export function canReconcile(input: { original: string; before: string }): boolean {
-  return sameDocument(input.original, input.before, true);
+  return sameBlocks(parse(input.original, true).blocks, parse(input.before, true).blocks);
 }
 
 /** CRLF when CRLF lines are at least as many as bare LF lines (Orca's rule). */
@@ -571,20 +590,28 @@ export function reconcileMarkdown(input: {
   const tail = input.original.slice(original.blocks.at(-1)?.end ?? input.original.length);
   const asAfter = (text: string) => restoreFenceContents(fromAfter(level, text), input.original);
 
-  const emitted = reconcileChildren(
-    level,
-    before,
-    original.blocks,
-    before.blocks,
-    after.blocks,
-  ).map((block) => {
-    // A rebuilt block that no longer reads as the edited one is taken from `after` alone.
-    const afterText = textOf(after, after.blocks[block.after]!);
-    return block.rebuilt && !sameDocument(block.text, afterText)
-      ? { ...block, text: asAfter(afterText), rebuilt: false }
-      : block;
-  });
-  const result = `${head}${join(level, original.blocks, after.blocks, emitted)}${tail}`;
+  const fallback = () => `${head}${asAfter(input.after.trim())}${tail}`;
+  let result: string;
+  try {
+    const emitted = reconcileChildren(
+      level,
+      before,
+      original.blocks,
+      before.blocks,
+      after.blocks,
+    ).map((block) => {
+      // A rebuilt block that no longer reads as the edited one is taken from `after` alone.
+      const afterText = textOf(after, after.blocks[block.after]!);
+      return block.rebuilt && !sameDocument(block.text, afterText)
+        ? { ...block, text: asAfter(afterText), rebuilt: false }
+        : block;
+    });
+    result = `${head}${join(level, original.blocks, after.blocks, emitted)}${tail}`;
+  } catch (error) {
+    // The edit must still reach the session: losing it is worse than rewriting the body.
+    console.error("[markdown-reconcile] placing the edit failed; saving the serialization", error);
+    return fallback();
+  }
   if (sameDocument(result, input.after)) return result;
-  return `${head}${asAfter(input.after.trim())}${tail}`;
+  return fallback();
 }
