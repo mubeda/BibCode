@@ -32,26 +32,26 @@ Steps
 1. [ ] Confirm Task 8.4 is Closed, so no source change follows the build, then run `vp run test:ui:desktop:build` on the exact commit that will be reviewed. Expected: exits 0 and the packaged app exists at the path the runbook for this system names. On macOS set `BIBCODE_E2E_PLATFORM`, `BIBCODE_E2E_ARCH` and `BIBCODE_E2E_APP_PATH` as `docs/testing/macos-desktop.md` describes; on Linux prefix the run with `xvfb-run --auto-servernum`.
 2. [ ] Write the spec with a fixture `notes.md` (frontmatter, a paragraph "Hello world", a fenced code block) and three tests: `edits in rendered view, saves and keeps the rest of the file` (type " again", apply Heading 2 to the paragraph, press Save file, read the file from disk and assert the frontmatter and fence bytes are unchanged and the paragraph is `## Hello world again`); `undo in rendered view and one-step undo in source view` (Undo removes the heading; make two more edits, switch to source, one Undo removes both); `opening and saving without editing leaves the file byte-identical`.
 3. [ ] Add the spec to the default list in `wdio.conf.ts`.
-4. [ ] Run `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts vp run test:ui:desktop`. Expected: PASS, 3 tests. A failure that shows a product defect reopens the Phase 6 task that owns it.
+4. [ ] Run `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts vp run test:ui:desktop`. Expected: PASS, 4 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 6 task that owns it.
 5. [ ] Run `vp check` and `vp run typecheck`. Expected: no errors.
 
 ### Task 8.2: Desktop end-to-end test for themes
 
-- Satisfies: R37 (Tokyo Night values), R41 (switch back to a built-in), R42 (reload with a custom theme), R44 (duplicate a built-in), R47 (edit and cancel)
+- Satisfies: R37 (Tokyo Night values), R40 (dark theme in Light mode; Undo), R41 (switch back to a built-in), R42 (reload with a custom theme), R44 (duplicate a built-in), R47 (edit and cancel)
 - Depends on: 8.1
-- Files: create `apps/desktop/e2e/specs/appearance-themes.e2e.ts`; modify `apps/desktop/e2e/wdio.conf.ts`
-- Interfaces: consumes the packaged build of Task 8.1, the route `/settings/appearance` and the accessible names "Use for dark", "Duplicate", "Edit", "Save" and "Cancel" from Phase 7; produces one spec file registered in the default list.
+- Files: create `apps/desktop/e2e/specs/appearance-themes.e2e.ts`; modify `apps/desktop/e2e/wdio.conf.ts`; run (lane D6 updated them for the Appearance Mode control) `apps/desktop/e2e/specs/platform-capabilities.e2e.ts` and `apps/desktop/e2e/specs/chat-activity-panel.e2e.ts`
+- Interfaces: consumes the packaged build of Task 8.1, the route `/settings/appearance`, the theme row buttons (`data-theme-select`), the Mode group, the Undo action and the accessible names "More actions for <name>", "Duplicate", "Edit", "Save" and "Cancel" from Phase 7 (amendment A8); produces one spec file registered in the default list.
 - Skills: none
 - Read first: `apps/desktop/e2e/specs/main-window.e2e.ts` (how a spec opens Settings and reloads the window)
 - Tier: standard
 - TDD: exempt (an end-to-end check of behavior the unit tests of Phase 7 already pin; it adds no new behavior)
-- Done when: `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop` exits 0 with 3 passing tests
+- Done when: `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop` exits 0 with 4 passing tests, and the two updated specs pass
 
 Steps
 
-1. [ ] Write the spec with three tests: `Tokyo Night repaints the app and Dark restores it` (set the mode to Dark, use Tokyo Night for dark, assert the computed `--background` on the root element is `#1a1b26`; select Dark, assert no inline `--background` remains); `a duplicated theme can be edited with live preview and cancelled` (Duplicate Tokyo Night, Edit, change primary to `#ff0000`, assert the computed `--primary`, Cancel, assert `#7aa2f7`); `a saved custom theme is painted again after a reload` (save a custom dark theme with background `#101820`, reload the window, assert the root background is `#101820`).
+1. [ ] Write the spec with four tests: `a dark theme row clicked in Light mode switches to Dark, and Undo restores Light` (amendment A8: set the mode to Light, click the Matrix Dark row, assert the root has `.dark` and the mode is Dark, use Undo, assert Light and the previous dark slot); `Tokyo Night repaints the app and Dark restores it` (set the mode to Dark, click the Tokyo Night row, assert the computed `--background` on the root element is `#1a1b26`; select Dark, assert no inline `--background` remains); `a duplicated theme can be edited with live preview and cancelled` (Duplicate Tokyo Night, Edit, change primary to `#ff0000`, assert the computed `--primary`, Cancel, assert `#7aa2f7`); `a saved custom theme is painted again after a reload` (save a custom dark theme with background `#101820`, reload the window, assert the root background is `#101820`).
 2. [ ] Add the spec to the default list in `wdio.conf.ts`.
-3. [ ] Run `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop`. Expected: PASS, 3 tests. A failure that shows a product defect reopens the Phase 7 task that owns it.
+3. [ ] Run `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop`. Expected: PASS, 4 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 7 task that owns it.
 4. [ ] Take four screenshots through the WebDriver session for the final report, saved outside the repository: the Appearance section in Light and in Tokyo Night, and the Files toolbar with the More menu open in Light and in Dark. Expected: four image files exist; they use fixture data only.
 5. [ ] Run `vp check` and `vp run typecheck`. Expected: no errors.
 
