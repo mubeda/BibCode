@@ -183,6 +183,24 @@ describe("theme export and import", () => {
     },
   );
 
+  it("a light import that sets background #fffdf8 and placeholder #cccccc loses the placeholder, names it, and keeps the background (R55)", async () => {
+    const { transfer } = await load();
+    const theme: ThemeFile = {
+      version: 1,
+      id: "cream",
+      name: "Cream",
+      base: "light",
+      ui: { background: "#fffdf8", placeholder: "#cccccc" },
+    };
+    const plan = transfer.planThemeImport(JSON.stringify(theme));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`)).toEqual([
+      "placeholder:background",
+    ]);
+    expect(plan.theme.ui).toEqual({ background: "#fffdf8" });
+  });
+
   it("a light import whose placeholder is under 4.5:1 loses that override and the pair is named, although the base fails the pair too", async () => {
     const { transfer } = await load();
     const theme: ThemeFile = {
