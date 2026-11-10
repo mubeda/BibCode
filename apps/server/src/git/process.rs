@@ -1218,16 +1218,20 @@ mod tests {
 
     /// Every command shape the server runs as a write, with whether a real Git took
     /// `index.lock` for it. [`takes_index_lock`] may list only commands a real Git took the
-    /// lock for.
+    /// lock for, and must list each `Locks` row, a shape it once misread.
     #[test]
     fn index_lock_cleanup_lists_only_commands_that_take_the_lock() {
         use notify::Watcher;
         enum Step {
             Write(&'static str, &'static str),
             Setup(&'static [&'static str]),
+            /// A setup that may fail, such as a merge that stops on a conflict.
+            Conflict(&'static [&'static str]),
             Watch(&'static [&'static str]),
+            /// Takes the lock on every Git CI runs; listing it is checked too.
+            Locks(&'static [&'static str]),
         }
-        use Step::{Setup, Watch, Write};
+        use Step::{Conflict, Locks, Setup, Watch, Write};
         let sandbox = TestSandbox::new("index-lock-cleanup-allowlist");
         let config = IsolatedGitConfig::new();
         let work = sandbox.path("work");
@@ -1309,6 +1313,85 @@ mod tests {
             Watch(&["update-ref", "refs/heads/extra", "HEAD"]),
             Watch(&["tag", "probe-tag"]),
             Watch(&["config", "probe.key", "value"]),
+            // A new branch at a start point other than HEAD, and at HEAD itself.
+            Locks(&["switch", "-c", "from-topic", "topic", "--no-track"]),
+            Setup(&["switch", "-q", "main"]),
+            Locks(&["switch", "-c", "from-main", "main", "--no-track"]),
+            Setup(&["switch", "-q", "main"]),
+            Locks(&["switch", "-c", "tracked", "--track", "origin/topic"]),
+            Setup(&["switch", "-q", "main"]),
+            // Paths that look like options after `--`.
+            Write("--soft", "soft\n"),
+            Write("-b", "b\n"),
+            Setup(&["add", "--", "--soft", "-b"]),
+            Setup(&["commit", "-q", "-m", "dashes"]),
+            Write("--soft", "soft 2\n"),
+            Setup(&["add", "--", "--soft"]),
+            Locks(&["reset", "--", "--soft"]),
+            Write("-b", "b 2\n"),
+            Locks(&["checkout", "HEAD", "--", "-b"]),
+            Setup(&["checkout", "HEAD", "--", "--soft"]),
+            // Conflicts to continue, skip and abort.
+            Write("c.txt", "base\n"),
+            Setup(&["add", "c.txt"]),
+            Setup(&["commit", "-q", "-m", "base"]),
+            Setup(&["tag", "base"]),
+            Setup(&["switch", "-q", "-c", "theirs"]),
+            Write("c.txt", "theirs\n"),
+            Setup(&["commit", "-q", "-a", "-m", "theirs"]),
+            Setup(&["switch", "-q", "-c", "theirs2", "base"]),
+            Write("c.txt", "theirs 2\n"),
+            Setup(&["commit", "-q", "-a", "-m", "theirs 2"]),
+            Setup(&["switch", "-q", "-c", "replay", "base"]),
+            Write("d.txt", "d\n"),
+            Setup(&["add", "d.txt"]),
+            Setup(&["commit", "-q", "-m", "replay"]),
+            Setup(&["switch", "-q", "main"]),
+            Write("c.txt", "ours\n"),
+            Setup(&["commit", "-q", "-a", "-m", "ours"]),
+            Setup(&["tag", "ours"]),
+            Conflict(&["merge", "--no-edit", "theirs"]),
+            Locks(&["merge", "--abort"]),
+            Conflict(&["cherry-pick", "theirs"]),
+            Locks(&["cherry-pick", "--abort"]),
+            Conflict(&["cherry-pick", "theirs"]),
+            Write("c.txt", "picked\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&["-c", "core.editor=:", "cherry-pick", "--continue"]),
+            Conflict(&["revert", "--no-edit", "ours"]),
+            Locks(&["revert", "--abort"]),
+            Conflict(&["revert", "--no-edit", "ours"]),
+            Write("c.txt", "reverted\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&["-c", "core.editor=:", "revert", "--continue"]),
+            Setup(&["switch", "-q", "theirs"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Locks(&["-c", "rebase.backend=merge", "rebase", "--abort"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Locks(&["-c", "rebase.backend=merge", "rebase", "--skip"]),
+            Setup(&["switch", "-q", "theirs2"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Write("c.txt", "rebased\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&[
+                "-c",
+                "core.editor=:",
+                "-c",
+                "rebase.backend=merge",
+                "rebase",
+                "--continue",
+            ]),
+            Setup(&["switch", "-q", "replay"]),
+            Locks(&[
+                "-c",
+                "rebase.backend=merge",
+                "-c",
+                "sequence.editor=:",
+                "rebase",
+                "-i",
+                "main",
+            ]),
+            Setup(&["switch", "-q", "main"]),
         ];
         let (events, received) = std::sync::mpsc::channel();
         let mut watcher =
@@ -1337,9 +1420,24 @@ mod tests {
                     fixture_git(&config, &work, args);
                     None
                 }
+                Conflict(args) => {
+                    let mut command = std::process::Command::new("git");
+                    config.apply_to_command(&mut command);
+                    command
+                        .args(*args)
+                        .current_dir(&work)
+                        .envs(git_environment(&config))
+                        .output()
+                        .expect("fixture Git starts");
+                    None
+                }
                 Watch(args) => {
                     fixture_git(&config, &work, args);
-                    Some(args)
+                    Some((args, false))
+                }
+                Locks(args) => {
+                    fixture_git(&config, &work, args);
+                    Some((args, true))
                 }
             };
             // Events arrive in order, so the sentinel's event closes this step's events.
@@ -1357,7 +1455,7 @@ mod tests {
                 }
             }
             std::fs::remove_file(&sentinel_path).expect("remove sentinel file");
-            let Some(args) = watched else {
+            let Some((args, must_list)) = watched else {
                 continue;
             };
             let listed = takes_index_lock(&args.iter().map(OsString::from).collect::<Vec<_>>());
@@ -1365,6 +1463,11 @@ mod tests {
             if listed && !took_lock {
                 mismatches.push(format!(
                     "git {args:?} is listed, but Git took no index.lock"
+                ));
+            }
+            if must_list && !(took_lock && listed) {
+                mismatches.push(format!(
+                    "git {args:?} took index.lock {took_lock}, listed {listed}"
                 ));
             }
         }
