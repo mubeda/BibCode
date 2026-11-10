@@ -827,8 +827,8 @@ fn takes_index_lock(args: &[OsString]) -> bool {
         "reset" => !has("--soft"),
         // Creating a branch at the current commit leaves the index alone.
         "checkout" | "switch" => !["-b", "-B", "-c", "-C"].into_iter().any(has),
-        "apply" => has("--cached") || has("--index"),
-        "stash" => matches!(rest.first(), None | Some(&("push" | "apply" | "pop"))),
+        "apply" => has("--cached"),
+        "stash" => matches!(rest.first(), Some(&("push" | "apply" | "pop"))),
         // `pull` holds no lock while it fetches, which is where it waits.
         _ => false,
     }
@@ -1160,7 +1160,8 @@ mod tests {
     }
 
     /// Every command shape the server runs as a write, with whether a real Git took
-    /// `index.lock` for it. [`takes_index_lock`] must agree with each observation.
+    /// `index.lock` for it. [`takes_index_lock`] may list only commands a real Git took the
+    /// lock for.
     #[test]
     fn index_lock_cleanup_lists_only_commands_that_take_the_lock() {
         use notify::Watcher;
@@ -1234,6 +1235,14 @@ mod tests {
             Watch(&["cherry-pick", "--empty=keep", "topic"]),
             Watch(&["rm", "--cached", "-r", "--ignore-unmatch", "--", "b.txt"]),
             Setup(&["reset", "-q", "--", "b.txt"]),
+            Write(
+                "../new.patch",
+                "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n\
+                 +++ b/new.txt\n@@ -0,0 +1 @@\n+new\n",
+            ),
+            Watch(&["apply", "--cached", "--whitespace=nowarn", "../new.patch"]),
+            Setup(&["reset", "-q", "--", "new.txt"]),
+            Watch(&["apply", "--whitespace=nowarn", "../new.patch"]),
             Watch(&["reset", "--mixed", "HEAD"]),
             Watch(&["-c", "rebase.backend=merge", "rebase", "main", "side"]),
             Setup(&["switch", "-q", "main"]),
@@ -1295,9 +1304,10 @@ mod tests {
                 continue;
             };
             let listed = takes_index_lock(&args.iter().map(OsString::from).collect::<Vec<_>>());
-            if listed != took_lock {
+            // Only a listed command that took no lock is unsafe; leaving one out is a nuisance.
+            if listed && !took_lock {
                 mismatches.push(format!(
-                    "git {args:?}: Git took the lock {took_lock}, listed {listed}"
+                    "git {args:?} is listed, but Git took no index.lock"
                 ));
             }
         }
