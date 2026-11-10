@@ -4,6 +4,7 @@ import {
   describeByteLimit,
   downloadWithBridge,
   interpretUploadResponse,
+  nextFreeFileName,
   resolveTransferUrl,
   sendBrowserUpload,
   triggerBrowserDownload,
@@ -176,5 +177,13 @@ describe("resolveTransferUrl", () => {
 
   it("refuses an unusable base or URL instead of throwing", () => {
     expect(resolveTransferUrl("not a url", "/api/transfers/t.k")).toBeNull();
+  });
+});
+
+describe("nextFreeFileName", () => {
+  it("nextFreeFileName adds a numbered suffix before the extension", () => {
+    expect(nextFreeFileName("diagram.png", 1)).toBe("diagram-1.png");
+    expect(nextFreeFileName("archive.tar.gz", 2)).toBe("archive.tar-2.gz");
+    expect(nextFreeFileName("README", 1)).toBe("README-1");
   });
 });

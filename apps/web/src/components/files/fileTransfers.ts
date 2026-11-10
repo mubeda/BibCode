@@ -125,6 +125,12 @@ export async function sendBrowserUpload(
   return { status: response.status, body: await response.text() };
 }
 
+/** `name` with `-<attempt>` before its last extension: `diagram.png`, 1 gives `diagram-1.png`. */
+export function nextFreeFileName(name: string, attempt: number): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? `${name.slice(0, dot)}-${attempt}${name.slice(dot)}` : `${name}-${attempt}`;
+}
+
 /** A byte cap as a person reads it: "1 GiB", "1.5 MiB", "900 bytes". */
 export function describeByteLimit(bytes: number): string {
   const units = [

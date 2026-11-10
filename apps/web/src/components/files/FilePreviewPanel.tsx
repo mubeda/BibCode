@@ -83,6 +83,7 @@ import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
 import { RichMarkdownFormatGroup } from "./richMarkdown/RichMarkdownFormatGroup";
 import { RichMarkdownLinkPopover } from "./richMarkdown/RichMarkdownLinkPopover";
+import { useInsertImage } from "./richMarkdown/useInsertImage";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
 import {
@@ -726,6 +727,29 @@ function EditableFileSurface({
   );
 }
 
+/** The formatting group with its image picker, which needs the file's folder. */
+function RichMarkdownFormatting({
+  cwd,
+  environmentId,
+  markdownPath,
+  editor,
+  onLink,
+}: {
+  cwd: string;
+  environmentId: EnvironmentId;
+  markdownPath: string;
+  editor: RichMarkdownEditor | null;
+  onLink: () => void;
+}) {
+  const insertImage = useInsertImage({ cwd, environmentId, markdownPath, editor });
+  return (
+    <>
+      <RichMarkdownFormatGroup editor={editor} onLink={onLink} onImage={insertImage.pick} />
+      <input {...insertImage.inputProps} />
+    </>
+  );
+}
+
 const RichMarkdownSurface = lazy(() => import("./richMarkdown/RichMarkdownSurface"));
 
 const READ_ONLY_MARKDOWN_NOTICE =
@@ -911,6 +935,7 @@ export default function FilePreviewPanel({
   const richEditable = richMode?.editable === true && richEditor !== null;
   const activeRichEditor = renderMarkdown && richEditable ? (richEditor ?? null) : null;
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+
   useSyncExternalStore(
     activeRichEditor?.subscribe ?? subscribeUnavailable,
     () => (activeRichEditor ? `${activeRichEditor.canUndo}:${activeRichEditor.canRedo}` : ""),
@@ -1085,10 +1110,12 @@ export default function FilePreviewPanel({
           saveBlockedReason={diskConflict ? fileDiskConflictSaveReason(diskConflict) : null}
           formatting={
             isMarkdown ? (
-              <RichMarkdownFormatGroup
+              <RichMarkdownFormatting
+                cwd={cwd}
+                environmentId={environmentId}
+                markdownPath={relativePath}
                 editor={activeRichEditor}
                 onLink={() => setLinkDialogOpen(true)}
-                onImage={() => {}}
               />
             ) : undefined
           }
