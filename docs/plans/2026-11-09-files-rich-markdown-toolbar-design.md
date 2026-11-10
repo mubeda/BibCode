@@ -629,3 +629,10 @@ was reproduced as a failing test before the fix.
   caller of `dispose()` is the ownership release, which defers it by a microtask. A removed
   subtree runs the owner's cleanup first, so the surface's own unmount delivery still runs
   before the dispose. A test pins that order.
+- Codex review 4, item 2, the surface test for a disk check during a failed delivery checked
+  the text only after the unmount delivered it, so removing the `reconcileRead` guard went
+  unnoticed and the next save carried the newer disk version as its precondition. Fixed in
+  the test: before the unmount it asserts the dropped read changed neither the text nor the
+  conflict state, and after the delivery recovers a check of the newer version makes Save a
+  conflict that writes nothing. Removing the guard in `reconcileRead`, `reconcileVersion` or
+  `beginDiskCheck` alone now fails the test.

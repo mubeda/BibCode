@@ -376,8 +376,8 @@ describe("RichMarkdownSurface", () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
-  it("a disk check while delivery fails applies no result and keeps the edit", async () => {
-    const { session } = createSession("Mine\n");
+  it("a disk check while delivery fails applies no result, so the newer disk version still blocks Save", async () => {
+    const { session, persist } = createSession("Mine\n");
     const { tiptap } = await mount(session, "Mine\n");
     const token = session.beginDiskCheck()!;
     reconcile.fail = true;
@@ -386,10 +386,22 @@ describe("RichMarkdownSurface", () => {
     expect(session.reconcileVersion(token, { _tag: "present", version: "v2" })).toBe("stale");
     session.reconcileRead(token, { version: "v2", contents: "Theirs\n" });
     expect(session.beginDiskCheck()).toBeNull();
+    expect(session.documentContents).toBe("Mine\n");
+    expect(session.getSnapshot().conflict).toBeNull();
+    expect(session.getSnapshot().editPending).toBe(true);
     reconcile.fail = false;
     await act(async () => root.render(null));
-
     expect(session.documentContents).toBe("Mine edited\n");
     expect(session.getSnapshot().save.phase).toBe("pending");
+
+    // The save precondition is still v1, so the next check sees v2 as a change on disk.
+    const next = session.beginDiskCheck()!;
+    expect(session.reconcileVersion(next, { _tag: "present", version: "v2" })).toBe("read");
+    session.reconcileRead(next, { version: "v2", contents: "Theirs\n" });
+    await act(async () => void (await session.flush()));
+
+    expect(session.getSnapshot().conflict).toMatchObject({ reason: "changed", diskKnown: true });
+    expect(session.documentContents).toBe("Mine edited\n");
+    expect(persist).not.toHaveBeenCalled();
   });
 });
