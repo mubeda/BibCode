@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 69810e7b4d2e)
+Spec: spec.md (sha256 745daaa9f184)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -53,6 +53,7 @@ Branch: claude/next-pr-planning-13d367
 | 9.3  | The native close protocol                                                 | 9     | Open        |               | Added by plan review 3             |
 | 8.6  | Desktop end-to-end test for export and the close dialog                   | 8     | Open        |               | Added by plan review 3             |
 | 6.10 | A checkbox in a read-only file keeps source history                       | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 3.4  | A status refresh does not wait on a slow pull-request lookup              | 3     | Open        |               | Added by amendment A7              |
 
 ## Log
 
@@ -92,3 +93,4 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 09:20 Lane E finished Tasks 3.1-3.3 on worktree-agent-a10a2df807771fb0d (cbc57f6a6..c1af78caf): status_owner 35 passed, held_pu 6, production_git_vcs_rpc 46, manager_transfer_gate 3, git_rpc 45, production_git_manager_rpc 71, manager:: 279; clippy and fmt clean. mstack-diagnose: Confirmed, the stacked-action and Git Manager mutation guards kept the read gate closed through the network wait. Codex review running. Open question (follow-up): `vcs.refreshStatus` still awaits PR enrichment through `gh pr list`, which may be unbounded.
 - 2026-11-10 09:20 Lane G (Phase 9) finished the design note (Codex and advisor reviewed, Approved) and every TypeScript step of Tasks 9.1-9.3 on worktree-agent-a1ca2211f1c4c64e7 (web checkpoint 1626 passed); its Rust is committed as wip, not compiled, waiting for the Rust slot. Ruling: Phase 9 owns `apps/desktop/src-tauri/src/remote_update_delegate.rs` too, so a remote update install asks this window first (R62 restart and update path); no other lane owns it. Ruling: the user decided Dock Quit and app-switcher Quit on macOS are a stated limit of R62, like logout; spec updated.
 - 2026-11-10 09:20 Lane B3 (opus medium) started on B2's branch in the Rust slot freed by lane E; lane G's Rust steps follow B3.
+- 2026-11-10 09:35 Codex review of lane E: 1 finding accepted with the advisor, confirmed in source (settle advances the epoch again after local_writes_finished, so a stream copy queued before settle is dropped while the broadcaster suppresses the equal trailing value; a subscriber can stay stale after a failed push). Ruling: amendment A7 (R18), approved by the user: a refresh does not wait on a slow pull-request lookup (Task 3.4). Lane E2 (opus medium, on E's branch) takes the finding and Task 3.4 in the Rust slot after B3.

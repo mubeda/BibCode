@@ -87,3 +87,22 @@ Steps
 7. [ ] Prove the test can fail: make `releases_reads_during_transfer` return true for Pull, run the same command. Expected: FAIL in `manager_transfer_gate_pull_and_fetch_keep_reads_waiting`. Restore and run again. Expected: PASS.
 8. [ ] In `docs/architecture/rpc-and-orchestration.md`, update every passage `rg -n -i "status read|read gate|trailing refresh" docs/architecture` finds in that file and in `docs/architecture/overview.md` (lines 133 and 144 say a read admitted during a mutation cannot publish and that the gate reopens only at the final idle transition; both change). In the overview's process and profiler passages, also describe the Git stop sequence of Phase 2 (ask, 2 second wait, force, lock cleanup, shutdown waits for running writes). The new text says: reads resume once a push-family operation finishes its local writes, the write lock is held to the end, pull and fetch keep reads waiting, and a fresh status is published when the operation ends.
 9. [ ] Run `cargo test -p bibcode-server --test git_rpc -j 2`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `vp run check:markdown-links`. Expected: PASS and no errors.
+
+### Task 3.4: A status refresh does not wait on a slow pull-request lookup
+
+- Satisfies: R18 (a slow pull-request lookup, amendment A7)
+- Depends on: 3.3
+- Files: modify `apps/server/src/production/git_vcs.rs`; modify `apps/server/tests/production_git_vcs_rpc.rs`
+- Interfaces: consumes `enrich_remote_pull_request` and `finish_fenced_enrichment` (git_vcs.rs near lines 890 and 3417) and `PullRequestService::resolve_current_optional_shared`; produces a bound on the refresh's wait for that lookup (a named constant well under the 10 second hang budget) after which the refresh answers without pull-request details, while the lookup keeps running and its result reaches subscribers through the status stream.
+- Skills: none
+- Read first: `apps/server/src/production/git_vcs.rs` near lines 880-900 and 1480-1500 (both enrichment call sites)
+- Tier: most capable
+- TDD: red-green
+- Done when: `cargo test -p bibcode-server --test production_git_vcs_rpc -j 2 slow_pull_request_lookup` exits 0 with the new tests passing
+
+Steps
+
+1. [ ] Add `slow_pull_request_lookup_does_not_delay_the_refresh` (a stub `gh` that answers after 12 seconds; the refresh answers within the bound with local status and no pull-request details) and `slow_pull_request_lookup_reaches_subscribers_when_it_finishes` (the subscriber receives the details after the stub answers). Run the Done when command. Expected: FAIL, the refresh waits for the stub.
+2. [ ] Implement the bound. Run the Done when command. Expected: PASS.
+3. [ ] Prove the test can fail: remove the bound. Expected: FAIL. Restore. Expected: PASS.
+4. [ ] Run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: no errors.

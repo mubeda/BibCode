@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 69810e7b4d2e)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 745daaa9f184)
 Repository: this repository
 Base: main
 
@@ -36,6 +36,7 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A4 (R34, approved by the user in chat on 2026-11-10 during execution). Lane C measured remark parse times of 116 ms at 50 kB, 537 ms at 200 kB and 7.1 s at 1 MB, with two or three parses per open. A Markdown file larger than 128 KiB opens read-only in rendered view with the notice.
 - A5 (approved by the user in chat on 2026-11-10 during execution). Theme export in the desktop app uses a new save-file desktop bridge command with the native Save dialog, because wry cancels webview downloads when no download handler exists (R53 gains a desktop scenario). Closing the desktop window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62), filed into this PR by the user instead of a separate issue. Both are Phase 9.
 - A6 (R34, approved by the user in chat on 2026-11-10 during execution). A task checkbox ticked in a read-only Markdown file keeps that file's source Undo history (Task 6.10), instead of R34's "as today".
+- A7 (R18, approved by the user in chat on 2026-11-10 during execution). A status refresh does not wait on a slow pull-request lookup: it answers with local status within a bound and the details follow on the status stream (Task 3.4).
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus

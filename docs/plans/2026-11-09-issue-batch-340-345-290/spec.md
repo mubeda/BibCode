@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A7 approved in chat during execution)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -348,6 +348,12 @@ WHILE a stacked action for a worktree has finished its local writes and is waiti
 - GIVEN a held push in worktree A
 - WHEN status is refreshed for worktree B
 - THEN B is answered without waiting for A
+
+#### Scenario: a slow pull-request lookup (amendment A7)
+
+- GIVEN a worktree whose pull-request lookup (`gh` or `glab`) does not answer for longer than 10 seconds
+- WHEN status is refreshed
+- THEN the refresh answers with current local status within a few seconds, without the pull-request details, and subscribers receive the pull-request details on the status stream once the lookup finishes
 
 ### R19. Status is delivered during Git Manager push-family operations [Must]
 
