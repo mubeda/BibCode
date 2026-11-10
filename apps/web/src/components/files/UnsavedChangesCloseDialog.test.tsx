@@ -285,6 +285,146 @@ describe("UnsavedChangesCloseHost", () => {
     expect(session.unsavedContents).toBe("my edit");
   });
 
+  describe("a remote update install the window allowed", () => {
+    let send: (request: DesktopCloseRequest) => void;
+    let endInstall: () => void;
+    let replies: [number, string][];
+
+    beforeEach(async () => {
+      await act(async () => root.unmount());
+      replies = [];
+      window.desktopBridge = {
+        onCloseRequest: (listener: (request: DesktopCloseRequest) => void) => {
+          send = listener;
+          return () => {};
+        },
+        replyCloseRequest: async (requestId: number, reply: string) => {
+          replies.push([requestId, reply]);
+        },
+        onUpdateInstallEnded: (listener: () => void) => {
+          endInstall = listener;
+          return () => {};
+        },
+      } as unknown as DesktopBridge;
+      root = createRoot(container);
+      await act(async () => root.render(<UnsavedChangesCloseHost />));
+    });
+
+    afterEach(async () => {
+      // Unblocks whatever a test left blocked, so the next test starts clean.
+      await act(async () => endInstall());
+      delete window.desktopBridge;
+    });
+
+    async function requestInstall(requestId: number) {
+      await act(async () => send({ requestId, reason: "update" }));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+
+    // Longer than the 500 ms autosave delay, so a write that is not held would have started.
+    const afterTheSaveDelay = () =>
+      act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      });
+
+    function editorOutsideTheDialog() {
+      const editor = document.createElement("textarea");
+      container.append(editor);
+      return editor;
+    }
+
+    it("Discard, then the install fails: saving works again", async () => {
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = openFile(newRegistry(), "notes.md", persist);
+      session.changeFromRichEditor("kept edit");
+
+      await requestInstall(4);
+      await click("Discard");
+      await vi.waitFor(() => expect(replies.at(-1)).toEqual([4, "allow"]));
+      await afterTheSaveDelay();
+      expect(persist).not.toHaveBeenCalled();
+
+      await act(async () => endInstall());
+      await expect(session.flush()).resolves.toBe("saved");
+      expect(persist).toHaveBeenCalledWith("notes.md", "kept edit", expect.anything());
+    });
+
+    it("Save all, then an edit before the restart is blocked", async () => {
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = openFile(newRegistry(), "notes.md", persist);
+      session.changeFromRichEditor("saved edit");
+      const editor = editorOutsideTheDialog();
+
+      await requestInstall(5);
+      await click("Save all");
+      await vi.waitFor(() => expect(replies.at(-1)).toEqual([5, "allow"]));
+      expect(dialogText()).toContain("Installing an update");
+      // The modal dialog takes the editors out of reach.
+      await vi.waitFor(() =>
+        expect(editor.closest("[inert], [aria-hidden='true']")).not.toBeNull(),
+      );
+      await act(async () => {
+        document.activeElement!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      expect(dialogText()).toContain("Installing an update");
+      // An edit that still reaches the session is not written before the restart.
+      session.changeFromRichEditor("late edit");
+      await afterTheSaveDelay();
+      expect(persist).not.toHaveBeenCalledWith("notes.md", "late edit", expect.anything());
+    });
+
+    it("the install fails after Save all: editing and saving run again", async () => {
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = openFile(newRegistry(), "notes.md", persist);
+      session.changeFromRichEditor("saved edit");
+      const editor = editorOutsideTheDialog();
+
+      await requestInstall(6);
+      await click("Save all");
+      await vi.waitFor(() => expect(dialogText()).toContain("Installing an update"));
+
+      await act(async () => endInstall());
+      expect(dialogText()).toBeUndefined();
+      await vi.waitFor(() => expect(editor.closest("[inert], [aria-hidden='true']")).toBeNull());
+      expect(toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error", title: "The update did not install" }),
+      );
+      session.changeFromRichEditor("next edit");
+      await expect(session.flush()).resolves.toBe("saved");
+      expect(persist).toHaveBeenCalledWith("notes.md", "next edit", expect.anything());
+    });
+
+    it("with nothing unsaved, an edit started during the install is not written", async () => {
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = openFile(newRegistry(), "notes.md", persist);
+
+      await requestInstall(7);
+      await vi.waitFor(() => expect(replies.at(-1)).toEqual([7, "allow"]));
+      expect(dialogText()).toContain("Installing an update");
+      session.changeFromRichEditor("late edit");
+      await afterTheSaveDelay();
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it("cancelling another leave during the install keeps it blocked", async () => {
+      const session = openFile(newRegistry(), "notes.md");
+      session.changeFromRichEditor("kept edit");
+
+      await requestInstall(8);
+      await click("Discard");
+      await vi.waitFor(() => expect(dialogText()).toContain("Installing an update"));
+      const [answer] = await leave("quit");
+      expect(dialogText()).toContain("notes.md");
+      await click("Cancel");
+      await expect(answer).resolves.toBe("stay");
+      expect(dialogText()).toContain("Installing an update");
+    });
+  });
+
   it("answers a desktop close request through the bridge", async () => {
     await act(async () => root.unmount());
     const replies: [number, string][] = [];
