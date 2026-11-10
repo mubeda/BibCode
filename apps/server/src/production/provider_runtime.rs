@@ -18491,6 +18491,7 @@ async fn run_claude_probe(
         timeout: operation_timeout,
         cleanup_timeout: CLEANUP_RESERVE,
         max_output_bytes: CLAUDE_ACTIVITY_PROBE_OUTPUT_LIMIT,
+        stop_policy: crate::process::supervised::StopPolicy::Force,
         overflow: SupervisedOverflow::Truncate,
     };
     // The cache producer is detached from the deadline-bounded caller. Let the

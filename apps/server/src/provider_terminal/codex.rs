@@ -2674,6 +2674,7 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
                 timeout: self.timeout,
                 cleanup_timeout: self.cleanup_timeout,
                 max_output_bytes: CODEX_PROBE_OUTPUT_LIMIT,
+                stop_policy: crate::process::supervised::StopPolicy::Force,
                 overflow: SupervisedOverflow::Truncate,
             };
             let cancellation = tokio_util::sync::CancellationToken::new();

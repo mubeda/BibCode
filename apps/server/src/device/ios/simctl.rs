@@ -498,6 +498,7 @@ async fn run(
             timeout,
             cleanup_timeout: CLEANUP_TIMEOUT,
             max_output_bytes,
+            stop_policy: crate::process::supervised::StopPolicy::Force,
             overflow: SupervisedOverflow::Error,
         },
         cancel,

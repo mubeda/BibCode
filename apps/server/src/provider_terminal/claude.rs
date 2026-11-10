@@ -2313,6 +2313,7 @@ async fn run_attributed_helper(
             timeout,
             cleanup_timeout: Duration::from_millis(500),
             max_output_bytes,
+            stop_policy: crate::process::supervised::StopPolicy::Force,
             overflow: SupervisedOverflow::Error,
         },
         &CancellationToken::new(),
@@ -2773,6 +2774,7 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
                 timeout: self.timeout,
                 cleanup_timeout: Duration::from_secs(1),
                 max_output_bytes: CLAUDE_PROBE_OUTPUT_LIMIT,
+                stop_policy: crate::process::supervised::StopPolicy::Force,
                 overflow: SupervisedOverflow::Truncate,
             };
             #[cfg(test)]

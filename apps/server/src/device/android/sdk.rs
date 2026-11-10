@@ -219,6 +219,7 @@ async fn run_tool(program: &Path, args: &[&str]) -> Result<ToolOutput, String> {
             timeout: LIST_TIMEOUT,
             cleanup_timeout: LIST_CLEANUP_TIMEOUT,
             max_output_bytes: LIST_MAX_OUTPUT_BYTES,
+            stop_policy: crate::process::supervised::StopPolicy::Force,
             overflow: SupervisedOverflow::Truncate,
         },
         &CancellationToken::new(),

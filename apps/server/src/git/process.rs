@@ -5,8 +5,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::process::supervised::{
-    SupervisedOverflow, SupervisedRunError, SupervisedRunOutput, SupervisedRunRequest,
-    SupervisedStreamOutput, run_supervised,
+    StopPolicy, SupervisedOverflow, SupervisedRunError, SupervisedRunOutput, SupervisedRunRequest,
+    SupervisedStreamOutput, run_supervised_reporting,
 };
 use crate::process::{ChildCommand, EnvironmentInheritance, SpawnPlan};
 
@@ -418,14 +418,16 @@ async fn run_request(
     inheritance: EnvironmentInheritance,
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    SpawnPlan::new(&request.command, |program| {
+    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let result = SpawnPlan::new(&request.command, |program| {
         process_command(request, inheritance, program)
     })
     .start(
         |command| {
-            Box::pin(run_supervised(
+            Box::pin(run_supervised_reporting(
                 supervised_request(request, command),
                 cancellation,
+                reports.clone(),
             ))
         },
         |error| match error {
@@ -433,7 +435,20 @@ async fn run_request(
             _ => None,
         },
     )
-    .await
+    .await;
+    // A report still pending belongs to a background reap; it is not awaited here.
+    if let Ok(report) = received.try_recv()
+        && report.requested
+        && report.forced
+        && runs_git(&request.command)
+    {
+        tracing::debug!(
+            operation = %request.operation,
+            exited = report.exited,
+            "Git did not stop when asked and was killed"
+        );
+    }
+    result
 }
 
 fn process_command(
@@ -471,7 +486,20 @@ fn supervised_request(request: &ProcessRequest, command: Command) -> SupervisedR
             OutputPolicy::Error => SupervisedOverflow::Error,
             OutputPolicy::Tail => SupervisedOverflow::Tail,
         },
+        // Git removes its own `index.lock` when asked to stop (R15); other programs this
+        // runner starts keep the immediate stop.
+        stop_policy: if runs_git(&request.command) {
+            StopPolicy::AskThenForce
+        } else {
+            StopPolicy::Force
+        },
     }
+}
+
+fn runs_git(command: &std::path::Path) -> bool {
+    command
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
 }
 
 /// Windows answers a missing working directory with `ERROR_DIRECTORY` ("not a directory"); it is
