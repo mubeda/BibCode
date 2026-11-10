@@ -129,8 +129,16 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 
 impl GitServerHarness {
     async fn start(temp: &TempDir, parallelism_permit: OwnedSemaphorePermit) -> Self {
+        Self::start_with_services(temp, parallelism_permit, git_vcs_services(temp)).await
+    }
+
+    async fn start_with_services(
+        temp: &TempDir,
+        parallelism_permit: OwnedSemaphorePermit,
+        services: GitVcsRpcServices,
+    ) -> Self {
         let mut registry = RpcRegistry::empty();
-        register_git_vcs_rpc(&mut registry, git_vcs_services(temp));
+        register_git_vcs_rpc(&mut registry, services);
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
             .await
             .expect("server starts");
@@ -2976,6 +2984,248 @@ async fn a_failed_push_leaves_subscribers_with_the_clean_status() {
             .await;
         }
     }
+
+    server.shutdown().await;
+}
+
+/// A `gh` that answers `pr list` from marker files in `STATE`. A `slow` file holds a delay
+/// in seconds, and an `open` file makes it report pull request 42 for the branch.
+#[cfg(unix)]
+const MARKER_GH: &str = r#"#!/bin/sh
+case "$1:$2" in
+  pr:list)
+    printf '%s\n' "$4" >> 'STATE/calls'
+    if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
+    if [ -f 'STATE/open' ]; then
+      printf '[{"number":42,"title":"PR for %s","url":"https://github.example.test/example-org/sample-project/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
+    else
+      printf '[]\n'
+    fi ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// A repository whose `origin` is a loopback host recorded as GitHub, served by `MARKER_GH`.
+#[cfg(unix)]
+struct PullRequestLookupFixture {
+    temp: TempDir,
+    repository: TempDir,
+    bin: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+impl PullRequestLookupFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temporary server directory");
+        let repository = TempDir::new().expect("temporary repository");
+        initialize_repository(&repository);
+        commit_file(repository.path(), "base.txt", "base\n", "test: base");
+        // Nothing listens on port 9, so a fetch fails at once and never leaves the host.
+        run_git(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "http://127.0.0.1:9/example-org/sample-project.git",
+            ],
+        );
+        let bin = temp.path().join("hosting-bin");
+        let state = temp.path().join("gh-state");
+        fs::create_dir(&bin).expect("hosting bin");
+        fs::create_dir(&state).expect("gh state");
+        let gh = bin.join("gh");
+        fs::write(&gh, MARKER_GH.replace("STATE", &state.to_string_lossy()))
+            .expect("write gh stub");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("gh is executable");
+        Self {
+            temp,
+            repository,
+            bin,
+            state,
+        }
+    }
+
+    fn services(&self) -> GitVcsRpcServices {
+        let hosts = Arc::new(bibcode_server::source_control::ProviderHosts::default());
+        hosts.record(
+            "127.0.0.1:9",
+            bibcode_server::source_control::ProviderKind::Github,
+        );
+        let repository = Arc::new(
+            bibcode_server::git::GitRepository::default().with_provider_hosts(hosts.clone()),
+        );
+        GitVcsRpcServices::with_repository(repository, hosts)
+            .with_hosting_executable_dir_for_integration_test(self.bin.clone())
+    }
+
+    fn cwd(&self) -> String {
+        self.repository.path().to_string_lossy().into_owned()
+    }
+
+    fn set(&self, marker: &str, contents: &str) {
+        fs::write(self.state.join(marker), contents).expect("gh marker");
+    }
+
+    fn lookups(&self) -> usize {
+        fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_pull_request_lookup_does_not_delay_the_refresh() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("slow_pull_request_lookup_does_not_delay_the_refresh") {
+        return;
+    }
+    let fixture = PullRequestLookupFixture::new();
+    fixture.set("open", "");
+    fixture.set("slow", "12");
+    let mut server = GitServerHarness::start_with_services(
+        &fixture.temp,
+        parallelism_permit,
+        fixture.services(),
+    )
+    .await;
+
+    request(
+        server.socket(),
+        "1",
+        "vcs.refreshStatus",
+        json!({ "cwd": fixture.cwd() }),
+    )
+    .await;
+    let status = timeout(Duration::from_secs(5), success_value(server.socket(), "1"))
+        .await
+        .expect("the refresh answers within a few seconds while gh takes 12 seconds");
+    assert_eq!(status["isRepo"], true, "{status}");
+    assert_eq!(status["refName"], "main", "{status}");
+    assert!(status["pr"].is_null(), "{status}");
+    assert_eq!(fixture.lookups(), 1, "the refresh asked gh once");
+
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_pull_request_lookup_reaches_subscribers_when_it_finishes() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "slow_pull_request_lookup_reaches_subscribers_when_it_finishes",
+    ) {
+        return;
+    }
+    let fixture = PullRequestLookupFixture::new();
+    let cwd = fixture.cwd();
+    let mut server = GitServerHarness::start_with_services(
+        &fixture.temp,
+        parallelism_permit,
+        fixture.services(),
+    )
+    .await;
+
+    request(
+        server.socket(),
+        "9",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let mut status_events = Vec::new();
+    let deadline = Instant::now() + GIT_STATUS_INTEGRATION_DEADLINE;
+    pump_server_message(
+        server.socket(),
+        deadline,
+        "the subscription snapshot",
+        &mut status_events,
+    )
+    .await;
+    while fixture.lookups() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription never looked up its pull request"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A finished mutation forgets the remembered "no pull request" answer. Waiting for its
+    // trailing status keeps the next refresh from publishing anything new.
+    fs::write(fixture.repository.path().join("staged.txt"), "staged\n").expect("write file");
+    request(
+        server.socket(),
+        "2",
+        "vcs.stageFiles",
+        json!({ "cwd": cwd, "filePaths": ["staged.txt"] }),
+    )
+    .await;
+    let is_staged = |events: &[Value]| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| event.get("local"))
+            .is_some_and(|local| {
+                local["workingTree"]["files"]
+                    .as_array()
+                    .is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|file| file["path"] == "staged.txt" && file["area"] == "staged")
+                    })
+            })
+    };
+    let mut staged = false;
+    while !staged || !is_staged(&status_events) {
+        if let ServerMessage::Exit { request_id, exit } = pump_server_message(
+            server.socket(),
+            deadline,
+            "the staged status reaching the subscriber",
+            &mut status_events,
+        )
+        .await
+        {
+            assert_eq!(request_id.as_str(), "2", "{exit:?}");
+            assert!(matches!(exit, RpcExit::Success { .. }), "{exit:?}");
+            staged = true;
+        }
+    }
+
+    fixture.set("open", "");
+    fixture.set("slow", "12");
+    let lookups_before_refresh = fixture.lookups();
+    request(
+        server.socket(),
+        "3",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let has_pull_request = |events: &[Value]| {
+        events
+            .iter()
+            .any(|event| event["remote"]["pr"]["number"] == 42)
+    };
+    while !has_pull_request(&status_events) {
+        pump_server_message(
+            server.socket(),
+            deadline,
+            "the subscriber receiving the pull request once gh answers",
+            &mut status_events,
+        )
+        .await;
+    }
+    assert_eq!(
+        fixture.lookups(),
+        lookups_before_refresh + 1,
+        "the subscriber reused the refresh's lookup"
+    );
 
     server.shutdown().await;
 }
