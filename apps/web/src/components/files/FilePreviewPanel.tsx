@@ -119,6 +119,7 @@ const UNAVAILABLE_SESSION_SNAPSHOT: FileEditingSessionSnapshot = {
   canRedo: false,
   conflict: null,
   deletedOnDisk: false,
+  editPending: false,
 };
 
 const subscribeUnavailable = (): (() => void) => () => {};

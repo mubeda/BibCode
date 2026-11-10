@@ -755,3 +755,216 @@ describe("FileEditingSession", () => {
     lease!.release();
   });
 });
+
+interface FakeSourceEditor {
+  readonly editor: InstanceType<typeof pierre.Editor>;
+  type(text: string): void;
+  text(): string;
+  setAttached(attached: boolean): void;
+}
+
+interface FakeTextEdit {
+  readonly range: {
+    readonly start: { line: number; character: number };
+    readonly end: { line: number; character: number };
+  };
+  readonly newText: string;
+}
+
+/** Gives the fake Pierre editor a document, an undo stack and an attach state. */
+function fakeSourceHistory(session: FileEditingSession<never>, initial: string): FakeSourceEditor {
+  const editor = session.editor as unknown as InstanceType<typeof pierre.Editor> &
+    Record<string, unknown>;
+  const onChange = editor.options["onChange"] as (file: { contents: string }) => void;
+  let text = initial;
+  let attached = true;
+  const history: string[] = [];
+  const offsetAt = ({ line, character }: { line: number; character: number }) =>
+    text
+      .split("\n")
+      .slice(0, line)
+      .reduce((sum, current) => sum + current.length + 1, 0) + character;
+  editor["getText"] = () => (attached ? text : "");
+  editor["getFile"] = () => (attached ? { name: "README.md", contents: text } : undefined);
+  editor["applyEdits"] = (edits: FakeTextEdit[], _history: boolean, undoBoundary: boolean) => {
+    if (!attached) throw new Error("Editor is not attached");
+    expect(undoBoundary).toBe(true);
+    history.push(text);
+    const resolved = edits
+      .map((edit) => ({
+        start: offsetAt(edit.range.start),
+        end: offsetAt(edit.range.end),
+        newText: edit.newText,
+      }))
+      .sort((a, b) => b.start - a.start);
+    for (const edit of resolved) {
+      text = text.slice(0, edit.start) + edit.newText + text.slice(edit.end);
+    }
+    onChange({ contents: text });
+  };
+  editor.undo.mockImplementation(() => {
+    const previous = history.pop();
+    if (previous === undefined) return;
+    text = previous;
+    onChange({ contents: text });
+  });
+  editor.canUndo = true;
+  return {
+    editor,
+    type: (next) => {
+      history.push(text);
+      text = next;
+      onChange({ contents: text });
+    },
+    text: () => text,
+    setAttached: (next) => {
+      attached = next;
+      if (next) (editor.options["onAttach"] as () => void)();
+    },
+  };
+}
+
+describe("FileEditingSession rich edits", () => {
+  const createSession = (persist = vi.fn(async () => AsyncResult.success(undefined))) =>
+    new FileEditingSession<never>({
+      cwd: "/repo",
+      relativePath: "README.md",
+      debounceMs: 500,
+      persist,
+      onPendingChange: vi.fn(),
+      onConfirmed: vi.fn(),
+    });
+
+  beforeEach(() => {
+    vi.useRealTimers();
+    pierre.instances.length = 0;
+  });
+
+  it("a rich edit keeps the source editor and its history", () => {
+    const session = createSession();
+    const source = fakeSourceHistory(session, "one\n");
+    source.type("one two\n");
+    source.type("one two three\n");
+
+    session.changeFromRichEditor("# one two three\n");
+    session.commitRichEdits();
+
+    expect(session.editor).toBe(source.editor);
+    expect(source.editor.cleanUp).not.toHaveBeenCalled();
+    expect(session.unsavedContents).toBe("# one two three\n");
+    expect(source.text()).toBe("# one two three\n");
+    session.undo();
+    expect(source.text()).toBe("one two three\n");
+    session.undo();
+    expect(source.text()).toBe("one two\n");
+    session.undo();
+    expect(source.text()).toBe("one\n");
+  });
+
+  it("several rich edits in one visit are one undo step", () => {
+    const session = createSession();
+    const source = fakeSourceHistory(session, "start\n");
+
+    session.changeFromRichEditor("start a\n");
+    session.changeFromRichEditor("start ab\n");
+    session.changeFromRichEditor("start abc\n");
+    session.commitRichEdits();
+
+    expect(source.text()).toBe("start abc\n");
+    session.undo();
+    expect(source.text()).toBe("start\n");
+  });
+
+  it("a commit on a detached editor lands on the next attach, one undo step per visit", () => {
+    const session = createSession();
+    const source = fakeSourceHistory(session, "start\n");
+    source.type("start typed\n");
+    source.setAttached(false);
+
+    session.changeFromRichEditor("first visit\n");
+    session.commitRichEdits();
+    session.changeFromRichEditor("second visit\n");
+    session.commitRichEdits();
+    expect(source.editor.cleanUp).not.toHaveBeenCalled();
+
+    source.setAttached(true);
+    expect(source.text()).toBe("second visit\n");
+    expect(session.getSnapshot().save.phase).toBe("pending");
+    session.undo();
+    expect(source.text()).toBe("first visit\n");
+    session.undo();
+    expect(source.text()).toBe("start typed\n");
+  });
+
+  it("a rich edit marks the file as having unsaved changes and flush saves it", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const session = createSession(persist);
+
+    session.changeFromRichEditor("rich text\n");
+
+    expect(session.getSnapshot().save.phase).toBe("pending");
+    await expect(session.flush()).resolves.toBe("saved");
+    expect(persist).toHaveBeenCalledWith("README.md", "rich text\n", null);
+  });
+
+  it("commitRichEdits without a source editor does nothing", () => {
+    const session = createSession();
+
+    session.changeFromRichEditor("rich only\n");
+    session.commitRichEdits();
+
+    expect(pierre.instances).toHaveLength(0);
+    expect(session.documentContents).toBe("rich only\n");
+  });
+
+  it("the pending edit flusher runs before flush, settle, a view commit, a disk check, a file switch and a path mutation", async () => {
+    const persist = vi.fn(async () => AsyncResult.success(undefined));
+    const registry = new FileEditingSessionRegistry<FileEditingSession<never>>();
+    const session = registry.getOrCreate("README.md", () => createSession(persist));
+    registry.getOrCreate("other.md", () => createSession(persist));
+    const waitWith = (text: string) => {
+      const flusher = vi.fn(() => {
+        session.setPendingEditFlusher(null);
+        session.changeFromRichEditor(text);
+      });
+      session.setPendingEditFlusher(flusher);
+      return flusher;
+    };
+
+    const onFlush = waitWith("flushed\n");
+    expect(session.getSnapshot().editPending).toBe(true);
+    await expect(session.flush()).resolves.toBe("saved");
+    expect(onFlush).toHaveBeenCalledOnce();
+    expect(session.getSnapshot().editPending).toBe(false);
+    expect(persist).toHaveBeenLastCalledWith("README.md", "flushed\n", null);
+
+    waitWith("settled\n");
+    await expect(session.settle()).resolves.toBe("saved");
+    expect(persist).toHaveBeenLastCalledWith("README.md", "settled\n", null);
+
+    waitWith("committed\n");
+    session.commitRichEdits();
+    expect(session.unsavedContents).toBe("committed\n");
+
+    waitWith("checked\n");
+    session.beginDiskCheck();
+    expect(session.unsavedContents).toBe("checked\n");
+
+    registry.setActivePath("README.md");
+    waitWith("switched\n");
+    registry.setActivePath("other.md");
+    expect(session.unsavedContents).toBe("switched\n");
+    await vi.waitFor(() =>
+      expect(persist).toHaveBeenLastCalledWith("README.md", "switched\n", null),
+    );
+
+    waitWith("renamed\n");
+    const lease = await registry.beginPathMutation({
+      kind: "rename",
+      fromRelativePath: "README.md",
+      toRelativePath: "GUIDE.md",
+    });
+    expect(persist).toHaveBeenLastCalledWith("README.md", "renamed\n", null);
+    lease?.release();
+  });
+});

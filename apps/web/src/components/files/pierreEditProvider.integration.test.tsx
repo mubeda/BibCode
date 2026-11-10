@@ -250,6 +250,42 @@ describe("Pierre stable edit integration", () => {
       session.reconcileRead(token, { version, contents });
     };
 
+    it("two source edits, a rich visit, then three undos restore the original text", async () => {
+      const { session } = createSession("one\n");
+      let editor = await renderSession(session, "one\n");
+      const insert = (character: number, newText: string) =>
+        editor.applyEdits(
+          [
+            {
+              range: { start: { line: 0, character }, end: { line: 0, character } },
+              newText,
+            },
+          ],
+          true,
+          true,
+        );
+      insert(3, " two");
+      insert(7, " three");
+      expect(editor.getText()).toBe("one two three\n");
+
+      // Rendered view replaces the source surface, which detaches the editor.
+      await act(async () => root.render(null));
+      session.changeFromRichEditor("# one two three\n");
+      session.changeFromRichEditor("# one two three!\n");
+      session.commitRichEdits();
+
+      editor = await renderSession(session, session.retainedContents ?? "one\n");
+      expect(editor).toBe(session.editor);
+      // Pierre reports the attach on its next render frame, which applies the visit.
+      await vi.waitFor(() => expect(editor.getText()).toBe("# one two three!\n"));
+      session.undo();
+      expect(editor.getText()).toBe("one two three\n");
+      session.undo();
+      expect(editor.getText()).toBe("one two\n");
+      session.undo();
+      expect(editor.getText()).toBe("one\n");
+    });
+
     it("reloads a clean editor in place, and Undo restores the old text as unsaved", async () => {
       const before = "one\ntwo words\nthree\n";
       const { session, persist } = createSession(before);
