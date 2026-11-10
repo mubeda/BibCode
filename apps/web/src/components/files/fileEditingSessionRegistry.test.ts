@@ -155,7 +155,7 @@ describe("FileEditingSessionRegistry", () => {
       toRelativePath: "src/renamed.ts",
     });
 
-    session.changeOutsideEditor("paused draft");
+    session.changeFromRichEditor("paused draft");
     registry.setActivePath(null);
     expect(persist).not.toHaveBeenCalled();
 
@@ -189,7 +189,7 @@ describe("FileEditingSessionRegistry", () => {
       toRelativePath: "src/renamed.ts",
     });
 
-    session.changeOutsideEditor("paused draft");
+    session.changeFromRichEditor("paused draft");
     const flush = vi.spyOn(session, "flush");
     registry.setActivePath(null);
     const pausedFlush = flush.mock.results[0]!.value;
@@ -235,7 +235,7 @@ describe("FileEditingSessionRegistry", () => {
         toRelativePath: "src/renamed.ts",
       });
 
-      session.changeOutsideEditor("paused draft");
+      session.changeFromRichEditor("paused draft");
       registry.setActivePath(null);
       lease!.release();
       await vi.advanceTimersByTimeAsync(0);

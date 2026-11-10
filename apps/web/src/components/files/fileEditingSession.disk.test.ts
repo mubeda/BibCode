@@ -100,7 +100,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
     expect(session.watchesDisk).toBe(false);
     expect(session.beginDiskCheck()).toBeNull();
-    session.changeOutsideEditor("edited\n");
+    session.changeFromRichEditor("edited\n");
     await expect(session.flush()).resolves.toBe("saved");
     expect(persist).toHaveBeenCalledWith("src/app.ts", "edited\n", null);
   });
@@ -108,9 +108,9 @@ describe("FileEditingSession disk reconciliation", () => {
   it("guards each save with the last version it saw and confirms the committed one", async () => {
     const { session, persist, onConfirmed } = createSession();
 
-    session.changeOutsideEditor("one\n");
+    session.changeFromRichEditor("one\n");
     await session.flush();
-    session.changeOutsideEditor("two\n");
+    session.changeFromRichEditor("two\n");
     await session.flush();
 
     expect(persist.mock.calls.map((call) => call[2])).toEqual([
@@ -136,7 +136,7 @@ describe("FileEditingSession disk reconciliation", () => {
     expect(session.getSnapshot()).toMatchObject({ conflict: null, deletedOnDisk: false });
     expect(persist).not.toHaveBeenCalled();
 
-    session.changeOutsideEditor("newer\n");
+    session.changeFromRichEditor("newer\n");
     await session.flush();
     expect(persist).toHaveBeenCalledWith("src/app.ts", "newer\n", {
       _tag: "version",
@@ -171,7 +171,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
     // The composition ends with its text committed: the deletion is now a conflict.
     session.setComposing(false);
-    session.changeOutsideEditor("composed\n");
+    session.changeFromRichEditor("composed\n");
     check(session, { _tag: "missing" });
     expect(session.getSnapshot()).toMatchObject({
       conflict: { reason: "deleted", diskKnown: true },
@@ -182,7 +182,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
   it("does not read the file again for a conflict whose disk version it already shows", () => {
     const { session } = createSession();
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
     check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
     const conflict = session.getSnapshot().conflict;
 
@@ -190,19 +190,19 @@ describe("FileEditingSession disk reconciliation", () => {
     expect(session.getSnapshot().conflict).toBe(conflict);
 
     // Edits that come to match the disk text settle the conflict without a read.
-    session.changeOutsideEditor("agent\n");
+    session.changeFromRichEditor("agent\n");
     expect(check(session, { _tag: "present", version: "v2" })).toBe("settled");
     expect(session.getSnapshot()).toMatchObject({ conflict: null, save: { phase: "clean" } });
 
     // A newer disk version is read as before.
-    session.changeOutsideEditor("mine again\n");
+    session.changeFromRichEditor("mine again\n");
     expect(check(session, { _tag: "present", version: "v3" })).toBe("read");
   });
 
   it("adopts a disk version whose text already matches the document", async () => {
     vi.useFakeTimers();
     const { session, persist } = createSession();
-    session.changeOutsideEditor("same edit\n");
+    session.changeFromRichEditor("same edit\n");
 
     check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "same edit\n" });
 
@@ -220,7 +220,7 @@ describe("FileEditingSession disk reconciliation", () => {
     const registry = new FileEditingSessionRegistry();
     registry.getOrCreate("src/app.ts", () => session);
     registry.setActivePath("src/app.ts");
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
     const cacheKey = session.cacheKey;
 
     check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
@@ -241,7 +241,7 @@ describe("FileEditingSession disk reconciliation", () => {
     registry.setActivePath("src/other.ts");
     session.pauseSaving();
     session.resumeSaving();
-    session.changeOutsideEditor("still mine\n");
+    session.changeFromRichEditor("still mine\n");
     await vi.runAllTimersAsync();
     // Closing the tab keeps the session, so reopening shows the edits and the bar.
     await registry.reconcile([]);
@@ -253,7 +253,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
   it("overwrites the disk version the conflict showed, then saves from what it wrote", async () => {
     const { session, persist, onConflictChange } = createSession();
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
     check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
 
     session.overwriteDisk();
@@ -266,7 +266,7 @@ describe("FileEditingSession disk reconciliation", () => {
     await vi.waitFor(() => expect(session.getSnapshot().save.phase).toBe("clean"));
     expect(session.getSnapshot().conflict).toBeNull();
     expect(onConflictChange).toHaveBeenLastCalledWith("src/app.ts", false);
-    session.changeOutsideEditor("later\n");
+    session.changeFromRichEditor("later\n");
     await session.flush();
     expect(persist).toHaveBeenLastCalledWith("src/app.ts", "later\n", {
       _tag: "version",
@@ -291,7 +291,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
   it("recreates a deleted file only with a missing precondition", async () => {
     const { session, persist } = createSession();
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
 
     check(session, { _tag: "missing" });
     expect(session.getSnapshot().conflict).toMatchObject({ reason: "deleted", diskKnown: true });
@@ -314,7 +314,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
   it("discards edits for a deleted file when the user reloads from disk", () => {
     const { session, persist } = createSession();
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
     check(session, { _tag: "missing" });
 
     session.reloadFromDisk();
@@ -334,12 +334,12 @@ describe("FileEditingSession disk reconciliation", () => {
     persist.mockReturnValueOnce(write.promise);
     const tokenBeforeSave = session.beginDiskCheck()!;
 
-    session.changeOutsideEditor("one\n");
+    session.changeFromRichEditor("one\n");
     const flushed = session.flush();
     await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
     expect(session.beginDiskCheck()).toBeNull();
     // The user keeps typing while the save is in flight.
-    session.changeOutsideEditor("two\n");
+    session.changeFromRichEditor("two\n");
     write.resolve(saved("v-one"));
     await flushed;
 
@@ -362,7 +362,7 @@ describe("FileEditingSession disk reconciliation", () => {
     const requested = vi.fn();
     session.subscribeDiskCheckRequests(requested);
     persist.mockResolvedValueOnce(refused("file_changed_on_disk"));
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
 
     await expect(session.flush()).resolves.toBe("failed");
 
@@ -379,7 +379,7 @@ describe("FileEditingSession disk reconciliation", () => {
 
   it("releases a conflict when the disk returns to the version the edits were based on", async () => {
     const { session, persist } = createSession();
-    session.changeOutsideEditor("mine\n");
+    session.changeFromRichEditor("mine\n");
     check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
 
     expect(check(session, { _tag: "present", version: "v1" })).toBe("settled");

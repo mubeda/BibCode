@@ -61,7 +61,7 @@ describe("FileEditingSession", () => {
     });
 
     expect(pierre.instances).toHaveLength(0);
-    session.changeOutsideEditor("- [x] rendered-only edit\n");
+    session.changeFromRichEditor("- [x] rendered-only edit\n");
     expect(pierre.instances).toHaveLength(0);
 
     const editor = session.editor;
@@ -90,7 +90,7 @@ describe("FileEditingSession", () => {
     expect(editor.undo).toHaveBeenCalledOnce();
   });
 
-  it("retains its editor's edited document, and an outside change only until it is saved", async () => {
+  it("retains its editor's edited document after it is saved", async () => {
     const session = new FileEditingSession({
       cwd: "/repo",
       relativePath: "README.md",
@@ -108,13 +108,6 @@ describe("FileEditingSession", () => {
     expect(session.retainedContents).toBe("- [ ] typed\n");
     await expect(session.flush()).resolves.toBe("saved");
     expect(session.retainedContents).toBe("- [ ] typed\n");
-
-    // A rendered-view toggle replaces the editor document; once saved, a newer
-    // read of the file seeds the next one.
-    session.changeOutsideEditor("- [x] typed\n");
-    expect(session.retainedContents).toBe("- [x] typed\n");
-    await expect(session.flush()).resolves.toBe("saved");
-    expect(session.retainedContents).toBeNull();
   });
 
   it("exposes its contents as unsaved until a save of them is confirmed", async () => {
@@ -172,29 +165,6 @@ describe("FileEditingSession", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(persist).toHaveBeenCalledWith("src/new.ts", "renamed contents", null);
-  });
-
-  it("invalidates existing source history without eagerly constructing a replacement", () => {
-    const session = new FileEditingSession({
-      cwd: "/repo",
-      relativePath: "README.md",
-      debounceMs: 500,
-      persist: vi.fn(async () => AsyncResult.success(undefined)),
-      onPendingChange: vi.fn(),
-      onConfirmed: vi.fn(),
-    });
-    const firstEditor = session.editor;
-    const firstCacheKey = session.cacheKey;
-
-    session.changeOutsideEditor("- [x] done\n");
-
-    expect(firstEditor.cleanUp).toHaveBeenCalledOnce();
-    expect(pierre.instances).toEqual([firstEditor]);
-    expect(session.cacheKey).not.toBe(firstCacheKey);
-    expect(session.getSnapshot().save.phase).toBe("pending");
-    expect(session.getSnapshot().canUndo).toBe(false);
-    expect(session.editor).not.toBe(firstEditor);
-    expect(pierre.instances).toHaveLength(2);
   });
 
   it("migrates a pending marker from the old file path to the renamed path", () => {

@@ -439,13 +439,6 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     if (conflicted) this.options.onConflictChange?.(relativePath, true);
   }
 
-  changeOutsideEditor(contents: string): void {
-    if (this.disposed) return;
-    this.discardEditor();
-    this.coordinator.change(contents);
-    this.publish();
-  }
-
   /** Asks the disk watcher, when one is attached, to check the file now. */
   requestDiskCheck(): void {
     for (const listener of this.diskCheckListeners) listener();

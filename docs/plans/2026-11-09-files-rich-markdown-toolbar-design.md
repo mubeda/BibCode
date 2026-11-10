@@ -708,3 +708,7 @@ was reproduced as a failing test before the fix.
   in TipTap's spelling. Fixed: in a rebuilt list the first emitted item takes `after`'s
   number and keeps the rest of its original bytes, so `1) one\n2) two\n3) three` loses its
   first item as `1) two\n3) three`.
+- Coordinator, `changeOutsideEditor` had no production caller once the read-only checkbox
+  used `changeFromRichEditor`. Removed from `fileEditingSession.ts`. Tests that only needed
+  to record a change without an editor now use `changeFromRichEditor`, and the two test
+  parts that checked the discarded editor itself are gone with it.
