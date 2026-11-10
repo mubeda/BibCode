@@ -2720,7 +2720,13 @@ async fn a_real_commit_survives_a_held_and_failed_push() {
         "the commit is made before the push connects"
     );
 
-    request(server.socket(), "2", "vcs.refreshStatus", json!({ "cwd": cwd })).await;
+    request(
+        server.socket(),
+        "2",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
     let mut action_events = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {

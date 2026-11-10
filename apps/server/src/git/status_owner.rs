@@ -710,7 +710,9 @@ impl StatusReadOwner {
         let Some(worktree) = state.worktrees.get_mut(canonical_cwd) else {
             return;
         };
-        if worktree.pending_mutations != 0 || worktree.mutation_active || worktree.mutation_lock_held
+        if worktree.pending_mutations != 0
+            || worktree.mutation_active
+            || worktree.mutation_lock_held
         {
             return;
         }
