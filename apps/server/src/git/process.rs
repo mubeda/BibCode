@@ -569,6 +569,7 @@ impl WriteSettlement {
             return;
         }
         let worktree = redact_path(&self.cwd.to_string_lossy());
+        let lock = watch.lock.clone();
         match watch.after_forced_stop().await {
             LockCleanup::Removed => tracing::warn!(
                 operation = %self.operation,
@@ -576,7 +577,7 @@ impl WriteSettlement {
                 "removed index.lock left by a Git process BiBCode had to force to stop"
             ),
             LockCleanup::RemoveFailed(kind) => {
-                self._ticket.lock_left();
+                self._ticket.lock_left(lock, worktree.clone());
                 tracing::warn!(
                     operation = %self.operation,
                     %worktree,
@@ -677,8 +678,31 @@ struct GitWriteRegistryState {
     closed: std::sync::Mutex<bool>,
     writes: TaskTracker,
     stop: CancellationToken,
-    /// Leftover locks of forced writes that could not be deleted.
-    locks_left: Arc<std::sync::atomic::AtomicUsize>,
+    /// Leftover locks of forced writes that could not be deleted, checked again on every stop.
+    locks_left: LeftLocks,
+}
+
+type LeftLocks = Arc<std::sync::Mutex<Vec<LeftLock>>>;
+
+/// A lock BiBCode owns but could not delete: its path, its state when the delete failed, and
+/// the redacted worktree a log names.
+#[derive(Debug)]
+struct LeftLock {
+    lock: PathBuf,
+    state: Option<(u64, Option<std::time::SystemTime>)>,
+    worktree: String,
+}
+
+impl LeftLock {
+    /// Deletes the lock if it is still the one BiBCode left. `false` once it is gone or
+    /// changed (another Git process has it now, so it is not BiBCode's to delete).
+    fn still_left(&self) -> bool {
+        let state = lock_state(&self.lock);
+        state.is_some()
+            && state == self.state
+            && std::fs::remove_file(&self.lock)
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+    }
 }
 
 /// One admitted write. Dropping it, after the write's outcome and lock cleanup, releases it.
@@ -686,24 +710,39 @@ struct GitWriteRegistryState {
 pub(crate) struct GitWriteTicket {
     _write: TaskTrackerToken,
     cancellation: CancellationToken,
-    locks_left: Arc<std::sync::atomic::AtomicUsize>,
+    locks_left: LeftLocks,
 }
 
 impl GitWriteTicket {
-    /// Records that this write's leftover `index.lock` could not be removed.
-    fn lock_left(&self) {
-        self.locks_left
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Records that this write's leftover `lock` in `worktree` (redacted) could not be removed.
+    fn lock_left(&self, lock: PathBuf, worktree: String) {
+        let state = lock_state(&lock);
+        record_left_lock(
+            &self.locks_left,
+            LeftLock {
+                lock,
+                state,
+                worktree,
+            },
+        );
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+fn record_left_lock(locks: &LeftLocks, left: LeftLock) {
+    locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(left);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuiesceOutcome {
     Clean,
     /// This many writes had not finished their stop and cleanup within the limit.
     Pending(usize),
-    /// Every write finished, but this many leftover locks could not be removed.
-    LocksLeft(usize),
+    /// Every write finished, but the leftover locks of these worktrees (redacted) are still
+    /// there after one more delete.
+    LocksLeft(Vec<String>),
 }
 
 impl GitWriteRegistry {
@@ -731,7 +770,8 @@ impl GitWriteRegistry {
     }
 
     /// Closes admission, cancels every admitted write and waits up to `limit` until each has
-    /// exited and finished its lock cleanup. Safe to call again after `Pending`.
+    /// exited and finished its lock cleanup, then checks every leftover lock again. Safe to
+    /// call again: each call reports from the current files.
     pub(crate) async fn stop_all_and_wait(&self, limit: Duration) -> QuiesceOutcome {
         self.close_admission();
         self.state.stop.cancel();
@@ -741,23 +781,31 @@ impl GitWriteRegistry {
         {
             return QuiesceOutcome::Pending(self.state.writes.len());
         }
-        match self
+        let mut locks = self
             .state
             .locks_left
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            0 => QuiesceOutcome::Clean,
-            locks => QuiesceOutcome::LocksLeft(locks),
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(LeftLock::still_left);
+        if locks.is_empty() {
+            QuiesceOutcome::Clean
+        } else {
+            QuiesceOutcome::LocksLeft(locks.iter().map(|left| left.worktree.clone()).collect())
         }
     }
 }
 
 #[cfg(all(test, unix))]
 impl GitWriteRegistry {
-    pub(crate) fn record_left_lock_for_test(&self, _lock: &Path, _worktree: &Path) {
-        self.state
-            .locks_left
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn record_left_lock_for_test(&self, lock: &Path, worktree: &Path) {
+        record_left_lock(
+            &self.state.locks_left,
+            LeftLock {
+                lock: lock.to_path_buf(),
+                state: lock_state(lock),
+                worktree: redact_path(&worktree.to_string_lossy()),
+            },
+        );
     }
 }
 
@@ -1581,7 +1629,8 @@ mod tests {
             LockCleanup::RemoveFailed(std::io::ErrorKind::PermissionDenied)
         );
         assert!(lock.exists(), "the lock could not be removed");
-        let reported = QuiesceOutcome::LocksLeft(1);
+        let reported =
+            QuiesceOutcome::LocksLeft(vec![redact_path(&git_dir.path().to_string_lossy())]);
         assert_eq!(first, reported);
         assert_eq!(second, reported, "a later stop still reports the lock");
     }

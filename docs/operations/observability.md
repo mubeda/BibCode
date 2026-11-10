@@ -92,12 +92,15 @@ and the lock stays. At shutdown the server refuses
 new Git writes and stops the running ones this way before the Profiler's
 teardown. If a write is still stopping after the wait, it writes `Git writes
 were still stopping at shutdown` (`error`) with the count, waits once more, and
-reports the shutdown as incomplete if one is still pending. The Profiler's
-session then stays open, and a later shutdown request waits for those writes
-again and ends the session only once they have stopped. If every write has
-stopped but a lock could not be deleted, it writes `leftover index.lock files
-could not be removed` (`error`) with the count and reports the shutdown as
-incomplete.
+reports the shutdown as incomplete if one is still pending. An update then
+waits: the Profiler's session stays open, and a later update request waits for
+those writes again. A final shutdown ends the Profiler's session anyway and
+marks it incomplete. Every shutdown and update request checks each leftover
+lock BiBCode could not delete once more. It forgets a lock that is gone or has
+changed, and it tries to delete an unchanged one again. For each lock still
+there it writes `a leftover index.lock could not be removed` (`error`) with
+the worktree path after the Profiler's path redaction. A leftover lock does not
+block an update, and the Profiler's session is marked incomplete.
 
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the

@@ -151,17 +151,8 @@ pub struct ProductionRuntime {
     _resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
     profiler: Arc<ProfilerRuntime>,
-    update_quiesced: tokio::sync::Mutex<Quiescence>,
-}
-
-/// How far [`ProductionRuntime::quiesce_for_update`] got.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Quiescence {
-    Running,
-    /// Every service stopped except Git writes that outlasted both waits; the Profiler still
-    /// runs.
-    GitWritesPending,
-    Done,
+    /// Whether an earlier quiesce stopped the services; later calls only settle the Git writes.
+    services_stopped: tokio::sync::Mutex<bool>,
 }
 
 pub fn finalize_rpc_registry(
@@ -843,7 +834,7 @@ impl ProductionRuntime {
             _resource_sampler: resource_sampler,
             process_monitor,
             profiler,
-            update_quiesced: tokio::sync::Mutex::new(Quiescence::Running),
+            services_stopped: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -973,29 +964,19 @@ impl ProductionRuntime {
         })
     }
 
+    /// `Err` while a Git write is still stopping; a leftover `index.lock` BiBCode could not
+    /// delete is logged and does not block the update. Each call decides from the current
+    /// writes and locks.
     pub async fn quiesce_for_update(&self) -> Result<(), String> {
-        let mut quiesced = self.update_quiesced.lock().await;
-        match *quiesced {
-            Quiescence::Done => return Ok(()),
-            // Only the Git writes are left: the services above them stopped on the first call.
-            Quiescence::GitWritesPending => {
-                let locks = match self.git_repository.stop_writes().await {
-                    Ok(locks) => locks,
-                    Err(pending) => {
-                        tracing::error!(pending, "Git writes were still stopping at shutdown");
-                        return Err(format!("{pending} Git writes had not stopped"));
-                    }
-                };
-                self.profiler.end_session().await;
-                *quiesced = Quiescence::Done;
-                return match locks {
-                    0 => Ok(()),
-                    locks => Err(format!(
-                        "{locks} leftover Git index locks could not be removed"
-                    )),
-                };
-            }
-            Quiescence::Running => {}
+        let mut services_stopped = self.services_stopped.lock().await;
+        if *services_stopped {
+            // The services stopped on an earlier call: only the Git writes and their leftover
+            // locks are checked again.
+            let writes = self.stop_git_writes().await;
+            self.end_profiler_session(&writes).await;
+            return writes
+                .map(drop)
+                .map_err(|pending| format!("{pending} Git writes had not stopped"));
         }
         // Each step is timed, so a slow stop names the step that took the time (#303).
         let mut steps = StopSteps::start("quiesce");
@@ -1074,26 +1055,9 @@ impl ProductionRuntime {
         // teardown: later writes are refused, and each running write is stopped and its
         // leftover `index.lock` removed (R17). On Windows, where the stop is forced, only this
         // cleanup removes the lock.
-        let mut writes = self.git_repository.stop_writes().await;
+        let writes = self.stop_git_writes().await;
         if let Err(pending) = writes {
-            tracing::error!(pending, "Git writes were still stopping at shutdown");
-            writes = self.git_repository.stop_writes().await;
-        }
-        match writes {
-            Ok(0) => {}
-            Err(pending) => {
-                tracing::error!(
-                    pending,
-                    "Git writes were still stopping after a second wait"
-                );
-                first_error.get_or_insert_with(|| format!("{pending} Git writes had not stopped"));
-            }
-            Ok(locks) => {
-                tracing::error!(locks, "leftover index.lock files could not be removed");
-                first_error.get_or_insert_with(|| {
-                    format!("{locks} leftover Git index locks could not be removed")
-                });
-            }
+            first_error.get_or_insert_with(|| format!("{pending} Git writes had not stopped"));
         }
         steps.mark("git-writes");
         self.terminal_services
@@ -1111,25 +1075,53 @@ impl ProductionRuntime {
         steps.mark("orchestration");
         // Recorded while the profiler still runs; its own teardown below is logged only.
         steps.emit();
-        if writes.is_err() {
-            // The Profiler keeps running, so a later call can still record the writes' end. A
-            // stop that never completes reads as an incomplete shutdown on the next start.
-            *quiesced = Quiescence::GitWritesPending;
-            return Err(first_error.unwrap_or_default());
-        }
+        *services_stopped = true;
         // Last, so the events and panics of every other service's shutdown are recorded, and a
         // crash anywhere in the shutdown still reads as a crash on the next start.
-        self.profiler.end_session().await;
+        self.end_profiler_session(&writes).await;
         steps.mark("profiler-end-session");
-        *quiesced = Quiescence::Done;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
+    /// Stops every Git write, waiting twice, and logs each leftover lock still there.
+    async fn stop_git_writes(&self) -> Result<Vec<String>, usize> {
+        let mut writes = self.git_repository.stop_writes().await;
+        if let Err(pending) = writes {
+            tracing::error!(pending, "Git writes were still stopping at shutdown");
+            writes = self.git_repository.stop_writes().await;
+        }
+        match &writes {
+            Err(pending) => tracing::error!(
+                pending,
+                "Git writes were still stopping after a second wait"
+            ),
+            Ok(worktrees) => {
+                for worktree in worktrees {
+                    tracing::error!(%worktree, "a leftover index.lock could not be removed");
+                }
+            }
+        }
+        writes
+    }
+
+    /// While a write is still stopping the Profiler keeps running, so a later call can still
+    /// record its end. A leftover lock ends the session as an incomplete shutdown.
+    async fn end_profiler_session(&self, writes: &Result<Vec<String>, usize>) {
+        match writes {
+            Err(_) => {}
+            Ok(worktrees) if worktrees.is_empty() => self.profiler.end_session().await,
+            Ok(_) => self.profiler.shutdown().await,
+        }
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.quiesce_for_update().await;
+        // Releases the Profiler even when a Git write never stopped; its session then reads
+        // as an incomplete shutdown on the next start.
+        self.profiler.shutdown().await;
     }
 }
 
