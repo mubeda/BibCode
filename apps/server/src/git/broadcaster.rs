@@ -6782,18 +6782,27 @@ mod tests {
     #[tokio::test]
     async fn a_new_subscriber_republishes_an_equal_status_once_under_each_new_epoch() {
         let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
-        let root = tempfile::tempdir().expect("repository folder");
-        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
-        let output = Command::new("git")
+        let sandbox = TestSandbox::new("git-broadcaster-subscribe-epoch");
+        let command = sandbox.executable_on_path("git");
+        let (_, environment) = isolated_git_environment(&sandbox);
+        let cwd = sandbox.path("repository");
+        fs::create_dir(&cwd).expect("repository directory");
+        let output = Command::new(&command)
             .args(["init", "-q", "-b", "main"])
             .current_dir(&cwd)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_clear()
+            .envs(environment.iter().cloned())
             .output()
             .expect("fixture Git");
         assert!(output.status.success(), "{output:?}");
+        let cwd = fs::canonicalize(cwd).expect("canonical repository");
         let broadcaster = StatusBroadcaster::new(
-            Arc::new(GitRepository::default()),
+            Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                IsolatedGitRunner {
+                    command,
+                    environment,
+                },
+            ))),
             Duration::from_secs(3_600),
             4,
         );
