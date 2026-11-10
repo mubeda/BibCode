@@ -1262,6 +1262,13 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
 /** Tauri deep-link plugin runtime event carrying the opened URLs. */
 export const DESKTOP_DEEP_LINK_EVENT = "deep-link://new-url";
 
+export interface DesktopCloseRequest {
+  readonly requestId: number;
+  readonly reason: "close" | "quit";
+}
+
+export type DesktopCloseReply = "acknowledge" | "keepalive" | "allow" | "stay";
+
 export interface DesktopBridge {
   getHostMetadata?: () => Promise<DesktopBridgeHostMetadata>;
   getAppBranding: () => DesktopAppBranding | null;
@@ -1357,6 +1364,13 @@ export interface DesktopBridge {
    * path, or `null` when the person cancels; rejects when the write fails.
    */
   saveTextFile?: (input: { suggestedName: string; contents: string }) => Promise<string | null>;
+  /**
+   * The desktop asks before the main window closes or the app quits. The listener answers
+   * through `replyCloseRequest`: `acknowledge` at once, `keepalive` every second while it waits
+   * on the person, then `allow` or `stay`.
+   */
+  onCloseRequest?: (listener: (request: DesktopCloseRequest) => void) => () => void;
+  replyCloseRequest?: (requestId: number, reply: DesktopCloseReply) => Promise<void>;
   pickFiles?: (options?: { title?: string }) => Promise<readonly string[]>;
   downloadToFolder?: (input: {
     url: string;

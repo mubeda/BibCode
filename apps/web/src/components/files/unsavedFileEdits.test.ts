@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import type { DesktopBridge } from "@bibcode/contracts";
+import type { DesktopBridge, DesktopCloseRequest } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -7,6 +7,7 @@ import {
   attachLeaveQuestionHost,
   getLeaveQuestion,
   registerUnsavedSource,
+  respondToDesktopCloseRequests,
   releaseLeaveHolds,
   windowUnsavedFiles,
   type UnsavedSource,
@@ -134,5 +135,80 @@ describe("unsaved file edits across the window", () => {
     expect(unload()).toBe(true);
     window.desktopBridge = {} as DesktopBridge;
     expect(unload()).toBe(false);
+  });
+
+  describe("desktop close requests", () => {
+    function fakeBridge() {
+      let listener: ((request: DesktopCloseRequest) => void) | null = null;
+      const replies: [number, string][] = [];
+      return {
+        replies,
+        send: (request: DesktopCloseRequest) => listener?.(request),
+        onCloseRequest: (next: (request: DesktopCloseRequest) => void) => {
+          listener = next;
+          return () => {
+            listener = null;
+          };
+        },
+        replyCloseRequest: vi.fn(async (requestId: number, reply: string) => {
+          replies.push([requestId, reply]);
+        }),
+      };
+    }
+
+    it("with nothing unsaved the close is acknowledged and allowed", async () => {
+      const bridge = fakeBridge();
+      cleanups.push(respondToDesktopCloseRequests(bridge));
+      bridge.send({ requestId: 7, reason: "close" });
+      await vi.waitFor(() =>
+        expect(bridge.replies).toEqual([
+          [7, "acknowledge"],
+          [7, "allow"],
+        ]),
+      );
+    });
+
+    it("waits for the person with keepalives and answers stay on Cancel", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        register(fakeSource(["notes.md"]));
+        const bridge = fakeBridge();
+        cleanups.push(respondToDesktopCloseRequests(bridge));
+        bridge.send({ requestId: 3, reason: "quit" });
+        await vi.waitFor(() => expect(getLeaveQuestion()).not.toBeNull());
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(
+          bridge.replies.filter(([, reply]) => reply === "keepalive").length,
+        ).toBeGreaterThanOrEqual(2);
+        getLeaveQuestion()!.answer("cancel");
+        await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([3, "stay"]));
+        const count = bridge.replies.length;
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(bridge.replies).toHaveLength(count);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("Save all answers allow once every file is saved", async () => {
+      const source = register(fakeSource(["notes.md"]));
+      const bridge = fakeBridge();
+      cleanups.push(respondToDesktopCloseRequests(bridge));
+      bridge.send({ requestId: 4, reason: "close" });
+      await vi.waitFor(() => expect(getLeaveQuestion()).not.toBeNull());
+      getLeaveQuestion()!.answer("save");
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([4, "allow"]));
+      expect(source.saveAll).toHaveBeenCalledOnce();
+    });
+
+    it("unsubscribing with a request pending answers stay", async () => {
+      register(fakeSource(["notes.md"]));
+      const bridge = fakeBridge();
+      const stop = respondToDesktopCloseRequests(bridge);
+      bridge.send({ requestId: 5, reason: "close" });
+      await vi.waitFor(() => expect(getLeaveQuestion()).not.toBeNull());
+      stop();
+      expect(bridge.replies.at(-1)).toEqual([5, "stay"]);
+    });
   });
 });

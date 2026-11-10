@@ -1,5 +1,9 @@
 // @vitest-environment happy-dom
-import type { ProjectWritePrecondition } from "@bibcode/contracts";
+import type {
+  DesktopBridge,
+  DesktopCloseRequest,
+  ProjectWritePrecondition,
+} from "@bibcode/contracts";
 import type { AtomCommandResult } from "@bibcode/client-runtime/state/runtime";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -244,5 +248,39 @@ describe("UnsavedChangesCloseHost", () => {
     });
     await expect(answer).resolves.toBe("stay");
     expect(session.unsavedContents).toBe("my edit");
+  });
+
+  it("answers a desktop close request through the bridge", async () => {
+    await act(async () => root.unmount());
+    const replies: [number, string][] = [];
+    let send: ((request: DesktopCloseRequest) => void) | null = null;
+    window.desktopBridge = {
+      onCloseRequest: (listener: (request: DesktopCloseRequest) => void) => {
+        send = listener;
+        return () => {
+          send = null;
+        };
+      },
+      replyCloseRequest: async (requestId: number, reply: string) => {
+        replies.push([requestId, reply]);
+      },
+    } as unknown as DesktopBridge;
+    try {
+      root = createRoot(container);
+      await act(async () => root.render(<UnsavedChangesCloseHost />));
+      const session = openFile(newRegistry(), "notes.md");
+      session.changeFromRichEditor("my edit");
+
+      await act(async () => send!({ requestId: 9, reason: "close" }));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(dialogText()).toContain("notes.md");
+      await click("Save all");
+      await vi.waitFor(() => expect(replies.at(-1)).toEqual([9, "allow"]));
+      expect(replies[0]).toEqual([9, "acknowledge"]);
+    } finally {
+      delete window.desktopBridge;
+    }
   });
 });

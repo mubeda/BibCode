@@ -1,3 +1,5 @@
+import type { DesktopBridge, DesktopCloseReply } from "@bibcode/contracts";
+
 import { toastManager } from "../ui/toast";
 
 /** A `FileEditingSessionRegistry` as the window-wide guard sees it. */
@@ -135,6 +137,54 @@ async function ask(_reason: LeaveReason): Promise<"proceed" | "stay"> {
     description: `${unsaved.join(", ")}. Open each file to reload, overwrite or retry the save.`,
   });
   return "stay";
+}
+
+/** The desktop waits 5 seconds for each, so a throttled timer still has five chances. */
+const KEEPALIVE_INTERVAL_MS = 1_000;
+
+/**
+ * Answers the desktop's close and quit requests through the leave question. Keepalives run only
+ * while this subscription holds a request, and stopping it with one pending answers stay.
+ */
+export function respondToDesktopCloseRequests(
+  bridge: Pick<DesktopBridge, "onCloseRequest" | "replyCloseRequest">,
+): () => void {
+  const { onCloseRequest, replyCloseRequest } = bridge;
+  if (!onCloseRequest || !replyCloseRequest) return () => {};
+  let active: {
+    readonly requestId: number;
+    readonly keepalive: ReturnType<typeof setInterval>;
+  } | null = null;
+  const reply = (requestId: number, answer: DesktopCloseReply) => {
+    replyCloseRequest(requestId, answer).catch((error: unknown) => {
+      console.warn("[unsaved-file-edits] could not answer the desktop close request", error);
+    });
+  };
+  const finish = (answer: "allow" | "stay") => {
+    if (active === null) return;
+    clearInterval(active.keepalive);
+    reply(active.requestId, answer);
+    active = null;
+  };
+  const unsubscribe = onCloseRequest(({ requestId, reason }) => {
+    if (active?.requestId === requestId) return;
+    finish("stay");
+    reply(requestId, "acknowledge");
+    const current = {
+      requestId,
+      keepalive: setInterval(() => reply(requestId, "keepalive"), KEEPALIVE_INTERVAL_MS),
+    };
+    active = current;
+    void askBeforeLeaving(reason).then((answer) => {
+      if (active === current) finish(answer === "proceed" ? "allow" : "stay");
+    });
+  });
+  return () => {
+    unsubscribe();
+    if (active === null) return;
+    finish("stay");
+    question?.answer("cancel");
+  };
 }
 
 if (typeof window !== "undefined") {

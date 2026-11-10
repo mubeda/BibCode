@@ -12,6 +12,7 @@ import { Button } from "../ui/button";
 import {
   attachLeaveQuestionHost,
   getLeaveQuestion,
+  respondToDesktopCloseRequests,
   subscribeLeaveQuestion,
 } from "./unsavedFileEdits";
 
@@ -71,7 +72,15 @@ export function UnsavedChangesCloseDialog({
 /** The window's one place that shows the leave question. Mount it once on every route. */
 export function UnsavedChangesCloseHost() {
   const question = useSyncExternalStore(subscribeLeaveQuestion, getLeaveQuestion, getLeaveQuestion);
-  useEffect(() => attachLeaveQuestionHost(), []);
+  useEffect(() => {
+    const detach = attachLeaveQuestionHost();
+    const bridge = window.desktopBridge;
+    const stop = bridge ? respondToDesktopCloseRequests(bridge) : undefined;
+    return () => {
+      stop?.();
+      detach();
+    };
+  }, []);
   if (question === null) return null;
   return (
     <UnsavedChangesCloseDialog
