@@ -44,16 +44,17 @@ uses (Orca pins `3.31.3`). The 3.32 and 3.33 lines are newer than two weeks on 2
 or fix nothing this design needs. Licenses were read with
 `npm view <name>@3.31.4 license` on 2026-11-09. Sizes are `dist.unpackedSize`.
 
-| Package                     | License | Unpacked | Why                                                                              |
-| --------------------------- | ------- | -------- | -------------------------------------------------------------------------------- |
-| `@tiptap/core`              | MIT     | 3.2 MB   | The editor, commands and the extension system                                    |
-| `@tiptap/pm`                | MIT     | 15 kB    | ProseMirror, required by every extension (it pulls the `prosemirror-*` packages) |
-| `@tiptap/starter-kit`       | MIT     | 54 kB    | Paragraph, headings, marks, lists, quote, code, hard break, history              |
-| `@tiptap/markdown`          | MIT     | 483 kB   | Markdown parse and serialize through `marked` 17 (MIT, transitive)               |
-| `@tiptap/extension-list`    | MIT     | 1.2 MB   | Task list and task item, imported directly                                       |
-| `@tiptap/extension-table`   | MIT     | 773 kB   | GFM tables, which must stay editable (R25, R34)                                  |
-| `@tiptap/extension-image`   | MIT     | 66 kB    | Inline image nodes for Insert image (R28)                                        |
-| `@tiptap/extension-details` | MIT     | 128 kB   | The `details`, `detailsSummary` and `detailsContent` nodes (R35)                 |
+| Package                        | License | Unpacked | Why                                                                                 |
+| ------------------------------ | ------- | -------- | ----------------------------------------------------------------------------------- |
+| `@tiptap/core`                 | MIT     | 3.2 MB   | The editor, commands and the extension system                                       |
+| `@tiptap/pm`                   | MIT     | 15 kB    | ProseMirror, required by every extension (it pulls the `prosemirror-*` packages)    |
+| `@tiptap/starter-kit`          | MIT     | 54 kB    | Paragraph, headings, marks, lists, quote, code, hard break, history                 |
+| `@tiptap/markdown`             | MIT     | 483 kB   | Markdown parse and serialize through `marked` 17 (MIT, transitive)                  |
+| `@tiptap/extension-list`       | MIT     | 1.2 MB   | Task list and task item, imported directly                                          |
+| `@tiptap/extension-table`      | MIT     | 773 kB   | GFM tables, which must stay editable (R25, R34)                                     |
+| `@tiptap/extension-image`      | MIT     | 66 kB    | Inline image nodes for Insert image (R28)                                           |
+| `@tiptap/extension-details`    | MIT     | 128 kB   | The `details`, `detailsSummary` and `detailsContent` nodes (R35)                    |
+| `@tiptap/extension-code-block` | MIT     | 87 kB    | Extended so a fence is longer than any backtick run in the code (added in Task 6.9) |
 
 `@tiptap/extension-details` declares `@tiptap/extension-text-style` (MIT, 429 kB) as a
 peer but never imports it at run time. It is not a direct dependency. pnpm installs it as
@@ -86,6 +87,10 @@ and `javascriptLedger` rise by the number added.
   `@tiptap/extension-link` is not a direct dependency and pnpm does not let the client
   import it. A click places the caret, and typing a URL does not create a link the person
   did not ask for.
+- `CodeBlock` from `@tiptap/extension-code-block` replaces StarterKit's code block. Its
+  `renderMarkdown` writes a fence one backtick longer than the longest backtick run in the
+  code, at least three. The stock serializer always writes three, so a three-backtick line
+  inside a four-backtick fence closed it early (found in Task 6.9).
 - `TaskList` and `TaskItem` (`nested: true`). A checkbox click changes the node's
   `checked` attribute, which the reconcile turns into a change of that item's marker only
   (R25).
@@ -383,7 +388,7 @@ view.
 - An edit inside a container with an unusual continuation prefix (lazy continuation
   lines) can take `after`'s spelling for that container's changed lines. The fallback
   check keeps the parsed document equal to what the person saw.
-- Eight direct packages add about 5.9 MB unpacked to the install and one lazy chunk to
+- Nine direct packages add about 6 MB unpacked to the install and one lazy chunk to
   the bundle. The chunk loads only when a Markdown file is shown in rendered view.
 - The editable view replaces `ChatMarkdown` for editable `.md` files, so it gives up what
   `ChatMarkdown` adds on top of Markdown: syntax colors in fenced code, Mermaid diagrams
