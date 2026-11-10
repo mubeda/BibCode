@@ -77,6 +77,30 @@ flowchart TB
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
   events implement privileged operations; browser fallbacks are limited to
   explicitly safe capabilities.
+  - **Saving a file.** Wry cancels webview downloads, so the desktop exports
+    text through `desktop_bridge_save_text_file` (`saveTextFile`). The web
+    supplies a plain suggested name with an extension and at most 8 MiB of
+    contents; the host opens the native Save dialog in Downloads, filtered by
+    that extension, and writes only to the path the person picked. Cancel
+    returns `null`, and a failed write rejects with its error text. Only a
+    `desktop-e2e` build lets `BIBCODE_E2E_SAVE_TEXT_PATH` replace the picked
+    path. The browser keeps its blob link.
+  - **Asking before leaving.** The main window's close, the BiBCode Quit menu
+    item (which replaces the predefined Quit so it can wait), and an update
+    install another device requests go through the host's `CloseGuard`. It
+    emits `desktop:close-request` `{ requestId, reason: "close" | "quit" |
+    "update" }` to the main window only, after showing and focusing it, and
+    the web answers through `desktop_bridge_reply_close_request` with
+    `acknowledge`, a `keepalive` every second while its question is open, and
+    then `allow` or `stay`. Nothing irreversible runs before `allow`: close
+    destroys the window, quit calls `app.exit(0)`, whose `ExitRequested`
+    handler runs the usual teardown, and an update installs. `stay` changes
+    nothing. One request is pending at a time, a second close joins it, and a
+    stale reply is dropped. Without an acknowledge or a keepalive for five
+    seconds the host shows a native "Close anyway" or "Keep waiting" prompt.
+    The web asks the same question itself before it restarts the app or
+    installs an update. Dock Quit on macOS, SIGTERM and session end do not
+    wait. A `desktop-e2e` teardown disarms the guard.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
