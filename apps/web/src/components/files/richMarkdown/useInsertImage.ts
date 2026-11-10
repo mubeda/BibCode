@@ -103,7 +103,7 @@ export function useInsertImage(input: {
           const now = live.current;
           // The image went next to the file it was picked for; a moved or closed file gets no link.
           if (now.editor === started.editor && now.markdownPath === started.markdownPath) {
-            started.editor?.insertImage(encodeURI(fileName));
+            started.editor?.insertImage(fileName);
           }
           return;
         }

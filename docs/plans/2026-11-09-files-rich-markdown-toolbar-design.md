@@ -359,11 +359,15 @@ P5). `useInsertImage` in `richMarkdown/useInsertImage.ts`:
 3. On HTTP 409 (the name exists) it retries with `nextFreeFileName(name, attempt)`
    (`diagram.png`, 1 gives `diagram-1.png`), up to attempt 99, and never sends
    `overwrite=1`, so an existing file is never replaced.
-4. On success it calls `editor.insertImage(fileName)` with the name URL-encoded the way
-   Markdown link targets need, only if the editor and the Markdown file's path it started
+4. On success it calls `editor.insertImage(fileName)` with the plain name, only if the editor and the Markdown file's path it started
    with are both still current. A move or rename of the Markdown file during the upload
    therefore inserts nothing, because the image sits in the old folder. A failed copy
    shows the Files error toast and inserts nothing.
+
+`insertImage` encodes each path segment with `encodeURIComponent` and writes parentheses as
+`%28` and `%29`, so `diagram#1.png` saves as `![](diagram%231.png)`. A `#` or `?` would
+otherwise start a fragment or a query, a space would end the destination, and an unmatched
+parenthesis would break it.
 
 ## Files ported from Orca
 
@@ -541,3 +545,6 @@ was reproduced as a failing test before the fix.
   accepted a file whose blocks did not line up. Fixed: the empty form is one leaf block,
   `canReconcile` compares the block lists level by level, and a throw while placing an edit
   falls back to `after`.
+- Codex review 2, item 4, an inserted image named `diagram#1.png` linked a fragment, a
+  `?` started a query and an unmatched parenthesis broke the destination. The hook used
+  `encodeURI`, which leaves `#`, `?` and parentheses as they are. Fixed: `insertImage` encodes each path segment.

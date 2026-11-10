@@ -3,12 +3,18 @@
 import type { Editor } from "@tiptap/core";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { Nodes } from "mdast";
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
+
 import * as corpus from "./fixtures/corpus";
 import { canReconcile, reconcileMarkdown } from "./markdownReconcile";
 import { findUnsupportedConstruct, splitFrontmatter } from "./markdownSupport";
 import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
 
 const editors: RichMarkdownEditor[] = [];
+const processor = unified().use(remarkParse).use(remarkGfm);
 
 function open(body: string, onUpdate = vi.fn()) {
   const element = document.createElement("div");
@@ -106,6 +112,25 @@ describe("createRichMarkdownEditor", () => {
     );
     editor.undo();
     expect(reconcileMarkdown({ original, before, after: editor.serialize() })).toBe(original);
+  });
+
+  it("an inserted image links its file even when the name holds #, ?, a space or parentheses", () => {
+    const names = ["diagram#1.png", "a?b.png", "my image.png", "fig (1).png", "fig).png"];
+    for (const name of names) {
+      const { editor } = open("Text\n");
+      editor.insertImage(`img/${name}`);
+      const images: string[] = [];
+      const collect = (node: Nodes) => {
+        if (node.type === "image") images.push(node.url);
+        if ("children" in node) node.children.forEach(collect);
+      };
+      collect(processor.parse(editor.serialize()));
+      expect(images, name).toHaveLength(1);
+      // Resolved the way a browser resolves it: the whole name is the path, with no query or fragment.
+      const resolved = new URL(images[0]!, "https://files.example.test/docs/");
+      expect(decodeURIComponent(resolved.pathname), name).toBe(`/docs/img/${name}`);
+      expect(`${resolved.search}${resolved.hash}`, name).toBe("");
+    }
   });
 
   it("reports and performs undo and redo", () => {

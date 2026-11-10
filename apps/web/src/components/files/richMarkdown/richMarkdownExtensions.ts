@@ -48,7 +48,7 @@ export type RichMarkdownEditor = {
   setLink(href: string): void;
   /** Removes the link under the caret and keeps its text. */
   removeLink(): void;
-  /** Inserts an image linking `relativePath` at the caret. */
+  /** Inserts an image linking `relativePath` (a plain, unencoded path) at the caret. */
   insertImage(relativePath: string): void;
   serialize(): string;
   destroy(): void;
@@ -226,7 +226,14 @@ export function createRichMarkdownEditor(input: {
       editor.chain().focus().extendMarkRange("link").unsetLink().run();
     },
     insertImage: (relativePath) => {
-      editor.chain().focus().setImage({ src: relativePath, alt: "" }).run();
+      // `#`, `?` and spaces would split the URL, and parentheses can end the Markdown destination.
+      const src = relativePath
+        .split("/")
+        .map((segment) =>
+          encodeURIComponent(segment).replace(/[()]/g, (paren) => (paren === "(" ? "%28" : "%29")),
+        )
+        .join("/");
+      editor.chain().focus().setImage({ src, alt: "" }).run();
     },
     serialize: () => editor.getMarkdown(),
     destroy: () => {
