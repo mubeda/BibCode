@@ -944,7 +944,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Vec<super::manager::conflicts::GitManagerConflictState>, GitCommandError> {
         let status = self
-            .execute(
+            .execute_read(
                 "GitManager.conflicts.status",
                 cwd,
                 &strings(&[
@@ -970,19 +970,25 @@ impl GitRepository {
             return Ok(Vec::new());
         }
         let markers = self
-            .execute(
+            .execute_read(
                 "GitManager.conflicts.markers",
                 cwd,
-                &strings(&["diff", "--check"]),
+                &strings(&["-c", "diff.autoRefreshIndex=false", "diff", "--check"]),
                 true,
                 cancellation,
             )
             .await?;
         let numstat = self
-            .execute(
+            .execute_read(
                 "GitManager.conflicts.numstat",
                 cwd,
-                &strings(&["diff", "--numstat", "-z"]),
+                &strings(&[
+                    "-c",
+                    "diff.autoRefreshIndex=false",
+                    "diff",
+                    "--numstat",
+                    "-z",
+                ]),
                 true,
                 cancellation,
             )
@@ -1023,7 +1029,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Option<bool>, GitCommandError> {
         let status = self
-            .execute(
+            .execute_read(
                 "GitManager.resolveConflict.status",
                 cwd,
                 &strings(&[
@@ -2048,7 +2054,7 @@ impl GitRepository {
                     ));
                 }
                 let output = self
-                    .execute_with_options(
+                    .execute_with_environment(
                         "GitVcsDriver.inspectWorktreeRemoval.status",
                         &fresh.path,
                         &strings(&[
@@ -2065,6 +2071,7 @@ impl GitRepository {
                             max_output_bytes: WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
                             output_policy: OutputPolicy::Error,
                         },
+                        git_read_environment(),
                         cancellation,
                     )
                     .await?;
@@ -5883,10 +5890,19 @@ impl GitRepository {
         }
 
         let deleted = self
-            .run(
+            .run_read(
                 "GitManager.undoCommit.initial.deleted",
                 cwd,
-                &strings(&["diff", "--name-only", "--diff-filter=D", "-z", "HEAD", "--"]),
+                &strings(&[
+                    "-c",
+                    "diff.autoRefreshIndex=false",
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=D",
+                    "-z",
+                    "HEAD",
+                    "--",
+                ]),
                 cancellation,
             )
             .await?;
@@ -6160,9 +6176,15 @@ impl GitRepository {
             return Ok(staged.stdout);
         }
         let mut working_args = strings(&super::CANONICAL_DIFF_CONFIG);
-        working_args.extend(strings(&["diff", "--patch", "--stat"]));
+        working_args.extend(strings(&[
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "--patch",
+            "--stat",
+        ]));
         let working = self
-            .run(
+            .run_read(
                 "GitVcsDriver.commitContext.working",
                 cwd,
                 &working_args,
@@ -10202,8 +10224,14 @@ mod tests {
                 "-z",
                 "--untracked-files=all",
             ],
-            vec!["diff", "--check"],
-            vec!["diff", "--numstat", "-z"],
+            vec!["-c", "diff.autoRefreshIndex=false", "diff", "--check"],
+            vec![
+                "-c",
+                "diff.autoRefreshIndex=false",
+                "diff",
+                "--numstat",
+                "-z",
+            ],
             vec!["check-attr", "--stdin", "-z", "merge"],
         ]
         .into_iter()
@@ -10214,11 +10242,12 @@ mod tests {
             requests[3].stdin.as_deref(),
             Some(b"text.txt\0image.dat\0".as_slice())
         );
-        assert!(requests.iter().all(|request| {
-            !request
+        // The reads never take index.lock; the attribute check runs as before.
+        assert!(requests[..3].iter().all(|request| {
+            request
                 .env
                 .iter()
-                .any(|(key, _)| key == "GIT_OPTIONAL_LOCKS")
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
         }));
     }
 
