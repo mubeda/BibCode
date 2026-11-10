@@ -435,7 +435,7 @@ IF a Markdown file contains reference-style links or their definitions, footnote
 #### Scenario: `.mdx`
 - GIVEN an `.mdx` file
 - WHEN it is opened
-- THEN it behaves as it does today
+- THEN it behaves as it does today, except that a task checkbox tick keeps the file's source Undo history (amendment A6)
 
 #### Scenario: a large file (amendment A4)
 - GIVEN a supported Markdown file of 129 KiB
