@@ -198,7 +198,8 @@ structure, level by level, starting at the root.
    block between them is not copied back. An original child after an inserted one keeps
    the separator that led into it in `original` when that separator holds a blank line at
    this depth (a line that is empty once the level's prefix, such as `>`, is removed). In
-   every other case it is `after`'s separator. Table rows have their own rule: the
+   every other case it is `after`'s separator, from the end of the previous block's last
+   line of text. Table rows have their own rule: the
    separator after the first emitted row is `original`'s text between its first two rows,
    which holds the delimiter row, and every other row separator is the line ending and the
    level's prefix. So a row inserted above or below the header row never copies the
@@ -671,3 +672,9 @@ was reproduced as a failing test before the fix.
   where both rows have an original, which predates the previous fix. Fixed: the separator
   is kept only when one of its lines is blank at this depth, and table rows take the rule
   in step 5, with exactly one delimiter separator.
+- The same sweep found a paragraph added after the list at the end of a block quote
+  joining the list's last item. `remark` ends that list after the blank `>` line in the
+  editor's serialization, but at the item's text in the file, so the separator sliced from
+  the serialization lost the blank line. This predates both separator fixes. Fixed: a
+  separator taken from `after` starts where the block's last line of text ends, before
+  any trailing lines that hold only a prefix.

@@ -507,11 +507,12 @@ function join(
   emitted: readonly Emitted[],
 ): string {
   const { eol, originalPrefix } = level;
-  const afterSeparator = (previous: Emitted, block: Emitted) =>
-    fromAfter(
-      level,
-      level.after.source.slice(afterBlocks[previous.after]!.end, afterBlocks[block.after]!.start),
-    );
+  const afterSeparator = (previous: Emitted, block: Emitted) => {
+    const from = afterBlocks[previous.after]!;
+    // A list in a block quote can end after a blank `>` line that `original`'s copy lacks.
+    const end = from.start + textOf(level.after, from).search(/(?:\r?\n[ \t>]*)*$/);
+    return fromAfter(level, level.after.source.slice(end, afterBlocks[block.after]!.start));
+  };
   const rows = originalBlocks[0]?.kind === "tableRow";
   let text = "";
   emitted.forEach((block, index) => {
