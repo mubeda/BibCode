@@ -636,3 +636,9 @@ was reproduced as a failing test before the fix.
   conflict state, and after the delivery recovers a check of the newer version makes Save a
   conflict that writes nothing. Removing the guard in `reconcileRead`, `reconcileVersion` or
   `beginDiskCheck` alone now fails the test.
+- Lane C3's probe, splitting a paragraph that sits before a table added a blank line before
+  the table. With the real editor, a split before a paragraph or a fence keeps one blank
+  line, and only the table case failed. `join` took the separator before an original block
+  from TipTap's serialization whenever the block before it was new, and TipTap writes an
+  extra line break before a table. Fixed: an original block that follows an inserted block
+  keeps the separator that led into it in the original. A second visit adds no line either.

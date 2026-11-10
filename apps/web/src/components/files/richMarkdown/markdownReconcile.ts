@@ -519,6 +519,11 @@ function join(
         const from = originalBlocks[previous.original]!;
         const to = originalBlocks[previous.original + 1]!;
         text += level.original.source.slice(from.end, to.start);
+      } else if (block.original !== null && block.original > 0) {
+        // After an inserted block, an original block keeps the blank lines that led into it.
+        const from = originalBlocks[block.original - 1]!;
+        const to = originalBlocks[block.original]!;
+        text += level.original.source.slice(from.end, to.start);
       } else {
         const from = afterBlocks[previous.after]!;
         const to = afterBlocks[block.after]!;

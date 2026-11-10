@@ -357,6 +357,43 @@ describe("RichMarkdownSurface", () => {
     expect(persist.mock.lastCall?.[1]).toBe("Hello world\n");
   });
 
+  it.each([
+    ["a table", "| a | b |\n|---|---|\n| 1 | 2 |\n"],
+    ["a paragraph", "Next paragraph.\n"],
+    ["a fence", "```js\nx\n```\n"],
+  ])(
+    "splitting a paragraph before %s keeps one blank line, visit after visit",
+    async (_name, tail) => {
+      let text = `first half second half\n\n${tail}`;
+      for (const [marker, expected] of [
+        ["first half", `first half\n\nsecond half\n\n${tail}`],
+        ["second", `first half\n\nsecond\n\nhalf\n\n${tail}`],
+      ] as const) {
+        const { session } = createSession(text);
+        const { tiptap } = await mount(session, text);
+        let position = -1;
+        tiptap!.state.doc.descendants((node, pos) => {
+          if (position < 0 && node.isTextblock && node.textContent.startsWith(marker)) {
+            position = pos + 1 + marker.length;
+          }
+        });
+        act(() => {
+          tiptap!
+            .chain()
+            .setTextSelection(position)
+            .deleteRange({ from: position, to: position + 1 })
+            .splitBlock()
+            .run();
+        });
+        await act(async () => vi.advanceTimersByTime(300));
+        await act(async () => root.render(null));
+
+        expect(session.unsavedContents).toBe(expected);
+        text = expected;
+      }
+    },
+  );
+
   it("Reload and Overwrite change nothing while a waiting edit cannot be delivered", async () => {
     const { session, persist } = createSession("Mine\n");
     const { tiptap } = await mount(session, "Mine\n");
