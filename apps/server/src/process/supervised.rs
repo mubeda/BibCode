@@ -324,6 +324,8 @@ struct SupervisedChildGuard {
     child: Option<Box<dyn ChildWrapper>>,
     stop_policy: StopPolicy,
     reports: Option<TerminationReports>,
+    /// When the stop already requested ends in a forced stop; set once `SIGTERM` was sent.
+    asked_until: Option<tokio::time::Instant>,
 }
 
 impl SupervisedChildGuard {
@@ -340,6 +342,7 @@ impl SupervisedChildGuard {
             child: Some(child),
             stop_policy,
             reports,
+            asked_until: None,
         }
     }
 
@@ -386,11 +389,15 @@ impl Drop for SupervisedChildGuard {
         if (ask || reports.is_some())
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
-            let asked = ask && signal_stop_request(&*child);
+            // A stop already requested keeps its deadline instead of asking again.
+            let asked_until = self.asked_until.or_else(|| {
+                (ask && signal_stop_request(&*child))
+                    .then(|| tokio::time::Instant::now() + GRACEFUL_STOP_WAIT)
+            });
             // Armed here, not in the task: a task dropped unpolled still kills the group.
             runtime.spawn(stop_dropped_child(
                 SupervisedChildGuard::arm(child),
-                asked,
+                asked_until,
                 reports,
             ));
             return;
@@ -402,10 +409,16 @@ impl Drop for SupervisedChildGuard {
 /// The background half of a dropped [`StopPolicy::AskThenForce`] or reporting run.
 async fn stop_dropped_child(
     mut guard: SupervisedChildGuard,
-    asked: bool,
+    asked_until: Option<tokio::time::Instant>,
     reports: Option<TerminationReports>,
 ) {
-    let stopped_when_asked = asked && wait_for_exit(guard.child_mut(), GRACEFUL_STOP_WAIT).await;
+    let stopped_when_asked = match asked_until {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            wait_for_exit(guard.child_mut(), left).await
+        }
+        None => false,
+    };
     terminate_and_wait_owned(
         guard.disarm(),
         PROCESS_CLEANUP_WAIT_TIMEOUT,
@@ -419,10 +432,14 @@ async fn stop_dropped_child(
 /// Under [`StopPolicy::AskThenForce`] on Unix, asks the process group to stop and waits up to
 /// [`GRACEFUL_STOP_WAIT`]. `true` when the root exited in time.
 async fn ask_to_stop(guard: &mut SupervisedChildGuard, stop_policy: StopPolicy) -> bool {
-    stop_policy == StopPolicy::AskThenForce
+    if !(stop_policy == StopPolicy::AskThenForce
         && cfg!(unix)
-        && signal_stop_request(guard.child())
-        && wait_for_exit(guard.child_mut(), GRACEFUL_STOP_WAIT).await
+        && signal_stop_request(guard.child()))
+    {
+        return false;
+    }
+    guard.asked_until = Some(tokio::time::Instant::now() + GRACEFUL_STOP_WAIT);
+    wait_for_exit(guard.child_mut(), GRACEFUL_STOP_WAIT).await
 }
 
 /// Sends `SIGTERM` to the ownership unit. `false` when nothing could be asked.
