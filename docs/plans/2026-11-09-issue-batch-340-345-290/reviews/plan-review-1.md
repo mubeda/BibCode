@@ -1,0 +1,131 @@
+Verdict: **Needs rework.** All 61 requirements have task IDs, but several tasks cannot satisfy their stated acceptance criteria as written. The main problems are Markdown preservation, Git lifecycle integration, incomplete theme-consumer wiring, and validation scheduled before the final source changes.
+
+This reviews the refreshed plan, including the added Git-write registry, queued-mutation policy, and `canReconcile` fallback. Findings below are source-traced predictions; no implementation tests were run.
+
+**Coverage**
+
+Phase citations below are relative to `docs/plans/2026-11-09-issue-batch-340-345-290/`.
+
+| Requirements | Tasks | Gaps |
+|---|---|---|
+| R1, R2 | 1.1 | Required packaged wide/stacked, light/dark proof is explicitly omitted. |
+| R3, R5, R6, R7 | 5.2 | Assigned; preserve existing fingerprint and recurrence behavior. |
+| R4 | 5.1 | Persistence failure is allowed to violate durability. |
+| R8, R10, R11, R12 | 4.1 | Execution-place information has no planned route into both production callers. |
+| R9 | 4.2 | Assigned to all four current render sites in the refreshed plan. |
+| R13 | 8.3 | Assigned. |
+| R14 | 2.1 | Flag targets the suspected Git behavior; broader call-site instruction is incorrect and concurrency proof is weak. |
+| R15 | 2.2 | Shared-request caller migration and Git-only policy selection are missing. |
+| R16, R17 | 2.3 | Registry tests added; actual forced-stop notification and production shutdown wiring remain underspecified. |
+| R18 | 3.2 | PR-only action misses the release point. |
+| R19 | 3.3 | Assigned. |
+| R20 | 3.1, 3.2 | Final refresh after reopening reads needs explicit handling. Commit preservation needs real-Git proof. |
+| R21 | 3.2, 3.3 | Git Manager’s outcome test omits workspace loss. |
+| R22 | 3.2 | Assigned. |
+| R23 | 3.1 | Correctly pins existing hang behavior without increasing its budget. |
+| R24, R26, R35 | 6.5 | Most formatting commands get name checks, but no behavior/serialization checks. |
+| R25 | 6.4, 8.1 | Paragraph editing covered; table-cell and other supported-block typing lack explicit proof. |
+| R27 | 6.6 | Assigned. |
+| R28 | 6.7 | Assigned; picker/upload completion after file or editor replacement is unspecified. |
+| R29 | 6.4, 8.1 | Explicit save covered; new rendered-view conflict and autosave scenarios are named but not actually added to the test steps. |
+| R30 | 6.2, 6.4, 8.1 | Source-to-rendered pending-edit scenario lacks an explicit test. |
+| R31 | 6.3, 8.1 | Assigned. |
+| R32 | 6.3, 6.4 | Assigned. |
+| R33 | 6.3 | Top-level reconciliation does not protect unchanged nested blocks. |
+| R34 | 6.3, 6.4 | Corpus exists, but representable variants need actual editor-load/reconciliation proof. |
+| R36 | 7.2 | Schema tests alone do not prove derived-token behavior; 7.4’s resolver conflicts with it. |
+| R37 | 7.4, 7.6, 8.2 | Assigned. |
+| R38 | 7.3, 7.5 | Default-look preservation remains incomplete for affected controls. |
+| R39 | 7.5, 7.6 | Assigned. |
+| R40 | 7.8 | Assigned. |
+| R41, R42 | 7.6, 8.2 | Pre-paint validation is weaker than the theme boundary. |
+| R43, R45, R46, R60 | 7.8 | Assigned. |
+| R44 | 7.8, 8.2 | Assigned. |
+| R47 | 7.9, 8.2 | Keyword-token controls and preview synchronization need concrete interfaces. |
+| R48 | 7.2, 7.5 | Pre-paint entry point remains insufficiently validated. |
+| R49, R61 | 7.5 | Storage notifications covered; same-ID saved edits need consumer repaint proof. |
+| R50 | 7.3, 8.4 | Pressed-state and default Send-button behavior need correction. |
+| R51 | 7.7 | Same-ID palette changes and retained running palettes lack tests. |
+| R52, R54 | 7.9 | Assigned, subject to correct color resolution. |
+| R53, R55 | 7.10 | Assigned, subject to correct color resolution. |
+| R56 | 7.4 | Binding palette/default recipes produce a contrast conflict; see open questions. |
+| R57, R58 | 7.11 | Proposed consumers do not satisfy the specified changed-token scenarios. |
+| R59 | 7.12 | Proposed selectors miss existing focus/shadow owners. |
+
+No numbered requirement is wholly unassigned. Tasks 6.1, 7.1 and 8.5 legitimately serve design, delivery and follow-up requirements. The stash filtering in Task 2.1 serves no requirement.
+
+**Findings, most severe first**
+
+| # | Severity | Location (file:line) | Issue | Evidence | Fix |
+|---|---|---|---|---|---|
+| 1 | Blocker | `phases/PHASE-06-rich-markdown-editing.md:82` | **Editing a container can rewrite untouched nested Markdown.** | The algorithm emits serialized `after` text for an entire changed top-level block. Editing one list item therefore reserializes its whole list, including an untouched sibling’s unusual fence or list markers. Equal top-level block counts pass `canReconcile` at line 67. This violates `spec.md:414`, independently of the approved ambiguous-edit fallback. | Reconcile unchanged descendants inside changed containers. Add byte comparisons for an edited list/quote/details body beside an unchanged nested fence. |
+| 2 | Major | `phases/PHASE-02-background-git-index-locks.md:35` | **The instruction includes a historical stash read as an unstaged working-tree read.** | `apps/server/src/git/repository.rs:1427` is `git_manager_stash_file_list`; line 1443 belongs to `git stash show`. Filtering its result by current porcelain paths would hide stashed files when the checkout is clean. Also, `observe_status` already selects output files through porcelain records at `repository.rs:2524`. | Limit the change to commands comparing the working tree. Keep stash statistics independent, and add a clean-checkout stash regression test. |
+| 3 | Major | `phases/PHASE-02-background-git-index-locks.md:31` | **The R14 tests do not prove the claimed concurrent/no-lock scenarios.** | Two independent loops at line 32 need not overlap. A one-millisecond existence poll at line 31 can miss a shorter lock lifetime. The statistics case at line 33 checks one insertion and zero deletions only. | Coordinate overlap explicitly, observe lock creation reliably, and compare staged/unstaged insertion and deletion results against an isolated baseline. Retain the newly added linked-worktree cases. |
+| 4 | Major | `phases/PHASE-02-background-git-index-locks.md:47` | **Adding the stop-policy field reaches callers outside the task’s ownership.** | `SupervisedRunRequest` is a directly initialized struct (`apps/server/src/process/supervised.rs:33`), including callers in `process/runner.rs:242`, `production/tool_maintenance.rs:901` and device/provider modules. A default enum value does not fill omitted Rust struct fields. The `git/process.rs` runner also executes non-Git commands, for example native trash at `git/manager/operations.rs:145`. | Inventory and migrate every initializer, or choose an interface preserving them. Define how only Git receives `AskThenForce`. |
+| 5 | Major | `phases/PHASE-02-background-git-index-locks.md:87` | **Timeout/cancellation is not evidence that a forced stop completed.** | The plan treats timeout, cancellation and drop as forced-stop outcomes. After Task 2.2, cancellation may finish gracefully. Existing `terminate_and_wait_owned` can also return while a background reap remains active (`apps/server/src/process/supervised.rs:500`). Neither `ProcessRequest` nor the returned error currently carries the required cleanup lifecycle (`apps/server/src/git/process.rs:25`, `:516`). | Specify a supervisor-owned termination result/callback, retain the ticket through confirmed exit and cleanup, and test the actual `quiesce_for_update` caller. Do not infer forced termination from the original RPC outcome. |
+| 6 | Major | `phases/PHASE-03-status-during-push.md:19` | **Reopening reads leaves the trailing-refresh rule incomplete.** | `settle` sets `trailing_refresh_pending` (`apps/server/src/git/status_owner.rs:1146`), but `finish_mutation_burst_if_idle` returns when `read_gate_closed` is already false, before draining that flag (`:709`). That is the normal newly introduced read-safe state. The retained-lock flag protects retirement, but does not fix this path. | Explicitly change refresh draining independently of gate reopening. Test a completed read during the push followed by settlement, with no watcher event to rescue the missing final refresh. |
+| 7 | Major | `phases/PHASE-03-status-during-push.md:45` | **The PR-only release point is inside a branch a PR-only action can skip.** | The cited bounded transfer at `apps/server/src/production/git_vcs.rs:3184` is inside `if wants_push` at `:3119`. When `wants_push` is false, execution reaches the PR step at `:3202` without calling the proposed release method. | Release before entering the PR step when local writes are finished. Add a held PR lookup/create test with no push. |
+| 8 | Major | `phases/PHASE-03-status-during-push.md:54` | **The held-push fixture cannot prove a real saved commit.** | `ControlledMutationRunner` changes a dirty boolean and returns canned status (`apps/server/src/production/git_vcs.rs:4048`, `:4071`); it does not create or retain a commit. Running the existing integration target unchanged at phase line 64 adds no new held-push assertion. The spec requires real Git fixtures (`spec.md:705`). | Keep focused owner tests, then add a real-Git RPC test with a held transport, commit-history assertions and the required outcomes. Include Git Manager workspace loss. |
+| 9 | Major | `phases/PHASE-04-remote-push-guidance.md:21` | **`ExecutionPlace` has no planned production data path.** | The operation receives repository, broadcaster, catalog, request, prompt and cancellation, with no server configuration (`apps/server/src/git/manager/operations.rs:999`). Its RPC service has no environment label (`apps/server/src/production/git_manager_rpc.rs:115`). Runtime construction currently supplies only the interactive-sign-in flag to VCS (`production/runtime.rs:547`). Task 4.1 owns neither that runtime wiring nor `git_manager_rpc.rs`. | Add those callers and files to the task. Pass immutable execution-place information from server construction into both services. |
+| 10 | Major | `phases/PHASE-05-orphan-worktree-warnings.md:34` | **A successful creation may have no durable creation record.** | The step explicitly logs a failed record write and still succeeds, contradicting R4’s durable-record requirement (`spec.md:107`). Once its pointer disappears, that worktree can lose the evidence R5 requires. | Define durable failure handling and rollback/recovery before success is reported. Add persistence-failure coverage. Use the repository’s async database API pattern (`apps/server/src/persistence/repositories.rs:238`). |
+| 11 | Major | `phases/PHASE-07-custom-themes.md:145` | **The pre-paint guard is not theme validation.** | The regex admits non-colors such as `inherit`, out-of-range lengths and arbitrary function-shaped strings. No property-name whitelist or per-token range validation is specified. This differs from Task 7.2 and violates the every-entry-point requirement (`spec.md:573`). | Validate property names, color values, bounded lengths, keywords, record shape and size before applying anything. Test hostile stored paint records directly. |
+| 12 | Major | `phases/PHASE-07-custom-themes.md:88` | **The shared resolver freezes derived values and does not cover its consumers’ inputs.** | `resolveToken` returns an override or a resolved base literal. That cannot make an unset primary-hover follow an overridden primary, as required by `spec.md:453`. It feeds previews, contrast warnings and import resets. Its base inventory covers fixed-pair tokens, while the preview also requests `border` at phase line 191. Validation accepts named colors at line 52, but contrast parsing at line 101 lists only hex/rgb/hsl/oklch. | Define one complete resolution contract for every accepted color/token, preserving base formulas. Test the same resolved values in painting, previews, contrast and import repair. |
+| 13 | Major | `phases/PHASE-07-custom-themes.md:156` | **Theme ID is not a valid palette cache key after editing that theme.** | A custom theme keeps its ID when saved with new ANSI colors. The proposed cache therefore returns its earlier palette. The current cache returns immediately on a known key (`apps/web/src/components/pipelines/log/jobLogStyle.ts:29`). | Key by palette contents/revision or invalidate on save. Test an open job log after a same-ID edit. Separately retain full launch palettes per session generation, not only light/dark mode (`terminalTheme.ts:5`). |
+| 14 | Major | `phases/PHASE-07-custom-themes.md:258` | **The R57/R58 tests and wiring do not establish the requested behavior.** | Mermaid accent currently uses `--info`, not `--primary` (`apps/web/src/index.css:822`). A primary-only edit therefore does not reach it. Both preview bridges implement `setAnnotationTheme` as a no-op (`apps/web/src/tauriPreviewBridge.ts:261`, `browser/framePreviewBridge.ts:307`). Scrollbars are derived from foreground at phase line 260, although R57’s scenario changes muted and border. | Trace and implement the real consumers. Test visible changes from precisely the tokens named by the scenarios, rather than CSS-reference strings or a callback spy. |
+| 15 | Major | `phases/PHASE-07-custom-themes.md:77` | **The prescribed token replacement changes or misses existing interaction states.** | Send currently rests at `bg-primary/90`, hovers at full primary and uses native `active:` styling (`apps/web/src/components/chat/ComposerPrimaryActions.tsx:307`). The proposed hover/data-pressed replacement does not preserve that baseline or cover its native pressed state. | Specify substitutions per control/state and compare computed idle, hover and active colors before/after for Light, Dark and Verdant Light. |
+| 16 | Major | `phases/PHASE-07-custom-themes.md:281` | **The CSS-only R59 approach misses actual owners.** | Input rings live on an ancestor using `has-focus-visible` (`apps/web/src/components/ui/input.tsx:61`), so clearing ring variables on the focused child does not remove that ring. Buttons also have pseudo-element shadows (`ui/button.tsx:44`). The native Send button has no `data-slot="button"` (`chat/ComposerPrimaryActions.tsx:305`), and the plan explicitly permits omitting composer coverage. | Target the existing ring/shadow owners, including pseudo-elements and Send. Add computed-style focus/shadow assertions. Omitting the composer does not satisfy R59. |
+| 17 | Major | `phases/PHASE-08-end-to-end-docs-gates.md:30` | **Packaged proof precedes the final product changes.** | Task 8.1 builds; 8.2 reuses that build; 8.4 subsequently changes selected-state source, including newly deferred files at line 92. Inline execution chooses lower task IDs first (`execute-plan.md:53`). No later rebuild is required. | Make the final token changes precede the packaged build, then run acceptance against that exact candidate. Add the pipeline screenshot proof required by `spec.md:770` instead of declaring it unavailable in `plan.md:227`. |
+| 18 | Major | `execute-plan.md:37` | **The task-level parallel schedule has unprotected shared writes.** | Every task becomes a workflow work item, but 6.6/6.7 both edit the editor extensions and panel; 7.9/7.10 both edit Appearance; 7.11/7.12 both edit CSS, theme application and tests. Round-one lanes also invoke root typecheck, which includes Rust (`docs/reference/scripts.md:61`), despite the one-Rust-lane rule. | Specify serial execution within each phase, or add file-conflict edges. Serialize repository-wide gates and dependency installation, including their shared build outputs. |
+
+For Task 2.1 specifically, **`diff.autoRefreshIndex=false` is a sound way to suppress Git’s identified refresh path**: Git 2.56 connects that option to `skip_stat_unmatch` and calls the refresh only when that mechanism requests it. This is verified from [Git’s implementation](https://github.com/git/git/blob/v2.56.0/builtin/diff.c#L494-L613), not a reproduction here. The extra porcelain filter is redundant for the current `observe_status` result assembly, and must not spread into stash reads.
+
+**What the plan got right**
+
+- The refreshed status design separates a held write lock from active local writes, protects retirement, and now tests queued writers on both sides of the release point (`phases/PHASE-03-status-during-push.md:19–34`).
+- Declared round-one product-file ownership is disjoint. Keeping editor CSS in Phase 6 and global theme CSS in Phase 7 preserves that separation (`plan.md:138–140`).
+- Existing save/conflict ownership, upload transport and source-editor history are reused instead of replaced (`phases/PHASE-06-rich-markdown-editing.md:43`, `:92`, `:161`).
+- Task IDs and titles match across all 35 tasks and `progress.md`; the recorded spec hash matches. Every task has a Done when, and the prohibited placeholder phrases were absent.
+- The required React, accessibility, UI and diagnosis skills generally fit the work. Phase-level skills apply even where a task says “none”; no skill-installation gap was found.
+
+Sizing judgment: **6.3, 6.4, 7.4 and 7.7 need smaller behavioral deliverables**. They respectively combine source reconciliation with construct detection; editor/schema installation with lifecycle integration; palette data with a general color resolver; and session retention with shell/environment and log consumers (`PHASE-06:62–109`; `PHASE-07:83–104`, `:151–171`). Most other tasks are reasonably bounded. The approved five-round outline can remain; it needs explicit within-phase serialization.
+
+**Open questions the plan cannot answer**
+
+- **Which binding rule resolves the palette contrast conflict?** Applying the specified 72% placeholder fallback to Tokyo Night gives approximately **3.63:1**, and Matrix Light **3.33:1**, below R56’s 4.5 minimum. Their supplied mappings omit placeholder overrides (`theme-palettes.md:50–69`, `:224–241`; `PHASE-07:64`). These were pure WCAG calculations. Task 7.4 currently says both “PASS” and “do not change the value; report it” (`:102`). This needs an explicit resolution, not an unapproved palette change.
+- What is the supported annotation surface for R58, given the current bridge no-ops? That decision may require ownership beyond Phase 7’s permitted web files.
+- What bounds reconciliation work per keystroke near the preview limit? The plan requests whole-document block LCS on every update without an algorithm/work budget (`PHASE-06:82`, `:105`).
+- How do library, slots and precomputed paint records remain consistent after a partial storage failure or a corrupt library entry? Task 7.5 names separate writes but no recovery protocol (`PHASE-07:14`, `:111`).
+
+TipTap, per-view undo, the Windows forced-stop fallback, the accepted legacy-orphan limitation and the deferred features remain accepted decisions, not review defects.
+
+Not checked: builds, suites, native UI, live authentication or Git lock reproduction. No files were changed; the findings need implementation-time failing tests before being treated as reproduced defects.
+
+## Handling
+
+Reviewer: Codex `gpt-6.1-sol`, effort high, read-only, 2026-11-09. Each finding was checked against the cited source lines before it was accepted.
+
+| # | Outcome | Reason or change |
+|---|---|---|
+| 1 | fixed | Task 6.3 now reconciles inside changed containers (lists, block quotes, `details`) and has byte comparisons for an edited list item beside an untouched nested fence. |
+| 2 | fixed | Task 2.1 changes only the working-tree statistics read of `observe_status`. The stash and conflict reads are left alone, the redundant path filter is removed, and a clean-checkout stash test is added. |
+| 3 | fixed | Task 2.1 forces overlap with a barrier, observes the Git directory with a file watcher, and compares statistics against a baseline from plain Git. |
+| 4 | fixed | Task 2.2 migrates every `SupervisedRunRequest` initializer and sets the ask-first policy only when the program is Git. Phase 2 owns those initializers. |
+| 5 | fixed | Task 2.2 returns a termination report from the supervisor; Task 2.3 keeps the write ticket through confirmed exit and tests the real `quiesce_for_update`. |
+| 6 | fixed | Task 3.1 drains the trailing refresh in `settle` whatever the gate state, with a test that has no watcher event. |
+| 7 | fixed | Task 3.2 releases reads before the pull-request step when the action has no push, with a held pull-request test. |
+| 8 | fixed | Task 3.2 adds a real-Git RPC test with a held transport and commit-history assertions; Task 3.3 adds workspace loss. |
+| 9 | fixed | Task 4.1 passes the execution place from server construction into both services and owns `git_manager_rpc.rs` and the runtime wiring. |
+| 10 | fixed | Task 5.1 fails and rolls back a creation whose record cannot be written, with a persistence-failure test, and uses the async repository pattern. |
+| 11 | fixed | Task 7.6 validates the paint record by shape, size, property allowlist and per-kind value grammar. The store writes normalized hex colors (new Task 7.13). |
+| 12 | fixed | New Task 7.13 defines one resolution contract with derived defaults for every supported token, used by painting, previews, contrast and import. Accepted color syntaxes are hex, `rgb()`, `hsl()` and `oklch()` (plan decision P16). |
+| 13 | fixed | The palette cache key is a hash of the palette contents (Task 7.7), and a running session keeps its full launch palette. The job log moved to new Task 7.14 with a same-ID edit test. |
+| 14 | fixed in part, kept for approval in part | Scrollbars now derive from `border`, the token R57's scenario changes. Diagrams do not use `primary` (they use `info`), and both annotation bridges are no-ops today, so R58's scenario cannot be met as written. Recommendation: amend R58's scenario to the tokens diagrams consume and to the annotation reader's values, and leave bridge wiring to a follow-up. Listed for the user at approval. |
+| 15 | fixed | Task 7.3 lists substitutions per control and state, leaves the Send button's classes as they are, and compares computed idle, hover and pressed colors before and after. |
+| 16 | fixed | Task 7.12 targets the real ring and shadow owners (the input wrapper, button pseudo-element shadows, the Send button) through attributes set in the owned components, with computed-style assertions. The composer is no longer optional. |
+| 17 | fixed in part, kept for approval in part | Phase 8 now makes the last source change before the packaged build. The packaged pipeline screenshot the spec's Verification names has no fixture with a pipeline host. Recommendation: amend the Verification line to component tests. Listed for the user at approval. |
+| 18 | fixed | Tasks inside Phases 6 and 7 are a single chain, round-1 web tasks use the web-only typecheck, and `execute-plan.md` says one lane per phase and one Rust build at a time. |
+| Sizing | fixed | 6.3, 6.4, 7.4 and 7.7 are split (new Tasks 6.8, 6.9, 7.13, 7.14). |
+| Open: placeholder contrast | fixed | Each new built-in whose default placeholder falls below 4.5:1 sets `placeholder` to its `muted-foreground` (plan decision P17). Listed for the user at approval because it adds a value to the binding palettes. |
+| Open: annotation surface | kept for approval | See finding 14. |
+| Open: reconcile cost | fixed | Task 6.9's surface serializes 300 ms after the last change, as Orca does; files over the existing preview limit already open in source view. |
+| Open: storage consistency | fixed | Task 7.5 treats the paint record as derived data: it is rebuilt from the library and slots at start when missing, corrupt or stale. |
