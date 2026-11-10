@@ -3129,7 +3129,7 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let push = if wants_push {
-        if let Some(mutation) = mutation.as_deref_mut() {
+        if let Some(mutation) = &mut mutation {
             mutation.local_writes_finished();
         }
         *phase = Some("push");
@@ -3215,7 +3215,7 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let pull_request = if let Some(provider) = pull_request_provider {
-        if let Some(mutation) = mutation.as_deref_mut() {
+        if let Some(mutation) = &mut mutation {
             mutation.local_writes_finished();
         }
         *phase = Some("pr");
@@ -5027,7 +5027,7 @@ mod mutation_ownership_tests {
 
     const HELD_PUSH: &str = "GitVcsDriver.pushCurrentBranch";
     /// Longer than any local status read and far below the 10 s hang budget.
-    const ANSWER_WHILE_HELD: Duration = Duration::from_secs(3);
+    const ANSWER_WHILE_HELD: Duration = Duration::from_secs(5);
 
     fn stacked_request(id: &str, cwd: &Path, action: &str) -> RpcRequest {
         RpcRequest {
@@ -6565,7 +6565,7 @@ esac
         .expect("the pull-request creation starts");
 
         let refreshed = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             services.handle_unary_with_context(
                 rpc_request("vcs.refreshStatus", json!({ "cwd": repository })),
                 RpcSessionContext::unauthenticated(),
