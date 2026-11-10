@@ -99,7 +99,13 @@ flowchart TB
     stale reply is dropped. Without an acknowledge or a keepalive for five
     seconds the host shows a native "Close anyway" or "Keep waiting" prompt.
     The web asks the same question itself before it restarts the app or
-    installs an update. Dock Quit on macOS, SIGTERM and session end do not
+    installs an update. After it allows an `update` request, the web holds
+    saving and shows a modal "Installing an update" dialog, so no edit made
+    during the backup and install is lost at the restart. If the install ends
+    without restarting (a refusal or a failure), the host emits
+    `desktop:update-install-ended` (`onUpdateInstallEnded`) to the main window,
+    and the web releases the holds, closes the dialog and says the update did
+    not install. Dock Quit on macOS, SIGTERM and session end do not
     wait. A `desktop-e2e` teardown disarms the guard.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,

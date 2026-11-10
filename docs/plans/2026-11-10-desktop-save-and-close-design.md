@@ -25,9 +25,10 @@ quits. The web asks the same question itself before it restarts the app or insta
 | `desktop_bridge_save_text_file`      | web to desktop | `{ suggestedName, contents }` to the saved path, `null` on Cancel, or a rejection |
 | `desktop:close-request` event        | desktop to web | `{ requestId: number, reason: "close" \| "quit" }`                                |
 | `desktop_bridge_reply_close_request` | web to desktop | `{ requestId, reply: "acknowledge" \| "keepalive" \| "allow" \| "stay" }`         |
+| `desktop:update-install-ended` event | desktop to web | no payload, after an allowed `update` request ends without a restart              |
 
-`DesktopBridge` gains `saveTextFile(input)`, `onCloseRequest(listener)` and
-`replyCloseRequest(requestId, reply)`, all optional so the browser build has none of them.
+`DesktopBridge` gains `saveTextFile(input)`, `onCloseRequest(listener)`,
+`replyCloseRequest(requestId, reply)` and `onUpdateInstallEnded(listener)`, all optional so the browser build has none of them.
 Both commands go into the `allow-desktop-bridge` permission, the `generate_handler!` list and
 the audited command lists in `lib.rs` and the `bridge.rs` tests. The event goes to the main
 window (`MAIN_WINDOW_LABEL`) only, and the close handler is installed on the main window only,
@@ -90,6 +91,25 @@ download and before `install_update`, `run_remote_install` asks this window thro
 local install does, so a remote install waits while nobody answers the open dialog. Proven by
 `close_request_on_remote_update_proceeds_only_when_the_web_allows_it` and
 `close_request_remote_install_asks_the_window_first`.
+
+The backup, protection and install run for a long time after `allow`, and the restart at the
+end asks nothing. So once the web allows an `update` request (Save all succeeded, Discard, or
+nothing was unsaved), it holds saving in every registry and shows a modal "Installing an update"
+dialog with no buttons, which Escape does not close. Edits made after the answer are therefore
+neither typed nor written. Only the remote path sends reason `update`; the local install in
+`UpdateProtectionDialog` keeps its own `releaseLeaveHolds()` handling.
+
+The existing `desktop:update-state` event cannot end that block. The `accepted: false` returns
+of `install_update` (backend recovery pending, an install in flight) change no state and emit
+nothing, and the clearing of `requestedBy` also fires on exits before the window was asked. So
+`install_after_allow` arms an `AllowedInstall` guard after `allow`. Its `Drop` emits
+`desktop:update-install-ended` to the main window on every return unless the result had
+`completed: true`, which restarts the app (on Windows the installer ends it). The web then
+releases the block's holds and any Discard holds, closes the dialog and shows "The update did not
+install". Proven by `close_request_remote_install_signals_every_end_without_restart_after_allow`
+and the web tests under "a remote update install the window allowed". Limit: when the person
+picks "Close anyway" in the native prompt for an `update` request, the web did not answer and is
+not blocked, as for any request the person forces.
 
 Dock Quit and the app switcher's Quit on macOS send `terminate:`, and tao has no
 `applicationShouldTerminate` hook, so they cannot wait for an answer. The user decided on
@@ -386,6 +406,14 @@ state, the end-to-end feature gate or compile defects.
    as outside R62. Rejected: the spec already says so.
 2. Decision 8 overstated dead-renderer coverage. Checked: the helper calls the command through
    `browser.execute` (`app-lifecycle.ts:35`). Fixed: decision 8 states the limit.
+
+Codex review of the Phase 9 code, triaged by the coordinator and the advisor, two findings.
+
+1. (P1) Edits made after the person allowed a remote install were lost at its restart. Fixed:
+   the web blocks Files editing and holds saving from the answer until the restart or
+   `desktop:update-install-ended` (decision 1).
+2. (P2) After Discard, a failed remote install left saving paused. Fixed: the same signal
+   releases the Discard holds.
 
 Decision 8 was added on 2026-11-10 at the coordinator's request, because the phase file's edit
 that should have listed it was missed.
