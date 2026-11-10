@@ -350,9 +350,10 @@ fixed keyword (spec, Anti-goals; R48).
 - The pre-paint script re-checks the record, because stored data can be edited by hand.
 - The theme name is rendered as React text only. The export file name is `<id>.theme.json`,
   safe because the id grammar has no path characters.
-- Import reads the file as text, applies the size check, parses JSON and validates. Nothing is
-  stored before the person confirms, and a conflict with an existing custom id asks Replace or
-  Keep both (R53).
+- Import refuses a chosen file whose `size` is over the limit before reading it. Otherwise it
+  reads the file or the pasted JSON as text, applies the size check to the text, parses JSON and
+  validates. Nothing is stored before the person confirms, and a conflict with an existing custom
+  id asks Replace or Keep both (R53). Import checks the id again when the person confirms.
 
 ## Contrast
 
@@ -396,8 +397,10 @@ changes in the roughly 60 files that carry one.
   `outline: var(--focus-ring-width, 2px) solid var(--ring)` with
   `outline-offset: var(--focus-ring-offset, 2px)` and clear the ring shadow. The rule excludes
   the inner control of a ring owner (the owner draws the outline), the popups that `index.css`
-  lines 103 to 110 silence on purpose, and the terminal's hidden text area. The rules sit
-  outside the utilities layer, so they win over `outline-none`.
+  lines 103 to 110 silence on purpose, and the terminal's hidden text area. An `InputGroup`
+  draws its ring only for its `input` or `textarea`, so it claims the outline only for those,
+  and a button in an addon keeps its own outline. The rules sit outside the utilities layer, so
+  they win over `outline-none`.
 - Under `:root[data-theme-control-shadow="none"]`, `[data-control-shadow]`, its `::before` and
   `::after`, and `.chat-composer-glass` get `box-shadow: none`.
 - Without the attributes nothing changes, so Light and Dark keep today's ring and shadows (R59).
@@ -491,3 +494,4 @@ each finding with a failing test before the fix.
 | C12. `commitThemeImport` trusted the conflict found at validation, so Import overwrote a theme another window stored with that id in between.                                                                              | Fixed. Import calls `commitThemeImport` with the choice `import`, which checks the id again and stores nothing when a custom theme now has it. The dialog then asks Replace or Keep both (R53). This is a recheck only. Cross-window locking stays rejected (C2).                                                                                                                                                      |
 | C13. Under a theme with a focus ring, a textarea showed the new outline on the control and the wrapper's 3px ring as well.                                                                                                 | Fixed. A search of `apps/web/src/components/ui` for rings drawn on a parent found four more wrappers, and each now carries `data-focus-ring-owner`, so the wrapper draws the one outline. The computed outline is checked in the Phase 8 end-to-end themes spec, because happy-dom does not apply layered utilities.                                                                                                   |
 | C14. Lane D changed the default button to `hover:` and `active:hover:` variants, which Tailwind wraps in `@media (hover: hover)`, so a touch press in Light and Dark lost the 90 percent primary of the base branch (R50). | Fixed. The compiled CSS showed the base selector `:is(:hover, [data-pressed])` with no media query and the new rules inside `@media (hover: hover)`. The button now uses `[:hover,[data-pressed]]:bg-primary-hover` and `[:active:hover,[data-pressed]]:bg-primary-active`, and `button.test.tsx` compiles the variant and checks that no rule is gated. A keyboard press without hover stays unthemed, a known limit. |
+| C15. The advisor checked the C13 fix and found that marking `InputGroup` made the group take the outline from a focused button in an addon (the address bar in `PreviewChromeRow.tsx` has one).                            | Fixed. `index.css` lets an input group claim the outline only for its `input` or `textarea`. `focusRingOwner.test.tsx` applies the rules in happy-dom and checks both cases.                                                                                                                                                                                                                                           |

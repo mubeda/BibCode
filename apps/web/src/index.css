@@ -386,14 +386,18 @@
     [data-slot="popover-popup"],
     .xterm-helper-textarea
   ),
-:root[data-theme-focus-ring] [data-focus-ring-owner]:has(:focus-visible) {
+:root[data-theme-focus-ring]
+  [data-focus-ring-owner]:not([data-slot="input-group"]):has(:focus-visible),
+:root[data-theme-focus-ring] [data-slot="input-group"]:has(:is(input, textarea):focus-visible) {
   outline: var(--focus-ring-width, 2px) solid var(--ring);
   outline-offset: var(--focus-ring-offset, 2px);
   --tw-ring-shadow: 0 0 #0000;
   --tw-ring-offset-shadow: 0 0 #0000;
 }
 
-:root[data-theme-focus-ring] [data-focus-ring-owner] :focus-visible {
+/* An input group owns only its text field's ring, so a button in an addon keeps its own. */
+:root[data-theme-focus-ring] [data-focus-ring-owner]:not([data-slot="input-group"]) :focus-visible,
+:root[data-theme-focus-ring] [data-slot="input-group"] :is(input, textarea):focus-visible {
   outline: none;
 }
 
