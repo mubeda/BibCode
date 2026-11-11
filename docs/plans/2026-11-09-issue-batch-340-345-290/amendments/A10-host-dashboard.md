@@ -6,7 +6,7 @@ the host its server runs on, live and since the server process started. Scope: a
 P0, its P1.1 charts inside P0, then P1.2, P1.3 and P1.4, and P2.1 and P2.2 as separate tasks
 that can be cut. The issue was verified at an older commit; its corrections on this branch are in
 [the design note](../../2026-11-11-host-metrics-dashboard-design.md#where-the-issue-is-wrong-or-stale-on-this-branch).
-Requirements R66 to R83, decisions D22 to D30. Plan phase: Phase 11.
+Requirements R66 to R85, decisions D22 to D33. Plan phase: Phase 11.
 
 Names used in these requirements:
 
@@ -19,7 +19,7 @@ Names used in these requirements:
 
 ### R66. The host collector reads CPU, memory and volume space without a process scan [Must] (amendment A10)
 
-The host collector SHALL report CPU use as a percentage of all logical cores between 0 and 100, memory total, used and available bytes where used is the operating system's own used figure and available is total minus used, and for each volume its mount point, name, file system, total, free (available to the server's user) and used (total minus free) bytes, and whether it is removable or read-only, and it SHALL NOT enumerate processes to do so.
+The host collector SHALL report CPU use as a percentage of all logical cores between 0 and 100, memory total, used and available bytes where used is the operating system's own used figure and available is total minus used, and for each volume its mount point, name, file system, total, free (free space on the volume as the operating system reports it; per-user quotas are not applied) and used (total minus free) bytes, and whether it is removable or read-only (on Linux from the mount options), and it SHALL NOT enumerate processes to do so.
 
 #### Scenario: memory figures
 
@@ -32,6 +32,12 @@ The host collector SHALL report CPU use as a percentage of all logical cores bet
 - GIVEN a source that reports CPU use of 104.5 and then of -0.2
 - WHEN the collector takes two readings
 - THEN their `cpuPercent` values are 100 and 0
+
+#### Scenario: read-only mount on Linux
+
+- GIVEN a Linux host with an ext4 image mounted read-only at `/mnt/ro-test`
+- WHEN the native source lists and reads its volumes
+- THEN `/mnt/ro-test` has `readOnly` true and `/` has `readOnly` false
 
 #### Scenario: no process table
 
@@ -63,25 +69,25 @@ The host collector SHALL skip zero-size volumes, `overlay` volumes not mounted a
 
 ### R68. A volume that does not answer does not hold back the rest [Must] (amendment A10)
 
-IF a volume's space read or the volume list takes longer than 2 seconds, THEN the host collector SHALL use the last volume list and report that volume as not responding with its last known sizes, or none before its first answer, SHALL still report CPU, memory and every other volume in the same reading, and SHALL NOT start another read of that volume while the first is still running.
+The host collector SHALL make every volume list and space read on a fixed pool of 4 disk worker threads and never in the CPU and memory sampling; WHILE a volume's read has run longer than 2 seconds, it SHALL report that volume as not responding with its last known sizes, or none before its first answer, SHALL NOT admit another read of that volume, and SHALL apply the late result when it arrives; IF the volume list takes longer than 2 seconds, THEN it SHALL keep the last list; and WHILE all 4 workers are held by calls that have not returned, it SHALL stop admitting disk reads, mark each reading with disk reads paused, and keep publishing CPU and memory at the current rate.
 
-#### Scenario: one volume hangs
+#### Scenario: CPU and memory keep their pace
 
-- GIVEN a fake source whose space read for `/mnt/slow` never returns and whose other reads return at once, on a paused clock
-- WHEN two readings with volumes are taken 5 seconds apart
-- THEN both readings have CPU and memory, `/` is `ok`, `/mnt/slow` is `notResponding` with no sizes, and the source received exactly one space read for `/mnt/slow`
+- GIVEN a source whose volume list call and whose space read of `/mnt/slow` each block a real thread on a channel the test holds, at the live rate of 1 second
+- WHEN 4 seconds pass
+- THEN 4 readings arrive with `sampledAt` values 1 second apart (within 200 ms), each with CPU and memory, `/` from the last list as `ok` and `/mnt/slow` as `notResponding`, and the source received exactly one space read for `/mnt/slow`
 
 #### Scenario: the volume answers late
 
-- GIVEN the hung read of `/mnt/slow` from the scenario above
-- WHEN it returns 100 GB total and 30 GB free after 12 seconds
-- THEN the next reading with volumes shows `/mnt/slow` as `ok` with those sizes, and the reading after it starts a new space read for `/mnt/slow`
+- GIVEN the held read of `/mnt/slow` from the scenario above
+- WHEN the test releases it with 100 GB total and 30 GB free after 12 seconds
+- THEN the next reading shows `/mnt/slow` as `ok` with those sizes, and the next volume tick admits a new space read for `/mnt/slow`
 
-#### Scenario: the volume list hangs
+#### Scenario: every worker is held
 
-- GIVEN a fake source whose volume list never returns after a first list of `/`
-- WHEN a reading with volumes is taken
-- THEN the reading arrives within 3 seconds with CPU, memory and `/` from the last list
+- GIVEN a source whose space reads of `/a`, `/b`, `/c` and `/d` all block
+- WHEN 10 seconds pass at the live rate
+- THEN every reading after the fourth call blocked has `volumesPaused` true, no fifth disk call was made, and the readings still arrive once a second
 
 ### R69. Statistics since server start keep a fixed size [Must] (amendment A10)
 
@@ -103,7 +109,13 @@ The host collector SHALL keep, for CPU percent and memory used percent since the
 
 - GIVEN one week of simulated background readings on a paused clock
 - WHEN the history is read
-- THEN the raw tier holds at most 900 readings, the minute tier at most 1,440 buckets, the oldest tier at most 20,000 buckets, and the statistics start at the first reading's time
+- THEN the raw tier holds at most 900 readings, the minute tier at most 1,440 buckets, and the statistics start at the first reading's time
+
+#### Scenario: the oldest tier compacts
+
+- GIVEN chart history whose oldest tier holds at most 8 buckets, fed 64 closed 15-minute buckets of CPU 10 percent, then 64 of CPU 30 percent of which one contains a reading of 95 percent
+- WHEN the history is read after the compactions this forces
+- THEN the oldest tier holds at most 8 buckets, its first bucket starts at the first reading, the weighted average across its buckets is within 0.1 of 20 percent, and the highest bucket peak is 95
 
 ### R70. The collector samples in the background and faster while watched [Must] (amendment A10)
 
@@ -115,15 +127,15 @@ WHILE no host stream is open, the host collector SHALL read CPU and memory at th
 - WHEN 120 seconds pass with no stream, then 10 seconds with one stream, then 10 seconds with two, then 120 seconds after both closed
 - THEN the source received 2 or 3 CPU and memory reads in the first period, 9 to 11 in each live period (not 18 or more with two streams), and 2 or 3 in the last, and volume reads only on every fifth reading
 
-### R71. Background sampling costs under 0.1 percent of one core [Must] (amendment A10)
+### R71. The collector's cost is measured, and the sampling policy follows the measurement [Must] (amendment A10)
 
-The host collector SHALL cost less than 0.1 percent of one core at the background rate and less than 1 percent of one core at the live rate, measured as process CPU time per reading on a macOS host and in a Linux container, and IF the background figure misses its limit, THEN collection SHALL start at the first host stream instead of at server start (D22), after the user approves the change.
+The host collector's CPU cost SHALL be measured through the real collector path (both loops, statistics, chart production and the encoding of every item one subscriber receives) as CPU time per background reading and per live reading on a macOS host and in a Linux container, and the sampling policy SHALL be the outcome of D22 that the measurement selects: always on with a 1-second live rate when background costs at most 0.1 percent of one core at 60 seconds and live at most 1 percent at 1 second; IF background costs more, THEN collection SHALL start at the first host stream; IF live costs more than 1 percent at 1 second, THEN the live rate SHALL be 2 seconds; and a fallback outcome SHALL take effect only after the user approves it.
 
 #### Scenario: measured cost
 
-- GIVEN the native source on this repository's macOS development host and in the Linux lab container
-- WHEN the cost probe takes 300 readings of each kind, 250 ms apart so that every CPU refresh does its work
-- THEN its report shows CPU time per background reading below 60 ms and per live reading below 10 ms, and the method and figures are recorded in the pull request
+- GIVEN the real collector with the native source on this repository's macOS development host and in the Linux lab container, at test rates no faster than 250 ms so that every CPU refresh does its work
+- WHEN the cost probe runs 300 background-shaped and 300 live-shaped readings with one subscriber whose items are encoded
+- THEN the probe reports CPU time per reading of each kind and the derived percent of one core at 60 s and at 1 s, and the design note records the figures, the method and the selected outcome
 
 ### R72. The host stream sends a snapshot first, then readings, to an authorized client only [Must] (amendment A10)
 
@@ -231,17 +243,17 @@ The host collector and its tests SHALL compile and pass on the Linux, macOS and 
 
 ### R80. The readings match the operating system's own tools [Should] (amendment A10)
 
-The host collector's readings SHALL agree with the operating system's command-line tools: memory used within 3 percentage points, each volume's total within 1 percent, free space within 1 percent of the tool's free figure (on macOS, at least `df`'s and within 1 percent of `diskutil`'s container free space), and CPU within 10 percentage points over the same 5-second window.
+The host collector's readings SHALL agree with the operating system's command-line tools: memory used within 3 percentage points, each volume's total within 1 percent, free space within 1 percent of the same figure as the operating system reports it (on macOS, the volume's available capacity for important usage, falling back to its available capacity as the collector does, read through the system's JavaScript bridge, and at least `df`'s Available), and CPU within 10 percentage points over the same 5-second window.
 
 #### Scenario: macOS host and Linux container
 
 - GIVEN this repository's macOS development host and the Linux lab container
-- WHEN the comparison probe runs against `vm_stat`, `df -k`, `diskutil info` and `top` on macOS, and `/proc/meminfo` (`MemTotal` minus `MemAvailable`), `df -k -P` and `/proc/stat` on Linux
+- WHEN the comparison probe runs against `vm_stat`, `df -k`, `osascript -l JavaScript` (`NSURL` volume resource values) and `top` on macOS, and `/proc/meminfo` (`MemTotal` minus `MemAvailable`), `df -k -P` and `/proc/stat` on Linux
 - THEN every comparison is inside its tolerance and the probe prints the figures it compared
 
 ### R81. Hidden volumes can be listed [Should] (amendment A10)
 
-The host dashboard SHALL list the volumes the filter hid under a closed **Hidden volumes (N)** disclosure, each with its mount point and the reason it was hidden, and SHALL NOT read their space.
+The host dashboard SHALL list the volumes the filter hid under a closed **Hidden volumes (N)** disclosure, each with its mount point and the reason it was hidden, and SHALL NOT read the space of a volume rejected before sampling (network, overlay not at `/`, file mount); volumes hidden as empty or as sharing storage are hidden after their space read.
 
 #### Scenario: one network volume hidden
 
@@ -269,9 +281,35 @@ The host collector SHALL keep, for each volume's used percent, the same five sta
 - WHEN the statistics are read
 - THEN `/` has current 60, minimum 40, maximum 60 and average 50
 
+### R84. A hung volume never delays server exit [Must] (amendment A10)
+
+WHEN the server shuts down while a disk call has not returned, the host collector SHALL stop without waiting for that call, and the server process SHALL exit.
+
+#### Scenario: exit with a read held
+
+- GIVEN a child process that runs the collector in a multi-thread Tokio runtime dropped after `block_on`, as the server's `main` does, with a space read blocked forever
+- WHEN the child shuts the collector down and returns from `block_on`
+- THEN the child exits with status 0 within 5 seconds
+
+### R85. A slow client still receives the latest charts [Must] (amendment A10)
+
+WHEN a subscriber falls behind while the uptime chart or the hidden-volume list changes, the server SHALL include the latest complete chart state in the next item it sends that subscriber, and the client SHALL keep only recent points less than 15 minutes older than its newest one, at most 900 of them.
+
+#### Scenario: blocked across a minute boundary
+
+- GIVEN a subscriber that does not read its stream from 50 seconds into a minute until 70 seconds, on a paused clock
+- WHEN it reads again
+- THEN the first item it receives carries the uptime chart that includes the bucket closed at 60 seconds
+
+#### Scenario: skipped samples
+
+- GIVEN a client view whose newest point is at 20:00:00 and which holds points back to 19:40:00
+- WHEN a sample at 20:00:01 arrives
+- THEN no point older than 19:45:01 remains
+
 ## Decisions
 
-D22. The collector samples from server start at 60 seconds, faster while watched, subject to measured cost: background under 0.1 percent of one core and live under 1 percent (R71). If background misses, collection starts at the first host stream instead and the statistics say "since" that time, after the user approves; if live misses, the live rate becomes 2 seconds and is measured again. Alternatives considered: sampling only while a dashboard is open (cannot answer "since server start"); starting at the first open (the first look of each run has no history). This reverses the process monitor's rule that a server nobody reads samples nothing, for the host collector only. Decided by: agent's call. Source: #292 open question 2 and P1.4.
+D22. The collector samples from server start at 60 seconds, faster while watched, subject to measured cost (R71). Task 11.4 measures first and then applies the policy. Outcomes: always on with live 1 s (background at most 0.1 percent of one core and live at most 1 percent); start at the first host stream (background over 0.1 percent; R69, R70, R71 and R76 then say "since the first dashboard opened"); live 2 seconds (live over 1 percent at 1 s and at most 1 percent at 2 s; R70, R72 and R77's stale threshold, 5 s instead of 3 s, change). A fallback takes effect only after the user approves it, before any web task; if live is over 1 percent even at 2 s, no outcome is accepted and the user decides. Alternatives considered: sampling only while a dashboard is open (cannot answer "since server start"); starting at the first open (the first look of each run has no history). This reverses the process monitor's rule that a server nobody reads samples nothing, for the host collector only. Decided by: agent's call. Source: #292 open question 2 and P1.4.
 
 D23. Statistics cover the current server process only, in memory, reset on restart or update. Alternatives considered: persisting 15-minute buckets for 90 days (a schema change and a migration for a follow-up nobody has asked for yet). Decided by: agent's call, the issue's recommendation. Source: #292 open question 1.
 
@@ -289,9 +327,16 @@ D29. Hidden volumes are a disclosure in the sheet, not a setting, and there is n
 
 D30. The host stream closes when the document is hidden, not when the window loses focus. Alternatives considered: also closing on blur like the status bar (a dashboard on a second display would freeze). Decided by: agent's call. Source: #292 Web 3 and #168.
 
+D31. Free space is the volume's free space as the operating system reports it, and per-user quotas are not applied; on Windows the crate reports total free bytes, not the caller-available figure. The UI says "free", never "available to you". Alternatives considered: a Windows adapter using the caller-available value (more platform code, and no quota lab to test it). Decided by: agent's call, after review. Source: `sysinfo` 0.39.6 `src/windows/disk.rs`.
+
+D32. Disk calls run on a fixed pool of 4 dedicated OS threads that shutdown never joins, never on the Tokio blocking pool and never inside CPU and memory sampling; all 4 held pauses disk reads with a visible notice. Alternatives considered: the Tokio blocking pool (runtime shutdown waits for every started blocking task, so a hung `statvfs` would keep the server from exiting); a thread per call (no bound). Decided by: the coordinator, after review. Source: the server's `main` drops its runtime after `block_on`.
+
+D33. On Linux the read-only flag comes from the mount options in `/proc/self/mounts`, read while listing on a disk worker. Alternatives considered: listing with a storage refresh, the only way the crate sets the flag (a `statvfs` of every volume on every listing, which can hang). Decided by: agent's call, after review. Source: `sysinfo` 0.39.6 `src/unix/linux/disk.rs`.
+
 ## Verification
 
-- **R66 to R70, R74, R83:** Rust unit tests of the host collector with a fake source and a paused clock; a log-capture test for R74.
+- **R66 to R70, R74, R83, R85:** Rust unit tests of the host collector with a fake source and a paused clock; a log-capture test for R74.
+- **R84:** a child-process test shaped like the server's `main`.
 - **R71, R80:** ignored probe tests run on the macOS development host and in the Linux lab container, their output recorded in the pull request; Windows only through CI build and tests (R79) and, if reachable, the Windows lab of `docs/testing/windows-desktop.md`. Unproven by this plan: the graphical tools (Activity Monitor, Disk Utility, Task Manager), Linux on bare metal and on x64, Windows on x64, and containers with cgroup limits.
 - **R72, R73:** server RPC tests over the real registrar, the scope test over a restricted socket, both descriptor tests, the contract fixture decoded and re-encoded by a Rust test, and the capability default test.
 - **R75 to R78, R81:** web component and logic tests with a fake stream; one packaged desktop end-to-end test that opens the local host dashboard and sees CPU, memory and at least one volume.

@@ -77,27 +77,46 @@ for remote servers and for the local environment.
    maintainer's host lists `/` and `/System/Volumes/Data` with the same total and available
    blocks. What `Disks` returns there is unverified until the probe in Task 11.3 runs.
 5. **macOS free space is not `df`'s.** `sysinfo` prefers "available capacity for important
-   usage", which counts purgeable space (`src/unix/apple/disk.rs:380-391`). It can be larger than
-   `df`'s Available. P1.3 compares it with `diskutil info`'s container free space and requires
-   it to be at least `df`'s value.
-6. **The local environment has no Environment actions menu.** `buildEnvironmentContextCardView`
+   usage", which counts purgeable space such as the trash and system-managed caches
+   (`src/unix/apple/disk.rs:380-391`). It can be larger than `df`'s Available and than
+   `diskutil`'s container free space. P1.3 therefore compares it with the same property, read
+   through the system's own JavaScript bridge (`osascript -l JavaScript`, `NSURL`
+   `resourceValuesForKeys`), with the crate's fallback to plain available capacity, and checks
+   only that it is at least `df`'s Available.
+6. **Linux read-only volumes would read as writable.** `sysinfo` sets `is_read_only` only in a
+   storage refresh on a disk's first listing (`src/unix/linux/disk.rs:141-148`, `first` is `true`
+   only from `new_disk`, line 276-285); a later `Disk::refresh_specifics` passes `false`
+   (line 110). Listing with `DiskRefreshKind::nothing()`, as planned, never sets it. The collector
+   reads the flag from the mount options (`ro`) of `/proc/self/mounts` instead, on the disk
+   worker while listing, which touches no file system (D33). macOS and Windows set the flag at
+   listing from `getfsstat` flags and `FILE_READ_ONLY_VOLUME` (`src/unix/apple/disk.rs:512`,
+   `src/windows/disk.rs:340`).
+7. **Windows free space ignores per-user quotas.** `get_drive_size` passes `None` for the
+   caller-available value of `GetDiskFreeSpaceExW` and reports the volume's total free bytes
+   (`src/windows/disk.rs:279-295`). The requirement says "free space on the volume; per-user
+   quotas are not applied" (D31), and the UI never says "available to you".
+8. **A blocking-pool task that never returns blocks server exit.** `apps/server/src/main.rs:13-17`
+   drops its Tokio runtime after `block_on`, and Tokio's runtime shutdown waits for every
+   started blocking task. A hung `statvfs` on the blocking pool would therefore keep the server
+   process alive. Disk reads run on dedicated threads that shutdown never joins (D32).
+9. **The local environment has no Environment actions menu.** `buildEnvironmentContextCardView`
    returns `null` for the primary and desktop-local targets
    (`apps/web/src/components/sidebar/environmentContextCard.logic.ts:54-59`), so the card and its
    menu exist only for remote environments. The local entry point is the Resource Manager popover
    in the status bar (D27).
-7. **The resource-history fixture is checked by a TypeScript test, not a Rust one.**
-   `server__getProcessResourceHistory-success.json` is asserted in
-   `packages/contracts/src/rpcRustParity.test.ts:212-250`. The Rust decode precedent is
-   `updater__status-success.json` in `apps/server/tests/remote_update_rpc.rs:42-58`, which
-   decodes into a Rust struct and re-encodes byte-identical. The new test follows that one.
-8. **The MCP tool cannot drain a subscription.** `RpcRegistry::invoke_local` runs unary methods
-   only (`rpc/session.rs:812`), and the stream drain waits for a terminal event a subscription
-   never sends. P2.1 adds a unary `server.getHostMetrics` (Task 11.12).
-9. **Line numbers moved:** the scope list is at `apps/server/src/auth/scope.rs:69-70` and its
-   test at `:252`; the method list at `apps/server/src/rpc/methods.rs:172-173`; the diagnostics
-   registrations at `production/server_terminal.rs:620-640`; the descriptor tests at
-   `lifecycle.rs:1333` and `production/control.rs:7318`; the context card in `Sidebar.tsx` at
-   `:378` and `:5593`.
+10. **The resource-history fixture is checked by a TypeScript test, not a Rust one.**
+    `server__getProcessResourceHistory-success.json` is asserted in
+    `packages/contracts/src/rpcRustParity.test.ts:212-250`. The Rust decode precedent is
+    `updater__status-success.json` in `apps/server/tests/remote_update_rpc.rs:42-58`, which
+    decodes into a Rust struct and re-encodes byte-identical. The new test follows that one.
+11. **The MCP tool cannot drain a subscription.** `RpcRegistry::invoke_local` runs unary methods
+    only (`rpc/session.rs:812`), and the stream drain waits for a terminal event a subscription
+    never sends. P2.1 adds a unary `server.getHostMetrics` (Task 11.12).
+12. **Line numbers moved:** the scope list is at `apps/server/src/auth/scope.rs:69-70` and its
+    test at `:252`; the method list at `apps/server/src/rpc/methods.rs:172-173`; the diagnostics
+    registrations at `production/server_terminal.rs:620-640`; the descriptor tests at
+    `lifecycle.rs:1333` and `production/control.rs:7318`; the context card in `Sidebar.tsx` at
+    `:378` and `:5593`.
 
 ## Approach
 
@@ -105,42 +124,50 @@ for remote servers and for the local environment.
 
 `HostMetricsCollector` lives in `apps/server/src/diagnostics/host_metrics/`. It holds an
 `Arc<dyn HostMetricsSource>`, not a generic parameter, so unit tests, the integration tests in
-`apps/server/tests/` and production pass different sources to the same type. The trait's
-methods return boxed futures, like `ProcessSampler`, so tests drive it with a fake and a paused
-clock:
+`apps/server/tests/` and production pass different sources to the same type. The trait is
+synchronous, because every call is made on a thread that may block:
 
 ```rust
 pub trait HostMetricsSource: std::fmt::Debug + Send + Sync + 'static {
     fn host_facts(&self) -> HostFacts;
-    fn read_cpu_memory(&self) -> BoxFuture<'_, Result<CpuMemoryReading, SamplingError>>;
-    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeDescriptor>>;
-    fn read_volume_space(&self, mount_point: &Path) -> BoxFuture<'_, Result<VolumeSpace, String>>;
+    fn read_cpu_memory(&self) -> Result<CpuMemoryReading, SamplingError>;
+    fn list_volumes(&self) -> Vec<VolumeDescriptor>;
+    fn read_volume_space(&self, mount_point: &Path) -> Result<VolumeSpace, String>;
 }
 ```
 
-The native source holds one `System::new()` (never `new_all()`) and the disk list. It refreshes
-CPU usage and memory only, never processes, on the blocking pool. Each volume is its own
-`Arc<Mutex<Disk>>` (`sysinfo` converts `Disks` into `Vec<Disk>`, `src/common/disk.rs:211`), and a
-space read is `Disk::refresh_specifics(DiskRefreshKind::nothing().with_storage())` on the blocking
-pool.
+`NativeHostMetricsSource::new()` does no I/O: it creates one empty `System::new()` (never
+`new_all()`) and an empty disk list. `read_cpu_memory` refreshes CPU usage and memory only,
+never processes; it reads `/proc/stat` and `/proc/meminfo` or one Mach or Win32 call, and runs on
+the Tokio blocking pool like other short reads. `list_volumes` refreshes the disk list with
+`DiskRefreshKind::nothing()`, which calls no `statvfs` on Linux, on the first listing too
+(`src/unix/linux/disk.rs:141-143`; `new_disk` passes the refresh kind through), adds the
+`symlink_metadata` "is a file" check and, on Linux, the read-only flag from `/proc/self/mounts`.
+On Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs:311-313`).
+`read_volume_space` refreshes one disk with `Disk::refresh_specifics(DiskRefreshKind::nothing()
+.with_storage())`; each disk is its own `Arc<Mutex<Disk>>` (`sysinfo` converts `Disks` into
+`Vec<Disk>`, `src/common/disk.rs:211`).
 
-The collector, not the source, owns the time limit and the "one read at a time" rule, so the
-fake can prove both. It runs each volume read as its own Tokio task and keeps the task's handle
-per mount point. On a volume tick it waits up to 2 s for the new reads. A read still running
-after that leaves its handle in place and the volume shows as not responding; on later ticks the
-collector starts no new read for that mount point while its handle is unfinished, and takes the
-result as soon as the handle finishes, so a volume that answers late recovers on the next volume
-tick. Listing the volumes (`list_volumes`, which includes the `symlink_metadata` check and, on
-macOS, Core Foundation property reads) runs under the same guard: if it does not finish in 2 s,
-the reading reuses the last list. A hung mount therefore costs at most one stuck blocking thread
-per mount point, and CPU and memory never wait on disks. On Linux, listing with
-`DiskRefreshKind::nothing()` reads `/proc/mounts` and calls no `statvfs`, on the first listing
-too (`src/unix/linux/disk.rs:141-143`, and `new_disk` passes the refresh kind through). On
-Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs:311-313`).
+**Disk work is separate from CPU and memory (D32).** Two loops run:
+
+- The **sampling loop** reads CPU and memory and publishes a reading every tick. It never awaits a
+  disk call. It copies the latest cached disk state into each reading.
+- The **disk loop** sends `list_volumes` and `read_volume_space` jobs to a pool of 4 dedicated
+  OS threads (`std::thread`, named `host-disk-<n>`), never the Tokio blocking pool. A job for a
+  mount point (or the list) that already has a job queued or running is not admitted again, so
+  the queue holds at most one job per mount point plus one list. A job running for more than
+  2 s marks its volume as not responding (or, for the list, keeps the last list); its late
+  result is still applied when it arrives, so the volume recovers. A hung call costs one thread
+  slot. When all 4 slots are hung, the disk loop stops admitting jobs and the reading says
+  `volumesPaused: true` ("Disk readings paused: volumes are not responding"); CPU and memory
+  keep publishing from the sampling loop. Shutdown sets a stop flag and never joins the
+  threads, and they are not Tokio threads, so a hung disk call never delays the runtime's drop
+  or the process's exit.
 
 One sample holds `sampledAt`, `cpuPercent` (0 to 100, all logical cores), `memoryTotalBytes`,
 `memoryUsedBytes`, `memoryAvailableBytes` and `volumes`. Each volume has `mountPoint`, `name`,
-`fileSystem`, `totalBytes`, `freeBytes` (available to the server's user), `usedBytes` (total
+`fileSystem`, `totalBytes`, `freeBytes` (free space on the volume as the OS reports it; per-user
+quotas are not applied, D31), `usedBytes` (total
 minus free), `removable`, `readOnly` and `state` (`ok` or `notResponding`). A not-responding
 volume keeps its last known bytes, or `null` before its first answer. Host facts are OS, arch,
 logical CPU count and total memory.
@@ -169,8 +196,10 @@ logical CPU count and total memory.
   When the first stream opens, the collector refreshes CPU once and takes the first live sample
   1 s later, so the first live value covers 1 s, not the minute since the last background
   sample. When the last stream closes it drops back to 60 s at once.
-- One task runs the loop; subscribers hold a counted guard. Live readers share one sample per
-  tick through a `tokio::sync::watch` channel, so ten open dashboards cost one read per second.
+- The sampling loop runs at the current rate; subscribers hold a counted guard. Live readers
+  share one sample per tick through a `tokio::sync::watch` channel, so ten open dashboards cost
+  one read per second. Volume reads follow the same "every fifth tick" cadence but are only
+  requested from the disk loop; their results arrive when they arrive.
 
 ### Statistics and chart history
 
@@ -200,14 +229,20 @@ replaced before it is sent. The payload is `{}`. Items form a tagged union:
 - `Snapshot`: host facts, `bootId`, `startedAt`, `statisticsSince`, the current sample (or `null`
   before the first one; the first read waits at most 1 s for it, like the process monitor),
   statistics, the recent chart and the uptime chart.
-- `Sample`: one live sample, the updated statistics, and the uptime chart once a minute (`null`
-  otherwise).
+- `Sample`: one live sample, the updated statistics, and the uptime chart (and, from P1.2, the
+  hidden-volume list) when the subscriber has not yet received their latest revision, `null`
+  otherwise.
 
-Each subscriber loop waits on the watch channel and sends with `sender.send().await` on the
-64-item channel of `spawn_stream` (`production/server_terminal.rs:1450-1458`). A slow client
-blocks only its own loop; when it catches up it reads the latest sample, so intermediate samples
-are skipped and nothing queues without bound. Statistics are cumulative, so a skipped sample
-loses one chart point only. A test bounds the encoded snapshot at 128 KiB (900 points and 240 buckets); a
+The collector keeps the uptime chart and the hidden-volume list as one `ChartState` with a
+revision number that rises each time either changes (about once a minute). Each subscriber loop
+waits on the watch channel, remembers the chart revision it last sent, and sends with
+`sender.send().await` on the 64-item channel of `spawn_stream`
+(`production/server_terminal.rs:1450-1458`). A slow client blocks only its own loop; when it
+catches up it reads the latest sample and, if the chart revision moved while it was blocked, the
+latest complete chart state, so a minute boundary is never lost. Intermediate samples are skipped
+and nothing queues without bound; statistics are cumulative, so a skipped sample loses one recent
+point only. The client keeps recent points newer than 15 minutes before its newest sample and at
+most 900, pruning by timestamp first. A test bounds the encoded snapshot at 128 KiB (900 points and 240 buckets); a
 larger item is still delivered, split by the existing E2EE chunking (`rpc/session.rs:2013-2049`).
 
 `bootId` comes from `ServerConfig::boot_id` and is `null` when the server has none, as in the
@@ -258,14 +293,20 @@ The statistics need samples while nobody watches. That reverses the rule
 | (b) Start at the first open, keep at 60 s | "since <first open>", full after that   | zero until opened, then as (c)                         | first open of a run shows almost no history          |
 | (c) Always on at 60 s from server start   | "since server start", as the issue asks | one CPU, memory read a minute, volumes every 5 minutes | reverses the rule; must be measured                  |
 
-Recommendation (agent's call): (c), decided by Task 11.4's measurement. The rule is written in
-the spec (R71): background sampling must cost under 0.1 percent of one core and a live stream
-under 1 percent, measured on the macOS development host and in the Linux lab. If background cost meets the
-limit, (c) stands. If background misses it but live meets its limit, (b) replaces (c): the
-collector starts at the first subscription, the snapshot's `statisticsSince` says when, and the
-coordinator asks the user to approve the change to R70 before web work starts. If live misses
-its limit, live sampling moves to 2 s and the measurement is repeated. (a) is not taken: it
-cannot answer "since server start" at all.
+Recommendation (agent's call): (c). Task 11.4 first **measures** and then **applies the
+policy**, as two separate steps. The measurement drives the real collector (both loops, the
+statistics, chart production and the encoding of every item one subscriber receives) and
+reports CPU time per background reading and per live reading on the macOS development host and
+in the Linux lab. The policy then picks exactly one outcome:
+
+| Outcome                               | Chosen when                                                              | Accepted when                                   | Requirements and tests that change                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| (c) always on, live 1 s               | background ≤ 0.1% of one core at 60 s and live ≤ 1% at 1 s on both hosts | as chosen                                       | none                                                                                                                                                                                                                                                                                                                                                                           |
+| (b) start at the first open, live 1 s | background > 0.1% and live ≤ 1%                                          | the user approves it before any web task starts | R69 and R76 ("since the first dashboard opened"), R70 (no reading before the first stream), R71 (the background limit applies only after the first open, which a person caused), D22; tests `background_reads_every_60_s_and_volumes_every_fifth_reading`, `the_first_subscriber_starts_an_idle_collector`, Task 11.6's runtime test, the "Since" texts of Tasks 11.7 and 11.8 |
+| (c) or (b) with live 2 s              | live > 1% at 1 s and ≤ 1% at 2 s                                         | the user approves it before any web task starts | R70 and R72 (2 s live rate), R77 (stale after 5 s instead of 3 s), D22; tests `streams_switch_to_the_live_rate_and_share_one_read`, `host_metrics_stream_sends_a_snapshot_then_samples` (2 s apart), the stale tests of Tasks 11.7 and 11.8, Task 11.14's wait                                                                                                                 |
+
+If live is over 1% even at 2 s, the task stops and reports to the user: no outcome is accepted.
+(a) is not an outcome: it cannot answer "since server start" at all.
 
 What makes (c) cheap: no process table walk (#24, #232), one `System` with CPU and memory
 refreshes only, `/proc/stat` and `/proc/meminfo` on Linux, one host statistics call on macOS,
@@ -331,7 +372,9 @@ one watched minute (60 samples) outweigh an unwatched hour (60 samples). The wir
 The issue's P1.2 asks for a setting to show filtered volumes and one to hide removable ones.
 `UI.md` warns against preferences that stand in for a decision. Instead the sheet lists the
 volumes the filter hid under a closed **Hidden volumes (N)** disclosure, each with its reason
-("Network volume", "Same storage as /", "Empty"), without reading their space. No option hides
+("Network volume", "Same storage as /", "Empty"). A volume rejected before sampling (network,
+overlay not at `/`, file mount) is never read; an empty or shared one is read once, which is how
+the filter knows. No option hides
 removable volumes; they carry a badge. Agent's call, for the user to confirm.
 
 ### D30. The stream stops when the document is hidden, not when the window loses focus
@@ -339,18 +382,43 @@ removable volumes; they carry a badge. Agent's call, for the user to confirm.
 A visible dashboard on a second display is a real use, and #168's cost came from a hidden window.
 The status bar's polling stops on blur too; the dashboard does not. Agent's call.
 
+### D31. Free space is the volume's, without per-user quotas
+
+On Windows `sysinfo` reports the volume's total free bytes, not the caller-available figure
+(`src/windows/disk.rs:279-295`); with disk quotas the two differ. The requirement says "free
+space on the volume; per-user quotas are not applied", and the UI says "free", never "available
+to you". Alternative: a Windows adapter that calls `GetDiskFreeSpaceExW` with the caller-available
+value and redefines total and used to match (more Windows code, untestable without a quota lab,
+for a setup few servers use). Agent's call, recorded for the user.
+
+### D32. Disk calls run on four dedicated threads that shutdown never joins
+
+Alternatives: the Tokio blocking pool (a hung `statvfs` keeps the runtime's drop, and so the
+server's exit, waiting forever, and it shares the pool with every other blocking call); one
+thread per call (no bound under mount churn). Four threads bound the cost of hung mounts; a
+fifth hung mount waits, and all four hung pauses disk reads with a visible notice while CPU and
+memory continue. Agent's call, after review.
+
+### D33. Linux read-only comes from the mount options
+
+`/proc/self/mounts` already lists `ro` for a read-only mount, and reading it touches no file
+system. Alternative: listing with `DiskRefreshKind::nothing().with_storage()`, the only way the
+crate sets the flag (on a disk's first listing); that listing runs `statvfs` on every volume
+each time, which can hang and repeats the space reads the disk loop already makes. Agent's call, after review; the Linux lab proves it with a real read-only mount.
+
 ## Lifecycle and failure behaviour
 
 - **Server start:** the production runtime creates the collector and starts the background loop
   (option c). Tests that build `ServerTerminalServices` without the builder get an idle collector
   over the native source, which samples nothing until a stream opens.
 - **First sample:** CPU needs two refreshes at least 200 ms apart (`MINIMUM_CPU_UPDATE_INTERVAL`,
-  `src/unix/apple/system.rs:74`). The first sample waits 200 ms with a Tokio sleep, never a
-  blocking sleep.
+  `src/unix/apple/system.rs:74`). The source's first CPU call sleeps 200 ms between its two refreshes; it
+  runs on the blocking pool, never on a Tokio worker thread.
 - **Read failure:** a failed CPU and memory read keeps the last good sample and logs one
   `tracing::warn!` per distinct error, as `DiagnosticsMonitor::publish` does (`monitor.rs:252-275`).
-- **Hung volume:** shown as not responding after 2 s; at most one blocking thread per hung volume;
-  other volumes, CPU and memory continue.
+- **Hung volume:** shown as not responding after 2 s; it holds one of the 4 disk threads until
+  it returns; other volumes, CPU and memory continue. With all 4 held, disk reads pause and say
+  so; CPU and memory continue.
 - **Client closes the sheet or hides the document:** the atom is released, the stream is
   cancelled, the subscriber guard drops, and the collector returns to 60 s when no guard is left.
 - **Client disconnects without closing:** `sender.closed()` ends the subscriber loop, as in
@@ -359,28 +427,32 @@ The status bar's polling stops on blur too; the dashboard does not. Agent's call
   the server restarted: the sheet resets and says when.
 - **Duplicate delivery and stale results:** every item carries `sampledAt`; the reducer ignores a
   sample older than the last one it applied.
-- **Shutdown:** `HostMetricsCollector::shutdown` cancels the loop and does not await blocking
-  volume reads; subscriber loops end when the watch sender is dropped. It runs in
+- **Shutdown:** `HostMetricsCollector::shutdown` cancels both loops, sets the disk threads' stop
+  flag and does not join them; subscriber loops end when the watch sender is dropped. A test runs
+  a child process shaped like `main.rs` (a multi-thread runtime dropped after `block_on`) with a
+  volume read held forever and asserts that it exits. It runs in
   `quiesce_for_update` right after the `process-monitor` step, marked `host-metrics`, before the
   profiler's teardown.
 
 ## Performance
 
 - Background: one CPU and memory refresh a minute and one space read per volume every 5 minutes.
-  No process table, no new thread except the blocking-pool calls.
+  No process table. Four idle disk threads, which cost no CPU while they wait.
 - Live: one read a second shared by all subscribers, and one JSON item a second per subscriber.
   At about 1 KB per item that is about 3.6 MB an hour while a dashboard is open and visible, and
   nothing while it is closed or hidden.
 - Memory: fixed-size statistics, at most 900 raw samples and 1,440 minute buckets, and the
   oldest tier under 1 MiB.
-- Measured in Task 11.4 before any web work, with readings 250 ms apart because `sysinfo` skips a
-  CPU refresh closer than 200 ms to the last one (`src/unix/apple/cpu.rs:33-35`,
-  `src/unix/linux/cpu.rs:48`); the method and numbers go in the pull request. JSON encoding of one
-  live item (about 1 KB) is checked again by Task 11.5's size test.
+- Measured in Task 11.4 before any web work, through the real collector with test rates no
+  faster than 250 ms, because `sysinfo` skips a CPU refresh closer than 200 ms to the last one
+  (`src/unix/apple/cpu.rs:33-35`, `src/unix/linux/cpu.rs:48`), and with one subscriber whose
+  items are encoded as on the wire. The figure is this process's CPU time during the run minus
+  an idle runtime of the same length. The method and numbers go in the pull request.
 
 ## Profiler, crash and trace coverage
 
-- **Child processes:** none. `sysinfo` reads `/proc`, Mach host statistics, `getfsstat` and
+- **Child processes:** none. The four disk threads are threads of the server process, named
+  `host-disk-<n>`, so the profiler's process sampler already counts their CPU. `sysinfo` reads `/proc`, Mach host statistics, `getfsstat` and
   Core Foundation, and Win32 calls in process; its only `Command::new` calls are in its own tests
   and in `Process::kill` on Windows (`src/unix/apple/cpu.rs:472`, `src/windows/process.rs:371`),
   neither of which the collector calls.
