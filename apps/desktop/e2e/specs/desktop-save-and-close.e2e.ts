@@ -278,7 +278,12 @@ describe("packaged desktop export and the close dialog", () => {
     const installButton = await browser.$(
       '//*[@role="dialog"]//button[normalize-space()="Protect projects and install"]',
     );
-    await installButton.click();
+    // Focused in the page, not by the driver's click: a driver click need not move focus, and the
+    // question returns focus to the element that had it when it opened.
+    await browser.execute((button: HTMLElement) => {
+      button.focus();
+      button.click();
+    }, installButton);
 
     await waitForLeaveDialog("close-update.md");
     await browser
@@ -298,11 +303,8 @@ describe("packaged desktop export and the close dialog", () => {
     await browser.$(leaveDialogSelector).waitForDisplayed({ reverse: true });
     await browser.waitUntil(
       () =>
-        browser.execute(() => {
-          const dialog = document.activeElement?.closest('[role="dialog"]');
-          return dialog?.textContent?.includes("Protect projects before updating") === true;
-        }),
-      { timeoutMsg: "Cancel did not return focus to the update dialog." },
+        browser.execute((button: HTMLElement) => document.activeElement === button, installButton),
+      { timeoutMsg: "Cancel did not return focus to the button that asked." },
     );
     await expect(updateDialog).toBeDisplayed();
     await expect(browser.$("[data-file-editor-toolbar] [aria-live='polite']")).toHaveText(
