@@ -13,6 +13,19 @@ import { describe, expect, it } from "vite-plus/test";
  */
 const ALLOWED = new Set<string>();
 
+/**
+ * A translucent `bg-selected/NN` blends with whatever is under it, and no text token is checked
+ * against the blend, so selected surfaces are opaque. These two files keep a tint because an
+ * opaque fill would make two of their states look the same; whether to check the blended pair
+ * instead is an open decision.
+ */
+const TRANSLUCENT_ALLOWED = new Set([
+  // The active group's header sits next to the active terminal row, which is opaque.
+  "components/ThreadTerminalPanel.tsx",
+  // A selected item that is not highlighted; the highlighted one is opaque accent.
+  "components/ui/combobox.tsx",
+]);
+
 const SRC = NodePath.resolve(import.meta.dirname, "..");
 
 function sourceFiles(dir: string): string[] {
@@ -35,6 +48,14 @@ describe("selected surfaces", () => {
         if (!ALLOWED.has(key)) offenders.push(key);
       }
     }
+    expect(offenders).toEqual([]);
+  });
+
+  it("a selected surface is opaque", () => {
+    const offenders = sourceFiles(SRC)
+      .filter((file) => NodeFS.readFileSync(file, "utf8").includes("bg-selected/"))
+      .map((file) => NodePath.relative(SRC, file).split(NodePath.sep).join("/"))
+      .filter((file) => !TRANSLUCENT_ALLOWED.has(file));
     expect(offenders).toEqual([]);
   });
 });

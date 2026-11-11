@@ -111,7 +111,7 @@ export const GitManagerChangeRow = memo(function GitManagerChangeRow({
       aria-selected={selected}
       className={cn(
         "group flex h-[29px] min-w-0 items-center gap-2 border-b border-border/35 px-2 text-xs outline-none hover:bg-accent/45 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-        selected && "bg-selected/65 text-selected-foreground",
+        selected && "bg-selected text-selected-foreground",
       )}
       data-path={row.path}
       role="option"
