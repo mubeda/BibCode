@@ -604,6 +604,32 @@ describe("PipelinesDetailView stages", () => {
     expect(link("rspec2m 0s").getAttribute("href")).toBe("/project/env/p-job-998/pipelines");
   });
 
+  it("the selected job row uses the selected token", async () => {
+    await render({
+      wrap: (view) => (
+        <PipelineLinksProvider
+          value={{
+            jobLink: (jobId) => ({
+              to: "/project/$environmentId/$projectId/pipelines",
+              params: { environmentId: "env", projectId: `p-job-${jobId}` },
+            }),
+          }}
+        >
+          {view}
+        </PipelineLinksProvider>
+      ),
+    });
+    act(() =>
+      link("rspec2m 0s").dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }),
+      ),
+    );
+    const row = link("rspec2m 0s");
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(row.className.split(" ")).toContain("bg-selected");
+    expect(row.className.split(" ")).not.toContain("bg-accent");
+  });
+
   it("folds a parallel group into one row that expands to its jobs", async () => {
     const jobs = [1, 2, 3].map((index) => ({
       ...pipelineJob,
