@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 5aeb8e62ab0f)
+Spec: spec.md (sha256 45d753cdb3f1)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -89,6 +89,8 @@ Branch: claude/next-pr-planning-13d367
 | 12.16 | Review with one-off instructions (P2.1)                                   | 12    | Open        |                 |                                    |
 | 12.17 | Turn on terminal reviews on Windows                                       | 12    | Open        |                 |                                    |
 | 12.18 | Fix the Windows batch `%` encoding (conditional)                          | 12    | Open        |                 |                                    |
+| 13.1  | Reproduce, find the cause, and reset at the opening boundary              | 13    | In progress | W1, opus        |                                    |
+| 13.2  | User guide, runbook scenario and changelog                                | 13    | In progress | W1, opus        |                                    |
 
 ## Log
 
@@ -184,3 +186,4 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-11 18:10 Ruling, from the user: when the work is done, test this PR on the Windows VM (Parallels on this Mac) and in Docker Linux before the push question. Both run the final commit: the server and desktop test suites and the packaged end-to-end list on each, plus on Windows the native batch-argument cases of Task 12.4, which is the evidence Task 12.17 needs to turn on terminal reviews there, and the Windows space read of Task 11.3.
 - 2026-11-11 18:20 Lab at d669cbf2a: the Linux build passes (the Linux-only GStreamer repair compiles and bundles) and the web process no longer carries the two plugin-path variables. The spec list did not run: Docker Desktop was quit from its own window five minutes in, most likely by the user; not restarted without asking. Finding that changes the audio fix's claim: the AppImage bundles the GStreamer core without plugins, and that core's built-in plugin folder is the build host's Debian multiarch path, so removing the variable can help only on Debian and Ubuntu; Fedora and Arch, both support targets, would still find no plugins. Open, with the advisor's order: run the audio spec with the same AppImage on a newer userland to learn whether the bundled core accepts newer system plugins; if it refuses them, bundle plugins that match the core (measure the size, list what lands in the bundle, update notices, ledger, workflows and the lab image). The changelog line now claims only Debian and Ubuntu. The audio crash is not counted as fixed.
 - 2026-11-11 18:45 Lab at 0ff59b249 (Ubuntu 22.04 arm64, no workaround): the full default list passes, 33 passed and 4 skipped on purpose, including `mermaid-diagrams` 8 of 8, `files-binary-preview` with its audio step, `files-rich-markdown` 3 of 3, `appearance-themes` 5 of 5 and the tightened focus case; the backend log has no missing audio sink and no GLib critical. Tasks 8.1, 8.2 and 8.6 have their Linux evidence at this commit (the macOS-only native close cases passed earlier on macOS). Cross-distribution probe with the same AppImage: on Ubuntu 24.04 (GStreamer 1.24) and Fedora 45 (1.28) the bundled 1.20 core and its GLib reject every system plugin (undefined symbols and version checks), with or without a correct plugin path; Arch not run (no official arm64 image). So the startup repair is needed but fixes audio only where the system matches the build host. Bundling the plugins that match the bundled core is the fix that does not depend on the distribution: about 4 MB compressed for base and good plugins, up to about 12 MB with their libraries, on a 102 MiB AppImage; bad, ugly and libav sets stay out. The size change to release artifacts is put to the user.
+- 2026-11-11 18:55 Rulings, from the user: bundle the GStreamer base and good plugin sets in the Linux AppImage (lane G8), and bring issue #346 into this PR, to be diagnosed with mstack-diagnose. Amendment A12 adds it as Phase 13 (R106 to R109, D50, two tasks), with the issue's proposed behavior as the requirement; the issue is static analysis, so lane W1 (opus) first reproduces the retained values in a mounted test, confirms the cause claim by claim, then fixes at the opening boundary.

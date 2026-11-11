@@ -2,7 +2,7 @@
 
 Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution; amendments A10 and A11 added on the user's instruction of 2026-11-11 and reviewed by Codex and the advisor, with their agent's calls listed for the user before the push)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
-Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09; issues #292 and #293 by amendments A10 and A11. One pull request closes all nine.
+Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09; issues #292 and #293 by amendments A10 and A11, and #346 by amendment A12. One pull request closes all ten.
 
 This spec is longer than the usual 25 requirements because the maintainer chose one pull request for seven issues. Each issue has its own section and its requirements can be planned and reviewed on their own. Built-in theme values are in [theme-palettes.md](theme-palettes.md).
 
@@ -1818,6 +1818,68 @@ appends them after a blank line to the resolved prompt of that one review only.
 - WHEN the review starts
 - THEN the first message ends with "\n\nFocus on the parser." and the saved prompts are unchanged
 
+#### Amendment A12: a fresh Create worktree dialog (#346)
+
+A12 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #346 joins this pull request: the Create worktree dialog kept the previous creation's name, source, mode and base override when it was opened again. The issue's proposed behavior and its recorded agent's calls are the requirement; they replace the documented promise that a same-project source survives a reopen. Requirements R106 to R109, decision D50. Plan phase: Phase 13.
+
+### R106. Every opening of Create worktree starts fresh [Must] (amendment A12)
+
+WHEN the Create worktree dialog opens, the dialog SHALL show an empty Name and an empty Create From, no selected source branch and no Reuse branch, Smart mode, an empty base override, Advanced collapsed, Create more off and no earlier form error, and SHALL put focus in Name. This holds after a successful creation and after the dialog was dismissed with Close or Escape.
+
+#### Scenario: reopen after a successful creation
+
+- GIVEN a dialog for one project with a typed name, Branch mode, a picked source branch, a base override under Advanced and a manually picked agent
+- WHEN creation succeeds with Create more off and the dialog is opened again for the same project, on the same mounted instance
+- THEN Name and Create From are empty, no branch is selected, the mode is Smart, the base override is empty, Advanced is collapsed, Create is disabled until a new name is entered, and neither cached nor refreshed branch data brings the old name or source back
+
+#### Scenario: reopen after dismissal
+
+- GIVEN edited input, Advanced expanded, Create more on and a form error
+- WHEN the idle dialog is dismissed with Escape and opened again
+- THEN every default of this requirement shows and the earlier error is gone
+
+#### Scenario: the next creation borrows nothing
+
+- GIVEN a successful first creation and a reopened dialog
+- WHEN a different valid name is entered with no source and no override, and Create is pressed
+- THEN the create command carries the new title and branch, `HEAD` as its base, the current project and the resolved agent, and no value of the first creation
+
+### R107. A fresh opening keeps context and saved preferences [Must] (amendment A12)
+
+WHEN the Create worktree dialog opens, the dialog SHALL select the project the caller supplies, otherwise the first available project or none, and SHALL select the Default Agent saved in Settings with the existing availability and fallback behavior, not the agent picked by hand in an earlier opening.
+
+#### Scenario: another project, and no context
+
+- GIVEN an earlier opening for project A
+- WHEN the dialog opens for project B, and later with no project context
+- THEN B is selected, then the first available project, and none of A's form values return; with no projects there is no selection and Create is disabled
+
+#### Scenario: the saved agent wins over an earlier manual pick
+
+- GIVEN a manually picked agent in the previous opening and a changed Default Agent in Settings
+- WHEN the dialog opens again
+- THEN the saved default is selected when it is available, and the existing fallback reason shows when it is not
+
+### R108. Work in progress survives while the dialog stays open [Must] (amendment A12)
+
+IF a creation fails, or projects, branches or agent settings refresh while the dialog is open, THEN the dialog SHALL keep the person's inputs, SHALL not apply the opening reset and SHALL not create a second worktree.
+
+#### Scenario: failure, pending and refresh
+
+- GIVEN an edited form
+- WHEN creation fails, the inputs stay with the existing error; WHEN creation is pending, dismissal and a second submission stay blocked; WHEN branch data refreshes without a new opening
+- THEN no input is erased
+
+### R109. Create more clears only the per-worktree fields [Must] (amendment A12)
+
+WHEN a creation succeeds with Create more on, the dialog SHALL stay open with Name, Create From, the branch and Reuse selection and the form error cleared and focus in Name, and SHALL keep the batch's project, mode, agent, base override, Advanced state and Create more setting until the dialog is closed.
+
+#### Scenario: batch, then a fresh opening
+
+- GIVEN Create more on with Branch mode, a base override and a picked agent
+- WHEN creation succeeds
+- THEN the dialog stays open with only the per-worktree fields cleared and no navigation happens; WHEN it is then closed and opened again, R106 and R107 apply
+
 ## Constraints and assumptions
 
 - **Public repository.** No real host, organization, person or machine path appears in code, tests, fixtures or this folder. Tests use `example-server`, `gitlab.example.test`, `test-user` and disposable folders. (Repository rule: AGENTS.md, Sensitive Data.)
@@ -1922,6 +1984,8 @@ D48. Every disabled state of the button names its reason, including loading ("Ch
 
 D49. Review settings belong to the environment that runs the review, and a review model whose provider instance differs from the reviewer's is ignored in favour of the provider's session default. Alternatives considered: one review model per provider (more settings than the issue asks for). Decided by: agent's call. Source: #293 "Settings".
 
+D50. Create worktree resets at its opening boundary: every opening is a new creation, including after Close or Escape, and no base override is remembered between openings; the Settings Default Agent and the caller's project are fresh defaults, not remembered form data; Create more keeps its batch options within one opening. Alternatives considered: resetting only after a successful creation (misses dismissal); remounting the dialog with a changing key (wider lifecycle change); keeping the documented same-project source retention (the reported defect). Decided by: the user, by adopting issue #346's proposal. Source: #346.
+
 ## Risks
 
 - The #341 cause is inferred from Git's source. -> The first task is a failing reproduction against real Git on Linux and Windows; the fix follows what it shows.
@@ -1955,6 +2019,8 @@ D49. Review settings belong to the environment that runs the review, and a revie
 - **Every change:** `vp check`, `vp run typecheck`, `vp run check:contracts`, `cargo fmt --all --check`, Clippy with warnings denied, the affected tests, and the React best-practices and `UI.md` reviews for the new components.
 
 - **R90 to R105:** contract and settings decode tests, a Rust projection and migration test with replay of events that lack the new fields, web logic and component tests for scope, prompt and reviewer resolution, terminal launch argument tests, native Windows batch argument tests on the Windows CI job, and a packaged desktop end-to-end test that starts a review and finds no Implement action after a reload.
+
+- **R106 to R109:** mounted tests of the real dialog on one mounted instance with real input events, asserting the visible state and the next create command's payload, and one Sidebar test with the real dialog through open, create, close and reopen.
 
 Input classes no scenario names, and their expected behavior:
 
