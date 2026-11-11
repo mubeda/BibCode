@@ -9,6 +9,8 @@ import {
   ignoreParentFolderPattern,
   isFileStaged,
   type PendingDiscard,
+  resolveCodeReviewButtonState,
+  resolveCodeReviewScope,
   resolveDiscardDialogCopy,
   resolveStagingToggleAction,
   resolveVsBaseLabel,
@@ -273,5 +275,102 @@ describe("discardPathsOf", () => {
     expect(
       discardPathsOf({ kind: "bulk", paths: ["a", "b"], variant: "delete-untracked" }),
     ).toEqual(["a", "b"]);
+  });
+});
+
+describe("resolveCodeReviewScope", () => {
+  const dirty: VcsStatusResult = {
+    ...BASE_STATUS,
+    hasWorkingTreeChanges: true,
+    workingTree: {
+      files: [{ path: "a.ts", insertions: 1, deletions: 0, area: "unstaged" }],
+      insertions: 1,
+      deletions: 0,
+    },
+  };
+
+  it("picks uncommitted scope for a dirty tree with no commits ahead", () => {
+    expect(
+      resolveCodeReviewScope({ ...dirty, defaultRefName: "main", aheadOfDefaultCount: 0 }),
+    ).toEqual({ kind: "uncommitted", base: "origin/main" });
+  });
+
+  it("picks branch scope for a clean branch with commits ahead", () => {
+    expect(
+      resolveCodeReviewScope({ ...BASE_STATUS, defaultRefName: "main", aheadOfDefaultCount: 2 }),
+    ).toEqual({ kind: "branch", base: "origin/main" });
+  });
+
+  it("picks branch scope when commits are ahead and the tree is dirty", () => {
+    expect(
+      resolveCodeReviewScope({ ...dirty, defaultRefName: "main", aheadOfDefaultCount: 2 }),
+    ).toEqual({ kind: "branch", base: "origin/main" });
+  });
+
+  it("returns null with nothing to review", () => {
+    expect(
+      resolveCodeReviewScope({ ...BASE_STATUS, defaultRefName: "main", aheadOfDefaultCount: 0 }),
+    ).toBeNull();
+  });
+
+  it("returns null for a clean tree when the server reports no count ahead", () => {
+    expect(resolveCodeReviewScope({ ...BASE_STATUS, defaultRefName: "main" })).toBeNull();
+  });
+
+  it("picks uncommitted scope on the default branch with edits", () => {
+    expect(
+      resolveCodeReviewScope({
+        ...dirty,
+        refName: "main",
+        isDefaultRef: true,
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+      }),
+    ).toEqual({ kind: "uncommitted", base: "origin/main" });
+  });
+
+  it("has no base without a default ref, and no branch scope", () => {
+    expect(resolveCodeReviewScope({ ...dirty, aheadOfDefaultCount: 3 })).toEqual({
+      kind: "uncommitted",
+      base: null,
+    });
+    expect(resolveCodeReviewScope({ ...BASE_STATUS, aheadOfDefaultCount: 3 })).toBeNull();
+  });
+
+  it("returns null without a status", () => {
+    expect(resolveCodeReviewScope(null)).toBeNull();
+    expect(resolveCodeReviewScope(undefined)).toBeNull();
+  });
+});
+
+describe("resolveCodeReviewButtonState", () => {
+  const scope = { kind: "uncommitted", base: "origin/main" } as const;
+
+  it("is disabled while the first status loads", () => {
+    expect(
+      resolveCodeReviewButtonState({ status: null, scope: null, unavailableReason: null }),
+    ).toEqual({ disabled: true, reason: "Checking for changes" });
+  });
+
+  it("is disabled with nothing to review", () => {
+    expect(
+      resolveCodeReviewButtonState({ status: BASE_STATUS, scope: null, unavailableReason: null }),
+    ).toEqual({ disabled: true, reason: "No changes to review" });
+  });
+
+  it("is enabled with a scope", () => {
+    expect(
+      resolveCodeReviewButtonState({ status: BASE_STATUS, scope, unavailableReason: null }),
+    ).toEqual({ disabled: false, reason: null });
+  });
+
+  it("lets the unavailable reason take precedence", () => {
+    const unavailableReason = "Update the BiBCode server on this environment to use Review.";
+    expect(
+      resolveCodeReviewButtonState({ status: BASE_STATUS, scope, unavailableReason }),
+    ).toEqual({ disabled: true, reason: unavailableReason });
+    expect(
+      resolveCodeReviewButtonState({ status: null, scope: null, unavailableReason }),
+    ).toEqual({ disabled: true, reason: unavailableReason });
   });
 });
