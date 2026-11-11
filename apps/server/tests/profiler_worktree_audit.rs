@@ -22,7 +22,7 @@ use bibcode_server::{
     },
     git::GitRepository,
     orchestration::{EngineOptions, OrchestrationEngine},
-    persistence::{Database, Repositories, run_migrations},
+    persistence::{Database, Repositories, WorktreeRemovalReceipt, run_migrations},
     production::worktree_catalog_rpc::{
         WorktreeCatalogOperationRuntime, WorktreeCatalogRpcServices, register_worktree_catalog_rpc,
     },
@@ -142,6 +142,53 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         [orphan.to_string_lossy().into_owned()],
         "the audit deleted the removed leftover's creation record"
     );
+
+    // Evidence written under another spelling of the project root still counts: the audit
+    // matches it by the worktree path.
+    let respelled = format!("{}/", fixture.main.to_string_lossy());
+    let by_record = fixture.managed.join("respelled-record");
+    let by_receipt = fixture.managed.join("respelled-receipt");
+    fs::create_dir(&by_record).expect("respelled record directory");
+    fs::create_dir(&by_receipt).expect("respelled receipt directory");
+    fixture
+        .repositories
+        .record_worktree_creation(&respelled, &by_record.to_string_lossy())
+        .await
+        .expect("creation record");
+    fixture
+        .repositories
+        .prepare_worktree_removal_receipt(WorktreeRemovalReceipt {
+            owner_thread_id: "respelled-owner".to_owned(),
+            project_cwd: respelled,
+            worktree_path: by_receipt.to_string_lossy().into_owned(),
+            identity_nonce: "respelled-nonce".to_owned(),
+            state: "prepared".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .await
+        .expect("removal receipt");
+    scan_once(&sources, &processes).await;
+    let fingerprints: Vec<_> = runtime.status()["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["fingerprint"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for name in ["respelled-record", "respelled-receipt"] {
+        let expected = fingerprint(
+            "worktree.orphan-dir",
+            &[
+                "unowned-unregistered".to_owned(),
+                fingerprint("worktree.parent", &[parent.to_string_lossy().into_owned()]),
+                fingerprint("worktree.directory", &[name.to_owned()]),
+            ],
+        );
+        assert!(
+            fingerprints.contains(&expected),
+            "{name} is an orphan: {fingerprints:?}"
+        );
+    }
 
     let thread_id = adopt(&mut fixture).await;
     fs::write(fixture.worktree.join("dirty.txt"), "dirty\n").expect("dirty file");
@@ -612,9 +659,12 @@ impl Fixture {
 
     async fn creation_records(&self) -> Vec<String> {
         self.repositories
-            .list_worktree_creation_records(&self.main.to_string_lossy())
+            .list_worktree_creation_records()
             .await
             .expect("creation records")
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
     }
 
     fn socket(&mut self) -> &mut TestSocket {

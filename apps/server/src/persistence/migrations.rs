@@ -3577,11 +3577,12 @@ mod tests {
         assert_eq!(
             columns,
             [
-                ("project_cwd".to_owned(), true, 1),
-                ("worktree_path".to_owned(), true, 2),
+                ("record_id".to_owned(), false, 1),
+                ("worktree_path".to_owned(), true, 0),
+                ("project_cwd".to_owned(), true, 0),
                 ("created_at".to_owned(), true, 0),
             ],
-            "three required columns, keyed by project and path"
+            "a record id, and three required columns"
         );
         let receipts: i64 = connection.query_row(
             "SELECT COUNT(*) FROM worktree_removal_receipts",
@@ -3591,11 +3592,12 @@ mod tests {
         assert_eq!(receipts, 1, "existing rows are kept");
         let insert = "INSERT INTO worktree_creation_records (project_cwd, worktree_path, created_at) VALUES (?, ?, '2026-11-09T00:00:00Z')";
         connection.execute(insert, ["/repo", "/worktrees/a"])?;
-        connection.execute(insert, ["/other", "/worktrees/a"])?;
+        connection.execute(insert, ["/repo", "/worktrees/b"])?;
         assert!(
             connection
-                .execute(insert, ["/repo", "/worktrees/a"])
-                .is_err()
+                .execute(insert, ["/other", "/worktrees/a"])
+                .is_err(),
+            "one record per worktree path, whatever the project"
         );
         // A ledger rolled back below 72 runs it again over the existing table.
         let transaction = connection.transaction()?;

@@ -5662,6 +5662,16 @@ mod worktree_creation_record_tests {
         Repositories::new(database)
     }
 
+    async fn recorded_paths(repositories: &Repositories) -> Vec<String> {
+        repositories
+            .list_worktree_creation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
+    }
+
     #[tokio::test]
     async fn worktree_creation_record_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -5676,13 +5686,10 @@ mod worktree_creation_record_tests {
         database.close().await;
 
         let reopened = migrated(Database::open_existing(&path).await.unwrap()).await;
-        assert_eq!(
-            reopened
-                .list_worktree_creation_records("/repo")
-                .await
-                .unwrap(),
-            ["/worktrees/feature-a"]
-        );
+        let records = reopened.list_worktree_creation_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].project_cwd, "/repo");
+        assert_eq!(records[0].worktree_path, "/worktrees/feature-a");
     }
 
     #[tokio::test]
@@ -5694,45 +5701,90 @@ mod worktree_creation_record_tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            repositories
-                .list_worktree_creation_records("/repo")
-                .await
-                .unwrap(),
-            ["/worktrees/feature-a"]
+        assert_eq!(recorded_paths(&repositories).await, ["/worktrees/feature-a"]);
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_of_a_recreation_replaces_the_earlier_one() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        let first = repositories.list_worktree_creation_records().await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        let second = repositories.list_worktree_creation_records().await.unwrap();
+        assert_eq!(second.len(), 1, "one record per path: {second:?}");
+        assert_ne!(
+            first[0].record_id, second[0].record_id,
+            "a new creation is a new record"
         );
+
+        repositories
+            .reap_worktree_creation_record(first[0].record_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-a"],
+            "reaping the earlier record keeps the later one"
+        );
+        repositories
+            .reap_worktree_creation_record(second[0].record_id)
+            .await
+            .unwrap();
+        assert!(recorded_paths(&repositories).await.is_empty());
     }
 
     #[tokio::test]
     async fn worktree_creation_record_delete_removes_only_that_path() {
         let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
         for (project, path) in [
-            ("/repo", "/worktrees/feature-a"),
+            ("/repo/", "/worktrees/feature-a"),
             ("/repo", "/worktrees/feature-b"),
-            ("/other", "/worktrees/feature-a"),
         ] {
             repositories
                 .record_worktree_creation(project, path)
                 .await
                 .unwrap();
         }
+        // The worktree path alone names the record, however the project root is spelled.
         repositories
-            .delete_worktree_creation_record("/repo", "/worktrees/feature-a")
+            .delete_worktree_creation_record("/worktrees/feature-a")
             .await
             .unwrap();
+        assert_eq!(recorded_paths(&repositories).await, ["/worktrees/feature-b"]);
+    }
+
+    #[tokio::test]
+    async fn incomplete_removal_paths_do_not_depend_on_the_project_spelling() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for (owner, project, path) in [
+            ("thread-a", "/repo/", "/worktrees/feature-a"),
+            ("thread-b", "/repo", "/worktrees/feature-b"),
+        ] {
+            repositories
+                .prepare_worktree_removal_receipt(WorktreeRemovalReceipt {
+                    owner_thread_id: owner.to_owned(),
+                    project_cwd: project.to_owned(),
+                    worktree_path: path.to_owned(),
+                    identity_nonce: format!("nonce-{owner}"),
+                    state: "prepared".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
         assert_eq!(
             repositories
-                .list_worktree_creation_records("/repo")
+                .list_incomplete_worktree_removal_paths()
                 .await
                 .unwrap(),
-            ["/worktrees/feature-b"]
-        );
-        assert_eq!(
-            repositories
-                .list_worktree_creation_records("/other")
-                .await
-                .unwrap(),
-            ["/worktrees/feature-a"]
+            ["/worktrees/feature-a", "/worktrees/feature-b"]
         );
     }
 }

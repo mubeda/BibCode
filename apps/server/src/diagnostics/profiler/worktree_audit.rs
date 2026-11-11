@@ -1246,8 +1246,90 @@ mod tests {
             .collect()
     }
 
-    fn record(path: &Path) -> (String, String) {
-        ("/repo".to_owned(), path.to_string_lossy().into_owned())
+    fn record(path: &Path) -> WorktreeCreationRecord {
+        WorktreeCreationRecord {
+            record_id: 1,
+            project_cwd: "/repo".to_owned(),
+            worktree_path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    async fn migrated_repositories() -> Repositories {
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        Repositories::new(database)
+    }
+
+    /// The creation records `resolve` finds gone, read before anything below changes.
+    async fn gone_after_read(repositories: &Repositories, managed: &Path) -> Vec<WorktreeCreationRecord> {
+        let recorded = repositories.list_worktree_creation_records().await.unwrap();
+        resolve(
+            Vec::new(),
+            HashMap::from([(managed.to_path_buf(), true)]),
+            HashMap::new(),
+            Vec::new(),
+            Evidence {
+                recorded,
+                incomplete: Vec::new(),
+            },
+            &CancellationToken::new(),
+        )
+        .gone_records
+    }
+
+    async fn recorded_paths(repositories: &Repositories) -> Vec<String> {
+        repositories
+            .list_worktree_creation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_reap_deletes_a_record_whose_folder_is_still_gone() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        let path = managed.join("feature-a").to_string_lossy().into_owned();
+        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        let gone = gone_after_read(&repositories, &managed).await;
+        assert_eq!(gone.len(), 1, "the folder was never made");
+        reap_gone_records(&repositories, gone).await;
+        assert!(recorded_paths(&repositories).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_reap_keeps_the_record_of_a_creation_after_the_audit_read() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        let path = managed.join("feature-a").to_string_lossy().into_owned();
+        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        // The audit reads A and finds its folder gone. B is created at the same path and
+        // recorded before the delayed delete, with its folder not made yet.
+        let gone = gone_after_read(&repositories, &managed).await;
+        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        reap_gone_records(&repositories, gone).await;
+        assert_eq!(recorded_paths(&repositories).await, [path], "B survives");
+    }
+
+    #[tokio::test]
+    async fn the_reap_keeps_a_record_whose_folder_came_back_after_the_audit_read() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        let path = managed.join("feature-a");
+        let written = path.to_string_lossy().into_owned();
+        repositories.record_worktree_creation("/repo", &written).await.unwrap();
+        let gone = gone_after_read(&repositories, &managed).await;
+        std::fs::create_dir(&path).unwrap();
+        reap_gone_records(&repositories, gone).await;
+        assert_eq!(recorded_paths(&repositories).await, [written]);
     }
 
     #[test]
@@ -1363,7 +1445,7 @@ mod tests {
             .await
             .unwrap();
         let incomplete = repositories
-            .list_incomplete_worktree_removal_paths("/repo")
+            .list_incomplete_worktree_removal_paths()
             .await
             .unwrap();
         let (_, findings) = audit_children(&managed, Vec::new(), incomplete);
