@@ -474,10 +474,10 @@ editors/file managers, and desktop-owned SSH, Tailscale, and host
 backend-shutdown `kill` commands. Isolation changes only the selected command.
 The desktop process, WebKitGTK-owned children, and BiBCode's own binaries retain
 the bundled environment, with one exception: at the top of `main`, before any
-thread starts, the Linux desktop drops the GStreamer plugin folders the launcher
-names but the bundle does not contain from `GST_PLUGIN_SYSTEM_PATH_1_0` and
-`GST_PLUGIN_SYSTEM_PATH`, and removes a variable when none of its folders exist,
-so WebKitGTK finds the system's plugins
+thread starts, the Linux desktop removes `GST_PLUGIN_SYSTEM_PATH_1_0` and
+`GST_PLUGIN_SYSTEM_PATH` when they start with the launcher's plugin folder and
+the bundle does not contain it, or when none of the folders they name exist, so
+WebKitGTK finds the system's plugins
 (`apps/desktop/src-tauri/src/gstreamer_environment.rs`). Desktop external-backend launches and the generic
 supervised process runner deliberately do not apply this policy. The login-shell
 PATH probe also inherits the original desktop environment: its output hydrates
