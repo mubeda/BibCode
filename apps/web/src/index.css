@@ -478,6 +478,8 @@
 
   [data-sidebar-level="worktree"] {
     position: relative;
+    /* The card class sets w-full, so the indent also narrows the row. */
+    max-width: calc(100% - 0.75rem);
     margin-inline-start: 0.75rem;
     background-color: var(--sidebar-worktree);
     font-size: 13px;

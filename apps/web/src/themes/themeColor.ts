@@ -227,11 +227,6 @@ export const FIXED_PAIRS: readonly FixedPair[] = [
     label: "Chat text on environment band",
   },
   { text: "sidebar-chat-foreground", surface: "sidebar-worktree", label: "Chat text on worktree" },
-  {
-    text: "sidebar-worktree-icon",
-    surface: "sidebar-worktree",
-    label: "Worktree icon on worktree",
-  },
 ];
 
 /**

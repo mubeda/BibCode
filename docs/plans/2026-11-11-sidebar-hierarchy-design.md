@@ -65,15 +65,19 @@ Light use the recipes unchanged.
 `resolveToken` now rounds once, after the whole recipe chain, because a level token is built on
 another derived token (`sidebar-worktree-border` on `sidebar-worktree` on `sidebar-env-band`).
 The stylesheet keeps Dark's `background` unrounded while `BASE_TOKEN_VALUES` holds it in hex, so
-the stylesheet parity test allows one channel step.
+the stylesheet parity test pins `background` to its base hex on both sides and then compares
+exactly. Built-in Dark resolves `sidebar-worktree` to `#332a25`, one channel step from the painted
+`#332b25`, for the same reason.
 
 ## Contrast
 
-`FIXED_PAIRS` gains five pairs, each with a sidebar token as its text, so the import reset of R55
+`FIXED_PAIRS` gains four pairs, each with a sidebar token as its text, so the import reset of R55
 removes only a sidebar override and never a theme's global `foreground` or `muted-foreground`:
-badge text on the badge; chat text on the card, on the band and on the worktree; the worktree
-icon on the worktree. The editor's Contrast list shows them, and an import whose badge text falls
-below 4.5:1 loses that override (R65, unreadable level).
+badge text on the badge; chat text on the card, on the band and on the worktree. The editor's
+Contrast list shows them, and an import whose badge text falls below 4.5:1 loses that override
+(R65, unreadable level). The worktree icon is a graphic, so a test checks it at 3:1 on the
+worktree instead of a fixed pair. As a fixed pair it would make an import that sets only
+`sidebar-worktree` lose that override whenever the derived icon fell under 4.5:1.
 
 Text in a level that uses a global token is checked by a separate test over the six built-ins:
 `foreground` on the band and on the worktree, and the painted sidebar muted text
@@ -93,7 +97,7 @@ sidebar muted text. Markers are checked against 3:1, the WCAG minimum for a grap
 | Matrix Light  | 7.58                | 9.03         | 8.04         | 8.46             | 6.63             | 15.25        | 16.05            | 5.48          | 5.77              | 4.47                | 8.18                 | 2.80                 |
 | Verdant Light | 7.51                | 6.38         | 5.94         | 5.99             | 6.56             | 11.06        | 11.16            | 5.71          | 5.76              | 4.65                | 8.47                 | 2.42                 |
 
-Every text pair is at or above 4.5:1 and the accent rule at or above 3:1. Before the built-in
+Every text pair is at or above 4.5:1, and the accent rule and both icons at or above 3:1. Before the built-in
 overrides, the recipes gave Tokyo Night chat on the band 4.44 and on the worktree 3.94, muted on
 the worktree 4.01, and Matrix Dark chat on the band 3.53 and on the worktree 3.16, muted on the
 worktree 4.31. The overrides above fix all six.

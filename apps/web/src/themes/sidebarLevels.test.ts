@@ -37,7 +37,6 @@ const LEVEL_PAIRS = [
   "sidebar-chat-foreground on sidebar-card",
   "sidebar-chat-foreground on sidebar-env-band",
   "sidebar-chat-foreground on sidebar-worktree",
-  "sidebar-worktree-icon on sidebar-worktree",
 ];
 
 const css = NodeFS.readFileSync(new URL("../index.css", import.meta.url), "utf8");
@@ -127,13 +126,13 @@ describe("sidebar levels in the built-in themes (R63)", () => {
       }
     });
 
-    it(`${theme.name} draws the environment accent rule at or above 3:1 on the band`, () => {
-      expect(
-        contrastRatio(
-          resolveToken(theme, "sidebar-env-accent"),
-          resolveToken(theme, "sidebar-env-band"),
-        ),
-      ).toBeGreaterThanOrEqual(3);
+    it(`${theme.name} draws the accent rule and the worktree icon at or above 3:1`, () => {
+      const graphic = (marker: string, surface: string) =>
+        contrastRatio(resolveToken(theme, marker), resolveToken(theme, surface));
+      expect(graphic("sidebar-env-accent", "sidebar-env-band"), "accent").toBeGreaterThanOrEqual(3);
+      expect(graphic("sidebar-worktree-icon", "sidebar-worktree"), "icon").toBeGreaterThanOrEqual(
+        3,
+      );
     });
   }
 });

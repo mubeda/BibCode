@@ -1,7 +1,7 @@
 import type { ThemeFile } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DERIVED_DEFAULTS } from "./baseTokenValues";
+import { BASE_TOKEN_VALUES, DERIVED_DEFAULTS } from "./baseTokenValues";
 import { derivedDeclarations, evaluateCssTokens } from "./cssTokenEvaluator.testSupport";
 import {
   contrastRatio,
@@ -62,18 +62,15 @@ describe("resolveToken against the stylesheet", () => {
       for (const token of derived) {
         const source = DERIVED_SOURCES[token];
         expect(source, `${base} ${token} has a known source`).toBeDefined();
-        const overrides = { [source!]: "#123456" };
-        // The resolver starts from the base values in hex, while the stylesheet keeps Dark's
-        // `background` unrounded, so a token two steps from it may differ by one channel step.
-        const resolved = parseColor(resolveToken(theme(base, overrides), token))!;
-        const painted = parseColor(evaluateCssTokens(base, overrides)(token))!;
-        for (const channel of ["r", "g", "b"] as const) {
-          expect(
-            Math.abs(resolved[channel] - painted[channel]),
-            `${base} ${token} ${channel}`,
-          ).toBeLessThanOrEqual(1);
-        }
-        expect(Math.abs(resolved.a - painted.a), `${base} ${token} alpha`).toBeLessThan(0.005);
+        // Both sides start from the base background in hex; the stylesheet alone keeps Dark's
+        // background unrounded, which would shift a token two steps from it by one channel step.
+        const overrides = {
+          background: BASE_TOKEN_VALUES[base].background!,
+          [source!]: "#123456",
+        };
+        expect(resolveToken(theme(base, overrides), token), `${base} ${token}`).toBe(
+          evaluateCssTokens(base, overrides)(token),
+        );
       }
     }
   });
@@ -148,7 +145,7 @@ describe("fixed pairs", () => {
     expect(pair?.ratio).toBeLessThan(4.5);
   });
 
-  it("FIXED_PAIRS has the fourteen pairs of the spec, then the five sidebar level pairs of R65, in order", () => {
+  it("FIXED_PAIRS has the fourteen pairs of the spec, then the four sidebar level pairs of R65, in order", () => {
     expect(FIXED_PAIRS.map((pair) => `${pair.text} on ${pair.surface}`)).toEqual([
       "foreground on background",
       "card-foreground on card",
@@ -168,7 +165,6 @@ describe("fixed pairs", () => {
       "sidebar-chat-foreground on sidebar-card",
       "sidebar-chat-foreground on sidebar-env-band",
       "sidebar-chat-foreground on sidebar-worktree",
-      "sidebar-worktree-icon on sidebar-worktree",
     ]);
     expect(FIXED_PAIRS.every((pair) => pair.label.length > 0)).toBe(true);
   });

@@ -381,10 +381,9 @@ fixed keyword (spec, Anti-goals; R48).
   `muted-foreground` on `background`, on `card` and on `accent`; `selected-foreground` on
   `selected`; `placeholder` on `background`; `find-match-foreground` on `find-match`;
   `find-match-active-foreground` on `find-match-active`; `terminal.foreground` on
-  `terminal.background`. Amendment A9 (R65) appends five sidebar level pairs:
+  `terminal.background`. Amendment A9 (R65) appends four sidebar level pairs:
   `sidebar-primary-badge-foreground` on `sidebar-primary-badge`; `sidebar-chat-foreground` on
-  `sidebar-card`, on `sidebar-env-band` and on `sidebar-worktree`; `sidebar-worktree-icon` on
-  `sidebar-worktree`.
+  `sidebar-card`, on `sidebar-env-band` and on `sidebar-worktree`.
 - The editor lists each pair with its ratio to two decimals and marks a pair below 4.5:1 with a
   warning icon and the text "Low contrast", naming both tokens. Save stays enabled (R54).
 - Import: a fixed pair below 4.5:1 is reset only when the same pair at the theme's base values
