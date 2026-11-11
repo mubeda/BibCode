@@ -250,6 +250,8 @@ function ToastBodyContent({
             <div
               aria-label={toastType === "error" ? "Error details" : "Details"}
               className="max-h-32 overflow-y-auto rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+              // A touch drag here scrolls the text; without this Base UI reads it as swipe-to-dismiss.
+              data-base-ui-swipe-ignore
               role="group"
               tabIndex={0}
             >
