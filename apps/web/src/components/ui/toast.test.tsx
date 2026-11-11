@@ -323,10 +323,16 @@ describe("ToastProvider rendering", () => {
     const markup = renderProvider(<ToastProvider />);
     const [description] = ui.filter("Description") as [Record<string, unknown>];
     expect(String(description["className"])).toContain("whitespace-pre-line");
-    expect(String(description["className"])).toContain("max-h-32");
-    expect(String(description["className"])).toContain("overflow-y-auto");
     expect(String(description["className"])).not.toContain("line-clamp-4");
-    expect(description["tabIndex"]).toBe(0);
+    // The label sits on a wrapper so the toast's aria-describedby still reads the text itself.
+    expect(description["aria-label"]).toBeUndefined();
+    const region = /<div[^>]*role="group"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(region).toContain('aria-label="Error details"');
+    expect(region).toContain('tabindex="0"');
+    expect(region).toContain("max-h-32");
+    expect(region).toContain("overflow-y-auto");
+    expect(region).toContain("focus-visible:ring-2");
+    expect(region).toContain("focus-visible:ring-ring");
     expect(markup).toContain('aria-label="Copy error"');
     (findHostByAria("Copy error")!["onClick"] as () => void)();
     expect(copy).toHaveBeenCalledWith(raw);
@@ -334,10 +340,18 @@ describe("ToastProvider rendering", () => {
 
   it("leaves single-line descriptions out of the scroll region", () => {
     testState.toasts = [makeToast({ type: "error", description: "one line" })];
-    renderProvider(<ToastProvider />);
+    const markup = renderProvider(<ToastProvider />);
     const [description] = ui.filter("Description") as [Record<string, unknown>];
     expect(String(description["className"])).not.toContain("whitespace-pre-line");
     expect(description["tabIndex"]).toBeUndefined();
+    expect(markup).not.toContain('role="group"');
+  });
+
+  it("names a multi-line region by what it holds when the toast is not an error", () => {
+    testState.toasts = [makeToast({ type: "info", description: "first\nsecond" })];
+    const markup = renderProvider(<ToastProvider />);
+    const region = /<div[^>]*role="group"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(region).toContain('aria-label="Details"');
   });
 
   it("shows the copy-error control and tighter padding for string error descriptions", () => {
