@@ -1116,6 +1116,8 @@ mod tests {
         assert_ne!(first[0]["id"], first[1]["id"]);
         assert_eq!(first[0]["evidence"]["path"], "orphan-a");
         assert_eq!(first[1]["evidence"]["path"], "orphan-b");
+        assert_eq!(first[0]["evidence"]["name"], "orphan-a");
+        assert_eq!(first[0]["evidence"]["reason"], "creation-record");
 
         facts.base_dirs.remove(0);
         let next = audit(&facts);
@@ -1152,6 +1154,38 @@ mod tests {
         let finding =
             json!({ "kind": "worktree.orphan-dir", "evidence": { "path": { "private": "data" } } });
         assert!(project_finding(&finding)["evidence"].get("path").is_none());
+    }
+
+    #[test]
+    fn an_orphan_keeps_its_folder_name_and_a_known_reason_only() {
+        let orphan = |name: Value, reason: Value| {
+            project_finding(&json!({
+                "kind": "worktree.orphan-dir",
+                "evidence": { "path": "/srv/worktrees/a", "name": name, "reason": reason }
+            }))["evidence"]
+                .clone()
+        };
+        for reason in [
+            "creation-record",
+            "incomplete-removal",
+            "git-pointer-file",
+            "removal-marker",
+        ] {
+            assert_eq!(orphan(json!("feature-a"), json!(reason))["reason"], reason);
+        }
+        let kept = orphan(json!("/srv/worktrees/feature-a"), json!("creation-record"));
+        assert_eq!(kept["name"], "feature-a", "a path keeps its file name only");
+        let dropped = orphan(json!({ "private": "data" }), json!("/srv/private/reason"));
+        assert!(dropped.get("name").is_none(), "{dropped}");
+        assert!(dropped.get("reason").is_none(), "{dropped}");
+        assert!(orphan(json!("a"), json!(7)).get("reason").is_none());
+
+        // The other worktree kinds keep only their path.
+        let missing = project_finding(&json!({
+            "kind": "worktree.missing",
+            "evidence": { "path": "/srv/worktrees/a", "name": "a", "reason": "creation-record" }
+        }));
+        assert_eq!(missing["evidence"], json!({ "path": "a" }));
     }
 
     /// An OS crash record names modules by their paths on this host: a finding keeps their

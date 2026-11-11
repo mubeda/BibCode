@@ -498,12 +498,14 @@ fn worktree_evidence(
 
 /// A regular file, not a link, that starts with `gitdir:` as a worktree's `.git` file does.
 fn is_git_pointer_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && opens_as_git_pointer_file(path)
+}
+
+fn opens_as_git_pointer_file(path: &Path) -> bool {
     use std::io::Read;
 
     const PREFIX: &[u8] = b"gitdir:";
-    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-        return false;
-    }
     let mut head = [0; PREFIX.len()];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut head))
@@ -1393,6 +1395,47 @@ mod tests {
             orphan_reasons(&findings),
             [("feature-a".to_owned(), "git-pointer-file".to_owned())]
         );
+    }
+
+    /// A `.git` swapped for a link after the audit listed the folder is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_link_is_not_followed_and_is_not_a_pointer_file() {
+        let (_root, managed) = managed_dir();
+        let target = managed.join("pointer");
+        std::fs::write(&target, "gitdir: /repo/.git/worktrees/feature-a\n").unwrap();
+        assert!(opens_as_git_pointer_file(&target), "the file itself is one");
+        std::fs::create_dir(managed.join("linked")).unwrap();
+        let link = managed.join("linked/.git");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!opens_as_git_pointer_file(&link), "the link is not followed");
+    }
+
+    /// A `.git` swapped for a FIFO after the audit listed the folder is opened without
+    /// blocking, and is not a pointer file.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_fifo_is_opened_without_blocking_and_is_not_a_pointer_file() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let (_root, managed) = managed_dir();
+        std::fs::create_dir(managed.join("piped")).unwrap();
+        let fifo = managed.join("piped/.git");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || sender.send(opens_as_git_pointer_file(&fifo)))
+        };
+        let opened = receiver.recv_timeout(Duration::from_secs(5));
+        if opened.is_err() {
+            // Release the blocked open so the test can fail instead of hanging.
+            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        }
+        let _ = reader.join();
+        assert_eq!(opened, Ok(false), "the FIFO is opened without blocking");
     }
 
     #[test]
