@@ -8,9 +8,22 @@ import {
 import { terminalInputKey } from "@bibcode/client-runtime/state/terminal";
 import type { TerminalDimensions } from "./terminalSizePolicy";
 
+/**
+ * False for a laid-out host with no area, such as a center column collapsed
+ * behind a maximized right panel: the fit addon would propose its 2-column or
+ * 1-row floor there. A host without a computed size (not laid out) is left to
+ * the addon, which already proposes nothing for it.
+ */
+export function terminalHostHasArea(host: Element): boolean {
+  const style = getComputedStyle(host);
+  return !(Number.parseFloat(style.width) <= 0 || Number.parseFloat(style.height) <= 0);
+}
+
 export function proposeTerminalDimensions(
   fit: Pick<FitAddon, "proposeDimensions">,
+  host?: Element,
 ): TerminalDimensions | null {
+  if (host && !terminalHostHasArea(host)) return null;
   try {
     const size = fit.proposeDimensions();
     return size && Number.isFinite(size.cols) && Number.isFinite(size.rows)

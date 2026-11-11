@@ -31,6 +31,10 @@
 - The left panel draws its repository, environment, primary checkout, worktree and chat rows as five visually distinct levels in every built-in theme, and a theme can style each level. (#290)
 - On the desktop app, exporting a theme or plan opens the native Save dialog, and closing, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel. (#290, #342)
 
+### Terminals
+
+- Maximizing the right panel no longer resizes a center terminal's program to 2 columns; a terminal with no visible area keeps its size until it is shown again. (#348)
+
 ## [v0.15.3] - 2026-11-08
 
 BiBCode v0.15.3 guards checkpoint restores in shared checkouts, offers Git Credential Manager sign-in on the desktop, keeps named MCP clients across runs, reworks the Pipelines and Files views, loads pipelines for self-hosted GitLab on any port, and hardens load-sensitive tests and secret scanning. This release includes PR #337 since v0.15.2.

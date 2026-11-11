@@ -87,7 +87,11 @@ import { openFileInPreview } from "~/browser/openFileInPreview";
 import { canPreviewAnyUrlInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
-import { proposeTerminalDimensions, registerTerminalSizeReader } from "./terminalSizing";
+import {
+  proposeTerminalDimensions,
+  registerTerminalSizeReader,
+  terminalHostHasArea,
+} from "./terminalSizing";
 import {
   shouldClaimTerminalSize,
   terminalDimensionsEqual,
@@ -1383,10 +1387,11 @@ export function TerminalViewport({
     });
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
-    fitTerminalSafely(fitAddon);
+    if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
     const sizeClaim = randomUUID();
-    let fittedDimensions = proposeTerminalDimensions(fitAddon);
-    const updateFittedDimensions = () => (fittedDimensions = proposeTerminalDimensions(fitAddon));
+    let fittedDimensions = proposeTerminalDimensions(fitAddon, mount);
+    const updateFittedDimensions = () =>
+      (fittedDimensions = proposeTerminalDimensions(fitAddon, mount));
     setRendererAttachmentInput({
       target: terminalTargetKey,
       sizeClaim,
@@ -1482,7 +1487,7 @@ export function TerminalViewport({
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
       if (!sizeOwnership) {
-        if (trigger !== "layout") return;
+        if (trigger !== "layout" || !terminalHostHasArea(mount)) return;
         const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
         fitTerminalSafely(fitAddon);
         if (wasAtBottom) terminal.scrollToBottom();

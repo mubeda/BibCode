@@ -5091,6 +5091,9 @@ workspace-loss fence. An attach carrying `cwd` can still create a missing
 session without that lease/fence, for example when it arrives before open or
 recreates a terminal after a server restart (a known gap). Open and attach send fitted dimensions only when a mounted renderer can
 supply them; new right-panel reservations have none and use server defaults.
+A mount whose computed width or height is zero, such as a center column behind a
+maximized right panel, supplies no dimensions and sends no fit, claim or resize
+until it has area again, instead of the fit addon's 2-column or 1-row floor.
 
 Against a server without `terminalSizeOwnership`, every replay is guarded;
 startup-history queries are not answered on that transitional path. Live replies
