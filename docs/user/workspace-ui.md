@@ -375,6 +375,15 @@ extra Flatpak overrides. Detection runs on the server that owns the
 environment, so a remote environment lists the editors installed on that remote
 host.
 
+The left panel shows five levels, and each one looks different from its
+neighbors even without color. A repository is an outlined card with a larger
+title. Inside it, an environment (a machine) is an inset band with a coloured
+rule on its left edge and a machine icon. The primary checkout leads with a house
+icon, a bold name and a **primary** badge. A worktree has a branch icon, sits
+indented under a thin guide line and has its own outlined surface. A chat is the
+smallest text, below the name of the checkout or worktree it belongs to. Themes
+can restyle each level (see [Appearance](#appearance)).
+
 ### Discovering existing worktrees
 
 When a connected server advertises worktree-catalog support, BiBCode can show
@@ -985,8 +994,19 @@ finished may already be saved, and a browser tab Git Credential Manager opened s
 The Source Control panel offers the same sign-in for its pull and push, and its progress
 shows **Cancel** while it pulls or pushes. The offer needs an `https://` remote with one URL
 in that direction; SSH remotes, `osxkeychain`-only setups, the browser app, paired devices,
-WSL and remote servers, and agents' Git tools never get it and show the authentication
-error as before.
+WSL and remote servers, and agents' Git tools never get it. They show the authentication
+error, and a push on a remote server adds the guidance below.
+
+**Pushing from a remote server.** Git runs on the server that owns the project, not on
+the device you are looking at. A "remote server" here is any server the desktop app did
+not start inside itself. When a push, publish, force push, tag push or tag creation that
+pushes fails because Git has no stored sign-in and cannot ask for one, BiBCode shows
+"Push ran on the remote server" and names the server when it has a name. The message
+appears in the Git Manager and in the Source Control panel, followed by Git's own text. To
+fix it, open a terminal on that server, go to the same repository as the user that runs
+BiBCode, and run `git push` to sign in. Then retry the push in BiBCode. A server that has
+a stored sign-in needs none of this. BiBCode does not open a sign-in window on a remote
+server, and it does not offer one for a plain credential store.
 
 The manager keeps the chosen tab for the session but does not save it, so it
 opens on **History** after a reload. A reconnect keeps the chosen tab and is not
@@ -2317,6 +2337,110 @@ The Files surface is a full file manager for the active workspace:
     disk.** and reopens if the file comes back. A file that becomes binary, or
     grows past 1 MB, can only be overwritten; the text you were editing stays
     on screen until you choose.
+
+### Editing Markdown in rendered view
+
+A `.md` file opens in its rendered view, and you can edit it there. A formatting
+group sits between **Redo** and the view switch in the file's toolbar:
+
+- Paragraph, Heading 1 to 3, Bold, Italic, Strikethrough, Bullet list, Numbered
+  list, Task list and Quote;
+- **Link**, which opens a small box for the address. An empty address removes the
+  link. With no text selected, the address is inserted as the link text;
+- **Image**, which asks for an image file and copies it next to the Markdown
+  file, then inserts it at the caret. A file that is not an image is refused. If
+  a file with that name is already there, the copy gets a new name such as
+  `diagram-1.png`, and the existing file is never replaced. If the copy fails, you
+  see an error and nothing is inserted;
+- **More formatting**, which adds Heading 4, Heading 5 and a collapsible section.
+
+In source view the group stays visible but disabled, and says that formatting is
+available in rendered view.
+
+Rendered edits use the same Save, autosave and **Changed on disk.** handling as
+source edits. Opening a file and saving it without a change leaves it
+byte-identical, and a frontmatter block at the top is never rewritten. Only the
+parts you edit change.
+
+Undo and Redo work inside the view you are in. Rendered view starts a fresh
+history each time you enter it. When you switch to source view, everything you
+did in that visit is one Undo step there.
+
+Some files stay read-only in rendered view, because the editor could not write
+them back without changing them. They show "This file uses Markdown that the
+editor cannot change safely. Edit it in source view." The causes are `.mdx`
+files, reference-style links and definitions, footnotes, HTML comments, other raw
+HTML (except a collapsible `<details>` section), and math written with `$`. A
+file over 128 KiB shows "This file is too large to edit in rendered view. Edit it
+in source view." You can still tick a task box in a read-only view. Use source
+view to edit these files.
+
+## Closing with unsaved edits
+
+If a Files tab has edits that are not saved, BiBCode asks before it throws them
+away. In the desktop app the question appears when you close the window, quit,
+restart BiBCode, or install an update. The title says what is about to happen,
+for example **Save your changes before leaving?** or **Save your changes before
+updating?**, and the dialog lists the files:
+
+- **Save all** saves every listed file, then continues. While it runs, the
+  button shows **Saving…**.
+- **Discard** continues without saving. The edits are lost.
+- **Cancel** stays where you were.
+
+If a file cannot be saved, for example because it changed on disk, BiBCode stays
+open and a message lists the files that are still unsaved. Open each one to
+reload, overwrite or retry the save. With nothing unsaved, no question is asked.
+If an update was started from another device, a short **Installing an update**
+message blocks editing until BiBCode restarts.
+
+In a browser, the browser shows its own warning when you leave the page with
+unsaved edits. It cannot offer **Save all**.
+
+BiBCode cannot ask when the operating system ends the session, for example at
+shutdown or logout. It also does not ask for Quit from the Dock or the macOS app
+switcher. Save your files first in those cases.
+
+**Exporting a theme or a plan.** In the desktop app, **Export** on a theme and the
+download of a plan open the system Save dialog. Choose where to save. Cancel
+writes nothing, and a write error is shown as a message. In a browser they use the
+browser's own download.
+
+## Appearance
+
+**Settings → Appearance** sets the colors of the app.
+
+- **Mode** is System, Light or Dark. System follows your operating system. Each
+  mode uses the theme chosen for it: a Light slot and a Dark slot.
+- **Themes** lists Light themes and Dark themes in two groups. Light, Dark,
+  Tokyo Night, Matrix Dark, Matrix Light and Verdant Light are built in. The
+  theme in use in each group is marked **In use**, and the group on screen is
+  marked **Showing now**.
+- Click a theme row, or press Enter or Space on it, to use that theme at once.
+  It goes into the slot for its kind (Light or Dark). If the app is showing the
+  other kind, the mode switches to match, a line under the group says so, and
+  **Undo** restores the earlier mode and theme. Moving between rows with Arrow Up
+  and Arrow Down does not change anything.
+- The **More actions for** menu beside each row offers **Duplicate** for every
+  theme and **Edit**, **Export** and **Delete** for your own themes. These never
+  switch the theme. Delete asks first and puts the built-in theme of that kind
+  back.
+- **New theme** asks for a kind (Light or Dark) and a name of up to 48
+  characters. The editor groups every color and size, with a color picker, a text
+  field and **Reset** for each, and **Reset all** after a question. Changes show
+  as a preview while you edit, and **Cancel** drops them. Save is off until every
+  field is valid. A pair of colors that is hard to read, such as text on its
+  background, is listed with its ratio and a **Low contrast** warning. The
+  warning does not stop you from saving.
+- **Import theme** takes a `.json` file or pasted text. **Validate** lists every
+  problem and stores nothing if there is one. If a theme with the same id exists,
+  you choose **Replace** or **Keep both**. Overrides that make a pair of colors hard to
+  read are removed, and the notice names the pairs. **Export** writes the
+  theme as `<id>.theme.json`.
+- Terminals: a terminal that is already running keeps the colors it started
+  with. New terminals use the theme.
+
+Custom themes are stored on this device only.
 
 ## Current limitations
 
