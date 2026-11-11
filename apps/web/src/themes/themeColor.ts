@@ -1,11 +1,11 @@
 import type { ThemeFile } from "@bibcode/contracts";
 
-import { BASE_TOKEN_VALUES, DERIVED_DEFAULTS } from "./baseTokenValues";
+import { BASE_EXACT_VALUES, BASE_TOKEN_VALUES, DERIVED_DEFAULTS } from "./baseTokenValues";
 
 /** Channels 0 to 255 (unrounded), alpha 0 to 1. */
 export type Rgba = { r: number; g: number; b: number; a: number };
 
-const NUMBER = String.raw`[+-]?(?:\d+(?:\.\d+)?|\.\d+)`;
+const NUMBER = String.raw`[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?`;
 const ARG = String.raw`${NUMBER}(?:%|deg)?`;
 const MODERN = new RegExp(
   String.raw`^(rgba?|hsla?|oklch)\(\s*(${ARG})\s+(${ARG})\s+(${ARG})(?:\s*\/\s*(${ARG}))?\s*\)$`,
@@ -131,13 +131,12 @@ export function mix(a: Rgba, b: Rgba, percentOfA: number): Rgba {
 }
 
 /**
- * `mix` on color strings, unrounded as `rgb(r g b / a)`, so a formula built on another formula
- * rounds once, like the browser (`resolveToken` returns hex).
+ * `mix` on color strings, at full precision as `rgb(r g b / a)`, so a formula built on another
+ * formula rounds once, at the final hex, like the browser (`resolveToken` returns hex).
  */
 export function mixColor(a: string, b: string, percentOfA: number): string {
   const { r, g, b: blue, a: alpha } = mix(parseOrThrow(a), parseOrThrow(b), percentOfA);
-  const fixed = (value: number) => value.toFixed(4);
-  return `rgb(${fixed(r)} ${fixed(g)} ${fixed(blue)} / ${fixed(alpha)})`;
+  return `rgb(${r} ${g} ${blue} / ${alpha})`;
 }
 
 function parseOrThrow(value: string): Rgba {
@@ -250,7 +249,7 @@ function resolveUnrounded(theme: ThemeFile, token: string): string {
 }
 
 function baseValue(theme: ThemeFile, token: string): string {
-  const value = BASE_TOKEN_VALUES[theme.base][token];
+  const value = BASE_EXACT_VALUES[theme.base][token]?.() ?? BASE_TOKEN_VALUES[theme.base][token];
   if (value === undefined) throw new Error(`No base value for ${token}`);
   return value;
 }

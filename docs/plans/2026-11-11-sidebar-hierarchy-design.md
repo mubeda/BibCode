@@ -62,12 +62,16 @@ three values because the recipes fail there (see the contrast table): `sidebar-w
 band strongly, so a worktree there is darker than the band instead. Matrix Light and Verdant
 Light use the recipes unchanged.
 
-`resolveToken` now rounds once, after the whole recipe chain, because a level token is built on
-another derived token (`sidebar-worktree-border` on `sidebar-worktree` on `sidebar-env-band`).
-The stylesheet keeps Dark's `background` unrounded while `BASE_TOKEN_VALUES` holds it in hex, so
-the stylesheet parity test pins `background` to its base hex on both sides and then compares
-exactly. Built-in Dark resolves `sidebar-worktree` to `#332a25`, one channel step from the painted
-`#332b25`, for the same reason.
+`resolveToken` keeps full precision through a recipe chain and rounds once, at the final hex,
+because a level token is built on another derived token (`sidebar-worktree-border` on
+`sidebar-worktree` on `sidebar-env-band`). The base values a recipe reads start unrounded too:
+`BASE_EXACT_VALUES` holds the values the stylesheet paints from Tailwind's oklch palette,
+`color-mix()` and `--alpha()` (Dark `background`, both bases' `foreground`, `muted-foreground`,
+`accent` and `accent-foreground`), and a test checks every recipe source against the stylesheet.
+The parity tests compare the resolver with the stylesheet exactly, on unmodified defaults and with
+each source overridden. This also corrected built-in Dark `sidebar-card` and `sidebar-env-band`,
+which the resolver had given as `#1f1f1f` and `#262626` while the stylesheet paints `#202020` and
+`#272727`.
 
 ## Contrast
 

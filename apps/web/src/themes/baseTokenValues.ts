@@ -8,6 +8,33 @@ const WHITE = "#ffffff";
 // Tailwind amber-400, oklch(82.8% 0.189 84.429).
 const AMBER_400 = "#ffb900";
 
+// Tailwind's neutral palette (tailwindcss/theme.css).
+const NEUTRAL_100 = "oklch(97% 0 0)";
+const NEUTRAL_500 = "oklch(55.6% 0 0)";
+const NEUTRAL_800 = "oklch(26.9% 0 0)";
+const NEUTRAL_950 = "oklch(14.5% 0 0)";
+
+/**
+ * The base values a recipe builds on that the stylesheet paints unrounded, as `index.css`
+ * writes them, so a recipe rounds once, at its final hex, like the browser.
+ * `BASE_TOKEN_VALUES` holds their hex.
+ */
+export const BASE_EXACT_VALUES: Record<"light" | "dark", Record<string, () => string>> = {
+  light: {
+    foreground: () => NEUTRAL_800,
+    "muted-foreground": () => mixColor(NEUTRAL_500, BLACK, 90),
+    accent: () => mixColor(BLACK, "transparent", 4),
+    "accent-foreground": () => NEUTRAL_800,
+  },
+  dark: {
+    background: () => mixColor(NEUTRAL_950, WHITE, 95),
+    foreground: () => NEUTRAL_100,
+    "muted-foreground": () => mixColor(NEUTRAL_500, WHITE, 90),
+    accent: () => mixColor(WHITE, "transparent", 4),
+    "accent-foreground": () => NEUTRAL_100,
+  },
+};
+
 /** The sidebar level tokens both bases share (index.css light block, R65). */
 const SIDEBAR_LEVEL_DEFAULTS: Record<string, Formula> = {
   "sidebar-env-accent": (resolve) => resolve("primary"),

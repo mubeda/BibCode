@@ -61,6 +61,15 @@ export function evaluateCssTokens(
   base: "light" | "dark",
   overrides: Record<string, string> = {},
 ): (token: string) => string {
+  const evaluate = evaluateCssTokensUnrounded(base, overrides);
+  return (token: string) => toHex(formatRgba(evaluate(token)));
+}
+
+/** `evaluateCssTokens` before the final rounding to hex. */
+export function evaluateCssTokensUnrounded(
+  base: "light" | "dark",
+  overrides: Record<string, string> = {},
+): (token: string) => Rgba {
   const scope = new Map([...lightBlock, ...(base === "dark" ? darkBlock : [])]);
   for (const [name, value] of themeInline) {
     if (name.startsWith("--color-") && !scope.has(name)) scope.set(name, value);
@@ -99,7 +108,7 @@ export function evaluateCssTokens(
   return (token: string) => {
     const value = scope.get(`--${token}`) ?? scope.get(`--color-${token}`);
     if (value === undefined) throw new Error(`index.css defines no --${token}`);
-    return toHex(formatRgba(evaluate(value)));
+    return evaluate(value);
   };
 }
 

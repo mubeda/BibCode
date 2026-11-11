@@ -6,9 +6,9 @@ import {
   terminalAnsiColors,
   terminalOscColorEnv,
 } from "../components/terminalTheme";
-import { BASE_TOKEN_VALUES } from "./baseTokenValues";
-import { evaluateCssTokens } from "./cssTokenEvaluator.testSupport";
-import { toHex } from "./themeColor";
+import { BASE_EXACT_VALUES, BASE_TOKEN_VALUES, DERIVED_DEFAULTS } from "./baseTokenValues";
+import { evaluateCssTokens, evaluateCssTokensUnrounded } from "./cssTokenEvaluator.testSupport";
+import { parseColor, toHex } from "./themeColor";
 
 describe("BASE_TOKEN_VALUES", () => {
   it("every supported color token and terminal color has a light and a dark base value", () => {
@@ -46,6 +46,28 @@ describe("BASE_TOKEN_VALUES", () => {
       const painted = evaluateCssTokens(base);
       for (const token of UI_COLOR_TOKENS) {
         expect(BASE_TOKEN_VALUES[base][token], `${base} ${token}`).toBe(painted(token));
+      }
+    }
+  });
+
+  it("every base value a recipe builds on is the unrounded value the stylesheet paints", () => {
+    for (const base of ["light", "dark"] as const) {
+      const sources = new Set<string>();
+      for (const formula of Object.values(DERIVED_DEFAULTS[base])) {
+        formula((token) => {
+          sources.add(token);
+          return BASE_TOKEN_VALUES[base][token]!;
+        });
+      }
+      const painted = evaluateCssTokensUnrounded(base);
+      for (const token of sources) {
+        if (token in DERIVED_DEFAULTS[base]) continue;
+        const value = BASE_EXACT_VALUES[base][token]?.() ?? BASE_TOKEN_VALUES[base][token]!;
+        const exact = parseColor(value)!;
+        const expected = painted(token);
+        for (const channel of ["r", "g", "b", "a"] as const) {
+          expect(exact[channel], `${base} ${token} ${channel}`).toBeCloseTo(expected[channel], 9);
+        }
       }
     }
   });
