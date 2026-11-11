@@ -822,7 +822,16 @@ describe("resolveProviderReviewTerminalAction", () => {
 
   it("refuses control characters other than tab and line breaks", () => {
     expect(review(codex, { prompt: "a\tb\r\nc" })?.disabledReason).toBeNull();
-    for (const prompt of ["a\u0000b", "a\u001bb", "a\u007fb"]) {
+    expect(review(codex, { prompt: "a b" })?.disabledReason).toBeNull();
+    for (const prompt of [
+      "a\u0000b",
+      "a\u001bb",
+      "a\u007fb",
+      "a\u0080b",
+      "a\u0085b",
+      "a\u009bb",
+      "a\u009fb",
+    ]) {
       expect(review(codex, { prompt })).toMatchObject({
         command: null,
         disabledReason:
