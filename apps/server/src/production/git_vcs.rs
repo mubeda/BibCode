@@ -998,26 +998,20 @@ impl GitVcsRpcServices {
             }
             "vcs.createWorktree" => {
                 let input: CreateWorktree = decode(request.payload, "vcs.createWorktree")?;
-                let cwd = input.cwd.clone();
-                let created = self
-                    .repository
-                    .create_worktree(
-                        CreateWorktreeInput {
-                            cwd: input.cwd,
-                            ref_name: input.ref_name,
-                            new_ref_name: input.new_ref_name,
-                            base_ref_name: input.base_ref_name,
-                            path: input.path,
-                        },
-                        &cancellation,
-                    )
-                    .await
-                    .map_err(serialize_error)?;
-                if let Some(repositories) = &self.repositories {
-                    self.record_worktree_creation(repositories, &cwd, &created)
-                        .await?;
-                }
-                Ok(encode_value(created))
+                encode_result(
+                    self.repository
+                        .create_worktree(
+                            CreateWorktreeInput {
+                                cwd: input.cwd,
+                                ref_name: input.ref_name,
+                                new_ref_name: input.new_ref_name,
+                                base_ref_name: input.base_ref_name,
+                                path: input.path,
+                            },
+                            &cancellation,
+                        )
+                        .await,
+                )
             }
             "vcs.removeWorktree" => {
                 let input: RemoveWorktree = decode(request.payload, "vcs.removeWorktree")?;
@@ -1182,37 +1176,6 @@ impl GitVcsRpcServices {
                 "RPC method is not registered here.",
             )),
         }
-    }
-
-    /// Records a worktree `vcs.createWorktree` created, or rolls it back and fails: the
-    /// record is part of a successful creation (#344).
-    async fn record_worktree_creation(
-        &self,
-        repositories: &Repositories,
-        cwd: &Path,
-        created: &crate::git::VcsCreateWorktreeResult,
-    ) -> Result<(), Value> {
-        let Err(error) = repositories
-            .record_worktree_creation(&display_path(cwd), &created.worktree.path)
-            .await
-        else {
-            return Ok(());
-        };
-        tracing::error!(%error, "worktree creation could not record the worktree");
-        let mut detail = format!("The worktree creation could not be recorded: {error}");
-        match &created.rollback {
-            Some(rollback) => {
-                if let Err(rollback) = self
-                    .repository
-                    .rollback_managed_worktree_creation(cwd, rollback)
-                    .await
-                {
-                    detail.push_str(&format!("; the rollback also failed: {}", rollback.detail));
-                }
-            }
-            None => detail.push_str("; the worktree has no exact rollback and was kept"),
-        }
-        Err(vcs_error("vcs.createWorktree", cwd, &detail))
     }
 
     async fn remove_worktree_with_durable_admission(
@@ -1415,11 +1378,6 @@ impl GitVcsRpcServices {
             }
         };
 
-        // The stored spellings, the key the creation record was written under.
-        let creation_record = (
-            project.workspace_root.clone(),
-            owner.worktree_path.clone().unwrap_or_default(),
-        );
         let repository = Arc::clone(&self.repository);
         let cwd = input.cwd;
         let error_cwd = cwd.clone();
@@ -1456,14 +1414,6 @@ impl GitVcsRpcServices {
                             ),
                         )
                     })?;
-                // The folder is gone. A failed delete is reaped by the next worktree audit.
-                let (_, worktree_path) = creation_record;
-                if let Err(error) = repositories
-                    .delete_worktree_creation_record(&worktree_path)
-                    .await
-                {
-                    tracing::warn!(%error, "a removed worktree kept its creation record");
-                }
                 Ok::<(), Value>(())
             })
             .map_err(|error| {
