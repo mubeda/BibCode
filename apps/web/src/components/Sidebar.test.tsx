@@ -4511,3 +4511,158 @@ staticDescribe("project rename and grouping dialogs", () => {
     expect(markup).toContain("own sidebar row");
   });
 });
+
+/** The `li` whose opening tag precedes `marker`, with its whole subtree, from static markup. */
+function liWith(markup: string, marker: string): string {
+  const at = markup.indexOf(marker);
+  const start = markup.lastIndexOf("<li", at);
+  if (at < 0 || start < 0) throw new Error(`no li with ${marker}`);
+  let depth = 0;
+  const pattern = /<li[\s>]|<\/li>/g;
+  pattern.lastIndex = start;
+  for (let match = pattern.exec(markup); match; match = pattern.exec(markup)) {
+    depth += match[0] === "</li>" ? -1 : 1;
+    if (depth === 0) return markup.slice(start, match.index + 5);
+  }
+  throw new Error(`unclosed li with ${marker}`);
+}
+
+const openingTag = (element: string) => element.slice(0, element.indexOf(">") + 1);
+
+const svgWith = (element: string, iconClass: string) =>
+  (element.match(/<svg[^>]*>/g) ?? []).filter(
+    (tag) => tag.includes(iconClass) && tag.includes("data-sidebar-icon"),
+  );
+
+/** One repository in two environments: a primary checkout, two worktrees and their chats. */
+function levelsScenario() {
+  groupedScenario();
+  h.state.threads = [
+    ...h.state.threads,
+    threadActive,
+    makeThread("thread-docs", {
+      title: "Docs worktree",
+      branch: "feat/docs",
+      worktreePath: "C:/wt/docs",
+    }),
+    makeThread("panel-on-worktree", { kind: "panel", worktreePath: "C:/wt/x" }),
+    makeThread("panel-main", { kind: "panel" }),
+  ];
+  h.state.routeParams = { environmentId: ENV_MAIN, threadId: "thread-active" };
+  h.state.vcsStatusByCwd = {
+    "C:/repo-a": { refName: "main" },
+    "C:/wt/x": { refName: "feat/x" },
+    "C:/wt/docs": { refName: "feat/docs" },
+  };
+}
+
+staticDescribe("Sidebar levels (R63, R64)", () => {
+  it.each(["environments", "repositories"] as const)(
+    "marks the checkout, worktree and chat levels in the %s view",
+    (view) => {
+      levelsScenario();
+      h.uiStore.setState({ sidebarView: view });
+      const markup = render(<Sidebar />);
+
+      const primary = liWith(markup, 'data-testid="primary-card-project-a"');
+      expect(openingTag(primary)).toContain('data-sidebar-level="checkout"');
+      expect(openingTag(primary)).toContain("data-primary");
+      expect(svgWith(primary, "lucide-house")).toHaveLength(1);
+      const label = primary.match(/<span[^>]*data-sidebar-label[^>]*>([^<]*)</);
+      expect(label?.[1]).toBe("main");
+      // The level rules colour the primary label and badge, so no utility colour may outrank them.
+      expect(label?.[0]).not.toContain("text-foreground/80");
+      const badge = primary.match(/<span[^>]*data-sidebar-badge[^>]*>/)?.[0] ?? "";
+      expect(badge).not.toBe("");
+      expect(badge).not.toMatch(/\bbg-muted\b|\btext-muted-foreground\b/);
+      const moreChats = primary.match(/<span[^>]*data-sidebar-level="chat"[^>]*>/)?.[0] ?? "";
+      expect(moreChats).not.toBe("");
+      expect(moreChats).not.toContain("text-muted-foreground");
+
+      for (const id of ["thread-active", "thread-docs"]) {
+        const worktree = liWith(markup, `data-testid="thread-row-${id}"`);
+        expect(openingTag(worktree)).toContain('data-sidebar-level="worktree"');
+        expect(openingTag(worktree)).not.toContain("data-primary");
+        expect(svgWith(worktree, "lucide-git-branch")).toHaveLength(1);
+        expect(worktree).toContain("data-sidebar-label");
+      }
+      expect(openingTag(liWith(markup, 'data-testid="thread-row-thread-active"'))).toContain(
+        'data-active="true"',
+      );
+      expect(openingTag(liWith(markup, 'data-testid="thread-row-thread-docs"'))).not.toContain(
+        "data-active",
+      );
+      // A chat in the main checkout that is not the primary one is a plain checkout.
+      const adHoc = openingTag(liWith(markup, 'data-testid="thread-row-thread-idle"'));
+      expect(adHoc).toContain('data-sidebar-level="checkout"');
+      expect(adHoc).not.toContain("data-primary");
+    },
+  );
+
+  it("draws the repository as repo level and each environment as one band in the Repositories view", () => {
+    levelsScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-sidebar-level="repo"/g)).toHaveLength(1);
+    expect(
+      openingTag(liWith(markup, 'data-testid="repository-group-github.com/acme/repo-a"')),
+    ).toContain('data-sidebar-level="repo"');
+    expect(markup.match(/data-sidebar-level="environment"/g)).toHaveLength(2);
+    // The band holds its environment's rows, as in the theme editor's preview.
+    const band = liWith(markup, `data-testid="environment-card-header-${ENV_MAIN}"`);
+    expect(openingTag(band)).toContain('data-sidebar-level="environment"');
+    expect(band).toContain('data-testid="primary-card-project-a"');
+  });
+
+  it("draws each Environments view project as repo level, sorted or manual", () => {
+    levelsScenario();
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-sidebar-level="repo"/g)).toHaveLength(2);
+    expect(markup).not.toContain('data-sidebar-level="environment"');
+    h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS, sidebarProjectSortOrder: "manual" };
+    expect(render(<Sidebar />).match(/data-sidebar-level="repo"/g)).toHaveLength(2);
+  });
+
+  it("keeps the selected, active, multi-selected, resting and unavailable states", () => {
+    levelsScenario();
+    h.state.environments = [
+      h.state.environments[0],
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "Remote Box",
+        connectionId: "remote",
+        phase: "disconnected",
+      }),
+    ];
+    h.selectionStore.setState({
+      selectedThreadKeys: new Set([threadKeyOf(threadActive), threadKeyOf(threadIdle)]),
+    });
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    const selectedActive = openingTag(liWith(markup, 'data-testid="thread-row-thread-active"'));
+    expect(selectedActive).toContain('data-selected="true"');
+    expect(selectedActive).toContain('data-active="true"');
+    expect(selectedActive).toContain("border-primary/60");
+    const selected = openingTag(liWith(markup, 'data-testid="thread-row-thread-idle"'));
+    expect(selected).toContain('data-selected="true"');
+    expect(selected).not.toContain("data-active");
+    expect(selected).toContain("border-primary/40");
+    const resting = openingTag(liWith(markup, 'data-testid="thread-row-thread-docs"'));
+    expect(resting).not.toContain("data-selected");
+    expect(resting).toContain("hover:bg-accent/60");
+    expect(openingTag(liWith(markup, 'data-testid="primary-card-project-a"'))).not.toContain(
+      "data-selected",
+    );
+    const remoteBand = liWith(markup, `data-testid="environment-card-header-${ENV_REMOTE}"`);
+    expect(remoteBand).toMatch(/group\/project-header[^"]*opacity-60/);
+  });
+
+  it("draws the hidden worktrees row as chat level without its own text colour", () => {
+    levelsScenario();
+    h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS, sidebarThreadPreviewCount: 1 };
+    const markup = render(<Sidebar />);
+    const showMore = liWith(markup, ">Show more<");
+    expect(openingTag(showMore)).toContain('data-sidebar-level="chat"');
+    expect(showMore).not.toMatch(/class="[^"]*\btext-muted-foreground\b[^"]*"[^>]*>(?:<[^>]*>)*Show more/);
+  });
+});

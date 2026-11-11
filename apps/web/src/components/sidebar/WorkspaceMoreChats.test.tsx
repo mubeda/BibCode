@@ -134,6 +134,13 @@ describe("WorkspaceMoreChatsList (#223)", () => {
     expect(h.loads.at(-1)?.append).toBe(true);
   });
 
+  it("draws each chat as a chat level row without its own text colour (R63)", () => {
+    mount(0);
+    const row = button("Chat here");
+    expect(row.getAttribute("data-sidebar-level")).toBe("chat");
+    expect(row.className).not.toMatch(/(^|\s)text-(foreground|\[13px\])/);
+  });
+
   it("offers a retry in place when a page fails", async () => {
     mount(2);
     act(() => button("2 older chats").click());
