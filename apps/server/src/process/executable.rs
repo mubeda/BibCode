@@ -200,7 +200,7 @@ fn with_thousands_separators(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -458,7 +458,10 @@ mod windows_batch_command_line_tests {
     fn windows_batch_command_line_accepts_exactly_8191_chars() {
         let fixed = format!(r#"/e:ON /v:OFF /d /c ""{SCRIPT}" "#).len() + 1;
         let fits = "a".repeat(8_191 - fixed);
-        assert_eq!(encode(std::slice::from_ref(&fits)).map(|line| line.len()), Ok(8_191));
+        assert_eq!(
+            encode(std::slice::from_ref(&fits)).map(|line| line.len()),
+            Ok(8_191)
+        );
         let over = format!("{fits}a");
         assert!(encode(&[over]).is_err());
     }
