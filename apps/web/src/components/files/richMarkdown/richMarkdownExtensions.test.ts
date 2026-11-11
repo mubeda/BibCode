@@ -79,6 +79,27 @@ describe("createRichMarkdownEditor", () => {
     expect(open("```mermaid\ngraph TD\n").tiptap.state.doc.child(0).type.name).toBe("codeBlock");
   });
 
+  it.each([
+    ["a block quote", "> Quoted.\n>\n> ```mermaid\n> graph TD\n>\n>   A --> B\n> ```\n\nAfter.\n"],
+    ["a list item", "- item\n\n  ```mermaid\n  graph TD\n\n    A --> B\n  ```\n\n- next\n"],
+    [
+      "a details body",
+      "<details>\n<summary>More</summary>\n\n```mermaid\ngraph TD\n\n  A --> B\n```\n\n</details>\n\nAfter.\n",
+    ],
+    ["an info string with a title", '```mermaid title="Flow"\ngraph TD\n  A --> B\n```\n'],
+    ["a CRLF file", "Before.\r\n\r\n~~~mermaid\r\ngraph TD\r\n  A --> B\r\n~~~\r\n\r\nAfter.\r\n"],
+  ])("keeps a diagram in %s editable and its bytes untouched", (_name, original) => {
+    const { editor, tiptap } = open(original);
+    let diagrams = 0;
+    tiptap.state.doc.descendants((node) => {
+      if (node.type.name === "mermaidDiagram") diagrams += 1;
+    });
+    expect(diagrams).toBe(1);
+    const before = editor.serialize();
+    expect(canReconcile({ original, before })).toBe(true);
+    expect(reconcileMarkdown({ original, before, after: before })).toBe(original);
+  });
+
   it("reconciles an untouched editor to the original bytes", () => {
     for (const [name, original] of supported) {
       const { editor } = open(original);

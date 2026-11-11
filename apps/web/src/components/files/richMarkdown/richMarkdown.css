@@ -92,3 +92,10 @@
   white-space: normal;
   margin: 0.75rem 0;
 }
+
+/* A diagram selected by a click or the keyboard, so Delete acts on something visible. */
+.rich-markdown-editor .rich-markdown-mermaid.ProseMirror-selectednode {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 0.375rem;
+}

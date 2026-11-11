@@ -3489,7 +3489,11 @@ sees partial source:
   so drawing, refusals, the sanitizer, the cache and theme recoloring are
   chat's. Typing elsewhere renders nothing in the block: the surface's list of
   diagram views changes only when a diagram block is added or removed. The
-  diagram's source is edited in source view, and the block says so. Other
+  diagram's source is edited in source view, and the block says so. There,
+  **Show source** shows plain, unhighlighted source, and copy goes through the
+  node's text and HTML serializers instead of `markdown-clipboard.ts`: the
+  copied text is the fenced source, and a diagram pasted back is a code block
+  until the view opens again. A fence title is not shown. Other
   fenced code in the editable view has no syntax colors, and a click on a link
   places the caret instead of opening it.
 - **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)

@@ -2364,7 +2364,9 @@ parts you edit change.
 
 A ` ```mermaid ` block shows its diagram in rendered view. The diagram is one
 block: click it to select it, and press Delete or Backspace to remove it. Edit
-its source in source view. Other code blocks show without syntax colors while
+its source in source view. Its **Show source** shows the source without syntax
+colors, and a diagram you cut and paste comes back as its code block until you
+open the file again. Other code blocks show without syntax colors while
 you edit, and clicking a link places the caret in it instead of opening it; the
 read-only rendered view opens a link on a click.
 
