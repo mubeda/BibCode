@@ -80,25 +80,50 @@ describe("createRichMarkdownEditor", () => {
   });
 
   it.each([
-    ["a block quote", "> Quoted.\n>\n> ```mermaid\n> graph TD\n>\n>   A --> B\n> ```\n\nAfter.\n"],
-    ["a list item", "- item\n\n  ```mermaid\n  graph TD\n\n    A --> B\n  ```\n\n- next\n"],
+    [
+      "a block quote",
+      "> Quoted.\n>\n> ```mermaid\n> graph TD\n>\n>   A --> B\n> ```\n\nAfter.\n",
+      "Quoted.",
+    ],
+    [
+      "a list item",
+      "- item\n\n  ```mermaid\n  graph TD\n\n    A --> B\n  ```\n\n- next\n",
+      "next",
+    ],
     [
       "a details body",
       "<details>\n<summary>More</summary>\n\n```mermaid\ngraph TD\n\n  A --> B\n```\n\n</details>\n\nAfter.\n",
+      "After.",
     ],
-    ["an info string with a title", '```mermaid title="Flow"\ngraph TD\n  A --> B\n```\n'],
-    ["a CRLF file", "Before.\r\n\r\n~~~mermaid\r\ngraph TD\r\n  A --> B\r\n~~~\r\n\r\nAfter.\r\n"],
-  ])("keeps a diagram in %s editable and its bytes untouched", (_name, original) => {
-    const { editor, tiptap } = open(original);
-    let diagrams = 0;
-    tiptap.state.doc.descendants((node) => {
-      if (node.type.name === "mermaidDiagram") diagrams += 1;
-    });
-    expect(diagrams).toBe(1);
-    const before = editor.serialize();
-    expect(canReconcile({ original, before })).toBe(true);
-    expect(reconcileMarkdown({ original, before, after: before })).toBe(original);
-  });
+    [
+      "an info string with a title",
+      'Intro.\n\n```mermaid title="Flow"\ngraph TD\n  A --> B\n```\n',
+      "Intro.",
+    ],
+    [
+      "a CRLF file",
+      "Before.\r\n\r\n~~~mermaid\r\ngraph TD\r\n  A --> B\r\n~~~\r\n\r\nAfter.\r\n",
+      "After.",
+    ],
+  ])(
+    "keeps a diagram in %s editable and its bytes through an edit elsewhere",
+    (_name, original, edited) => {
+      const { editor, tiptap } = open(original);
+      let diagrams = 0;
+      tiptap.state.doc.descendants((node) => {
+        if (node.type.name === "mermaidDiagram") diagrams += 1;
+      });
+      expect(diagrams).toBe(1);
+      const before = editor.serialize();
+      expect(canReconcile({ original, before })).toBe(true);
+
+      typeAfter(tiptap, edited, " Edited.");
+
+      expect(reconcileMarkdown({ original, before, after: editor.serialize() })).toBe(
+        original.replace(edited, `${edited} Edited.`),
+      );
+    },
+  );
 
   it("reconciles an untouched editor to the original bytes", () => {
     for (const [name, original] of supported) {
