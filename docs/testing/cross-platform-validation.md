@@ -294,6 +294,12 @@ size/owner remain the same. A changed applied size/owner makes it eligible to
 reappear. Closing the terminal and creating a new one must not inherit its
 dismissal.
 
+With a provider TUI in a center terminal, maximize the right panel and restore
+it: `stty size` in a plain center terminal never reports 2 columns or 1 row
+while it is hidden. Move the window to a display with another scale, or change
+the display scale, without resizing any panel: the TUI's bottom rows stay
+visible.
+
 Resize the mirror's container: it must not resize the program. Focus, click, or
 type in a mirror, including an equal-size mirror, to transfer ownership. After
 a click or keypress, the notice must stay hidden without flashing back while
