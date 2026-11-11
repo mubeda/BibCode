@@ -5987,6 +5987,95 @@ mod tests {
         assert!(validate_settings_document(&settings).is_err());
     }
 
+    #[test]
+    fn code_review_settings_default_when_missing() {
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+        assert_eq!(
+            settings["codeReviewAgent"],
+            json!({"kind":"chat","instanceId":"codex"})
+        );
+        assert_eq!(settings["codeReviewModelSelection"], Value::Null);
+        assert_eq!(settings["codeReviewPrompt"], "");
+        assert!(validate_settings_document(&settings).is_ok());
+    }
+
+    #[tokio::test]
+    async fn code_review_settings_patch_replaces_model_whole() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+
+        control
+            .update_settings(json!({"patch":{
+                "codeReviewAgent":{"kind":"terminal","instanceId":"claudeAgent"},
+                "codeReviewModelSelection":{
+                    "instanceId":"claudeAgent","model":"opus",
+                    "options":[{"id":"effort","value":"high"}]
+                },
+                "codeReviewPrompt":"Look at tests."
+            }}))
+            .await
+            .expect("store review settings");
+        let updated = control
+            .update_settings(json!({"patch":{
+                "codeReviewModelSelection":{"instanceId":"codex","model":"gpt-5"}
+            }}))
+            .await
+            .expect("replace review model");
+        assert_eq!(
+            updated["codeReviewModelSelection"],
+            json!({"instanceId":"codex","model":"gpt-5"})
+        );
+        assert_eq!(
+            updated["codeReviewAgent"],
+            json!({"kind":"terminal","instanceId":"claudeAgent"})
+        );
+        assert_eq!(updated["codeReviewPrompt"], "Look at tests.");
+
+        let cleared = control
+            .update_settings(json!({"patch":{"codeReviewModelSelection":null}}))
+            .await
+            .expect("clear review model");
+        assert_eq!(cleared["codeReviewModelSelection"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn code_review_settings_reject_long_prompt_and_bad_agent() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        control
+            .update_settings(json!({"patch":{"codeReviewPrompt":"Kept."}}))
+            .await
+            .expect("store review prompt");
+        let before = control.settings.read().await.clone();
+
+        // 7,680 UTF-16 units is the limit; "é" is one unit, so this is 7,681.
+        let long = format!("{}é", "a".repeat(7_680));
+        for patch in [
+            json!({"codeReviewPrompt": long}),
+            json!({"codeReviewPrompt": 7}),
+            json!({"codeReviewAgent":{"kind":"other"}}),
+            json!({"codeReviewModelSelection":{"instanceId":"codex"}}),
+        ] {
+            assert!(
+                control
+                    .update_settings(json!({ "patch": patch }))
+                    .await
+                    .is_err(),
+                "{patch} must be rejected"
+            );
+            assert_eq!(*control.settings.read().await, before);
+        }
+        control
+            .update_settings(json!({"patch":{"codeReviewPrompt": "😀".repeat(3_840)}}))
+            .await
+            .expect("7,680 UTF-16 units fit");
+    }
+
     #[tokio::test]
     async fn default_agent_update_persists_as_a_whole_selection() {
         let temp = tempfile::tempdir().expect("control root");
