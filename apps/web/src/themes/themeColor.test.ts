@@ -36,6 +36,14 @@ const DERIVED_SOURCES: Record<string, string> = {
   "primary-active": "primary",
   selected: "accent",
   "selected-foreground": "accent-foreground",
+  "sidebar-env-accent": "primary",
+  "sidebar-primary-badge": "primary",
+  "sidebar-primary-badge-foreground": "primary",
+  "sidebar-worktree": "primary",
+  "sidebar-worktree-border": "foreground",
+  "sidebar-worktree-icon": "primary",
+  "sidebar-chat-foreground": "foreground",
+  "sidebar-indent-guide": "foreground",
 };
 
 describe("resolveToken against the stylesheet", () => {
@@ -132,7 +140,7 @@ describe("fixed pairs", () => {
     expect(pair?.ratio).toBeLessThan(4.5);
   });
 
-  it("FIXED_PAIRS has the fourteen pairs of the spec in order", () => {
+  it("FIXED_PAIRS has the fourteen pairs of the spec, then the five sidebar level pairs of R65, in order", () => {
     expect(FIXED_PAIRS.map((pair) => `${pair.text} on ${pair.surface}`)).toEqual([
       "foreground on background",
       "card-foreground on card",
@@ -148,6 +156,11 @@ describe("fixed pairs", () => {
       "find-match-foreground on find-match",
       "find-match-active-foreground on find-match-active",
       "terminal.foreground on terminal.background",
+      "sidebar-primary-badge-foreground on sidebar-primary-badge",
+      "sidebar-chat-foreground on sidebar-card",
+      "sidebar-chat-foreground on sidebar-env-band",
+      "sidebar-chat-foreground on sidebar-worktree",
+      "sidebar-worktree-icon on sidebar-worktree",
     ]);
     expect(FIXED_PAIRS.every((pair) => pair.label.length > 0)).toBe(true);
   });

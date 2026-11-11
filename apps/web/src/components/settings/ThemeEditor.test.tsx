@@ -100,6 +100,37 @@ describe("ThemeEditor", () => {
     expect(keys.toSorted()).toEqual(expected.toSorted());
   });
 
+  it("the Sidebar group offers every level token and shows the five-level preview", async () => {
+    await mount();
+    const sidebar = [...container.querySelectorAll("fieldset")].find(
+      (fieldset) => fieldset.querySelector("legend")?.textContent === "Sidebar",
+    )!;
+    for (const token of [
+      "sidebar-env-accent",
+      "sidebar-primary-badge",
+      "sidebar-primary-badge-foreground",
+      "sidebar-worktree",
+      "sidebar-worktree-border",
+      "sidebar-worktree-icon",
+      "sidebar-chat-foreground",
+      "sidebar-indent-guide",
+    ]) {
+      expect(sidebar.querySelector(`[data-theme-field="ui.${token}"]`), token).not.toBeNull();
+    }
+    const preview = sidebar.querySelector('figure[aria-label="Sidebar preview"]')!;
+    for (const level of ["repo", "environment", "checkout", "worktree", "chat"]) {
+      expect(preview.querySelector(`[data-sidebar-level="${level}"]`), level).not.toBeNull();
+    }
+  });
+
+  it("a custom worktree color repaints the preview's surface variable and is saved", async () => {
+    await mount();
+    await type(textOf("ui.sidebar-worktree"), "#123456");
+    expect(painted("--sidebar-worktree")).toBe("#123456");
+    await click(button("Save"));
+    expect(getTheme("mine")?.ui?.["sidebar-worktree"]).toBe("#123456");
+  });
+
   it("changing primary repaints at once and Cancel restores the saved color", async () => {
     await mount();
     await type(textOf("ui.primary"), "#ff0000");

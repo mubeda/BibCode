@@ -149,6 +149,30 @@ describe("theme export and import", () => {
     expect(plan.theme.ui).toEqual(night.ui);
   });
 
+  it("an unreadable primary badge falls back to the base badge text, the pair is named and the other sidebar overrides are kept (R65)", async () => {
+    const { transfer } = await load();
+    const badge = {
+      "sidebar-primary-badge": "#3a2a1a",
+      "sidebar-primary-badge-foreground": "#3b2b1b",
+      "sidebar-worktree": "#202830",
+    };
+    const plan = transfer.planThemeImport(
+      JSON.stringify({ ...night, ui: { ...night.ui, ...badge } }),
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`)).toEqual([
+      "sidebar-primary-badge-foreground:sidebar-primary-badge",
+    ]);
+    expect(plan.theme.ui).toEqual({
+      ...night.ui,
+      "sidebar-primary-badge": "#3a2a1a",
+      "sidebar-worktree": "#202830",
+    });
+    const again = transfer.planThemeImport(transfer.exportThemeJson(plan.theme));
+    expect(again).toMatchObject({ ok: true, theme: plan.theme, resetPairs: [] });
+  });
+
   it("a light import that sets only the background, with the default placeholder, keeps its background and resets nothing (amendment A3)", async () => {
     const { transfer } = await load();
     // Built-in Light already fails placeholder on background (about 3.1:1). The import is not
