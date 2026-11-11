@@ -303,9 +303,9 @@ describe("ServerSettings code review", () => {
   });
 
   it("rejects a review prompt over 7680 characters", () => {
-    expect(decodeServerSettings({ codeReviewPrompt: "a".repeat(7_680) }).codeReviewPrompt).toHaveLength(
-      7_680,
-    );
+    expect(
+      decodeServerSettings({ codeReviewPrompt: "a".repeat(7_680) }).codeReviewPrompt,
+    ).toHaveLength(7_680);
     expect(() => decodeServerSettings({ codeReviewPrompt: "a".repeat(7_681) })).toThrow();
     expect(() => decodeServerSettingsPatch({ codeReviewPrompt: "a".repeat(7_681) })).toThrow();
   });
