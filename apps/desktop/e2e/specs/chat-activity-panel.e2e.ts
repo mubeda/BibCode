@@ -45,6 +45,14 @@ const isWindowsE2e = process.env.BIBCODE_E2E_PLATFORM === "win";
 const supportsCodexTerminalActivity = !isWindowsE2e;
 const preparedCodexExecutable = NodePath.join(shimDirectory, isWindowsE2e ? "codex.cmd" : "codex");
 
+afterEach(async () => {
+  try {
+    clearDesktopActivityMarker(preparedProjectPath);
+  } finally {
+    await restoreRuntimeMotionEmulation();
+  }
+});
+
 interface RectSnapshot {
   readonly bottom: number;
   readonly height: number;
@@ -1401,15 +1409,6 @@ async function assertNarrowSplitUsability(terminalId: string): Promise<void> {
 }
 
 describe("packaged responsive activity experience", () => {
-  // Inside this suite: at file level every spec of the shared worker would inherit it.
-  afterEach(async () => {
-    try {
-      clearDesktopActivityMarker(preparedProjectPath);
-    } finally {
-      await restoreRuntimeMotionEmulation();
-    }
-  });
-
   it("keeps activity responsive, keyboard-operable, and focus-stable in the packaged app", async () => {
     clearDesktopActivityMarker(preparedProjectPath);
     await setDesktopUiWindowSize(1_200, 720);
