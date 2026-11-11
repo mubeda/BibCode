@@ -472,6 +472,16 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            // Only a worktree this call created has a rollback, and only it gets a record. The
+            // turn goes on without one: the worktree's `.git` pointer file is the audit's evidence.
+            if result.rollback.is_some()
+                && let Err(error) = self
+                    .repositories
+                    .record_worktree_creation(&input.project_cwd, &result.worktree.path)
+                    .await
+            {
+                tracing::warn!(%error, "a bootstrap worktree has no creation record");
+            }
             let path = PathBuf::from(&result.worktree.path);
             let worktree = BootstrapWorktree {
                 repository_root: input.project_cwd,
