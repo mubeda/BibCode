@@ -1666,7 +1666,7 @@ with an error that names the length, and the UI SHALL show it.
 
 - GIVEN a Windows environment, the reviewer Claude Terminal and a dirty tree, before the Windows terminal reviews are enabled
 - WHEN the panel is shown
-- THEN the button is disabled with the tooltip "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.", and macOS and Linux environments are not affected
+- THEN the button is disabled with the tooltip "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.", the review menu shows Claude Terminal and Codex Terminal disabled with the same reason, and on macOS and Linux environments the button and those items stay enabled
 
 #### Scenario: line breaks
 
@@ -1880,7 +1880,7 @@ D33. On Linux the read-only flag comes from the mount options in `/proc/self/mou
 
 D40. A review opens as a chat panel of the current thread through the side-chat creation path, not as a new top-level thread through `thread.turn.start` with `bootstrap.createThread`, because a public client cannot give a new thread a worktree that way and the review would read the main checkout. Alternatives considered: the issue's top-level thread (wrong checkout from a worktree); a new server RPC for a top-level thread in a worktree (new authority surface and RPC for what the panel path already does). Decided by: agent's call. Source: #293 "Start a thread with a prompt"; `decode_public_orchestration_command`.
 
-D41. Review chats run with `approval-required` for every provider and in plan mode only for Claude. Alternatives considered: the user's default runtime mode (the issue's recommendation for open question 1; on this branch it is `full-access`, which leaves Codex, Cursor, Grok and OpenCode unguarded); `approval-required` with plan everywhere (plan adds no block to Codex and makes Codex, Cursor and Grok end with plan cards). UI copy names the mechanism ("Starts in Claude's plan mode.", "Runs in Codex's read-only sandbox.") and never promises the outcome, because user, project and local Claude settings load and can weaken plan mode; which settings a review loads is an open decision for the user. Decided by: agent's call. Source: #293 open question 1; driver mappings in the design note.
+D41. Review chats run with `approval-required` for every provider and in plan mode only for Claude, so a Claude review starts in Claude's plan mode; user, project and local Claude settings can weaken it. Alternatives considered: the user's default runtime mode (the issue's recommendation for open question 1; on this branch it is `full-access`, which leaves Codex, Cursor, Grok and OpenCode unguarded); `approval-required` with plan everywhere (plan adds no block to Codex and makes Codex, Cursor and Grok end with plan cards). UI copy names the mechanism ("Starts in Claude's plan mode.", "Runs in Codex's read-only sandbox.") and never promises the outcome, because user, project and local Claude settings load and can weaken plan mode; which settings a review loads is an open decision for the user. Decided by: agent's call. Source: #293 open question 1; driver mappings in the design note.
 
 D42. A review thread carries a durable `codeReview` flag set at panel creation, and a review thread shows no Implement, Refine or "Implement in a new thread"; its plan card reads "Review findings". Alternatives considered: matching the title (breaks on rename); a client-only flag (lost on reload); keeping Implement (one-click auto-fixing is a non-goal). Decided by: agent's call. Source: #293 open question 2.
 

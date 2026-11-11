@@ -209,12 +209,12 @@ The issue's open question 1 recommends the user's default runtime mode. On this 
 default is `full-access`, which gives Codex `dangerFullAccess` with plan text as the only guard,
 auto-approves Cursor and Grok permission requests, and allows everything in OpenCode. Options:
 
-- User's default runtime mode, plan everywhere (the issue): nothing is enforced except Claude.
+- User's default runtime mode, plan everywhere (the issue): only Claude gets a mechanism (it starts in Claude's plan mode; user, project and local Claude settings can weaken it).
 - `approval-required` and `plan` everywhere: Codex gains the read-only sandbox, but plan mode
   adds nothing to its guard and makes Codex, Cursor and Grok end with a proposed plan card.
-- `approval-required` everywhere, `plan` only for Claude (chosen): every driver that can enforce
-  a block or an approval gate does, and only Claude, whose plan mode is its hard block, produces
-  plan cards. Cost: Codex's `untrusted` policy may ask before some read commands, which the
+- `approval-required` everywhere, `plan` only for Claude (chosen): every driver whose provider
+  offers a block or an approval gate gets it, and only Claude, which starts in Claude's plan mode
+  (user, project and local Claude settings can weaken it), produces plan cards. Cost: Codex's `untrusted` policy may ask before some read commands, which the
   person answers in the panel. Side chats already use `approval-required` for the same reason.
 
 Agent's call, overriding the issue's recommendation as the brief requires.
