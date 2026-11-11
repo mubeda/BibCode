@@ -171,6 +171,8 @@ interface TimelineRowSharedState {
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  /** A review thread's plan card reads "Review findings" (#293). */
+  isCodeReview: boolean;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
@@ -281,6 +283,7 @@ interface MessagesTimelineProps {
   verboseChat: boolean;
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  isCodeReview?: boolean;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
@@ -355,6 +358,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   verboseChat,
   workspaceRoot,
   skills = EMPTY_TIMELINE_SKILLS,
+  isCodeReview = false,
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
@@ -571,6 +575,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       skills,
+      isCodeReview,
       activeThreadEnvironmentId,
       onRevertUserMessage,
       onResolveTurnDelivery,
@@ -598,6 +603,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       skills,
+      isCodeReview,
       activeThreadEnvironmentId,
       onRevertUserMessage,
       onResolveTurnDelivery,
@@ -1686,6 +1692,7 @@ function ProposedPlanTimelineRow({
         onExpandedChange={onExpandedChange}
         detailsOpen={detailsOpenForScope(row.disclosure, PLAN_BODY_FIND_SCOPE)}
         onDetailsOpenChange={onDetailsOpenChange}
+        isCodeReview={ctx.isCodeReview}
       />
     </div>
   );

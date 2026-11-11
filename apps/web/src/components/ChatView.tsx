@@ -2356,8 +2356,15 @@ function ChatViewContent(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
-  const planSidebarLabel = sidebarProposedPlan || interactionMode === "plan" ? "Plan" : "Tasks";
+  // A review panel reports findings; implementing them is not a review's job (D42).
+  const isCodeReviewThread = activeThread?.codeReview === true;
+  const planSidebarLabel = isCodeReviewThread
+    ? "Review findings"
+    : sidebarProposedPlan || interactionMode === "plan"
+      ? "Plan"
+      : "Tasks";
   const showPlanFollowUpPrompt =
+    !isCodeReviewThread &&
     pendingUserInputs.length === 0 &&
     interactionMode === "plan" &&
     latestTurnSettled &&
@@ -7419,6 +7426,7 @@ function ChatViewContent(props: ChatViewProps) {
                       verboseChat={settings.verboseChat}
                       workspaceRoot={activeWorkspaceRoot}
                       skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
+                      isCodeReview={isCodeReviewThread}
                       anchorMessageId={timelineAnchorMessageId}
                       onAnchorReady={onTimelineAnchorReady}
                       onAnchorSizeChanged={onTimelineAnchorSizeChanged}
