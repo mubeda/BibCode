@@ -101,6 +101,7 @@ const testState = vi.hoisted(() => ({
     error?: unknown;
   }>,
   commandCalls: [] as Array<{ label: string; input: unknown }>,
+  defaultAgent: { kind: "chat", instanceId: "codex" } as { kind: string; instanceId: string },
   commandResults: {} as Record<string, unknown>,
   toastAdd: (() => {}) as (toast: unknown) => void,
   fileTree: {
@@ -228,6 +229,10 @@ vi.mock("~/state/environments", () => ({
   useEnvironmentConnectionState: () => ({
     data: testState.connectionPhase === null ? null : { phase: testState.connectionPhase },
   }),
+}));
+
+vi.mock("~/hooks/useSettings", () => ({
+  usePrimaryDefaultAgent: () => testState.defaultAgent,
 }));
 
 vi.mock("~/state/preview", () => ({
@@ -492,6 +497,7 @@ beforeEach(() => {
   testState.vcsStatus = null;
   testState.openFileInPreview = vi.fn(async () => ({ _tag: "Success" }));
   testState.commandCalls = [];
+  testState.defaultAgent = { kind: "chat", instanceId: "codex" };
   testState.fileTreeEntriesLive = [];
   testState.commandResults = {};
   testState.toastAdd = vi.fn();
@@ -1913,6 +1919,67 @@ describe("add as project", () => {
         }),
       }),
     );
+  });
+
+  function readyProvider(instanceId: string, driver: string, model: string) {
+    return {
+      instanceId,
+      driver,
+      enabled: true,
+      installed: true,
+      version: "1.0.0",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-11-11T00:00:00.000Z",
+      models: [{ slug: model, name: model, isCustom: false, capabilities: null }],
+      slashCommands: [],
+      skills: [],
+      agents: [],
+    };
+  }
+
+  function addedProjectInstanceId(): unknown {
+    const call = testState.commandCalls.find((entry) => entry.label === "create");
+    return (call?.input as { input: { defaultModelSelection: { instanceId: string } } } | undefined)
+      ?.input.defaultModelSelection.instanceId;
+  }
+
+  it("opens the new project's Main on the Default Agent (#347)", async () => {
+    testState.defaultAgent = { kind: "chat", instanceId: "claudeAgent" };
+    testState.environment = {
+      serverConfig: {
+        providers: [
+          readyProvider("codex", "codex", "gpt-5.4"),
+          readyProvider("claudeAgent", "claudeAgent", "claude-opus-4-6"),
+        ],
+        settings: DEFAULT_SERVER_SETTINGS,
+      },
+    };
+    setEntries([entry("packages/app", "directory")]);
+    renderPanel();
+    rowActionsFor("packages/app", "directory").onAddAsProject();
+    await flushPromises();
+
+    expect(addedProjectInstanceId()).toBe("claudeAgent");
+  });
+
+  it("falls back to the first ready chat when the Default Agent is unavailable, as Add Project does", async () => {
+    testState.defaultAgent = { kind: "chat", instanceId: "claudeAgent" };
+    testState.environment = {
+      serverConfig: {
+        providers: [
+          readyProvider("codex", "codex", "gpt-5.4"),
+          { ...readyProvider("claudeAgent", "claudeAgent", "claude-opus-4-6"), status: "error" },
+        ],
+        settings: DEFAULT_SERVER_SETTINGS,
+      },
+    };
+    setEntries([entry("packages/app", "directory")]);
+    renderPanel();
+    rowActionsFor("packages/app", "directory").onAddAsProject();
+    await flushPromises();
+
+    expect(addedProjectInstanceId()).toBe("codex");
   });
 
   it("reports failures adding a directory as a project", async () => {
