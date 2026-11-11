@@ -1,5 +1,7 @@
 import {
   ProviderDriverKind,
+  TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH,
+  type ModelSelection,
   type ServerSettings,
   type TerminalLaunchCommand,
 } from "@bibcode/contracts";
@@ -156,31 +158,47 @@ function providerArguments(
   return [];
 }
 
+function resolveTerminalLaunch(
+  entry: ProviderInstanceEntry,
+  settings: ProviderTerminalSettings,
+  definition: ProviderTerminalDefinition,
+  explicitSelection: ModelSelection | null,
+) {
+  const instance = settings.providerInstances?.[entry.instanceId];
+  const legacy = (settings.providers as Readonly<Record<string, unknown>>)[entry.driverKind];
+  const resolution = resolveProviderSessionDefault({
+    driver: entry.driverKind,
+    instanceId: entry.instanceId,
+    models: entry.models,
+    configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+    explicitSelection,
+  });
+  return {
+    executable: binaryPath(instance?.config) ?? binaryPath(legacy) ?? definition.executable,
+    // Every AI Terminal names its provider: the server observes the ones it can (Codex, Claude,
+    // OpenCode on macOS and Linux) and reports the rest as status unavailable (#187).
+    activity: { driverKind: entry.driverKind, providerInstanceId: entry.instanceId },
+    resolution,
+    modelArguments: providerArguments(entry.driverKind, resolution, entry.models),
+  };
+}
+
 export function resolveProviderTerminalAction(
   entry: ProviderInstanceEntry,
   settings: ProviderTerminalSettings,
 ): ProviderTerminalActionItem | null {
   const definition = DEFINITIONS[entry.driverKind];
   if (!definition) return null;
-  const instance = settings.providerInstances?.[entry.instanceId];
-  const legacy = (settings.providers as Readonly<Record<string, unknown>>)[entry.driverKind];
-  const executable = binaryPath(instance?.config) ?? binaryPath(legacy) ?? definition.executable;
+  const { executable, activity, resolution, modelArguments } = resolveTerminalLaunch(
+    entry,
+    settings,
+    definition,
+    null,
+  );
   const label = `${entry.displayName} Terminal`;
-  // Every AI Terminal names its provider: the server observes the ones it can (Codex, Claude,
-  // OpenCode on macOS and Linux) and reports the rest as status unavailable (#187).
-  const activity = {
-    driverKind: entry.driverKind,
-    providerInstanceId: entry.instanceId,
-  };
-  const resolution = resolveProviderSessionDefault({
-    driver: entry.driverKind,
-    instanceId: entry.instanceId,
-    models: entry.models,
-    configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
-  });
   const command = decodeTerminalLaunchCommand({
     executable,
-    args: [...definition.args, ...providerArguments(entry.driverKind, resolution, entry.models)],
+    args: [...definition.args, ...modelArguments],
     label,
     ...(definition.env ? { env: { ...definition.env } } : {}),
     activity,
@@ -193,6 +211,81 @@ export function resolveProviderTerminalAction(
       disabledReason: COMMAND_BOUNDS_REASON,
     };
   }
+  return {
+    entry,
+    label,
+    command,
+    disabledReason: null,
+    ...(resolution.fallback ? { fallback: resolution.fallback } : {}),
+  };
+}
+
+// Only Task 12.17 turns this on, once the native Windows batch argument tests run green (D44).
+export const WINDOWS_TERMINAL_REVIEWS_ENABLED = false;
+
+/** Read-only flags replace `DEFINITIONS`' bypass flags; other CLIs' read-only flags are unverified. */
+const REVIEW_ARGUMENTS: Partial<Record<ProviderDriverKind, ReadonlyArray<string>>> = {
+  [ProviderDriverKind.make("claudeAgent")]: ["--permission-mode", "plan"],
+  [ProviderDriverKind.make("codex")]: ["--sandbox", "read-only", "--ask-for-approval", "never"],
+};
+
+export const CODE_REVIEW_DRIVERS_WITH_TERMINALS: ReadonlySet<ProviderDriverKind> = new Set(
+  Object.keys(REVIEW_ARGUMENTS) as ProviderDriverKind[],
+);
+
+const WINDOWS_REVIEWS_OFF_REASON =
+  "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.";
+const REVIEW_PROMPT_TOO_LONG_REASON = `Review prompt is longer than ${TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH.toLocaleString("en-US")} characters. Shorten it in Settings → Agents.`;
+const REVIEW_PROMPT_CONTROL_REASON =
+  "Review prompt holds a control character other than tab or a line break. Remove it in Settings → Agents.";
+// oxlint-disable-next-line no-control-regex -- the point is to find control characters.
+const FORBIDDEN_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+export function resolveProviderReviewTerminalAction(
+  entry: ProviderInstanceEntry,
+  settings: ProviderTerminalSettings,
+  input: {
+    readonly prompt: string;
+    readonly platformOs: string | null;
+    readonly modelSelection: ModelSelection | null;
+    /** Test seam for Task 12.17; callers leave it unset. */
+    readonly windowsEnabled?: boolean;
+  },
+): ProviderTerminalActionItem | null {
+  const reviewArguments = REVIEW_ARGUMENTS[entry.driverKind];
+  const definition = DEFINITIONS[entry.driverKind];
+  if (!reviewArguments || !definition) return null;
+  const label = `${entry.displayName} Review`;
+  const disabled = (disabledReason: string): DisabledProviderTerminalAction => ({
+    entry,
+    label,
+    command: null,
+    disabledReason,
+  });
+  const isWindows = input.platformOs === "windows";
+  if (isWindows && !(input.windowsEnabled ?? WINDOWS_TERMINAL_REVIEWS_ENABLED)) {
+    return disabled(WINDOWS_REVIEWS_OFF_REASON);
+  }
+  // cmd.exe cannot carry a line break inside an argument; the web cannot see whether the
+  // resolved executable is a batch file, so every Windows launch is flattened.
+  const prompt = isWindows ? input.prompt.replace(/\r\n|\r|\n/g, " ") : input.prompt;
+  if (prompt.length > TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH) {
+    return disabled(REVIEW_PROMPT_TOO_LONG_REASON);
+  }
+  if (FORBIDDEN_CONTROL_CHARACTER.test(prompt)) return disabled(REVIEW_PROMPT_CONTROL_REASON);
+  const { executable, activity, resolution, modelArguments } = resolveTerminalLaunch(
+    entry,
+    settings,
+    definition,
+    input.modelSelection,
+  );
+  const command = decodeTerminalLaunchCommand({
+    executable,
+    args: [...reviewArguments, ...modelArguments, "--", prompt],
+    label,
+    activity,
+  });
+  if (command === null) return disabled(COMMAND_BOUNDS_REASON);
   return {
     entry,
     label,
