@@ -383,7 +383,7 @@ function SourceControlFileRow({
         "group flex h-full items-center gap-2 rounded-md px-2 hover:bg-accent/50",
         // Indents a grouped row so its name lines up under the folder label.
         !showDirectory && "pl-7",
-        section.selectionMode && isSelected && "bg-selected/70",
+        section.selectionMode && isSelected && "bg-selected/70 text-selected-foreground",
       )}
       onContextMenu={(event) => {
         event.preventDefault();
@@ -425,7 +425,12 @@ function SourceControlFileRow({
           // Takes the leftover width, never less than a readable tail.
           <span
             dir="rtl"
-            className="min-w-[4.5rem] shrink basis-0 grow truncate text-left text-xs text-muted-foreground"
+            className={cn(
+              "min-w-[4.5rem] shrink basis-0 grow truncate text-left text-xs",
+              section.selectionMode && isSelected
+                ? "text-selected-foreground/70"
+                : "text-muted-foreground",
+            )}
           >
             <bdi dir="ltr">{dir}</bdi>
           </span>

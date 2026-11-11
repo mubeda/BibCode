@@ -150,7 +150,7 @@ function SortableCenterTab({
       className={cn(
         "group flex h-7 min-w-25 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm",
         active
-          ? "bg-selected text-foreground"
+          ? "bg-selected text-selected-foreground"
           : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
         isDragging && "opacity-40",
       )}

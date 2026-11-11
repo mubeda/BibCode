@@ -39,7 +39,11 @@ function JobLink({ job, children }: { job: PipelinesJob; children: ReactNode }) 
   const { jobLink, selectJob, selectedJobId } = usePipelineLinks();
   const route = jobLink(job.id);
   const selected = selectedJobId === job.id;
-  const className = cn(ROW_CLASS, "flex-1 no-underline", selected && "bg-selected");
+  const className = cn(
+    ROW_CLASS,
+    "flex-1 no-underline",
+    selected && "bg-selected text-selected-foreground",
+  );
   if (route !== null)
     return (
       <Link

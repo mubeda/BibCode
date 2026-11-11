@@ -401,7 +401,7 @@ const JobLogRow = memo(function JobLogRow({
         highlighted
           ? "bg-amber-100 dark:bg-amber-500/20"
           : active
-            ? "bg-selected"
+            ? "bg-selected text-selected-foreground"
             : kind === LINE_ERROR
               ? "bg-red-50 dark:bg-red-500/10"
               : ""

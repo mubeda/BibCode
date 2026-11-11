@@ -3122,7 +3122,7 @@ export default function ThreadTerminalPanel({
                           type="button"
                           className={`flex w-full items-center rounded px-1 py-0.5 text-xs uppercase tracking-[0.08em] ${
                             isGroupActive
-                              ? "bg-selected/70 text-foreground"
+                              ? "bg-selected/70 text-selected-foreground"
                               : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                           }`}
                           onClick={() => onActiveTerminalChange(groupActiveTerminalId)}
@@ -3144,13 +3144,11 @@ export default function ThreadTerminalPanel({
                               key={terminalId}
                               className={`group flex items-center gap-1 rounded px-1 py-0.5 text-xs ${
                                 isActive
-                                  ? "bg-selected text-foreground"
+                                  ? "bg-selected text-selected-foreground"
                                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                               }`}
                             >
-                              {showGroupHeaders && (
-                                <span className="text-xs text-muted-foreground">└</span>
-                              )}
+                              {showGroupHeaders && <span className="text-xs">└</span>}
                               <button
                                 type="button"
                                 className="flex min-w-0 flex-1 items-center gap-1 text-left"
