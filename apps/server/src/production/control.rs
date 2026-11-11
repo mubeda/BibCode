@@ -2429,7 +2429,11 @@ fn validate_default_agent(value: &Value, field: &str) -> Result<(), String> {
         .ok_or_else(|| format!("{field} must be an object"))?;
     match selection.get("kind").and_then(Value::as_str) {
         Some("chat" | "terminal") => {}
-        _ => return Err(format!("{field}.kind must be either \"chat\" or \"terminal\"")),
+        _ => {
+            return Err(format!(
+                "{field}.kind must be either \"chat\" or \"terminal\""
+            ));
+        }
     }
     validate_slug(
         selection
