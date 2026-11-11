@@ -47,6 +47,19 @@ describe("theme export and import", () => {
     expect(plan).toEqual({ ok: true, theme: night, resetPairs: [], conflict: false });
   });
 
+  it("a translucent Dark background with card text at 4.5:1 on the derived card keeps that text", async () => {
+    const { transfer } = await load();
+    const file: ThemeFile = {
+      version: 1,
+      id: "alpha-background",
+      name: "Alpha background",
+      base: "dark",
+      ui: { background: "#000000e6", "card-foreground": "#787779" },
+    };
+    const plan = transfer.planThemeImport(JSON.stringify(file));
+    expect(plan).toEqual({ ok: true, theme: file, resetPairs: [], conflict: false });
+  });
+
   it("invalid JSON gives one error on the file field", async () => {
     const { transfer } = await load();
     const plan = transfer.planThemeImport("{ not json");

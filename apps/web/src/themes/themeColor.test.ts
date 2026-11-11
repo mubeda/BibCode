@@ -1,7 +1,8 @@
-import type { ThemeFile } from "@bibcode/contracts";
+import { type ThemeFile, UI_COLOR_TOKENS } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { BASE_TOKEN_VALUES, DERIVED_DEFAULTS } from "./baseTokenValues";
+import { BUILTIN_THEMES } from "./builtinThemes";
 import { derivedDeclarations, evaluateCssTokens } from "./cssTokenEvaluator.testSupport";
 import {
   contrastRatio,
@@ -19,6 +20,9 @@ const theme = (base: "light" | "dark", ui: Record<string, string> = {}): ThemeFi
   base,
   ui,
 });
+
+/** A Dark theme whose card text sits at the 4.5:1 threshold on the derived, translucent card. */
+const ALPHA_BACKGROUND = theme("dark", { background: "#000000e6", "card-foreground": "#787779" });
 
 // Each derived token and a token it depends on, from index.css lines 243 to 331.
 const DERIVED_SOURCES: Record<string, string> = {
@@ -62,17 +66,47 @@ describe("resolveToken against the stylesheet", () => {
       for (const token of derived) {
         const source = DERIVED_SOURCES[token];
         expect(source, `${base} ${token} has a known source`).toBeDefined();
-        // Both sides start from the base background in hex; the stylesheet alone keeps Dark's
-        // background unrounded, which would shift a token two steps from it by one channel step.
-        const overrides = {
-          background: BASE_TOKEN_VALUES[base].background!,
-          [source!]: "#123456",
-        };
+        const overrides = { [source!]: "#123456" };
         expect(resolveToken(theme(base, overrides), token), `${base} ${token}`).toBe(
           evaluateCssTokens(base, overrides)(token),
         );
       }
     }
+  });
+
+  it("on unmodified defaults every derived token equals its painted value and its base value", () => {
+    for (const base of ["light", "dark"] as const) {
+      for (const token of Object.keys(DERIVED_DEFAULTS[base])) {
+        const resolved = resolveToken(theme(base), token);
+        expect(resolved, `${base} ${token}`).toBe(evaluateCssTokens(base)(token));
+        expect(resolved, `${base} ${token}`).toBe(BASE_TOKEN_VALUES[base][token]);
+      }
+    }
+  });
+
+  it("every color token of the built-ins and of a translucent-background theme equals its painted value", () => {
+    for (const file of [...BUILTIN_THEMES, ALPHA_BACKGROUND]) {
+      // The paint record sets each override as hex (paintRecordFor).
+      const painted = evaluateCssTokens(
+        file.base,
+        Object.fromEntries(
+          Object.entries(file.ui ?? {})
+            .filter(([token]) => (UI_COLOR_TOKENS as readonly string[]).includes(token))
+            .map(([token, value]) => [token, toHex(value)]),
+        ),
+      );
+      for (const token of UI_COLOR_TOKENS) {
+        expect(resolveToken(file, token), `${file.id} ${token}`).toBe(painted(token));
+      }
+    }
+  });
+
+  it("rounds only the final hex, so a translucent Dark background derives card #060606e7", () => {
+    // 230/255 * 98% + 2% of alpha is 230.5/255, which rounds up to e7 (4.50065:1 with the text).
+    expect(resolveToken(ALPHA_BACKGROUND, "card")).toBe("#060606e7");
+    expect(resolveToken(ALPHA_BACKGROUND, "popover")).toBe("#060606e7");
+    const failing = failingPairs(ALPHA_BACKGROUND, 4.5).map(({ pair }) => pair.text);
+    expect(failing).not.toContain("card-foreground");
   });
 });
 
