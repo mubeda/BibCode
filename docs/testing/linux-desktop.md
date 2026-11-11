@@ -131,6 +131,17 @@ forced theme selection, user theme overrides, missing and drifted hooks failing
 without post-processing mutations, discovery passthrough, and upstream failure
 propagation.
 
+Run the AppImage GStreamer wrapper regression too:
+
+```sh
+vp test scripts/tauri-linuxdeploy-plugin-gstreamer.test.ts
+```
+
+It covers the core/base/good-only plugin check (a plugin from another source
+package, or owned by no package, fails before the AppDir changes), the empty
+plugin folder, Wayland library removal after the upstream plugin re-runs
+linuxdeploy, the required plugin scanner and hook, and discovery passthrough.
+
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
 
@@ -172,6 +183,23 @@ directory, downgrade desktop libraries, or bypass the pinned plugin to make
 packaging pass. `--plugin-api-version` discovery does not require GTK metadata.
 Successful local DEB/RPM packaging does not qualify the AppImage; its release
 build and artifact checks must still pass on the documented baseline.
+
+The AppImage also bundles GStreamer plugins
+(`bundle.linux.appimage.bundleMediaFramework` in `tauri.linux.conf.json`): the
+bundled GStreamer core, from the Ubuntu 22.04 build host, rejects the plugins
+of newer distributions, so without its own it finds no audio sink. The pinned
+upstream plugin copies every file in the host's
+`/usr/lib/<arch>-linux-gnu/gstreamer-1.0`, so every AppImage build host installs
+`gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `gstreamer1.0-alsa`
+and `gstreamer1.0-pulseaudio` (the plugin scanner comes with
+`libgstreamer1.0-0`) and must not have `gstreamer1.0-plugins-bad`,
+`gstreamer1.0-plugins-ugly` or `gstreamer1.0-libav`. The BiBCode wrapper asks
+`dpkg-query` which source package owns each plugin and fails unless all come
+from `gstreamer1.0`, `gst-plugins-base1.0` or `gst-plugins-good1.0`; uninstall
+the reported packages instead of bypassing it. These sets are LGPL-2.1-or-later
+(source: <https://gstreamer.freedesktop.org/src/>, and the Ubuntu 22.04 source
+packages of the same names); the AppImage ships them as unmodified shared
+libraries that BiBCode and WebKitGTK load dynamically.
 
 ### User-facing child environment isolation
 
@@ -389,6 +417,13 @@ contain no `gsettings get org.gnome.desktop.interface gtk-theme` line, no
 ```sh
 if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi
 ```
+
+The same extracted copy must hold `usr/lib/gstreamer-1.0/` with the core,
+base and good plugins (at least `libgstcoreelements.so`, `libgstapp.so`,
+`libgstplayback.so`, `libgstwavparse.so` and `libgstautodetect.so`), the
+scanner at `usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner`, and
+`apprun-hooks/linuxdeploy-plugin-gstreamer.sh`. The Desktop UI smoke workflow
+checks these files.
 
 Record the backend actually used by the packaged BiBCode window, alongside the
 desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any

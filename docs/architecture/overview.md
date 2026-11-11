@@ -473,7 +473,11 @@ Git and source-control helpers (including review Git commands), server-launched
 editors/file managers, and desktop-owned SSH, Tailscale, and host
 backend-shutdown `kill` commands. Isolation changes only the selected command.
 The desktop process, WebKitGTK-owned children, and BiBCode's own binaries retain
-the bundled environment, with one exception: at the top of `main`, before any
+the bundled environment. The AppImage bundles the GStreamer core, base and good
+plugins its own GStreamer core can load, and the launcher points
+`GST_PLUGIN_SYSTEM_PATH_1_0` at them, so WebKitGTK plays audio without the
+system's plugins, which a newer distribution's GStreamer builds for a newer core.
+As a fallback for a build made without plugins, at the top of `main`, before any
 thread starts, the Linux desktop removes `GST_PLUGIN_SYSTEM_PATH_1_0` and
 `GST_PLUGIN_SYSTEM_PATH` when they start with the launcher's plugin folder and
 the bundle does not contain it, or when none of the folders they name exist, so
