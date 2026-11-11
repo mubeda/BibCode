@@ -6070,6 +6070,30 @@ describe("ChatView handlers (captured from mocked children)", () => {
       }
     });
 
+    it("opens one terminal review per double click, and again after a failed open", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "terminal", instanceId: claudeInstanceId } });
+      seedServerThread(makeThread());
+      const firstOpen = deferredResult<ReturnType<typeof AsyncResult.success<void>>>();
+      h.commandResults["terminal.open"] = () => firstOpen.promise;
+      const view = await mountServerReview();
+      try {
+        await act(async () => {
+          view.review().onStart(SCOPE);
+          view.review().onStart(SCOPE);
+        });
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        await act(async () => {
+          firstOpen.resolve(AsyncResult.failure(Cause.fail(new Error("spawn failed"))) as never);
+          await firstOpen.promise;
+        });
+        h.commandResults["terminal.open"] = () => AsyncResult.success(undefined);
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(2));
+      } finally {
+        await view.unmount();
+      }
+    });
+
     it.each([
       ["chat Codex", { kind: "chat" as const, instanceId: codexInstanceId }],
       ["Claude Terminal", { kind: "terminal" as const, instanceId: claudeInstanceId }],
