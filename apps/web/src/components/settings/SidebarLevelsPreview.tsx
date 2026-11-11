@@ -76,7 +76,10 @@ function Worktree(props: {
  */
 export function SidebarLevelsPreview() {
   return (
-    <figure aria-label="Sidebar preview" className="m-0 mb-2 rounded-lg bg-sidebar-well p-2">
+    <figure
+      aria-label="Sidebar preview"
+      className="m-0 mb-2 w-full max-w-80 rounded-lg bg-sidebar-well p-2"
+    >
       <ul inert className="grid gap-1 text-foreground">
         <li
           data-sidebar-level="repo"
