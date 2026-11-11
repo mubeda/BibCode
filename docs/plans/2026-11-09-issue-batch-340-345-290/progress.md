@@ -1,7 +1,7 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 d0c29ad67ddb)
+Spec: spec.md (sha256 dd37e165b821)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
@@ -54,6 +54,8 @@ Branch: claude/next-pr-planning-13d367
 | 8.6  | Desktop end-to-end test for export and the close dialog                   | 8     | Open   |               | Added by plan review 3             |
 | 6.10 | A checkbox in a read-only file keeps source history                       | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
 | 3.4  | A status refresh does not wait on a slow pull-request lookup              | 3     | Closed | E to E4, opus | Merged; A7 table, 26 lookup tests  |
+| 10.1 | Sidebar level tokens, their styles and the editor preview                 | 10    | Open   |               | Added by amendment A9              |
+| 10.2 | The left panel draws the five levels                                      | 10    | Open   |               | Added by amendment A9              |
 
 ## Log
 
@@ -121,3 +123,4 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 19:45 Ruling: amendment A8 to R40 and D9, from the user after trying the dev build: clicking a theme row applies it and switches the mode to its base (System included), with Undo; the list groups Light and Dark themes, marks the one in use, and keeps Duplicate, Edit, Export and Delete off the row's click target. Task 7.8 reopens for it. The sidebar-hierarchy extension stays out of this PR (D2) and is filed in Task 8.5.
 - 2026-11-10 20:25 Lane D5 (lane-d5, f1897c4bf..a8e52af4f) built A8: the theme row is the control, cross-mode clicks switch the mode with Undo, themes grouped Light and Dark, secondary actions in a row menu. Codex review (astra), triaged with the advisor: accepted Undo half-applying or overwriting a newer choice, the row menu's touch area overlapping the row, focus lost after the Delete confirmation, and two desktop e2e specs left looking for the removed General theme control.
 - 2026-11-11 07:20 Lane D6 (lane-d6, 2b8292863..482b81df2) fixed them: Undo is an inline status line under the theme's group, valid only while the live mode and slot match; 44 px reserved for the row menu; focus moves after Cancel and Delete; the two specs and two runbook lines point at Settings > Appearance > Mode. Codex review of D6 (astra), triaged with the advisor: two storage-failure findings parked under the stop rule. 7.8 Closed and integrated (cherry-picked f1897c4bf..482b81df2). Evidence on the branch: web suite 11093 passed, scripts 921 passed, vp check, vp run typecheck, markdown links, all exit 0; a cross-mode row click and Undo checked in the dev build.
+- 2026-11-11 08:40 Ruling: amendment A9, approved by the user after trying the dev build: the sidebar-hierarchy extension of #290 comes into this PR as Phase 10 (R63 to R65, D21: eight new tokens next to the existing sidebar tokens, not the issue's eighteen), reversing that part of D2. Task 8.5 no longer files the follow-up issue; Task 8.2 gains a sidebar case. The user approves the look between Tasks 10.1 and 10.2.

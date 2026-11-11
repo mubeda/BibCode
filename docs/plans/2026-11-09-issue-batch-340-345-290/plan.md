@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 d0c29ad67ddb)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 dd37e165b821)
 Repository: this repository
 Base: main
 
@@ -37,6 +37,8 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A5 (approved by the user in chat on 2026-11-10 during execution). Theme export in the desktop app uses a new save-file desktop bridge command with the native Save dialog, because wry cancels webview downloads when no download handler exists (R53 gains a desktop scenario). Closing the desktop window or quitting with unsaved Files edits asks first with Save all, Discard and Cancel (new R62), filed into this PR by the user instead of a separate issue. Both are Phase 9.
 - A6 (R34, approved by the user in chat on 2026-11-10 during execution). A task checkbox ticked in a read-only Markdown file keeps that file's source Undo history (Task 6.10), instead of R34's "as today".
 - A7 (R18, approved by the user in chat on 2026-11-10 during execution). A status refresh does not wait on a slow pull-request lookup: it answers with local status within a bound and the details follow on the status stream (Task 3.4).
+- A8 (R40, D9, approved by the user in chat on 2026-11-10 during execution). Clicking a theme row applies the theme and switches the mode to its base, with Undo (Task 7.8 reopened and closed again).
+- A9 (approved by the user in chat on 2026-11-11 during execution). The sidebar-hierarchy extension of #290 comes into this plan as Phase 10 (R63 to R65, D21), reversing that part of D2. Task 8.5 no longer files a follow-up issue for it.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus
@@ -77,17 +79,18 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 
 ## Phases
 
-| Phase | File                                          | Goal                                                                   | Round | Depends on             | Tier         |
-| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | ---------------------- | ------------ |
-| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                   | standard     |
-| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                   | most capable |
-| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                      | most capable |
-| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                      | most capable |
-| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                      | most capable |
-| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                   | most capable |
-| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                   | most capable |
-| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates, follow-up issue                    | 5     | 1, 2, 3, 4, 5, 6, 7, 9 | standard     |
-| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                   | most capable |
+| Phase | File                                          | Goal                                                                   | Round | Depends on                 | Tier         |
+| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | -------------------------- | ------------ |
+| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                       | standard     |
+| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                       | most capable |
+| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                          | most capable |
+| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                          | most capable |
+| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                          | most capable |
+| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                       | most capable |
+| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                       | most capable |
+| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates                                     | 5     | 1, 2, 3, 4, 5, 6, 7, 9, 10 | standard     |
+| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                       | most capable |
+| 10    | phases/PHASE-10-sidebar-hierarchy.md          | Five readable sidebar levels that themes can style (A9)                | 3     | 7, 9                       | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds. Tasks inside a phase run one after another, in the order their Depends on lines give: one lane per phase, never one lane per task. The four server phases (2, 3, 4, 5) are a chain because they share `repository.rs`, `git_vcs.rs` and `manager/operations.rs`. Run at most one lane that compiles Rust at a time, and check `df -h .` for at least 60 GB free before a lane starts a build.
 
@@ -220,6 +223,9 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R60         | 7.8                 |
 | R61         | 7.5                 |
 | R62         | 9.2, 9.3, 8.6       |
+| R63         | 10.1, 10.2, 8.2     |
+| R64         | 10.2                |
+| R65         | 10.1                |
 
 ## End-to-end verification
 

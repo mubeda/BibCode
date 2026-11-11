@@ -1,6 +1,6 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A8 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
 Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
 
@@ -47,7 +47,6 @@ Seven open issues block or degrade daily work:
 - Signing in to Git on a remote server from the client (#343 P1). It needs its own design for secret handling.
 - Shortcuts, image paste, slash-menu extras, `.mdx` rich editing and a third preview mode for #342. They follow once the toolbar set works.
 - Drawing annotations in the browser preview with theme colors (R58 covers reporting the colors only). The preview bridges ignore the annotation theme today, and wiring them is a separate change.
-- The sidebar-hierarchy extension at the end of #290. It moves to its own issue, because it redesigns five sidebar levels and adds about 18 tokens.
 - Custom syntax colors, importing themes from other apps, server-side theme sync and a theme CLI (#290 P2).
 - Changing the pull-request checks tab for #340. It is a different renderer.
 - Changing pull and fetch gating for #345. Pull rewrites files at its end, so reads stay gated.
@@ -1052,6 +1051,54 @@ WHEN the person closes the desktop window or quits the app while any Files edit 
 - WHEN the window is closed
 - THEN it closes at once with no dialog
 
+### R63. The left panel shows five distinct levels in every built-in theme [Must] (amendment A9)
+
+The left panel SHALL draw the repository or project card, the environment band, the primary checkout, a worktree and a chat row so that each differs from the others by more than color: the environment band has its own surface and a leading accent rule; the primary checkout has an accent-tinted badge with an icon and a heavier label; a worktree has a branch icon, an indent guide under its environment and its own surface; a chat row is smaller and lighter than a checkout row. This holds in both the Environments and the Repositories view and in each of the six built-in themes, and every text and surface pair of these levels SHALL keep at least 4.5:1.
+
+#### Scenario: fixture sidebar
+
+- GIVEN a sidebar with one repository, two environments, one primary checkout, two worktrees and a chat under each checkout, in each built-in theme
+- WHEN it is painted
+- THEN each element carries its level (`repo`, `environment`, `checkout`, `worktree`, `chat`), the primary checkout is marked as primary, the level surfaces and markers of that theme resolve to values that differ from each other, and every level's text meets 4.5:1 on its surface
+
+#### Scenario: primary without reading the badge
+
+- GIVEN a primary checkout and a worktree side by side
+- WHEN the badge text is ignored
+- THEN the primary checkout is still told apart by its icon and label weight, and the worktree by its branch icon and indent guide
+
+### R64. The existing card states survive the redesign [Must] (amendment A9)
+
+The left panel SHALL keep every card outlined, the active card's stronger border, the tinted multi-selected card, the focus ring, the hover state and the dimmed unavailable environment, and a selected worktree SHALL be clearly stronger than a hovered one.
+
+#### Scenario: states on a worktree
+
+- GIVEN a worktree row
+- WHEN it is hovered, then selected, then focused by keyboard
+- THEN each state is visible and differs from the others, and the selected state differs from hover by more than a slight tint
+
+### R65. Themes can style each sidebar level [Must] (amendment A9)
+
+The supported tokens SHALL include `sidebar-env-accent`, `sidebar-primary-badge`, `sidebar-primary-badge-foreground`, `sidebar-worktree`, `sidebar-worktree-border`, `sidebar-worktree-icon`, `sidebar-chat-foreground` and `sidebar-indent-guide`, next to the existing `sidebar-well`, `sidebar-card`, `sidebar-card-border`, `sidebar-env-band` and `sidebar-card-shadow`. A theme file without them SHALL get values derived from its base, so existing theme files keep working. The theme editor's Sidebar group SHALL offer every one of them and SHALL show a live preview of the five levels built from fixture data, drawn by the same styles as the real left panel. Export and import SHALL carry them, and the contrast check of R54 to R56 SHALL cover the new text and surface pairs.
+
+#### Scenario: old theme file
+
+- GIVEN a custom theme saved before these tokens existed
+- WHEN it is applied
+- THEN the left panel shows the five levels with values derived from the theme's base and nothing is reported as invalid
+
+#### Scenario: custom worktree color
+
+- GIVEN a custom theme that sets `sidebar-worktree` and `sidebar-primary-badge`
+- WHEN it is edited in the theme editor
+- THEN the preview and the real left panel repaint with those values, and an export followed by an import keeps them
+
+#### Scenario: unreadable level
+
+- GIVEN an imported theme whose `sidebar-primary-badge-foreground` on `sidebar-primary-badge` is below 4.5:1 and below the base's ratio
+- WHEN it is imported
+- THEN that pair falls back as R55 describes
+
 ## Constraints and assumptions
 
 - **Public repository.** No real host, organization, person or machine path appears in code, tests, fixtures or this folder. Tests use `example-server`, `gitlab.example.test`, `test-user` and disposable folders. (Repository rule: AGENTS.md, Sensitive Data.)
@@ -1072,7 +1119,7 @@ WHEN the person closes the desktop window or quits the app while any Files edit 
 
 D1. One pull request closes all seven issues. Alternatives considered: one pull request per issue, which is easier to review but was not what the maintainer asked for. Decided by: user. Source: request of 2026-11-09.
 
-D2. Scope per issue is the first priority tier of #340, #342 and #343 plus matching help text; all of #341, #344 and #345; and the first two tiers of #290 without its sidebar extension. Alternatives considered: including #343 remote sign-in (needs a secret-handling design), #342 shortcuts and paste (deferred to keep the first slice provable), the #290 sidebar extension (a separate redesign). Decided by: user. Source: round 1, questions 1 and 2.
+D2. Scope per issue is the first priority tier of #340, #342 and #343 plus matching help text; all of #341, #344 and #345; and the first two tiers of #290. Its sidebar extension was first left out and came back in by amendment A9 (2026-11-11, user, after trying the dev build: the left panel still did not show which row is a repository, a machine, the main checkout or a worktree); see R63 to R65 and D21. Alternatives considered: including #343 remote sign-in (needs a secret-handling design), #342 shortcuts and paste (deferred to keep the first slice provable), the #290 sidebar extension (a separate redesign). Decided by: user. Source: round 1, questions 1 and 2.
 
 D3. Design notes for #342 and #290 count as approved after Codex and advisor review. Alternatives considered: waiting for the maintainer to approve each note, which the issues ask for but which stops an unattended run. Decided by: user. Source: round 1, question 3.
 
@@ -1107,6 +1154,8 @@ D17. New color tokens are named `foreground-strong`, `placeholder`, `primary-hov
 D18. Built-in names are "Tokyo Night", "Matrix Dark", "Matrix Light" and "Verdant Light", with the source named in each row's subtitle. Tokyo Night and Matrix Dark keep their source values, including ANSI black equal to the background and Matrix Dark's softer accent. Alternatives considered: brightening Matrix Dark toward the mockups (departs from the cited source). Decided by: agent's call. Source: #290 open questions 6, 7, 9 and 11.
 
 D20. Review-driven clarifications: "remote server" means any server the desktop app did not start inside itself; a creation record ends when its folder is gone; several rendered edits in one visit are one undo step in source view; the list of constructs that keep a file read-only is the one in R34; an unset token keeps its base definition, including derived ones; the theme format and the editor cover every supported token instead of a shorter curated list, because the built-in themes already set about 35 of them; contrast minimums bind the four new built-ins and not Light and Dark; a low-contrast import has the failing overrides removed from what is stored. Alternatives considered: a curated editor list of about 20 tokens (a duplicate of a built-in would carry values the person cannot edit); painting base values for failing pairs without changing the stored theme (export and re-import would then disagree with what is shown). Decided by: agent's call. Source: independent read of 2026-11-09.
+
+D21. The sidebar levels reuse the existing sidebar tokens and add eight (R65) instead of the issue's eighteen. Alternatives considered: the issue's full list (it renames `sidebar-card`, `sidebar-card-border`, `sidebar-env-band` and `sidebar-card-shadow`, which would need aliases or break saved themes), a separate selected-worktree token (selection keeps the primary-tinted states of R64), a sidebar radius token (the `radius` token already exists). New defaults for Light and Dark are intended; R50's "today's look" covers only the six roles it names. Levels are styled in one place from `data-sidebar-level` and `data-primary` attributes, with no new subscriptions in the sidebar. Decided by: agent's call, after the user's go-ahead for A9. Source: #290 Extension, parts 1 and 2.
 
 D19. A theme with no terminal colors uses its base's built-in terminal palette, and the custom theme library holds at most 64 themes. Alternatives considered: deriving the terminal background from the UI background (breaks the reason the terminal is decoupled). Decided by: agent's call. Source: #290 open question 4 and Orca's limit.
 
@@ -1146,7 +1195,7 @@ Input classes no scenario names, and their expected behavior:
 
 ## Open questions
 
-- Which GitHub issue number tracks the sidebar-hierarchy extension split out of #290? Owner: the plan's last task, which files it. Can wait because: it does not change any requirement here.
+- None since amendment A9 brought the sidebar-hierarchy extension into this spec (R63 to R65).
 
 ## Appendix: interview record
 

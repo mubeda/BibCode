@@ -1,8 +1,8 @@
 # Phase 8: End-to-end tests, documents and final gates
 
-- Goal: The combined branch is proven in the packaged desktop app, the user guide, runbooks, notices and changelog describe the seven changes, every repository gate passes, and the split-out follow-up issue exists.
+- Goal: The combined branch is proven in the packaged desktop app, the user guide, runbooks, notices and changelog describe the seven changes, every repository gate passes, and the final report is written.
 - Round: 5
-- Depends on: 1, 2, 3, 4, 5, 6, 7, 9
+- Depends on: 1, 2, 3, 4, 5, 6, 7, 9, 10
 - Owns: `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts`, `apps/desktop/e2e/specs/desktop-save-and-close.e2e.ts`, `apps/desktop/e2e/support/app-lifecycle.ts`, `apps/desktop/e2e/wdio.conf.ts`, `docs/user/workspace-ui.md`, `docs/testing/**`, `apps/web/THIRD_PARTY_NOTICES.md`, `CHANGELOG.md`, and the one selected-state class in `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx`
 - Must not touch: source files of Phases 2 to 7 except to fix a defect an end-to-end test or a gate exposes, which reopens the owning task
 - Skills: issue-delivery (acceptance evidence per issue before any costly run)
@@ -32,12 +32,12 @@ Steps
 1. [ ] Confirm Task 8.4 is Closed, so no source change follows the build, then run `vp run test:ui:desktop:build` on the exact commit that will be reviewed. Expected: exits 0 and the packaged app exists at the path the runbook for this system names. On macOS set `BIBCODE_E2E_PLATFORM`, `BIBCODE_E2E_ARCH` and `BIBCODE_E2E_APP_PATH` as `docs/testing/macos-desktop.md` describes; on Linux prefix the run with `xvfb-run --auto-servernum`.
 2. [ ] Write the spec with a fixture `notes.md` (frontmatter, a paragraph "Hello world", a fenced code block) and three tests: `edits in rendered view, saves and keeps the rest of the file` (type " again", apply Heading 2 to the paragraph, press Save file, read the file from disk and assert the frontmatter and fence bytes are unchanged and the paragraph is `## Hello world again`); `undo in rendered view and one-step undo in source view` (Undo removes the heading; make two more edits, switch to source, one Undo removes both); `opening and saving without editing leaves the file byte-identical`.
 3. [ ] Add the spec to the default list in `wdio.conf.ts`.
-4. [ ] Run `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts vp run test:ui:desktop`. Expected: PASS, 4 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 6 task that owns it.
+4. [ ] Run `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts vp run test:ui:desktop`. Expected: PASS, 5 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 6 task that owns it.
 5. [ ] Run `vp check` and `vp run typecheck`. Expected: no errors.
 
 ### Task 8.2: Desktop end-to-end test for themes
 
-- Satisfies: R37 (Tokyo Night values), R40 (dark theme in Light mode; Undo), R41 (switch back to a built-in), R42 (reload with a custom theme), R44 (duplicate a built-in), R47 (edit and cancel)
+- Satisfies: R37 (Tokyo Night values), R40 (dark theme in Light mode; Undo), R63 (fixture sidebar levels are marked), R41 (switch back to a built-in), R42 (reload with a custom theme), R44 (duplicate a built-in), R47 (edit and cancel)
 - Depends on: 8.1
 - Files: create `apps/desktop/e2e/specs/appearance-themes.e2e.ts`; modify `apps/desktop/e2e/wdio.conf.ts`; run (lane D6 updated them for the Appearance Mode control) `apps/desktop/e2e/specs/platform-capabilities.e2e.ts` and `apps/desktop/e2e/specs/chat-activity-panel.e2e.ts`
 - Interfaces: consumes the packaged build of Task 8.1, the route `/settings/appearance`, the theme row buttons (`data-theme-select`), the Mode group, the Undo action and the accessible names "More actions for <name>", "Duplicate", "Edit", "Save" and "Cancel" from Phase 7 (amendment A8); produces one spec file registered in the default list.
@@ -45,13 +45,13 @@ Steps
 - Read first: `apps/desktop/e2e/specs/main-window.e2e.ts` (how a spec opens Settings and reloads the window)
 - Tier: standard
 - TDD: exempt (an end-to-end check of behavior the unit tests of Phase 7 already pin; it adds no new behavior)
-- Done when: `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop` exits 0 with 4 passing tests, and the two updated specs pass
+- Done when: `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop` exits 0 with 5 passing tests, and the two updated specs pass
 
 Steps
 
-1. [ ] Write the spec with four tests: `a dark theme row clicked in Light mode switches to Dark, and Undo restores Light` (amendment A8: set the mode to Light, click the Matrix Dark row, assert the root has `.dark` and the mode is Dark, use Undo, assert Light and the previous dark slot); `Tokyo Night repaints the app and Dark restores it` (set the mode to Dark, click the Tokyo Night row, assert the computed `--background` on the root element is `#1a1b26`; select Dark, assert no inline `--background` remains); `a duplicated theme can be edited with live preview and cancelled` (Duplicate Tokyo Night, Edit, change primary to `#ff0000`, assert the computed `--primary`, Cancel, assert `#7aa2f7`); `a saved custom theme is painted again after a reload` (save a custom dark theme with background `#101820`, reload the window, assert the root background is `#101820`).
+1. [ ] Write the spec with five tests: `the left panel marks its levels` (amendment A9: with the fixture project open, assert an element with `data-sidebar-level="repo"`, one with `data-sidebar-level="checkout"` and `data-primary`, and one with `data-sidebar-level="chat"` exist, in Light and in Tokyo Night); `a dark theme row clicked in Light mode switches to Dark, and Undo restores Light` (amendment A8: set the mode to Light, click the Matrix Dark row, assert the root has `.dark` and the mode is Dark, use Undo, assert Light and the previous dark slot); `Tokyo Night repaints the app and Dark restores it` (set the mode to Dark, click the Tokyo Night row, assert the computed `--background` on the root element is `#1a1b26`; select Dark, assert no inline `--background` remains); `a duplicated theme can be edited with live preview and cancelled` (Duplicate Tokyo Night, Edit, change primary to `#ff0000`, assert the computed `--primary`, Cancel, assert `#7aa2f7`); `a saved custom theme is painted again after a reload` (save a custom dark theme with background `#101820`, reload the window, assert the root background is `#101820`).
 2. [ ] Add the spec to the default list in `wdio.conf.ts`.
-3. [ ] Run `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop`. Expected: PASS, 4 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 7 task that owns it.
+3. [ ] Run `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts vp run test:ui:desktop`. Expected: PASS, 5 tests; then run the two updated specs, expected PASS. A failure that shows a product defect reopens the Phase 7 task that owns it.
 4. [ ] Take four screenshots through the WebDriver session for the final report, saved outside the repository: the Appearance section in Light and in Tokyo Night, and the Files toolbar with the More menu open in Light and in Dark. Expected: four image files exist; they use fixture data only.
 5. [ ] Run `vp check` and `vp run typecheck`. Expected: no errors.
 
@@ -134,5 +134,5 @@ Steps
 2. [ ] Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p bibcode-server -j 2`. Expected: each exits 0.
 3. [ ] Run `vp run check:contracts`, `vp run check:dependency-ledger` and `vp run check:markdown-links`. Expected: each exits 0, with no diff under `packages/contracts/fixtures`.
 4. [ ] Run `git diff main...HEAD --stat` and `git status --short`, and read the diff for debug output, generated files other than `routeTree.gen.ts` and `pnpm-lock.yaml`, and sensitive data (real hosts, names, machine paths). Expected: none found. Run `vp test run scripts`. Expected: PASS, including the sensitive-data guard.
-5. [ ] Create the follow-up issue the user authorized on 2026-11-09: `gh issue create --title "Sidebar: make the hierarchy readable and let themes style each card level" --label enhancement --body-file <scratch file>`, where the body is the "Extension" section of issue #290 with its acceptance criteria and a line saying it was split out of #290. Expected: the command prints the new issue URL. Record the number in `progress.md`. Create no other issue, and do not push or open a pull request unless the user asks.
+5. [ ] No follow-up issue is filed for the sidebar hierarchy: amendment A9 brought it into this plan as Phase 10. Create no issue, and do not push or open a pull request unless the user asks.
 6. [ ] Write the final report: outcome per issue against its acceptance criteria; the profiler coverage line (child processes: the Git stop policy and lock cleanup of Phase 2; shutdown: the lock-cleanup wait before the profiler teardown; findings: the `worktree.orphan-dir` rule and evidence fields of Phase 5; RPC methods: none added, `is_long_running` unchanged; logs: the lock-removal warning; Phase 9: the close-request warnings when the web never acknowledges or keepalives stop, and the shutdown order that holds quit before the server stops); the review results of Phase 9's dialog; the React best-practices and UI.md review results recorded by Phases 1, 4, 6 and 7; the runbook review result; every Ruling; what was not run and why (the pipeline detail view of #340 is proven by component tests, per spec amendment A2); residual risks; and the exact commands run.
