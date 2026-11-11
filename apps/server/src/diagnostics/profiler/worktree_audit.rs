@@ -1003,15 +1003,33 @@ mod tests {
                 (PathBuf::from("/base/repo/owned"), true),
                 (PathBuf::from("/base/repo/registered"), true),
             ]),
+            evidence: HashMap::from([
+                (
+                    PathBuf::from("/base/repo/owned"),
+                    WorktreeEvidence::CreationRecord,
+                ),
+                (
+                    PathBuf::from("/base/repo/registered"),
+                    WorktreeEvidence::GitPointerFile,
+                ),
+                (
+                    PathBuf::from("/base/repo/orphan"),
+                    WorktreeEvidence::CreationRecord,
+                ),
+            ]),
             ..AuditFacts::default()
         };
         let found = kinds(&facts);
         assert_eq!(found[0].0, "worktree.orphan-dir");
         assert_eq!(found[0].1[0], "unowned-unregistered");
-        // Another tool's hidden entry is not BiBCode's leftover (#105).
+        // Another tool's hidden entry is not BiBCode's leftover (#105), even with evidence.
         facts
             .base_dirs
             .push(PathBuf::from("/base/repo/.orca-worktree-trash"));
+        facts.evidence.insert(
+            PathBuf::from("/base/repo/.orca-worktree-trash"),
+            WorktreeEvidence::GitPointerFile,
+        );
         assert_eq!(kinds(&facts), found);
         assert_eq!(
             found
@@ -1019,6 +1037,235 @@ mod tests {
                 .filter(|(kind, _)| *kind == "worktree.orphan-dir")
                 .count(),
             1
+        );
+    }
+
+    /// A managed worktree directory in a disposable folder, in its physical spelling.
+    fn managed_dir() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let managed = std::fs::canonicalize(root.path()).unwrap().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        (root, managed)
+    }
+
+    /// Resolves every child of `managed` as one complete managed directory, with the given
+    /// creation records and incomplete removal receipts, and audits the result.
+    fn audit_children(
+        managed: &Path,
+        recorded: Vec<(String, String)>,
+        incomplete: Vec<String>,
+    ) -> (AuditFacts, Vec<FindingInput>) {
+        let children = std::fs::read_dir(managed)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let comparison = resolve(
+            Vec::new(),
+            HashMap::from([(managed.to_path_buf(), true)]),
+            HashMap::from([(managed.to_path_buf(), children)]),
+            Vec::new(),
+            Evidence {
+                recorded,
+                incomplete,
+            },
+            &CancellationToken::new(),
+        );
+        let facts = AuditFacts {
+            base_dirs: comparison.base_dirs,
+            evidence: comparison.evidence,
+            managed_dirs: comparison.managed_dirs,
+            ..AuditFacts::default()
+        };
+        let findings = audit(&facts);
+        (facts, findings)
+    }
+
+    fn orphan_reasons(findings: &[FindingInput]) -> Vec<(String, String)> {
+        findings
+            .iter()
+            .filter(|finding| finding.kind == "worktree.orphan-dir")
+            .map(|finding| {
+                (
+                    finding.evidence["name"].as_str().unwrap().to_owned(),
+                    finding.evidence["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn record(path: &Path) -> (String, String) {
+        ("/repo".to_owned(), path.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn a_folder_without_worktree_evidence_is_not_an_orphan() {
+        let (_root, managed) = managed_dir();
+        let container = managed.join("container");
+        std::fs::create_dir_all(container.join("project/src")).unwrap();
+        std::fs::write(container.join("project/README.md"), "a project\n").unwrap();
+        std::fs::write(container.join("project/src/main.rs"), "fn main() {}\n").unwrap();
+        // The name does not matter: a plain folder named like a worktree has no evidence either.
+        std::fs::create_dir(managed.join("feature-a")).unwrap();
+        // A clone's `.git` directory is not a worktree's pointer file.
+        std::fs::create_dir_all(managed.join("clone/.git")).unwrap();
+        let (facts, findings) = audit_children(&managed, Vec::new(), Vec::new());
+        assert_eq!(orphan_reasons(&findings), Vec::<(String, String)>::new());
+        assert!(
+            facts
+                .base_dirs
+                .iter()
+                .all(|dir| dir.parent() == Some(managed.as_path())),
+            "the audit lists no path below a child: {:?}",
+            facts.base_dirs
+        );
+    }
+
+    #[test]
+    fn a_leftover_with_a_creation_record_is_an_orphan_without_git() {
+        let (root, managed) = managed_dir();
+        std::fs::create_dir(managed.join("feature-a")).unwrap();
+        // The record keeps the spelling it was written with, which may be a linked one.
+        let written = root.path().join("managed/feature-a");
+        let (_, findings) = audit_children(&managed, vec![record(&written)], Vec::new());
+        assert_eq!(
+            orphan_reasons(&findings),
+            [("feature-a".to_owned(), "creation-record".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_leftover_with_only_a_git_pointer_file_is_an_orphan() {
+        let (_root, managed) = managed_dir();
+        std::fs::create_dir(managed.join("feature-a")).unwrap();
+        std::fs::write(
+            managed.join("feature-a/.git"),
+            "gitdir: /repo/.git/worktrees/feature-a\n",
+        )
+        .unwrap();
+        std::fs::create_dir(managed.join("not-a-pointer")).unwrap();
+        std::fs::write(managed.join("not-a-pointer/.git"), "something else\n").unwrap();
+        let (_, findings) = audit_children(&managed, Vec::new(), Vec::new());
+        assert_eq!(
+            orphan_reasons(&findings),
+            [("feature-a".to_owned(), "git-pointer-file".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_leftover_with_a_removal_marker_is_an_orphan() {
+        let (_root, managed) = managed_dir();
+        for (name, marker) in [
+            ("identity", ".bibcode-removal-identity"),
+            ("tombstone", ".bibcode-removal-tombstone"),
+        ] {
+            std::fs::create_dir(managed.join(name)).unwrap();
+            std::fs::write(managed.join(name).join(marker), "nonce\n").unwrap();
+        }
+        let (_, mut findings) = audit_children(&managed, Vec::new(), Vec::new());
+        findings.sort_by_key(|finding| finding.evidence["name"].to_string());
+        assert_eq!(
+            orphan_reasons(&findings),
+            [
+                ("identity".to_owned(), "removal-marker".to_owned()),
+                ("tombstone".to_owned(), "removal-marker".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leftover_with_an_incomplete_removal_receipt_is_an_orphan() {
+        let (_root, managed) = managed_dir();
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let repositories = Repositories::new(database);
+        for (owner, name) in [("thread-prepared", "prepared"), ("thread-removed", "removed")] {
+            std::fs::create_dir(managed.join(name)).unwrap();
+            repositories
+                .prepare_worktree_removal_receipt(crate::persistence::WorktreeRemovalReceipt {
+                    owner_thread_id: owner.to_owned(),
+                    project_cwd: "/repo".to_owned(),
+                    worktree_path: managed.join(name).to_string_lossy().into_owned(),
+                    identity_nonce: format!("nonce-{name}"),
+                    state: "prepared".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        repositories
+            .complete_worktree_removal_receipt(
+                "thread-removed".to_owned(),
+                "nonce-removed".to_owned(),
+            )
+            .await
+            .unwrap();
+        let incomplete = repositories
+            .list_incomplete_worktree_removal_paths("/repo")
+            .await
+            .unwrap();
+        let (_, findings) = audit_children(&managed, Vec::new(), incomplete);
+        assert_eq!(
+            orphan_reasons(&findings),
+            [("prepared".to_owned(), "incomplete-removal".to_owned())],
+            "a receipt in state removed is not evidence"
+        );
+    }
+
+    #[test]
+    fn orphan_ids_stay_per_parent_and_name_and_evidence_names_the_folder() {
+        let parents = ["/outside-home/a", "/outside-home/b"];
+        let facts = AuditFacts {
+            base_dirs: parents
+                .iter()
+                .map(|parent| Path::new(parent).join("feature-a"))
+                .collect(),
+            evidence: parents
+                .iter()
+                .map(|parent| {
+                    (
+                        Path::new(parent).join("feature-a"),
+                        WorktreeEvidence::CreationRecord,
+                    )
+                })
+                .collect(),
+            managed_dirs: parents.iter().map(PathBuf::from).collect(),
+            ..AuditFacts::default()
+        };
+        let findings = audit(&facts);
+        assert_eq!(findings.len(), 2);
+        for (finding, parent) in findings.iter().zip(parents) {
+            assert_eq!(
+                finding.fingerprint_fields,
+                [
+                    "unowned-unregistered".to_owned(),
+                    fingerprint("worktree.parent", &[parent.to_owned()]),
+                    fingerprint("worktree.directory", &["feature-a".to_owned()]),
+                ],
+                "the ID is computed as before"
+            );
+            assert_eq!(finding.evidence["name"], "feature-a");
+        }
+        assert_ne!(
+            findings[0].fingerprint_fields,
+            findings[1].fingerprint_fields
+        );
+        let again: Vec<_> = audit(&facts)
+            .into_iter()
+            .map(|finding| finding.fingerprint_fields)
+            .collect();
+        assert_eq!(
+            again,
+            findings
+                .iter()
+                .map(|finding| finding.fingerprint_fields.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1299,7 +1546,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (sources, _removal) = stalled_repository(root.path()).await;
         // A leftover directory the stalled registrations would have to be compared with.
-        std::fs::create_dir_all(root.path().join(".bibcode-worktrees/main/orphan")).unwrap();
+        let orphan = root.path().join(".bibcode-worktrees/main/orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        // Evidence, so only the deadline keeps it out.
+        std::fs::write(orphan.join(".git"), "gitdir: /elsewhere/.git/worktrees/orphan\n").unwrap();
         let limits = ScanLimits {
             budget: Duration::from_secs(10),
             git: Duration::from_millis(100),
@@ -1478,6 +1728,10 @@ mod tests {
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             }],
             base_dirs: vec![home.join("work/orphan-a"), home.join("work/orphan-b")],
+            evidence: HashMap::from([
+                (home.join("work/orphan-a"), WorktreeEvidence::CreationRecord),
+                (home.join("work/orphan-b"), WorktreeEvidence::GitPointerFile),
+            ]),
             managed_dirs: vec![home.join("work")],
             ..AuditFacts::default()
         };
@@ -1489,6 +1743,10 @@ mod tests {
         );
         let relocated = audit(&AuditFacts {
             base_dirs: vec![PathBuf::from("/outside-home/work/orphan-a")],
+            evidence: HashMap::from([(
+                PathBuf::from("/outside-home/work/orphan-a"),
+                WorktreeEvidence::CreationRecord,
+            )]),
             managed_dirs: vec![PathBuf::from("/outside-home/work")],
             ..AuditFacts::default()
         });

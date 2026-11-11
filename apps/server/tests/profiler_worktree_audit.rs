@@ -50,6 +50,7 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     let mut fixture = Fixture::new().await;
     let orphan = fixture.managed.join("orphan");
     fs::create_dir_all(&orphan).expect("orphan directory");
+    fixture.record_creation(&orphan).await;
 
     // As in production: the detector starts before the server binds the catalog, and scans
     // as soon as it is bound rather than ten minutes later.
@@ -90,25 +91,54 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     let sources = fixture.sources();
     let processes = ProcessAttributionRegistry::new();
 
-    scan_once(&sources, &processes).await;
-    let remaining_id = finding(&runtime, "worktree.orphan-dir")["id"].clone();
+    // A second leftover with evidence, and a folder that was never a worktree.
     let other_orphan = fixture.managed.join("other-orphan");
     fs::create_dir(&other_orphan).expect("second orphan directory");
+    fixture.record_creation(&other_orphan).await;
+    let container = fixture.managed.join("container");
+    fs::create_dir_all(container.join("project")).expect("container directory");
+    fs::write(container.join("project/README.md"), "not a worktree\n").expect("container file");
+    scan_once(&sources, &processes).await;
     scan_once(&sources, &processes).await;
     let orphans = runtime.status()["findings"].as_array().unwrap().clone();
-    assert_eq!(orphans.len(), 2, "each orphan has its own finding");
+    assert_eq!(
+        orphans.len(),
+        2,
+        "each leftover has its own finding, and the container none: {orphans:?}"
+    );
     assert_ne!(orphans[0]["id"], orphans[1]["id"]);
+    assert!(orphans.iter().all(|finding| finding["count"] == 2), "{orphans:?}");
+    // The orphan's ID is computed from its managed parent and name, as before.
+    let parent = fs::canonicalize(&fixture.managed).expect("managed directory");
+    let remaining = fingerprint(
+        "worktree.orphan-dir",
+        &[
+            "unowned-unregistered".to_owned(),
+            fingerprint("worktree.parent", &[parent.to_string_lossy().into_owned()]),
+            fingerprint("worktree.directory", &["orphan".to_owned()]),
+        ],
+    );
+    let remaining_id = orphans
+        .iter()
+        .find(|finding| finding["fingerprint"] == remaining.as_str())
+        .unwrap_or_else(|| panic!("no finding for the first leftover: {orphans:?}"))["id"]
+        .clone();
     fs::remove_dir(&other_orphan).expect("remove one orphan");
     scan_once(&sources, &processes).await;
     let next = runtime.status()["findings"].as_array().unwrap().clone();
     assert_eq!(next.len(), 2);
     for finding in next {
-        let expected = if finding["id"] == remaining_id { 3 } else { 1 };
+        let expected = if finding["id"] == remaining_id { 3 } else { 2 };
         assert_eq!(
             finding["count"], expected,
             "only the remaining orphan recurs"
         );
     }
+    assert_eq!(
+        fixture.creation_records().await,
+        [orphan.to_string_lossy().into_owned()],
+        "the audit deleted the removed leftover's creation record"
+    );
 
     let thread_id = adopt(&mut fixture).await;
     fs::write(fixture.worktree.join("dirty.txt"), "dirty\n").expect("dirty file");
@@ -567,6 +597,21 @@ impl Fixture {
             catalog: self.catalog.clone(),
             repositories: self.repositories.clone(),
         }
+    }
+
+    /// Records `path` as a worktree BiBCode created for the project.
+    async fn record_creation(&self, path: &Path) {
+        self.repositories
+            .record_worktree_creation(&self.main.to_string_lossy(), &path.to_string_lossy())
+            .await
+            .expect("creation record");
+    }
+
+    async fn creation_records(&self) -> Vec<String> {
+        self.repositories
+            .list_worktree_creation_records(&self.main.to_string_lossy())
+            .await
+            .expect("creation records")
     }
 
     fn socket(&mut self) -> &mut TestSocket {
