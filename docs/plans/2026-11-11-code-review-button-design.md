@@ -54,8 +54,15 @@ Everything below was read at commit `3cd0fbab8` unless marked otherwise.
   (`provider/claude/runtime.rs` line 2529) turns its `plan` input into `turn.proposed.completed`.
   BiBCode launches Claude with `--print` and no permission prompt tool, and nothing calls
   `open_permission_request` (line 2548), so BiBCode never answers a Claude permission request.
-  Inferred, not run: Claude denies a tool that needs permission, so it cannot leave plan mode on
-  its own in a BiBCode chat.
+  The `--settings` BiBCode adds (`claude_session_settings`, `provider_runtime.rs` line 18686)
+  carries only HTTP hooks for activity, and the hook sink answers `204 No Content` with no
+  decision (`provider/claude/hook_sink.rs`), so no hook grants a permission either. Inferred, not
+  run: Claude denies a tool that needs permission, so it cannot leave plan mode on its own in a
+  BiBCode chat.
+- A panel thread takes its host's `branch` and `worktreePath` on the server
+  (`worktree_catalog_rpc.rs`, the `thread.create` it dispatches near line 1545), and the engine
+  refuses a panel whose host is itself a panel (`engine.rs` line 4915), so a review from a panel is
+  hosted by that panel's host.
 - The chat offers Implement while `interactionMode === "plan"` and the latest proposed plan is
   not implemented (`showPlanFollowUpPrompt`, `ChatView.tsx` about line 2359). An empty Enter then
   sends `PLEASE IMPLEMENT THIS PLAN` in default mode (`resolvePlanFollowUpSubmission`,
@@ -213,15 +220,18 @@ read the interactive prompt from stdin. The lead-in makes the argument always st
 review requested", so trimming is not needed and saved text is never changed. Agent's call.
 
 **D44. Windows terminal reviews flatten line breaks by the environment's OS, are length-checked,
-and stay off unless a native round trip passes in CI.** The web knows
+and refuse any character a native round trip does not prove.** The web knows
 `serverConfig.environment.platform.os`, not the resolved file, so it replaces each line break with
 one space whenever the environment is Windows (harmless for a `.exe`). A conservative bound of
 7,000 for `length + 8 × (count of %) + (count of ")` keeps the `cmd.exe` line under its 8,191
-limit. A new Windows-only test sends the review argument (with `"`, `%PATH%`, `&`, `^`, `|`, `<`,
-`>`, `!`) through a `%*` shim to `node` and compares `process.argv`, and a CI step runs it on the
-Windows job. If any class fails, the terminal reviewer is disabled on Windows with "Terminal
-reviews are not available on Windows. Pick a chat reviewer in Settings → Agents." rather than
-guessing. Alternative: a server-side line-break replacement for batch targets (changes every
+limit. New Windows-only tests send one argument per character class (`"`, `%` and `%PATH%`, `&`,
+`^`, `|`, `<` with `>`, `!`) through a `%*` shim to `node` and compare `process.argv`, and a CI
+step runs them on the Windows job. Only the classes that pass are committed as tests; for a class
+that fails, the web refuses a prompt holding that character on Windows with "Review prompt contains
+a character a Windows terminal cannot pass. Remove it or pick a chat reviewer.", a web test pins
+the refusal, and the failure is reported for a separate fix. This phase does not change the
+server's escaping. The existing batch test passes `percent-value`, not a real `%`, so the `%`
+class is the one most worth watching. Alternative: a server-side line-break replacement for batch targets (changes every
 terminal launch, and the server would rewrite text it was asked to pass). Agent's call.
 
 **D45. The base is `origin/<defaultRefName>`; a stale local default branch may enable the
@@ -306,8 +316,7 @@ session default applies. Agent's call.
   first message is not resent blindly.
 - **Tab closed while creating.** The panel is archived once it exists and the prompt is not sent.
 - **Restart.** The panel, its `codeReview` flag and the project prompt are durable; the terminal
-  is an ordinary AI Terminal and follows the terminal lifecycle (it does not survive a server
-  restart today).
+  is an ordinary AI Terminal and follows the existing terminal lifecycle, unchanged here.
 - **Cancel or shutdown.** The panel's Stop and the terminal's close work as for any chat or AI
   Terminal; nothing new runs in the background.
 - **Status changes after the click.** The scope is read once at the click; a later status change

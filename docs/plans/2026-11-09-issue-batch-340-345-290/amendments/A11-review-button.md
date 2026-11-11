@@ -225,9 +225,8 @@ review launcher SHALL start nothing and show the reason.
 
 WHILE the reviewing environment runs Windows, the review launcher SHALL replace each line break in
 the prompt with one space, and IF the prompt's length plus eight per `%` and one per `"` exceeds
-7,000, or terminal reviews are off on Windows because the native argument round trip (scenario
-"metacharacters through an npm-style shim") failed, THEN it SHALL start no terminal review and name
-the reason.
+7,000, or the prompt holds a character that a Windows batch launch is not proven to pass intact,
+THEN it SHALL start no terminal review and name the reason.
 
 #### Scenario: line breaks
 
@@ -237,9 +236,9 @@ the reason.
 
 #### Scenario: metacharacters through an npm-style shim
 
-- GIVEN a Windows `.cmd` shim that forwards `%*` to `node` and the argument `say "hi" 100% & a ^ b | c < d > e !x!`
-- WHEN it is launched through the terminal launch path
-- THEN `node` receives exactly that argument, and nothing else runs
+- GIVEN a Windows `.cmd` shim that forwards `%*` to `node`, and one argument per character class: `say "hi"`, `100% %PATH%`, `a & b`, `a ^ b`, `a | b`, `c < d > e` and `!x!`
+- WHEN each is launched through the terminal launch path
+- THEN `node` receives each argument exactly and no redirect or second command runs, and for any class where that does not hold, the review launcher refuses a prompt holding that character on Windows with "Review prompt contains a character a Windows terminal cannot pass. Remove it or pick a chat reviewer."
 
 #### Scenario: too long for cmd.exe
 
@@ -358,7 +357,7 @@ D42. A review thread carries a durable `codeReview` flag set at panel creation, 
 
 D43. A terminal prompt is passed as one argument after `--`, behind the fixed lead-in, and never through stdin; saved text is never trimmed or rewritten. Alternatives considered: `--` alone (Claude 2.1.322 still runs a subcommand named by the prompt); trimming leading dashes at save time (changes the person's text and misses subcommand words); stdin (interactive Codex refuses it). Decided by: agent's call. Source: #293 open question 3; CLI probes recorded in the design note.
 
-D44. On Windows the web replaces line breaks by the environment's OS, bounds the escaped length at 7,000, and keeps terminal reviews off unless a native `%*` round trip passes in Windows CI. Alternatives considered: the issue's rule keyed on the resolved `.cmd` (the web never sees it); a server-side rewrite for batch targets (changes every terminal launch). Decided by: agent's call. Source: #293 "Handle the argument limits".
+D44. On Windows the web replaces line breaks by the environment's OS, bounds the escaped length at 7,000, and refuses on Windows any character whose native `%*` round trip does not pass in Windows CI; this phase does not change the server's escaping. Alternatives considered: the issue's rule keyed on the resolved `.cmd` (the web never sees it); a server-side rewrite for batch targets (changes every terminal launch). Decided by: agent's call. Source: #293 "Handle the argument limits".
 
 D45. The base is `origin/<default>` with the local branch as the prompt's fallback, and a stale local default branch may enable the button. Alternatives considered: counting against the remote ref (a server change outside this issue). Decided by: agent's call (the issue's recommendation for open question 4). Source: #293 open question 4.
 
