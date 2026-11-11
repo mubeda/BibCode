@@ -8,9 +8,22 @@ const NON_COLOR_TEXT =
  */
 export function textColorUtilities(className: string): string[] {
   return className.split(/\s+/).filter((token) => {
-    const utility = token.slice(token.lastIndexOf(":") + 1);
+    const utility = baseUtility(token);
     return utility.startsWith("text-") && !NON_COLOR_TEXT.test(utility);
   });
+}
+
+/** The utility after its variants: split on colons outside brackets, minus a leading or trailing `!`. */
+function baseUtility(token: string): string {
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < token.length; index++) {
+    const char = token[index];
+    if (char === "[" || char === "(") depth++;
+    else if (char === "]" || char === ")") depth--;
+    else if (char === ":" && depth === 0) start = index + 1;
+  }
+  return token.slice(start).replace(/^!|!$/g, "");
 }
 
 /** Every opening tag in `markup` that a label or chat level rule paints. */
