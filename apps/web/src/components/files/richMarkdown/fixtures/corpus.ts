@@ -44,7 +44,12 @@ export const blockMath = "Before.\n\n$$\nE = mc^2\n$$\n\nAfter.\n";
 /** One HTML block with no body: TipTap writes it back in the blank-line form. */
 export const emptyDetails = "<details><summary>More</summary></details>\n\nHello\n";
 
+/** A tilde fence, which the editor would write with backticks, drawn as a diagram. */
+export const mermaidFence =
+  "Before the diagram.\n\n~~~mermaid\ngraph TD\n  A --> B\n~~~\n\nAfter the diagram.\n";
+
 export const supportedFixtures = {
+  mermaidFence,
   alignedTable,
   fourBacktickFence,
   mixedListMarkers,
