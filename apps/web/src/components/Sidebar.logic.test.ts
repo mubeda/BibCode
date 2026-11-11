@@ -766,6 +766,20 @@ describe("resolveThreadStatusPill", () => {
     ).toMatchObject({ label: "Plan Ready", pulse: false });
   });
 
+  it("never shows plan ready for a code review's findings (#293)", () => {
+    expect(
+      resolveThreadStatusPill({
+        thread: {
+          ...baseThread,
+          codeReview: true,
+          hasActionableProposedPlan: true,
+          latestTurn: makeLatestTurn(),
+          session: { ...baseThread.session, status: "ready", activeTurnId: null },
+        },
+      })?.label,
+    ).not.toBe("Plan Ready");
+  });
+
   it("does not manufacture completed state without a client visit marker", () => {
     expect(
       resolveThreadStatusPill({
@@ -1763,6 +1777,28 @@ describe("summarizeWorkspaceChats", () => {
       ),
     ).toEqual({ count: 1, status: WORKSPACE_CARD_STATUS.idle });
     expect(summaries.size).toBe(2);
+  });
+
+  it("does not raise Plan Ready for a worktree whose only plan belongs to a review panel (#293)", () => {
+    const settledPlan = {
+      worktreePath: "/wt/review",
+      interactionMode: "plan" as const,
+      hasActionableProposedPlan: true,
+      latestTurn: makeLatestTurn(),
+    };
+    const key = workspaceCheckoutKey({
+      environmentId,
+      projectId: ProjectId.make("project-1"),
+      worktreePath: "/wt/review",
+    });
+    const review = summarizeWorkspaceChats(
+      [panel("r", { ...settledPlan, codeReview: true })],
+      () => null,
+    );
+    expect(review.get(key)?.status).not.toEqual(WORKSPACE_CARD_STATUS.plan);
+    // The same panel without the review flag still raises it.
+    const plain = summarizeWorkspaceChats([panel("p", settledPlan)], () => null);
+    expect(plain.get(key)?.status).toEqual(WORKSPACE_CARD_STATUS.plan);
   });
 
   it("keeps worktree keys apart across environments and projects", () => {
