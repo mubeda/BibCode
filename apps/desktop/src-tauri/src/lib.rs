@@ -399,6 +399,8 @@ mod desktop_e2e_page_load;
 #[cfg(target_os = "linux")]
 mod display_loss;
 mod firewall;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod gstreamer_environment;
 #[cfg(target_os = "linux")]
 mod linux_text_rendering;
 #[cfg(target_os = "linux")]
