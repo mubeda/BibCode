@@ -5344,6 +5344,156 @@ mod mutation_invalidation_tests {
         fixture.shutdown().await;
     }
 
+    fn managed_create_payload(command_id: &str, ref_name: &str) -> serde_json::Value {
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "threadId":format!("{command_id}-thread"),
+            "title":"Managed",
+            "refName":ref_name,
+            "newRefName":null,
+            "baseRefName":null,
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        })
+    }
+
+    async fn create_managed(
+        fixture: &HandlerFixture,
+        command_id: &str,
+        ref_name: &str,
+    ) -> super::RpcResult {
+        create_managed_worktree(
+            &fixture.services,
+            request(
+                "worktree.createManaged",
+                managed_create_payload(command_id, ref_name),
+            ),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn creation_records(fixture: &HandlerFixture) -> Vec<String> {
+        fixture
+            .engine
+            .repositories()
+            .list_worktree_creation_records(&fixture.main.to_string_lossy())
+            .await
+            .expect("creation records")
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_follows_create_and_remove() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/recorded"]);
+        let created = create_managed(&fixture, "create-recorded", "feature/recorded")
+            .await
+            .expect("managed creation succeeds");
+        let path = created["path"].as_str().expect("created path").to_owned();
+        assert_eq!(creation_records(&fixture).await, [path.clone()]);
+
+        create_managed(&fixture, "create-missing", "feature/does-not-exist")
+            .await
+            .expect_err("a missing ref fails the creation");
+        assert_eq!(
+            creation_records(&fixture).await,
+            [path.clone()],
+            "a failed creation writes no record"
+        );
+
+        fixture
+            .catalog
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("catalog includes the created worktree");
+        let plan = get_removal_plan(
+            &fixture.services,
+            request(
+                "worktree.getRemovalPlan",
+                json!({"projectId":"project-1","threadId":"create-recorded-thread"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal plan");
+        remove_worktree(
+            &fixture.services,
+            request(
+                "worktree.remove",
+                json!({
+                    "commandId":"remove-recorded", "projectId":"project-1",
+                    "threadId":"create-recorded-thread", "mode":"delete-git-worktree",
+                    "expectedGeneration":plan["generation"], "planToken":plan["planToken"],
+                    "forceDirty":false, "confirmRepositoryWidePrune":false
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal succeeds");
+        assert!(!Path::new(&path).exists(), "the worktree folder is gone");
+        assert!(
+            creation_records(&fixture).await.is_empty(),
+            "the record ends with the worktree"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_creation_whose_record_cannot_be_written_fails_and_leaves_no_worktree() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/unrecorded"]);
+        fixture
+            .engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute_batch("DROP TABLE worktree_creation_records")?;
+                Ok(())
+            })
+            .await
+            .expect("records table removed");
+        let managed = GitRepository::default()
+            .managed_worktree_parent(&fixture.main)
+            .await
+            .expect("managed worktree directory");
+
+        create_managed(&fixture, "create-unrecorded", "feature/unrecorded")
+            .await
+            .expect_err("an unwritable record fails the creation");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&managed)
+            .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "no worktree folder: {leftovers:?}");
+        let inventory = GitRepository::default()
+            .worktree_inventory(&fixture.main, &CancellationToken::new())
+            .await
+            .expect("repository remains readable");
+        assert_eq!(
+            inventory.records.len(),
+            1,
+            "Git lists only the primary checkout: {:?}",
+            inventory.records
+        );
+        assert!(
+            fixture
+                .engine
+                .repositories()
+                .get_thread("create-unrecorded-thread".to_owned())
+                .await
+                .expect("thread read")
+                .is_none(),
+            "no workspace thread owns the path"
+        );
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn removal_invalidates_only_after_accepted_terminal_receipt() {
         let entered = Arc::new(Semaphore::new(0));

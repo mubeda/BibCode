@@ -3278,7 +3278,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70,  71, 72]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3311,7 +3311,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68, 69, 70, 71]
+            [65, 66, 67, 68, 69, 70,  71, 72]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3347,7 +3347,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70,  71, 72]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3389,7 +3389,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68, 69, 70, 71]
+            [66, 67, 68, 69, 70,  71, 72]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3420,7 +3420,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [69, 70, 71]
+            [69, 70,  71, 72]
         );
         let index_sql: String = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
@@ -3465,7 +3465,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [70, 71]
+            [70,  71, 72]
         );
         let unnamed: (Option<String>, Option<String>) = connection.query_row(
             "SELECT (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = 'l'), (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = 's')",
@@ -3514,7 +3514,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [71]
+            [71, 72]
         );
         let taken_over: Option<String> = connection.query_row(
             "SELECT taken_over_at FROM mcp_named_clients WHERE client_id = 'nc_1'",
@@ -3525,6 +3525,56 @@ mod tests {
         let transaction = connection.transaction()?;
         super::migration_071(&transaction)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_72_adds_worktree_creation_records() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(71))?;
+        connection.execute(
+            "INSERT INTO worktree_removal_receipts (owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at) \
+             VALUES ('thread-1', '/repo', '/worktrees/a', 'nonce', 'prepared', '2026-11-09T00:00:00Z', '2026-11-09T00:00:00Z')",
+            [],
+        )?;
+        assert!(!table_exists(&connection, "worktree_creation_records")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [72]
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(worktree_creation_records)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            columns,
+            [
+                ("project_cwd".to_owned(), true, 1),
+                ("worktree_path".to_owned(), true, 2),
+                ("created_at".to_owned(), true, 0),
+            ],
+            "three required columns, keyed by project and path"
+        );
+        let receipts: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM worktree_removal_receipts",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(receipts, 1, "existing rows are kept");
+        let insert = "INSERT INTO worktree_creation_records (project_cwd, worktree_path, created_at) VALUES (?, ?, '2026-11-09T00:00:00Z')";
+        connection.execute(insert, ["/repo", "/worktrees/a"])?;
+        connection.execute(insert, ["/other", "/worktrees/a"])?;
+        assert!(connection.execute(insert, ["/repo", "/worktrees/a"]).is_err());
         Ok(())
     }
 
@@ -3542,7 +3592,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68, 69, 70, 71]
+            [68, 69, 70,  71, 72]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3570,7 +3620,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68, 69, 70, 71]
+            [67, 68, 69, 70,  71, 72]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -3596,7 +3646,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [62, 63, 64, 65, 66, 67, 68, 69, 70,  71, 72]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3651,7 +3701,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70,  71, 72]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),

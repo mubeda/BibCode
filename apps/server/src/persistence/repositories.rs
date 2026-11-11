@@ -5576,6 +5576,94 @@ mod activity_order_tests {
 }
 
 #[cfg(test)]
+mod worktree_creation_record_tests {
+    use super::*;
+    use crate::persistence::run_migrations;
+
+    async fn migrated(database: Database) -> Repositories {
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        Repositories::new(database)
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = Database::create_new(&path).await.unwrap();
+        let repositories = migrated(database.clone()).await;
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        drop(repositories);
+        database.close().await;
+
+        let reopened = migrated(Database::open_existing(&path).await.unwrap()).await;
+        assert_eq!(
+            reopened.list_worktree_creation_records("/repo").await.unwrap(),
+            ["/worktrees/feature-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_is_idempotent() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for _ in 0..2 {
+            repositories
+                .record_worktree_creation("/repo", "/worktrees/feature-a")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            repositories
+                .list_worktree_creation_records("/repo")
+                .await
+                .unwrap(),
+            ["/worktrees/feature-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_delete_removes_only_that_path() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for (project, path) in [
+            ("/repo", "/worktrees/feature-a"),
+            ("/repo", "/worktrees/feature-b"),
+            ("/other", "/worktrees/feature-a"),
+        ] {
+            repositories
+                .record_worktree_creation(project, path)
+                .await
+                .unwrap();
+        }
+        repositories
+            .delete_worktree_creation_record("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .list_worktree_creation_records("/repo")
+                .await
+                .unwrap(),
+            ["/worktrees/feature-b"]
+        );
+        assert_eq!(
+            repositories
+                .list_worktree_creation_records("/other")
+                .await
+                .unwrap(),
+            ["/worktrees/feature-a"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod frozen_session_unfreeze_tests {
     use super::*;
     use crate::persistence::{ProviderSessionRuntime, run_migrations};
