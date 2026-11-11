@@ -67,6 +67,7 @@ const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
 const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
+const decodeOrchestrationThread = Schema.decodeUnknownEffect(OrchestrationThread);
 const decodeTurnDelivery = Schema.decodeUnknownSync(TurnDelivery);
 const decodeThreadTurnDeliveryUpdatedPayload = Schema.decodeUnknownSync(
   ThreadTurnDeliveryUpdatedPayload,
@@ -605,7 +606,7 @@ describe("code review marker", () => {
         (yield* decodeThreadCreatedPayload({ ...payload, codeReview: true })).codeReview,
         true,
       );
-      const thread = yield* Schema.decodeUnknownEffect(OrchestrationThread)({
+      const thread = yield* decodeOrchestrationThread({
         ...baseShellFixture,
         deletedAt: null,
         messages: [],
