@@ -137,10 +137,14 @@ Run the AppImage GStreamer wrapper regression too:
 vp test scripts/tauri-linuxdeploy-plugin-gstreamer.test.ts
 ```
 
-It covers the core/base/good-only plugin check (a plugin from another source
-package, or owned by no package, fails before the AppDir changes), the empty
-plugin folder, Wayland library removal after the upstream plugin re-runs
-linuxdeploy, the required plugin scanner and hook, and discovery passthrough.
+It covers bundling exactly the allowlist while other host plugins stay out, a
+missing allowlisted plugin, ownership answers that fail closed before the AppDir
+changes (no owner, another path, several lines, several packages, a source
+package outside core, base and good), escaping of glob characters in the
+ownership lookup, a bundled plugin folder that differs from the allowlist,
+Wayland library removal after the upstream plugin re-runs linuxdeploy, the
+required plugin scanner, and discovery passthrough. It runs on Linux and macOS
+and is skipped on Windows.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
@@ -187,22 +191,22 @@ build and artifact checks must still pass on the documented baseline.
 The AppImage also bundles GStreamer plugins
 (`bundle.linux.appimage.bundleMediaFramework` in `tauri.linux.conf.json`): the
 bundled GStreamer core, from the Ubuntu 22.04 build host, rejects the plugins
-of newer distributions, so without its own it finds no audio sink. The pinned
-upstream plugin copies every file in the host's
-`/usr/lib/<arch>-linux-gnu/gstreamer-1.0`, so every AppImage build host installs
-`gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good` (which carries the
-PulseAudio sink on Ubuntu 22.04) and `gstreamer1.0-alsa` (the plugin scanner
-comes with `libgstreamer1.0-0`) and must not have `gstreamer1.0-plugins-bad`,
-`gstreamer1.0-plugins-ugly` or `gstreamer1.0-libav`. The BiBCode wrapper asks
-`dpkg-query` which source package owns each plugin and fails unless all come
-from `gstreamer1.0`, `gst-plugins-base1.0` or `gst-plugins-good1.0`; uninstall
-the reported packages instead of bypassing it. These sets are LGPL, version 2
-or later per the Debian copyright files (source:
-<https://gstreamer.freedesktop.org/src/>, and the Ubuntu 22.04 source packages
-`gstreamer1.0`, `gst-plugins-base1.0` and `gst-plugins-good1.0`). The AppImage
-ships the host's shared libraries with only their run paths rewritten by
-`patchelf`, and BiBCode and WebKitGTK load them dynamically. The libraries
-those plugins depend on, which linuxdeploy also bundles, are not recorded here.
+of newer distributions, so without its own it finds no audio sink. Only the
+plugins in `allowed_plugins` in `scripts/tauri/linuxdeploy-plugin-gstreamer.sh`
+are bundled: WebKitGTK's audio pipeline and the decoders for the audio types
+Files previews (WAV, MP3, Ogg Vorbis and Opus, WebM audio, FLAC; not M4A, whose
+AAC decoders are outside the core, base and good sets). Every AppImage build
+host installs `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good` (which
+carries the PulseAudio sink on Ubuntu 22.04) and `gstreamer1.0-alsa`; the
+plugin scanner comes with `libgstreamer1.0-0`. Other plugins on the host, such
+as the bad, ugly or libav sets, do not reach the bundle. The wrapper copies each
+allowlisted file into a private folder after `dpkg-query` names exactly one
+owning package for its exact path whose source is `gstreamer1.0`,
+`gst-plugins-base1.0` or `gst-plugins-good1.0`; a missing file or any other
+answer fails the build with the plugin's name. Install the reported package
+instead of bypassing the check. Licences, sources and the libraries bundled for
+these plugins are in
+[`apps/desktop/THIRD_PARTY_NOTICES.md`](../../apps/desktop/THIRD_PARTY_NOTICES.md).
 
 ### User-facing child environment isolation
 
@@ -421,11 +425,10 @@ contain no `gsettings get org.gnome.desktop.interface gtk-theme` line, no
 if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi
 ```
 
-The same extracted copy must hold `usr/lib/gstreamer-1.0/` with the core,
-base and good plugins (at least `libgstcoreelements.so`, `libgstapp.so`,
-`libgstplayback.so`, `libgstwavparse.so`, `libgstautodetect.so`,
-`libgstpulseaudio.so` and `libgstalsa.so`), the
-scanner at `usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner`, and
+In the same extracted copy, `usr/lib/gstreamer-1.0/` must hold exactly the
+files that `bash scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins`
+prints and nothing else, beside the scanner at
+`usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner` and
 `apprun-hooks/linuxdeploy-plugin-gstreamer.sh`. The Desktop UI smoke workflow
 checks these files.
 

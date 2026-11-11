@@ -473,15 +473,17 @@ Git and source-control helpers (including review Git commands), server-launched
 editors/file managers, and desktop-owned SSH, Tailscale, and host
 backend-shutdown `kill` commands. Isolation changes only the selected command.
 The desktop process, WebKitGTK-owned children, and BiBCode's own binaries retain
-the bundled environment. The AppImage bundles the GStreamer core, base and good
-plugins its own GStreamer core can load, and the launcher points
+the bundled environment. The AppImage bundles an allowlist of GStreamer core,
+base and good plugins that its own GStreamer core can load (the audio pipeline
+and the decoders for the audio types Files previews), and the launcher points
 `GST_PLUGIN_SYSTEM_PATH_1_0` at them, so WebKitGTK plays audio without the
 system's plugins, which a newer distribution's GStreamer builds for a newer core.
 As a fallback for a build made without plugins, at the top of `main`, before any
 thread starts, the Linux desktop removes `GST_PLUGIN_SYSTEM_PATH_1_0` and
-`GST_PLUGIN_SYSTEM_PATH` when they start with the launcher's plugin folder and
-the bundle does not contain it, or when none of the folders they name exist, so
-WebKitGTK finds the system's plugins
+`GST_PLUGIN_SYSTEM_PATH` only when `APPDIR` is set, the value starts with the
+launcher's plugin folder, and the bundle does not contain it, so WebKitGTK finds
+the system's plugins. Any other value, including one whose folders are all
+missing, may be the user's own and is kept
 (`apps/desktop/src-tauri/src/gstreamer_environment.rs`). Desktop external-backend launches and the generic
 supervised process runner deliberately do not apply this policy. The login-shell
 PATH probe also inherits the original desktop environment: its output hydrates
@@ -1555,18 +1557,23 @@ answered by those clients.
 
 See the [AppImage child environment policy](#appimage-child-environments).
 
-The desktop build's `beforeBuildCommand` runs
+The desktop's `beforeBundleCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
 and GStreamer plugin wrappers in `target/.tauri` alongside the upstream plugins
-pinned by URL and SHA-256. Linux Tauri configuration uses that project-local
+pinned by URL and SHA-256. Tauri runs that hook in both `tauri build` and a
+standalone `tauri bundle`, before linuxdeploy, so the bundler never fetches or
+runs an unpinned plugin copy. Linux Tauri configuration uses that project-local
 tools directory for local, release, and packaged UI builds, and turns on
 `bundle.linux.appimage.bundleMediaFramework`, which adds linuxdeploy's GStreamer
-plugin. `scripts/tauri/linuxdeploy-plugin-gstreamer.sh` refuses a build host
-whose GStreamer plugin folder holds a plugin from any source package but
-`gstreamer1.0`, `gst-plugins-base1.0` or `gst-plugins-good1.0`, runs the pinned
-plugin, removes the Wayland client its nested linuxdeploy run redeploys, and
-requires the plugin scanner and the AppRun hook that points GStreamer at the
-bundled plugins.
+plugin. `scripts/tauri/linuxdeploy-plugin-gstreamer.sh` holds the plugin
+allowlist: it copies exactly those plugin files from the host into a private
+folder, after checking that `dpkg-query` names exactly one owning package for
+each exact path and that the package's source is `gstreamer1.0`,
+`gst-plugins-base1.0` or `gst-plugins-good1.0`, and points the pinned plugin
+there. It then removes the Wayland client the nested linuxdeploy run
+redeploys, and requires the plugin scanner, the AppRun hook and a bundled
+plugin folder equal to the allowlist. Other plugins on the build host never
+reach the bundle.
 
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it

@@ -18,7 +18,7 @@
 
 - Markdown opens editable in rendered view, with a formatting group in the Files toolbar (paragraph, headings 1 to 5, bold, italic, strikethrough, bullet, numbered and task lists, block quote, a link dialog, Insert image next to the file, collapsible section). Undo and Redo work in both views and a save changes only what you edited; frontmatter and constructs the editor cannot represent stay as written or read-only. (#342)
 - Ticking a task checkbox in a read-only Markdown or `.mdx` file keeps the file's source Undo history. (#342)
-- Playing audio in Files on the Linux AppImage no longer crashes the window: the AppImage now carries the GStreamer plugins it needs, on every distribution.
+- Playing audio in Files on the Linux AppImage no longer crashes the window. The AppImage now carries its own GStreamer plugins for the audio formats Files previews (WAV, MP3, Ogg, WebM audio and FLAC).
 
 ### Appearance
 
