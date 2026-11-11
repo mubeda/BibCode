@@ -239,7 +239,7 @@ const REVIEW_PROMPT_TOO_LONG_REASON = `Review prompt is longer than ${TERMINAL_L
 const REVIEW_PROMPT_CONTROL_REASON =
   "Review prompt holds a control character other than tab or a line break. Remove it in Settings → Agents.";
 // oxlint-disable-next-line no-control-regex -- the point is to find control characters.
-const FORBIDDEN_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const FORBIDDEN_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
 
 export function resolveProviderReviewTerminalAction(
   entry: ProviderInstanceEntry,
