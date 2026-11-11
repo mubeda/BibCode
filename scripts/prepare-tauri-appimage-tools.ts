@@ -19,6 +19,12 @@ export const GTK_PLUGIN_PIN = {
   sha256: "cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a",
 } as const satisfies UpstreamGtkPluginPin;
 
+// Tauri downloads this plugin from its default branch unless the tools folder already has it.
+export const GSTREAMER_PLUGIN_PIN = {
+  url: "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/2a2e67491c32995a3f279ad0ecbe77abd512b42a/linuxdeploy-plugin-gstreamer.sh",
+  sha256: "c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94",
+} as const satisfies UpstreamGtkPluginPin;
+
 export type TauriAppImageToolPreparationBoundary = "download" | "integrity" | "filesystem";
 
 export class TauriAppImageToolPreparationError extends Error {
@@ -42,6 +48,7 @@ export interface PrepareTauriAppImageToolsOptions {
   readonly platform?: NodeJS.Platform;
   readonly download?: (url: string) => Promise<Uint8Array>;
   readonly plugin?: UpstreamGtkPluginPin;
+  readonly gstreamerPlugin?: UpstreamGtkPluginPin;
 }
 
 export type PrepareTauriAppImageToolsResult =
@@ -81,6 +88,23 @@ function publishExecutableAtomically(targetPath: string, bytes: Uint8Array): voi
   }
 }
 
+async function publishVerifiedDownload(
+  targetPath: string,
+  plugin: UpstreamGtkPluginPin,
+  download: (url: string) => Promise<Uint8Array>,
+): Promise<void> {
+  let downloadedBytes: Uint8Array;
+  try {
+    downloadedBytes = await download(plugin.url);
+  } catch (error) {
+    throw new TauriAppImageToolPreparationError("download", plugin.url, error);
+  }
+  if (sha256(downloadedBytes) !== plugin.sha256) {
+    throw new TauriAppImageToolPreparationError("integrity", targetPath);
+  }
+  publishExecutableAtomically(targetPath, downloadedBytes);
+}
+
 async function downloadBytes(url: string): Promise<Uint8Array> {
   return Effect.runPromise(
     HttpClient.get(url).pipe(
@@ -113,6 +137,17 @@ export async function prepareTauriAppImageTools(
     "scripts/tauri/linuxdeploy-plugin-gtk.sh",
   );
   const plugin = options.plugin ?? GTK_PLUGIN_PIN;
+  const gstreamerUpstreamPath = NodePath.join(
+    toolsDirectory,
+    "bibcode-linuxdeploy-gstreamer-upstream.sh",
+  );
+  const gstreamerWrapperPath = NodePath.join(toolsDirectory, "linuxdeploy-plugin-gstreamer.sh");
+  const gstreamerWrapperSourcePath = NodePath.join(
+    repositoryRoot,
+    "scripts/tauri/linuxdeploy-plugin-gstreamer.sh",
+  );
+  const gstreamerPlugin = options.gstreamerPlugin ?? GSTREAMER_PLUGIN_PIN;
+  const download = options.download ?? downloadBytes;
 
   try {
     NodeFS.mkdirSync(toolsDirectory, { recursive: true });
@@ -122,7 +157,11 @@ export async function prepareTauriAppImageTools(
       cachedBytes !== undefined && sha256(cachedBytes) === plugin.sha256;
     const legacyUpstreamIsValid =
       legacyCachedBytes !== undefined && sha256(legacyCachedBytes) === plugin.sha256;
-    const usedCachedUpstream = cachedUpstreamIsValid || legacyUpstreamIsValid;
+    const cachedGstreamerBytes = readFileIfPresent(gstreamerUpstreamPath);
+    const cachedGstreamerIsValid =
+      cachedGstreamerBytes !== undefined && sha256(cachedGstreamerBytes) === gstreamerPlugin.sha256;
+    const usedCachedUpstream =
+      (cachedUpstreamIsValid || legacyUpstreamIsValid) && cachedGstreamerIsValid;
 
     if (cachedUpstreamIsValid) {
       NodeFS.rmSync(legacyUpstreamPath, { force: true });
@@ -132,19 +171,20 @@ export async function prepareTauriAppImageTools(
       NodeFS.rmSync(legacyUpstreamPath, { force: true });
     } else {
       NodeFS.rmSync(legacyUpstreamPath, { force: true });
-      let downloadedBytes: Uint8Array;
-      try {
-        downloadedBytes = await (options.download ?? downloadBytes)(plugin.url);
-      } catch (error) {
-        throw new TauriAppImageToolPreparationError("download", plugin.url, error);
-      }
-      if (sha256(downloadedBytes) !== plugin.sha256) {
-        throw new TauriAppImageToolPreparationError("integrity", upstreamPath);
-      }
-      publishExecutableAtomically(upstreamPath, downloadedBytes);
+      await publishVerifiedDownload(upstreamPath, plugin, download);
+    }
+    if (cachedGstreamerIsValid) {
+      NodeFS.chmodSync(gstreamerUpstreamPath, 0o755);
+    } else {
+      await publishVerifiedDownload(gstreamerUpstreamPath, gstreamerPlugin, download);
     }
 
     publishExecutableAtomically(wrapperPath, NodeFS.readFileSync(wrapperSourcePath));
+    // Replaces any unpinned copy the bundler downloaded into this folder before.
+    publishExecutableAtomically(
+      gstreamerWrapperPath,
+      NodeFS.readFileSync(gstreamerWrapperSourcePath),
+    );
     return { status: "prepared", toolsDirectory, usedCachedUpstream };
   } catch (error) {
     if (error instanceof TauriAppImageToolPreparationError) {

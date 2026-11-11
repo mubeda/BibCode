@@ -93,6 +93,10 @@ jobs:
             librsvg2-dev \
             xdg-utils \
             patchelf \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-alsa \
+            gstreamer1.0-pulseaudio \
             xvfb \
             xdotool
 
@@ -138,6 +142,21 @@ jobs:
               "$forbidden_library" >&2
             exit 1
           fi
+
+          # Audio in Files needs the bundled GStreamer core to find its own plugins.
+          for required in \
+            usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner \
+            usr/lib/gstreamer-1.0/libgstcoreelements.so \
+            usr/lib/gstreamer-1.0/libgstapp.so \
+            usr/lib/gstreamer-1.0/libgstplayback.so \
+            usr/lib/gstreamer-1.0/libgstwavparse.so \
+            usr/lib/gstreamer-1.0/libgstautodetect.so \
+            apprun-hooks/linuxdeploy-plugin-gstreamer.sh; do
+            if [[ ! -f "$extract_directory/squashfs-root/$required" ]]; then
+              printf 'Linux AppImage is missing GStreamer file: %s\n' "$required" >&2
+              exit 1
+            fi
+          done
 
       - name: Install macOS application from DMG build
         if: matrix.platform == 'mac'

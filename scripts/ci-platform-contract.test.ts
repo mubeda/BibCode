@@ -480,6 +480,35 @@ describe("cross-platform CI contract", () => {
       expect(allStepCommands(job)).toContain("xdg-utils");
     }
   });
+
+  it("installs only LGPL GStreamer plugin sets in every Linux AppImage build workflow", () => {
+    const jobs = [
+      requireJob(readWorkflow(CI_WORKFLOW_PATH).workflow, "native_desktop"),
+      requireJob(readWorkflow(RELEASE_WORKFLOW_PATH).workflow, "build_desktop"),
+      requireJob(readWorkflow(DESKTOP_UI_WORKFLOW_PATH).workflow, "desktop_ui_smoke"),
+      requireJob(readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH).workflow, "seeded_upgrade_smoke"),
+    ];
+
+    for (const job of jobs) {
+      const commands = allStepCommands(job);
+      for (const dependency of [
+        "gstreamer1.0-plugins-base",
+        "gstreamer1.0-plugins-good",
+        "gstreamer1.0-alsa",
+        "gstreamer1.0-pulseaudio",
+      ]) {
+        expect(commands).toContain(dependency);
+      }
+      // The AppImage bundles every plugin on the build host; these sets are not LGPL-only.
+      for (const excluded of [
+        "gstreamer1.0-plugins-bad",
+        "gstreamer1.0-plugins-ugly",
+        "gstreamer1.0-libav",
+      ]) {
+        expect(commands).not.toContain(excluded);
+      }
+    }
+  });
 });
 
 const HEAD_SHA = "a".repeat(40);

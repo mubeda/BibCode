@@ -39,6 +39,11 @@ const PlatformToolsTauriConfiguration = Schema.fromJsonString(
   Schema.Struct({
     bundle: Schema.Struct({
       useLocalToolsDir: Schema.Boolean,
+      linux: Schema.optionalKey(
+        Schema.Struct({
+          appimage: Schema.Struct({ bundleMediaFramework: Schema.Boolean }),
+        }),
+      ),
       windows: Schema.optionalKey(
         Schema.Struct({
           nsis: Schema.Struct({ installerHooks: Schema.String }),
@@ -186,6 +191,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
 
       assert.equal(tauri.bundle.useLocalToolsDir, undefined);
       assert.equal(linux.bundle.useLocalToolsDir, true);
+      // The bundled GStreamer core rejects newer distributions' plugins, so it ships its own.
+      assert.equal(linux.bundle.linux?.appimage.bundleMediaFramework, true);
       // Windows keeps NSIS under target/.tauri instead of %LOCALAPPDATA%, so an
       // ARM64 build never depends on a per-account cache that x86 filesystem
       // redirection can make unreachable for the NSIS bootstrapper.
