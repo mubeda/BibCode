@@ -1496,7 +1496,7 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
     });
     let repository = Arc::new(GitRepository::default());
     let provider_factory = Arc::new(NeverProvider::default());
-    let worktree_path = {
+    let (worktree_path, created_records) = {
         let database = Database::create_new(&database_path)
             .await
             .expect("database");
@@ -1632,10 +1632,23 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
             .expect("persisted thread")
             .worktree_path
             .expect("worktree path");
+        let records = engine
+            .repositories()
+            .list_worktree_creation_records()
+            .await
+            .expect("creation records");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.project_cwd.clone(), record.worktree_path.clone()))
+                .collect::<Vec<_>>(),
+            [(repository_root.path().to_string_lossy().into_owned(), path.clone())],
+            "the bootstrap records the worktree it created under the thread's path"
+        );
         provider.shutdown().await.expect("provider shutdown");
         effects.shutdown().await;
         engine.shutdown().await;
-        path
+        (path, records)
     };
 
     {
@@ -1699,6 +1712,15 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
         assert_eq!(
             thread.worktree_path.as_deref(),
             Some(worktree_path.as_str())
+        );
+        assert_eq!(
+            engine
+                .repositories()
+                .list_worktree_creation_records()
+                .await
+                .expect("creation records"),
+            created_records,
+            "a restart that reuses the worktree records nothing"
         );
         delivery.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");

@@ -5492,6 +5492,89 @@ mod mutation_invalidation_tests {
     }
 
     #[tokio::test]
+    async fn a_bootstrap_worktree_record_ends_with_its_catalog_removal() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        // As a turn's bootstrap creates a worktree: the record keeps the project root the
+        // client sent, here with a trailing separator, and the thread the created path.
+        let created = GitRepository::default()
+            .ensure_worktree(
+                crate::git::CreateWorktreeInput {
+                    cwd: fixture.main.clone(),
+                    ref_name: "main".to_owned(),
+                    new_ref_name: Some("bibcode/bootstrap".to_owned()),
+                    base_ref_name: None,
+                    path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("bootstrap worktree");
+        let path = created.worktree.path.clone();
+        fixture
+            .engine
+            .repositories()
+            .record_worktree_creation(&format!("{}/", fixture.main.to_string_lossy()), &path)
+            .await
+            .expect("creation record");
+        fixture
+            .engine
+            .dispatch(OrchestrationCommand::ThreadCreate {
+                command_id: "bootstrap-create".to_owned(),
+                thread_id: "bootstrap-thread".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Bootstrap".to_owned(),
+                kind: Some("workspace".to_owned()),
+                host_thread_id: None,
+                side_chat: false,
+                purpose: None,
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: Some(created.worktree.ref_name.clone()),
+                worktree_path: Some(path.clone()),
+                created_at: "2026-08-23T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("thread created");
+        fixture
+            .catalog
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("catalog includes the bootstrap worktree");
+        let plan = get_removal_plan(
+            &fixture.services,
+            request(
+                "worktree.getRemovalPlan",
+                json!({"projectId":"project-1","threadId":"bootstrap-thread"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal plan");
+        remove_worktree(
+            &fixture.services,
+            request(
+                "worktree.remove",
+                json!({
+                    "commandId":"remove-bootstrap", "projectId":"project-1",
+                    "threadId":"bootstrap-thread", "mode":"delete-git-worktree",
+                    "expectedGeneration":plan["generation"], "planToken":plan["planToken"],
+                    "forceDirty":false, "confirmRepositoryWidePrune":false
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal succeeds");
+        assert!(!Path::new(&path).exists(), "the worktree folder is gone");
+        assert!(
+            creation_records(&fixture).await.is_empty(),
+            "the record ends with the worktree, whatever the project spelling"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_creation_whose_record_cannot_be_written_fails_and_leaves_no_worktree() {
         let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
         git(&fixture.main, &["branch", "feature/unrecorded"]);
