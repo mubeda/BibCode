@@ -19,27 +19,21 @@ const PLUGIN_SYSTEM_PATH_VARIABLES: [(&str, &str); 2] = [
     ("GST_PLUGIN_SYSTEM_PATH", "usr/lib/gstreamer"),
 ];
 
-/// Whether one plugin path variable should be removed. A value the launcher wrote (it starts
-/// with `launcher_entry`) is removed when that folder is missing: the rest of it is a copy of
-/// `QT_PLUGIN_PATH`, never a GStreamer setting. Any other value is removed only when it names
-/// directories and every one is missing. Unset, empty and entry-less values are kept.
+/// Whether one plugin path variable should be removed: only a value the launcher wrote (it
+/// starts with `launcher_entry`, which needs `APPDIR`) whose folder the bundle lacks. The rest of
+/// such a value is a copy of `QT_PLUGIN_PATH`, never a GStreamer setting. Any other value may be
+/// the user's own, so it is kept even when its folders are missing.
 pub(crate) fn should_remove_plugin_path(
     value: Option<&OsStr>,
     launcher_entry: Option<&Path>,
     exists: impl Fn(&Path) -> bool,
 ) -> bool {
-    let Some(value) = value else {
+    let (Some(value), Some(launcher_entry)) = (value, launcher_entry) else {
         return false;
     };
-    let entries: Vec<_> = std::env::split_paths(value)
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    if let (Some(first), Some(launcher_entry)) = (entries.first(), launcher_entry)
-        && first == launcher_entry
-    {
-        return !exists(first);
-    }
-    !entries.is_empty() && !entries.iter().any(|entry| exists(entry))
+    std::env::split_paths(value)
+        .find(|entry| !entry.as_os_str().is_empty())
+        .is_some_and(|first| first == launcher_entry && !exists(&first))
 }
 
 /// Repairs both plugin path variables in this process. Call it only while the process is
@@ -102,9 +96,17 @@ mod tests {
     }
 
     #[test]
-    fn removes_any_value_whose_directories_are_all_missing() {
-        assert!(decide(Some("/missing/one:/missing/two:"), false, &[]));
-        assert!(decide(Some("/missing/one"), true, &[]));
+    fn keeps_a_value_the_launcher_did_not_write_even_when_its_folders_are_missing() {
+        // Without APPDIR nothing identifies a launcher value: the user may have set it on purpose.
+        assert!(!decide(Some("/missing/one:/missing/two:"), false, &[]));
+        assert!(!decide(Some(&format!("{LAUNCHER_ENTRY}:")), false, &[]));
+        // With APPDIR, a value that does not start with the launcher's folder is not its value.
+        assert!(!decide(Some("/missing/one"), true, &[]));
+        assert!(!decide(
+            Some(&format!("/missing/one:{LAUNCHER_ENTRY}")),
+            true,
+            &[]
+        ));
     }
 
     #[test]
@@ -133,10 +135,18 @@ mod tests {
     #[test]
     fn reads_raw_byte_entries() {
         use std::os::unix::ffi::OsStrExt;
-        let raw = OsStr::from_bytes(b"/missing:/opt/\xff");
-        assert!(!should_remove_plugin_path(Some(raw), None, |path| {
-            path.as_os_str().as_bytes() == b"/opt/\xff"
-        }));
-        assert!(should_remove_plugin_path(Some(raw), None, |_| false));
+        let launcher = Path::new(OsStr::from_bytes(b"/tmp/.mount_\xff/usr/lib/gstreamer-1.0"));
+        let value = OsStr::from_bytes(b"/tmp/.mount_\xff/usr/lib/gstreamer-1.0:/opt/\xff");
+        assert!(should_remove_plugin_path(
+            Some(value),
+            Some(launcher),
+            |_| false
+        ));
+        assert!(!should_remove_plugin_path(
+            Some(value),
+            Some(launcher),
+            |path| { path == launcher }
+        ));
+        assert!(!should_remove_plugin_path(Some(value), None, |_| false));
     }
 }
