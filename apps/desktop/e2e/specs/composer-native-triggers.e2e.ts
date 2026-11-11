@@ -445,7 +445,7 @@ async function openProviderPanel(displayName: string): Promise<void> {
     },
   );
   const activeProviderTab = browser.$(
-    `//*[contains(concat(" ", normalize-space(@class), " "), " bg-accent ") and ` +
+    `//*[@data-active-tab="true" and ` +
       `.//button[@aria-label="Close ${displayName}"] and ` +
       `.//span[normalize-space()="${displayName}"]]`,
   );
