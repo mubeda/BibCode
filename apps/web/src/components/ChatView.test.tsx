@@ -5789,6 +5789,97 @@ describe("ChatView handlers (captured from mocked children)", () => {
     ).toBeUndefined();
   });
 
+  describe("a code review thread (R96)", () => {
+    const reviewTurnId = TurnId.make("turn-review");
+    const planThread = (codeReview: boolean) =>
+      makeThread({
+        interactionMode: "plan",
+        ...(codeReview ? { codeReview: true } : {}),
+        latestTurn: {
+          turnId: reviewTurnId,
+          state: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          assistantMessageId: null,
+        },
+        proposedPlans: [
+          {
+            id: "plan-review" as Thread["proposedPlans"][number]["id"],
+            turnId: reviewTurnId,
+            planMarkdown: "# Fix the parser\n\n- Low: example finding",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+
+    async function renderPlanThread(codeReview: boolean) {
+      h.realTimeline = true;
+      h.realChildren = true;
+      seedConnectedServerThread(planThread(codeReview));
+      useRightPanelStore.getState().open(threadRef, "plan");
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+        );
+        await Promise.resolve();
+      });
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+      composerRef.current = composerHandle();
+      (composer["promptRef"] as RefObject<string>).current = "";
+      return {
+        container,
+        composer,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    }
+
+    const buttonLabels = (container: HTMLElement) =>
+      [...container.querySelectorAll("button")].map((button) => button.textContent ?? "");
+
+    it("offers no Implement, sends nothing on an empty Enter and titles the card Review findings", async () => {
+      const view = await renderPlanThread(true);
+      try {
+        expect(view.composer["showPlanFollowUpPrompt"]).toBe(false);
+        const labels = buttonLabels(view.container);
+        expect(labels.some((label) => /Implement|Refine/.test(label))).toBe(false);
+        expect(view.container.textContent).toContain("Review findings");
+        expect(view.container.textContent).not.toContain("Fix the parser");
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe(
+          "Review findings",
+        );
+        await act(async () => (view.composer["onSend"] as () => Promise<void>)());
+        expect(commandCallsFor("thread.startTurn")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("keeps today's plan actions without the flag", async () => {
+      const view = await renderPlanThread(false);
+      try {
+        expect(view.composer["showPlanFollowUpPrompt"]).toBe(true);
+        expect(buttonLabels(view.container)).toContain("Implement");
+        expect(view.container.textContent).toContain("Fix the parser");
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Plan");
+      } finally {
+        await view.unmount();
+      }
+    });
+  });
+
   it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {
     const customInstanceId = ProviderInstanceId.make("codex_personal");
     const startedThread = makeThread({
