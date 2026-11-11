@@ -28,6 +28,7 @@ import {
   GitCommitIcon,
   ListChecksIcon,
   ListIcon,
+  ScanSearchIcon,
   SparklesIcon,
   SquareIcon,
   Undo2Icon,
@@ -45,6 +46,7 @@ import {
 } from "~/components/ui/dialog";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
 import { Spinner } from "~/components/ui/spinner";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { Textarea } from "~/components/ui/textarea";
 import { stackedThreadToast, toastManager, type ThreadToastData } from "~/components/ui/toast";
 import { GitSignInPrompt } from "~/components/gitSignIn/GitSignInPrompt";
@@ -111,7 +113,10 @@ import {
   ignoreFileNamePattern,
   ignoreParentFolderPattern,
   isFileStaged,
+  type CodeReviewScope,
   type PendingDiscard,
+  resolveCodeReviewButtonState,
+  resolveCodeReviewScope,
   resolveDiscardDialogCopy,
   resolveStagingToggleAction,
   resolveVsBaseLabel,
@@ -137,6 +142,12 @@ interface SourceControlPanelProps {
   workspaceUnavailable?: string | null;
   /** The thread's project; Git Manager operations (fetch, merge) are scoped to it. */
   projectRef?: ScopedProjectRef | null;
+  /** "Review changes" (#293); absent hides the button. */
+  codeReview?: {
+    readonly unavailableReason: string | null;
+    readonly guardLine: string | null;
+    readonly onStart: (scope: CodeReviewScope) => void;
+  } | null;
 }
 
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
@@ -187,6 +198,7 @@ export default function SourceControlPanel({
   gitCwd,
   workspaceUnavailable = null,
   projectRef = null,
+  codeReview = null,
 }: SourceControlPanelProps) {
   const environmentId = threadRef.environmentId;
   const scope = useMemo(() => ({ environmentId, cwd: gitCwd }), [environmentId, gitCwd]);
@@ -354,6 +366,18 @@ export default function SourceControlPanel({
   const isDefaultRef = status?.isDefaultRef ?? false;
   const hasPrimaryRemote = status?.hasPrimaryRemote ?? false;
   const vsBaseLabel = useMemo(() => resolveVsBaseLabel(status), [status]);
+  // Read once at the click: a later status change does not alter a started review.
+  const codeReviewScope = useMemo(() => resolveCodeReviewScope(status), [status]);
+  const codeReviewUnavailableReason = codeReview?.unavailableReason ?? null;
+  const codeReviewButton = useMemo(
+    () =>
+      resolveCodeReviewButtonState({
+        status,
+        scope: codeReviewScope,
+        unavailableReason: codeReviewUnavailableReason,
+      }),
+    [codeReviewScope, codeReviewUnavailableReason, status],
+  );
 
   // Legacy servers (no staging areas) keep the chat-header cascade
   // (commit_push-first, commit-by-filePaths). The primary button and dropdown
@@ -1092,6 +1116,39 @@ export default function SourceControlPanel({
           {status.aheadCount > 0 ? `↑${status.aheadCount}` : ""}{" "}
           {status.behindCount > 0 ? `↓${status.behindCount}` : ""}
         </span>
+      ) : null}
+      {codeReview ? (
+        <Tooltip>
+          {/* Stays focusable while disabled, so its tooltip can say why. */}
+          <TooltipTrigger
+            render={
+              <Button
+                aria-disabled={codeReviewButton.disabled}
+                aria-label="Review changes"
+                className={cn("ml-auto shrink-0", codeReviewButton.disabled && "opacity-64")}
+                size="icon-xs"
+                variant="ghost"
+                onClick={() => {
+                  if (!codeReviewButton.disabled && codeReviewScope) {
+                    codeReview.onStart(codeReviewScope);
+                  }
+                }}
+              />
+            }
+          >
+            <ScanSearchIcon aria-hidden="true" className="size-3.5" />
+          </TooltipTrigger>
+          <TooltipPopup side="bottom">
+            {codeReviewButton.reason ?? (
+              <>
+                <span className="block">Review changes</span>
+                {codeReview.guardLine ? (
+                  <span className="block text-muted-foreground">{codeReview.guardLine}</span>
+                ) : null}
+              </>
+            )}
+          </TooltipPopup>
+        </Tooltip>
       ) : null}
     </div>
   );

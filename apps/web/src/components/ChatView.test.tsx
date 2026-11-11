@@ -6108,25 +6108,28 @@ describe("ChatView handlers (captured from mocked children)", () => {
       ["windows", WINDOWS_REASON],
       ["darwin", null],
       ["linux", null],
-    ])("offers a Claude Terminal review on %s only when terminal reviews are on", async (os, reason) => {
-      seedReviewEnvironment({
-        reviewer: { kind: "terminal", instanceId: claudeInstanceId },
-        os,
-      });
-      seedServerThread(makeThread());
-      const view = await mountServerReview();
-      try {
-        expect(view.review().unavailableReason).toBe(reason);
-        await act(async () => view.review().onStart(SCOPE));
-        if (reason !== null) {
-          expect(commandCallsFor("terminal.open")).toEqual([]);
-        } else {
-          await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+    ])(
+      "offers a Claude Terminal review on %s only when terminal reviews are on",
+      async (os, reason) => {
+        seedReviewEnvironment({
+          reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+          os,
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          expect(view.review().unavailableReason).toBe(reason);
+          await act(async () => view.review().onStart(SCOPE));
+          if (reason !== null) {
+            expect(commandCallsFor("terminal.open")).toEqual([]);
+          } else {
+            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+          }
+        } finally {
+          await view.unmount();
         }
-      } finally {
-        await view.unmount();
-      }
-    });
+      },
+    );
   });
 
   it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {

@@ -69,6 +69,12 @@ export function codeReviewGuardLine(reviewer: {
   return INSTRUCTED_GUARD_LINE;
 }
 
+export const CODE_REVIEW_SERVER_UPDATE_REASON =
+  "Update the BiBCode server on this environment to use Review.";
+export const CODE_REVIEW_DRAFT_REASON = "Send a first message in this chat, then review from here.";
+export const CODE_REVIEW_UNLISTED_REASON =
+  "The code review agent is not available on this environment. Change it in Settings → Agents.";
+
 const unavailableReviewerReason = (label: string) =>
   `${label} is not available. Change the code review agent in Settings → Agents.`;
 
@@ -95,11 +101,7 @@ export function resolveSavedCodeReviewer(
       selection.kind === "terminal" ? `${known.displayName} Terminal` : known.displayName;
     return { action: null, reason: unavailableReviewerReason(label) };
   }
-  return {
-    action: null,
-    reason:
-      "The code review agent is not available on this environment. Change it in Settings → Agents.",
-  };
+  return { action: null, reason: CODE_REVIEW_UNLISTED_REASON };
 }
 
 /** The stored review model applies only to its own instance (D49). */

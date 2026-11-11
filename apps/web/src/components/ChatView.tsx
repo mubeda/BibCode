@@ -210,7 +210,11 @@ import {
   type CenterPanelDropRequest,
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
-import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
+import {
+  CODE_REVIEW_SEND_FAILED_TITLE,
+  takeComposerFocusRequest,
+  useCenterPanelActions,
+} from "../centerPanelActions";
 import { markChatPanelSent } from "../centerPanelClose";
 import {
   applyProviderInstanceSettings,
@@ -335,7 +339,22 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline, type TimelineOlderHistory } from "./chat/MessagesTimeline";
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
-import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
+import {
+  type ProviderTerminalAction,
+  resolveProviderReviewTerminalAction,
+} from "./chat/providerTerminalActions";
+import { buildProviderAgentActions } from "./chat/providerAgentActions";
+import {
+  CODE_REVIEW_DRAFT_REASON,
+  CODE_REVIEW_SERVER_UPDATE_REASON,
+  CODE_REVIEW_UNLISTED_REASON,
+  codeReviewGuardLine,
+  resolveCodeReviewChatModes,
+  resolveCodeReviewModelSelection,
+  resolveCodeReviewPrompt,
+  resolveSavedCodeReviewer,
+} from "../codeReview";
+import type { CodeReviewScope } from "./SourceControlPanel.logic";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { ChatPanelOpeningState, NoActiveThreadState } from "./NoActiveThreadState";
@@ -4818,6 +4837,117 @@ function ChatViewContent(props: ChatViewProps) {
       { label: action.label, command: action.command },
     );
   });
+  // Review changes (#293): the saved reviewer exactly as saved (D48), with this environment's
+  // settings (D49). The prompt and the launch are resolved only on click.
+  const codeReviewAgentActions = useMemo(
+    () => buildProviderAgentActions(providerStatuses, settings),
+    [providerStatuses, settings],
+  );
+  const savedCodeReviewer = useMemo(
+    () =>
+      resolveSavedCodeReviewer(
+        codeReviewAgentActions,
+        settings.codeReviewAgent,
+        providerInstanceEntries,
+      ),
+    [codeReviewAgentActions, providerInstanceEntries, settings.codeReviewAgent],
+  );
+  const codeReviewPlatformOs = serverConfig?.environment.platform.os ?? null;
+  const codeReviewsSupported = serverConfig?.environment.capabilities?.codeReviews === true;
+  const hasCodeReviewLaunchContext = isServerThread && centerPanelLaunchContext !== null;
+  const codeReviewUnavailableReason = useMemo(() => {
+    if (!codeReviewsSupported) return CODE_REVIEW_SERVER_UPDATE_REASON;
+    if (workspaceUnavailable) return workspaceUnavailable;
+    // A draft has no panel host and no terminal launch context (D40).
+    if (!hasCodeReviewLaunchContext) return CODE_REVIEW_DRAFT_REASON;
+    if (savedCodeReviewer.reason !== null) return savedCodeReviewer.reason;
+    const reviewer = savedCodeReviewer.action;
+    if (reviewer.kind !== "terminal") return null;
+    const terminal = resolveProviderReviewTerminalAction(reviewer.entry, settings, {
+      prompt: "",
+      platformOs: codeReviewPlatformOs,
+      modelSelection: null,
+    });
+    return terminal === null ? CODE_REVIEW_UNLISTED_REASON : terminal.disabledReason;
+  }, [
+    codeReviewPlatformOs,
+    codeReviewsSupported,
+    hasCodeReviewLaunchContext,
+    savedCodeReviewer,
+    settings,
+    workspaceUnavailable,
+  ]);
+  const codeReviewGuard = savedCodeReviewer.action
+    ? codeReviewGuardLine({
+        kind: savedCodeReviewer.action.kind,
+        driver: savedCodeReviewer.action.entry.driverKind,
+      })
+    : null;
+  const handleStartCodeReview = useLatestHandler((scope: CodeReviewScope) => {
+    const reviewer = savedCodeReviewer.action;
+    if (codeReviewUnavailableReason !== null || reviewer === null) return;
+    if (!activeThread || !centerPanelLaunchContext) return;
+    const { entry } = reviewer;
+    const prompt = resolveCodeReviewPrompt({
+      project: activeProject?.codeReviewPrompt ?? "",
+      user: settings.codeReviewPrompt,
+      scope,
+    });
+    const modelSelection = resolveCodeReviewModelSelection(
+      settings.codeReviewModelSelection,
+      entry.instanceId,
+    );
+    if (reviewer.kind === "terminal") {
+      const action = resolveProviderReviewTerminalAction(entry, settings, {
+        prompt,
+        platformOs: codeReviewPlatformOs,
+        modelSelection,
+      });
+      if (action === null || action.command === null) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: CODE_REVIEW_SEND_FAILED_TITLE,
+            description: action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON,
+          }),
+        );
+        return;
+      }
+      handleOpenProviderTerminalPanel(action);
+      return;
+    }
+    const resolution = resolveProviderSessionDefault({
+      driver: entry.driverKind,
+      instanceId: entry.instanceId,
+      models: entry.models,
+      configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+      explicitSelection: modelSelection,
+    });
+    void centerPanelActions.createPromptedChatPanel({
+      // A panel cannot host a panel: a review from one is hosted by its host.
+      hostRef: scopeThreadRef(
+        activeThread.environmentId,
+        activeThread.hostThreadId ?? activeThread.id,
+      ),
+      projectId: activeThread.projectId,
+      worktreePath: centerPanelLaunchContext.worktreePath,
+      branch: activeThread.branch ?? null,
+      modelSelection: resolution.modelSelection,
+      providerLabel: entry.displayName,
+      label: `Code review · ${entry.displayName}`,
+      prompt,
+      ...resolveCodeReviewChatModes(entry.driverKind),
+      codeReview: true,
+    });
+  });
+  const sourceControlCodeReview = useMemo(
+    () => ({
+      unavailableReason: codeReviewUnavailableReason,
+      guardLine: codeReviewGuard,
+      onStart: handleStartCodeReview,
+    }),
+    [codeReviewGuard, codeReviewUnavailableReason, handleStartCodeReview],
+  );
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -7261,6 +7391,7 @@ function ChatViewContent(props: ChatViewProps) {
           gitCwd={gitCwd}
           projectRef={activeProjectRef}
           workspaceUnavailable={workspaceUnavailable}
+          codeReview={sourceControlCodeReview}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "device" ? (

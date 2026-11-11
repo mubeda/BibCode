@@ -1111,7 +1111,9 @@ describe("SourceControlPanel", () => {
     const reviewButton = () =>
       captured.buttons.find((button) => button["aria-label"] === "Review changes");
     const tooltipText = (markup: string) =>
-      [...markup.matchAll(/data-testid="tooltip">(.*?)<\/div>/g)].map((match) => match[1]);
+      [...markup.matchAll(/data-testid="tooltip">(.*?)<\/div>/g)].map((match) =>
+        match[1]!.replaceAll("&#x27;", "'"),
+      );
 
     it("is absent without a review handler", () => {
       render(buildProps());
