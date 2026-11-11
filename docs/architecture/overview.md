@@ -1557,9 +1557,16 @@ See the [AppImage child environment policy](#appimage-child-environments).
 
 The desktop build's `beforeBuildCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
-plugin wrapper in `target/.tauri` alongside the upstream plugin pinned by URL
-and SHA-256. Linux Tauri configuration uses that project-local tools directory
-for local, release, and packaged UI builds.
+and GStreamer plugin wrappers in `target/.tauri` alongside the upstream plugins
+pinned by URL and SHA-256. Linux Tauri configuration uses that project-local
+tools directory for local, release, and packaged UI builds, and turns on
+`bundle.linux.appimage.bundleMediaFramework`, which adds linuxdeploy's GStreamer
+plugin. `scripts/tauri/linuxdeploy-plugin-gstreamer.sh` refuses a build host
+whose GStreamer plugin folder holds a plugin from any source package but
+`gstreamer1.0`, `gst-plugins-base1.0` or `gst-plugins-good1.0`, runs the pinned
+plugin, removes the Wayland client its nested linuxdeploy run redeploys, and
+requires the plugin scanner and the AppRun hook that points GStreamer at the
+bundled plugins.
 
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it

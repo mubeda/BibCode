@@ -96,7 +96,6 @@ jobs:
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good \
             gstreamer1.0-alsa \
-            gstreamer1.0-pulseaudio \
             xvfb \
             xdotool
 
@@ -151,6 +150,8 @@ jobs:
             usr/lib/gstreamer-1.0/libgstplayback.so \
             usr/lib/gstreamer-1.0/libgstwavparse.so \
             usr/lib/gstreamer-1.0/libgstautodetect.so \
+            usr/lib/gstreamer-1.0/libgstpulseaudio.so \
+            usr/lib/gstreamer-1.0/libgstalsa.so \
             apprun-hooks/linuxdeploy-plugin-gstreamer.sh; do
             if [[ ! -f "$extract_directory/squashfs-root/$required" ]]; then
               printf 'Linux AppImage is missing GStreamer file: %s\n' "$required" >&2

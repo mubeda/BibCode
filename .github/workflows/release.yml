@@ -473,8 +473,7 @@ jobs:
             patchelf \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good \
-            gstreamer1.0-alsa \
-            gstreamer1.0-pulseaudio
+            gstreamer1.0-alsa
 
       - name: Verify stable updater signing configuration
         if: needs.preflight.outputs.is_update_candidate == 'true'

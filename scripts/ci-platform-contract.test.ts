@@ -495,7 +495,6 @@ describe("cross-platform CI contract", () => {
         "gstreamer1.0-plugins-base",
         "gstreamer1.0-plugins-good",
         "gstreamer1.0-alsa",
-        "gstreamer1.0-pulseaudio",
       ]) {
         expect(commands).toContain(dependency);
       }
