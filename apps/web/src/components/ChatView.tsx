@@ -424,6 +424,8 @@ const PreviewPanel = lazy(() =>
 );
 const DiffPanel = lazy(() => import("./DiffPanel"));
 const SourceControlPanel = lazy(() => import("./SourceControlPanel"));
+/** Hosts with a terminal review being opened, so a double click opens one (#293). */
+const pendingTerminalReviewHosts = new Set<string>();
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
@@ -4880,7 +4882,7 @@ function ChatViewContent(props: ChatViewProps) {
     const focusedGroup = selectFocusedCenterPanelGroup(
       selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, activeThreadRef),
     );
-    void openCenterTerminal(
+    return openCenterTerminal(
       { type: "tab", groupId: focusedGroup.id },
       { label: action.label, command: action.command },
     );
@@ -4961,7 +4963,14 @@ function ChatViewContent(props: ChatViewProps) {
         );
         return;
       }
-      handleOpenProviderTerminalPanel(action);
+      // Terminal ids are distinct per open, so only this guard stops a double click (as chat
+      // reviews are guarded in centerPanelActions); it is released however the open settles.
+      const hostKey = `${activeThread.environmentId}:${activeThread.hostThreadId ?? activeThread.id}`;
+      if (pendingTerminalReviewHosts.has(hostKey)) return;
+      pendingTerminalReviewHosts.add(hostKey);
+      void handleOpenProviderTerminalPanel(action).finally(() =>
+        pendingTerminalReviewHosts.delete(hostKey),
+      );
       return;
     }
     const resolution = resolveProviderSessionDefault({
