@@ -8,6 +8,7 @@ import {
   contrastRatio,
   failingPairs,
   FIXED_PAIRS,
+  pairRatios,
   parseColor,
   resolveToken,
   toHex,
@@ -120,6 +121,33 @@ describe("parseColor and toHex", () => {
     expect(toHex("oklch(62.8% 0.2577 29.23)")).toBe("#ff0000");
     expect(toHex("oklch(1 0 0)")).toBe("#ffffff");
     expect(parseColor("red")).toBeNull();
+  });
+
+  it("every accepted spelling resolves through resolveToken without throwing", () => {
+    for (const value of [
+      "#abc",
+      "#abcd",
+      "#12345678",
+      "rgb(300 -5 1e2)",
+      "rgb(10%, 20%, 30%)",
+      "rgba(1e-7, 2, 3, 1e-3)",
+      "hsl(-45 120% 50%)",
+      "hsl(720deg 50% 1e1%)",
+      "hsla(1E2, 50%, 50%, 50%)",
+      "oklch(1e-1 1e-3 360)",
+      "oklch(120% 200% 1e2 / 2)",
+      "rgb(1e-999 0 0)",
+    ]) {
+      const theme: ThemeFile = {
+        version: 1,
+        id: "x",
+        name: "X",
+        base: "dark",
+        ui: { foreground: value },
+      };
+      expect(resolveToken(theme, "foreground"), value).toMatch(/^#[0-9a-f]{6}([0-9a-f]{2})?$/);
+      expect(() => pairRatios(theme), value).not.toThrow();
+    }
   });
 
   it("toHex round-trips", () => {

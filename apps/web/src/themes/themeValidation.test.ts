@@ -13,6 +13,38 @@ function errorsFor(
 }
 
 describe("isSafeCssColor", () => {
+  it("a number that overflows to infinity is rejected in every argument of every syntax, and an exponent that stays finite is accepted", () => {
+    const overflow = ["1e999", "-1e999", "+1e400", "1e999%", "1e99999", ".5e999", "1e999deg"];
+    const forms = [
+      (n: string) => `hsl(${n} 50% 50%)`,
+      (n: string) => `hsl(10 ${n} 50%)`,
+      (n: string) => `hsl(10 50% ${n})`,
+      (n: string) => `hsl(10, 50%, ${n})`,
+      (n: string) => `hsla(10, 50%, 50%, ${n})`,
+      (n: string) => `rgb(${n} 20 30)`,
+      (n: string) => `rgb(10 ${n} 30)`,
+      (n: string) => `rgb(10 20 ${n})`,
+      (n: string) => `rgb(10, 20, ${n})`,
+      (n: string) => `rgb(10 20 30 / ${n})`,
+      (n: string) => `oklch(${n} 0.1 250)`,
+      (n: string) => `oklch(0.7 ${n} 250)`,
+      (n: string) => `oklch(0.7 0.1 ${n})`,
+      (n: string) => `oklch(0.7 0.1 250 / ${n})`,
+    ];
+    for (const form of forms) {
+      for (const n of overflow) expect(isSafeCssColor(form(n)), form(n)).toBe(false);
+    }
+    // Finite exponents parse like CSS: huge channels clamp, tiny ones underflow to zero.
+    for (const value of [
+      "hsl(1e2 50% 50%)",
+      "rgb(1e2 2e1 3E0)",
+      "rgb(1e-999 0 0)",
+      "oklch(7e-1 1e-1 2.5e2)",
+    ]) {
+      expect(isSafeCssColor(value), value).toBe(true);
+    }
+  });
+
   it("hex, rgb(), hsl() and oklch() colors are accepted and named colors, color-mix() and inherit are rejected", () => {
     for (const value of [
       "#fff",

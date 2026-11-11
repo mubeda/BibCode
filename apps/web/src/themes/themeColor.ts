@@ -60,6 +60,12 @@ function oklchToRgb(lightness: number, chroma: number, hue: number): [number, nu
 
 /** Parses a hex color, `rgb()`, `hsl()` or `oklch()` (plan decision P16); anything else is null. */
 export function parseColor(value: string): Rgba | null {
+  const color = parseColorUnchecked(value);
+  // An exponent can overflow to Infinity, which becomes NaN channels; reject it here, once.
+  return color && Object.values(color).every(Number.isFinite) ? color : null;
+}
+
+function parseColorUnchecked(value: string): Rgba | null {
   const text = value.trim();
   if (HEX.test(text)) {
     let digits = text.slice(1);
@@ -77,6 +83,13 @@ export function parseColor(value: string): Rgba | null {
     string,
     string | undefined,
   ];
+  if (
+    [first, second, third, alphaArg].some(
+      (arg) => arg !== undefined && !Number.isFinite(number(arg)),
+    )
+  ) {
+    return null;
+  }
   const a = alphaOf(alphaArg);
   if (a === null) return null;
   const kind = name.toLowerCase();

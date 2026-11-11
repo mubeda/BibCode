@@ -56,6 +56,25 @@ describe("theme library and slots store", () => {
     expect(storage.writes).toEqual([]);
   });
 
+  it("a stored theme with an overflowing color is skipped alone and the others load and paint", async () => {
+    const bad = custom("overflow", "dark", { foreground: "hsl(1e999 50% 50%)" });
+    const good = custom("fine", "dark", { foreground: "#eeeeee" });
+    installStorage({ [LIBRARY_KEY]: JSON.stringify([good, bad, custom("other", "light")]) });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = await import("./customThemes");
+    expect(store.listThemes().map((theme) => theme.id)).toEqual([
+      "light",
+      "dark",
+      "tokyo-night",
+      "matrix-dark",
+      "matrix-light",
+      "verdant-light",
+      "fine",
+      "other",
+    ]);
+    expect(() => store.paintRecordFor(store.getTheme("fine")!)).not.toThrow();
+  });
+
   it("a light theme cannot be put in the dark slot", async () => {
     installStorage();
     const store = await import("./customThemes");
