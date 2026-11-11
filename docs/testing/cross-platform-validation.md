@@ -734,6 +734,22 @@ connection is back. Before the fix, with a read-only composer, its
 offline-before-typing arm lost the text on macOS arm64 in every run. What closed
 the macOS x64 runner's connection in that CI run is not known.
 
+The seeded loop `apps/desktop/e2e/specs/terminal-footer-invariant.e2e.ts` (not
+in the default list; run it with
+`BIBCODE_E2E_SPEC=./specs/terminal-footer-invariant.e2e.ts`) opens a Codex
+Terminal on the fixture TUI, which draws a footer on its last three rows and
+logs each PTY size, and drives random layout actions around it: the right
+panel's toggle, maximize and edge drag, the terminal's Activity panel, a center
+split or unsplit, tab and route switches, the sidebar, window resizes, and
+reloads. After each step, and again 1.5 s later, the PTY's rows must equal the
+rows xterm draws and the rows that fit the mount, the last row must sit inside
+every clipping ancestor, and with the DOM renderer the footer must be on the
+last row. `BIBCODE_E2E_FOOTER_SEED` (default 348) replays a run and
+`BIBCODE_E2E_FOOTER_STEPS` (default 40) lengthens it. A violation fails with
+the seed, the steps so far, the measurements, and a
+`terminal-footer-<seed>-<step>-<time>.png` screenshot with a `.json` report
+beside it. An edge drag that the driver cannot perform is logged as skipped.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original

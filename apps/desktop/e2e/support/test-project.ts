@@ -359,8 +359,15 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
 // the packaged scenario reads it: a WebGL terminal has no text in the DOM.
 if (process.stdout.isTTY) {
   const drawTerminalSize = () => {
-    const size = process.stdout.columns + "x" + process.stdout.rows;
-    process.stdout.write("\x1b[2J\x1b[Hfixture-tui " + size + "\r\n");
+    const rows = process.stdout.rows;
+    const size = process.stdout.columns + "x" + rows;
+    // A footer on the last three rows, as an agent CLI draws one, shows a clipped bottom (#348).
+    const footer = rows >= 5
+      ? "\x1b[" + (rows - 2) + ";1Hfixture-footer-a " + size +
+        "\x1b[" + (rows - 1) + ";1Hfixture-footer-b" +
+        "\x1b[" + rows + ";1Hfixture-footer-z " + rows + "\x1b[2;1H"
+      : "";
+    process.stdout.write("\x1b[2J\x1b[Hfixture-tui " + size + "\r\n" + footer);
     try {
       fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
     } catch {}
