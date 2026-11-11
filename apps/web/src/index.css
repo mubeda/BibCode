@@ -511,7 +511,8 @@
    layers, so they win over the card state utilities, whose translucent fills would replace the
    worktree surface and drop text under 4.5:1. Every state of either row mixes into the worktree
    surface, so a selected checkout and a selected worktree look alike. On a state surface the
-   label and the muted text step up one level. Task 10.2 sets both attributes in the left panel. */
+   label and the muted text step up one level. Hover, active and selected share a specificity, so
+   their source order below decides which wins. Task 10.2 sets both attributes in the left panel. */
 [data-sidebar-level="worktree"] {
   border-color: var(--sidebar-worktree-border);
   background-color: var(--sidebar-worktree);

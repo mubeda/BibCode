@@ -207,6 +207,29 @@ describe("theme export and import", () => {
     expect(again).toMatchObject({ ok: true, theme: plan.theme, resetPairs: [] });
   });
 
+  it("a Dark import that sets only the band, the worktree and its icon to #444444 loses all three, the default muted text named first", async () => {
+    const { transfer } = await load();
+    const file: ThemeFile = {
+      version: 1,
+      id: "grey",
+      name: "Grey",
+      base: "dark",
+      ui: {
+        "sidebar-env-band": "#444444",
+        "sidebar-worktree": "#444444",
+        "sidebar-worktree-icon": "#444444",
+      },
+    };
+    const plan = transfer.planThemeImport(JSON.stringify(file));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    const { ui: _ui, ...withoutUi } = file;
+    expect(plan.theme).toEqual(withoutUi);
+    const reset = plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`);
+    expect(reset[0]).toBe("sidebar-card-muted-foreground:sidebar-env-band");
+    expect(reset).toContain("sidebar-worktree-icon:sidebar-worktree");
+  });
+
   it("a light theme saved with only sidebar-env-band #262626 loses that override through the chat pair (R65)", async () => {
     const { transfer } = await load();
     const old: ThemeFile = {

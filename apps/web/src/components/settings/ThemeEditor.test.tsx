@@ -213,6 +213,9 @@ describe("ThemeEditor", () => {
       '[data-contrast-pair="sidebar-worktree-icon:sidebar-worktree"]',
     )!;
     expect(icon.textContent).toContain("needs 3:1");
+    const ratio = Number(/(\d+\.\d+):1$/.exec(icon.textContent ?? "")?.[1]);
+    expect(ratio).toBeGreaterThanOrEqual(3);
+    expect(ratio).toBeLessThan(4.5);
     expect(icon.textContent).not.toContain("Low contrast");
   });
 

@@ -129,7 +129,7 @@ the selected and active card's `bg-primary/22` with `border-primary/60`, the hov
 the inner button's orange focus ring and the `opacity-60` of an unavailable environment.
 
 On checkout and worktree rows those fills are translucent and replace the worktree surface. In
-Tokyo Night and Matrix Dark they dropped a selected row's text to 3.7:1. Unlayered row rules in
+Tokyo Night and Matrix Dark they dropped a selected row's label to 3.35:1 and its chat text to 3.74:1. Unlayered row rules in
 `index.css` therefore replace the state fills and borders on these two levels. Every state mixes
 into `sidebar-worktree`, so it stays opaque and a selected checkout looks like a selected worktree.
 These mixes are not theme tokens (D21).
@@ -144,8 +144,7 @@ These mixes are not theme tokens (D21).
 | Selected and active | `data-selected="true"` `data-active="true"` | `primary` 20 percent   | `primary` 60 percent         |
 
 Each fill is the named color mixed into `sidebar-worktree`. Hover paints over the resting surface,
-so it is never weaker than resting. Selected beats hover and active, and selected and active beats
-selected, because the rules have rising specificity in that order. On a hover, active or selected
+so it is never weaker than resting. Selected beats hover and active because its rule comes later with the same specificity, and selected and active beats selected because its selector is more specific. Hovered selected and hovered active rows were not rendered in a browser. The order is checked only by reading the rules. On a hover, active or selected
 row the label (`data-sidebar-label`, outside the primary checkout) paints `foreground` instead of
 `foreground` at 90 percent, and the muted text paints the chat color. Selection keeps the
 `primary` tint of R64 and differs from hover by hue, border and fill.
@@ -173,6 +172,11 @@ same element that carries `resolveWorkspaceCardClassName`:
 - `data-active="true"` when the row is active (`isActive`), and no attribute otherwise.
 - `data-sidebar-label` on the element that holds the checkout or branch name,
   `data-sidebar-icon` on the leading icon and `data-sidebar-badge` on the `primary` badge.
+- The row rules replace the background and border of `resolveWorkspaceCardClassName` on these
+  rows, so its fill and border utilities no longer show there.
+- Chat rows must not carry their own text color utility (such as `text-foreground/80`). The chat
+  rule sits in the components layer and would lose to it, which bypasses the Tokyo Night and
+  Matrix Dark `sidebar-chat-foreground` overrides.
 - `data-sidebar-level="chat"` on each chat row and on the "N more chats" row inside a checkout or
   worktree, so the muted text and chat rules reach them.
 
