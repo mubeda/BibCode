@@ -24,7 +24,12 @@ import {
 import { createRoot, type Root } from "react-dom/client";
 import * as React from "react";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { ProjectId, WorktreeKey, WorktreeRepositoryKey } from "@bibcode/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProjectId,
+  WorktreeKey,
+  WorktreeRepositoryKey,
+} from "@bibcode/contracts";
 import { scopeProjectRef } from "@bibcode/client-runtime/environment";
 import { derivePhysicalProjectKey } from "../logicalProject";
 import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/shell";
@@ -332,6 +337,87 @@ describe("SidebarThreadRow browser interactions", () => {
         open: true,
         defaultProjectRef: scopeProjectRef(projectA.environmentId, projectA.id),
       });
+    } finally {
+      await unmount(root, container);
+    }
+  });
+
+  it("reopens the real Create worktree dialog fresh after a creation (#346)", async () => {
+    baseScenario();
+    h.state.realCreateWorktreeDialog = true;
+    h.state.primaryDefaultAgent = DEFAULT_SERVER_SETTINGS.defaultAgent;
+    h.state.serverConfigs = new Map([
+      [
+        ENV_MAIN,
+        {
+          environment: { label: "Main" },
+          providers: [
+            {
+              instanceId: "codex",
+              driver: "codex",
+              enabled: true,
+              installed: true,
+              status: "ready",
+              models: [],
+            },
+          ],
+          settings: DEFAULT_SERVER_SETTINGS,
+        },
+      ],
+    ]);
+    const { container, root } = await mount(<Sidebar />);
+    const nameInput = () =>
+      requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']");
+    const createButton = () => {
+      const match = Array.from(container.querySelectorAll("button")).find((button) =>
+        button.textContent?.startsWith("Create worktree"),
+      );
+      if (!match) throw new Error("Missing Create worktree button");
+      return match;
+    };
+    const openFromProjectRow = () =>
+      dispatch(
+        requiredElement<HTMLButtonElement>(container, "[aria-label='New worktree in Repo A']"),
+        new MouseEvent("click", { bubbles: true, cancelable: true }),
+      );
+    async function typeInto(input: HTMLInputElement, value: string): Promise<void> {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value);
+      await dispatch(input, new Event("input", { bubbles: true }));
+    }
+    try {
+      await openFromProjectRow();
+      const githubTab = Array.from(container.querySelectorAll("button")).find(
+        (button) => button.textContent === "GitHub",
+      );
+      if (!githubTab) throw new Error("Missing GitHub tab");
+      await dispatch(githubTab, new MouseEvent("click", { bubbles: true }));
+      await typeInto(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='#1234 or a GitHub issue/PR URL']",
+        ),
+        "#42",
+      );
+      await typeInto(nameInput(), "sidebar-check");
+      await dispatch(createButton(), new MouseEvent("click", { bubbles: true }));
+      await React.act(async () => flush());
+
+      const created = (
+        h.state.commandCalls as Array<{ label: string; input: { input: { title: string } } }>
+      ).filter((call) => call.label === "worktree.createManaged");
+      expect(created.map((call) => call.input.input.title)).toEqual(["sidebar-check"]);
+      // The dialog closed itself through the Sidebar's callback.
+      expect(captured("Dialog").some((entry) => entry.props["open"] === false)).toBe(true);
+
+      await openFromProjectRow();
+      expect(nameInput().value).toBe("");
+      expect(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
+      ).toBe("");
+      expect(createButton().disabled).toBe(true);
     } finally {
       await unmount(root, container);
     }
