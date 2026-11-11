@@ -1362,9 +1362,7 @@ async fn execute_branch_or_sync_operation(
         (result, ..) => result,
     };
     result.map_err(|mut error| {
-        if !cancellation.is_cancelled()
-            && let Some(guidance) = remote_push_guidance(request, &error, place)
-        {
+        if let Some(guidance) = remote_push_guidance(request, &error, place) {
             error.message = guidance;
             if !matches!(request, GitManagerOperationRequest::TagCreate { .. }) {
                 error.code = GitManagerFailureCode::Authentication.as_str().to_owned();
