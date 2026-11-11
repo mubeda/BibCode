@@ -307,6 +307,8 @@ impl Repositories {
             .await
     }
 
+    /// Records that BiBCode created a worktree at `worktree_path`. A creation at a path that
+    /// still has a record replaces it with a new `record_id`.
     pub async fn record_worktree_creation(
         &self,
         project_cwd: &str,
@@ -316,62 +318,73 @@ impl Repositories {
         self.database
             .call(move |connection| {
                 connection.execute(
-                    "INSERT OR IGNORE INTO worktree_creation_records (project_cwd, worktree_path, created_at) \
+                    "INSERT OR REPLACE INTO worktree_creation_records (worktree_path, project_cwd, created_at) \
                      VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                    params![project_cwd, worktree_path],
+                    params![worktree_path, project_cwd],
                 )?;
                 Ok(())
             })
             .await
     }
 
-    pub async fn delete_worktree_creation_record(
-        &self,
-        project_cwd: &str,
-        worktree_path: &str,
-    ) -> Result<()> {
-        let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
+    /// Deletes the creation record of a removed worktree, written under any project spelling.
+    pub async fn delete_worktree_creation_record(&self, worktree_path: &str) -> Result<()> {
+        let worktree_path = worktree_path.to_owned();
         self.database
             .call(move |connection| {
                 connection.execute(
-                    "DELETE FROM worktree_creation_records WHERE project_cwd = ? AND worktree_path = ?",
-                    params![project_cwd, worktree_path],
+                    "DELETE FROM worktree_creation_records WHERE worktree_path = ?",
+                    [worktree_path],
                 )?;
                 Ok(())
             })
             .await
     }
 
-    pub async fn list_worktree_creation_records(&self, project_cwd: &str) -> Result<Vec<String>> {
-        let project_cwd = project_cwd.to_owned();
+    /// Deletes exactly the creation record `record_id`, and never a later one at its path.
+    pub async fn reap_worktree_creation_record(&self, record_id: i64) -> Result<()> {
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM worktree_creation_records WHERE record_id = ?",
+                    [record_id],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list_worktree_creation_records(&self) -> Result<Vec<WorktreeCreationRecord>> {
         self.database
             .call(move |connection| {
                 connection
                     .prepare(
-                        "SELECT worktree_path FROM worktree_creation_records \
-                         WHERE project_cwd = ? ORDER BY worktree_path",
+                        "SELECT record_id, project_cwd, worktree_path FROM worktree_creation_records \
+                         ORDER BY worktree_path",
                     )?
-                    .query_map([project_cwd], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .query_map([], |row| {
+                        Ok(WorktreeCreationRecord {
+                            record_id: row.get(0)?,
+                            project_cwd: row.get(1)?,
+                            worktree_path: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(Into::into)
             })
             .await
     }
 
-    /// The worktree paths of a project's removals that were prepared and never completed.
-    pub async fn list_incomplete_worktree_removal_paths(
-        &self,
-        project_cwd: &str,
-    ) -> Result<Vec<String>> {
-        let project_cwd = project_cwd.to_owned();
+    /// The worktree paths of removals that were prepared and never completed, in every project.
+    pub async fn list_incomplete_worktree_removal_paths(&self) -> Result<Vec<String>> {
         self.database
             .call(move |connection| {
                 connection
                     .prepare(
                         "SELECT DISTINCT worktree_path FROM worktree_removal_receipts \
-                         WHERE project_cwd = ? AND state = 'prepared' ORDER BY worktree_path",
+                         WHERE state = 'prepared' ORDER BY worktree_path",
                     )?
-                    .query_map([project_cwd], |row| row.get(0))?
+                    .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()
                     .map_err(Into::into)
             })
@@ -3542,6 +3555,13 @@ pub(crate) fn finalize_command_receipt_on(
     } else {
         Err(PersistenceError::CommandReceiptConflict(command_id))
     }
+}
+/// A worktree BiBCode created, as `worktree_creation_records` stores it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeCreationRecord {
+    pub record_id: i64,
+    pub project_cwd: String,
+    pub worktree_path: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeRemovalReceipt {

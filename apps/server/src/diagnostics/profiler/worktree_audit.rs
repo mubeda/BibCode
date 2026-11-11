@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     diagnostics::ProcessAttributionRegistry,
-    persistence::Repositories,
+    persistence::{Repositories, WorktreeCreationRecord},
     worktree_catalog::{AdoptedWorktreeAvailability, WorktreeCatalogService},
 };
 
@@ -327,8 +327,9 @@ async fn scan(
 }
 
 /// Reads one scan's facts, and which parts were read in full. It never refreshes the catalog,
-/// and its only write deletes a creation record whose folder is gone. The registry and the processes come first and are always audited; the
-/// process step and the comparison each give up at their own deadline.
+/// and its only write deletes a creation record whose folder is gone. The registry and the
+/// processes come first and are always audited; the process step and the comparison each
+/// give up at their own deadline.
 async fn gather(
     sources: &AuditSources,
     processes: &ProcessAttributionRegistry,
@@ -432,15 +433,15 @@ struct Comparison {
     managed_dirs: Vec<PathBuf>,
     /// The worktree evidence of each listed directory that has some.
     evidence: HashMap<PathBuf, WorktreeEvidence>,
-    /// The creation records whose folder is gone, as (project root, worktree path).
-    gone_records: Vec<(String, String)>,
+    /// The creation records whose folder is gone.
+    gone_records: Vec<WorktreeCreationRecord>,
 }
 
 /// What the database says about the projects' worktrees, in the spellings it stores.
 #[derive(Default)]
 struct Evidence {
-    /// Each creation record, as (project root, worktree path).
-    recorded: Vec<(String, String)>,
+    /// Each creation record.
+    recorded: Vec<WorktreeCreationRecord>,
     /// The worktree paths of removals that were prepared and never completed.
     incomplete: Vec<String>,
 }
@@ -555,31 +556,26 @@ async fn compare(
     // A thread can own a worktree in another project's managed directory (two checkouts of
     // one repository), so one unread owner list makes every comparison unsafe.
     let mut all_owners_known = true;
+    // Evidence is matched by worktree path, so it is read once for every project, whatever
+    // spelling of the project root it was written with.
     let mut evidence = Evidence::default();
+    match sources.repositories.list_worktree_creation_records().await {
+        Ok(records) => evidence.recorded = records,
+        Err(error) => {
+            tracing::warn!(%error, "worktree audit could not read the creation records");
+        }
+    }
+    match sources
+        .repositories
+        .list_incomplete_worktree_removal_paths()
+        .await
+    {
+        Ok(paths) => evidence.incomplete = paths,
+        Err(error) => {
+            tracing::warn!(%error, "worktree audit could not read the removal receipts");
+        }
+    }
     for (project, parent) in projects.into_iter().zip(parents) {
-        let cwd = &project.workspace_root;
-        match sources
-            .repositories
-            .list_worktree_creation_records(cwd)
-            .await
-        {
-            Ok(paths) => evidence
-                .recorded
-                .extend(paths.into_iter().map(|path| (cwd.clone(), path))),
-            Err(error) => {
-                tracing::warn!(%error, "worktree audit could not read a project's creation records");
-            }
-        }
-        match sources
-            .repositories
-            .list_incomplete_worktree_removal_paths(cwd)
-            .await
-        {
-            Ok(paths) => evidence.incomplete.extend(paths),
-            Err(error) => {
-                tracing::warn!(%error, "worktree audit could not read a project's removal receipts");
-            }
-        }
         match sources
             .repositories
             .load_worktree_catalog_projection(project.project_id, MAX_PROJECT_ENTRIES)
@@ -621,21 +617,34 @@ async fn compare(
     if !all_owners_known {
         complete.values_mut().for_each(|complete| *complete = false);
     }
-    let comparison = blocking(permit, cancel, move |cancel| {
+    let mut comparison = blocking(permit, cancel, move |cancel| {
         resolve(owned, complete, listings, registrations, evidence, cancel)
     })
     .await?;
-    // A record ends when its folder is gone (#344), so a later folder at that path has none.
-    for (project_cwd, path) in &comparison.gone_records {
-        if let Err(error) = sources
-            .repositories
-            .delete_worktree_creation_record(project_cwd, path)
+    reap_gone_records(
+        &sources.repositories,
+        std::mem::take(&mut comparison.gone_records),
+    )
+    .await;
+    Some(comparison)
+}
+
+/// A record ends when its folder is gone (#344), so a later folder at that path has none.
+/// Each record is deleted only if its folder is still gone, and by the id the audit read, so
+/// a worktree created at that path since keeps its own record.
+async fn reap_gone_records(repositories: &Repositories, gone: Vec<WorktreeCreationRecord>) {
+    for record in gone {
+        match tokio::fs::symlink_metadata(&record.worktree_path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => continue,
+        }
+        if let Err(error) = repositories
+            .reap_worktree_creation_record(record.record_id)
             .await
         {
             tracing::warn!(%error, "worktree audit could not delete a stale creation record");
         }
     }
-    Some(comparison)
 }
 
 /// Each project's managed directory in its physical spelling, and what one level of each
@@ -688,17 +697,17 @@ fn resolve(
         .collect();
     let mut comparison = Comparison::default();
     let mut recorded = HashSet::new();
-    for (project_cwd, path) in evidence
+    for record in evidence
         .recorded
         .into_iter()
         .take_while(|_| !cancel.is_cancelled())
     {
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(&record.worktree_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                comparison.gone_records.push((project_cwd, path));
+                comparison.gone_records.push(record);
             }
             _ => {
-                recorded.insert(physical(Path::new(&path)));
+                recorded.insert(physical(Path::new(&record.worktree_path)));
             }
         }
     }
@@ -1205,7 +1214,7 @@ mod tests {
     /// creation records and incomplete removal receipts, and audits the result.
     fn audit_children(
         managed: &Path,
-        recorded: Vec<(String, String)>,
+        recorded: Vec<WorktreeCreationRecord>,
         incomplete: Vec<String>,
     ) -> (AuditFacts, Vec<FindingInput>) {
         let children = std::fs::read_dir(managed)

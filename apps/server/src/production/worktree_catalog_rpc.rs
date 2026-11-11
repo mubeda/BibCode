@@ -1404,10 +1404,7 @@ async fn create_managed_worktree_locked(
                 .await;
             if rollback.is_ok()
                 && let Err(error) = repositories
-                    .delete_worktree_creation_record(
-                        &project.workspace_root,
-                        &created.worktree.path,
-                    )
+                    .delete_worktree_creation_record(&created.worktree.path)
                     .await
             {
                 tracing::warn!(%error, "a rolled-back worktree kept its creation record");
@@ -1837,8 +1834,8 @@ struct ResolvedRemovalPlan {
 struct ResolvedRemovalThread {
     path: PathBuf,
     known_thread_ids: Vec<String>,
-    /// The project root and worktree path as stored, the key of the worktree's creation record.
-    creation_record: (String, String),
+    /// The worktree path as stored, the key of the worktree's creation record.
+    creation_record: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -2410,11 +2407,10 @@ async fn remove_worktree_owned(
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
                 // The folder is gone. A failed delete is reaped by the next worktree audit.
-                let (project_cwd, worktree_path) = &resolved.creation_record;
                 if let Err(error) = services
                     .orchestration
                     .repositories()
-                    .delete_worktree_creation_record(project_cwd, worktree_path)
+                    .delete_worktree_creation_record(&resolved.creation_record)
                     .await
                 {
                     tracing::warn!(%error, "a removed worktree kept its creation record");
@@ -2554,10 +2550,7 @@ async fn resolve_removal_thread(
     Ok(ResolvedRemovalThread {
         path,
         known_thread_ids,
-        creation_record: (
-            project.workspace_root,
-            persisted_path.to_string_lossy().into_owned(),
-        ),
+        creation_record: persisted_path.to_string_lossy().into_owned(),
     })
 }
 
@@ -5430,9 +5423,12 @@ mod mutation_invalidation_tests {
         fixture
             .engine
             .repositories()
-            .list_worktree_creation_records(&fixture.main.to_string_lossy())
+            .list_worktree_creation_records()
             .await
             .expect("creation records")
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
     }
 
     #[tokio::test]

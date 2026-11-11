@@ -1457,9 +1457,9 @@ impl GitVcsRpcServices {
                         )
                     })?;
                 // The folder is gone. A failed delete is reaped by the next worktree audit.
-                let (project_cwd, worktree_path) = creation_record;
+                let (_, worktree_path) = creation_record;
                 if let Err(error) = repositories
-                    .delete_worktree_creation_record(&project_cwd, &worktree_path)
+                    .delete_worktree_creation_record(&worktree_path)
                     .await
                 {
                     tracing::warn!(%error, "a removed worktree kept its creation record");

@@ -3053,15 +3053,17 @@ fn migration_071(transaction: &Transaction<'_>) -> Result<()> {
 
 fn migration_072(transaction: &Transaction<'_>) -> Result<()> {
     // The worktrees BiBCode created (#344): the orphan audit warns only for a leftover with
-    // worktree evidence, and a record ends when its folder is gone.
+    // worktree evidence, and a record ends when its folder is gone. One record per path, and
+    // each creation gets a new `record_id`, never reused, so the audit's reap of a record it
+    // read cannot delete a later creation's.
     // Guarded like the migrations before it: a ledger rolled back below 72 runs it again.
     transaction.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS worktree_creation_records (
+          record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          worktree_path TEXT NOT NULL UNIQUE,
           project_cwd TEXT NOT NULL,
-          worktree_path TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          PRIMARY KEY(project_cwd, worktree_path)
+          created_at TEXT NOT NULL
         );
         "#,
     )
