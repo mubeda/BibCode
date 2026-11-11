@@ -250,11 +250,17 @@ Picking a row fills the field with that branch, which closes the list the same
 way; editing the field clears the choice and brings the rows back. In Smart, a
 field that exactly names a branch is that branch even when the name is a number
 such as `2026`; type `#2026` for the GitHub item instead. The field is
-the choice, so it survives reopening the dialog for the same project and
-switching between Smart and Branch; opening the dialog for another project
-clears it. If the chosen remote branch becomes local before submit,
-the server reuses it when free and still suffixes it when another worktree owns
-it.
+the choice, so it survives switching between Smart and Branch, and changing
+Project clears it. Every opening of the dialog starts fresh: Name and Create
+From are empty, Smart is selected, Advanced is collapsed with no base override,
+Create more is off, the Project is the one you opened it from (or the first
+project), and the agent follows Default Agent. This holds after a creation and
+after you close the dialog. While it stays open, your input survives a failed
+create and data refreshes. With **Create more** on, a successful create clears
+Name and Create From for the next worktree and keeps the project, mode, agent,
+base override and Advanced for that batch. If the chosen remote branch becomes
+local before submit, the server reuses it when free and still suffixes it when
+another worktree owns it.
 
 BiBCode's Git follows your system Git settings for line endings, Git LFS,
 symlinks and long paths, so a new worktree and a reverted turn hold the same

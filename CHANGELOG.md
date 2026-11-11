@@ -12,6 +12,7 @@
 - Background status reads no longer take Git's index lock, so your own `git add` or `git commit` in a terminal no longer fails with "index.lock: File exists" while BiBCode is open. On Linux and macOS BiBCode asks Git to stop before it forces it; on Windows it forces it as before. Either way it then removes an `index.lock` that its own stopped process left and that nothing else is using, including when it quits. (#341)
 - Local status for a worktree is delivered while a stacked action or a Git Manager push, publish, force push or remote branch delete waits on the network. Writes stay one at a time; pull and fetch still wait. (#345)
 - The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
+- Create worktree starts fresh every time it opens, after a creation or a close: the last Name, Create From, mode, base override, Advanced, Create more and agent pick no longer come back. Input stays while the dialog is open, and Create more still keeps the project, mode, agent and base override for its batch. (#346)
 
 ### Files
 

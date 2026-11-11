@@ -3474,6 +3474,14 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Create Worktree starts fresh on every opening (#346): choose **Branch**, pick
+  a branch, type a Name, set a base override under **Advanced** and pick an
+  agent by hand, then create with **Create more** off. Reopen it from the same
+  project: Name and Create From are empty, Smart is selected, Advanced is
+  collapsed and empty, Create more is off, the agent is the Default Agent, and
+  Create is disabled. Repeat with edits closed by **Escape**, and confirm that
+  a failed create keeps the input and that **Create more** keeps the project,
+  mode, agent and override for the next worktree until the dialog is closed;
 - Create Worktree and Add Project follow **Settings → Agents → Default Agent**
   (#185). Check each of these:
   - **Primary project:** with the app running, change Default Agent to a Claude
