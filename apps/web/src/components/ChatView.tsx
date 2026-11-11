@@ -2169,6 +2169,30 @@ function ChatViewContent(props: ChatViewProps) {
     providerChosen: isServerThread,
   });
   const providerBindingConflictReason = providerBinding.conflict?.reason ?? null;
+  // A chat keeps its provider when that provider is disabled or removed: name it and refuse
+  // Send instead of submitting an instance the server rejects (#347).
+  const boundProviderEntry = providerInstanceEntries.find(
+    (entry) => entry.instanceId === providerBinding.instanceId,
+  );
+  const boundInstanceSettings = settings.providerInstances?.[providerBinding.instanceId];
+  // An instance the server has not reported but settings still configure is only not known yet.
+  const boundProviderUnavailable = boundProviderEntry
+    ? !boundProviderEntry.enabled
+    : boundInstanceSettings
+      ? boundInstanceSettings.enabled === false
+      : providerStatuses.length > 0;
+  const unavailableProviderName =
+    isServerThread &&
+    serverConfig !== null &&
+    activeEnvironmentUnavailableState === null &&
+    providerBinding.conflict === null &&
+    boundProviderUnavailable
+      ? (boundProviderEntry?.displayName ?? formatProviderSlugLabel(providerBinding.instanceId))
+      : null;
+  const unavailableProviderReason =
+    unavailableProviderName === null ? null : `${unavailableProviderName} is not available`;
+  const unavailableProviderOnPrimary =
+    activeThread !== undefined && activeThread.environmentId === primaryEnvironment?.environmentId;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -2257,6 +2281,26 @@ function ChatViewContent(props: ChatViewProps) {
         description: providerBinding.conflict.reason,
       });
     }
+    if (unavailableProviderReason) {
+      items.push({
+        id: `provider-unavailable:${providerBinding.instanceId}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: unavailableProviderReason,
+        description: unavailableProviderOnPrimary
+          ? "This chat stays on it. Enable it in Settings → Providers, or add a chat with another agent from the + menu."
+          : "This chat stays on it. Enable it on this chat's server, or add a chat with another agent from the + menu.",
+        ...(unavailableProviderOnPrimary
+          ? {
+              actions: (
+                <Button size="xs" onClick={() => void navigate({ to: "/settings/providers" })}>
+                  Open Providers
+                </Button>
+              ),
+            }
+          : {}),
+      });
+    }
     if (showVersionMismatchBanner && versionMismatch && versionMismatchDismissKey) {
       items.push({
         id: `version-mismatch:${versionMismatchDismissKey}`,
@@ -2285,6 +2329,9 @@ function ChatViewContent(props: ChatViewProps) {
     navigate,
     presentation,
     providerBinding.conflict,
+    providerBinding.instanceId,
+    unavailableProviderOnPrimary,
+    unavailableProviderReason,
     setDismissedVersionMismatchKey,
     showVersionMismatchBanner,
     versionMismatch,
@@ -5719,6 +5766,7 @@ function ChatViewContent(props: ChatViewProps) {
       isConnecting ||
       workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
+      unavailableProviderReason !== null ||
       stoppingQueueRef.current ||
       sendInFlightRef.current
     )
@@ -7685,7 +7733,9 @@ function ChatViewContent(props: ChatViewProps) {
                             providerBindingInstanceId={providerBinding.instanceId}
                             lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
                             providerBindingConflictReason={
-                              workspaceUnavailable ?? providerBindingConflictReason
+                              workspaceUnavailable ??
+                              providerBindingConflictReason ??
+                              unavailableProviderReason
                             }
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={

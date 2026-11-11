@@ -6190,6 +6190,11 @@ describe("ChatView handlers (captured from mocked children)", () => {
       },
     });
     seedConnectedServerThread(startedThread);
+    // Configured but not reported yet; an instance in neither is removed and blocks Send (#347).
+    h.settings = {
+      ...h.settings,
+      providerInstances: { codex_personal: { driver: "codex", enabled: true } },
+    };
     useComposerDraftStore.getState().setModelSelection(threadRef, {
       instanceId: customInstanceId,
       model: "gpt-5.4",
