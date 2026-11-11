@@ -43,6 +43,7 @@ import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSel
 import { resolveEnvironmentOptionLabel } from "../BranchToolbar.logic";
 import {
   buildProviderAgentActions,
+  resolveDefaultAgentInstanceId,
   resolveEffectiveProviderAgentAction,
 } from "../chat/providerAgentActions";
 import { stackedThreadToast, toastManager } from "../ui/toast";
@@ -1020,15 +1021,12 @@ export function useAddProjectWorkflow(input: {
           );
           const serverConfig = environment?.serverConfig;
           const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
-          const defaultAgent = getDefaultAgent();
-          const selectedAction = resolveEffectiveProviderAgentAction(
-            buildProviderAgentActions(serverConfig?.providers ?? [], settings),
-            defaultAgent,
-          );
-          // Adding a project never waits for an agent: before sign-in, or while the server's
-          // agents are unknown, Main still opens on the Default Agent's provider.
           const resolution = resolveProviderSessionSelectionForInstance({
-            instanceId: selectedAction?.entry.instanceId ?? defaultAgent.instanceId,
+            instanceId: resolveDefaultAgentInstanceId(
+              serverConfig?.providers ?? [],
+              settings,
+              getDefaultAgent(),
+            ),
             providers: serverConfig?.providers ?? [],
             settings,
           });

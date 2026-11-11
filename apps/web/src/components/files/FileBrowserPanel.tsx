@@ -1,5 +1,5 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
-import { DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@bibcode/contracts";
+import { DEFAULT_SERVER_SETTINGS } from "@bibcode/contracts";
 import type {
   EditorId,
   EnvironmentId,
@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
 import { sanitizeFrontendLogText } from "~/diagnostics/frontendLogCapture";
 import { usePreferredEditor } from "~/editorPreferences";
+import { usePrimaryDefaultAgent } from "~/hooks/useSettings";
 import { useTheme } from "~/hooks/useTheme";
 import { inferProjectTitleFromPath } from "~/lib/projectPaths";
 import { cn, newProjectId } from "~/lib/utils";
@@ -43,6 +44,7 @@ import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { vcsEnvironment } from "~/state/vcs";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 
+import { resolveDefaultAgentInstanceId } from "../chat/providerAgentActions";
 import { RetryButton } from "../ui/retry-button";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import FileEntryDialog, { type FileEntryDialogRequest } from "./FileEntryDialog";
@@ -284,6 +286,7 @@ export default function FileBrowserPanel({
   const hasWorkspaceRoot = cwd.length > 0;
 
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
+  const defaultAgent = usePrimaryDefaultAgent();
   const createEntry = useAtomCommand(projectEnvironment.createEntry, { reportFailure: false });
   const refreshServerEntries = useAtomCommand(projectEnvironment.refreshEntries, {
     reportFailure: false,
@@ -418,10 +421,12 @@ export default function FileBrowserPanel({
     (workspaceRoot: string) => {
       void (async () => {
         const serverConfig = environment?.serverConfig;
+        const providers = serverConfig?.providers ?? [];
+        const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
         const resolution = resolveProviderSessionSelectionForInstance({
-          instanceId: ProviderInstanceId.make("codex"),
-          providers: serverConfig?.providers ?? [],
-          settings: serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS,
+          instanceId: resolveDefaultAgentInstanceId(providers, settings, defaultAgent),
+          providers,
+          settings,
         });
         if (resolution.fallback) {
           console.warn("Provider session default fallback", resolution.fallback);
@@ -446,7 +451,7 @@ export default function FileBrowserPanel({
         }
       })();
     },
-    [createProject, environment?.serverConfig, environmentId, showMutationError],
+    [createProject, defaultAgent, environment?.serverConfig, environmentId, showMutationError],
   );
 
   const createChildEntry = useCallback(
