@@ -249,7 +249,7 @@ function ToastBodyContent({
             // The label sits here, not on the description, so the toast's aria-describedby still reads the text.
             <div
               aria-label={toastType === "error" ? "Error details" : "Details"}
-              className="max-h-32 overflow-y-auto rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              className="max-h-32 overflow-y-auto rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
               role="group"
               tabIndex={0}
             >
