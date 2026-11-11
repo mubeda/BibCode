@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
 import type { Editor } from "@tiptap/core";
+import { NodeSelection } from "@tiptap/pm/state";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { List, Nodes } from "mdast";
@@ -11,6 +12,7 @@ import { unified } from "unified";
 import * as corpus from "./fixtures/corpus";
 import { canReconcile, reconcileMarkdown } from "./markdownReconcile";
 import { findUnsupportedConstruct, splitFrontmatter } from "./markdownSupport";
+import { fencedCode } from "./mermaidDiagramExtension";
 import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
 
 const editors: RichMarkdownEditor[] = [];
@@ -155,6 +157,33 @@ describe("createRichMarkdownEditor", () => {
     await Promise.resolve();
     // Teardown publishes nothing, so a destroyed editor never sets the surface's state.
     expect(onDiagramViewsChange).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["a diagram with a title", "~~~mermaid title=\"Flow\"", "graph TD\n  A --> B", "mermaidDiagram"],
+    ["a diagram with a backtick run", "~~~~mermaid", "graph TD\n  %% ```\n  A --> B", "mermaidDiagram"],
+    ["a code block with a title", "~~~js title=\"x\"", "const a = 1;", "codeBlock"],
+    ["a tilde code block", "~~~js", "const a = 1;", "codeBlock"],
+    ["a code block with a backtick run", "~~~~text", "a\n```\nb", "codeBlock"],
+  ])("cut and pasted, %s keeps its info string and code", (_name, opener, code, type) => {
+    const closer = opener.replace(/[^~]/g, "");
+    const original = `Intro.\n\n${opener}\n${code}\n${closer}\n\nEnd.\n`;
+    const { editor, tiptap } = open(original);
+    const before = editor.serialize();
+    const position = tiptap.state.doc.child(0).nodeSize;
+    expect(tiptap.state.doc.child(1).type.name).toBe(type);
+
+    const slice = NodeSelection.create(tiptap.state.doc, position).content();
+    const html = tiptap.view.serializeForClipboard(slice).dom.innerHTML;
+    tiptap.chain().setNodeSelection(position).deleteSelection().run();
+    typeAfter(tiptap, "End.", "");
+    tiptap.view.pasteHTML(html);
+
+    expect(tiptap.state.doc.lastChild?.type.name).toBe(type);
+    const info = opener.replace(/^~+/, "");
+    expect(reconcileMarkdown({ original, before, after: editor.serialize() })).toBe(
+      `Intro.\n\nEnd.\n\n${fencedCode(code, info)}\n`,
+    );
   });
 
   it("reconciles an untouched editor to the original bytes", () => {
