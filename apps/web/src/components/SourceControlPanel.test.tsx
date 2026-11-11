@@ -8,7 +8,7 @@ import {
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
-import type { Dispatch, ReactElement, SetStateAction } from "react";
+import { isValidElement, type Dispatch, type ReactElement, type SetStateAction } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -748,6 +748,28 @@ beforeEach(() => {
   testState.toast.update.mockReset();
   testState.toast.close.mockReset();
 });
+
+const REMOTE_PUSH_GUIDANCE =
+  "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+const GIT_USERNAME_LINE =
+  "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
+
+/** The failure toast's description keeps both paragraphs, line breaks and selection. */
+function expectMultiLineDescription(description: unknown): void {
+  expect(isValidElement(description)).toBe(true);
+  const { className, children } = (
+    description as ReactElement<{
+      className: string;
+      children: string;
+    }>
+  ).props;
+  expect(className.split(" ")).toEqual(
+    expect.arrayContaining(["whitespace-pre-line", "select-text"]),
+  );
+  expect(children.startsWith(`${REMOTE_PUSH_GUIDANCE}\n\n`)).toBe(true);
+  expect(children.split("\n").at(-1)).toBe(GIT_USERNAME_LINE);
+}
 
 describe("SourceControlPanel", () => {
   it("pushes before opening the merge request review, and cancel does no further work", async () => {
@@ -1578,6 +1600,33 @@ describe("SourceControlPanel", () => {
       "toast-1",
       expect.objectContaining({ title: "Commit failed", description: gitError }),
     );
+  });
+
+  it("a failed push from the panel shows the guidance and Git's own line", async () => {
+    testState.runAction.mockImplementationOnce(async (input: { actionId: string }) =>
+      AsyncResult.failure(
+        Cause.fail(
+          new VcsActionRemoteFailureError({
+            actionId: input.actionId,
+            transportActionId: input.actionId,
+            action: "commit_push",
+            environmentId: ENVIRONMENT_ID,
+            cwd: "/repo",
+            phase: "push",
+            remoteMessage: REMOTE_PUSH_FAILURE,
+          }),
+        ),
+      ),
+    );
+    render(buildProps());
+
+    buttonsByText("Commit (1)")[0]?.onClick?.();
+    await flushPromises();
+    expect(testState.toast.update).toHaveBeenLastCalledWith(
+      "toast-1",
+      expect.objectContaining({ type: "error", title: "Push failed" }),
+    );
+    expectMultiLineDescription(testState.toast.update.mock.calls.at(-1)?.[1].description);
   });
 
   it("renders the legacy flat section and commits by explicit file paths", async () => {

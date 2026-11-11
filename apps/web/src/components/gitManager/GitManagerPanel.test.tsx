@@ -369,6 +369,22 @@ beforeEach(() => {
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
+const REMOTE_PUSH_GUIDANCE =
+  "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+const GIT_USERNAME_LINE =
+  "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
+
+/** The element showing the failure keeps both paragraphs on their own lines. */
+function expectMultiLineFailure(root: ParentNode): void {
+  const shown = [...root.querySelectorAll("p")].find((element) =>
+    element.textContent?.includes(REMOTE_PUSH_GUIDANCE),
+  );
+  expect(shown?.textContent).toContain(REMOTE_PUSH_FAILURE);
+  expect(shown?.classList).toContain("whitespace-pre-line");
+  expect(shown?.classList).toContain("select-text");
+}
+
 describe("GitManagerPanel", () => {
   it("reports catalog loading only until the first live snapshot", () => {
     h.catalogPending = true;
@@ -908,6 +924,46 @@ describe("GitManagerPanel", () => {
         expect.any(Function),
       );
     } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("a failed push in history shows the multi-line message", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const failed = {
+      _tag: "failed",
+      operation: "push",
+      code: "authentication",
+      message: REMOTE_PUSH_FAILURE,
+      blocked: null,
+    };
+    h.runOperation.mockImplementation((_registry, _target, onEvent) => {
+      (onEvent as (event: unknown) => void)(failed);
+      return {
+        result: Promise.resolve({ _tag: "Success", value: failed, waiting: false }),
+        cancel: vi.fn(),
+      };
+    });
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction as (action: unknown) => void;
+      await act(async () => onAction({ _tag: "revert", sha: "d".repeat(40) }));
+      await act(async () => {
+        for (const effect of h.effects.splice(0)) effect();
+      });
+      expectMultiLineFailure(container);
+    } finally {
+      h.runOperation.mockReset();
+      h.runOperation.mockImplementation(() => ({
+        result: new Promise(() => undefined),
+        cancel: vi.fn(),
+      }));
       await act(async () => root.unmount());
       container.remove();
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
