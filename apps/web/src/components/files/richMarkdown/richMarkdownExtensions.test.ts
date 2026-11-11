@@ -125,6 +125,38 @@ describe("createRichMarkdownEditor", () => {
     },
   );
 
+  it("publishes one diagram snapshot per change, however many diagrams it touches", async () => {
+    const body = Array.from(
+      { length: 200 },
+      (_, index) => `\`\`\`mermaid\ngraph TD\n  A${String(index)} --> B\n\`\`\``,
+    ).join("\n\n");
+    const onDiagramViewsChange = vi.fn<(views: readonly unknown[]) => void>();
+    const element = document.createElement("div");
+    document.body.append(element);
+    const editor = createRichMarkdownEditor({
+      body,
+      element,
+      onUpdate: vi.fn(),
+      onDiagramViewsChange,
+    });
+    await Promise.resolve();
+    expect(onDiagramViewsChange).toHaveBeenCalledOnce();
+    expect(onDiagramViewsChange.mock.lastCall![0]).toHaveLength(200);
+
+    const tiptap = (element.querySelector(".ProseMirror") as HTMLElement & { editor: Editor })
+      .editor;
+    tiptap.chain().selectAll().deleteSelection().run();
+    await Promise.resolve();
+    expect(onDiagramViewsChange).toHaveBeenCalledTimes(2);
+    expect(onDiagramViewsChange.mock.lastCall![0]).toHaveLength(0);
+
+    tiptap.commands.undo();
+    editor.destroy();
+    await Promise.resolve();
+    // Teardown publishes nothing, so a destroyed editor never sets the surface's state.
+    expect(onDiagramViewsChange).toHaveBeenCalledTimes(2);
+  });
+
   it("reconciles an untouched editor to the original bytes", () => {
     for (const [name, original] of supported) {
       const { editor } = open(original);

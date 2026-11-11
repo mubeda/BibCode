@@ -30,8 +30,22 @@ export function createMermaidDiagramExtension(
   onViewsChange?: (views: readonly MermaidDiagramView[]) => void,
 ) {
   const views = new Set<MermaidDiagramView>();
-  const publish = () => onViewsChange?.([...views]);
+  // One snapshot for every view a load or a transaction adds or removes, not one per view, and
+  // none once the editor is destroyed.
+  let scheduled = false;
+  let destroyed = false;
+  const publish = () => {
+    if (!onViewsChange || scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      if (!destroyed) onViewsChange([...views]);
+    });
+  };
   return Node.create({
+    onDestroy() {
+      destroyed = true;
+    },
     name: "mermaidDiagram",
     group: "block",
     atom: true,
