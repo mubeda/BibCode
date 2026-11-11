@@ -532,6 +532,8 @@ impl ProductionRuntime {
             catalog: worktree_catalog.clone(),
             repositories: repositories.clone(),
         });
+        // Where Git runs, named by a failed push (#343).
+        let execution_place = crate::git::sign_in::execution_place(config);
         let pull_requests = PullRequestsRpcServices::with_dependencies(
             config.state_dir(),
             repositories.clone(),
@@ -547,7 +549,8 @@ impl ProductionRuntime {
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone())
         .with_mcp_settings(control.mcp_server_signal())
-        .with_interactive_git_sign_in(config.interactive_git_sign_in);
+        .with_interactive_git_sign_in(config.interactive_git_sign_in)
+        .with_execution_place(execution_place.clone());
         let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
             git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
         } else {
@@ -726,7 +729,8 @@ impl ProductionRuntime {
             repositories.clone(),
             workspace_availability.clone(),
             file_trash,
-        );
+        )
+        .with_execution_place(execution_place);
         let git_manager = if config.interactive_git_sign_in {
             git_manager.with_interactive_git_sign_in(&config.state_dir())
         } else {

@@ -59,7 +59,9 @@ fn relaunched(test_name: &str) -> bool {
     if std::env::var_os(ISOLATED).is_some() {
         return false;
     }
-    let _guard = RELAUNCH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = RELAUNCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = IsolatedGitConfig::new();
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     config.apply_to_command(&mut command);
@@ -98,10 +100,19 @@ fn use_credential_helper(cwd: &Path, helper: &str) {
         .args(["config", "--global", "--unset-all", "credential.helper"])
         .status();
     // An empty value clears helpers from every lower-priority file, the system one included.
-    git(cwd, &["config", "--global", "--add", "credential.helper", ""]);
-    git(cwd, &["config", "--global", "--add", "credential.helper", helper]);
+    git(
+        cwd,
+        &["config", "--global", "--add", "credential.helper", ""],
+    );
+    git(
+        cwd,
+        &["config", "--global", "--add", "credential.helper", helper],
+    );
     let helpers = git(cwd, &["config", "--get-all", "credential.helper"]);
-    assert_eq!(helpers, helper, "only the test's helper after the empty reset");
+    assert_eq!(
+        helpers, helper,
+        "only the test's helper after the empty reset"
+    );
 }
 
 enum Mode {
@@ -129,7 +140,10 @@ impl Fixture {
         let bare = root.path().join("served.git");
         let checkout = root.path().join("checkout");
         fs::create_dir(&checkout).expect("checkout directory");
-        git(root.path(), &["init", "-q", "--bare", "-b", "main", "served.git"]);
+        git(
+            root.path(),
+            &["init", "-q", "--bare", "-b", "main", "served.git"],
+        );
         git(&checkout, &["init", "-q", "-b", "main"]);
         git(&checkout, &["config", "user.name", "Test User"]);
         git(&checkout, &["config", "user.email", "user@example.test"]);
@@ -246,7 +260,8 @@ impl Fixture {
     /// The terminal event of a Source Control stacked push.
     async fn stacked_push(&mut self) -> Value {
         let id = self.id();
-        let payload = json!({ "actionId": format!("action-{id}"), "cwd": self.checkout, "action": "push" });
+        let payload =
+            json!({ "actionId": format!("action-{id}"), "cwd": self.checkout, "action": "push" });
         self.send_claiming_sign_in(&id, "git.runStackedAction", payload)
             .await;
         let events = drain(&mut self.socket, &id).await;
@@ -380,7 +395,10 @@ async fn remote_push_never_offers_sign_in() {
             } else {
                 fixture.stacked_push().await
             };
-            assert!(failed.get("signIn").is_none(), "{helper} {surface}: {failed}");
+            assert!(
+                failed.get("signIn").is_none(),
+                "{helper} {surface}: {failed}"
+            );
             assert_guidance(&failed, KNOWN_HOST_GUIDANCE);
             assert_eq!(
                 fixture.host.receive_pack_requests(),
@@ -389,7 +407,11 @@ async fn remote_push_never_offers_sign_in() {
             );
         }
     }
-    assert_ne!(fixture.served_head(), fixture.local_head(), "nothing pushed");
+    assert_ne!(
+        fixture.served_head(),
+        fixture.local_head(),
+        "nothing pushed"
+    );
 }
 
 #[tokio::test]
@@ -444,7 +466,10 @@ async fn stored_credential_push_succeeds_in_both_modes() {
         assert_eq!(fixture.served_head(), fixture.local_head());
 
         fs::write(fixture.checkout.join("tracked.txt"), "stacked change\n").expect("change");
-        git(&fixture.checkout, &["commit", "-q", "-am", "stacked change"]);
+        git(
+            &fixture.checkout,
+            &["commit", "-q", "-am", "stacked change"],
+        );
         let finished = fixture.stacked_push().await;
         assert_eq!(finished["kind"], "action_finished", "{finished}");
         assert_eq!(fixture.served_head(), fixture.local_head());
@@ -583,7 +608,11 @@ async fn drain(socket: &mut TestSocket, id: &str) -> Vec<Value> {
                 if request_id.as_str() == id {
                     values.extend(chunk);
                 }
-                send(socket, json!({"_tag": "Ack", "requestId": request_id.as_str()})).await;
+                send(
+                    socket,
+                    json!({"_tag": "Ack", "requestId": request_id.as_str()}),
+                )
+                .await;
             }
             ServerMessage::Exit {
                 request_id,

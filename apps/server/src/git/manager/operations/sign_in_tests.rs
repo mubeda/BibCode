@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 use super::{GitManagerOperationRequest, execute_branch_or_sync_operation};
 use crate::git::{
     BoxGitProcessFuture, GitManagerRefEntry, GitManagerRefsSnapshot, GitProcessRunner,
-    GitRepository, ProcessOutput, ProcessRequest, sign_in::CredentialPrompt,
+    GitRepository, ProcessOutput, ProcessRequest,
+    sign_in::{CredentialPrompt, ExecutionPlace},
 };
 
 const GCM_STDERR: &str = concat!(
@@ -161,12 +162,22 @@ async fn run(
     request: &GitManagerOperationRequest,
     prompt: CredentialPrompt,
 ) -> Result<super::GitManagerOperationOutcome, super::GitManagerOperationError> {
+    run_at(runner, request, prompt, &ExecutionPlace::default()).await
+}
+
+async fn run_at(
+    runner: &Arc<RemoteRunner>,
+    request: &GitManagerOperationRequest,
+    prompt: CredentialPrompt,
+    place: &ExecutionPlace,
+) -> Result<super::GitManagerOperationOutcome, super::GitManagerOperationError> {
     let repository = GitRepository::with_runner_for_test(runner.clone());
     execute_branch_or_sync_operation(
         &repository,
         &snapshot(),
         request,
         prompt,
+        place,
         &CancellationToken::new(),
     )
     .await
@@ -329,4 +340,38 @@ async fn a_resumed_request_runs_only_against_the_approved_destination() {
         assert_eq!(error.code, "destination-changed", "{}", resume.operation());
         assert_eq!(changed.network_spawns(), 0, "{}", resume.operation());
     }
+}
+
+#[tokio::test]
+async fn local_gcm_refusal_still_offers_sign_in_after_the_guidance_change() {
+    let stderr = concat!(
+        "fatal: Cannot prompt because user interactivity has been disabled.\n",
+        "fatal: could not read Username for 'https:",
+        "//gitlab.example.test': terminal prompts disabled\n"
+    );
+    let destination = concat!(
+        "https:",
+        "//gitlab.example.test/example-group/sample-project.git"
+    );
+    let push = request(
+        json!({"_tag": "push", "remote": "origin", "localBranch": "main", "remoteBranch": null}),
+    );
+    let local = ExecutionPlace {
+        remote: false,
+        server_name: None,
+    };
+    let runner = RemoteRunner::new(destination, stderr);
+    let error = run_at(&runner, &push, CredentialPrompt::OfferSignIn, &local)
+        .await
+        .expect_err("GCM refused");
+    assert_eq!(error.code, "sign-in-required");
+    assert_eq!(
+        error.message,
+        "Git Credential Manager needs you to sign in before Git can reach this remote."
+    );
+    let sign_in = error.sign_in.expect("signIn object");
+    assert_eq!(sign_in.destination, destination);
+    assert_eq!(sign_in.host, "gitlab.example.test");
+    assert_eq!(sign_in.direction.as_str(), "push");
+    assert_eq!(runner.network_spawns(), 1, "no retry");
 }

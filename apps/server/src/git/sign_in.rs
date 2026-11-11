@@ -97,6 +97,54 @@ pub fn has_gcm_refusal(stderr: &str) -> bool {
     })
 }
 
+/// True when Git stopped for a missing username with prompts disabled (#343).
+#[must_use]
+pub fn has_missing_username_refusal(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("could not read username") && detail.contains("terminal prompts disabled")
+}
+
+/// Where this server's Git runs, as a failed push names it (#343): `remote` for every server
+/// the desktop app did not start inside itself.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionPlace {
+    pub remote: bool,
+    pub server_name: Option<String>,
+}
+
+#[must_use]
+pub fn execution_place(config: &crate::ServerConfig) -> ExecutionPlace {
+    let label = config.environment_label.trim();
+    ExecutionPlace {
+        remote: !config.interactive_git_sign_in,
+        server_name: (!label.is_empty() && label != crate::config::LOCAL_ENVIRONMENT_LABEL)
+            .then(|| label.to_owned()),
+    }
+}
+
+impl ExecutionPlace {
+    /// The guidance for a push that failed on a remote server for a missing username, or
+    /// `None` when Git ran here or failed for another reason.
+    #[must_use]
+    pub fn push_guidance(&self, git_detail: &str) -> Option<String> {
+        (self.remote && has_missing_username_refusal(git_detail))
+            .then(|| remote_push_guidance(self.server_name.as_deref(), git_detail))
+    }
+}
+
+/// Where to sign in after a remote missing-credentials push, a blank line, then Git's text.
+#[must_use]
+pub fn remote_push_guidance(server_name: Option<&str>, git_detail: &str) -> String {
+    let (server, there) = server_name.map_or_else(
+        || ("".to_owned(), "the remote server".to_owned()),
+        |name| (format!(" {name}"), name.to_owned()),
+    );
+    format!(
+        "Push ran on the remote server{server}. In a terminal on {there}, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.\n\n{}",
+        git_detail.trim()
+    )
+}
+
 /// The pinned destination and its host for an `https://` URL, without user information.
 /// A query, fragment or `=` (which `-c http.<url>.*` cannot carry) gets no sign-in.
 #[must_use]
@@ -519,6 +567,66 @@ mod tests {
         assert!(!has_gcm_refusal(
             "git@github.com: Permission denied (publickey).\n"
         ));
+    }
+
+    const MISSING_USERNAME: &str = "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+
+    #[test]
+    fn detects_the_missing_username_refusal_only_with_prompts_disabled() {
+        assert!(has_missing_username_refusal(MISSING_USERNAME));
+        assert!(has_missing_username_refusal(
+            &MISSING_USERNAME.to_ascii_uppercase()
+        ));
+        assert!(!has_missing_username_refusal(
+            "fatal: could not read Username for 'https://gitlab.example.test': No such device"
+        ));
+        assert!(!has_missing_username_refusal(
+            "fatal: Authentication failed for 'https://gitlab.example.test/'"
+        ));
+    }
+
+    #[test]
+    fn names_a_known_server_and_keeps_gits_line_after_a_blank_line() {
+        assert_eq!(
+            remote_push_guidance(Some("example-server"), &format!("{MISSING_USERNAME}\n")),
+            format!(
+                "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.\n\n{MISSING_USERNAME}"
+            )
+        );
+        assert_eq!(
+            remote_push_guidance(None, MISSING_USERNAME),
+            format!(
+                "Push ran on the remote server. In a terminal on the remote server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.\n\n{MISSING_USERNAME}"
+            )
+        );
+    }
+
+    #[test]
+    fn the_place_is_remote_unless_the_desktop_started_the_server() {
+        let mut config = crate::ServerConfig::new(std::env::temp_dir());
+        config.environment_label = " example-server ".to_owned();
+        assert_eq!(
+            execution_place(&config),
+            ExecutionPlace {
+                remote: true,
+                server_name: Some("example-server".to_owned()),
+            }
+        );
+        for label in ["Local", "  ", ""] {
+            config.environment_label = label.to_owned();
+            assert_eq!(execution_place(&config).server_name, None, "{label:?}");
+        }
+        config.interactive_git_sign_in = true;
+        let local = execution_place(&config);
+        assert!(!local.remote);
+        assert_eq!(local.push_guidance(MISSING_USERNAME), None);
+        config.interactive_git_sign_in = false;
+        let remote = execution_place(&config);
+        assert!(remote.push_guidance(MISSING_USERNAME).is_some());
+        assert_eq!(
+            remote.push_guidance("fatal: Authentication failed for 'https://gitlab.example.test/'"),
+            None
+        );
     }
 
     #[test]

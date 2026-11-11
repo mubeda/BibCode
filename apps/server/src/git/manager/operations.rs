@@ -15,8 +15,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::git::sign_in::{
-    CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
-    resolve_destination,
+    CredentialPrompt, Destination, ExecutionPlace, SignInDirection, SignInRequired,
+    has_gcm_refusal, resolve_destination,
 };
 use crate::git::{
     GitCommandError, GitManagerBlockedReason, GitManagerInProgressKind, GitManagerRefsSnapshot,
@@ -1002,6 +1002,7 @@ pub async fn run_branch_or_sync_operation(
     catalog: WorktreeCatalogService,
     request: GitManagerOperationRequest,
     prompt: CredentialPrompt,
+    place: ExecutionPlace,
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1063,6 +1064,7 @@ pub async fn run_branch_or_sync_operation(
                     &snapshot,
                     &locked_request,
                     prompt,
+                    &place,
                     &operation_cancellation,
                 )
                 .await
@@ -1328,6 +1330,7 @@ async fn execute_branch_or_sync_operation(
     snapshot: &GitManagerRefsSnapshot,
     request: &GitManagerOperationRequest,
     prompt: CredentialPrompt,
+    place: &ExecutionPlace,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1352,12 +1355,41 @@ async fn execute_branch_or_sync_operation(
         }
     }
     let result = execute_operation_steps(repository, snapshot, request, cancellation).await;
-    match (result, network, prompt) {
+    let result = match (result, network, prompt) {
         (Err(error), Some(step), CredentialPrompt::OfferSignIn) => {
             Err(offer_sign_in(repository, request.cwd(), error, step, cancellation).await)
         }
         (result, ..) => result,
+    };
+    result.map_err(|mut error| {
+        if let Some(guidance) = remote_push_guidance(request, &error, place) {
+            error.message = guidance;
+        }
+        error
+    })
+}
+
+/// #343: a push that failed on a remote server for a missing username says where to sign in.
+fn remote_push_guidance(
+    request: &GitManagerOperationRequest,
+    error: &GitManagerOperationError,
+    place: &ExecutionPlace,
+) -> Option<String> {
+    use GitManagerOperationRequest as Request;
+    let pushes = matches!(
+        request,
+        Request::Push { .. }
+            | Request::PublishBranch { .. }
+            | Request::ForcePush { .. }
+            | Request::TagPush { .. }
+    );
+    if !pushes
+        || error.sign_in.is_some()
+        || error.code != GitManagerFailureCode::Authentication.as_str()
+    {
+        return None;
     }
+    place.push_guidance(&error.outputs.last()?.stderr)
 }
 
 /// Turns a failure whose stderr carries GCM's refusal into `sign-in-required` naming the
@@ -4208,6 +4240,7 @@ mod tests {
             &snapshot,
             &request,
             CredentialPrompt::Never,
+            &ExecutionPlace::default(),
             &CancellationToken::new(),
         )
         .await
@@ -6067,6 +6100,7 @@ mod tests {
                     expected_destination: None,
                 },
                 CredentialPrompt::Never,
+                &ExecutionPlace::default(),
                 &token,
             )
             .await
@@ -6078,6 +6112,7 @@ mod tests {
             &snapshot,
             &request,
             CredentialPrompt::Never,
+            &ExecutionPlace::default(),
             &token,
         )
         .await
@@ -6260,6 +6295,7 @@ mod transfer_gate_tests {
             harness.catalog.clone(),
             request,
             CredentialPrompt::Never,
+            ExecutionPlace::default(),
             cancellation,
         ))
     }

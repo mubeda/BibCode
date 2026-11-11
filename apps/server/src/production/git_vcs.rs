@@ -27,8 +27,8 @@ use crate::{
             NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
         },
         sign_in::{
-            CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
-            resolve_destination, upstream_remote,
+            CredentialPrompt, Destination, ExecutionPlace, SignInDirection, SignInRequired,
+            has_gcm_refusal, resolve_destination, upstream_remote,
         },
         validate_pathspecs,
     },
@@ -272,6 +272,8 @@ pub struct GitVcsRpcServices {
     /// Set only on the desktop's in-process server: the desktop app's own session may be offered a
     /// Git Credential Manager sign-in (#325).
     interactive_git_sign_in: bool,
+    /// Where this server's Git runs, for a failed push's guidance (#343).
+    place: ExecutionPlace,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -429,6 +431,7 @@ impl GitVcsRpcServices {
             clone_policy: ClonePolicy::default(),
             mcp_settings: None,
             interactive_git_sign_in: false,
+            place: ExecutionPlace::default(),
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
@@ -528,6 +531,13 @@ impl GitVcsRpcServices {
     #[must_use]
     pub fn with_interactive_git_sign_in(mut self, enabled: bool) -> Self {
         self.interactive_git_sign_in = enabled;
+        self
+    }
+
+    /// Where this server's Git runs (#343), built once from the server configuration.
+    #[must_use]
+    pub fn with_execution_place(mut self, place: ExecutionPlace) -> Self {
+        self.place = place;
         self
     }
 
@@ -1693,6 +1703,7 @@ impl GitVcsRpcServices {
         let availability = self.availability_registry.clone();
         let trace_diagnostics = self.trace_diagnostics.clone();
         let prompt = credential_prompt(self.interactive_git_sign_in, &context);
+        let place = self.place.clone();
         tokio::spawn(async move {
             let started = tokio::time::Instant::now();
             let payload = request.payload.clone();
@@ -1802,7 +1813,11 @@ impl GitVcsRpcServices {
                                     Some(Err(note)) => {
                                         wire["detail"] = json!(format!("{detail} {note}"));
                                     }
-                                    None => {}
+                                    None => {
+                                        if let Some(guidance) = place.push_guidance(&detail) {
+                                            wire["detail"] = json!(guidance);
+                                        }
+                                    }
                                 }
                             }
                             result
