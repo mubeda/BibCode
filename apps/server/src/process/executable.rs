@@ -395,6 +395,51 @@ impl SpawnPlan {
     }
 }
 
+#[cfg(test)]
+mod windows_batch_command_line_tests {
+    use std::{ffi::OsString, path::Path};
+
+    use super::make_windows_batch_command_line;
+
+    const SCRIPT: &str = r"C:\tools\review.cmd";
+
+    fn encode(arguments: &[String]) -> Result<String, String> {
+        let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+        make_windows_batch_command_line(Path::new(SCRIPT), &arguments)
+            .map(|line| line.into_string().expect("UTF-8 command line"))
+    }
+
+    #[test]
+    fn windows_batch_command_line_refuses_over_8191_chars() {
+        // About 4,240 characters raw; a quoted argument doubles its trailing backslashes.
+        let prompt = format!("Code review requested from BiBCode. {}", "\\".repeat(4_200));
+        let arguments = ["--permission-mode", "plan", "--", &prompt].map(str::to_owned);
+        let encoded = format!(
+            r#"/e:ON /v:OFF /d /c ""{SCRIPT}" --permission-mode plan -- "Code review requested from BiBCode. {}"""#,
+            "\\".repeat(8_400)
+        );
+        let length = encoded.encode_utf16().count();
+        assert!(prompt.chars().count() < 8_191 && length > 8_191);
+        let thousands = length / 1_000;
+        let units = length % 1_000;
+        assert_eq!(
+            encode(&arguments),
+            Err(format!(
+                "The command is too long for a Windows terminal ({thousands},{units:03} of 8,191 characters). Shorten the review prompt or pick a chat reviewer."
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_batch_command_line_accepts_exactly_8191_chars() {
+        let fixed = format!(r#"/e:ON /v:OFF /d /c ""{SCRIPT}" "#).len() + 1;
+        let fits = "a".repeat(8_191 - fixed);
+        assert_eq!(encode(std::slice::from_ref(&fits)).map(|line| line.len()), Ok(8_191));
+        let over = format!("{fits}a");
+        assert!(encode(&[over]).is_err());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod spawn_program_tests {
     use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
