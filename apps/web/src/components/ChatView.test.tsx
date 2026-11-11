@@ -757,7 +757,10 @@ vi.mock("./DiffPanel", () => ({
   },
 }));
 vi.mock("./SourceControlPanel", () => ({
-  default: () => <div data-mock="source-control-panel" />,
+  default: (props: Record<string, unknown>) => {
+    h.captured["sourceControlPanel"] = props;
+    return <div data-mock="source-control-panel" />;
+  },
 }));
 vi.mock("./files/FilePreviewPanel", () => {
   let nextInstanceId = 0;
@@ -5874,6 +5877,252 @@ describe("ChatView handlers (captured from mocked children)", () => {
         expect(buttonLabels(view.container)).toContain("Implement");
         expect(view.container.textContent).toContain("Fix the parser");
         expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Plan");
+      } finally {
+        await view.unmount();
+      }
+    });
+  });
+
+  describe("Review changes from Source Control (R90, R95, R97, R98)", () => {
+    type ReviewProp = {
+      readonly unavailableReason: string | null;
+      readonly guardLine: string | null;
+      readonly onStart: (scope: { kind: "branch" | "uncommitted"; base: string | null }) => void;
+    };
+    const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+    const cursorInstanceId = ProviderInstanceId.make("cursor");
+    const claudeProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: claudeInstanceId,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models: [{ slug: "opus", name: "Opus", isCustom: false, capabilities: null }],
+    };
+    const cursorProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: cursorInstanceId,
+      driver: ProviderDriverKind.make("cursor"),
+      models: [{ slug: "auto", name: "Auto", isCustom: false, capabilities: null }],
+    };
+    const SCOPE = { kind: "uncommitted", base: "origin/main" } as const;
+    const DRAFT_REASON = "Send a first message in this chat, then review from here.";
+    const WINDOWS_REASON =
+      "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.";
+
+    function seedReviewEnvironment(input: {
+      readonly reviewer: { kind: "chat" | "terminal"; instanceId: ProviderInstanceId };
+      readonly os?: string;
+      readonly codeReviews?: boolean;
+      readonly providers?: ReadonlyArray<ServerProvider>;
+      readonly settings?: Record<string, unknown>;
+    }): void {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: input.providers ?? [codexProvider, claudeProvider],
+            environment: {
+              label: "Local",
+              platform: { os: input.os ?? "linux", arch: "x64" },
+              capabilities: {
+                activityProtocolVersion: 2,
+                worktreeCatalog: true,
+                codeReviews: input.codeReviews ?? true,
+              },
+            },
+          },
+        } as never),
+      );
+      seedProject(makeProject());
+      seedGitStatus(true);
+      h.settings = { ...h.settings, codeReviewAgent: input.reviewer, ...input.settings };
+    }
+
+    async function mountReview(route: ReactElement): Promise<{
+      readonly review: () => ReviewProp;
+      readonly unmount: () => Promise<void>;
+    }> {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(route);
+        await Promise.resolve();
+      });
+      await vi.waitFor(() => expect(h.captured["sourceControlPanel"]).toBeDefined());
+      return {
+        review: () =>
+          (h.captured["sourceControlPanel"] as { codeReview: ReviewProp | null }).codeReview!,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    }
+
+    async function mountServerReview() {
+      useRightPanelStore.getState().open(threadRef, "sourceControl");
+      return mountReview(
+        <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+      );
+    }
+
+    it("starts a Codex chat review as a panel of the current thread", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId } });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        expect(view.review().guardLine).toBe(
+          "Runs in Codex's read-only sandbox. Writes ask for your approval.",
+        );
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+        const creations = commandCallsFor("worktree.createPanel");
+        expect(creations).toHaveLength(1);
+        expect(creations[0]!.input).toMatchObject({
+          environmentId,
+          input: {
+            hostThreadId: threadId,
+            title: "Panel: Code review · Codex",
+            threadDefaults: {
+              modelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            },
+            codeReview: true,
+          },
+        });
+        const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+          input: { message: { text: string } };
+        };
+        expect(turn.input.message.text).toMatch(
+          /^Code review requested from BiBCode\. Do not edit files\. Scope: the staged, unstaged and untracked changes in the working tree\.\n\n/,
+        );
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("opens a Claude Terminal review with the review command", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "terminal", instanceId: claudeInstanceId } });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        expect(view.review().guardLine).toBe("Starts in Claude's plan mode.");
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        const opened = commandCallsFor("terminal.open")[0]!.input as {
+          input: { command: { executable: string; args: string[] } };
+        };
+        expect(opened.input.command.executable).toBe("claude");
+        expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+        expect(opened.input.command.args.at(-2)).toBe("--");
+        expect(opened.input.command.args.at(-1)).toMatch(/^Code review requested from BiBCode\./);
+        expect(opened.input.command.args).not.toContain("--dangerously-skip-permissions");
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it.each([
+      ["chat Codex", { kind: "chat" as const, instanceId: codexInstanceId }],
+      ["Claude Terminal", { kind: "terminal" as const, instanceId: claudeInstanceId }],
+    ])("is unavailable in a draft chat for %s", async (_name, reviewer) => {
+      seedReviewEnvironment({ reviewer });
+      const draftId = newDraftId();
+      useComposerDraftStore
+        .getState()
+        .setLogicalProjectDraftThreadId(
+          "logical-project-1",
+          scopeProjectRef(environmentId, projectId),
+          draftId,
+          { threadId, createdAt: now, envMode: "local", worktreePath: null },
+        );
+      useRightPanelStore.getState().open(threadRef, "sourceControl");
+      publishSeededStoreState(useComposerDraftStore);
+      publishSeededStoreState(useRightPanelStore);
+      const view = await mountReview(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="draft"
+          draftId={draftId}
+        />,
+      );
+      try {
+        expect(view.review().unavailableReason).toBe(DRAFT_REASON);
+        await act(async () => view.review().onStart(SCOPE));
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("never falls back from a disabled saved reviewer", async () => {
+      seedReviewEnvironment({
+        reviewer: { kind: "chat", instanceId: claudeInstanceId },
+        providers: [claudeProvider, cursorProvider],
+        settings: {
+          providers: {
+            ...DEFAULT_SERVER_SETTINGS.providers,
+            claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
+          },
+        },
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBe(
+          "Claude is not available. Change the code review agent in Settings → Agents.",
+        );
+        await act(async () => view.review().onStart(SCOPE));
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("needs a server that advertises code reviews", async () => {
+      seedReviewEnvironment({
+        reviewer: { kind: "chat", instanceId: codexInstanceId },
+        codeReviews: false,
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBe(
+          "Update the BiBCode server on this environment to use Review.",
+        );
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it.each([
+      ["windows", WINDOWS_REASON],
+      ["darwin", null],
+      ["linux", null],
+    ])("offers a Claude Terminal review on %s only when terminal reviews are on", async (os, reason) => {
+      seedReviewEnvironment({
+        reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+        os,
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBe(reason);
+        await act(async () => view.review().onStart(SCOPE));
+        if (reason !== null) {
+          expect(commandCallsFor("terminal.open")).toEqual([]);
+        } else {
+          await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        }
       } finally {
         await view.unmount();
       }

@@ -442,6 +442,17 @@ vi.mock("~/components/ui/button", () => ({
   },
 }));
 
+vi.mock("~/components/ui/tooltip", () => ({
+  Tooltip: (props: { children?: unknown }) => <>{props.children as never}</>,
+  TooltipTrigger: (props: { render: ReactElement; children?: unknown }) => {
+    const Trigger = props.render.type as (input: Record<string, unknown>) => ReactElement;
+    return Trigger({ ...(props.render.props as object), children: props.children });
+  },
+  TooltipPopup: (props: { children?: unknown }) => (
+    <div data-testid="tooltip">{props.children as never}</div>
+  ),
+}));
+
 vi.mock("~/components/ui/dialog", () => ({
   Dialog: (props: CapturedDialogProps) => {
     captured.dialogs.push(props);
@@ -1091,6 +1102,77 @@ describe("SourceControlPanel", () => {
       (testState.localApi as { shell: unknown }).shell,
       "https://example.com/pr/7",
     );
+  });
+
+  describe("Review changes (R90)", () => {
+    const GUARD = "Starts in Claude's plan mode.";
+    const reviewProps = (unavailableReason: string | null = null, onStart = vi.fn()) =>
+      buildProps({ codeReview: { unavailableReason, guardLine: GUARD, onStart } });
+    const reviewButton = () =>
+      captured.buttons.find((button) => button["aria-label"] === "Review changes");
+    const tooltipText = (markup: string) =>
+      [...markup.matchAll(/data-testid="tooltip">(.*?)<\/div>/g)].map((match) => match[1]);
+
+    it("is absent without a review handler", () => {
+      render(buildProps());
+      expect(reviewButton()).toBeUndefined();
+    });
+
+    it("is enabled for a dirty tree and names the guard", () => {
+      testState.statusQuery.data = stagingStatus({
+        refName: "main",
+        isDefaultRef: true,
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+      });
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      expect(reviewButton()).toBeDefined();
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(false);
+      expect(tooltipText(markup).join("|")).toContain("Review changes");
+      expect(tooltipText(markup).join("|")).toContain(GUARD);
+      reviewButton()!.onClick!();
+      expect(onStart).toHaveBeenCalledWith({ kind: "uncommitted", base: "origin/main" });
+    });
+
+    it("is enabled for a clean branch with commits ahead and starts a branch review", () => {
+      testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 2 });
+      const onStart = vi.fn();
+      render(reviewProps(null, onStart));
+      reviewButton()!.onClick!();
+      expect(onStart).toHaveBeenCalledWith({ kind: "branch", base: "origin/main" });
+    });
+
+    it.each([
+      ["nothing to review", () => status({ defaultRefName: "main", aheadOfDefaultCount: 0 })],
+      ["no count ahead from the server", () => status({ defaultRefName: "main" })],
+    ])("is disabled with %s", (_name, makeStatus) => {
+      testState.statusQuery.data = makeStatus();
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain("No changes to review");
+      reviewButton()!.onClick!();
+      expect(onStart).not.toHaveBeenCalled();
+    });
+
+    it("is disabled while the first status loads", () => {
+      testState.statusQuery = { data: null, error: null, isPending: true, refresh: vi.fn() };
+      const markup = render(reviewProps());
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain("Checking for changes");
+    });
+
+    it("shows the unavailable reason first", () => {
+      const reason = "Update the BiBCode server on this environment to use Review.";
+      const onStart = vi.fn();
+      const markup = render(reviewProps(reason, onStart));
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain(reason);
+      expect(tooltipText(markup).join("|")).not.toContain(GUARD);
+      reviewButton()!.onClick!();
+      expect(onStart).not.toHaveBeenCalled();
+    });
   });
 
   it("groups files into staged, unstaged and untracked sections", () => {
