@@ -25,9 +25,37 @@ cue.
 | Worktree    | `data-sidebar-level="worktree"`                                     | branch icon, indent of 0.75rem, a 1px indent guide beside it, its own outlined surface  | `sidebar-worktree`, `sidebar-worktree-border`, `sidebar-worktree-icon`, `sidebar-indent-guide` |
 | Chat        | `data-sidebar-level="chat"`                                         | 12px (`text-xs`, the app's floor) at weight 400 under a 13px checkout or worktree label | `sidebar-chat-foreground`                                                                      |
 
-The "N more chats" and hidden-worktrees rows are chat level. Inside a level, three child markers
-let one rule reach the right element: `data-sidebar-label` (the checkout or branch name),
-`data-sidebar-icon` (the leading icon) and `data-sidebar-badge` (the `primary` badge).
+The "N more chats" label inside a card and the hidden-worktrees row are chat level. The chats in
+the "N more chats" popover are not: they sit on the popover surface and paint
+`popover-foreground`, the checked menu pair. The hidden-worktrees row marks its text span,
+because the ghost button's `text-foreground` utility would outrank the chat rule on the button.
+Inside a level, three child markers let one rule reach the right element: `data-sidebar-label`
+(the checkout or branch name), `data-sidebar-icon` (the leading icon) and `data-sidebar-badge`
+(the `primary` badge).
+
+### Row order
+
+A primary card leads with its checkout name (the live branch) and a house icon. A worktree row
+leads the same way with its branch: line 1 is the branch icon and branch name as
+`data-sidebar-label`, then the PR, dirty, terminal and port indicators and the Archive or jump
+control. Line 2 is the chat title at chat level (`data-sidebar-level="chat"`), which keeps the
+title's id, test id, unread state, tooltip and inline rename. The card's accessible name is still
+the chat title and its description still starts with the branch. When the branch equals the
+chat title (`shouldShowWorkspaceBranchText`), the row shows one name line, the title as the
+label with the branch icon. A thread row in the main checkout keeps title first and branch
+below.
+
+### Unread
+
+An unread row draws a dot before its title, the shape of the Agents view's unread dot
+(`AgentsRow.tsx`, whose sky colour is hard-coded). Here the level rule
+`[data-sidebar-unread]` paints it `sidebar-primary-badge-foreground`, at or above 3:1 on every
+row state in every built-in (tested). The title paints `foreground` and weight 600, and the
+card's screen-reader flags still say "unread". The dot is the cue that does not depend on colour
+or weight, which matters on the primary label (already 600) and in Tokyo Night and Matrix Dark,
+whose chat colour equals `foreground`. Labels and chat text carry no colour utility, read or
+unread. A resting non-primary label paints `foreground` at 90 percent from the
+`[data-sidebar-label]` rule.
 
 ## Tokens
 
@@ -126,7 +154,14 @@ fill.
 `resolveWorkspaceCardClassName` in `Sidebar.logic.ts` keeps its classes for every card: outlined,
 the active card's `bg-foreground/8`, the selected card's `bg-primary/15` with `border-primary/40`,
 the selected and active card's `bg-primary/22` with `border-primary/60`, the hover `bg-accent/60`,
-the inner button's orange focus ring and the `opacity-60` of an unavailable environment.
+the inner button's orange focus ring. An unavailable environment puts `opacity-60` on the element
+that owns the band, as the preview does, so the band surface and accent rule dim with the header
+(and with any rows the band still holds).
+
+In the Environments view a remote's context card (`EnvironmentContextCard`) is the environment
+level band, drawn by the same rule. The rule also maps `--muted-foreground` to the sidebar card's
+muted text, which Dark needs there: the global muted grey is 3.83:1 on the band, the sidebar
+card's 5.78:1. A local environment draws no card.
 
 On checkout and worktree rows those fills are translucent and replace the worktree surface. In
 Tokyo Night and Matrix Dark they dropped a selected row's label to 3.35:1 and its chat text to 3.74:1. Unlayered row rules in
@@ -138,12 +173,17 @@ These mixes are not theme tokens (D21).
 | ------------------- | ------------------------------------------- | ---------------------- | ---------------------------- |
 | Resting worktree    | none                                        | `sidebar-worktree`     | `sidebar-worktree-border`    |
 | Resting checkout    | none                                        | none (the band)        | the card class's transparent |
-| Hover               | `:hover`                                    | `foreground` 3 percent | unchanged                    |
+| Hover               | `:hover`                                    | `foreground` 5 percent | unchanged                    |
 | Active              | `data-active="true"`                        | `foreground` 8 percent | `foreground` 40 percent      |
 | Selected            | `data-selected="true"`                      | `primary` 16 percent   | `primary` 40 percent         |
 | Selected and active | `data-selected="true"` `data-active="true"` | `primary` 20 percent   | `primary` 60 percent         |
 
-Each fill is the named color mixed into `sidebar-worktree`. Hover paints over the resting surface,
+Each fill is the named color mixed into `sidebar-worktree`. Hover was 3 percent, a 1.054:1 step
+from resting in five built-ins, too small to see in Tokyo Night. At 5 percent the step is 1.092:1
+to 1.156:1, and a test asks for at least 1.09:1 and for active above hover. Under the dark base
+(`.dark`) selected mixes 18 percent and selected and active 22 percent, because Dark's 5 percent
+hover (1.156:1) came within 5 percent of its 16 percent selection (1.197:1). The test asks for
+selected above hover by at least 5 percent. Hover paints over the resting surface,
 so it is never weaker than resting. Selected beats hover and active because its rule comes later with the same specificity, and selected and active beats selected because its selector is more specific. Hovered selected and hovered active rows were not rendered in a browser. The order is checked only by reading the rules. On a hover, active or selected
 row the label (`data-sidebar-label`, outside the primary checkout) paints `foreground` instead of
 `foreground` at 90 percent, and the muted text paints the chat color. Selection keeps the
@@ -154,12 +194,12 @@ Contrast of label, chat and muted text on each composited row surface, measured 
 
 | Theme         | Resting worktree    | Resting checkout    | Hover               | Active              | Selected            | Selected and active |
 | ------------- | ------------------- | ------------------- | ------------------- | ------------------- | ------------------- | ------------------- |
-| Light         | 10.62 / 7.47 / 5.25 | 10.69 / 7.54 / 5.29 | 13.52 / 7.09 / 7.09 | 12.25 / 6.42 / 6.42 | 11.82 / 6.20 / 6.20 | 11.28 / 5.92 / 5.92 |
-| Dark          | 10.65 / 8.13 / 5.37 | 11.40 / 8.75 / 5.78 | 11.69 / 7.46 / 7.46 | 10.05 / 6.41 / 6.41 | 10.64 / 6.79 / 6.79 | 10.00 / 6.38 / 6.38 |
-| Tokyo Night   | 6.27 / 7.37 / 5.24  | 5.48 / 6.36 / 4.52  | 6.99 / 6.99 / 6.99  | 6.34 / 6.34 / 6.34  | 5.55 / 5.55 / 5.55  | 5.15 / 5.15 / 5.15  |
-| Matrix Dark   | 7.42 / 8.84 / 7.97  | 4.66 / 5.33 / 4.81  | 8.38 / 8.38 / 8.38  | 7.55 / 7.55 / 7.55  | 6.61 / 6.61 / 6.61  | 6.11 / 6.11 / 6.11  |
-| Matrix Light  | 12.21 / 8.46 / 5.77 | 11.70 / 8.04 / 5.48 | 15.10 / 7.96 / 7.96 | 13.65 / 7.20 / 7.20 | 12.95 / 6.83 / 6.83 | 12.32 / 6.50 / 6.50 |
-| Verdant Light | 8.33 / 5.99 / 5.76  | 8.27 / 5.94 / 5.71  | 10.59 / 5.68 / 5.68 | 9.68 / 5.19 / 5.19  | 8.98 / 4.82 / 4.82  | 8.50 / 4.56 / 4.56  |
+| Light         | 10.62 / 7.47 / 5.25 | 10.69 / 7.54 / 5.29 | 13.02 / 6.83 / 6.83 | 12.25 / 6.42 / 6.42 | 11.82 / 6.20 / 6.20 | 11.28 / 5.92 / 5.92 |
+| Dark          | 10.65 / 8.13 / 5.37 | 11.40 / 8.75 / 5.78 | 11.01 / 7.03 / 7.03 | 10.05 / 6.41 / 6.41 | 10.34 / 6.60 / 6.60 | 9.76 / 6.23 / 6.23  |
+| Tokyo Night   | 6.27 / 7.37 / 5.24  | 5.48 / 6.36 / 4.52  | 6.72 / 6.72 / 6.72  | 6.34 / 6.34 / 6.34  | 5.33 / 5.33 / 5.33  | 4.92 / 4.92 / 4.92  |
+| Matrix Dark   | 7.42 / 8.84 / 7.97  | 4.66 / 5.33 / 4.81  | 8.03 / 8.03 / 8.03  | 7.55 / 7.55 / 7.55  | 6.36 / 6.36 / 6.36  | 5.87 / 5.87 / 5.87  |
+| Matrix Light  | 12.21 / 8.46 / 5.77 | 11.70 / 8.04 / 5.48 | 14.55 / 7.67 / 7.67 | 13.65 / 7.20 / 7.20 | 12.95 / 6.83 / 6.83 | 12.32 / 6.50 / 6.50 |
+| Verdant Light | 8.33 / 5.99 / 5.76  | 8.27 / 5.94 / 5.71  | 10.22 / 5.49 / 5.49 | 9.68 / 5.19 / 5.19  | 8.98 / 4.82 / 4.82  | 8.50 / 4.56 / 4.56  |
 
 ### Attribute contract for Task 10.2
 
@@ -174,9 +214,12 @@ same element that carries `resolveWorkspaceCardClassName`:
   `data-sidebar-icon` on the leading icon and `data-sidebar-badge` on the `primary` badge.
 - The row rules replace the background and border of `resolveWorkspaceCardClassName` on these
   rows, so its fill and border utilities no longer show there.
-- Chat rows must not carry their own text color utility (such as `text-foreground/80`). The chat
-  rule sits in the components layer and would lose to it, which bypasses the Tokyo Night and
-  Matrix Dark `sidebar-chat-foreground` overrides.
+- Labels and chat rows must not carry their own text color utility (such as
+  `text-foreground/80`), read or unread. The label and chat rules sit in the components layer and
+  would lose to it, which bypasses the Tokyo Night and Matrix Dark `sidebar-chat-foreground`
+  overrides. Guard tests in the left panel, the title line and the preview check every marked
+  element.
+- `data-unread="true"` on an unread title and `data-sidebar-unread` on its dot.
 - `data-sidebar-level="chat"` on each chat row and on the "N more chats" row inside a checkout or
   worktree, so the muted text and chat rules reach them.
 
@@ -190,8 +233,8 @@ rule, keyed on `data-sidebar-level`, `data-primary` and the three child markers.
 Sidebar group shows `SidebarLevelsPreview` (`apps/web/src/components/settings/`), a static,
 `inert` figure of fixture data: one repository (`example-group/sample-project`) with two
 environments (Local, connected, and `example-server`, unavailable), the primary checkout `main`
-(active), two worktrees (`feature/sample`, selected, and `feature/sample-docs`, at rest), chat rows
-and a "3 more chats" row. It uses `SIDEBAR_CARD_CLASS` and `resolveWorkspaceCardClassName` from
+(active), two worktrees (`feature/sample`, selected, and `feature/sample-docs`, at rest, whose
+chat is unread), chat rows and a "3 more chats" row. It uses `SIDEBAR_CARD_CLASS` and `resolveWorkspaceCardClassName` from
 `Sidebar.logic.ts`, so it is drawn by the same rules and state classes as the left panel. Editing
 a token repaints the preview through the editor's live theme preview, with no subscription in the
 preview.

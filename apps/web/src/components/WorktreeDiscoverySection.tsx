@@ -516,13 +516,16 @@ function PhysicalWorktreeDiscoverySection(props: {
       {showCollapsedLine ? (
         <Button
           aria-label={`Hiding ${formatDiscoveredWorktreeCount(allCandidates.length)}`}
-          className="h-6 w-full justify-start gap-1.5 px-2 text-xs text-muted-foreground"
+          className="h-6 w-full justify-start gap-1.5 px-2 text-xs"
           size="xs"
           variant="ghost"
           onClick={() => setManuallyExpanded(true)}
         >
           <EyeOffIcon className="size-3" />
-          <span>{`Hiding ${formatDiscoveredWorktreeCount(allCandidates.length)}`}</span>
+          {/* On the text, since the ghost variant's text colour outranks the level rule. */}
+          <span data-sidebar-level="chat">
+            {`Hiding ${formatDiscoveredWorktreeCount(allCandidates.length)}`}
+          </span>
           <ChevronRightIcon className="ml-auto size-3" />
         </Button>
       ) : null}

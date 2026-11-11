@@ -9,6 +9,7 @@ import {
 
 import { cn } from "../../lib/utils";
 import { resolveWorkspaceCardClassName, SIDEBAR_CARD_CLASS } from "../Sidebar.logic";
+import { WorkspaceCardUnreadDot } from "../sidebar/WorkspaceCard";
 
 function EnvironmentHeader(props: {
   icon: LucideIcon;
@@ -31,14 +32,28 @@ function EnvironmentHeader(props: {
   );
 }
 
-function ChatRows(props: { chats: readonly string[]; more?: number | undefined }) {
+function ChatRows(props: {
+  chats: readonly string[];
+  more?: number | undefined;
+  /** The chat drawn unread, with the left panel's dot and weight. */
+  unread?: string | undefined;
+}) {
   return (
     <ul className="mt-0.5 grid gap-0.5 ps-5">
-      {props.chats.map((chat) => (
-        <li key={chat} data-sidebar-level="chat" className="truncate">
-          {chat}
-        </li>
-      ))}
+      {props.chats.map((chat) =>
+        chat === props.unread ? (
+          <li key={chat} className="flex min-w-0 items-center gap-1.5">
+            <WorkspaceCardUnreadDot />
+            <span data-sidebar-level="chat" data-unread="true" className="truncate font-semibold">
+              {chat}
+            </span>
+          </li>
+        ) : (
+          <li key={chat} data-sidebar-level="chat" className="truncate">
+            {chat}
+          </li>
+        ),
+      )}
       {props.more ? <li data-sidebar-level="chat">{`${props.more} more chats`}</li> : null}
     </ul>
   );
@@ -50,6 +65,7 @@ function Worktree(props: {
   active?: boolean;
   chats: readonly string[];
   more?: number;
+  unread?: string;
 }) {
   const isSelected = props.selected === true;
   const isActive = props.active === true;
@@ -60,13 +76,13 @@ function Worktree(props: {
       data-active={isActive ? "true" : undefined}
       className={cn(resolveWorkspaceCardClassName({ isActive, isSelected }), "px-2 py-1")}
     >
-      <div className="flex min-w-0 items-center gap-1.5 text-foreground/90">
+      <div className="flex min-w-0 items-center gap-1.5">
         <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
         <span data-sidebar-label className="min-w-0 truncate">
           {props.branch}
         </span>
       </div>
-      <ChatRows chats={props.chats} more={props.more} />
+      <ChatRows chats={props.chats} more={props.more} unread={props.unread} />
     </li>
   );
 }
@@ -112,7 +128,7 @@ export function SidebarLevelsPreview() {
                     "px-2 py-1",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-1.5 text-foreground/90">
+                  <div className="flex min-w-0 items-center gap-1.5">
                     <HouseIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
                     <span data-sidebar-label className="min-w-0 truncate">
                       main
@@ -127,6 +143,7 @@ export function SidebarLevelsPreview() {
                 <Worktree
                   branch="feature/sample-docs"
                   chats={["Update the setup guide"]}
+                  unread="Update the setup guide"
                   more={3}
                 />
               </ul>

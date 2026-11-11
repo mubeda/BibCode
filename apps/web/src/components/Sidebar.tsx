@@ -1175,6 +1175,29 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
       <TooltipPopup side="top">Archive</TooltipPopup>
     </Tooltip>
   );
+  // A worktree row leads with its branch, as the primary card leads with its checkout, and
+  // shows the chat title below it. A branch equal to the title stays one line.
+  const leadsWithBranch = thread.worktreePath !== null && showBranchText;
+  const branchTooltip = showBranchText
+    ? resolveWorkspaceCardBranchTooltip({
+        branch: branchLabel,
+        worktreePath: thread.worktreePath,
+        checkoutPath: gitCwd,
+      })
+    : null;
+  const indicators = (
+    <>
+      {prStatus ? <WorkspaceCardPrButton indicator={prStatus} onClick={handlePrClick} /> : null}
+      {dirty ? <WorkspaceCardDirtyDot /> : null}
+      {terminalStatus ? (
+        <WorkspaceCardTerminalIcon
+          label={terminalStatus.label}
+          colorClass={terminalStatus.colorClass}
+        />
+      ) : null}
+      <WorkspaceCardPortsButton ports={discoveredPorts} onClick={handleOpenDiscoveredPort} />
+    </>
+  );
 
   return (
     <WorkspaceCardShell
@@ -1223,12 +1246,24 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         ) : null
       }
     >
+      {leadsWithBranch ? (
+        <WorkspaceCardBranchLine
+          id={cardIds.branch}
+          branch={branchLabel}
+          branchTooltip={branchTooltip}
+          label
+        >
+          {indicators}
+          {trailing}
+        </WorkspaceCardBranchLine>
+      ) : null}
       <WorkspaceCardTitleLine
         id={cardIds.title}
         flagsId={cardIds.flags}
         title={thread.title}
         titleTestId={`thread-title-${thread.id}`}
-        icon={thread.worktreePath !== null ? GitBranchIcon : undefined}
+        icon={thread.worktreePath !== null && !leadsWithBranch ? GitBranchIcon : undefined}
+        chat={leadsWithBranch}
         unread={isUnread}
         pinned={isPinned}
         pinnedTestId={`thread-pinned-${thread.id}`}
@@ -1248,7 +1283,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
             />
           ) : undefined
         }
-        trailing={trailing}
+        trailing={leadsWithBranch ? undefined : trailing}
         badge={
           thread.requester ? (
             <AgentActorChip
@@ -1260,30 +1295,14 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           ) : undefined
         }
       />
-      {hasBranchLine ? (
+      {hasBranchLine && !leadsWithBranch ? (
         <WorkspaceCardBranchLine
           id={cardIds.branch}
           branch={showBranchText ? branchLabel : null}
           branchIcon={thread.worktreePath === null}
-          branchTooltip={
-            showBranchText
-              ? resolveWorkspaceCardBranchTooltip({
-                  branch: branchLabel,
-                  worktreePath: thread.worktreePath,
-                  checkoutPath: gitCwd,
-                })
-              : null
-          }
+          branchTooltip={branchTooltip}
         >
-          {prStatus ? <WorkspaceCardPrButton indicator={prStatus} onClick={handlePrClick} /> : null}
-          {dirty ? <WorkspaceCardDirtyDot /> : null}
-          {terminalStatus ? (
-            <WorkspaceCardTerminalIcon
-              label={terminalStatus.label}
-              colorClass={terminalStatus.colorClass}
-            />
-          ) : null}
-          <WorkspaceCardPortsButton ports={discoveredPorts} onClick={handleOpenDiscoveredPort} />
+          {indicators}
         </WorkspaceCardBranchLine>
       ) : null}
       {hasSessionLine ? (
@@ -3390,12 +3409,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   return (
     <>
-      <div
-        className={cn(
-          "group/project-header relative",
-          environmentCard && !environmentCard.available && "opacity-60",
-        )}
-      >
+      <div className="group/project-header relative">
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
@@ -3854,7 +3868,12 @@ const SidebarProjectListRow = memo(function SidebarProjectListRow(props: Sidebar
   return (
     <SidebarMenuItem
       // ps-1 keeps the band's 3px leading rule clear of the header; pb-1 lifts its last row off its edge.
-      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "ps-1 pb-1"}
+      // An unavailable environment dims its whole band, surface and accent rule included.
+      className={
+        isCard
+          ? cn(SIDEBAR_CARD_CLASS, "p-1")
+          : cn("ps-1 pb-1", !props.environmentCard?.available && "opacity-60")
+      }
       data-sidebar-card={isCard ? "true" : undefined}
       data-sidebar-level={isCard ? "repo" : "environment"}
     >

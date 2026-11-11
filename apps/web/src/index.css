@@ -451,6 +451,9 @@
    (selected, active, hover, unavailable) still win over a level's resting look (R64). */
 @layer components {
   [data-sidebar-level="environment"] {
+    /* Outside a repository card (the Environments view) too, the band's muted text is the
+       sidebar card's, which the band contrast pairs check. */
+    --muted-foreground: var(--sidebar-card-muted-foreground);
     border-radius: calc(var(--radius) - 2px);
     background-color: var(--sidebar-env-band);
     box-shadow: inset 3px 0 0 var(--sidebar-env-accent);
@@ -458,6 +461,11 @@
 
   [data-sidebar-level="checkout"] {
     font-size: 13px;
+  }
+
+  /* A checkout or branch name at rest. Labels and chat text carry no colour utility. */
+  [data-sidebar-label] {
+    color: color-mix(in srgb, var(--foreground) 90%, transparent);
   }
 
   [data-sidebar-level="checkout"][data-primary] [data-sidebar-label] {
@@ -505,6 +513,17 @@
     line-height: 1rem;
     color: var(--sidebar-chat-foreground);
   }
+
+  /* Unread: a dot before the title (the shape is the cue) and the title at foreground. The
+     primary label keeps its stronger rule. */
+  [data-sidebar-unread] {
+    background-color: var(--sidebar-primary-badge-foreground);
+  }
+
+  [data-sidebar-label][data-unread="true"],
+  [data-sidebar-level="chat"][data-unread="true"] {
+    color: var(--foreground);
+  }
 }
 
 /* Checkout and worktree row states (R64), keyed on data-selected and data-active. Outside the
@@ -519,7 +538,7 @@
 }
 
 :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):hover {
-  background-color: color-mix(in srgb, var(--foreground) 3%, var(--sidebar-worktree));
+  background-color: color-mix(in srgb, var(--foreground) 5%, var(--sidebar-worktree));
 }
 
 :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-active="true"] {
@@ -538,6 +557,20 @@
   )[data-selected="true"][data-active="true"] {
   border-color: color-mix(in srgb, var(--primary) 60%, transparent);
   background-color: color-mix(in srgb, var(--primary) 20%, var(--sidebar-worktree));
+}
+
+/* The dark base lifts hover more per percent, so its selection mixes in more primary to stay
+   clearly stronger than hover. */
+.dark :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-selected="true"] {
+  background-color: color-mix(in srgb, var(--primary) 18%, var(--sidebar-worktree));
+}
+
+.dark
+  :is(
+    [data-sidebar-level="checkout"],
+    [data-sidebar-level="worktree"]
+  )[data-selected="true"][data-active="true"] {
+  background-color: color-mix(in srgb, var(--primary) 22%, var(--sidebar-worktree));
 }
 
 :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):is(

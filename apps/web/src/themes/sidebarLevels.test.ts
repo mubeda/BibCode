@@ -151,16 +151,15 @@ const STATES = {
   "selected and active": `${ROWS}[data-selected="true"][data-active="true"]`,
 } as const;
 
-/** A state rule, with the dark base's override when the stylesheet has one. */
+/** A state rule's declarations, with the dark base's overrides on top when it has any. */
 function stateRule(theme: ThemeFile, selector: string): Map<string, string> {
-  if (theme.base === "dark") {
-    try {
-      return ruleDeclarations(`.dark ${selector}`);
-    } catch {
-      // The dark base uses the shared rule.
-    }
+  const shared = ruleDeclarations(selector);
+  if (theme.base !== "dark") return shared;
+  try {
+    return new Map([...shared, ...ruleDeclarations(`.dark ${selector}`)]);
+  } catch {
+    return shared;
   }
-  return ruleDeclarations(selector);
 }
 
 /** What the row rules of index.css paint on a checkout or worktree row in each state (R64). */
@@ -314,9 +313,10 @@ describe("unread rows (R63)", () => {
       const text = evaluate(ruleDeclarations(UNREAD_TEXT).get("color")!);
       for (const level of ["checkout", "worktree"] as const) {
         for (const [state, painted] of Object.entries(paintRows(theme, level).surfaces)) {
-          expect(contrastRatio(dot, painted.surface), `${level} ${state} dot`).toBeGreaterThanOrEqual(
-            3,
-          );
+          expect(
+            contrastRatio(dot, painted.surface),
+            `${level} ${state} dot`,
+          ).toBeGreaterThanOrEqual(3);
           expect(
             contrastRatio(text, painted.surface),
             `${level} ${state} unread text`,

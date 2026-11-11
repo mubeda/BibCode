@@ -7,17 +7,17 @@ const NON_COLOR_TEXT =
  * or chat element must have none, or it outranks the level rules of `index.css` (R63).
  */
 export function textColorUtilities(className: string): string[] {
-  return className
-    .split(/\s+/)
-    .filter((token) => {
-      const utility = token.slice(token.lastIndexOf(":") + 1);
-      return utility.startsWith("text-") && !NON_COLOR_TEXT.test(utility);
-    });
+  return className.split(/\s+/).filter((token) => {
+    const utility = token.slice(token.lastIndexOf(":") + 1);
+    return utility.startsWith("text-") && !NON_COLOR_TEXT.test(utility);
+  });
 }
 
 /** Every opening tag in `markup` that a label or chat level rule paints. */
 export function levelTextTags(markup: string): string[] {
-  return markup.match(/<[a-z]+\b[^>]*(?:data-sidebar-label|data-sidebar-level="chat")[^>]*>/g) ?? [];
+  return (
+    markup.match(/<[a-z]+\b[^>]*(?:data-sidebar-label|data-sidebar-level="chat")[^>]*>/g) ?? []
+  );
 }
 
 /** The class attribute of an opening tag. */

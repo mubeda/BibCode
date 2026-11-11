@@ -40,11 +40,7 @@ import {
   threadIdle,
   threadKeyOf,
 } from "./Sidebar.testHarness";
-import {
-  classOf,
-  levelTextTags,
-  textColorUtilities,
-} from "./sidebar/sidebarLevels.testSupport";
+import { classOf, levelTextTags, textColorUtilities } from "./sidebar/sidebarLevels.testSupport";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as React from "react";
@@ -4596,7 +4592,9 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
         // shows the chat title below at chat level, as in the preview.
         const label = worktree.match(/<span[^>]*data-sidebar-label[^>]*>([^<]*)</);
         expect(label?.[1]).toBe(branch);
-        const chat = worktree.match(new RegExp(`<span[^>]*data-testid="thread-title-${id}"[^>]*>([^<]*)<`));
+        const chat = worktree.match(
+          new RegExp(`<span[^>]*data-testid="thread-title-${id}"[^>]*>([^<]*)<`),
+        );
         expect(chat?.[1]).toBe(title);
         expect(chat?.[0]).toContain('data-sidebar-level="chat"');
         expect(chat?.[0]).not.toContain("data-sidebar-label");
@@ -4641,7 +4639,7 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
 
   it("keeps one name line on a worktree whose branch equals its title", () => {
     levelsScenario();
-    h.state.threads = h.state.threads.map((thread) =>
+    h.state.threads = h.state.threads.map((thread: EnvironmentThreadShell) =>
       thread.id === threadActive.id ? { ...thread, title: "feat/x" } : thread,
     );
     const markup = render(<Sidebar />);

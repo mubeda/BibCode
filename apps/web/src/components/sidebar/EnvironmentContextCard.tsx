@@ -82,7 +82,9 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
   return (
     <div
       data-testid="environment-context-card"
-      className="mx-2 mb-1 flex items-center gap-2 rounded-[10px] border border-border bg-background px-2.5 py-2"
+      // The level rule paints the band surface, its radius and the leading accent rule.
+      data-sidebar-level="environment"
+      className="mx-2 mb-1 flex items-center gap-2 py-2 ps-3 pe-2.5"
     >
       <span
         data-status={view.status}
