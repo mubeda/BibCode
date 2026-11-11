@@ -1964,8 +1964,12 @@ if (browserRuntime) {
       await renderDialog(root, false, PROJECT_REF);
       await renderDialog(root, true, PROJECT_REF);
 
+      // A new opening starts in Smart mode (#346), with an empty field.
       expect(
-        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
       ).toBe("");
       expect(requiredButton(container, "Create worktree").disabled).toBe(true);
 

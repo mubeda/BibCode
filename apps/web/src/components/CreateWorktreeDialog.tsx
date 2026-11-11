@@ -164,8 +164,6 @@ export function CreateWorktreeDialog({
   const [pickedAgentValue, setPickedAgentValue] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const previousOpenRef = useRef(false);
-  // The project whose branches the Create From text names, set where the user types or picks it.
-  const sourceProjectRef = useRef<ScopedProjectRef | null>(null);
   const refsEnabledRef = useRef(false);
 
   const selectProjectTarget = useCallback((nextProjectRef: ScopedProjectRef | null) => {
@@ -208,14 +206,13 @@ export function CreateWorktreeDialog({
   const handleSourceTextChange = useCallback(
     (value: string) => {
       setSourceText(value);
-      sourceProjectRef.current = projectRef;
       clearBranchSelection();
       if (mode === "github" || mode === "smart") {
         const item = parseGitHubWorkItem(value);
         if (item) applySuggestedName(githubWorkItemBranchName(item));
       }
     },
-    [applySuggestedName, clearBranchSelection, mode, projectRef],
+    [applySuggestedName, clearBranchSelection, mode],
   );
 
   const handleBranchSelect = useCallback(
@@ -232,12 +229,11 @@ export function CreateWorktreeDialog({
   const handleBranchRowPick = useCallback(
     (ref: RefLike) => {
       setSourceText(ref.name);
-      sourceProjectRef.current = projectRef;
       handleBranchSelect(ref);
       // The picked row goes away with the list, so focus stays on the field.
       sourceInputRef.current?.focus();
     },
-    [handleBranchSelect, projectRef],
+    [handleBranchSelect],
   );
 
   const handleProjectChange = useCallback(
@@ -255,28 +251,28 @@ export function CreateWorktreeDialog({
     const wasOpen = previousOpenRef.current;
     previousOpenRef.current = open;
     if (!open) return;
+    // Every opening starts a new creation (#346): the dialog stays mounted while closed, so the
+    // last opening's input, including what Create more kept for its batch, is cleared here.
     if (!wasOpen) {
-      setPickedAgentValue(null);
+      setMode("smart");
+      setName(EMPTY_WORKTREE_NAME);
+      setSourceText("");
       setReuseSelectedBranch(false);
-      setName(forgetAutomaticName);
-      // Opening for a project other than the one whose branches the source names clears it, as
-      // changing Project does; the dialog may have last shown another project than it opened for.
-      if (
-        defaultProjectRef !== null &&
-        !sameProjectRef(sourceProjectRef.current, defaultProjectRef)
-      ) {
-        setSourceText("");
-      }
+      setBaseBranchOverride("");
+      setShowAdvanced(false);
+      setCreateMore(false);
+      setPickedAgentValue(null);
+      setFormError(null);
     }
     const firstProject = projects[0];
     const firstProjectRef = firstProject
       ? scopeProjectRef(firstProject.environmentId, firstProject.id)
       : null;
     setProjectSelection((current) => {
-      const nextProjectRef = defaultProjectRef ?? current.projectRef ?? firstProjectRef;
       if (!wasOpen) {
-        return { projectRef: nextProjectRef, branchRefName: null };
+        return { projectRef: defaultProjectRef ?? firstProjectRef, branchRefName: null };
       }
+      const nextProjectRef = defaultProjectRef ?? current.projectRef ?? firstProjectRef;
       if (current.projectRef !== null) return current;
       return sameProjectRef(current.projectRef, nextProjectRef)
         ? current
