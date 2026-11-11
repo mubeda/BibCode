@@ -566,6 +566,9 @@ function acquireTerminalInputBinding(inputKey: string): {
   return { binding: keyedBinding, scheduler };
 }
 
+/** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
+const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+
 export function fitTerminalSafely(fitAddon: FitAddon): boolean {
   try {
     fitAddon.fit();
@@ -1410,6 +1413,22 @@ export function TerminalViewport({
     let claimNoticeSuppressed = false;
     let oscColorResponderActive = false;
     let disposed = false;
+    let resizeRetryTimer: number | null = null;
+    let resizeRetries = 0;
+    // A failed final resize would otherwise wait for another layout or input
+    // event, leaving the PTY at its old size (#348).
+    const retryFailedResize = () => {
+      if (disposed || resizeRetryTimer !== null) return;
+      const delay = TERMINAL_RESIZE_RETRY_DELAYS_MS[resizeRetries];
+      if (delay === undefined) return;
+      resizeRetries += 1;
+      resizeRetryTimer = window.setTimeout(() => {
+        resizeRetryTimer = null;
+        // Re-measures, so a newer size replaces the failed one, and the ownership
+        // policy decides whether this renderer may still claim.
+        handleSizeTrigger("layout");
+      }, delay);
+    };
     const resizeTerminal = (size: Pick<TerminalResizeInput, "cols" | "rows" | "sizeClaim">) =>
       runTerminalResize({ environmentId, input: { threadId, terminalId, ...size } });
     const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
@@ -1424,12 +1443,16 @@ export function TerminalViewport({
       lastRequestedSizeRef.current = request;
       void resizeTerminal(dimensions).then((result) => {
         if (
-          result._tag === "Failure" &&
-          resizeRendererGenerationRef.current === rendererGeneration &&
-          lastRequestedSizeRef.current === request
-        ) {
-          lastRequestedSizeRef.current = null;
+          resizeRendererGenerationRef.current !== rendererGeneration ||
+          lastRequestedSizeRef.current !== request
+        )
+          return;
+        if (result._tag === "Success") {
+          resizeRetries = 0;
+          return;
         }
+        lastRequestedSizeRef.current = null;
+        retryFailedResize();
       });
     };
 
@@ -1530,11 +1553,18 @@ export function TerminalViewport({
           )
             return;
           claimInFlight = null;
-          if (!succeeded) claimNoticeSuppressed = false;
+          if (succeeded) resizeRetries = 0;
+          else claimNoticeSuppressed = false;
           const refit = layoutChangedWhileClaimPending;
           layoutChangedWhileClaimPending = false;
           if (refit) handleSizeTrigger("layout");
-          else updateSizeNotice();
+          else {
+            updateSizeNotice();
+            // A claim taken from another window's size is not retried.
+            if (!succeeded && !hasForeignTerminalSizeOwner(appliedSize, sizeClaim)) {
+              retryFailedResize();
+            }
+          }
         };
         void resizeTerminal(request).then(
           (result) => finishClaim(result._tag === "Success"),
@@ -2053,6 +2083,7 @@ export function TerminalViewport({
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
       window.clearTimeout(fitTimer);
+      if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
       outputSink.dispose();
       replyGuard.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;

@@ -2861,7 +2861,7 @@ describe("TerminalViewport mounted lifecycle", () => {
         await view.flushFrame();
         expect(sent()).toEqual([19]);
         // No further resize event: only a retry can deliver the size.
-        await act(async () => vi.advanceTimersByTime(10_000));
+        await act(async () => vi.advanceTimersByTimeAsync(10_000));
         expect(sent()).toEqual([19, 19]);
         expect(view.resizeSpy).toHaveBeenLastCalledWith(expected(19));
 
@@ -2887,7 +2887,7 @@ describe("TerminalViewport mounted lifecycle", () => {
           await view.flushFrame();
           expect(sent()).toEqual([17]);
         }
-        await act(async () => vi.advanceTimersByTime(10_000));
+        await act(async () => vi.advanceTimersByTimeAsync(10_000));
         expect(view.resizeSpy).toHaveBeenLastCalledWith(expected(17));
 
         // Retries are bounded when every attempt fails.
@@ -2896,18 +2896,33 @@ describe("TerminalViewport mounted lifecycle", () => {
         xtermState.proposedDimensions = { cols: 80, rows: 16 };
         await view.resizeContainer();
         await view.flushFrame();
-        await act(async () => vi.advanceTimersByTime(120_000));
+        await act(async () => vi.advanceTimersByTimeAsync(120_000));
         expect(sent()).toEqual([16, 16, 16, 16]);
 
-        // An unmounted renderer never retries.
-        view.resizeSpy.mockClear();
+        // A success restores the retry budget; an unmounted renderer never retries.
+        view.resizeSpy.mockReset();
+        view.resizeSpy.mockResolvedValue(AsyncResult.success(undefined));
         xtermState.proposedDimensions = { cols: 80, rows: 15 };
         await view.resizeContainer();
         await view.flushFrame();
-        expect(sent()).toEqual([15]);
+        if (mode === "owner") {
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 15, sizeClaim: claim! },
+            }),
+          );
+        }
+        view.resizeSpy.mockResolvedValueOnce(failure);
+        xtermState.proposedDimensions = { cols: 80, rows: 14 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        expect(sent()).toEqual([15, 14]);
         await view.setVisible(false);
-        await act(async () => vi.advanceTimersByTime(120_000));
-        expect(sent()).toEqual([15]);
+        await act(async () => vi.advanceTimersByTimeAsync(120_000));
+        expect(sent()).toEqual([15, 14]);
       } finally {
         vi.useRealTimers();
         view.resizeSpy.mockReset();
@@ -2941,7 +2956,7 @@ describe("TerminalViewport mounted lifecycle", () => {
         mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
       );
       expect(view.resizeSpy).toHaveBeenCalledOnce();
-      await act(async () => vi.advanceTimersByTime(120_000));
+      await act(async () => vi.advanceTimersByTimeAsync(120_000));
       expect(view.resizeSpy).toHaveBeenCalledOnce();
       expect(view.fakeTerminal?.rows).toBe(50);
     } finally {
