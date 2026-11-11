@@ -307,6 +307,57 @@ impl Repositories {
             .await
     }
 
+    pub async fn record_worktree_creation(
+        &self,
+        project_cwd: &str,
+        worktree_path: &str,
+    ) -> Result<()> {
+        let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT OR IGNORE INTO worktree_creation_records (project_cwd, worktree_path, created_at) \
+                     VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    params![project_cwd, worktree_path],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn delete_worktree_creation_record(
+        &self,
+        project_cwd: &str,
+        worktree_path: &str,
+    ) -> Result<()> {
+        let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM worktree_creation_records WHERE project_cwd = ? AND worktree_path = ?",
+                    params![project_cwd, worktree_path],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list_worktree_creation_records(&self, project_cwd: &str) -> Result<Vec<String>> {
+        let project_cwd = project_cwd.to_owned();
+        self.database
+            .call(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT worktree_path FROM worktree_creation_records \
+                         WHERE project_cwd = ? ORDER BY worktree_path",
+                    )?
+                    .query_map([project_cwd], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn upsert_checkpoint_diff_blob(&self, row: CheckpointDiffBlob) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
@@ -5606,7 +5657,10 @@ mod worktree_creation_record_tests {
 
         let reopened = migrated(Database::open_existing(&path).await.unwrap()).await;
         assert_eq!(
-            reopened.list_worktree_creation_records("/repo").await.unwrap(),
+            reopened
+                .list_worktree_creation_records("/repo")
+                .await
+                .unwrap(),
             ["/worktrees/feature-a"]
         );
     }

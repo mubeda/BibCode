@@ -1347,6 +1347,28 @@ async fn create_managed_worktree_locked(
                 None,
             ))
         })?;
+        let repositories = services.orchestration.repositories();
+        if let Err(error) = repositories
+            .record_worktree_creation(&project.workspace_root, &created.worktree.path)
+            .await
+        {
+            tracing::error!(%error, "managed worktree creation could not record the worktree");
+            let rollback = repository
+                .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
+                .await;
+            let detail = match rollback {
+                Ok(()) => format!("The worktree creation could not be recorded: {error}"),
+                Err(rollback) => format!(
+                    "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
+                    rollback.detail
+                ),
+            };
+            return Err(encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                detail,
+                None,
+            )));
+        }
         let terminal_cancellation = CancellationToken::new();
         let dispatch = services
             .orchestration
@@ -1380,6 +1402,16 @@ async fn create_managed_worktree_locked(
             let rollback = repository
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
                 .await;
+            if rollback.is_ok()
+                && let Err(error) = repositories
+                    .delete_worktree_creation_record(
+                        &project.workspace_root,
+                        &created.worktree.path,
+                    )
+                    .await
+            {
+                tracing::warn!(%error, "a rolled-back worktree kept its creation record");
+            }
             let detail = match rollback {
                 Ok(()) => error.to_string(),
                 Err(rollback) => format!(
@@ -1805,6 +1837,8 @@ struct ResolvedRemovalPlan {
 struct ResolvedRemovalThread {
     path: PathBuf,
     known_thread_ids: Vec<String>,
+    /// The project root and worktree path as stored, the key of the worktree's creation record.
+    creation_record: (String, String),
 }
 
 #[derive(Clone, Serialize)]
@@ -2375,6 +2409,16 @@ async fn remove_worktree_owned(
                 .map_err(encode)?;
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
+                // The folder is gone. A failed delete is reaped by the next worktree audit.
+                let (project_cwd, worktree_path) = &resolved.creation_record;
+                if let Err(error) = services
+                    .orchestration
+                    .repositories()
+                    .delete_worktree_creation_record(project_cwd, worktree_path)
+                    .await
+                {
+                    tracing::warn!(%error, "a removed worktree kept its creation record");
+                }
                 services
                     .catalog
                     .invalidate_repository_after_mutation(&input.project_id)
@@ -2510,6 +2554,10 @@ async fn resolve_removal_thread(
     Ok(ResolvedRemovalThread {
         path,
         known_thread_ids,
+        creation_record: (
+            project.workspace_root,
+            persisted_path.to_string_lossy().into_owned(),
+        ),
     })
 }
 
@@ -5395,14 +5443,17 @@ mod mutation_invalidation_tests {
             .await
             .expect("managed creation succeeds");
         let path = created["path"].as_str().expect("created path").to_owned();
-        assert_eq!(creation_records(&fixture).await, [path.clone()]);
+        assert_eq!(
+            creation_records(&fixture).await,
+            std::slice::from_ref(&path)
+        );
 
         create_managed(&fixture, "create-missing", "feature/does-not-exist")
             .await
             .expect_err("a missing ref fails the creation");
         assert_eq!(
             creation_records(&fixture).await,
-            [path.clone()],
+            std::slice::from_ref(&path),
             "a failed creation writes no record"
         );
 
@@ -5468,7 +5519,12 @@ mod mutation_invalidation_tests {
             .expect_err("an unwritable record fails the creation");
 
         let leftovers: Vec<_> = std::fs::read_dir(&managed)
-            .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).collect())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
             .unwrap_or_default();
         assert!(leftovers.is_empty(), "no worktree folder: {leftovers:?}");
         let inventory = GitRepository::default()
