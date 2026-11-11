@@ -651,6 +651,15 @@ The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
 
+The default specs share one app session, so a spec that closes the app cannot
+run among them. Each closing case of `desktop-save-and-close.e2e.ts` runs in its
+own app session. The lifecycle helper
+(`apps/desktop/e2e/support/app-lifecycle.ts`) asks the window to close while the
+backend is still running, so the close dialog can reach the web page, and
+teardown accepts an app that has already exited. A spec that leaves an edit
+unsaved cannot hang teardown: the helper ends it through
+`desktop_e2e_prepare_for_exit` or a Discard answer.
+
 The default suite also includes `chat-side-chat.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/chat-side-chat.e2e.ts`). It starts a `[[slow]]` host
 turn, types `:btw <question>` into the running thread, and checks that a
@@ -3602,6 +3611,39 @@ sizes. Cover relevant:
   environment is disconnected and verify the tab reconciles as soon as it
   reconnects. On Windows, repeat the clean-tab reload with a WSL-hosted
   workspace on a Windows path, where read latency sets the poll's cost;
+- Files rich Markdown editing: the packaged `files-rich-markdown` spec opens a
+  fixture `notes.md` (frontmatter, a paragraph, a fenced code block) in the
+  rendered view. It proves that an edit and a heading made there save with the
+  frontmatter and the fence unchanged on disk, that Undo in rendered view removes
+  the heading and that one Undo in source view removes a whole rendered visit,
+  and that opening and saving a file without editing leaves it byte-identical.
+  Rerun it alone with `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts`. By
+  hand, also check **Link**, **Image** (the copy lands beside the Markdown file
+  and a second copy with the same name gets a new name), the **More formatting**
+  menu, and that a file with a footnote or an `.mdx` file shows the read-only
+  notice;
+- Appearance themes: the packaged `appearance-themes` spec proves that the left
+  panel marks its repository, checkout and chat levels in Light and in Tokyo
+  Night, that clicking the Matrix Dark row in Light mode switches to Dark and
+  Undo restores Light, that Tokyo Night repaints the app and Dark restores it,
+  that a duplicated theme previews while it is edited and returns to its saved
+  colors on Cancel, and that a saved custom theme is painted again after a
+  reload. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts`. By hand, open a terminal
+  before changing the theme and verify it keeps its colors while a new terminal
+  uses the theme;
+- Desktop export and close: the packaged `desktop-save-and-close` spec proves that
+  **Export** on a custom theme writes the theme JSON through the real Save
+  command (an end-to-end build writes to the path in
+  `BIBCODE_E2E_SAVE_TEXT_PATH`), that a native close request with an unsaved edit
+  shows the dialog, that **Cancel** keeps the window, the server and the edit,
+  that **Save all** writes the edit and exits, that **Discard** exits and leaves
+  the file unchanged, that Quit from the menu with nothing unsaved exits and
+  shuts the server down, that the leave dialog takes focus over the update dialog,
+  and that a close with nothing unsaved exits at once. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/desktop-save-and-close.e2e.ts`. On macOS the Dock
+  Quit and the app switcher's Quit, and on every system an ended OS session, do
+  not ask; do not count that as a failure;
 - Files path-kind changes: replace a file with a directory containing nested
   entries while the tree is open, then select a descendant and replace its
   directory with a file. Exercise automatic refresh and **Refresh**; neither
