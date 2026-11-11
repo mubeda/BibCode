@@ -1,6 +1,7 @@
 mod archive;
 mod attribution;
 pub(crate) mod history;
+pub mod host_metrics;
 mod model;
 mod monitor;
 mod native;
