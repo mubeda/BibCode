@@ -77,6 +77,8 @@ const h = vi.hoisted(() => {
     realChildren: false,
     /** With `realChildren`, also renders the real model picker instead of its stub. */
     realModelPicker: false,
+    /** With `realChildren`, also renders the real provider status banner and composer banners. */
+    realStatusBanners: false,
     realTimeline: false,
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
@@ -602,12 +604,20 @@ vi.mock("./chat/PanelLayoutControls", () => ({
   },
 }));
 
-vi.mock("./chat/ProviderStatusBanner", () => ({
-  ProviderStatusBanner: (props: Record<string, unknown>) => {
-    h.captured["providerStatusBanner"] = props;
-    return <div data-mock="provider-status-banner" />;
-  },
-}));
+vi.mock("./chat/ProviderStatusBanner", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ProviderStatusBanner")>();
+  const RealBanner = actual.ProviderStatusBanner as unknown as (props: object) => ReactNode;
+  return {
+    ProviderStatusBanner: (props: Record<string, unknown>) => {
+      h.captured["providerStatusBanner"] = props;
+      return h.realStatusBanners ? (
+        <RealBanner {...props} />
+      ) : (
+        <div data-mock="provider-status-banner" />
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ThreadErrorBanner", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./chat/ThreadErrorBanner")>();
@@ -625,12 +635,20 @@ vi.mock("./chat/ThreadErrorBanner", async (importOriginal) => {
   };
 });
 
-vi.mock("./chat/ComposerBannerStack", () => ({
-  ComposerBannerStack: (props: Record<string, unknown>) => {
-    h.captured["composerBannerStack"] = props;
-    return <div data-mock="composer-banner-stack" />;
-  },
-}));
+vi.mock("./chat/ComposerBannerStack", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ComposerBannerStack")>();
+  const RealStack = actual.ComposerBannerStack as unknown as (props: object) => ReactNode;
+  return {
+    ComposerBannerStack: (props: Record<string, unknown>) => {
+      h.captured["composerBannerStack"] = props;
+      return h.realStatusBanners ? (
+        <RealStack {...props} />
+      ) : (
+        <div data-mock="composer-banner-stack" />
+      );
+    },
+  };
+});
 
 vi.mock("./PullRequestThreadDialog", () => ({
   PullRequestThreadDialog: (props: Record<string, unknown>) => {
@@ -1097,6 +1115,7 @@ beforeEach(() => {
   h.captured = {};
   h.realChildren = false;
   h.realModelPicker = false;
+  h.realStatusBanners = false;
   h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -8243,60 +8262,104 @@ describe("ChatView composer model picker provider scope (#347)", () => {
     ).toBe("claude-sonnet-4-6");
   });
 
+  const claudeSession = {
+    threadId,
+    status: "ready" as const,
+    providerName: "claudeAgent",
+    providerInstanceId: claudeInstanceId,
+    runtimeMode: "full-access" as const,
+    activeTurnId: null,
+    lastError: null,
+    updatedAt: now,
+  };
+
+  function disableClaudeInSettings(): void {
+    const providerSettings = h.settings["providers"] as Record<string, object>;
+    h.settings = {
+      ...h.settings,
+      providers: {
+        ...providerSettings,
+        claudeAgent: { ...providerSettings["claudeAgent"], enabled: false },
+      },
+    };
+  }
+
+  function sendButton(container: HTMLElement): HTMLButtonElement | undefined {
+    return [...container.querySelectorAll<HTMLButtonElement>("button[type='submit']")].find(
+      (button) => (button.getAttribute("aria-label") ?? button.textContent ?? "").includes("Send"),
+    );
+  }
+
+  it("keeps a not-ready provider's chat on it and lets its status banner explain (A6)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, { ...claudeProvider, status: "error" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+    h.realStatusBanners = true;
+
+    const container = await mount(serverRoute);
+
+    expect(container.textContent).toContain("Claude provider is unavailable.");
+    expect(
+      container
+        .querySelector("[data-chat-provider-model-picker='true']")
+        ?.getAttribute("aria-label"),
+    ).toBe("Claude · Claude Opus 4.6");
+    expect(await openPickerAndListInstances(container)).toEqual([]);
+  });
+
   it.each([
-    {
-      label: "disabled",
-      provider: { ...claudeProvider, enabled: false, status: "disabled" as const },
-      disable: true,
-    },
-    {
-      label: "not ready",
-      provider: { ...claudeProvider, status: "error" as const },
-      disable: false,
-    },
-  ])(
-    "offers no other provider's models when the chat's provider is $label (A6)",
-    async ({ provider, disable }) => {
-      seedEnvironment(
-        makeEnvironmentPresentation({
-          serverConfig: { providers: [codexProvider, provider], environment: { label: "Local" } },
-        }),
-      );
-      seedGitStatus(true);
-      if (disable) {
-        const providerSettings = h.settings["providers"] as Record<string, object>;
-        h.settings = {
-          ...h.settings,
-          providers: {
-            ...providerSettings,
-            claudeAgent: { ...providerSettings["claudeAgent"], enabled: false },
-          },
-        };
-      }
-      seedProject(makeProject());
-      seedServerThread(makeThread({ modelSelection: claudeSelection }));
+    { label: "a disabled provider in a never-started chat", started: false, removed: false },
+    { label: "a removed provider in a never-started chat", started: false, removed: true },
+    { label: "a disabled provider in a started chat", started: true, removed: false },
+    { label: "a removed provider in a started chat", started: true, removed: true },
+  ])("explains $label and blocks Send with that reason (A6)", async ({ started, removed }) => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: removed
+            ? [codexProvider]
+            : [codexProvider, { ...claudeProvider, enabled: false, status: "disabled" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    if (!removed) disableClaudeInSettings();
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: claudeSelection,
+        ...(started ? { session: claudeSession } : {}),
+      }),
+    );
+    useComposerDraftStore.getState().setPrompt(threadRef, "hello");
+    publishSeededStoreState(useComposerDraftStore);
+    h.realStatusBanners = true;
 
-      const container = await mount(serverRoute);
+    const container = await mount(serverRoute);
 
-      expect(await openPickerAndListInstances(container)).toEqual([]);
-      expect(
-        capturedProps<Record<string, unknown>>("chatComposer")["providerBindingInstanceId"],
-      ).toBe(claudeInstanceId);
-      // The chat's own status reaches the provider banner, which explains a not-ready provider.
-      expect(capturedProps<{ status: unknown }>("providerStatusBanner").status).toMatchObject({
-        instanceId: claudeInstanceId,
-        status: provider.status,
-      });
-      expect(
-        container
-          .querySelector("[data-chat-provider-model-picker='true']")
-          ?.getAttribute("aria-label"),
-      ).toBe("Claude · Claude Opus 4.6");
-      expect(document.querySelector("[data-model-picker-content]")?.textContent).toContain(
-        "No models found",
-      );
-    },
-  );
+    expect(container.textContent).toMatch(/is not available/);
+    expect(container.textContent).toContain("Settings → Providers");
+    expect(container.textContent).toContain("+");
+    const send = sendButton(container);
+    expect(send?.getAttribute("aria-label")).toMatch(/^Send unavailable\. .*is not available/);
+    const form = container.querySelector("form");
+    await act(async () => {
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
+    expect(
+      capturedProps<Record<string, unknown>>("chatComposer")["providerBindingInstanceId"],
+    ).toBe(claudeInstanceId);
+  });
 
   it("still lists every ready provider in a blank new draft, where the picker chooses the provider", async () => {
     seedTwoReadyProviders();
