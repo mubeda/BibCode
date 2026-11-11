@@ -3549,6 +3549,35 @@ mod tests {
     }
 
     #[test]
+    fn migration_73_adds_code_review_prompt_defaulting_empty() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(72))?;
+        connection.execute(
+            "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) VALUES ('p', 'P', '/repo', NULL, '[]', '{}', '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z', NULL)",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [73]
+        );
+        let prompt: String = connection.query_row(
+            "SELECT code_review_prompt FROM projection_projects WHERE project_id = 'p'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(prompt, "");
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_073(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_72_adds_worktree_creation_records() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(71))?;

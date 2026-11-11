@@ -534,6 +534,188 @@ async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_thro
     restarted.shutdown().await;
 }
 
+async fn rebuild_project_projection(repositories: &Repositories) -> OrchestrationEngine {
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_projects", [])?;
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.projects'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("rewind project projection");
+    OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+        .await
+        .expect("engine restarts")
+}
+
+async fn review_prompt(engine: &OrchestrationEngine) -> String {
+    load_snapshot(&engine.repositories())
+        .await
+        .expect("project projection")
+        .projects[0]
+        .code_review_prompt
+        .clone()
+}
+
+fn review_project_create() -> OrchestrationCommand {
+    decode(json!({
+        "type": "project.create",
+        "commandId": "review-create",
+        "projectId": "review-project",
+        "title": "Review project",
+        "workspaceRoot": "C:/review-project",
+        "defaultModelSelection": null,
+        "createdAt": CREATED_AT,
+    }))
+}
+
+#[tokio::test]
+async fn code_review_prompt_survives_omitted_update_reset_and_replay() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    engine
+        .dispatch(review_project_create())
+        .await
+        .expect("project creates");
+    assert_eq!(review_prompt(&engine).await, "");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-set",
+            "projectId": "review-project",
+            "codeReviewPrompt": "Project text",
+        })))
+        .await
+        .expect("prompt persists");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-title",
+            "projectId": "review-project",
+            "title": "Renamed review project",
+        })))
+        .await
+        .expect("title-only update persists");
+    assert_eq!(review_prompt(&engine).await, "Project text");
+    engine.shutdown().await;
+
+    let restarted = rebuild_project_projection(&repositories).await;
+    assert_eq!(review_prompt(&restarted).await, "Project text");
+    restarted
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-reset",
+            "projectId": "review-project",
+            "codeReviewPrompt": "",
+        })))
+        .await
+        .expect("reset persists");
+    assert_eq!(review_prompt(&restarted).await, "");
+    restarted.shutdown().await;
+
+    let rebuilt = rebuild_project_projection(&repositories).await;
+    assert_eq!(review_prompt(&rebuilt).await, "");
+    rebuilt.shutdown().await;
+}
+
+#[tokio::test]
+async fn code_review_prompt_replays_events_recorded_without_it() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    engine
+        .dispatch(review_project_create())
+        .await
+        .expect("project creates");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-title",
+            "projectId": "review-project",
+            "title": "Renamed review project",
+        })))
+        .await
+        .expect("title-only update persists");
+    engine.shutdown().await;
+    // Events recorded before the field existed carry no `codeReviewPrompt` key.
+    let stripped = repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.execute(
+                "UPDATE orchestration_events SET payload_json = json_remove(payload_json, '$.codeReviewPrompt') WHERE event_type IN ('project.created', 'project.meta-updated')",
+                [],
+            )?)
+        })
+        .await
+        .expect("strip the field from recorded events");
+    assert_eq!(stripped, 2);
+
+    let rebuilt = rebuild_project_projection(&repositories).await;
+    let project = load_snapshot(&rebuilt.repositories())
+        .await
+        .expect("replayed project projection")
+        .projects[0]
+        .clone();
+    assert_eq!(project.title, "Renamed review project");
+    assert_eq!(project.code_review_prompt, "");
+    rebuilt.shutdown().await;
+}
+
+#[tokio::test]
+async fn code_review_prompt_over_limit_is_rejected() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    engine
+        .dispatch(review_project_create())
+        .await
+        .expect("project creates");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-set",
+            "projectId": "review-project",
+            "codeReviewPrompt": "Kept",
+        })))
+        .await
+        .expect("prompt persists");
+    // 7,681 UTF-16 units: the limit plus one character outside the basic plane counts two.
+    let oversized = format!("{}😀", "a".repeat(7_679));
+    assert!(
+        engine
+            .dispatch(decode(json!({
+                "type": "project.meta.update",
+                "commandId": "review-oversized",
+                "projectId": "review-project",
+                "codeReviewPrompt": oversized,
+            })))
+            .await
+            .is_err()
+    );
+    assert_eq!(review_prompt(&engine).await, "Kept");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-at-limit",
+            "projectId": "review-project",
+            "codeReviewPrompt": "a".repeat(7_680),
+        })))
+        .await
+        .expect("7,680 units fit");
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn default_thread_cannot_be_archived_or_deleted_directly() {
     let repositories = migrated_repositories().await;

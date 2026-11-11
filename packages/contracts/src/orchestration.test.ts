@@ -1180,6 +1180,54 @@ it.effect("defaults missing worktree discovery policy for legacy project represe
       });
     }
     assert.strictEqual(Object.hasOwn(metaUpdated, "worktreeDiscovery"), false);
+    for (const project of [decodedProject, decodedProjectShell, decodedCreated]) {
+      assert.strictEqual(project.codeReviewPrompt, "");
+    }
+    assert.strictEqual(Object.hasOwn(metaUpdated, "codeReviewPrompt"), false);
+  }),
+);
+
+it.effect("carries a client project review prompt and rejects one over the limit", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "project.meta.update",
+      commandId: "project-meta-1",
+      projectId: "project-1",
+      codeReviewPrompt: "Our rules",
+    } as const;
+    const client = yield* decodeClientOrchestrationCommand(command);
+    assert.strictEqual(
+      client.type === "project.meta.update" ? client.codeReviewPrompt : undefined,
+      "Our rules",
+    );
+    const server = yield* decodeOrchestrationCommand(command);
+    assert.strictEqual(
+      server.type === "project.meta.update" ? server.codeReviewPrompt : undefined,
+      "Our rules",
+    );
+    const metaUpdated = yield* decodeProjectMetaUpdatedPayload({
+      projectId: "project-1",
+      codeReviewPrompt: "",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(metaUpdated.codeReviewPrompt, "");
+
+    const oversized = { ...command, codeReviewPrompt: "a".repeat(7_681) };
+    const exits = [
+      yield* Effect.exit(decodeClientOrchestrationCommand(oversized)),
+      yield* Effect.exit(decodeOrchestrationCommand(oversized)),
+      yield* Effect.exit(
+        decodeProjectMetaUpdatedPayload({
+          projectId: "project-1",
+          codeReviewPrompt: "a".repeat(7_681),
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    assert.deepStrictEqual(
+      exits.map((exit) => exit._tag),
+      ["Failure", "Failure", "Failure"],
+    );
   }),
 );
 
