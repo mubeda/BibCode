@@ -1292,6 +1292,9 @@ struct CommandModel {
     project_roots_canonicalized: bool,
 }
 
+/// Longest review prompt a project or a user may store, in UTF-16 units, as in the contract (#293).
+pub(crate) const CODE_REVIEW_PROMPT_MAX_LENGTH: usize = 7_680;
+
 #[derive(Clone, Debug)]
 struct ProjectState {
     workspace_root: String,

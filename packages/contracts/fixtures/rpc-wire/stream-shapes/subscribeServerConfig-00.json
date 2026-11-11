@@ -74,6 +74,12 @@
             "kind": "chat",
             "instanceId": "codex"
           },
+          "codeReviewAgent": {
+            "kind": "chat",
+            "instanceId": "codex"
+          },
+          "codeReviewModelSelection": null,
+          "codeReviewPrompt": "",
           "providers": {
             "codex": {
               "enabled": true,

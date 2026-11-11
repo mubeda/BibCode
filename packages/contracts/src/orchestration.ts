@@ -25,6 +25,9 @@ import {
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 
+/** Longest stored review prompt (user or project), in UTF-16 units (#293). */
+export const CODE_REVIEW_PROMPT_MAX_LENGTH = 7_680;
+
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",

@@ -2196,7 +2196,26 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
         validate_model_selection(selection, "textGenerationModelSelection")?;
     }
     if let Some(default_agent) = object.get("defaultAgent") {
-        validate_default_agent(default_agent)?;
+        validate_default_agent(default_agent, "defaultAgent")?;
+    }
+    if let Some(agent) = object.get("codeReviewAgent") {
+        validate_default_agent(agent, "codeReviewAgent")?;
+    }
+    if let Some(selection) = object.get("codeReviewModelSelection")
+        && !selection.is_null()
+    {
+        validate_model_selection(selection, "codeReviewModelSelection")?;
+    }
+    if let Some(prompt) = object.get("codeReviewPrompt") {
+        let max = crate::orchestration::engine::CODE_REVIEW_PROMPT_MAX_LENGTH;
+        if prompt
+            .as_str()
+            .is_none_or(|prompt| prompt.encode_utf16().count() > max)
+        {
+            return Err(format!(
+                "codeReviewPrompt must be a string of at most {max} characters"
+            ));
+        }
     }
     if let Some(providers) = object.get("providers") {
         validate_legacy_provider_settings(providers)?;
@@ -2404,20 +2423,20 @@ fn validate_model_selection(selection: &Value, field: &str) -> Result<(), String
     Ok(())
 }
 
-fn validate_default_agent(value: &Value) -> Result<(), String> {
+fn validate_default_agent(value: &Value, field: &str) -> Result<(), String> {
     let selection = value
         .as_object()
-        .ok_or_else(|| "defaultAgent must be an object".to_owned())?;
+        .ok_or_else(|| format!("{field} must be an object"))?;
     match selection.get("kind").and_then(Value::as_str) {
         Some("chat" | "terminal") => {}
-        _ => return Err("defaultAgent.kind must be either \"chat\" or \"terminal\"".to_owned()),
+        _ => return Err(format!("{field}.kind must be either \"chat\" or \"terminal\"")),
     }
     validate_slug(
         selection
             .get("instanceId")
             .and_then(Value::as_str)
-            .ok_or_else(|| "defaultAgent.instanceId is required".to_owned())?,
-        "defaultAgent.instanceId",
+            .ok_or_else(|| format!("{field}.instanceId is required"))?,
+        &format!("{field}.instanceId"),
     )
 }
 
@@ -2621,11 +2640,19 @@ fn apply_settings_defaults(settings: &mut Value) {
             "terminal": { "webglEnabled": true },
         }),
     );
-    settings
-        .as_object_mut()
-        .expect("settings object")
+    let object = settings.as_object_mut().expect("settings object");
+    object
         .entry("defaultAgent")
         .or_insert_with(|| json!({ "kind": "chat", "instanceId": "codex" }));
+    object
+        .entry("codeReviewAgent")
+        .or_insert_with(|| json!({ "kind": "chat", "instanceId": "codex" }));
+    object
+        .entry("codeReviewModelSelection")
+        .or_insert(Value::Null);
+    object
+        .entry("codeReviewPrompt")
+        .or_insert_with(|| json!(""));
 }
 
 fn apply_settings_patch(target: &mut Value, patch: Value) {
@@ -2638,6 +2665,8 @@ fn apply_settings_patch(target: &mut Value, patch: Value) {
             || key == "providerSessionDefaults"
             || key == "automaticGitFetchInterval"
             || key == "defaultAgent"
+            || key == "codeReviewAgent"
+            || key == "codeReviewModelSelection"
         {
             target.insert(key.clone(), value.clone());
             continue;
