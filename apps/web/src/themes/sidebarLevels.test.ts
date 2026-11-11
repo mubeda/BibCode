@@ -197,6 +197,30 @@ function paintRows(theme: ThemeFile, level: "checkout" | "worktree") {
   return { band, surfaces };
 }
 
+describe("checkout and worktree row state rule order (R64)", () => {
+  it("hover, active, selected and selected+active are unlayered and appear in that order", () => {
+    const flat = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\s+/g, " ");
+    const ROW = ':is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])';
+    const hover = flat.indexOf(`${ROW}:hover {`);
+    const active = flat.indexOf(`${ROW}[data-active="true"] {`);
+    const selected = flat.indexOf(`${ROW}[data-selected="true"] {`);
+    const selectedActive = flat.search(
+      /:is\( \[data-sidebar-level="checkout"\], \[data-sidebar-level="worktree"\] \)\[data-selected="true"\]\[data-active="true"\] \{/,
+    );
+    const at = [hover, active, selected, selectedActive];
+    expect(
+      at.every((index) => index >= 0),
+      `all four rules found: ${at}`,
+    ).toBe(true);
+    expect(at, "source order").toEqual(at.toSorted((x, y) => x - y));
+    for (const index of at) {
+      const before = flat.slice(0, index);
+      const depth = before.split("{").length - before.split("}").length;
+      expect(depth, "outside @layer and every other block").toBe(0);
+    }
+  });
+});
+
 describe("checkout and worktree row states (R63, R64)", () => {
   for (const theme of BUILTIN_THEMES) {
     for (const level of ["checkout", "worktree"] as const) {

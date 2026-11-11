@@ -211,5 +211,7 @@ preview.
 - Text fixes alone on the selected rows. Muted text could not reach 4.5:1 on a translucent
   `primary` fill over the band in Tokyo Night and Matrix Dark without changing its color at rest.
 
+A selected checkout or worktree row has no hover tint: the unlayered selected rule follows the hover rule at the same specificity and sets the same properties, so hovering it changes nothing, and the old `hover:bg-primary/19` class in `Sidebar.logic.ts` no longer shows on those rows.
+
 New defaults for Light and Dark are intended. R50's "today's look" covers only the six roles it
 names.
