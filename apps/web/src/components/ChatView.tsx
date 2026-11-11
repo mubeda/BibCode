@@ -4945,8 +4945,18 @@ function ChatViewContent(props: ChatViewProps) {
       unavailableReason: codeReviewUnavailableReason,
       guardLine: codeReviewGuard,
       onStart: handleStartCodeReview,
+      projectId: activeProject?.id ?? null,
+      projectPrompt: activeProject?.codeReviewPrompt ?? "",
+      userPrompt: settings.codeReviewPrompt,
     }),
-    [codeReviewGuard, codeReviewUnavailableReason, handleStartCodeReview],
+    [
+      activeProject?.codeReviewPrompt,
+      activeProject?.id,
+      codeReviewGuard,
+      codeReviewUnavailableReason,
+      handleStartCodeReview,
+      settings.codeReviewPrompt,
+    ],
   );
   const runProjectScript = useCallback(
     async (

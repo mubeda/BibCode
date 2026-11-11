@@ -7,6 +7,7 @@ import {
   type GitManagerRefEntry,
   type GitRunStackedActionInput,
   type GitStackedAction,
+  type ProjectId,
   type ScopedProjectRef,
   type ScopedThreadRef,
   type VcsPullInput,
@@ -130,6 +131,8 @@ import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog"
 import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
 import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
+import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
+import { CODE_REVIEW_SERVER_UPDATE_REASON } from "~/codeReview";
 import {
   GitManagerCreatePullRequestDialog,
   type GitManagerCreatePullRequestDialogProps,
@@ -147,6 +150,10 @@ interface SourceControlPanelProps {
     readonly unavailableReason: string | null;
     readonly guardLine: string | null;
     readonly onStart: (scope: CodeReviewScope) => void;
+    /** The thread's project, whose review prompt the menu edits; `null` hides the menu. */
+    readonly projectId: ProjectId | null;
+    readonly projectPrompt: string;
+    readonly userPrompt: string;
   } | null;
 }
 
@@ -366,6 +373,9 @@ export default function SourceControlPanel({
   const isDefaultRef = status?.isDefaultRef ?? false;
   const hasPrimaryRemote = status?.hasPrimaryRemote ?? false;
   const vsBaseLabel = useMemo(() => resolveVsBaseLabel(status), [status]);
+  const [reviewPromptDialogOpen, setReviewPromptDialogOpen] = useState(false);
+  // An older server would drop the project prompt without an error (D47).
+  const codeReviewsSupported = capabilities?.codeReviews === true;
   // Read once at the click: a later status change does not alter a started review.
   const codeReviewScope = useMemo(() => resolveCodeReviewScope(status), [status]);
   const codeReviewUnavailableReason = codeReview?.unavailableReason ?? null;
@@ -1150,6 +1160,24 @@ export default function SourceControlPanel({
           </TooltipPopup>
         </Tooltip>
       ) : null}
+      {codeReview?.projectId ? (
+        <Menu>
+          <MenuTrigger
+            render={<Button aria-label="Review options" size="icon-xs" variant="ghost" />}
+          >
+            <ChevronDownIcon aria-hidden="true" className="size-3.5" />
+          </MenuTrigger>
+          <MenuPopup align="end">
+            <MenuItem
+              disabled={!codeReviewsSupported}
+              {...(codeReviewsSupported ? {} : { title: CODE_REVIEW_SERVER_UPDATE_REASON })}
+              onClick={() => setReviewPromptDialogOpen(true)}
+            >
+              Review prompt for this project…
+            </MenuItem>
+          </MenuPopup>
+        </Menu>
+      ) : null}
     </div>
   );
 
@@ -1623,6 +1651,17 @@ export default function SourceControlPanel({
           </div>
         ) : null}
       </div>
+
+      {codeReview?.projectId ? (
+        <CodeReviewProjectPromptDialog
+          open={reviewPromptDialogOpen}
+          onOpenChange={setReviewPromptDialogOpen}
+          environmentId={environmentId}
+          projectId={codeReview.projectId}
+          projectPrompt={codeReview.projectPrompt}
+          userPrompt={codeReview.userPrompt}
+        />
+      ) : null}
 
       {pendingPullRequest !== null &&
       pendingPullRequest.scope.environmentId === environmentId &&
