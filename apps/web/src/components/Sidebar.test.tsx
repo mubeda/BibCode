@@ -812,7 +812,7 @@ staticDescribe("Sidebar full render", () => {
     const markup = render(<Sidebar />);
     // One repository card; its two environment checkouts are bands inside it, not nested cards.
     expect(markup.match(/data-sidebar-card="true"/g)).toHaveLength(1);
-    expect(markup.match(/bg-sidebar-env-band/g)).toHaveLength(2);
+    expect(markup.match(/data-sidebar-level="environment"/g)).toHaveLength(2);
   });
 
   it("orders Repositories view groups by name by default, not by recent activity", () => {
@@ -899,9 +899,7 @@ staticDescribe("Sidebar full render", () => {
         props["data-thread-selection-safe"] !== undefined &&
         props["size"] === "sm" &&
         props["className"] !== undefined &&
-        String(props["className"]).includes(
-          "text-left text-xs text-muted-foreground hover:bg-accent",
-        ),
+        String(props["className"]).includes("text-left text-xs text-inherit hover:bg-accent"),
       "show more button",
     );
     invoke(showMore, "onClick", mouseEvent());
@@ -4617,10 +4615,12 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
   it("draws each Environments view project as repo level, sorted or manual", () => {
     levelsScenario();
     const markup = render(<Sidebar />);
-    expect(markup.match(/data-sidebar-level="repo"/g)).toHaveLength(2);
+    // The selected environment's project card; the view has no environment band.
+    expect(markup.match(/data-sidebar-level="repo"/g)).toHaveLength(1);
+    expect(markup.match(/data-sidebar-card="true"[^>]*data-sidebar-level="repo"/g)).toHaveLength(1);
     expect(markup).not.toContain('data-sidebar-level="environment"');
     h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS, sidebarProjectSortOrder: "manual" };
-    expect(render(<Sidebar />).match(/data-sidebar-level="repo"/g)).toHaveLength(2);
+    expect(render(<Sidebar />).match(/data-sidebar-level="repo"/g)).toHaveLength(1);
   });
 
   it("keeps the selected, active, multi-selected, resting and unavailable states", () => {
@@ -4663,6 +4663,8 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
     const markup = render(<Sidebar />);
     const showMore = liWith(markup, ">Show more<");
     expect(openingTag(showMore)).toContain('data-sidebar-level="chat"');
-    expect(showMore).not.toMatch(/class="[^"]*\btext-muted-foreground\b[^"]*"[^>]*>(?:<[^>]*>)*Show more/);
+    expect(showMore).not.toMatch(
+      /class="[^"]*\btext-muted-foreground\b[^"]*"[^>]*>(?:<[^>]*>)*Show more/,
+    );
   });
 });

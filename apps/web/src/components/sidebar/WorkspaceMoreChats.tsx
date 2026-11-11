@@ -88,7 +88,7 @@ function WorkspaceMoreChatsPopup(
 }
 
 const ROW_CLASS =
-  "flex h-7 w-full min-w-0 items-center rounded-sm px-2 text-left text-[13px] text-foreground/80 hover:bg-accent focus-visible:bg-accent focus-visible:outline-hidden";
+  "flex h-7 w-full min-w-0 items-center rounded-sm px-2 text-left hover:bg-accent focus-visible:bg-accent focus-visible:outline-hidden";
 
 /**
  * The checkout's chats: the shell's, then a row that loads the left-out ones a page at a time,
@@ -144,6 +144,7 @@ export function WorkspaceMoreChatsList(
         <button
           key={thread.id}
           type="button"
+          data-sidebar-level="chat"
           className={ROW_CLASS}
           onClick={() => onOpenChat(thread)}
         >

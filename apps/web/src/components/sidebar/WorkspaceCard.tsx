@@ -10,6 +10,7 @@ import {
   PinIcon,
   TerminalIcon,
   TriangleAlertIcon,
+  type LucideIcon,
 } from "lucide-react";
 import type * as React from "react";
 import type { ReactNode } from "react";
@@ -126,6 +127,11 @@ export interface WorkspaceCardShellProps {
   readonly className: string;
   readonly idBase: string;
   readonly isActive: boolean;
+  /** Multi-selected. With `isActive` it keys the row state rules of `index.css` (R64). */
+  readonly isSelected: boolean;
+  /** The row's sidebar level in `index.css` (R63). `primary` marks the main checkout. */
+  readonly level: "checkout" | "worktree";
+  readonly primary?: boolean;
   readonly hasFlags: boolean;
   readonly hasBranchLine: boolean;
   readonly hasSessionLine: boolean;
@@ -158,6 +164,10 @@ export function WorkspaceCardShell(props: WorkspaceCardShellProps) {
   return (
     <SidebarMenuSubItem
       className={props.className}
+      data-sidebar-level={props.level}
+      data-primary={props.primary ? "" : undefined}
+      data-selected={props.isSelected ? "true" : undefined}
+      data-active={props.isActive ? "true" : undefined}
       data-thread-item
       data-testid={props.testId}
       onClick={props.onClick}
@@ -200,6 +210,8 @@ export function WorkspaceCardTitleLine(props: {
   readonly pinned: boolean;
   readonly pinnedTestId?: string;
   readonly primary?: boolean;
+  /** The level's leading icon: a house on the primary checkout, a branch on a worktree. */
+  readonly icon?: LucideIcon | undefined;
   /** Replaces the visible title while renaming inline. */
   readonly renameInput?: ReactNode;
   /** Archive/Confirm, or the ⌘ jump label while the modifier is held. */
@@ -210,8 +222,10 @@ export function WorkspaceCardTitleLine(props: {
   const flags = [props.unread ? "unread" : null, props.pinned ? "pinned" : null]
     .filter((flag) => flag !== null)
     .join(", ");
+  const Icon = props.icon;
   return (
     <div className="flex h-5 min-w-0 items-center gap-1.5">
+      {Icon ? <Icon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" /> : null}
       {props.renameInput ? (
         <>
           <span id={props.id} className="sr-only">
@@ -227,9 +241,13 @@ export function WorkspaceCardTitleLine(props: {
                 id={props.id}
                 data-testid={props.titleTestId}
                 data-unread={props.unread ? "true" : undefined}
+                data-sidebar-label
                 className={cn(
                   "pointer-events-auto min-w-0 truncate text-[13px]",
-                  props.unread ? "font-semibold text-foreground" : "text-foreground/80",
+                  // The primary label's weight and colour come from its level rule.
+                  props.unread
+                    ? "font-semibold text-foreground"
+                    : !props.primary && "text-foreground/80",
                 )}
               />
             }
@@ -242,7 +260,7 @@ export function WorkspaceCardTitleLine(props: {
         </Tooltip>
       )}
       {props.primary ? (
-        <span className="shrink-0 rounded border border-border bg-muted px-1.5 text-xs leading-4 text-muted-foreground">
+        <span data-sidebar-badge className="shrink-0 px-1.5 text-xs leading-4">
           primary
         </span>
       ) : null}
@@ -463,7 +481,7 @@ export function WorkspaceCardMoreChats(props: {
 }) {
   // Spans only: it is the label of the button that lists the chats.
   return (
-    <span className="flex h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+    <span data-sidebar-level="chat" className="flex h-5 min-w-0 items-center gap-1.5">
       <span className="flex w-4 shrink-0 items-center justify-center">
         <WorkspaceCardStatusGlyph status={props.status} />
       </span>

@@ -25,7 +25,11 @@ export const SidebarRepositoryGroup = memo(function SidebarRepositoryGroup({
     group.environmentCount === 1 ? "environment" : "environments"
   }`;
   return (
-    <SidebarMenuItem className={cn(SIDEBAR_CARD_CLASS, "p-1")} data-sidebar-card="true">
+    <SidebarMenuItem
+      className={cn(SIDEBAR_CARD_CLASS, "p-1")}
+      data-sidebar-card="true"
+      data-sidebar-level="repo"
+    >
       <section
         aria-label={`Repository ${group.title}`}
         data-testid={`repository-group-${group.key}`}

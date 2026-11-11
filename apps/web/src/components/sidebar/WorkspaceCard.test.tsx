@@ -88,6 +88,8 @@ describe("WorkspaceCardShell", () => {
             className=""
             idBase="controls"
             isActive={false}
+            isSelected={false}
+            level="worktree"
             hasFlags={false}
             hasBranchLine
             hasSessionLine={false}
@@ -144,6 +146,9 @@ describe("WorkspaceCardShell", () => {
         className="card-surface"
         idBase="card"
         isActive
+        isSelected
+        level="checkout"
+        primary
         hasFlags
         hasBranchLine
         hasSessionLine={false}
@@ -157,6 +162,9 @@ describe("WorkspaceCardShell", () => {
     );
     expect(markup).toContain('data-testid="thread-row-a"');
     expect(markup).toContain('data-thread-item="true"');
+    expect(markup).toContain(
+      'data-sidebar-level="checkout" data-primary="" data-selected="true" data-active="true"',
+    );
     expect(markup).toContain('data-testid="thread-card-button-a"');
     expect(markup).toContain('type="button"');
     expect(markup).toContain('aria-labelledby="card-status card-title card-flags"');
@@ -175,6 +183,8 @@ describe("WorkspaceCardShell", () => {
         className=""
         idBase="card"
         isActive={false}
+        isSelected={false}
+        level="worktree"
         hasFlags={false}
         hasBranchLine={false}
         hasSessionLine={false}
@@ -186,6 +196,8 @@ describe("WorkspaceCardShell", () => {
         {null}
       </WorkspaceCardShell>,
     );
+    expect(markup).toContain('data-sidebar-level="worktree"');
+    expect(markup).not.toMatch(/data-(primary|selected|active)=/);
     expect(markup).toContain('aria-labelledby="card-status card-title"');
     expect(markup).not.toContain("aria-describedby");
     expect(markup).not.toContain("aria-current");
@@ -246,7 +258,7 @@ describe("card lines", () => {
     expect(markup).toContain('data-testid="thread-pinned-a"');
   });
 
-  it("shows a read title muted with the primary chip", () => {
+  it("leaves a read primary title and its chip to the level rules (R63)", () => {
     const markup = renderToStaticMarkup(
       <WorkspaceCardTitleLine
         id="t"
@@ -258,9 +270,28 @@ describe("card lines", () => {
         primary
       />,
     );
-    expect(markup).toContain("text-[13px] text-foreground/80");
-    expect(markup).toContain(">primary<");
+    expect(markup).toMatch(
+      /data-sidebar-label="true" class="pointer-events-auto min-w-0 truncate text-\[13px\]"/,
+    );
+    expect(markup).toMatch(
+      /<span data-sidebar-badge="true" class="shrink-0 px-1.5 text-xs leading-4">primary</,
+    );
     expect(markup).not.toContain("sr-only");
+  });
+
+  it("shows a read non-primary title muted", () => {
+    const markup = renderToStaticMarkup(
+      <WorkspaceCardTitleLine
+        id="t"
+        flagsId="f"
+        title="Fix the build"
+        titleTestId="thread-title-t"
+        unread={false}
+        pinned={false}
+      />,
+    );
+    expect(markup).toContain("text-[13px] text-foreground/80");
+    expect(markup).not.toContain("data-sidebar-badge");
   });
 
   it("keeps the indicators right-aligned when the branch text is hidden", () => {
