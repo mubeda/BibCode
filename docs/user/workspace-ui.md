@@ -2236,7 +2236,8 @@ The Files surface is a full file manager for the active workspace:
   cannot run; **View source** opens its XML in the editor, and the editor's
   switch brings the image back. A **PDF** opens in the browser's or webview's own
   viewer, and audio (MP3, M4A, WAV, OGG, OGA, WebM, FLAC) plays in the native
-  player. These previews come from the same size-capped file route as the
+  player. The Linux AppImage plays all of these except M4A, whose AAC decoder
+  it does not carry; an M4A file there says it cannot be shown. These previews come from the same size-capped file route as the
   integrated browser, so a file over 10 MiB, or one the viewer cannot decode,
   explains itself instead of failing: it says the file is too large (or cannot be
   shown) and points at **Open in** in the header, or at the machine the
