@@ -436,6 +436,12 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         worktree_discovery: Option<Value>,
+        #[serde(
+            rename = "codeReviewPrompt",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        code_review_prompt: Option<String>,
     },
     #[serde(rename = "project.repository-identity.set")]
     ProjectRepositoryIdentitySet {
@@ -4492,7 +4498,7 @@ async fn plan_command(
                     created_at,
                     command_id,
                     metadata.clone(),
-                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"worktreeDiscovery":default_worktree_discovery(),"createdAt":created_at,"updatedAt":created_at}),
+                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"worktreeDiscovery":default_worktree_discovery(),"codeReviewPrompt":"","createdAt":created_at,"updatedAt":created_at}),
                 ),
                 make_event(
                     "thread.created",
@@ -4513,8 +4519,19 @@ async fn plan_command(
             default_model_selection,
             scripts,
             worktree_discovery,
+            code_review_prompt,
         } => {
             require_project(model, command, project_id)?;
+            if let Some(prompt) = code_review_prompt
+                && prompt.encode_utf16().count() > CODE_REVIEW_PROMPT_MAX_LENGTH
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "The project review prompt is longer than {CODE_REVIEW_PROMPT_MAX_LENGTH} characters."
+                    ),
+                );
+            }
             if let Some(workspace_root) = workspace_root
                 && let Some(conflicting_project_id) =
                     model.projects.iter().find_map(|(candidate_id, project)| {
@@ -4550,6 +4567,11 @@ async fn plan_command(
                 &mut payload,
                 "worktreeDiscovery",
                 worktree_discovery.as_ref().map(|value| json!(value)),
+            );
+            insert_optional(
+                &mut payload,
+                "codeReviewPrompt",
+                code_review_prompt.as_ref().map(|value| json!(value)),
             );
             Ok(vec![make_event(
                 "project.meta-updated",
@@ -7476,11 +7498,11 @@ fn apply_projects_projector_tx(
     match event.event.event_type.as_str() {
         "project.created" => {
             transaction.execute(
-        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL) \
+        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, code_review_prompt, created_at, updated_at, deleted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) \
          ON CONFLICT (project_id) DO UPDATE SET \
            title = excluded.title, workspace_root = excluded.workspace_root, \
-           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, worktree_discovery_json = excluded.worktree_discovery_json, \
+           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, worktree_discovery_json = excluded.worktree_discovery_json, code_review_prompt = excluded.code_review_prompt, \
            created_at = excluded.created_at, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
         params![
             required_str(payload, "projectId")?,
@@ -7500,6 +7522,7 @@ fn apply_projects_projector_tx(
                     .cloned()
                     .unwrap_or_else(default_worktree_discovery),
             )?,
+            optional_string(payload.get("codeReviewPrompt")).unwrap_or_default(),
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
         ],
@@ -7507,7 +7530,7 @@ fn apply_projects_projector_tx(
         }
         "project.meta-updated" => {
             transaction.execute(
-            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, repository_identity_json = CASE WHEN ? THEN ? ELSE repository_identity_json END, updated_at = ? WHERE project_id = ?",
+            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, code_review_prompt = COALESCE(?, code_review_prompt), repository_identity_json = CASE WHEN ? THEN ? ELSE repository_identity_json END, updated_at = ? WHERE project_id = ?",
             params![
                 optional_string(payload.get("title")),
                 optional_string(payload.get("workspaceRoot")),
@@ -7516,6 +7539,7 @@ fn apply_projects_projector_tx(
                 payload.get("scripts").map(json_string).transpose()?,
                 payload.get("worktreeDiscovery").is_some(),
                 payload.get("worktreeDiscovery").map(json_string).transpose()?,
+                optional_string(payload.get("codeReviewPrompt")),
                 payload.get("repositoryIdentity").is_some(),
                 optional_json_string(payload.get("repositoryIdentity").filter(|value| !value.is_null()))?,
                 required_str(payload, "updatedAt")?,
@@ -9616,6 +9640,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": null,
@@ -10189,6 +10214,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": "2026-08-09T00:00:00Z",
@@ -10354,6 +10380,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": "2026-08-09T00:00:00Z",
@@ -10799,6 +10826,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility":"shown",
                         "initialPromptDismissedAt":"2026-08-09T00:00:00Z",

@@ -526,13 +526,13 @@ impl Repositories {
     pub async fn upsert_project(&self, row: ProjectionProject) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at, repository_identity_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (project_id) DO UPDATE SET \
                    title=excluded.title, workspace_root=excluded.workspace_root, \
                    default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, worktree_discovery_json=excluded.worktree_discovery_json, \
-                   created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, repository_identity_json=excluded.repository_identity_json",
-                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at, optional_json(&row.repository_identity)?],
+                   created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, repository_identity_json=excluded.repository_identity_json, code_review_prompt=excluded.code_review_prompt",
+                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at, optional_json(&row.repository_identity)?, row.code_review_prompt],
             )?; Ok(())
         }).await
     }
@@ -3606,6 +3606,9 @@ pub struct ProjectionProject {
     pub updated_at: Timestamp,
     pub deleted_at: Option<Timestamp>,
     pub repository_identity: Option<Value>,
+    /// The project's review prompt (#293); `""` falls through to the user's and the built-in one.
+    #[serde(default)]
+    pub code_review_prompt: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4182,7 +4185,7 @@ pub struct AuthSession {
     pub mcp_named_client: Option<McpNamedClient>,
 }
 
-const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
+const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt FROM projection_projects";
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
@@ -5134,6 +5137,7 @@ fn decode_project(row: &Row<'_>) -> rusqlite::Result<ProjectionProject> {
         updated_at: row.get(8)?,
         deleted_at: row.get(9)?,
         repository_identity: decode_optional_json(row.get(10)?, "repository_identity_json")?,
+        code_review_prompt: row.get(11)?,
     })
 }
 fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {

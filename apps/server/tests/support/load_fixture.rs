@@ -492,6 +492,7 @@ pub async fn seed(repositories: &Repositories, workspace_parent: &Path) {
                 updated_at: timestamp(project, 0),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .unwrap();

@@ -142,6 +142,7 @@ pub(super) async fn fixture_with(register: impl FnOnce(&mut RpcRegistry)) -> Fix
             updated_at: CREATED_AT.to_owned(),
             deleted_at: None,
             repository_identity: None,
+            code_review_prompt: String::new(),
         })
         .await
         .expect("project");

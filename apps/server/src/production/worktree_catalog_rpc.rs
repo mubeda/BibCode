@@ -3416,6 +3416,7 @@ async fn update_discovery_policy_locked(
         workspace_root: None,
         default_model_selection: OptionalNullable::Missing,
         scripts: None,
+        code_review_prompt: None,
         worktree_discovery: Some(policy_value.clone()),
     };
     if legacy_receipt {

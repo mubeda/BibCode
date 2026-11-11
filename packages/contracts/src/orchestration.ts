@@ -27,6 +27,7 @@ import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 
 /** Longest stored review prompt (user or project), in UTF-16 units (#293). */
 export const CODE_REVIEW_PROMPT_MAX_LENGTH = 7_680;
+const CodeReviewPrompt = Schema.String.check(Schema.isMaxLength(CODE_REVIEW_PROMPT_MAX_LENGTH));
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -311,6 +312,8 @@ export const OrchestrationProject = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),
@@ -678,6 +681,8 @@ export const OrchestrationProjectShell = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   /**
@@ -966,6 +971,7 @@ const ProjectMetaUpdateCommand = Schema.Struct({
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
   worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
 });
 
 const ClientProjectMetaUpdateCommand = Schema.Struct({
@@ -976,6 +982,7 @@ const ClientProjectMetaUpdateCommand = Schema.Struct({
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
 });
 
 const ProjectDeleteCommand = Schema.Struct({
@@ -1512,6 +1519,8 @@ export const ProjectCreatedPayload = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1524,6 +1533,7 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
   worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
   updatedAt: IsoDateTime,
 });
 

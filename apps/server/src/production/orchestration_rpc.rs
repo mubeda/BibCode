@@ -2696,6 +2696,7 @@ fn project_shell(project: &crate::persistence::ProjectionProject) -> Value {
         "defaultModelSelection": project.default_model_selection,
         "scripts": project.scripts,
         "worktreeDiscovery": project.worktree_discovery,
+        "codeReviewPrompt": project.code_review_prompt,
         "repositoryIdentity": project.repository_identity,
         "createdAt": project.created_at,
         "updatedAt": project.updated_at,
@@ -4221,6 +4222,7 @@ mod tests {
             updated_at: CREATED_AT.to_owned(),
             deleted_at: None,
             repository_identity: None,
+            code_review_prompt: String::new(),
         };
         let mut deleted_project = project.clone();
         deleted_project.project_id = "project-deleted".to_owned();

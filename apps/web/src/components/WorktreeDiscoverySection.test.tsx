@@ -138,6 +138,7 @@ function project(
     repositoryIdentity: null,
     defaultModelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5"),
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: { visibility, initialPromptDismissedAt, baselinePaths },
     createdAt: "2026-08-09T00:00:00.000Z",
     updatedAt: "2026-08-09T00:00:00.000Z",

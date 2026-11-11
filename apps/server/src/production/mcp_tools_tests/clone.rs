@@ -394,6 +394,7 @@ async fn fixture(options: Options) -> Fixture {
             updated_at: CREATED_AT.to_owned(),
             deleted_at: None,
             repository_identity: None,
+            code_review_prompt: String::new(),
         })
         .await
         .expect("project");

@@ -1838,6 +1838,7 @@ mod tests {
                 updated_at: "2026-10-09T00:00:00Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .unwrap();

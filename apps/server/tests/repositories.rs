@@ -82,7 +82,41 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
         updated_at: created_at.to_owned(),
         deleted_at: None,
         repository_identity: None,
+        code_review_prompt: String::new(),
     }
+}
+
+#[tokio::test]
+async fn project_code_review_prompt_round_trips() {
+    let repositories = migrated_repositories().await;
+    let mut row = project("p-review", T0);
+    row.code_review_prompt = "Check our test naming. Base is {base}.".to_owned();
+    repositories.upsert_project(row).await.expect("upsert");
+    let stored = repositories
+        .get_project("p-review".to_owned())
+        .await
+        .expect("read")
+        .expect("project exists");
+    assert_eq!(
+        stored.code_review_prompt,
+        "Check our test naming. Base is {base}."
+    );
+    assert_eq!(
+        repositories.list_projects().await.expect("list")[0].code_review_prompt,
+        stored.code_review_prompt
+    );
+    let mut cleared = project("p-review", T1);
+    cleared.code_review_prompt = String::new();
+    repositories.upsert_project(cleared).await.expect("clear");
+    assert_eq!(
+        repositories
+            .get_project("p-review".to_owned())
+            .await
+            .expect("read")
+            .expect("project exists")
+            .code_review_prompt,
+        ""
+    );
 }
 
 #[tokio::test]
