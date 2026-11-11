@@ -32,7 +32,7 @@ import {
   SquareIcon,
   Undo2Icon,
 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -154,6 +154,18 @@ const RUNNING_ACTIONS = [
 // Legacy servers (no staging areas) don't support the stage/unstage RPCs, so
 // their single flat section renders no checkbox and never invokes onToggle.
 const LEGACY_NOOP_TOGGLE = () => {};
+
+/**
+ * A multi-line failure (#343: where to sign in, a blank line, then Git's own line) keeps its
+ * line breaks; a one-line failure stays a string so the toast keeps its Copy button.
+ */
+function failureDescription(message: string): ReactNode {
+  return message.includes("\n") ? (
+    <span className="select-text whitespace-pre-line">{message}</span>
+  ) : (
+    message
+  );
+}
 
 function sourceControlErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
@@ -550,7 +562,7 @@ export default function SourceControlPanel({
           stackedThreadToast({
             type: "error",
             title: stackedActionFailureTitle(error),
-            description: sourceControlErrorMessage(error),
+            description: failureDescription(sourceControlErrorMessage(error)),
             data: threadToastData,
           }),
         );
