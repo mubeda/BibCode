@@ -366,11 +366,12 @@ describe("resolveCodeReviewButtonState", () => {
 
   it("lets the unavailable reason take precedence", () => {
     const unavailableReason = "Update the BiBCode server on this environment to use Review.";
-    expect(
-      resolveCodeReviewButtonState({ status: BASE_STATUS, scope, unavailableReason }),
-    ).toEqual({ disabled: true, reason: unavailableReason });
-    expect(
-      resolveCodeReviewButtonState({ status: null, scope: null, unavailableReason }),
-    ).toEqual({ disabled: true, reason: unavailableReason });
+    expect(resolveCodeReviewButtonState({ status: BASE_STATUS, scope, unavailableReason })).toEqual(
+      { disabled: true, reason: unavailableReason },
+    );
+    expect(resolveCodeReviewButtonState({ status: null, scope: null, unavailableReason })).toEqual({
+      disabled: true,
+      reason: unavailableReason,
+    });
   });
 });

@@ -16,6 +16,7 @@ import {
   resolveSavedCodeReviewer,
 } from "./codeReview";
 import { buildProviderAgentActions } from "./components/chat/providerAgentActions";
+import { deriveProviderInstanceEntries } from "./providerInstances";
 
 const BRANCH = { kind: "branch", base: "origin/main" } as const;
 const UNCOMMITTED = { kind: "uncommitted", base: "origin/main" } as const;
@@ -175,29 +176,49 @@ describe("resolveSavedCodeReviewer", () => {
       claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
     },
   };
-  const actions = buildProviderAgentActions(
-    [provider("claudeAgent", "claudeAgent", "Claude"), provider("cursor", "cursor", "Cursor")],
-    settings,
-  );
+  const providers = [
+    provider("claudeAgent", "claudeAgent", "Claude"),
+    provider("cursor", "cursor", "Cursor"),
+  ];
+  const actions = buildProviderAgentActions(providers, settings);
+  const known = deriveProviderInstanceEntries(providers);
 
-  it("never falls back from a disabled saved reviewer", () => {
+  it("never falls back from a disabled saved reviewer (R90)", () => {
     expect(
-      resolveSavedCodeReviewer(actions, {
-        kind: "chat",
-        instanceId: ProviderInstanceId.make("claudeAgent"),
-      }),
+      resolveSavedCodeReviewer(
+        actions,
+        { kind: "chat", instanceId: ProviderInstanceId.make("claudeAgent") },
+        known,
+      ),
     ).toEqual({
       action: null,
       reason: "Claude is not available. Change the code review agent in Settings → Agents.",
     });
   });
 
-  it("names an unlisted reviewer", () => {
+  it("names a listed reviewer that is not ready", () => {
+    const notReady = buildProviderAgentActions(
+      [{ ...provider("codex", "codex", "Codex"), status: "error" } as ServerProvider],
+      DEFAULT_SERVER_SETTINGS,
+    );
     expect(
-      resolveSavedCodeReviewer(actions, {
-        kind: "chat",
+      resolveSavedCodeReviewer(notReady, {
+        kind: "terminal",
         instanceId: ProviderInstanceId.make("codex"),
       }),
+    ).toEqual({
+      action: null,
+      reason: "Codex Terminal is not available. Change the code review agent in Settings → Agents.",
+    });
+  });
+
+  it("names an unlisted reviewer", () => {
+    expect(
+      resolveSavedCodeReviewer(
+        actions,
+        { kind: "chat", instanceId: ProviderInstanceId.make("codex") },
+        known,
+      ),
     ).toEqual({
       action: null,
       reason:
