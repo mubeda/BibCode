@@ -309,27 +309,32 @@ export function WorkspaceCardBranchLine(props: {
   /** False on a worktree row, whose title line already leads with the branch icon. */
   readonly branchIcon?: boolean;
   readonly label?: boolean;
+  /** With `label`: Archive or the jump label, outside the element the card's description reads. */
+  readonly trailing?: ReactNode;
   readonly children?: ReactNode;
 }) {
   if (props.label) {
     return (
-      <div id={props.id} className="flex h-5 min-w-0 items-center gap-1.5">
-        <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <span data-sidebar-label className="pointer-events-auto min-w-0 flex-1 truncate" />
-            }
-          >
-            {props.branch}
-          </TooltipTrigger>
-          {props.branchTooltip ? (
-            <TooltipPopup side="top">{props.branchTooltip}</TooltipPopup>
-          ) : null}
-        </Tooltip>
-        <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-          {props.children}
-        </span>
+      <div className="flex h-5 min-w-0 items-center gap-1.5">
+        <div id={props.id} className="flex min-w-0 flex-1 items-center gap-1.5">
+          <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <span data-sidebar-label className="pointer-events-auto min-w-0 flex-1 truncate" />
+              }
+            >
+              {props.branch}
+            </TooltipTrigger>
+            {props.branchTooltip ? (
+              <TooltipPopup side="top">{props.branchTooltip}</TooltipPopup>
+            ) : null}
+          </Tooltip>
+          <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+            {props.children}
+          </span>
+        </div>
+        {props.trailing}
       </div>
     );
   }

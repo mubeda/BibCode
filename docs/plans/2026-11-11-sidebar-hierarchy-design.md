@@ -180,7 +180,9 @@ These mixes are not theme tokens (D21).
 
 Each fill is the named color mixed into `sidebar-worktree`. Hover was 3 percent, a 1.054:1 step
 from resting in five built-ins, too small to see in Tokyo Night. At 5 percent the step is 1.092:1
-to 1.156:1, and a test asks for at least 1.09:1 and for active above hover. Under the dark base
+to 1.156:1, and a test asks for at least 1.09:1 and for active above hover. A checkout rests on
+the band, so its hover is `foreground` 5 percent over the band instead (1.092:1 to 1.165:1). Mixed
+into `sidebar-worktree`, which sits near the band in some themes, it gave 1.048:1 in Matrix Light. Under the dark base
 (`.dark`) selected mixes 18 percent and selected and active 22 percent, because Dark's 5 percent
 hover (1.156:1) came within 5 percent of its 16 percent selection (1.197:1). The test asks for
 selected above hover by at least 5 percent. Hover paints over the resting surface,

@@ -4600,6 +4600,21 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
         expect(chat?.[0]).not.toContain("data-sidebar-label");
         expect(worktree.indexOf(label![0])).toBeLessThan(worktree.indexOf(chat![0]));
       }
+      // The card's description reads the branch line, so Archive sits outside it.
+      const docs = liWith(markup, 'data-testid="thread-row-thread-docs"');
+      expect(docs).toContain('data-testid="thread-archive-thread-docs"');
+      const start = docs.search(/<div id="[^"]*-branch"/);
+      expect(start).toBeGreaterThan(-1);
+      const pattern = /<div[\s>]|<\/div>/g;
+      pattern.lastIndex = start;
+      let depth = 0;
+      let end = -1;
+      for (let match = pattern.exec(docs); match && end < 0; match = pattern.exec(docs)) {
+        depth += match[0] === "</div>" ? -1 : 1;
+        if (depth === 0) end = match.index;
+      }
+      expect(docs.slice(start, end)).toContain("feat/docs");
+      expect(docs.slice(start, end)).not.toContain("thread-archive-");
       expect(openingTag(liWith(markup, 'data-testid="thread-row-thread-active"'))).toContain(
         'data-active="true"',
       );

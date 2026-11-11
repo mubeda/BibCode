@@ -541,6 +541,12 @@
   background-color: color-mix(in srgb, var(--foreground) 5%, var(--sidebar-worktree));
 }
 
+/* A checkout rests on the band, so its hover tints the band rather than the worktree surface,
+   which sits near the band in some themes and left the step under 1.06:1. */
+[data-sidebar-level="checkout"]:hover {
+  background-color: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+
 :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-active="true"] {
   border-color: color-mix(in srgb, var(--foreground) 40%, var(--sidebar-worktree));
   background-color: color-mix(in srgb, var(--foreground) 8%, var(--sidebar-worktree));

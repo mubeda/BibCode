@@ -359,16 +359,28 @@ describe("card lines", () => {
 
   it("leads a worktree row with the branch as its level label", () => {
     const markup = renderToStaticMarkup(
-      <WorkspaceCardBranchLine id="b" branch="feat/x" branchTooltip="/wt/x" label>
+      <WorkspaceCardBranchLine
+        id="b"
+        branch="feat/x"
+        branchTooltip="/wt/x"
+        label
+        trailing={<button type="button">Archive</button>}
+      >
         <span>indicator</span>
       </WorkspaceCardBranchLine>,
     );
+    // The description reads the branch and its indicators, never the Archive control.
+    const host = document.createElement("div");
+    host.innerHTML = markup;
+    const described = host.querySelector("#b")!;
+    expect(described.textContent).toContain("indicator");
+    expect(described.querySelector("button")).toBeNull();
+    expect(host.querySelector("button")?.textContent).toBe("Archive");
     const label = markup.match(/<span[^>]*data-sidebar-label[^>]*>([^<]*)</);
     expect(label?.[1]).toBe("feat/x");
     expect(textColorUtilities(classOf(label?.[0] ?? ""))).toEqual([]);
     expect(markup.match(/<svg[^>]*data-sidebar-icon[^>]*>/g)).toHaveLength(1);
     // The line keeps the branch id the card's description points at.
-    expect(markup).toMatch(/^<div id="b"/);
     expect(markup.match(/<div id="b" class="([^"]*)"/)?.[1]).not.toMatch(/\btext-xs\b/);
     expect(markup).toContain("indicator");
   });

@@ -200,7 +200,11 @@ function paintRows(theme: ThemeFile, level: "checkout" | "worktree") {
       },
     };
   for (const [state, selector] of Object.entries(STATES)) {
-    const fill = stateRule(theme, selector).get("background-color");
+    const rule =
+      level === "checkout" && state === "hover"
+        ? ruleDeclarations('[data-sidebar-level="checkout"]:hover')
+        : stateRule(theme, selector);
+    const fill = rule.get("background-color");
     expect(fill, `${selector} sets a background`).toBeDefined();
     surfaces[state] = {
       surface: compositeHex(evaluate(fill!), band),
@@ -266,6 +270,14 @@ describe("checkout and worktree row states (R63, R64)", () => {
         fromRest("selected and active"),
         "selected and active beyond selected",
       ).toBeGreaterThan(fromRest("selected"));
+    });
+
+    it(`${theme.name} paints a hovered checkout visibly over the band it rests on`, () => {
+      const { surfaces } = paintRows(theme, "checkout");
+      expect(
+        contrastRatio(surfaces.hover!.surface, surfaces.resting!.surface),
+        "hover differs from resting",
+      ).toBeGreaterThanOrEqual(1.09);
     });
   }
 

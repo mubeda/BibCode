@@ -1252,9 +1252,9 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           branch={branchLabel}
           branchTooltip={branchTooltip}
           label
+          trailing={trailing}
         >
           {indicators}
-          {trailing}
         </WorkspaceCardBranchLine>
       ) : null}
       <WorkspaceCardTitleLine
