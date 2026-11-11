@@ -46,6 +46,11 @@ const LEVEL_PAIRS = [
   "sidebar-chat-foreground on sidebar-card",
   "sidebar-chat-foreground on sidebar-env-band",
   "sidebar-chat-foreground on sidebar-worktree",
+  "foreground on sidebar-env-band",
+  "foreground on sidebar-worktree",
+  "sidebar-card-muted-foreground on sidebar-env-band",
+  "sidebar-card-muted-foreground on sidebar-worktree",
+  "sidebar-worktree-icon on sidebar-worktree",
 ];
 
 const css = NodeFS.readFileSync(new URL("../index.css", import.meta.url), "utf8");
@@ -110,22 +115,10 @@ describe("sidebar levels in the built-in themes (R63)", () => {
       );
     });
 
-    it(`${theme.name} keeps every level text pair at or above 4.5:1`, () => {
+    it(`${theme.name} keeps every sidebar level pair at or above its minimum`, () => {
       for (const { pair, ratio } of pairRatios(theme)) {
         const name = `${pair.text} on ${pair.surface}`;
-        if (LEVEL_PAIRS.includes(name)) expect(ratio, name).toBeGreaterThanOrEqual(4.5);
-      }
-      const behind = resolveToken(theme, "background");
-      for (const surface of ["sidebar-env-band", "sidebar-worktree"]) {
-        const painted = resolveToken(theme, surface);
-        expect(
-          contrastRatio(resolveToken(theme, "foreground"), painted, behind),
-          `foreground on ${surface}`,
-        ).toBeGreaterThanOrEqual(4.5);
-        expect(
-          contrastRatio(resolveSidebarMuted(theme), painted, behind),
-          `card muted text on ${surface}`,
-        ).toBeGreaterThanOrEqual(4.5);
+        if (LEVEL_PAIRS.includes(name)) expect(ratio, name).toBeGreaterThanOrEqual(pair.minimum);
       }
     });
 

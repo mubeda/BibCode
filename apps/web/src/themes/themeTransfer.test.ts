@@ -194,7 +194,9 @@ describe("theme export and import", () => {
       "sidebar-worktree": "#444444",
       "sidebar-worktree-icon": "#444444",
     };
-    const plan = transfer.planThemeImport(JSON.stringify({ ...night, ui: { ...night.ui, ...grey } }));
+    const plan = transfer.planThemeImport(
+      JSON.stringify({ ...night, ui: { ...night.ui, ...grey } }),
+    );
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
     expect(plan.theme.ui).toEqual({ ...night.ui, "muted-foreground": "#999999" });

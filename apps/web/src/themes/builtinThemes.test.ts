@@ -107,7 +107,7 @@ describe("built-in theme files", () => {
 describe("built-in theme contrast", () => {
   it("each new built-in keeps every fixed pair at or above 4.5", () => {
     for (const id of NEW_BUILTINS) {
-      expect(failingPairs(builtin(id), 4.5), id).toEqual([]);
+      expect(failingPairs(builtin(id)), id).toEqual([]);
     }
     const ratio = (id: string, text: string, surface: string) =>
       contrastRatio(

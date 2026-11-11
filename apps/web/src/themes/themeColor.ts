@@ -187,45 +187,79 @@ export function contrastRatio(text: string, surface: string, behind?: string): n
   return (light! + 0.05) / (dark! + 0.05);
 }
 
-export type FixedPair = { text: string; surface: string; label: string };
+/** The sidebar card's muted text, a CSS variable rather than a token (`resolveSidebarMuted`). */
+export const SIDEBAR_MUTED = "sidebar-card-muted-foreground";
+
+export type FixedPair = {
+  text: string;
+  surface: string;
+  label: string;
+  /** The ratio the pair needs: 4.5 for text, 3 for a graphic. */
+  minimum: number;
+  /**
+   * The overrides an import may remove when the pair fails (R55): the text's, then the
+   * surface's if the pair still fails, or only one of them.
+   */
+  reset: "text-then-surface" | "surface" | "text";
+};
+
+const textPair = (text: string, surface: string, label: string): FixedPair => ({
+  text,
+  surface,
+  label,
+  minimum: 4.5,
+  reset: "text-then-surface",
+});
 
 /** The pairs every theme is checked against (spec, Fixed pairs), in the spec's order. */
 export const FIXED_PAIRS: readonly FixedPair[] = [
-  { text: "foreground", surface: "background", label: "Text on background" },
-  { text: "card-foreground", surface: "card", label: "Card text on card" },
-  { text: "popover-foreground", surface: "popover", label: "Menu text on menu" },
-  { text: "primary-foreground", surface: "primary", label: "Primary label on primary" },
-  { text: "secondary-foreground", surface: "secondary", label: "Secondary text on secondary" },
-  { text: "accent-foreground", surface: "accent", label: "Accent text on accent" },
-  { text: "muted-foreground", surface: "background", label: "Muted text on background" },
-  { text: "muted-foreground", surface: "card", label: "Muted text on card" },
-  { text: "muted-foreground", surface: "accent", label: "Muted text on accent" },
-  { text: "selected-foreground", surface: "selected", label: "Selected text on selected" },
-  { text: "placeholder", surface: "background", label: "Placeholder on background" },
-  { text: "find-match-foreground", surface: "find-match", label: "Find match text on find match" },
+  textPair("foreground", "background", "Text on background"),
+  textPair("card-foreground", "card", "Card text on card"),
+  textPair("popover-foreground", "popover", "Menu text on menu"),
+  textPair("primary-foreground", "primary", "Primary label on primary"),
+  textPair("secondary-foreground", "secondary", "Secondary text on secondary"),
+  textPair("accent-foreground", "accent", "Accent text on accent"),
+  textPair("muted-foreground", "background", "Muted text on background"),
+  textPair("muted-foreground", "card", "Muted text on card"),
+  textPair("muted-foreground", "accent", "Muted text on accent"),
+  textPair("selected-foreground", "selected", "Selected text on selected"),
+  textPair("placeholder", "background", "Placeholder on background"),
+  textPair("find-match-foreground", "find-match", "Find match text on find match"),
+  textPair(
+    "find-match-active-foreground",
+    "find-match-active",
+    "Active find match text on active find match",
+  ),
+  textPair("terminal.foreground", "terminal.background", "Terminal text on terminal background"),
+  // The sidebar levels (R65). An import that fails one resets the sidebar text override, then the
+  // sidebar surface override.
+  textPair(
+    "sidebar-primary-badge-foreground",
+    "sidebar-primary-badge",
+    "Primary badge text on primary badge",
+  ),
+  textPair("sidebar-chat-foreground", "sidebar-card", "Chat text on sidebar card"),
+  textPair("sidebar-chat-foreground", "sidebar-env-band", "Chat text on environment band"),
+  textPair("sidebar-chat-foreground", "sidebar-worktree", "Chat text on worktree"),
+  // Global text on a sidebar level surface: an import that fails one resets only the sidebar
+  // surface, never the global text. The muted text is what a sidebar card paints.
+  { ...textPair("foreground", "sidebar-env-band", "Text on environment band"), reset: "surface" },
+  { ...textPair("foreground", "sidebar-worktree", "Text on worktree"), reset: "surface" },
   {
-    text: "find-match-active-foreground",
-    surface: "find-match-active",
-    label: "Active find match text on active find match",
+    ...textPair(SIDEBAR_MUTED, "sidebar-env-band", "Sidebar muted text on environment band"),
+    reset: "surface",
   },
   {
-    text: "terminal.foreground",
-    surface: "terminal.background",
-    label: "Terminal text on terminal background",
+    ...textPair(SIDEBAR_MUTED, "sidebar-worktree", "Sidebar muted text on worktree"),
+    reset: "surface",
   },
-  // The sidebar levels (R65). Each text is a sidebar token, so an import reset removes only it.
   {
-    text: "sidebar-primary-badge-foreground",
-    surface: "sidebar-primary-badge",
-    label: "Primary badge text on primary badge",
+    text: "sidebar-worktree-icon",
+    surface: "sidebar-worktree",
+    label: "Worktree icon on worktree",
+    minimum: 3,
+    reset: "text",
   },
-  { text: "sidebar-chat-foreground", surface: "sidebar-card", label: "Chat text on sidebar card" },
-  {
-    text: "sidebar-chat-foreground",
-    surface: "sidebar-env-band",
-    label: "Chat text on environment band",
-  },
-  { text: "sidebar-chat-foreground", surface: "sidebar-worktree", label: "Chat text on worktree" },
 ];
 
 /**
@@ -269,7 +303,7 @@ export function pairRatios(theme: ThemeFile): { pair: FixedPair; ratio: number }
   return FIXED_PAIRS.map((pair) => {
     const behind = pair.surface.startsWith("terminal.") ? "terminal.background" : "background";
     const ratio = contrastRatio(
-      resolveToken(theme, pair.text),
+      pair.text === SIDEBAR_MUTED ? resolveSidebarMuted(theme) : resolveToken(theme, pair.text),
       resolveToken(theme, pair.surface),
       resolveToken(theme, behind),
     );
@@ -277,9 +311,7 @@ export function pairRatios(theme: ThemeFile): { pair: FixedPair; ratio: number }
   });
 }
 
-export function failingPairs(
-  theme: ThemeFile,
-  minimum: number,
-): { pair: FixedPair; ratio: number }[] {
-  return pairRatios(theme).filter(({ ratio }) => ratio < minimum);
+/** The fixed pairs under their minimum. */
+export function failingPairs(theme: ThemeFile): { pair: FixedPair; ratio: number }[] {
+  return pairRatios(theme).filter(({ pair, ratio }) => ratio < pair.minimum);
 }

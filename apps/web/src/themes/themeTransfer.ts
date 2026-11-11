@@ -13,7 +13,6 @@ import { MAX_THEME_FILE_BYTES, validateThemeFile, type ThemeFieldError } from ".
 
 /** Theme files move between devices as JSON (#290, R53, R55). */
 
-const MINIMUM_RATIO = 4.5;
 const UI_ORDER = [...UI_COLOR_TOKENS, ...UI_LENGTH_TOKENS, ...UI_KEYWORD_TOKENS];
 
 export type ImportPlan =
@@ -54,9 +53,12 @@ function withoutOverride(theme: ThemeFile, token: string): ThemeFile | null {
 
 /**
  * Removes the overrides that make a fixed pair unreadable (R55, amendment A3 revised). A pair
- * under 4.5:1 is reset only when the same pair at the theme's base values meets 4.5:1 or the
- * theme still overrides the pair's text token. A pair the base fails is left alone otherwise.
- * The text override goes first, then the surface override if the pair still fails.
+ * under its minimum is reset only when the same pair at the theme's base values meets it, or,
+ * for a pair that may lose its text, when the theme still overrides the pair's text token.
+ * Most pairs lose the text override first, then the surface override if the pair still fails,
+ * so a theme that sets only a sidebar surface loses that surface through its chat pair. A pair
+ * of global text on a sidebar surface loses only the surface, and the worktree icon pair only
+ * the icon.
  */
 function resetUnreadablePairs(theme: ThemeFile): { theme: ThemeFile; resetPairs: FixedPair[] } {
   const base: ThemeFile = { version: 1, id: theme.base, name: theme.base, base: theme.base };
@@ -67,9 +69,10 @@ function resetUnreadablePairs(theme: ThemeFile): { theme: ThemeFile; resetPairs:
   for (let changed = true; changed;) {
     changed = false;
     for (const { pair, ratio } of pairRatios(current)) {
-      if (ratio >= MINIMUM_RATIO) continue;
-      if (baseRatio.get(pair)! < MINIMUM_RATIO && !withoutOverride(current, pair.text)) continue; // no text override left
-      const next = withoutOverride(current, pair.text) ?? withoutOverride(current, pair.surface);
+      if (ratio >= pair.minimum) continue;
+      const text = pair.reset === "surface" ? null : withoutOverride(current, pair.text);
+      if (baseRatio.get(pair)! < pair.minimum && !text) continue; // no text override left
+      const next = text ?? (pair.reset === "text" ? null : withoutOverride(current, pair.surface));
       if (!next) continue;
       current = next;
       changed = true;

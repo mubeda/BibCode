@@ -105,7 +105,7 @@ describe("resolveToken against the stylesheet", () => {
     // 230/255 * 98% + 2% of alpha is 230.5/255, which rounds up to e7 (4.50065:1 with the text).
     expect(resolveToken(ALPHA_BACKGROUND, "card")).toBe("#060606e7");
     expect(resolveToken(ALPHA_BACKGROUND, "popover")).toBe("#060606e7");
-    const failing = failingPairs(ALPHA_BACKGROUND, 4.5).map(({ pair }) => pair.text);
+    const failing = failingPairs(ALPHA_BACKGROUND).map(({ pair }) => pair.text);
     expect(failing).not.toContain("card-foreground");
   });
 });
@@ -171,7 +171,7 @@ describe("resolveToken", () => {
 
 describe("fixed pairs", () => {
   it("failingPairs lists a pair below the minimum and resolves unset tokens", () => {
-    const failing = failingPairs(theme("dark", { foreground: "#222222" }), 4.5);
+    const failing = failingPairs(theme("dark", { foreground: "#222222" }));
     const labels = failing.map((entry) => `${entry.pair.text} on ${entry.pair.surface}`);
     expect(labels).toContain("foreground on background");
     expect(labels).not.toContain("card-foreground on card");
@@ -179,7 +179,7 @@ describe("fixed pairs", () => {
     expect(pair?.ratio).toBeLessThan(4.5);
   });
 
-  it("FIXED_PAIRS has the fourteen pairs of the spec, then the four sidebar level pairs of R65, in order", () => {
+  it("FIXED_PAIRS has the fourteen pairs of the spec, then the nine sidebar level pairs of R65, in order", () => {
     expect(FIXED_PAIRS.map((pair) => `${pair.text} on ${pair.surface}`)).toEqual([
       "foreground on background",
       "card-foreground on card",
@@ -199,7 +199,23 @@ describe("fixed pairs", () => {
       "sidebar-chat-foreground on sidebar-card",
       "sidebar-chat-foreground on sidebar-env-band",
       "sidebar-chat-foreground on sidebar-worktree",
+      "foreground on sidebar-env-band",
+      "foreground on sidebar-worktree",
+      "sidebar-card-muted-foreground on sidebar-env-band",
+      "sidebar-card-muted-foreground on sidebar-worktree",
+      "sidebar-worktree-icon on sidebar-worktree",
     ]);
     expect(FIXED_PAIRS.every((pair) => pair.label.length > 0)).toBe(true);
+    const policy = (pair: (typeof FIXED_PAIRS)[number]) => `${pair.minimum} ${pair.reset}`;
+    expect(FIXED_PAIRS.slice(0, 18).map(policy)).toEqual(
+      Array.from({ length: 18 }, () => "4.5 text-then-surface"),
+    );
+    expect(FIXED_PAIRS.slice(18).map(policy)).toEqual([
+      "4.5 surface",
+      "4.5 surface",
+      "4.5 surface",
+      "4.5 surface",
+      "3 text",
+    ]);
   });
 });

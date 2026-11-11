@@ -207,8 +207,8 @@ describe("ThemeEditor", () => {
       '[data-contrast-pair="sidebar-card-muted-foreground:sidebar-env-band"]',
     )!;
     expect(muted.textContent).toContain("Low contrast");
-    // About 3.4:1: under the 4.5:1 of text, over the 3:1 of a graphic.
-    await type(textOf("ui.sidebar-worktree-icon"), "#a06a40");
+    // Between the 3:1 of a graphic and the 4.5:1 of text.
+    await type(textOf("ui.sidebar-worktree-icon"), "#c09070");
     const icon = container.querySelector(
       '[data-contrast-pair="sidebar-worktree-icon:sidebar-worktree"]',
     )!;

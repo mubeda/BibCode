@@ -106,7 +106,6 @@ const UI_GROUPS: { title: string; tokens: readonly UiToken[] }[] = [
 ];
 
 const LENGTH_TOKENS = new Set<string>(Object.keys(LENGTH_TOKEN_RANGES));
-const MINIMUM_RATIO = 4.5;
 
 type Texts = Record<string, string>;
 
@@ -395,7 +394,7 @@ export function ThemeEditor({ themeId, onClose }: { themeId: string; onClose(): 
       <SettingsSection title="Contrast">
         <ul className="grid gap-1 p-4 text-sm">
           {ratios.map(({ pair, ratio }) => {
-            const low = ratio < MINIMUM_RATIO;
+            const low = ratio < pair.minimum;
             return (
               <li
                 key={`${pair.text}:${pair.surface}`}
@@ -404,7 +403,9 @@ export function ThemeEditor({ themeId, onClose }: { themeId: string; onClose(): 
               >
                 <span className="min-w-0 flex-1">
                   {pair.label}{" "}
-                  <span className="text-muted-foreground">{`(${pair.text} on ${pair.surface})`}</span>
+                  <span className="text-muted-foreground">
+                    {`(${pair.text} on ${pair.surface}${pair.minimum === 4.5 ? "" : `, needs ${pair.minimum}:1`})`}
+                  </span>
                 </span>
                 {low ? (
                   <span className="flex items-center gap-1 text-warning-foreground">
