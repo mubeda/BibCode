@@ -651,14 +651,16 @@ The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
 
-The default specs share one app session, so a spec that closes the app cannot
-run among them. Each closing case of `desktop-save-and-close.e2e.ts` runs in its
-own app session. The lifecycle helper
-(`apps/desktop/e2e/support/app-lifecycle.ts`) asks the window to close while the
-backend is still running, so the close dialog can reach the web page, and
-teardown accepts an app that has already exited. A spec that leaves an edit
-unsaved cannot hang teardown: the helper ends it through
-`desktop_e2e_prepare_for_exit` or a Discard answer.
+The default specs share one app session. `desktop-save-and-close.e2e.ts` ends
+the app, so it runs last, in a worker of its own. Its native close and quit
+cases choose Close Window or Quit from the application menu while the backend is
+still running, so the close dialog can reach the web page; they run on macOS
+only and skip on Linux and Windows, where the export and update-dialog focus
+cases still run. After a case that ended the app, the lifecycle helper
+(`apps/desktop/e2e/support/app-lifecycle.ts`) starts the app again with a new
+WebDriver session, and teardown accepts an app that has already exited. A spec
+that leaves an edit unsaved cannot hang teardown: the helper ends it through
+`desktop_e2e_prepare_for_exit`.
 
 The default suite also includes `chat-side-chat.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/chat-side-chat.e2e.ts`). It starts a `[[slow]]` host
