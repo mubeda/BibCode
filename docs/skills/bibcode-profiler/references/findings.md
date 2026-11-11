@@ -486,8 +486,10 @@ name for paths outside home.
 - **`error` reasons:** every other reason, such as `git-failed`, `internal`,
   `orchestration-failed` and `workspace-identity-unavailable`.
 
-The remaining kinds come from the read-only scan in
-[`worktree.audit`](events.md#worktreeaudit). It never prunes or deletes.
+The remaining kinds come from the scan in
+[`worktree.audit`](events.md#worktreeaudit). It never prunes, and never
+deletes a file, a folder or a Git registration. Its only write deletes the
+creation record of a worktree whose folder is gone.
 
 ### worktree.missing
 
@@ -512,7 +514,8 @@ The remaining kinds come from the read-only scan in
   first of these, in this order:
   - `creation-record`: BiBCode recorded that it created a worktree at that path.
   - `incomplete-removal`: a removal receipt for the path is still `prepared`.
-  - `git-pointer-file`: a `.git` file at its root starts with `gitdir:`.
+  - `git-pointer-file`: a `.git` regular file at its root, not a link or a
+    FIFO, starts with `gitdir:`.
   - `removal-marker`: `.bibcode-removal-identity` or
     `.bibcode-removal-tombstone` is at its root.
 - A directory without evidence is never reported, whatever its name, and the
@@ -529,7 +532,9 @@ The remaining kinds come from the read-only scan in
 - Once removed, registered or owned, that directory stops recurring; existing
   findings remain in the book (there is no automatic resolved-state
   transition). An audit deletes the creation record of a directory that is
-  gone, so a later folder at that path has no evidence.
+  still gone when it deletes, so a later folder at that path has no evidence.
+  A worktree BiBCode creates there again gets a new record, which that delete
+  never removes.
 
 ### worktree.registration-mismatch
 
