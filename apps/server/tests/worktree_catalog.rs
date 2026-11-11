@@ -612,6 +612,7 @@ fn workspace_thread(path: &Path) -> ProjectionThread {
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 

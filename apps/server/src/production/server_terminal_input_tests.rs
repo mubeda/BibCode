@@ -362,6 +362,7 @@ fn thread_row_in(
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 

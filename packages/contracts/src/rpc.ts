@@ -475,6 +475,8 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   ),
   /** Opens a side chat of the host (#265). Only for a server that advertises `sideChats`. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** Marks the panel as a code review (#293). Only for a server that advertises `codeReviews`. */
+  codeReview: Schema.optional(Schema.Boolean),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 

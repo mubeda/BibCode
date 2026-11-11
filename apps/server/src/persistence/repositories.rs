@@ -956,11 +956,11 @@ impl Repositories {
     pub async fn upsert_thread(&self, row: ProjectionThread) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, side_chat) \
+                "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, side_chat, code_review) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (thread_id) DO UPDATE SET \
-                   project_id=excluded.project_id, title=excluded.title, kind=excluded.kind, model_selection_json=excluded.model_selection_json, runtime_mode=excluded.runtime_mode, interaction_mode=excluded.interaction_mode, branch=excluded.branch, worktree_path=excluded.worktree_path, latest_turn_id=excluded.latest_turn_id, created_at=excluded.created_at, updated_at=excluded.updated_at, archived_at=excluded.archived_at, latest_user_message_at=excluded.latest_user_message_at, pending_approval_count=excluded.pending_approval_count, pending_user_input_count=excluded.pending_user_input_count, has_actionable_proposed_plan=excluded.has_actionable_proposed_plan, deleted_at=excluded.deleted_at, host_thread_id=excluded.host_thread_id, side_chat=excluded.side_chat",
-                params![row.thread_id,row.project_id,row.title,row.kind,encode_json(&row.model_selection)?,row.runtime_mode,row.interaction_mode,row.branch,row.worktree_path,row.latest_turn_id,row.created_at,row.updated_at,row.archived_at,row.latest_user_message_at,row.pending_approval_count,row.pending_user_input_count,row.has_actionable_proposed_plan,row.deleted_at,row.host_thread_id,row.side_chat],
+                   project_id=excluded.project_id, title=excluded.title, kind=excluded.kind, model_selection_json=excluded.model_selection_json, runtime_mode=excluded.runtime_mode, interaction_mode=excluded.interaction_mode, branch=excluded.branch, worktree_path=excluded.worktree_path, latest_turn_id=excluded.latest_turn_id, created_at=excluded.created_at, updated_at=excluded.updated_at, archived_at=excluded.archived_at, latest_user_message_at=excluded.latest_user_message_at, pending_approval_count=excluded.pending_approval_count, pending_user_input_count=excluded.pending_user_input_count, has_actionable_proposed_plan=excluded.has_actionable_proposed_plan, deleted_at=excluded.deleted_at, host_thread_id=excluded.host_thread_id, side_chat=excluded.side_chat, code_review=excluded.code_review",
+                params![row.thread_id,row.project_id,row.title,row.kind,encode_json(&row.model_selection)?,row.runtime_mode,row.interaction_mode,row.branch,row.worktree_path,row.latest_turn_id,row.created_at,row.updated_at,row.archived_at,row.latest_user_message_at,row.pending_approval_count,row.pending_user_input_count,row.has_actionable_proposed_plan,row.deleted_at,row.host_thread_id,row.side_chat,row.code_review],
             )?; Ok(())
         }).await
     }
@@ -3662,6 +3662,9 @@ pub struct ProjectionThread {
     /// carries the host's messages, and it captures no checkpoints.
     #[serde(default)]
     pub side_chat: bool,
+    /// A `panel` thread started as a code review (#293): it offers no Implement.
+    #[serde(default)]
+    pub code_review: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4186,7 +4189,7 @@ pub struct AuthSession {
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt FROM projection_projects";
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat FROM projection_threads";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
@@ -5167,6 +5170,7 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         last_activity_at: row.get(22)?,
         requester: decode_optional_json(row.get(23)?, "requester_json")?,
         side_chat: row.get(24)?,
+        code_review: row.get(25)?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {

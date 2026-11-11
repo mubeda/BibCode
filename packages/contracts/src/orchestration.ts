@@ -630,6 +630,8 @@ export const OrchestrationThread = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293): it offers no Implement; sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** The outside agent that created the thread and why; absent for a person's thread. */
   requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -728,6 +730,8 @@ export const OrchestrationThreadShell = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293): it offers no Implement; sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** The outside agent that created the thread and why; absent for a person's thread. */
   requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -1555,6 +1559,8 @@ export const ThreadCreatedPayload = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293); sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** Why an outside agent created the thread; its actor is in the event's metadata. */
   purpose: Schema.optional(Schema.String),
   branch: Schema.NullOr(TrimmedNonEmptyString),

@@ -530,6 +530,14 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "std::ops::Not::not"
         )]
         side_chat: bool,
+        /// A panel started as a code review (#293); only `worktree.createPanel` sets it, and only
+        /// on a panel. Omitted when false so a plain command keeps its digest.
+        #[serde(
+            rename = "codeReview",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        code_review: bool,
         /// Why an outside agent created the thread (untrusted text, at most 200 characters);
         /// shown with the agent's label, never logged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4885,6 +4893,7 @@ async fn plan_command(
             kind,
             host_thread_id,
             side_chat,
+            code_review,
             purpose,
             model_selection,
             runtime_mode,
@@ -4898,6 +4907,12 @@ async fn plan_command(
                 return invariant(
                     command,
                     "A side chat must be a chat panel with a host thread.".to_owned(),
+                );
+            }
+            if *code_review && (kind.as_deref() != Some("panel") || host_thread_id.is_none()) {
+                return invariant(
+                    command,
+                    "A code review must be a chat panel with a host thread.".to_owned(),
                 );
             }
             if purpose
@@ -4953,6 +4968,7 @@ async fn plan_command(
             );
             insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
             insert_optional(&mut payload, "sideChat", side_chat.then(|| json!(true)));
+            insert_optional(&mut payload, "codeReview", code_review.then(|| json!(true)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -7562,10 +7578,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat, code_review) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, code_review = excluded.code_review, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -7599,6 +7615,7 @@ fn apply_threads_projector_tx(
                     ))
                     .transpose()?,
                 payload.get("sideChat").and_then(Value::as_bool) == Some(true),
+                payload.get("codeReview").and_then(Value::as_bool) == Some(true),
             ],
         )?;
     } else {
@@ -9675,6 +9692,7 @@ mod tests {
                     branch: Some("feature/detach".to_owned()),
                     worktree_path: Some(path.to_owned()),
                     created_at: "2026-08-09T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread");
@@ -9940,6 +9958,7 @@ mod tests {
                         branch: None,
                         worktree_path: None,
                         created_at: "2026-10-08T00:00:01Z".to_owned(),
+                        code_review: false,
                     })
                     .await
                     .expect("thread");
@@ -10288,6 +10307,7 @@ mod tests {
                     branch: Some("old".to_owned()),
                     worktree_path: Some(worktree_path.to_owned()),
                     created_at: "2026-08-09T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread");
@@ -11157,6 +11177,7 @@ mod tests {
                 branch: None,
                 worktree_path: None,
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
+                code_review: false,
             })
             .await
             .expect("panel");
@@ -11243,6 +11264,7 @@ mod tests {
                 branch: None,
                 worktree_path: None,
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
+                code_review: false,
             };
         let refusal = |result: Result<_, OrchestrationError>| match result {
             Err(OrchestrationError::Invariant { detail, .. }) => detail,
@@ -11332,6 +11354,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             created_at: "2026-11-02T00:00:01Z".to_owned(),
+            code_review: false,
         }
     }
 
@@ -11808,7 +11831,10 @@ mod tests {
             })
             .await
             .expect("count marked events");
-        assert_eq!(plain_payload_has_key, 1, "only the review panel records the key");
+        assert_eq!(
+            plain_payload_has_key, 1,
+            "only the review panel records the key"
+        );
         engine
             .repositories()
             .database()

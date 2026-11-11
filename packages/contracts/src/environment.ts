@@ -102,6 +102,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   webhookStatusKinds: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `worktree.createPanel` takes `sideChat`: a panel seeded with its host's messages (#265). */
   sideChats: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `worktree.createPanel` takes `codeReview`: a review panel that offers no Implement (#293). */
+  codeReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
   threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });

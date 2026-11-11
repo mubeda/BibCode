@@ -1388,6 +1388,7 @@ async fn create_managed_worktree_locked(
                     branch: Some(created.worktree.ref_name.clone()),
                     worktree_path: Some(created.worktree.path.clone()),
                     created_at: now_iso(),
+                    code_review: false,
                 },
                 CommandAdmission {
                     payload_digest,
@@ -1542,6 +1543,7 @@ async fn create_worktree_panel(
                                     kind: Some("panel".to_owned()),
                                     host_thread_id: Some(host.thread_id),
                                     side_chat: input.side_chat,
+                                    code_review: input.code_review,
                                     purpose: input.purpose,
                                     model_selection: input.thread_defaults.model_selection,
                                     runtime_mode: input.thread_defaults.runtime_mode,
@@ -3541,6 +3543,10 @@ struct WorktreeCreatePanelInput {
     /// digest of a receipt stored before side chats existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     side_chat: bool,
+    /// A code review panel (#293). Omitted when false, so a plain panel request keeps the
+    /// digest of a receipt stored before code reviews existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    code_review: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4235,6 +4241,7 @@ mod mutation_invalidation_tests {
                     branch: Some("feature/remove".to_owned()),
                     worktree_path: Some(self.linked.to_string_lossy().into_owned()),
                     created_at: "2026-08-23T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread created");
@@ -5534,6 +5541,7 @@ mod mutation_invalidation_tests {
                 branch: Some(created.worktree.ref_name.clone()),
                 worktree_path: Some(path.clone()),
                 created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
             })
             .await
             .expect("thread created");
@@ -5667,6 +5675,7 @@ mod mutation_invalidation_tests {
                 branch: Some("feature/remove".to_owned()),
                 worktree_path: Some(linked.to_string_lossy().into_owned()),
                 created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
             })
             .await
             .expect("thread created");

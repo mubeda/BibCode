@@ -319,6 +319,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 

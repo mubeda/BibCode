@@ -182,6 +182,7 @@ fn thread_row(
         last_activity_at: Some(LONG_AGO.to_owned()),
         requester: None,
         side_chat: false,
+        code_review: false,
     }
 }
 

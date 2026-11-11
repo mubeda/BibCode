@@ -2968,6 +2968,9 @@ fn thread_shell_with_records(
     if thread.side_chat {
         shell["sideChat"] = json!(true);
     }
+    if thread.code_review {
+        shell["codeReview"] = json!(true);
+    }
     if let Some(requester) = &thread.requester {
         shell["requester"] = requester.clone();
     }
@@ -3308,6 +3311,7 @@ mod tests {
                 deleted_at: None,
                 host_thread_id: None,
                 compaction: None,
+                code_review: false,
             }],
             messages: vec![
                 ProjectionThreadMessage {

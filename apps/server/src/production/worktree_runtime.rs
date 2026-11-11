@@ -2865,6 +2865,7 @@ mod tests {
                     deleted_at: None,
                     host_thread_id: None,
                     compaction: None,
+                    code_review: false,
                 })
                 .await
                 .expect("thread");

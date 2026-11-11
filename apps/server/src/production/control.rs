@@ -2866,6 +2866,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookBearerToken": true,
         "webhookStatusKinds": true,
         "sideChats": true,
+        "codeReviews": true,
         "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
