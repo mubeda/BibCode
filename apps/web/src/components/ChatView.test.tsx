@@ -5870,6 +5870,29 @@ describe("ChatView handlers (captured from mocked children)", () => {
       }
     });
 
+    it("keeps the Tasks label for a review without a proposed plan", async () => {
+      h.realTimeline = true;
+      seedConnectedServerThread(makeThread({ codeReview: true }));
+      useRightPanelStore.getState().open(threadRef, "plan");
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Tasks");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("keeps today's plan actions without the flag", async () => {
       const view = await renderPlanThread(false);
       try {

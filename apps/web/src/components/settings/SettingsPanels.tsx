@@ -1231,7 +1231,12 @@ function CodeReviewSettingsSection({
       label: action.label,
     }));
   if (!reviewerItems.some((item) => item.value === savedValue)) {
-    reviewerItems.push({ value: savedValue, label: saved.instanceId });
+    const known = instanceEntries.find((entry) => entry.instanceId === saved.instanceId);
+    const name = known?.displayName ?? saved.instanceId;
+    reviewerItems.push({
+      value: savedValue,
+      label: saved.kind === "terminal" ? `${name} Terminal` : name,
+    });
   }
   const reviewerEntry =
     savedReviewer.action?.entry ??

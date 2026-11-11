@@ -2377,11 +2377,12 @@ function ChatViewContent(props: ChatViewProps) {
   );
   // A review panel reports findings; implementing them is not a review's job (D42).
   const isCodeReviewThread = activeThread?.codeReview === true;
-  const planSidebarLabel = isCodeReviewThread
-    ? "Review findings"
-    : sidebarProposedPlan || interactionMode === "plan"
-      ? "Plan"
-      : "Tasks";
+  const planSidebarLabel =
+    isCodeReviewThread && sidebarProposedPlan
+      ? "Review findings"
+      : sidebarProposedPlan || interactionMode === "plan"
+        ? "Plan"
+        : "Tasks";
   const showPlanFollowUpPrompt =
     !isCodeReviewThread &&
     pendingUserInputs.length === 0 &&
