@@ -69,6 +69,16 @@ describe("createRichMarkdownEditor", () => {
     expect(canReconcile({ original, before: editor.serialize() })).toBe(false);
   });
 
+  it("holds a closed mermaid fence as one diagram block, written as the code block was", () => {
+    const { editor, tiptap } = open(corpus.mermaidFence);
+    expect(tiptap.state.doc.child(1).type.name).toBe("mermaidDiagram");
+    expect(editor.serialize()).toBe(
+      "Before the diagram.\n\n```mermaid\ngraph TD\n  A --> B\n```\n\nAfter the diagram.",
+    );
+    // An unclosed fence stays a code block, as chat shows it as source.
+    expect(open("```mermaid\ngraph TD\n").tiptap.state.doc.child(0).type.name).toBe("codeBlock");
+  });
+
   it("reconciles an untouched editor to the original bytes", () => {
     for (const [name, original] of supported) {
       const { editor } = open(original);
@@ -368,7 +378,7 @@ describe("an edit at any boundary of any level", () => {
       true,
     );
     expect(failures).toEqual([]);
-    expect(count).toBe(126);
+    expect(count).toBe(130);
   });
 
   it("inserting a paragraph or a first nested item inside a list item keeps every other block's bytes", () => {
@@ -424,6 +434,6 @@ describe("an edit at any boundary of any level", () => {
       false,
     );
     expect(failures).toEqual([]);
-    expect(count).toBe(81);
+    expect(count).toBe(84);
   });
 });

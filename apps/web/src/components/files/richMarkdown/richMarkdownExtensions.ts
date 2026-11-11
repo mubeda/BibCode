@@ -13,6 +13,11 @@ import { Markdown } from "@tiptap/markdown";
 import StarterKit from "@tiptap/starter-kit";
 
 import { createDetailsExtensions } from "./detailsExtension";
+import {
+  createMermaidDiagramExtension,
+  fencedCode,
+  type MermaidDiagramView,
+} from "./mermaidDiagramExtension";
 
 export type FormatName =
   | "paragraph"
@@ -89,13 +94,13 @@ const MarkedListItem = ListItem.extend({
 const FencedCodeBlock = CodeBlock.extend({
   renderMarkdown: (node: JSONContent, helpers) => {
     const code = node.content ? helpers.renderChildren(node.content) : "";
-    const longest = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
-    const fence = "`".repeat(Math.max(3, longest + 1));
-    return `${fence}${(node.attrs?.["language"] as string | null) ?? ""}\n${code}\n${fence}`;
+    return fencedCode(code, (node.attrs?.["language"] as string | null) ?? "");
   },
 });
 
-function extensions(): AnyExtension[] {
+function extensions(
+  onDiagramViewsChange?: (views: readonly MermaidDiagramView[]) => void,
+): AnyExtension[] {
   return [
     StarterKit.configure({
       bulletList: false,
@@ -108,6 +113,7 @@ function extensions(): AnyExtension[] {
     MarkedBulletList,
     MarkedListItem,
     FencedCodeBlock,
+    createMermaidDiagramExtension(onDiagramViewsChange),
     TaskList,
     TaskItem.configure({ nested: true }),
     TableKit.configure({ table: { resizable: false } }),
@@ -183,10 +189,12 @@ export function createRichMarkdownEditor(input: {
   body: string;
   element: HTMLElement | null;
   onUpdate(): void;
+  /** Where each Mermaid diagram block sits, whenever one is added or removed. */
+  onDiagramViewsChange?: (views: readonly MermaidDiagramView[]) => void;
 }): RichMarkdownEditor {
   const editor = new Editor({
     element: input.element,
-    extensions: extensions(),
+    extensions: extensions(input.onDiagramViewsChange),
     content: input.body,
     contentType: "markdown",
     onUpdate: () => input.onUpdate(),

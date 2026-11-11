@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import type { FileEditingSession } from "../fileEditingSession";
 import { canReconcile, detectDominantEol, reconcileMarkdown } from "./markdownReconcile";
 import { splitFrontmatter } from "./markdownSupport";
+import type { MermaidDiagramView } from "./mermaidDiagramExtension";
+import { RichMarkdownMermaid } from "./RichMarkdownMermaid";
 import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
 import "./richMarkdown.css";
 
@@ -36,6 +39,8 @@ export default function RichMarkdownSurface({
 }: RichMarkdownSurfaceProps) {
   const [opened] = useState(() => ({ source: contents, ...splitFrontmatter(contents) }));
   const editorRef = useRef<HTMLDivElement>(null);
+  // Changes only when a diagram block is added or removed, never on typing.
+  const [diagrams, setDiagrams] = useState<readonly MermaidDiagramView[]>([]);
 
   useEffect(() => {
     const element = editorRef.current;
@@ -75,6 +80,7 @@ export default function RichMarkdownSurface({
         if (timer !== null) clearTimeout(timer);
         timer = setTimeout(() => deliver(), SERIALIZE_DELAY_MS);
       },
+      onDiagramViewsChange: setDiagrams,
     });
     before = editor.serialize();
     if (!canReconcile({ original: opened.body, before })) {
@@ -113,7 +119,14 @@ export default function RichMarkdownSurface({
           <pre>{opened.frontmatter}</pre>
         </div>
       ) : null}
-      <div ref={editorRef} className="chat-markdown rich-markdown-editor" />
+      {/* ChatMarkdown's root classes: the diagram fonts are measured once per page from here. */}
+      <div
+        ref={editorRef}
+        className="chat-markdown rich-markdown-editor text-sm leading-relaxed text-foreground/80"
+      />
+      {diagrams.map((view) =>
+        createPortal(<RichMarkdownMermaid source={view.source} />, view.element, String(view.id)),
+      )}
     </div>
   );
 }

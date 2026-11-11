@@ -86,3 +86,9 @@
   white-space: pre-wrap;
   user-select: text;
 }
+
+/* A drawn Mermaid fence: not editable, and laid out like chat's, not like editor text. */
+.rich-markdown-editor .rich-markdown-mermaid {
+  white-space: normal;
+  margin: 0.75rem 0;
+}

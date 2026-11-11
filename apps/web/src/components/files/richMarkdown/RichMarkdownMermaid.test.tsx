@@ -127,9 +127,26 @@ function type(tiptap: Editor, text: string): void {
   });
 }
 
+/**
+ * Presses `key` through the editor's key handlers, as a real key press reaches them. TipTap's
+ * `keyboardShortcut` command keeps only the steps of what the key did, not its selection.
+ */
 function press(tiptap: Editor, key: string): void {
   act(() => {
-    tiptap.commands.keyboardShortcut(key);
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    tiptap.view.someProp("handleKeyDown", (handle) => handle(tiptap.view, event));
+  });
+}
+
+function selectDiagram(tiptap: Editor): void {
+  let position = -1;
+  tiptap.state.doc.descendants((node, pos) => {
+    if (node.type.name === "mermaidDiagram") position = pos;
+    return position < 0;
+  });
+  expect(position).toBeGreaterThanOrEqual(0);
+  act(() => {
+    tiptap.commands.setNodeSelection(position);
   });
 }
 
@@ -242,9 +259,7 @@ describe("Mermaid diagrams in the rendered Markdown editor", () => {
     const session = createSession(last);
     const { tiptap } = await mount(session, last);
 
-    act(() => {
-      tiptap.commands.setNodeSelection(tiptap.state.doc.child(0).nodeSize);
-    });
+    selectDiagram(tiptap);
     press(tiptap, "Enter");
     type(tiptap, "Written after.");
     await deliver();
@@ -252,17 +267,26 @@ describe("Mermaid diagrams in the rendered Markdown editor", () => {
     expect(session.unsavedContents).toBe(`Intro.\n\n${FENCE}\n\nWritten after.\n`);
   });
 
-  it("Backspace after the diagram selects it, a second deletes exactly the fence, Undo restores it", async () => {
+  it("Delete removes a selected diagram and exactly its fence", async () => {
+    const session = createSession(FILE);
+    const { tiptap } = await mount(session, FILE);
+
+    selectDiagram(tiptap);
+    press(tiptap, "Delete");
+    await deliver();
+
+    expect(session.unsavedContents).toBe(
+      "# Diagram\n\nBefore the diagram.\n\nAfter the diagram.\n",
+    );
+  });
+
+  it("Backspace at the start of the next paragraph deletes exactly the fence, Undo restores it", async () => {
     const session = createSession(FILE);
     const { tiptap, onEditorChange } = await mount(session, FILE);
     const editor = onEditorChange.mock.lastCall![0]!;
 
     caretBefore(tiptap, "After the diagram.");
-    press(tiptap, "Backspace");
-    expect(tiptap.state.selection.toJSON()).toMatchObject({ type: "node" });
-    await deliver();
-    expect(session.changeFromRichEditor).not.toHaveBeenCalled();
-
+    // As before a horizontal rule: the block before the caret goes whole.
     press(tiptap, "Backspace");
     await deliver();
     expect(session.unsavedContents).toBe(
