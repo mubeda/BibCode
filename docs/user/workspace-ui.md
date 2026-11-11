@@ -2362,6 +2362,12 @@ source edits. Opening a file and saving it without a change leaves it
 byte-identical, and a frontmatter block at the top is never rewritten. Only the
 parts you edit change.
 
+A ` ```mermaid ` block shows its diagram in rendered view. The diagram is one
+block: click it to select it, and press Delete or Backspace to remove it. Edit
+its source in source view. Other code blocks show without syntax colors while
+you edit, and clicking a link places the caret in it instead of opening it; the
+read-only rendered view opens a link on a click.
+
 Undo and Redo work inside the view you are in. Rendered view starts a fresh
 history each time you enter it. When you switch to source view, everything you
 did in that visit is one Undo step there.

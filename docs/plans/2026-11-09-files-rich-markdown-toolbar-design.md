@@ -92,6 +92,9 @@ and `javascriptLedger` rise by the number added.
   `renderMarkdown` writes a fence one backtick longer than the longest backtick run in the
   code, at least three. The stock serializer always writes three, so a three-backtick line
   inside a four-backtick fence closed it early (found in Task 6.9).
+- `mermaidDiagram` (lane C6), an atom block node for a closed ```mermaid fence, ahead of
+  the code block for the same Markdown token. It writes the same fence as the code block,
+  and its node view draws the diagram (see Risks).
 - `TaskList` and `TaskItem` (`nested: true`). A checkbox click changes the node's
   `checked` attribute, which the reconcile turns into a change of that item's marker only
   (R25).
@@ -450,11 +453,18 @@ view.
   check keeps the parsed document equal to what the person saw.
 - Nine direct packages add about 6 MB unpacked to the install and one lazy chunk to
   the bundle. The chunk loads only when a Markdown file is shown in rendered view.
-- The editable view replaces `ChatMarkdown` for editable `.md` files, so it gives up what
-  `ChatMarkdown` adds on top of Markdown: syntax colors in fenced code, Mermaid diagrams
-  and links that open on a plain click. These are accepted costs of making the rendered
-  view the editor (spec non-goal: no third preview mode). Read-only files keep
-  `ChatMarkdown`.
+- The editable view replaces `ChatMarkdown` for editable `.md` files, so it gives up two
+  things `ChatMarkdown` adds on top of Markdown: syntax colors in fenced code and links
+  that open on a plain click. These are accepted costs of making the rendered view the
+  editor (spec non-goal: no third preview mode). Read-only files keep `ChatMarkdown`.
+  Mermaid diagrams were on this list until the packaged suite failed on them, and are
+  drawn again (lane C6): `mermaidDiagramExtension.ts` turns a fence that passes chat's
+  closed-fence gate into one non-editable atom node, serialized exactly as the code block
+  it replaces, so `canReconcile` and the reconcile see the same document and an untouched
+  fence keeps its bytes. `RichMarkdownSurface` portals chat's `MarkdownMermaidBlock` into
+  each node view, so drawing, refusals, the sanitizer and theme recoloring have one
+  implementation. The source is edited in source view. Each diagram costs one React
+  subtree, rendered when its block is added and on a theme switch, never on typing.
 - An inserted or existing image shows in the editor through its relative path, which the
   browser resolves against the app, not the file. The saved Markdown is right.
   `ChatMarkdown` has no image source rewrite either (inferred: no match for an image

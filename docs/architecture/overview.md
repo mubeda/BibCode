@@ -3438,9 +3438,10 @@ The unit tests compare every streamed prefix with one.
 #### Mermaid diagrams
 
 A fenced block whose language is exactly `mermaid` draws as a diagram in every
-`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and the
-rendered Markdown file view) once its own closing fence has arrived, so the
-renderer never sees partial source:
+`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and a
+read-only rendered Markdown file view) and in the editable rendered view of a
+Markdown file, once its own closing fence has arrived, so the renderer never
+sees partial source:
 
 - **Gate.** `components/markdown/mermaidFence.ts` reads what the parser decided
   rather than parsing CommonMark again. The block's source slice must start
@@ -3475,6 +3476,22 @@ renderer never sees partial source:
   is cancelled only when its last waiting block leaves, and a result shows only
   in a block that still holds its source. A failed renderer import is cleared
   so **Retry** can try again.
+- **Editable file view.** The rendered view of an editable `.md` file is a
+  TipTap editor, not `ChatMarkdown`. There,
+  `components/files/richMarkdown/mermaidDiagramExtension.ts` turns each fence
+  that passes the same gate into one non-editable atom node, which a click
+  selects and Delete or Backspace removes whole (Undo brings it back). The
+  node keeps the fence's body and info string and serializes exactly as the
+  code block it replaces, so the save reconcile sees the same document and an
+  untouched fence keeps its bytes. Its node view is an empty element that
+  `RichMarkdownSurface` fills through a React portal with the same
+  `MarkdownMermaidBlock` (`RichMarkdownMermaid.tsx`, memoized on the source),
+  so drawing, refusals, the sanitizer, the cache and theme recoloring are
+  chat's. Typing elsewhere renders nothing in the block: the surface's list of
+  diagram views changes only when a diagram block is added or removed. The
+  diagram's source is edited in source view, and the block says so. Other
+  fenced code in the editable view has no syntax colors, and a click on a link
+  places the caret instead of opening it.
 - **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)
   and `data-markdown-atomic`, so `markdown-clipboard.ts` copies a selection
   inside or across a diagram as its source, and the HTML flavor as an escaped
