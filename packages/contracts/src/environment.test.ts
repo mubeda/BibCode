@@ -65,6 +65,10 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).sideChats).toBe(false);
     expect(decodeTerminalCapabilities({ sideChats: true }).sideChats).toBe(true);
   });
+  it("reads code reviews as off for an older server and keeps advertised support", () => {
+    expect(decodeTerminalCapabilities({}).codeReviews).toBe(false);
+    expect(decodeTerminalCapabilities({ codeReviews: true }).codeReviews).toBe(true);
+  });
   it("reads unused thread deletes as off for an older server", () => {
     expect(decodeTerminalCapabilities({ sideChats: true }).threadDeleteOnlyIfUnused).toBe(false);
     expect(

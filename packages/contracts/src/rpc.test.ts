@@ -459,6 +459,16 @@ describe("WsRpcGroup", () => {
       }).sideChat,
     ).toBe(true);
     expect(
+      decodeWorktreeCreatePanel({
+        commandId: "command-review",
+        hostThreadId: "thread-host",
+        threadId: "thread-review",
+        title: "Code review · Codex",
+        threadDefaults,
+        codeReview: true,
+      }).codeReview,
+    ).toBe(true);
+    expect(
       decodeWorktreeRetarget({
         commandId: "command-retarget",
         projectId: "project-1",

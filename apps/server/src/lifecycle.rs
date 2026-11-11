@@ -1352,6 +1352,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["codeReviews"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);

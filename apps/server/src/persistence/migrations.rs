@@ -3592,6 +3592,35 @@ mod tests {
     }
 
     #[test]
+    fn migration_74_adds_code_review_defaulting_false() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(73))?;
+        connection.execute(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z', NULL, NULL)",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [74]
+        );
+        let code_review: i64 = connection.query_row(
+            "SELECT code_review FROM projection_threads WHERE thread_id = 't'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(code_review, 0);
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_074(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_72_adds_worktree_creation_records() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(71))?;

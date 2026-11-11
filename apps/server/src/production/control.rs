@@ -7456,6 +7456,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["codeReviews"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
         // environment's logs only when it says so (#194).

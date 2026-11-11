@@ -571,6 +571,53 @@ describe("side chat marker", () => {
   );
 });
 
+describe("code review marker", () => {
+  it("is absent on a thread from an older server and true on a review panel", () => {
+    expect(decodeShell(baseShellFixture).codeReview).toBeUndefined();
+    expect(
+      decodeShell({
+        ...baseShellFixture,
+        kind: "panel",
+        hostThreadId: "thread-host",
+        codeReview: true,
+      }).codeReview,
+    ).toBe(true);
+  });
+
+  it.effect("is optional on a thread and on thread.created", () =>
+    Effect.gen(function* () {
+      const payload = {
+        threadId: "thread-review",
+        projectId: "project-1",
+        title: "Code review · Codex",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        kind: "panel",
+        hostThreadId: "thread-host",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-11-11T00:00:00.000Z",
+        updatedAt: "2026-11-11T00:00:00.000Z",
+      };
+      assert.strictEqual((yield* decodeThreadCreatedPayload(payload)).codeReview, undefined);
+      assert.strictEqual(
+        (yield* decodeThreadCreatedPayload({ ...payload, codeReview: true })).codeReview,
+        true,
+      );
+      const thread = yield* Schema.decodeUnknownEffect(OrchestrationThread)({
+        ...baseShellFixture,
+        deletedAt: null,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      });
+      assert.strictEqual(thread.codeReview, undefined);
+    }),
+  );
+});
+
 describe("OrchestrationConversationPreview", () => {
   it("decodes a shell without the field (older server)", () => {
     const shell = decodeShell(baseShellFixture);

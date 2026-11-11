@@ -3562,6 +3562,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn code_review_thread_shell_marks_only_a_review() {
+        let snapshot = preview_snapshot_fixture("running");
+        let mut thread = snapshot.threads[0].clone();
+        assert!(
+            thread_shell(&thread, &snapshot, None)
+                .get("codeReview")
+                .is_none()
+        );
+        thread.code_review = true;
+        assert_eq!(
+            thread_shell(&thread, &snapshot, None)["codeReview"],
+            serde_json::json!(true)
+        );
+    }
+
     fn store_thread(
         thread_id: &str,
         project_id: &str,

@@ -11728,6 +11728,108 @@ mod tests {
         assert!(!side_chat_of(host_id).await);
     }
 
+    fn code_review_create(
+        command_id: &str,
+        thread_id: &str,
+        kind: Option<&str>,
+        host: Option<&str>,
+    ) -> OrchestrationCommand {
+        let mut command = side_chat_create(command_id, thread_id, kind, host);
+        if let OrchestrationCommand::ThreadCreate {
+            side_chat,
+            code_review,
+            title,
+            ..
+        } = &mut command
+        {
+            *side_chat = false;
+            *code_review = true;
+            *title = "Code review · Codex".to_owned();
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn code_review_thread_flag_is_refused_without_a_host() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for command in [
+            code_review_create("no-kind", "no-kind", None, Some(&host_id)),
+            code_review_create("workspace", "workspace", Some("workspace"), Some(&host_id)),
+            code_review_create("no-host", "no-host", Some("panel"), None),
+        ] {
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "A code review must be a chat panel with a host thread."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_thread_marker_survives_replay() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(code_review_create(
+                "review",
+                "review-panel",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("review panel");
+        engine
+            .dispatch(plain_panel_create("plain", "plain-panel", &host_id))
+            .await
+            .expect("plain panel");
+        let code_review_of = |thread_id: &str| {
+            let repositories = engine.repositories();
+            let thread_id = thread_id.to_owned();
+            async move {
+                repositories
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .expect("thread exists")
+                    .code_review
+            }
+        };
+        assert!(code_review_of("review-panel").await);
+        assert!(!code_review_of("plain-panel").await);
+        assert!(!code_review_of(&host_id).await);
+        // A plain create records no key, like every thread.created before the flag existed.
+        let plain_payload_has_key = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.created' AND json_extract(payload_json, '$.codeReview') IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .expect("count marked events");
+        assert_eq!(plain_payload_has_key, 1, "only the review panel records the key");
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE projection_threads SET code_review = 0", [])?;
+                connection.execute(
+                    "DELETE FROM projection_state WHERE projector = 'projection.threads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset thread projection");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("replay threads");
+        assert!(code_review_of("review-panel").await);
+        assert!(!code_review_of("plain-panel").await);
+        assert!(!code_review_of(&host_id).await);
+    }
+
     #[tokio::test]
     async fn side_chat_checkpoint_revert_is_refused() {
         let (engine, host_id) = delivery_engine(TestHooks::default()).await;

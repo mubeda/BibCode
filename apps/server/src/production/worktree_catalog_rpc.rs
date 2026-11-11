@@ -5834,6 +5834,52 @@ mod mutation_invalidation_tests {
     }
 
     #[tokio::test]
+    async fn code_review_thread_panel_is_marked_and_survives_replay() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        create_host(&fixture).await;
+        let mut review = panel_request("review", None);
+        review["codeReview"] = json!(true);
+        let created = create_panel(&fixture, review.clone())
+            .await
+            .expect("review panel created");
+        assert_eq!(created["threadId"], "review-thread");
+        let thread = fixture
+            .engine
+            .repositories()
+            .get_thread("review-thread".to_owned())
+            .await
+            .expect("review panel read")
+            .expect("review panel exists");
+        assert_eq!(thread.kind, "panel");
+        assert!(thread.code_review);
+        assert!(!thread.side_chat);
+        assert_eq!(thread.host_thread_id.as_deref(), Some("host-thread"));
+        // The same command id replays the same thread; dropping the marker is another request.
+        assert_eq!(
+            create_panel(&fixture, review).await.expect("replay")["threadId"],
+            "review-thread"
+        );
+        let conflict = create_panel(&fixture, panel_request("review", None))
+            .await
+            .expect_err("a changed marker conflicts");
+        assert_eq!(conflict["reason"], "command-conflict");
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn code_review_thread_plain_panel_keeps_its_receipt_digest() {
+        let old_format = panel_request("old", None);
+        let mut explicit_false = panel_request("old", None);
+        explicit_false["codeReview"] = json!(false);
+        let decoded: super::WorktreeCreatePanelInput =
+            serde_json::from_value(explicit_false).expect("decode");
+        assert_eq!(
+            crate::orchestration::canonical_command_digest(&decoded).expect("digest"),
+            crate::orchestration::canonical_command_digest(&old_format).expect("old digest"),
+        );
+    }
+
+    #[tokio::test]
     async fn create_panel_replays_a_receipt_stored_before_side_chats() {
         // A receipt stored before side chats hashed the input without a `sideChat` key, so
         // a plain request must digest exactly as that payload did.
