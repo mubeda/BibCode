@@ -2,7 +2,7 @@
 
 Issue #293, amendment A11. Requirements R90 to R105, decisions D40 to D49. Phase 12 of the
 batch plan in [2026-11-09-issue-batch-340-345-290](2026-11-09-issue-batch-340-345-290/plan.md).
-Status: Draft, for the user's approval before code lands.
+Status: Approved 2026-11-11 by review (Codex, two rounds, and the advisor), on the user's instruction to add #293; decisions marked agent's call await the user's confirmation before the push.
 
 ## Problem
 
