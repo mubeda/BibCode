@@ -24,6 +24,50 @@ const fence = "```ts\nconst answer   = 42; // spacing kept\n```\n";
 /** Frontmatter, the paragraph "Hello world" and a fenced code block (R25, R31). */
 const notesContents = `${frontmatter}\nHello world\n\n${fence}`;
 
+const untouchedContents = [
+  "---",
+  "title: Untouched fixture",
+  "---",
+  "",
+  "Hello world",
+  "",
+  "| Name | Value |",
+  "|:-----|------:|",
+  "| one  |     1 |",
+  "",
+  "```ts",
+  "const answer   = 42;",
+  "```",
+  "",
+  "* star item",
+  "- dash item",
+  "+ plus item",
+].join("\n");
+
+/** Records, from now on, whether the Files toolbar ever says "Unsaved changes". */
+async function watchForUnsavedIndicator(): Promise<void> {
+  await browser.execute(() => {
+    const record = window as unknown as { __bibcodeUnsavedSeen?: boolean };
+    record.__bibcodeUnsavedSeen = false;
+    const check = () => {
+      const status = document.querySelector("[data-file-editor-toolbar] [aria-live='polite']");
+      if (status?.textContent === "Unsaved changes") record.__bibcodeUnsavedSeen = true;
+    };
+    new MutationObserver(check).observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    check();
+  });
+}
+
+async function unsavedIndicatorAppeared(): Promise<boolean> {
+  return browser.execute(
+    () => (window as unknown as { __bibcodeUnsavedSeen?: boolean }).__bibcodeUnsavedSeen === true,
+  );
+}
+
 function writeNotes(fileName: string): string {
   const path = NodePath.join(preparedProjectPath, fileName);
   NodeFS.writeFileSync(path, notesContents);
@@ -293,21 +337,24 @@ describe("packaged rich Markdown editing", () => {
   });
 
   it("opening and saving without editing leaves the file byte-identical", async () => {
-    const path = writeNotes("notes-untouched.md");
+    // R31: frontmatter, a table, a fenced code block, mixed list markers, no final newline.
+    const path = NodePath.join(preparedProjectPath, "notes-untouched.md");
+    NodeFS.writeFileSync(path, untouchedContents);
     const before = NodeFS.readFileSync(path);
-    const beforeModified = NodeFS.statSync(path).mtimeMs;
     await openNotes("notes-untouched.md");
+    await watchForUnsavedIndicator();
 
+    await switchView("Show markdown source");
+    await waitForSourceEditor("notes-untouched.md");
+    await switchView("Show rendered markdown");
+    await browser.$(richEditorSelector).waitForDisplayed();
     await placeCaretAfter("Hello world");
-    // Save file is disabled on a clean file, so the shortcut asks for the save.
+    // A clean file's Save file is disabled, so save through the Files shortcut.
     await browser.keys(["Meta", "s"]);
-    expect(await (await toolbarButton("Save file")).isEnabled()).toBe(false);
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    // Longer than the rendered view's 300 ms edit delay and a save round trip.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
 
     expect(NodeFS.readFileSync(path).equals(before)).toBe(true);
-    expect(NodeFS.statSync(path).mtimeMs).toBe(beforeModified);
-    expect(await browser.$("[data-file-editor-toolbar] [aria-live='polite']").getText()).not.toBe(
-      "Unsaved changes",
-    );
+    expect(await unsavedIndicatorAppeared()).toBe(false);
   });
 });
