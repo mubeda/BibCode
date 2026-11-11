@@ -487,7 +487,7 @@ fn worktree_evidence(
     if incomplete.contains(dir) {
         return Some(WorktreeEvidence::IncompleteRemoval);
     }
-    if is_git_pointer_file(&dir.join(".git")) {
+    if opens_as_git_pointer_file(&dir.join(".git")) {
         return Some(WorktreeEvidence::GitPointerFile);
     }
     REMOVAL_MARKERS
@@ -497,19 +497,30 @@ fn worktree_evidence(
 }
 
 /// A regular file, not a link, that starts with `gitdir:` as a worktree's `.git` file does.
-fn is_git_pointer_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
-        && opens_as_git_pointer_file(path)
-}
-
+/// The open neither follows a link nor waits on a FIFO, and the opened file is the one checked,
+/// so a `.git` swapped after the folder was listed cannot block or redirect the audit.
 fn opens_as_git_pointer_file(path: &Path) -> bool {
     use std::io::Read;
 
     const PREFIX: &[u8] = b"gitdir:";
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return false;
+    };
     let mut head = [0; PREFIX.len()];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut head))
-        .is_ok()
+    file.metadata().is_ok_and(|metadata| metadata.is_file())
+        && file.read_exact(&mut head).is_ok()
         && head == PREFIX
 }
 
