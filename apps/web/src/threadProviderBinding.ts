@@ -32,10 +32,11 @@ interface ResolveThreadProviderBindingInput {
   readonly selectedProviderInstanceId: ProviderInstanceId | null;
   readonly providers: ReadonlyArray<ServerProvider>;
   /**
-   * True when the thread already exists on the server: it was created for a
-   * chosen agent (worktree, project Main, chat panel), so it keeps that exact
-   * instance before its first turn. False for a local draft, whose composer
-   * picker is where the provider is still chosen.
+   * True when the thread already exists on the server: it was created with a
+   * provider (the agent picked for a worktree, project Main or chat panel, or
+   * the project default for an adopted worktree or pull request), so it keeps
+   * that exact instance before its first turn. False for a local draft, whose
+   * composer picker is where the provider is still chosen.
    */
   readonly providerChosen: boolean;
 }

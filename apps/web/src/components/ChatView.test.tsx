@@ -7880,7 +7880,7 @@ describe("ChatView composer model picker provider scope (#347)", () => {
   it.each([
     {
       label: "disabled",
-      provider: { ...claudeProvider, enabled: false },
+      provider: { ...claudeProvider, enabled: false, status: "disabled" as const },
       disable: true,
     },
     {
@@ -7916,6 +7916,19 @@ describe("ChatView composer model picker provider scope (#347)", () => {
       expect(
         capturedProps<Record<string, unknown>>("chatComposer")["providerBindingInstanceId"],
       ).toBe(claudeInstanceId);
+      // The chat's own status reaches the provider banner, which explains a not-ready provider.
+      expect(capturedProps<{ status: unknown }>("providerStatusBanner").status).toMatchObject({
+        instanceId: claudeInstanceId,
+        status: provider.status,
+      });
+      expect(
+        container
+          .querySelector("[data-chat-provider-model-picker='true']")
+          ?.getAttribute("aria-label"),
+      ).toBe("Claude · Claude Opus 4.6");
+      expect(document.querySelector("[data-model-picker-content]")?.textContent).toContain(
+        "No models found",
+      );
     },
   );
 

@@ -268,6 +268,19 @@ describe("resolveThreadProviderBinding", () => {
     });
   });
 
+  it("locks a never-started chat to a provider already picked in its composer draft", () => {
+    // Only a person's pick writes a server thread's draft provider; that pick is what Send uses.
+    const binding = resolveThreadProviderBinding({
+      thread: thread(),
+      projectDefaultModelSelection: null,
+      selectedProviderInstanceId: claudeInstanceId,
+      providers: [codexProvider, claudeProvider],
+      providerChosen: true,
+    });
+
+    expect(binding).toMatchObject({ instanceId: "claude", lockedProviderInstanceId: "claude" });
+  });
+
   it("keeps a never-started chat on its disabled provider instead of another one", () => {
     const binding = resolveThreadProviderBinding({
       thread: thread({ modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" } }),
