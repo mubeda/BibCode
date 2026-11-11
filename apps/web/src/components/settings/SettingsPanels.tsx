@@ -1215,6 +1215,10 @@ function CodeReviewSettingsSection({
   const supported =
     usePrimaryEnvironment()?.serverConfig?.environment.capabilities?.codeReviews === true;
   const unsupportedStatus = supported ? null : CODE_REVIEW_SERVER_UPDATE_REASON;
+  // An older server ignores or refuses these keys (D47), so nothing here sends them there.
+  const updateReviewSettings = (patch: Parameters<typeof updateSettings>[0]) => {
+    if (supported) updateSettings(patch);
+  };
   // Terminals only for the CLIs whose read-only flags are verified (design note).
   const reviewerActions = actions.filter(
     (action) =>
@@ -1268,10 +1272,12 @@ function CodeReviewSettingsSection({
             : savedReviewer.reason)
         }
         resetAction={
-          Equal.equals(saved, DEFAULT_DEFAULT_AGENT_SELECTION) ? null : (
+          !supported || Equal.equals(saved, DEFAULT_DEFAULT_AGENT_SELECTION) ? null : (
             <SettingResetButton
               label="code review agent"
-              onClick={() => updateSettings({ codeReviewAgent: DEFAULT_DEFAULT_AGENT_SELECTION })}
+              onClick={() =>
+                updateReviewSettings({ codeReviewAgent: DEFAULT_DEFAULT_AGENT_SELECTION })
+              }
             />
           )
         }
@@ -1282,7 +1288,8 @@ function CodeReviewSettingsSection({
             disabled={!supported}
             onValueChange={(value) => {
               const action = reviewerActions.find((item) => item.value === value);
-              if (action && !action.disabled) updateSettings({ codeReviewAgent: action.selection });
+              if (action && !action.disabled)
+                updateReviewSettings({ codeReviewAgent: action.selection });
             }}
             items={reviewerItems}
           >
@@ -1304,10 +1311,10 @@ function CodeReviewSettingsSection({
         description="The model of a review. Provider default uses the agent's own default."
         status={unsupportedStatus}
         resetAction={
-          storedModel === null ? null : (
+          !supported || storedModel === null ? null : (
             <SettingResetButton
               label="review model"
-              onClick={() => updateSettings({ codeReviewModelSelection: null })}
+              onClick={() => updateReviewSettings({ codeReviewModelSelection: null })}
             />
           )
         }
@@ -1318,10 +1325,10 @@ function CodeReviewSettingsSection({
             disabled={!supported || reviewerEntry === null}
             onValueChange={(value) => {
               if (!value || value === PROVIDER_DEFAULT_REVIEW_MODEL || reviewerEntry === null) {
-                updateSettings({ codeReviewModelSelection: null });
+                updateReviewSettings({ codeReviewModelSelection: null });
                 return;
               }
-              updateSettings({
+              updateReviewSettings({
                 codeReviewModelSelection: { instanceId: reviewerEntry.instanceId, model: value },
               });
             }}
@@ -1345,10 +1352,10 @@ function CodeReviewSettingsSection({
         description="Sent after a fixed line that names the scope and says not to edit. {scope} and {base} are filled in. A project can set its own in Source Control."
         status={unsupportedStatus}
         resetAction={
-          settings.codeReviewPrompt === "" ? null : (
+          !supported || settings.codeReviewPrompt === "" ? null : (
             <SettingResetButton
               label="review prompt"
-              onClick={() => updateSettings({ codeReviewPrompt: "" })}
+              onClick={() => updateReviewSettings({ codeReviewPrompt: "" })}
             />
           )
         }
@@ -1359,7 +1366,7 @@ function CodeReviewSettingsSection({
           id={promptFieldId}
           stored={settings.codeReviewPrompt}
           disabled={!supported}
-          onSave={(codeReviewPrompt) => updateSettings({ codeReviewPrompt })}
+          onSave={(codeReviewPrompt) => updateReviewSettings({ codeReviewPrompt })}
         />
       </SettingsRow>
     </SettingsSection>
