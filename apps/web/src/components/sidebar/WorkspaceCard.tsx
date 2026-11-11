@@ -289,6 +289,8 @@ export function WorkspaceCardBranchLine(props: {
   readonly branch: string | null;
   readonly branchTooltip: string | null;
   readonly notice?: { readonly label: string; readonly description: string } | null;
+  /** False on a worktree row, whose title line already leads with the branch icon. */
+  readonly branchIcon?: boolean;
   readonly children?: ReactNode;
 }) {
   return (
@@ -311,7 +313,9 @@ export function WorkspaceCardBranchLine(props: {
         </>
       ) : props.branch !== null ? (
         <>
-          <GitBranchIcon aria-hidden className="size-3 shrink-0" />
+          {props.branchIcon === false ? null : (
+            <GitBranchIcon aria-hidden className="size-3 shrink-0" />
+          )}
           <Tooltip>
             <TooltipTrigger
               render={<span className="pointer-events-auto min-w-0 flex-1 truncate" />}

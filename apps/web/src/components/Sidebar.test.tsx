@@ -4582,6 +4582,8 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
         expect(openingTag(worktree)).toContain('data-sidebar-level="worktree"');
         expect(openingTag(worktree)).not.toContain("data-primary");
         expect(svgWith(worktree, "lucide-git-branch")).toHaveLength(1);
+        // The leading branch icon replaces the branch line's own, as in the preview.
+        expect(worktree.match(/<svg[^>]*lucide-git-branch/g)).toHaveLength(1);
         expect(worktree).toContain("data-sidebar-label");
       }
       expect(openingTag(liWith(markup, 'data-testid="thread-row-thread-active"'))).toContain(

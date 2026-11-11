@@ -1264,6 +1264,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         <WorkspaceCardBranchLine
           id={cardIds.branch}
           branch={showBranchText ? branchLabel : null}
+          branchIcon={thread.worktreePath === null}
           branchTooltip={
             showBranchText
               ? resolveWorkspaceCardBranchTooltip({
@@ -3852,8 +3853,8 @@ const SidebarProjectListRow = memo(function SidebarProjectListRow(props: Sidebar
   const isCard = !props.environmentCard;
   return (
     <SidebarMenuItem
-      // ps-1 keeps the band's 3px leading rule clear of the header.
-      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "ps-1"}
+      // ps-1 keeps the band's 3px leading rule clear of the header; pb-1 lifts its last row off its edge.
+      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "ps-1 pb-1"}
       data-sidebar-card={isCard ? "true" : undefined}
       data-sidebar-level={isCard ? "repo" : "environment"}
     >
