@@ -5092,8 +5092,12 @@ session without that lease/fence, for example when it arrives before open or
 recreates a terminal after a server restart (a known gap). Open and attach send fitted dimensions only when a mounted renderer can
 supply them; new right-panel reservations have none and use server defaults.
 A mount whose computed width or height is zero, such as a center column behind a
-maximized right panel, supplies no dimensions and sends no fit, claim or resize
-until it has area again, instead of the fit addon's 2-column or 1-row floor.
+maximized right panel, supplies no fitted dimensions and sends no layout-driven
+resize until it has area again, instead of the fit addon's 2-column or 1-row
+floor. Its attach still carries its `sizeClaim`, so attachment ownership is
+unchanged. A failed layout resize or owner claim is retried by re-measuring
+after 250 ms, 1 s and 4 s; a success restores those attempts, and a renderer
+whose size belongs to another window does not retry its claim.
 
 Against a server without `terminalSizeOwnership`, every replay is guarded;
 startup-history queries are not answered on that transitional path. Live replies
