@@ -124,7 +124,9 @@ pub fn execution_place(config: &crate::ServerConfig) -> ExecutionPlace {
 
 impl ExecutionPlace {
     /// The guidance for a push that failed on a remote server for a missing username, or
-    /// `None` when Git ran here or failed for another reason.
+    /// `None` when Git ran here or failed for another reason. Git Manager and Source Control
+    /// both decide with this, so on a remote server the refusal outranks a helper's earlier
+    /// "timed out" or "cancelled" line, while a local desktop keeps its classification.
     #[must_use]
     pub fn push_guidance(&self, git_detail: &str) -> Option<String> {
         (self.remote && has_missing_username_refusal(git_detail))

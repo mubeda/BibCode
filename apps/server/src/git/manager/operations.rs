@@ -1362,14 +1362,20 @@ async fn execute_branch_or_sync_operation(
         (result, ..) => result,
     };
     result.map_err(|mut error| {
-        if let Some(guidance) = remote_push_guidance(request, &error, place) {
+        if !cancellation.is_cancelled()
+            && let Some(guidance) = remote_push_guidance(request, &error, place)
+        {
             error.message = guidance;
+            if !matches!(request, GitManagerOperationRequest::TagCreate { .. }) {
+                error.code = GitManagerFailureCode::Authentication.as_str().to_owned();
+            }
         }
         error
     })
 }
 
-/// #343: a push that failed on a remote server for a missing username says where to sign in.
+/// #343: a push that failed on a remote server for a missing username says where to sign in,
+/// whatever a credential helper printed before Git's line (Source Control decides the same way).
 fn remote_push_guidance(
     request: &GitManagerOperationRequest,
     error: &GitManagerOperationError,
@@ -1382,14 +1388,25 @@ fn remote_push_guidance(
             | Request::PublishBranch { .. }
             | Request::ForcePush { .. }
             | Request::TagPush { .. }
+            | Request::TagCreate {
+                push_remote: Some(_),
+                ..
+            }
     );
-    if !pushes
-        || error.sign_in.is_some()
-        || error.code != GitManagerFailureCode::Authentication.as_str()
-    {
+    if !pushes || error.sign_in.is_some() {
         return None;
     }
-    place.push_guidance(&error.outputs.last()?.stderr)
+    let guidance = place.push_guidance(&error.outputs.last()?.stderr)?;
+    Some(match request {
+        Request::TagCreate {
+            name,
+            push_remote: Some(remote),
+            ..
+        } => {
+            format!("Created tag {name} locally, but pushing it to {remote} failed.\n\n{guidance}")
+        }
+        _ => guidance,
+    })
 }
 
 /// Turns a failure whose stderr carries GCM's refusal into `sign-in-required` naming the
@@ -1982,25 +1999,30 @@ async fn execute_operation_steps(
                             outputs.push(pushed);
                             None
                         }
-                        Ok(pushed) => Some(
-                            pushed
+                        Ok(pushed) => {
+                            let detail = pushed
                                 .stderr
                                 .lines()
                                 .map(str::trim)
                                 .find(|line| !line.is_empty())
                                 .unwrap_or("Git could not reach the remote.")
-                                .to_owned(),
-                        ),
+                                .to_owned();
+                            // Kept so the remote push guidance (#343) reads Git's whole text.
+                            outputs.push(pushed);
+                            Some(detail)
+                        }
                         Err(error) => Some(error.to_string()),
                     };
                 if let Some(detail) = failure {
-                    return Err(operation_error(
+                    let mut error = operation_error(
                         operation,
                         "tag-push-failed",
                         &format!(
                             "Created tag {name} locally, but pushing it to {remote} failed: {detail}"
                         ),
-                    ));
+                    );
+                    error.outputs = outputs;
+                    return Err(error);
                 }
             }
             outputs
