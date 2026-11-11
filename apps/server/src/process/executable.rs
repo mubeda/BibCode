@@ -161,6 +161,9 @@ pub(crate) fn wrap_windows_batch_command(
     })
 }
 
+/// The longest command line `cmd.exe` accepts, in UTF-16 units.
+pub(crate) const WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS: usize = 8_191;
+
 fn make_windows_batch_command_line(
     script: &Path,
     arguments: &[OsString],
@@ -181,7 +184,28 @@ fn make_windows_batch_command_line(
         append_windows_batch_argument(&mut command, &argument.to_string_lossy())?;
     }
     command.push('"');
+    // Counted after quoting, backslash doubling and the `%` guard: what cmd.exe receives.
+    let length = command.encode_utf16().count();
+    if length > WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS {
+        return Err(format!(
+            "The command is too long for a Windows terminal ({} of {} characters). Shorten the review prompt or pick a chat reviewer.",
+            with_thousands_separators(length),
+            with_thousands_separators(WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS)
+        ));
+    }
     Ok(command.into())
+}
+
+fn with_thousands_separators(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn append_windows_batch_argument(command: &mut String, argument: &str) -> Result<(), String> {
