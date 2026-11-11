@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
+import { classOf, levelTextTags, textColorUtilities } from "../sidebar/sidebarLevels.testSupport";
 import { SidebarLevelsPreview } from "./SidebarLevelsPreview";
 
 let container: HTMLDivElement;
@@ -56,6 +57,31 @@ describe("SidebarLevelsPreview", () => {
     const [, unavailable] = levels("environment");
     expect(unavailable!.className).toContain("opacity-60");
     expect(unavailable!.textContent).toContain("Unavailable");
+  });
+
+  it("leads each worktree with its branch label and puts its chats below at chat level", () => {
+    for (const worktree of levels("worktree")) {
+      const label = worktree.querySelector("[data-sidebar-label]")!;
+      expect(label.textContent).toMatch(/^feature\//);
+      const chat = worktree.querySelector('[data-sidebar-level="chat"]')!;
+      expect(label.compareDocumentPosition(chat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it("shows one unread chat with a dot before its title, the label at foreground", () => {
+    const unread = [...container.querySelectorAll<HTMLElement>('[data-unread="true"]')];
+    expect(unread).toHaveLength(1);
+    expect(unread[0]!.getAttribute("data-sidebar-level")).toBe("chat");
+    const dot = unread[0]!.parentElement!.querySelector("[data-sidebar-unread]")!;
+    expect(dot.className).toMatch(/\brounded-full\b/);
+    expect(dot.compareDocumentPosition(unread[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(container.querySelectorAll("[data-sidebar-unread]")).toHaveLength(1);
+  });
+
+  it("gives no level label or chat text a colour utility", () => {
+    const tags = levelTextTags(container.innerHTML);
+    expect(tags.length).toBeGreaterThan(4);
+    for (const tag of tags) expect(textColorUtilities(classOf(tag)), tag).toEqual([]);
   });
 
   it("sits in a sidebar card on the well, is hidden from interaction and uses placeholder names only", () => {

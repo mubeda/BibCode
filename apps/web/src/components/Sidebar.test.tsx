@@ -40,6 +40,11 @@ import {
   threadIdle,
   threadKeyOf,
 } from "./Sidebar.testHarness";
+import {
+  classOf,
+  levelTextTags,
+  textColorUtilities,
+} from "./sidebar/sidebarLevels.testSupport";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as React from "react";
@@ -4577,14 +4582,25 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
       expect(moreChats).not.toBe("");
       expect(moreChats).not.toContain("text-muted-foreground");
 
-      for (const id of ["thread-active", "thread-docs"]) {
+      for (const [id, branch, title] of [
+        ["thread-active", "feat/x", "Active worktree"],
+        ["thread-docs", "feat/docs", "Docs worktree"],
+      ] as const) {
         const worktree = liWith(markup, `data-testid="thread-row-${id}"`);
         expect(openingTag(worktree)).toContain('data-sidebar-level="worktree"');
         expect(openingTag(worktree)).not.toContain("data-primary");
         expect(svgWith(worktree, "lucide-git-branch")).toHaveLength(1);
         // The leading branch icon replaces the branch line's own, as in the preview.
         expect(worktree.match(/<svg[^>]*lucide-git-branch/g)).toHaveLength(1);
-        expect(worktree).toContain("data-sidebar-label");
+        // A worktree row leads with its branch, as a primary card leads with its checkout, and
+        // shows the chat title below at chat level, as in the preview.
+        const label = worktree.match(/<span[^>]*data-sidebar-label[^>]*>([^<]*)</);
+        expect(label?.[1]).toBe(branch);
+        const chat = worktree.match(new RegExp(`<span[^>]*data-testid="thread-title-${id}"[^>]*>([^<]*)<`));
+        expect(chat?.[1]).toBe(title);
+        expect(chat?.[0]).toContain('data-sidebar-level="chat"');
+        expect(chat?.[0]).not.toContain("data-sidebar-label");
+        expect(worktree.indexOf(label![0])).toBeLessThan(worktree.indexOf(chat![0]));
       }
       expect(openingTag(liWith(markup, 'data-testid="thread-row-thread-active"'))).toContain(
         'data-active="true"',
@@ -4598,6 +4614,43 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
       expect(adHoc).not.toContain("data-primary");
     },
   );
+
+  it("gives no level label or chat text a colour utility, read or unread", () => {
+    levelsScenario();
+    h.metaStore.setState({
+      unreadThreadKeys: [threadKeyOf(threadActive), threadKeyOf(threadIdle)],
+    });
+    for (const view of ["environments", "repositories"] as const) {
+      h.uiStore.setState({ sidebarView: view });
+      const markup = render(<Sidebar />);
+      const tags = levelTextTags(markup);
+      expect(tags.length, view).toBeGreaterThan(4);
+      for (const tag of tags) expect(textColorUtilities(classOf(tag)), tag).toEqual([]);
+      // Unread keeps its announcement and gains a dot before the unread title.
+      for (const id of ["thread-active", "thread-idle"]) {
+        const row = liWith(markup, `data-testid="thread-row-${id}"`);
+        expect(row).toContain(">unread</span>");
+        const title = row.match(new RegExp(`<span[^>]*data-testid="thread-title-${id}"[^>]*>`))!;
+        expect(title[0]).toContain('data-unread="true"');
+        const dot = row.indexOf("data-sidebar-unread");
+        expect(dot, id).toBeGreaterThan(-1);
+        expect(dot).toBeLessThan(row.indexOf(title[0]));
+      }
+    }
+  });
+
+  it("keeps one name line on a worktree whose branch equals its title", () => {
+    levelsScenario();
+    h.state.threads = h.state.threads.map((thread) =>
+      thread.id === threadActive.id ? { ...thread, title: "feat/x" } : thread,
+    );
+    const markup = render(<Sidebar />);
+    const worktree = liWith(markup, 'data-testid="thread-row-thread-active"');
+    expect(worktree.match(/data-sidebar-label/g)).toHaveLength(1);
+    const title = worktree.match(/<span[^>]*data-testid="thread-title-thread-active"[^>]*>/)?.[0];
+    expect(title).toContain("data-sidebar-label");
+    expect(title).not.toContain('data-sidebar-level="chat"');
+  });
 
   it("draws the repository as repo level and each environment as one band in the Repositories view", () => {
     levelsScenario();
@@ -4617,7 +4670,8 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
   it("draws each Environments view project as repo level, sorted or manual", () => {
     levelsScenario();
     const markup = render(<Sidebar />);
-    // The selected environment's project card; the view has no environment band.
+    // The selected environment's project card. A local environment draws no context card, so
+    // this view has no environment band (EnvironmentContextCard.test covers a remote's band).
     expect(markup.match(/data-sidebar-level="repo"/g)).toHaveLength(1);
     expect(markup.match(/data-sidebar-card="true"[^>]*data-sidebar-level="repo"/g)).toHaveLength(1);
     expect(markup).not.toContain('data-sidebar-level="environment"');
@@ -4656,7 +4710,10 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
       "data-selected",
     );
     const remoteBand = liWith(markup, `data-testid="environment-card-header-${ENV_REMOTE}"`);
-    expect(remoteBand).toMatch(/group\/project-header[^"]*opacity-60/);
+    // The band owns the dim, as in the preview, so its surface and rule dim with the header.
+    expect(openingTag(remoteBand)).toContain('data-sidebar-level="environment"');
+    expect(openingTag(remoteBand)).toMatch(/class="[^"]*\bopacity-60\b/);
+    expect(remoteBand).not.toMatch(/group\/project-header[^"]*opacity-60/);
   });
 
   it("draws the hidden worktrees row as chat level without its own text colour", () => {

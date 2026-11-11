@@ -183,6 +183,17 @@ describe("EnvironmentContextCard", () => {
     expect(markup).toContain("BiBCode v0.4.2");
   });
 
+  it("draws the remote as the environment level band (R63)", () => {
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment(SERVER_CONFIG);
+    const card = renderToStaticMarkup(<EnvironmentContextCard />).match(/^<div[^>]*>/)?.[0] ?? "";
+    expect(card).toContain('data-testid="environment-context-card"');
+    expect(card).toContain('data-sidebar-level="environment"');
+    // The level rule paints the band, its radius and its leading accent rule.
+    expect(card).not.toMatch(/\bbg-background\b|\bborder-border\b|\brounded-\[/);
+  });
+
   it("disconnects through the latch and deep-links Manage", () => {
     h.reset();
     h.activeEnvironmentId = ENV_REMOTE;

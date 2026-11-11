@@ -151,13 +151,29 @@ const STATES = {
   "selected and active": `${ROWS}[data-selected="true"][data-active="true"]`,
 } as const;
 
+/** A state rule, with the dark base's override when the stylesheet has one. */
+function stateRule(theme: ThemeFile, selector: string): Map<string, string> {
+  if (theme.base === "dark") {
+    try {
+      return ruleDeclarations(`.dark ${selector}`);
+    } catch {
+      // The dark base uses the shared rule.
+    }
+  }
+  return ruleDeclarations(selector);
+}
+
 /** What the row rules of index.css paint on a checkout or worktree row in each state (R64). */
-function paintRows(theme: ThemeFile, level: "checkout" | "worktree") {
-  const overrides: Record<string, string> = Object.fromEntries(
+function themeOverrides(theme: ThemeFile): Record<string, string> {
+  return Object.fromEntries(
     Object.entries(theme.ui ?? {})
       .filter(([token]) => (UI_COLOR_TOKENS as readonly string[]).includes(token))
       .map(([token, value]) => [token, toHex(value)]),
   );
+}
+
+function paintRows(theme: ThemeFile, level: "checkout" | "worktree") {
+  const overrides = themeOverrides(theme);
   const worktree = ruleDeclarations('[data-sidebar-level="worktree"]');
   const evaluate = (expression: string) =>
     evaluateCssTokens(theme.base, { ...overrides, "probe-value": expression })("probe-value");
@@ -179,13 +195,13 @@ function paintRows(theme: ThemeFile, level: "checkout" | "worktree") {
     {
       resting: {
         surface: rest,
-        label: evaluate("color-mix(in srgb, var(--foreground) 90%, transparent)"),
+        label: evaluate(ruleDeclarations("[data-sidebar-label]").get("color")!),
         chat: resolve("sidebar-chat-foreground"),
         muted: resolveSidebarMuted(theme),
       },
     };
   for (const [state, selector] of Object.entries(STATES)) {
-    const fill = ruleDeclarations(selector).get("background-color");
+    const fill = stateRule(theme, selector).get("background-color");
     expect(fill, `${selector} sets a background`).toBeDefined();
     surfaces[state] = {
       surface: compositeHex(evaluate(fill!), band),
@@ -241,7 +257,9 @@ describe("checkout and worktree row states (R63, R64)", () => {
       const { surfaces } = paintRows(theme, "worktree");
       const fromRest = (state: string) =>
         contrastRatio(surfaces[state]!.surface, surfaces.resting!.surface);
-      expect(fromRest("hover"), "hover differs from resting").toBeGreaterThan(1.03);
+      // 1.09:1 is about one and a half times the old 3 percent step (1.054:1 in five built-ins).
+      expect(fromRest("hover"), "hover differs from resting").toBeGreaterThanOrEqual(1.09);
+      expect(fromRest("active"), "active beyond hover").toBeGreaterThan(fromRest("hover"));
       expect(fromRest("selected"), "selected beyond hover").toBeGreaterThan(
         fromRest("hover") * 1.05,
       );
@@ -261,7 +279,7 @@ describe("checkout and worktree row states (R63, R64)", () => {
         evaluateCssTokens(theme.base, { "probe-value": expression })("probe-value");
       const border = (selector: string) =>
         contrastRatio(
-          compositeHex(evaluate(ruleDeclarations(selector).get("border-color")!), band),
+          compositeHex(evaluate(stateRule(theme, selector).get("border-color")!), band),
           band,
         );
       expect(border(STATES.active), `${theme.name} active border`).toBeGreaterThan(
@@ -271,6 +289,48 @@ describe("checkout and worktree row states (R63, R64)", () => {
     expect(ruleDeclarations(STATES.selected).get("border-color")).toContain("var(--primary) 40%");
     expect(ruleDeclarations(STATES["selected and active"]).get("border-color")).toContain(
       "var(--primary) 60%",
+    );
+  });
+});
+
+describe("unread rows (R63)", () => {
+  const UNREAD_TEXT =
+    '[data-sidebar-label][data-unread="true"], [data-sidebar-level="chat"][data-unread="true"]';
+
+  it("marks unread with a dot and the text at foreground, never a dimmer colour", () => {
+    expect(ruleDeclarations("[data-sidebar-unread]").get("background-color")).toMatch(
+      /^var\(--[a-z-]+\)$/,
+    );
+    expect(ruleDeclarations(UNREAD_TEXT).get("color")).toBe("var(--foreground)");
+  });
+
+  for (const theme of BUILTIN_THEMES) {
+    it(`${theme.name} draws the unread dot at 3:1 and unread text at 4.5:1 on every row state`, () => {
+      const evaluate = (expression: string) =>
+        evaluateCssTokens(theme.base, { ...themeOverrides(theme), "probe-value": expression })(
+          "probe-value",
+        );
+      const dot = evaluate(ruleDeclarations("[data-sidebar-unread]").get("background-color")!);
+      const text = evaluate(ruleDeclarations(UNREAD_TEXT).get("color")!);
+      for (const level of ["checkout", "worktree"] as const) {
+        for (const [state, painted] of Object.entries(paintRows(theme, level).surfaces)) {
+          expect(contrastRatio(dot, painted.surface), `${level} ${state} dot`).toBeGreaterThanOrEqual(
+            3,
+          );
+          expect(
+            contrastRatio(text, painted.surface),
+            `${level} ${state} unread text`,
+          ).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+  }
+});
+
+describe("environment band outside a repository card (R63)", () => {
+  it("paints muted text in the sidebar card's muted colour, which the band pairs check", () => {
+    expect(ruleDeclarations('[data-sidebar-level="environment"]').get("--muted-foreground")).toBe(
+      "var(--sidebar-card-muted-foreground)",
     );
   });
 });

@@ -134,11 +134,12 @@ describe("WorkspaceMoreChatsList (#223)", () => {
     expect(h.loads.at(-1)?.append).toBe(true);
   });
 
-  it("draws each chat as a chat level row without its own text colour (R63)", () => {
+  it("draws each popover chat in the popover's own colour, not at chat level (R63)", () => {
     mount(0);
     const row = button("Chat here");
-    expect(row.getAttribute("data-sidebar-level")).toBe("chat");
-    expect(row.className).not.toMatch(/(^|\s)text-(foreground|\[13px\])/);
+    // The chat colour is checked against the sidebar surfaces only, never the popover's.
+    expect(row.hasAttribute("data-sidebar-level")).toBe(false);
+    expect(row.className.split(/\s+/)).toContain("text-popover-foreground");
   });
 
   it("offers a retry in place when a page fails", async () => {
