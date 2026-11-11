@@ -2618,7 +2618,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       await act(async () => {
-        for (const listener of [...watched()[0]!.listeners]) listener();
+        for (const listener of watched()[0]!.listeners) listener();
       });
       await view.flushFrame();
       expect(view.resizeSpy).toHaveBeenCalledWith({
