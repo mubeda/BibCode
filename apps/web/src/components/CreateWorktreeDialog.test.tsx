@@ -2172,11 +2172,11 @@ if (browserRuntime) {
     });
 
     describe("every opening starts fresh (#346)", () => {
-      const SOURCE_PLACEHOLDERS = [
+      const SOURCE_PLACEHOLDERS = new Set([
         "Type #1234 or search branches",
         "Search branches",
         "#1234 or a GitHub issue/PR URL",
-      ];
+      ]);
       const FRESH_FORM = {
         name: "",
         source: "",
@@ -2196,7 +2196,7 @@ if (browserRuntime) {
 
       function sourceField(container: ParentNode): HTMLInputElement {
         const match = Array.from(container.querySelectorAll<HTMLInputElement>("input")).find(
-          (candidate) => SOURCE_PLACEHOLDERS.includes(candidate.placeholder),
+          (candidate) => SOURCE_PLACEHOLDERS.has(candidate.placeholder),
         );
         if (!match) throw new Error("Missing Create From field");
         return match;
