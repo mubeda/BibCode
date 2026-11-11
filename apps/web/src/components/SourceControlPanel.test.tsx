@@ -123,6 +123,7 @@ const testState = vi.hoisted(() => ({
   primaryEnvironmentId: null as unknown,
   pullRequestBranchSelection: true,
   mergeCapabilities: true,
+  codeReviews: true,
   runGitManagerOperation: vi.fn(),
   availableEditors: [] as string[],
   preferredEditor: null as string | null,
@@ -226,6 +227,14 @@ const captured = vi.hoisted(() => ({
   },
 }));
 
+const reviewPromptDialog = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+vi.mock("./sourceControl/CodeReviewProjectPromptDialog", () => ({
+  CodeReviewProjectPromptDialog: (props: Record<string, unknown>) => {
+    reviewPromptDialog.props = props;
+    return null;
+  },
+}));
+
 vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
   GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
     captured.createPullRequest = props;
@@ -320,6 +329,7 @@ vi.mock("~/state/entities", () => ({
           gitPullRequestBranchSelection: testState.pullRequestBranchSelection,
           gitManagerStashMergeOperations: testState.mergeCapabilities,
           gitManagerBranchSyncOperations: testState.mergeCapabilities,
+          codeReviews: testState.codeReviews,
         },
       },
     }),
@@ -728,6 +738,7 @@ beforeEach(() => {
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
   testState.pullRequestBranchSelection = true;
   testState.mergeCapabilities = true;
+  testState.codeReviews = true;
   testState.runGitManagerOperation = vi.fn(() => ({
     result: new Promise(() => undefined),
     cancel: vi.fn(),
@@ -1107,7 +1118,16 @@ describe("SourceControlPanel", () => {
   describe("Review changes (R90)", () => {
     const GUARD = "Starts in Claude's plan mode.";
     const reviewProps = (unavailableReason: string | null = null, onStart = vi.fn()) =>
-      buildProps({ codeReview: { unavailableReason, guardLine: GUARD, onStart } });
+      buildProps({
+        codeReview: {
+          unavailableReason,
+          guardLine: GUARD,
+          onStart,
+          projectId: "project-1" as never,
+          projectPrompt: "",
+          userPrompt: "",
+        },
+      });
     const reviewButton = () =>
       captured.buttons.find((button) => button["aria-label"] === "Review changes");
     const tooltipText = (markup: string) =>
@@ -1163,6 +1183,41 @@ describe("SourceControlPanel", () => {
       const markup = render(reviewProps());
       expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
       expect(tooltipText(markup)).toContain("Checking for changes");
+    });
+
+    it("opens the project review prompt dialog from the review menu (R100)", () => {
+      render(
+        buildProps({
+          codeReview: {
+            unavailableReason: null,
+            guardLine: GUARD,
+            onStart: vi.fn(),
+            projectId: "project-1" as never,
+            projectPrompt: "Our rules",
+            userPrompt: "User rules",
+          },
+        }),
+      );
+      expect(reviewPromptDialog.props?.["open"]).toBe(false);
+      const item = menuItemByText("Review prompt for this project…");
+      expect(item?.disabled).toBe(false);
+      item!.onClick!();
+      rerender();
+      expect(reviewPromptDialog.props).toMatchObject({
+        open: true,
+        environmentId: ENVIRONMENT_ID,
+        projectId: "project-1",
+        projectPrompt: "Our rules",
+        userPrompt: "User rules",
+      });
+    });
+
+    it("disables the project prompt on a server without code reviews", () => {
+      testState.codeReviews = false;
+      render(reviewProps());
+      const item = menuItemByText("Review prompt for this project…");
+      expect(item?.disabled).toBe(true);
+      expect(item?.title).toBe("Update the BiBCode server on this environment to use Review.");
     });
 
     it("shows the unavailable reason first", () => {
