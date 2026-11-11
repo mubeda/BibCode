@@ -481,7 +481,7 @@ describe("cross-platform CI contract", () => {
     }
   });
 
-  it("installs only LGPL GStreamer plugin sets in every Linux AppImage build workflow", () => {
+  it("installs the allowlisted GStreamer plugin packages in every Linux AppImage build workflow", () => {
     const jobs = [
       requireJob(readWorkflow(CI_WORKFLOW_PATH).workflow, "native_desktop"),
       requireJob(readWorkflow(RELEASE_WORKFLOW_PATH).workflow, "build_desktop"),
@@ -490,23 +490,56 @@ describe("cross-platform CI contract", () => {
     ];
 
     for (const job of jobs) {
-      const commands = allStepCommands(job);
+      // Each apt-get install command, with its backslash-continued lines.
+      const installs = (allStepCommands(job).match(/apt-get install(?:\\\n|[^\n])*/g) ?? []).join(
+        "\n",
+      );
       for (const dependency of [
         "gstreamer1.0-plugins-base",
         "gstreamer1.0-plugins-good",
         "gstreamer1.0-alsa",
       ]) {
-        expect(commands).toContain(dependency);
+        expect(installs).toContain(dependency);
       }
-      // The AppImage bundles every plugin on the build host; these sets are not LGPL-only.
+      // The bundle takes only allowlisted files, but the build should not ask for these sets.
       for (const excluded of [
         "gstreamer1.0-plugins-bad",
         "gstreamer1.0-plugins-ugly",
         "gstreamer1.0-libav",
       ]) {
-        expect(commands).not.toContain(excluded);
+        expect(installs).not.toContain(excluded);
       }
     }
+  });
+
+  it("bundles only an allowlist of core, base and good GStreamer plugins", () => {
+    const wrapper = NodeFS.readFileSync(
+      NodePath.join(REPOSITORY_ROOT, "scripts/tauri/linuxdeploy-plugin-gstreamer.sh"),
+      "utf8",
+    );
+    const block =
+      /# BEGIN BIBCODE GSTREAMER PLUGINS\n([\s\S]*?)# END BIBCODE GSTREAMER PLUGINS/.exec(
+        wrapper,
+      )?.[1];
+    const entries = (block ?? "").split("\n").filter((line) => /^\s+libgst/.test(line));
+
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      // Every entry names its plugin set and why it is there.
+      expect(entry).toMatch(
+        /^\s+libgst[a-z0-9]+\.so\s+# (core|base|good|base \(gstreamer1\.0-alsa\)): \S/,
+      );
+    }
+    const plugins = entries.map((entry) => entry.trim().split(/\s+/)[0]);
+    // An encoder the app never uses (LAME carries a GPL file) and plugins outside core/base/good.
+    for (const excluded of ["libgstlame.so", "libgstlibav.so", "libgstfaad.so", "libgstx264.so"]) {
+      expect(plugins).not.toContain(excluded);
+    }
+    // The smoke compares the built AppImage with this list rather than a copy of it.
+    const smoke = allStepCommands(
+      requireJob(readWorkflow(DESKTOP_UI_WORKFLOW_PATH).workflow, "desktop_ui_smoke"),
+    );
+    expect(smoke).toContain("scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins");
   });
 });
 

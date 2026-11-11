@@ -13,7 +13,10 @@ import { decodeRgbaPng, type DecodedRgbaPng } from "./lib/png-rgba.ts";
 const TauriConfiguration = Schema.fromJsonString(
   Schema.Struct({
     identifier: Schema.String,
-    build: Schema.Struct({ beforeBuildCommand: Schema.String }),
+    build: Schema.Struct({
+      beforeBuildCommand: Schema.String,
+      beforeBundleCommand: Schema.optionalKey(Schema.String),
+    }),
     app: Schema.Struct({
       withGlobalTauri: Schema.Boolean,
       security: Schema.Struct({
@@ -211,7 +214,13 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(installerHook.includes("Abort"), false);
       assert.equal(
         tauri.build.beforeBuildCommand,
-        "node ../../scripts/prepare-tauri-appimage-tools.ts && vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+        "vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+      );
+      // tauri build and a standalone tauri bundle both run this before linuxdeploy, so the
+      // pinned plugins and wrappers replace any copy the bundler would fetch unpinned.
+      assert.equal(
+        tauri.build.beforeBundleCommand,
+        "node ../../scripts/prepare-tauri-appimage-tools.ts",
       );
       assert.equal(
         yield* fs.exists(path.join(repoRoot, "scripts/prepare-tauri-appimage-tools.ts")),

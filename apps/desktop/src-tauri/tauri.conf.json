@@ -5,7 +5,8 @@
   "identifier": "com.bibcode.desktop",
   "build": {
     "beforeDevCommand": "node ../../scripts/dev-runner.ts dev",
-    "beforeBuildCommand": "node ../../scripts/prepare-tauri-appimage-tools.ts && vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+    "beforeBuildCommand": "vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+    "beforeBundleCommand": "node ../../scripts/prepare-tauri-appimage-tools.ts",
     "devUrl": "http://localhost:5733",
     "frontendDist": "../../web/dist"
   },

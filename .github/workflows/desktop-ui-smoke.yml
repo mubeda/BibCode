@@ -142,22 +142,23 @@ jobs:
             exit 1
           fi
 
-          # Audio in Files needs the bundled GStreamer core to find its own plugins.
+          # Audio in Files needs the bundled GStreamer core to find its own plugins: exactly the
+          # wrapper's allowlist, nothing else, plus the scanner and the AppRun hook.
           for required in \
             usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner \
-            usr/lib/gstreamer-1.0/libgstcoreelements.so \
-            usr/lib/gstreamer-1.0/libgstapp.so \
-            usr/lib/gstreamer-1.0/libgstplayback.so \
-            usr/lib/gstreamer-1.0/libgstwavparse.so \
-            usr/lib/gstreamer-1.0/libgstautodetect.so \
-            usr/lib/gstreamer-1.0/libgstpulseaudio.so \
-            usr/lib/gstreamer-1.0/libgstalsa.so \
             apprun-hooks/linuxdeploy-plugin-gstreamer.sh; do
             if [[ ! -f "$extract_directory/squashfs-root/$required" ]]; then
               printf 'Linux AppImage is missing GStreamer file: %s\n' "$required" >&2
               exit 1
             fi
           done
+          expected_plugins="$(bash scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins | LC_ALL=C sort)"
+          bundled_plugins="$(ls -1 "$extract_directory/squashfs-root/usr/lib/gstreamer-1.0" | LC_ALL=C sort)"
+          if [[ "$bundled_plugins" != "$expected_plugins" ]]; then
+            printf 'Linux AppImage GStreamer plugins differ from the allowlist:\n' >&2
+            diff <(printf '%s\n' "$expected_plugins") <(printf '%s\n' "$bundled_plugins") >&2 || true
+            exit 1
+          fi
 
       - name: Install macOS application from DMG build
         if: matrix.platform == 'mac'
