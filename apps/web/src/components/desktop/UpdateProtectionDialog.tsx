@@ -48,10 +48,14 @@ function addRecoveryToast(toast: Parameters<typeof toastManager.add>[0]): void {
 async function runDesktopUpdateAction(
   setBusy: (busy: boolean) => void,
   action: () => Promise<void>,
+  leaveReason?: Parameters<typeof askBeforeLeaving>[0],
 ): Promise<void> {
   if (desktopUpdateActionInFlight) return;
   desktopUpdateActionInFlight = true;
   try {
+    // Asked before the busy state: disabled buttons cannot take focus back after "stay", and the
+    // in-flight flag already turns away a second click.
+    if (leaveReason && (await askBeforeLeaving(leaveReason)) === "stay") return;
     setBusy(true);
     await action();
   } finally {
@@ -202,7 +206,6 @@ export function UpdateProtectionDialog({
       (busy) => setRestarting(busy ? "app" : null),
       async () => {
         setAppRestartError(null);
-        if ((await askBeforeLeaving("restart")) === "stay") return;
         try {
           await restartApp();
         } catch (error) {
@@ -223,6 +226,7 @@ export function UpdateProtectionDialog({
           }
         }
       },
+      "restart",
     );
   };
 
@@ -294,39 +298,45 @@ export function UpdateProtectionDialog({
 
   const startInstall = async () => {
     if (working || recovering || (failedSecondaries.length > 0 && !exclusionsComplete)) return;
-    await runDesktopUpdateAction(setSubmitting, async () => {
-      setRestartError(null);
-      setAppRestartError(null);
-      setDetailsOpen(false);
-      if ((await askBeforeLeaving("update")) === "stay") return;
-      try {
-        const exclusions = [...excludedEnvironmentIds];
-        const result = await installUpdate(
-          exclusions.length > 0 ? { excludedEnvironmentIds: exclusions } : undefined,
-        );
-        handleInstallResult(result);
-      } catch (error) {
-        releaseLeaveHolds();
-        onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
-      }
-    });
+    await runDesktopUpdateAction(
+      setSubmitting,
+      async () => {
+        setRestartError(null);
+        setAppRestartError(null);
+        setDetailsOpen(false);
+        try {
+          const exclusions = [...excludedEnvironmentIds];
+          const result = await installUpdate(
+            exclusions.length > 0 ? { excludedEnvironmentIds: exclusions } : undefined,
+          );
+          handleInstallResult(result);
+        } catch (error) {
+          releaseLeaveHolds();
+          onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
+        }
+      },
+      "update",
+    );
   };
 
   const startUnprotectedInstall = async () => {
     if (working || recovering || !hasProtectionFailure || !skipProtectionAcknowledged) return;
-    await runDesktopUpdateAction(setSubmitting, async () => {
-      setRestartError(null);
-      setAppRestartError(null);
-      setDetailsOpen(false);
-      if ((await askBeforeLeaving("update")) === "stay") return;
-      try {
-        const result = await installUpdate({ skipProtection: true });
-        handleInstallResult(result);
-      } catch (error) {
-        releaseLeaveHolds();
-        onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
-      }
-    });
+    await runDesktopUpdateAction(
+      setSubmitting,
+      async () => {
+        setRestartError(null);
+        setAppRestartError(null);
+        setDetailsOpen(false);
+        try {
+          const result = await installUpdate({ skipProtection: true });
+          handleInstallResult(result);
+        } catch (error) {
+          releaseLeaveHolds();
+          onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
+        }
+      },
+      "update",
+    );
   };
 
   return (

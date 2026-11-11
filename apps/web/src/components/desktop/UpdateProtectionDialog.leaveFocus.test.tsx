@@ -121,7 +121,11 @@ describe("leave question opened from the update dialog", () => {
     // Nearest observable fact: the opener must not be disabled while the question is open.
     expect(install.disabled).toBe(false);
 
-    await act(async () => byText("Cancel")!.click());
+    const leaveDialog = document.querySelector('[data-slot="alert-dialog-popup"]')!;
+    const cancel = [...leaveDialog.querySelectorAll("button")].find(
+      (entry) => entry.textContent?.trim() === "Cancel",
+    )!;
+    await act(async () => cancel.click());
     await settle();
 
     expect(document.activeElement).toBe(install);
