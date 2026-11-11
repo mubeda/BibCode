@@ -2583,59 +2583,127 @@ describe("TerminalViewport mounted lifecycle", () => {
     },
   );
 
-  it("refits and repaints when the device pixel ratio changes under an unchanged mount", async () => {
-    // #348: xterm rounds each row's CSS height from device pixels, so moving the
-    // window to a display with another scale changes how many rows fit while the
-    // mount keeps its box and the ResizeObserver stays silent.
-    const queries: Array<{ query: string; listeners: Set<() => void> }> = [];
-    vi.stubGlobal("devicePixelRatio", 2);
-    vi.stubGlobal(
-      "matchMedia",
-      vi.fn((query: string) => {
-        const entry = { query, listeners: new Set<() => void>() };
-        queries.push(entry);
-        return {
-          matches: true,
-          media: query,
-          addEventListener: (_type: string, listener: () => void) => entry.listeners.add(listener),
-          removeEventListener: (_type: string, listener: () => void) =>
-            entry.listeners.delete(listener),
-        };
-      }),
-    );
-    const view = await mountViewport({ visible: true });
-    await view.flushFrame();
-    await view.flushMountFit();
-    const terminal = view.fakeTerminal!;
-    view.resizeSpy.mockClear();
-    terminal.refresh.mockClear();
-    const watched = () => queries.filter((entry) => entry.listeners.size > 0);
-    expect(watched().map((entry) => entry.query)).toEqual(["(resolution: 2dppx)"]);
-
-    vi.stubGlobal("devicePixelRatio", 1);
-    view.setFitDimensions(80, 23);
-    xtermState.proposedDimensions = { cols: 80, rows: 23 };
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    try {
-      await act(async () => {
-        for (const listener of watched()[0]!.listeners) listener();
+  it.each(["legacy", "owner", "mirror"] as const)(
+    "refits when the device pixel ratio changes under an unchanged mount (%s)",
+    async (mode) => {
+      // #348: xterm rounds each row's CSS height from device pixels, so moving the
+      // window to a display with another scale changes how many rows fit while the
+      // mount keeps its box and the ResizeObserver stays silent.
+      const queries: Array<{ query: string; listeners: Set<() => void> }> = [];
+      vi.stubGlobal("devicePixelRatio", 2);
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => {
+          const entry = { query, listeners: new Set<() => void>() };
+          queries.push(entry);
+          return {
+            matches: true,
+            media: query,
+            addEventListener: (_type: string, listener: () => void) =>
+              entry.listeners.add(listener),
+            removeEventListener: (_type: string, listener: () => void) =>
+              entry.listeners.delete(listener),
+          };
+        }),
+      );
+      if (mode !== "legacy") {
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      }
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const view = await mountViewport({ visible: true });
+      const terminal = view.fakeTerminal!;
+      const fit = xtermState.fitAddons.at(-1)!.fit;
+      // The fake grid changes only when fit runs, as xterm's does.
+      fit.mockImplementation(() => {
+        if (xtermState.proposedDimensions) {
+          terminal.cols = xtermState.proposedDimensions.cols;
+          terminal.rows = xtermState.proposedDimensions.rows;
+        }
       });
       await view.flushFrame();
-      expect(view.resizeSpy).toHaveBeenCalledWith({
-        environmentId: ENVIRONMENT_ID,
-        input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 23 },
-      });
-      await act(async () => vi.advanceTimersByTime(50));
-      expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
-    } finally {
-      vi.useRealTimers();
-    }
-    // The next change is watched at the new ratio.
-    expect(watched().map((entry) => entry.query)).toEqual(["(resolution: 1dppx)"]);
+      await view.flushMountFit();
+      let claim: string | undefined;
+      if (mode !== "legacy") {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot("prompt"),
+              size: { cols: 80, rows: 24, sizeClaim: mode === "owner" ? null : "other-window" },
+            },
+          }),
+        );
+        if (mode === "owner") {
+          claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 24, sizeClaim: claim! },
+            }),
+          );
+        }
+      }
+      expect(terminal.rows).toBe(24);
+      view.resizeSpy.mockClear();
+      fit.mockClear();
+      terminal.refresh.mockClear();
+      const watched = () => queries.filter((entry) => entry.listeners.size > 0);
+      expect(watched().map((entry) => entry.query)).toEqual(["(resolution: 2dppx)"]);
 
-    await view.setVisible(false);
-    expect(watched()).toEqual([]);
-  });
+      vi.stubGlobal("devicePixelRatio", 1);
+      xtermState.proposedDimensions = { cols: 80, rows: 23 };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await act(async () => {
+          for (const listener of watched()[0]!.listeners) listener();
+        });
+        await view.flushFrame();
+        if (mode === "legacy") {
+          expect(fit).toHaveBeenCalledOnce();
+          expect(terminal.rows).toBe(23);
+          expect(view.resizeSpy).toHaveBeenCalledWith({
+            environmentId: ENVIRONMENT_ID,
+            input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 23 },
+          });
+        } else if (mode === "owner") {
+          expect(view.resizeSpy).toHaveBeenCalledWith({
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              cols: 80,
+              rows: 23,
+              sizeClaim: claim,
+            },
+          });
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 23, sizeClaim: claim! },
+            }),
+          );
+          expect(terminal.rows).toBe(23);
+        } else {
+          // A mirror keeps the owner's size and never claims on a scale change.
+          expect(view.resizeSpy).not.toHaveBeenCalled();
+          expect(terminal.rows).toBe(24);
+        }
+        await act(async () => vi.advanceTimersByTime(50));
+        expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+      } finally {
+        vi.useRealTimers();
+      }
+      // The next change is watched at the new ratio.
+      expect(watched().map((entry) => entry.query)).toEqual(["(resolution: 1dppx)"]);
+
+      await view.setVisible(false);
+      expect(watched()).toEqual([]);
+    },
+  );
 
   it("sends a height-only change of the mount to the PTY as the size owner", async () => {
     // #348: an Activity card appearing below an AI terminal shrinks only its height.
