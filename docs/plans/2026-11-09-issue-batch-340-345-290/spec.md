@@ -1118,7 +1118,7 @@ Names used in these requirements:
 
 ### R66. The host collector reads CPU, memory and volume space without a process scan [Must] (amendment A10)
 
-The host collector SHALL report CPU use as a percentage of all logical cores between 0 and 100, memory total, used and available bytes where used is the operating system's own used figure and available is total minus used, and for each volume its mount point, name, file system, total, free (free space on the volume as the operating system reports it; per-user quotas are not applied) and used (total minus free) bytes, and whether it is removable or read-only (on Linux from the mount options), and it SHALL NOT enumerate processes to do so.
+The host collector SHALL report CPU use as a percentage of all logical cores between 0 and 100, memory total, used and available bytes where used is the operating system's own used figure and available is total minus used, and for each volume its mount point, name, file system, total and free bytes, both relative to the user the server runs as (Linux: total blocks and the blocks available to unprivileged users from `statvfs`; macOS: the volume's total capacity and its available capacity for important usage; Windows: the caller's total and the caller's free bytes from one `GetDiskFreeSpaceEx` call, so a quota applies to both), and used bytes as total minus free, never below 0, and whether it is removable or read-only (on Linux from the mount options), and it SHALL NOT enumerate processes to do so.
 
 #### Scenario: memory figures
 
@@ -1131,6 +1131,12 @@ The host collector SHALL report CPU use as a percentage of all logical cores bet
 - GIVEN a source that reports CPU use of 104.5 and then of -0.2
 - WHEN the collector takes two readings
 - THEN their `cpuPercent` values are 100 and 0
+
+#### Scenario: free above total
+
+- GIVEN a source that reports a volume with 100 GB total and 800 GB free
+- WHEN the collector takes a reading with volumes
+- THEN the volume has `freeBytes` 100 GB, `totalBytes` 100 GB and `usedBytes` 0, on every system
 
 #### Scenario: read-only mount on Linux
 
@@ -1168,7 +1174,7 @@ The host collector SHALL skip zero-size volumes, `overlay` volumes not mounted a
 
 ### R68. A volume that does not answer does not hold back the rest [Must] (amendment A10)
 
-The host collector SHALL make every volume list and space read on a fixed pool of 4 disk worker threads and never in the CPU and memory sampling; WHILE a volume's read has run longer than 2 seconds, it SHALL report that volume as not responding with its last known sizes, or none before its first answer, SHALL NOT admit another read of that volume, and SHALL apply the late result when it arrives; IF the volume list takes longer than 2 seconds, THEN it SHALL keep the last list; and WHILE all 4 workers are held by calls that have not returned, it SHALL stop admitting disk reads, mark each reading with disk reads paused, and keep publishing CPU and memory at the current rate.
+The host collector SHALL make every volume list and space read on a fixed pool of 4 disk worker threads and never in the CPU and memory sampling; WHILE a volume's read has run longer than 2 seconds, it SHALL report that volume as not responding with its last known sizes, or none before its first answer, SHALL NOT admit another read of that volume, and SHALL apply the late result when it arrives if that volume, identified by its mount point and the generation of the listing that first showed it, is still listed; WHEN a listing no longer shows a volume, it SHALL retire that volume's state and queued jobs and discard any result of its generation that arrives later, and a hung read of a retired volume SHALL NOT block a read of a new volume at the same mount point; IF the volume list takes longer than 2 seconds, THEN it SHALL keep the last list; and WHILE all 4 workers are held by calls that have not returned, it SHALL stop admitting disk reads, mark each reading with disk reads paused, and keep publishing CPU and memory at the current rate.
 
 #### Scenario: CPU and memory keep their pace
 
@@ -1187,6 +1193,18 @@ The host collector SHALL make every volume list and space read on a fixed pool o
 - GIVEN a source whose space reads of `/a`, `/b`, `/c` and `/d` all block
 - WHEN 10 seconds pass at the live rate
 - THEN every reading after the fourth call blocked has `volumesPaused` true, no fifth disk call was made, and the readings still arrive once a second
+
+#### Scenario: a volume is replaced at the same mount point
+
+- GIVEN a held space read of `/mnt/usb` (generation 1), then a listing without `/mnt/usb`, then a listing with a new `/mnt/usb` (generation 2) whose read returns 64 GB total and 10 GB free
+- WHEN the held generation 1 read later returns 32 GB total and 30 GB free
+- THEN `/mnt/usb` shows 64 GB total and 10 GB free, the late result is discarded, and the generation 2 read was admitted while the generation 1 read was still held
+
+#### Scenario: mount churn
+
+- GIVEN 200 listings, each with `/` and one new mount point that the next listing drops, at the live rate
+- WHEN they have been processed
+- THEN the collector holds state for at most the volumes of the latest listing plus the reads still held, and CPU and memory readings arrived once a second throughout
 
 ### R69. Statistics since server start keep a fixed size [Must] (amendment A10)
 
@@ -1332,7 +1350,7 @@ WHEN the host dashboard closes or the document becomes hidden, the web client SH
 
 ### R79. The collector builds and passes its tests on Linux, macOS and Windows [Must] (amendment A10)
 
-The host collector and its tests SHALL compile and pass on the Linux, macOS and Windows CI runners.
+The host collector and its tests SHALL compile and pass on the Linux, macOS and Windows CI runners, including the exit test of R84 and the runtime start-and-quiesce test, and each CI step that runs them SHALL fail when it matches no test.
 
 #### Scenario: CI
 
@@ -1342,13 +1360,19 @@ The host collector and its tests SHALL compile and pass on the Linux, macOS and 
 
 ### R80. The readings match the operating system's own tools [Should] (amendment A10)
 
-The host collector's readings SHALL agree with the operating system's command-line tools: memory used within 3 percentage points, each volume's total within 1 percent, free space within 1 percent of the same figure as the operating system reports it (on macOS, the volume's available capacity for important usage, falling back to its available capacity as the collector does, read through the system's JavaScript bridge, and at least `df`'s Available), and CPU within 10 percentage points over the same 5-second window.
+The host collector's readings SHALL agree with the operating system's command-line tools: memory used within 3 percentage points, each volume's total within 1 percent, free space within 1 percent of the matching column of the same tool (Linux: `df -k -P` Available and 1024-blocks; Windows: the caller's free and total bytes; on macOS, the volume's available capacity for important usage, falling back to its available capacity as the collector does, read through the system's JavaScript bridge, and at least `df`'s Available), and CPU within 10 percentage points over the same 5-second window.
 
 #### Scenario: macOS host and Linux container
 
 - GIVEN this repository's macOS development host and the Linux lab container
 - WHEN the comparison probe runs against `vm_stat`, `df -k`, `osascript -l JavaScript` (`NSURL` volume resource values) and `top` on macOS, and `/proc/meminfo` (`MemTotal` minus `MemAvailable`), `df -k -P` and `/proc/stat` on Linux
 - THEN every comparison is inside its tolerance and the probe prints the figures it compared
+
+#### Scenario: Windows
+
+- GIVEN the Windows CI runner or the Windows lab
+- WHEN the comparison probe runs against PowerShell's `Get-CimInstance Win32_OperatingSystem`, `[System.IO.DriveInfo]` (`AvailableFreeSpace` and `TotalSize`) and `Get-Counter`
+- THEN every comparison is inside its tolerance; until one such run has passed, R80 and the Windows space read stay unproven on Windows
 
 ### R81. Hidden volumes can be listed [Should] (amendment A10)
 
@@ -1392,13 +1416,13 @@ WHEN the server shuts down while a disk call has not returned, the host collecto
 
 ### R85. A slow client still receives the latest charts [Must] (amendment A10)
 
-WHEN a subscriber falls behind while the uptime chart or the hidden-volume list changes, the server SHALL include the latest complete chart state in the next item it sends that subscriber, and the client SHALL keep only recent points less than 15 minutes older than its newest one, at most 900 of them.
+WHEN a subscriber falls behind while the uptime chart or the hidden-volume list changes, the server SHALL build each item only after it holds a free slot in that subscriber's send queue, from the latest reading and chart revision at that moment, so that once the items already queued have drained the subscriber holds the latest complete chart state, and the client SHALL keep only recent points less than 15 minutes older than its newest one, at most 900 of them.
 
 #### Scenario: blocked across a minute boundary
 
-- GIVEN a subscriber that does not read its stream from 50 seconds into a minute until 70 seconds, on a paused clock
-- WHEN it reads again
-- THEN the first item it receives carries the uptime chart that includes the bucket closed at 60 seconds
+- GIVEN a subscriber that does not read its stream from 50 seconds into a minute until 70 seconds, on a paused clock, with its send queue of 64 items full
+- WHEN it reads again and drains every item that was queued
+- THEN the chart it holds includes the bucket closed at 60 seconds, every item built after it resumed carries a reading from 70 seconds or later, and no item was built while the queue was full
 
 #### Scenario: skipped samples
 
@@ -1854,7 +1878,7 @@ D21. The sidebar levels reuse the existing sidebar tokens and add eight (R65) in
 
 D19. A theme with no terminal colors uses its base's built-in terminal palette, and the custom theme library holds at most 64 themes. Alternatives considered: deriving the terminal background from the UI background (breaks the reason the terminal is decoupled). Decided by: agent's call. Source: #290 open question 4 and Orca's limit.
 
-D22. The collector samples from server start at 60 seconds, faster while watched, subject to measured cost (R71). Task 11.4 measures first and then applies the policy. Outcomes: always on with live 1 s (background at most 0.1 percent of one core and live at most 1 percent); start at the first host stream (background over 0.1 percent; R69, R70, R71 and R76 then say "since the first dashboard opened"); live 2 seconds (live over 1 percent at 1 s and at most 1 percent at 2 s; R70, R72 and R77's stale threshold, 5 s instead of 3 s, change). A fallback takes effect only after the user approves it, before any web task; if live is over 1 percent even at 2 s, no outcome is accepted and the user decides. Alternatives considered: sampling only while a dashboard is open (cannot answer "since server start"); starting at the first open (the first look of each run has no history). This reverses the process monitor's rule that a server nobody reads samples nothing, for the host collector only. Decided by: agent's call. Source: #292 open question 2 and P1.4.
+D22. The collector samples from server start at 60 seconds, faster while watched, subject to measured cost (R71). Task 11.4 measures first and then applies the policy. Outcomes: always on with live 1 s (background at most 0.1 percent of one core and live at most 1 percent); start at the first host stream (background over 0.1 percent; R69, R70, R71 and R76 then say "since the first dashboard opened"); live 2 seconds (live over 1 percent at 1 s and at most 1 percent at 2 s; R68's scenarios, R70, R72 and R77's stale threshold, 5 s instead of 3 s, change, with the tests Task 11.4 lists). A fallback takes effect only after the user approves it, before any web task; if live is over 1 percent even at 2 s, no outcome is accepted and the user decides. Alternatives considered: sampling only while a dashboard is open (cannot answer "since server start"); starting at the first open (the first look of each run has no history). This reverses the process monitor's rule that a server nobody reads samples nothing, for the host collector only. Decided by: agent's call. Source: #292 open question 2 and P1.4.
 
 D23. Statistics cover the current server process only, in memory, reset on restart or update. Alternatives considered: persisting 15-minute buckets for 90 days (a schema change and a migration for a follow-up nobody has asked for yet). Decided by: agent's call, the issue's recommendation. Source: #292 open question 1.
 
@@ -1872,7 +1896,7 @@ D29. Hidden volumes are a disclosure in the sheet, not a setting, and there is n
 
 D30. The host stream closes when the document is hidden, not when the window loses focus. Alternatives considered: also closing on blur like the status bar (a dashboard on a second display would freeze). Decided by: agent's call. Source: #292 Web 3 and #168.
 
-D31. Free space is the volume's free space as the operating system reports it, and per-user quotas are not applied; on Windows the crate reports total free bytes, not the caller-available figure. The UI says "free", never "available to you". Alternatives considered: a Windows adapter using the caller-available value (more platform code, and no quota lab to test it). Decided by: agent's call, after review. Source: `sysinfo` 0.39.6 `src/windows/disk.rs`.
+D31. Free and total are both relative to the user the server runs as, on every system: Linux `statvfs` available blocks and total blocks, macOS available capacity for important usage and total capacity, and on Windows a small space read of its own, `GetDiskFreeSpaceExW` through the existing `windows-sys` dependency (its `Win32_Storage_FileSystem` feature is already enabled, and `persistence/compaction.rs` already calls it) taking the caller's free bytes with the caller's total, run on the disk workers like every other space read. Used is total minus free, clamped at 0. Alternatives considered: the crate's Windows read, which pairs the caller's total with the volume-wide free bytes, so free can exceed total under a quota and used goes negative; the volume-wide pair (not what the server's user can write). The Windows read is proven only by Windows CI or the Windows lab, and stays unproven until one runs. Decided by: the coordinator, after the second review. Source: `sysinfo` 0.39.6 `src/windows/disk.rs` and the `GetDiskFreeSpaceExW` documentation.
 
 D32. Disk calls run on a fixed pool of 4 dedicated OS threads that shutdown never joins, never on the Tokio blocking pool and never inside CPU and memory sampling; all 4 held pauses disk reads with a visible notice. Alternatives considered: the Tokio blocking pool (runtime shutdown waits for every started blocking task, so a hung `statvfs` would keep the server from exiting); a thread per call (no bound). Decided by: the coordinator, after review. Source: the server's `main` drops its runtime after `block_on`.
 

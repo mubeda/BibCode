@@ -1,7 +1,6 @@
 # Host metrics dashboard
 
-Status: Draft (counts as approved once Codex and the advisor have reviewed it and their findings
-are resolved, as D3 of the batch spec allows)
+Status: Approved 2026-11-11 by review (Codex, two rounds, and the advisor), on the user's instruction to add #292; decisions marked agent's call await the user's confirmation before the push.
 
 Issue #292, amendment A10 of [the batch spec](./2026-11-09-issue-batch-340-345-290/spec.md):
 requirements R66 to R83, decisions D22 to D30. Plan phase:
@@ -91,10 +90,12 @@ for remote servers and for the local environment.
    worker while listing, which touches no file system (D33). macOS and Windows set the flag at
    listing from `getfsstat` flags and `FILE_READ_ONLY_VOLUME` (`src/unix/apple/disk.rs:512`,
    `src/windows/disk.rs:340`).
-7. **Windows free space ignores per-user quotas.** `get_drive_size` passes `None` for the
-   caller-available value of `GetDiskFreeSpaceExW` and reports the volume's total free bytes
-   (`src/windows/disk.rs:279-295`). The requirement says "free space on the volume; per-user
-   quotas are not applied" (D31), and the UI never says "available to you".
+7. **Windows total and free do not match under a quota.** `get_drive_size` passes `None` for
+   the caller-available value of `GetDiskFreeSpaceExW` and pairs `lpTotalNumberOfBytes`, which is
+   relative to the calling user when quotas apply, with `lpTotalNumberOfFreeBytes`, which is
+   volume-wide (`src/windows/disk.rs:279-295`). With a 100 GB quota on a volume with 800 GB free,
+   free exceeds total and `used = total - free` goes negative. The collector does its own small
+   Windows space read with the caller's pair (D31).
 8. **A blocking-pool task that never returns blocks server exit.** `apps/server/src/main.rs:13-17`
    drops its Tokio runtime after `block_on`, and Tokio's runtime shutdown waits for every
    started blocking task. A hung `statvfs` on the blocking pool would therefore keep the server
@@ -155,9 +156,14 @@ On Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs
 - The **disk loop** sends `list_volumes` and `read_volume_space` jobs to a pool of 4 dedicated
   OS threads (`std::thread`, named `host-disk-<n>`), never the Tokio blocking pool. A job for a
   mount point (or the list) that already has a job queued or running is not admitted again, so
-  the queue holds at most one job per mount point plus one list. A job running for more than
-  2 s marks its volume as not responding (or, for the list, keeps the last list); its late
-  result is still applied when it arrives, so the volume recovers. A hung call costs one thread
+  the queue holds at most one job per mount point plus one list. Admission and results are
+  keyed by the mount point plus a **generation**: the number of the listing that first showed
+  that volume. A job running for more than 2 s marks its volume as not responding (or, for the
+  list, keeps the last list); its late result is applied when it arrives if its key is still
+  listed, so the volume recovers. When a listing no longer shows a volume, its state and queued
+  jobs are retired and a later result of that generation is discarded; a new volume at the same
+  mount point gets a new generation, so a hung read of the old one never blocks or overwrites
+  it. Retained state is therefore bounded by the latest listing plus the reads still held. A hung call costs one thread
   slot. When all 4 slots are hung, the disk loop stops admitting jobs and the reading says
   `volumesPaused: true` ("Disk readings paused: volumes are not responding"); CPU and memory
   keep publishing from the sampling loop. Shutdown sets a stop flag and never joins the
@@ -166,9 +172,11 @@ On Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs
 
 One sample holds `sampledAt`, `cpuPercent` (0 to 100, all logical cores), `memoryTotalBytes`,
 `memoryUsedBytes`, `memoryAvailableBytes` and `volumes`. Each volume has `mountPoint`, `name`,
-`fileSystem`, `totalBytes`, `freeBytes` (free space on the volume as the OS reports it; per-user
-quotas are not applied, D31), `usedBytes` (total
-minus free), `removable`, `readOnly` and `state` (`ok` or `notResponding`). A not-responding
+`fileSystem`, `totalBytes` and `freeBytes`, both relative to the user the server runs as
+(Linux: `statvfs` total blocks and the blocks available to unprivileged users, the Available and
+1024-blocks columns of `df`; macOS: total capacity and available capacity for important usage;
+Windows: the caller's total and the caller's free bytes from one `GetDiskFreeSpaceExW`, D31),
+`usedBytes` (total minus free, with free clamped to total so it is never negative), `removable`, `readOnly` and `state` (`ok` or `notResponding`). A not-responding
 volume keeps its last known bytes, or `null` before its first answer. Host facts are OS, arch,
 logical CPU count and total memory.
 
@@ -235,11 +243,16 @@ replaced before it is sent. The payload is `{}`. Items form a tagged union:
 
 The collector keeps the uptime chart and the hidden-volume list as one `ChartState` with a
 revision number that rises each time either changes (about once a minute). Each subscriber loop
-waits on the watch channel, remembers the chart revision it last sent, and sends with
-`sender.send().await` on the 64-item channel of `spawn_stream`
-(`production/server_terminal.rs:1450-1458`). A slow client blocks only its own loop; when it
-catches up it reads the latest sample and, if the chart revision moved while it was blocked, the
-latest complete chart state, so a minute boundary is never lost. Intermediate samples are skipped
+gets the `mpsc::Sender` itself from `spawn_stream`, a channel of 64
+(`production/server_terminal.rs:1450-1458`), and remembers the chart revision it last sent. For
+each item it first waits for a free slot with `sender.reserve().await`, only then reads the latest
+watch value and chart revision, encodes the item (with the chart when its revision is newer than
+the one it last sent) and sends it through the reserved permit. It never calls
+`sender.send(item).await`, which would hold an item built before the wait. A slow client blocks
+only its own loop. Items already queued when it stops reading are older than a chart that changes
+meanwhile, so the guarantee is about what the client holds once those queued items have drained:
+the first item built after it resumes carries the latest complete chart state, so a minute
+boundary is never lost. Intermediate samples are skipped
 and nothing queues without bound; statistics are cumulative, so a skipped sample loses one recent
 point only. The client keeps recent points newer than 15 minutes before its newest sample and at
 most 900, pruning by timestamp first. A test bounds the encoded snapshot at 128 KiB (900 points and 240 buckets); a
@@ -299,11 +312,11 @@ statistics, chart production and the encoding of every item one subscriber recei
 reports CPU time per background reading and per live reading on the macOS development host and
 in the Linux lab. The policy then picks exactly one outcome:
 
-| Outcome                               | Chosen when                                                              | Accepted when                                   | Requirements and tests that change                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| (c) always on, live 1 s               | background ≤ 0.1% of one core at 60 s and live ≤ 1% at 1 s on both hosts | as chosen                                       | none                                                                                                                                                                                                                                                                                                                                                                           |
-| (b) start at the first open, live 1 s | background > 0.1% and live ≤ 1%                                          | the user approves it before any web task starts | R69 and R76 ("since the first dashboard opened"), R70 (no reading before the first stream), R71 (the background limit applies only after the first open, which a person caused), D22; tests `background_reads_every_60_s_and_volumes_every_fifth_reading`, `the_first_subscriber_starts_an_idle_collector`, Task 11.6's runtime test, the "Since" texts of Tasks 11.7 and 11.8 |
-| (c) or (b) with live 2 s              | live > 1% at 1 s and ≤ 1% at 2 s                                         | the user approves it before any web task starts | R70 and R72 (2 s live rate), R77 (stale after 5 s instead of 3 s), D22; tests `streams_switch_to_the_live_rate_and_share_one_read`, `host_metrics_stream_sends_a_snapshot_then_samples` (2 s apart), the stale tests of Tasks 11.7 and 11.8, Task 11.14's wait                                                                                                                 |
+| Outcome                               | Chosen when                                                              | Accepted when                                   | Requirements and tests that change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (c) always on, live 1 s               | background ≤ 0.1% of one core at 60 s and live ≤ 1% at 1 s on both hosts | as chosen                                       | none                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| (b) start at the first open, live 1 s | background > 0.1% and live ≤ 1%                                          | the user approves it before any web task starts | R69 and R76 ("since the first dashboard opened"), R70 (no reading before the first stream), R71 (the background limit applies only after the first open, which a person caused), D22; tests `background_reads_every_60_s_and_volumes_every_fifth_reading`, `the_first_subscriber_starts_an_idle_collector`, Task 11.6's runtime test, the "Since" texts of Tasks 11.7 and 11.8                                                                                                                                                                                                                                                                                                                          |
+| (c) or (b) with live 2 s              | live > 1% at 1 s and ≤ 1% at 2 s                                         | the user approves it before any web task starts | R68 (its readings come 2 s apart), R70 and R72 (2 s live rate), R77 (stale after 5 s instead of 3 s), D22; Task 11.4 itself edits the already written tests `the_first_live_reading_covers_one_second`, `streams_switch_to_the_live_rate_and_share_one_read`, `cpu_and_memory_keep_their_pace_while_disks_hang`, `every_worker_held_pauses_disk_reads`, `mount_churn_keeps_state_bounded` (Task 11.2), `host_metrics_stream_sends_a_snapshot_then_samples` and `a_slow_subscriber_holds_the_latest_chart_after_the_queue_drains` (Task 11.5), then reruns the Done when commands of Tasks 11.2, 11.3 and 11.5; the stale tests of Tasks 11.7 and 11.8 and Task 11.14's wait are written at the new rate |
 
 If live is over 1% even at 2 s, the task stops and reports to the user: no outcome is accepted.
 (a) is not an outcome: it cannot answer "since server start" at all.
@@ -382,14 +395,20 @@ removable volumes; they carry a badge. Agent's call, for the user to confirm.
 A visible dashboard on a second display is a real use, and #168's cost came from a hidden window.
 The status bar's polling stops on blur too; the dashboard does not. Agent's call.
 
-### D31. Free space is the volume's, without per-user quotas
+### D31. Free and total are both relative to the server's user, on every system
 
-On Windows `sysinfo` reports the volume's total free bytes, not the caller-available figure
-(`src/windows/disk.rs:279-295`); with disk quotas the two differ. The requirement says "free
-space on the volume; per-user quotas are not applied", and the UI says "free", never "available
-to you". Alternative: a Windows adapter that calls `GetDiskFreeSpaceExW` with the caller-available
-value and redefines total and used to match (more Windows code, untestable without a quota lab,
-for a setup few servers use). Agent's call, recorded for the user.
+Linux reports `statvfs` total blocks and available blocks, macOS total capacity and available
+capacity for important usage, and Windows a small space read of the collector's own:
+`GetDiskFreeSpaceExW` through the existing `windows-sys` dependency (its `Win32_Storage_FileSystem`
+feature is already enabled in `apps/server/Cargo.toml`, and `persistence/compaction.rs:860-884`
+already calls it), taking `lpFreeBytesAvailableToCaller` with `lpTotalNumberOfBytes`. It runs on
+the disk workers like every other space read. So "free" and "used" mean the same thing on all
+three: what the server's user can still write, and the rest of what it can see. A pure step clamps
+free to total, so used is never negative whatever a source reports; a fixture with free above
+total proves it on every system. Alternatives: the crate's Windows read (caller total with
+volume-wide free, which breaks under a quota); the volume-wide pair (not what the server's user
+can write). The Windows read is proven only by Windows CI or the Windows lab and stays unproven
+until one of them runs. Decided by the coordinator after the second review.
 
 ### D32. Disk calls run on four dedicated threads that shutdown never joins
 
@@ -430,7 +449,10 @@ each time, which can hang and repeats the space reads the disk loop already make
 - **Shutdown:** `HostMetricsCollector::shutdown` cancels both loops, sets the disk threads' stop
   flag and does not join them; subscriber loops end when the watch sender is dropped. A test runs
   a child process shaped like `main.rs` (a multi-thread runtime dropped after `block_on`) with a
-  volume read held forever and asserts that it exits. It runs in
+  volume read held forever and asserts that it exits. It follows `run_isolated_case` in
+  `apps/server/tests/provider_usage_domain.rs`, which has no platform gate, and uses nothing
+  Unix-only, so the native Windows and macOS CI steps run it too, with the runtime
+  start-and-quiesce test, and fail when their filters match no test (R79). It runs in
   `quiesce_for_update` right after the `process-monitor` step, marked `host-metrics`, before the
   profiler's teardown.
 
