@@ -107,7 +107,10 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         "each leftover has its own finding, and the container none: {orphans:?}"
     );
     assert_ne!(orphans[0]["id"], orphans[1]["id"]);
-    assert!(orphans.iter().all(|finding| finding["count"] == 2), "{orphans:?}");
+    assert!(
+        orphans.iter().all(|finding| finding["count"] == 2),
+        "{orphans:?}"
+    );
     // The orphan's ID is computed from its managed parent and name, as before.
     let parent = fs::canonicalize(&fixture.managed).expect("managed directory");
     let remaining = fingerprint(

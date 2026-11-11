@@ -358,6 +358,26 @@ impl Repositories {
             .await
     }
 
+    /// The worktree paths of a project's removals that were prepared and never completed.
+    pub async fn list_incomplete_worktree_removal_paths(
+        &self,
+        project_cwd: &str,
+    ) -> Result<Vec<String>> {
+        let project_cwd = project_cwd.to_owned();
+        self.database
+            .call(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT DISTINCT worktree_path FROM worktree_removal_receipts \
+                         WHERE project_cwd = ? AND state = 'prepared' ORDER BY worktree_path",
+                    )?
+                    .query_map([project_cwd], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn upsert_checkpoint_diff_blob(&self, row: CheckpointDiffBlob) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(

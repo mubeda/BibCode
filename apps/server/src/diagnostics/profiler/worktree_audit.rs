@@ -326,8 +326,8 @@ async fn scan(
     }
 }
 
-/// Reads one scan's facts, and which parts were read in full. Read-only: it never refreshes
-/// the catalog. The registry and the processes come first and are always audited; the
+/// Reads one scan's facts, and which parts were read in full. It never refreshes the catalog,
+/// and its only write deletes a creation record whose folder is gone. The registry and the processes come first and are always audited; the
 /// process step and the comparison each give up at their own deadline.
 async fn gather(
     sources: &AuditSources,
@@ -402,6 +402,7 @@ async fn gather(
         base_dirs: comparison.base_dirs,
         git_registrations: comparison.registrations,
         managed_dirs: comparison.managed_dirs,
+        evidence: comparison.evidence,
         held_open,
         ..AuditFacts::default()
     };
@@ -429,6 +430,84 @@ struct Comparison {
     base_dirs: Vec<PathBuf>,
     registrations: HashMap<PathBuf, bool>,
     managed_dirs: Vec<PathBuf>,
+    /// The worktree evidence of each listed directory that has some.
+    evidence: HashMap<PathBuf, WorktreeEvidence>,
+    /// The creation records whose folder is gone, as (project root, worktree path).
+    gone_records: Vec<(String, String)>,
+}
+
+/// What the database says about the projects' worktrees, in the spellings it stores.
+#[derive(Default)]
+struct Evidence {
+    /// Each creation record, as (project root, worktree path).
+    recorded: Vec<(String, String)>,
+    /// The worktree paths of removals that were prepared and never completed.
+    incomplete: Vec<String>,
+}
+
+/// Why a folder in a managed worktree directory is a worktree's leftover. A folder with more
+/// than one kind is reported with the first, in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeEvidence {
+    /// BiBCode created a worktree at this path.
+    CreationRecord,
+    /// A removal of this path was prepared and never completed.
+    IncompleteRemoval,
+    /// A `.git` file at its root points at a Git directory.
+    GitPointerFile,
+    /// A BiBCode removal marker is at its root.
+    RemovalMarker,
+}
+
+impl WorktreeEvidence {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CreationRecord => "creation-record",
+            Self::IncompleteRemoval => "incomplete-removal",
+            Self::GitPointerFile => "git-pointer-file",
+            Self::RemovalMarker => "removal-marker",
+        }
+    }
+}
+
+/// The markers a worktree removal writes at the worktree's root (`git/repository.rs`).
+const REMOVAL_MARKERS: [&str; 2] = [".bibcode-removal-identity", ".bibcode-removal-tombstone"];
+
+/// The first kind of evidence `dir` has: the database's first, then one `stat` or one small
+/// read per marker at its root. Nothing below the root is read.
+fn worktree_evidence(
+    dir: &Path,
+    recorded: &HashSet<PathBuf>,
+    incomplete: &HashSet<PathBuf>,
+) -> Option<WorktreeEvidence> {
+    if recorded.contains(dir) {
+        return Some(WorktreeEvidence::CreationRecord);
+    }
+    if incomplete.contains(dir) {
+        return Some(WorktreeEvidence::IncompleteRemoval);
+    }
+    if is_git_pointer_file(&dir.join(".git")) {
+        return Some(WorktreeEvidence::GitPointerFile);
+    }
+    REMOVAL_MARKERS
+        .iter()
+        .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
+        .then_some(WorktreeEvidence::RemovalMarker)
+}
+
+/// A regular file, not a link, that starts with `gitdir:` as a worktree's `.git` file does.
+fn is_git_pointer_file(path: &Path) -> bool {
+    use std::io::Read;
+
+    const PREFIX: &[u8] = b"gitdir:";
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let mut head = [0; PREFIX.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head == PREFIX
 }
 
 /// Reads, in order, the managed directories' listings, then each project's owners, then its
@@ -476,7 +555,31 @@ async fn compare(
     // A thread can own a worktree in another project's managed directory (two checkouts of
     // one repository), so one unread owner list makes every comparison unsafe.
     let mut all_owners_known = true;
+    let mut evidence = Evidence::default();
     for (project, parent) in projects.into_iter().zip(parents) {
+        let cwd = &project.workspace_root;
+        match sources
+            .repositories
+            .list_worktree_creation_records(cwd)
+            .await
+        {
+            Ok(paths) => evidence
+                .recorded
+                .extend(paths.into_iter().map(|path| (cwd.clone(), path))),
+            Err(error) => {
+                tracing::warn!(%error, "worktree audit could not read a project's creation records");
+            }
+        }
+        match sources
+            .repositories
+            .list_incomplete_worktree_removal_paths(cwd)
+            .await
+        {
+            Ok(paths) => evidence.incomplete.extend(paths),
+            Err(error) => {
+                tracing::warn!(%error, "worktree audit could not read a project's removal receipts");
+            }
+        }
         match sources
             .repositories
             .load_worktree_catalog_projection(project.project_id, MAX_PROJECT_ENTRIES)
@@ -518,10 +621,21 @@ async fn compare(
     if !all_owners_known {
         complete.values_mut().for_each(|complete| *complete = false);
     }
-    blocking(permit, cancel, move |cancel| {
-        resolve(owned, complete, listings, registrations, cancel)
+    let comparison = blocking(permit, cancel, move |cancel| {
+        resolve(owned, complete, listings, registrations, evidence, cancel)
     })
-    .await
+    .await?;
+    // A record ends when its folder is gone (#344), so a later folder at that path has none.
+    for (project_cwd, path) in &comparison.gone_records {
+        if let Err(error) = sources
+            .repositories
+            .delete_worktree_creation_record(project_cwd, path)
+            .await
+        {
+            tracing::warn!(%error, "worktree audit could not delete a stale creation record");
+        }
+    }
+    Some(comparison)
 }
 
 /// Each project's managed directory in its physical spelling, and what one level of each
@@ -557,13 +671,15 @@ fn list_managed(
 }
 
 /// The filesystem half of the comparison: physical paths for the owners and registrations,
-/// and the listed directories of complete managed directories that still exist. Returns early
-/// once `cancel` fires.
+/// the listed directories of complete managed directories that still exist with their
+/// worktree evidence, and the creation records whose folder is gone. Returns early once
+/// `cancel` fires.
 fn resolve(
     owned: Vec<(String, PathBuf)>,
     complete: HashMap<PathBuf, bool>,
     listings: HashMap<PathBuf, Vec<PathBuf>>,
     registrations: Vec<(PathBuf, bool)>,
+    evidence: Evidence,
     cancel: &CancellationToken,
 ) -> Comparison {
     let managed_dirs: Vec<PathBuf> = complete
@@ -571,15 +687,40 @@ fn resolve(
         .filter_map(|(parent, complete)| complete.then_some(parent))
         .collect();
     let mut comparison = Comparison::default();
+    let mut recorded = HashSet::new();
+    for (project_cwd, path) in evidence
+        .recorded
+        .into_iter()
+        .take_while(|_| !cancel.is_cancelled())
+    {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                comparison.gone_records.push((project_cwd, path));
+            }
+            _ => {
+                recorded.insert(physical(Path::new(&path)));
+            }
+        }
+    }
+    let incomplete: HashSet<PathBuf> = evidence
+        .incomplete
+        .iter()
+        .take_while(|_| !cancel.is_cancelled())
+        .map(|path| physical(Path::new(path)))
+        .collect();
     for (parent, children) in listings {
         if managed_dirs.contains(&parent) {
-            comparison.base_dirs.extend(
-                children
-                    .into_iter()
-                    .take_while(|_| !cancel.is_cancelled())
-                    // Removed since it was listed: a removal finishing, not a leftover.
-                    .filter(|child| std::fs::symlink_metadata(child).is_ok()),
-            );
+            for child in children
+                .into_iter()
+                .take_while(|_| !cancel.is_cancelled())
+                // Removed since it was listed: a removal finishing, not a leftover.
+                .filter(|child| std::fs::symlink_metadata(child).is_ok())
+            {
+                if let Some(kind) = worktree_evidence(&child, &recorded, &incomplete) {
+                    comparison.evidence.insert(child.clone(), kind);
+                }
+                comparison.base_dirs.push(child);
+            }
         }
     }
     for (path, prunable) in registrations
@@ -761,6 +902,9 @@ pub struct AuditFacts {
     pub held_open: Vec<(PathBuf, u32)>,
     /// The managed worktree directories.
     pub managed_dirs: Vec<PathBuf>,
+    /// The worktree evidence of each directory in `base_dirs` that has some. Only those can be
+    /// orphans.
+    pub evidence: HashMap<PathBuf, WorktreeEvidence>,
 }
 
 /// The findings one scan's facts show. Orphans are keyed by hashed parent and relative
@@ -806,8 +950,13 @@ pub fn audit(facts: &AuditFacts) -> Vec<FindingInput> {
         let hidden = dir
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+        // A folder with no worktree evidence was never a worktree, as far as anything shows.
+        let Some(evidence) = facts.evidence.get(dir) else {
+            continue;
+        };
         if !hidden && !owned.contains(dir.as_path()) && !facts.git_registrations.contains_key(dir) {
             let path = redact(dir);
+            let name = dir.file_name().unwrap_or_default().to_string_lossy();
             let mut orphan = finding(
                 "worktree.orphan-dir",
                 Severity::Warn,
@@ -817,7 +966,11 @@ pub fn audit(facts: &AuditFacts) -> Vec<FindingInput> {
                     "{path} is in a managed worktree directory, but no catalog entry owns it \
                      and Git does not register it."
                 ),
-                json!({ "path": path }),
+                json!({
+                    "path": path,
+                    "name": redact_path(&name),
+                    "reason": evidence.reason(),
+                }),
             );
             // The scan lists direct children. Namespace their relative names by managed parent.
             orphan.fingerprint_fields.extend([
@@ -1184,7 +1337,10 @@ mod tests {
             .await
             .unwrap();
         let repositories = Repositories::new(database);
-        for (owner, name) in [("thread-prepared", "prepared"), ("thread-removed", "removed")] {
+        for (owner, name) in [
+            ("thread-prepared", "prepared"),
+            ("thread-removed", "removed"),
+        ] {
             std::fs::create_dir(managed.join(name)).unwrap();
             repositories
                 .prepare_worktree_removal_receipt(crate::persistence::WorktreeRemovalReceipt {
@@ -1549,7 +1705,11 @@ mod tests {
         let orphan = root.path().join(".bibcode-worktrees/main/orphan");
         std::fs::create_dir_all(&orphan).unwrap();
         // Evidence, so only the deadline keeps it out.
-        std::fs::write(orphan.join(".git"), "gitdir: /elsewhere/.git/worktrees/orphan\n").unwrap();
+        std::fs::write(
+            orphan.join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/orphan\n",
+        )
+        .unwrap();
         let limits = ScanLimits {
             budget: Duration::from_secs(10),
             git: Duration::from_millis(100),

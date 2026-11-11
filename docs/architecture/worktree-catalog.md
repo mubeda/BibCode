@@ -424,14 +424,26 @@ process facts are audited regardless, and the scan's `worktree.audit` event says
 what was covered (`compared`, `processesRead`). Findings are fingerprinted by
 kind and reason, never a raw path. Orphan directories also include hashes of
 their managed parent and relative directory name, so each leftover has its own
-finding and stops recurring when removed or registered. The redacted path
-appears in the summary and evidence; MCP keeps the file name outside home.
+finding and stops recurring when removed, registered or owned. A directory is
+an orphan only with worktree evidence, checked in this order: a creation
+record, a removal receipt still `prepared`, a `.git` pointer file at its root,
+or a BiBCode removal marker at its root. A directory without evidence is never
+reported, and the audit reads nothing below its root. A leftover from before
+BiBCode recorded its worktrees, with no `.git` file, receipt or marker, stops
+being reported. The redacted path, the directory `name` and the evidence
+`reason` appear in the evidence; MCP keeps the file name outside home.
+
+BiBCode records each worktree that `worktree.createManaged` or
+`vcs.createWorktree` creates in `worktree_creation_records`, keyed by the
+project root and the worktree path as stored. A creation whose record cannot be
+written is rolled back and fails. A removal deletes the record once the folder
+is gone, and an audit deletes the record of any folder that is gone.
 
 | Finding                          | Severity | Condition                                                                                                                                          |
 | -------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `worktree.missing`               | Warn     | A catalog entry is `missing-registered` or `missing-unregistered`.                                                                                 |
 | `worktree.stuck-removal`         | Error    | A `removing` guard has been held for more than 10 minutes.                                                                                         |
-| `worktree.orphan-dir`            | Warn     | A directory in a managed worktree directory has no catalog owner and no Git registration.                                                          |
+| `worktree.orphan-dir`            | Warn     | A directory in a managed worktree directory has worktree evidence, no catalog owner and no Git registration.                                       |
 | `worktree.registration-mismatch` | Warn     | Git registers a worktree in a managed worktree directory, its directory is gone, and no catalog entry owns it.                                     |
 | `worktree.held-open`             | Warn     | A process BiBCode owns works inside a missing worktree, inside one stuck in removal, or in a deleted directory under a managed worktree directory. |
 

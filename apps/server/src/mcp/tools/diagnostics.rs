@@ -1085,7 +1085,7 @@ mod tests {
         use crate::diagnostics::profiler::{
             findings::FindingsBook,
             store::{ProfilerStore, StoreConfig},
-            worktree_audit::{AuditFacts, audit},
+            worktree_audit::{AuditFacts, WorktreeEvidence, audit},
         };
 
         let state = tempfile::tempdir().unwrap();
@@ -1097,6 +1097,10 @@ mod tests {
                 "/srv/worktrees/orphan-b".into(),
             ],
             managed_dirs: vec!["/srv/worktrees".into()],
+            evidence: ["/srv/worktrees/orphan-a", "/srv/worktrees/orphan-b"]
+                .into_iter()
+                .map(|dir| (dir.into(), WorktreeEvidence::CreationRecord))
+                .collect(),
             ..AuditFacts::default()
         };
         let now = time::OffsetDateTime::now_utc();
