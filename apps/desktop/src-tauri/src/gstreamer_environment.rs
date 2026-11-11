@@ -1,10 +1,13 @@
 //! The AppImage launcher (AppImageKit's `AppRun`, shipped as `AppRun.wrapped`) sets
 //! `GST_PLUGIN_SYSTEM_PATH_1_0` to `$APPDIR/usr/lib/gstreamer-1.0:` and `GST_PLUGIN_SYSTEM_PATH`
 //! to `$APPDIR/usr/lib/gstreamer:`, each followed by the launch's `QT_PLUGIN_PATH` (an upstream
-//! slip: it reuses that variable's old value), and drops any GStreamer value the user had. The
-//! bundle ships no GStreamer plugins, so GStreamer scans none, finds no `autoaudiosink`, and
-//! WebKitGTK's web process dies on the first audio element. Removing such a value lets
-//! GStreamer use the system's default plugin path; the web processes inherit the result.
+//! slip: it reuses that variable's old value), and drops any GStreamer value the user had.
+//! Release AppImages ship their GStreamer plugins in `usr/lib/gstreamer-1.0`, so the first
+//! value is kept and the second, whose folder never exists, is removed. This repair is the
+//! safety net for a build made without plugins: there GStreamer would scan none, find no
+//! `autoaudiosink`, and WebKitGTK's web process would die on the first audio element.
+//! Removing such a value lets GStreamer use the system's default plugin path; the web
+//! processes inherit the result.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -87,6 +90,12 @@ mod tests {
     fn keeps_the_launchers_value_when_the_bundle_has_the_folder() {
         assert!(!decide(
             Some(&format!("{LAUNCHER_ENTRY}:")),
+            true,
+            &[LAUNCHER_ENTRY]
+        ));
+        // A QT_PLUGIN_PATH suffix that names a missing folder does not matter.
+        assert!(!decide(
+            Some(&format!("{LAUNCHER_ENTRY}:/missing/qt5/plugins")),
             true,
             &[LAUNCHER_ENTRY]
         ));
