@@ -16,6 +16,7 @@ mod isolated_git_config;
 mod websocket_frames;
 
 use std::{
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -52,6 +53,8 @@ const LOCAL_AUTHENTICATION_MESSAGE: &str =
     "Authentication failed. Check the configured credentials and try again.";
 /// A credential helper that prints Git Credential Manager's refusal and answers nothing.
 const GCM_REFUSING_HELPER: &str = "!f() { echo 'fatal: Cannot prompt because user interactivity has been disabled.' >&2; exit 1; }; f";
+/// A credential helper that reports a timed-out lookup and answers nothing.
+const TIMED_OUT_HELPER: &str = "!f() { echo 'credential lookup timed out' >&2; }; f";
 
 /// Re-runs `test_name` alone in a child with an isolated global Git configuration; true in the
 /// parent, which then returns.
@@ -63,8 +66,10 @@ fn relaunched(test_name: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = IsolatedGitConfig::new();
+    let home = TempDir::new().expect("isolated home");
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     config.apply_to_command(&mut command);
+    isolate_network_environment(&mut command, home.path());
     let output = command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(ISOLATED, "1")
@@ -77,6 +82,102 @@ fn relaunched(test_name: &str) -> bool {
         String::from_utf8_lossy(&output.stderr)
     );
     true
+}
+
+fn is_proxy_or_netrc(name: &OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name == "netrc" || name.ends_with("_proxy")
+}
+
+/// Keeps Git from authenticating with the developer's `.netrc` or reaching a proxy: a throwaway
+/// `HOME`, no `NETRC` and no proxy variable, inherited or already set on `command`.
+fn isolate_network_environment(command: &mut Command, home: &Path) {
+    let names: Vec<OsString> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.get_envs().map(|(name, _)| name.to_owned()))
+        .filter(|name| is_proxy_or_netrc(name))
+        .collect();
+    for name in names {
+        command.env_remove(name);
+    }
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("NO_PROXY", "*")
+        .env("no_proxy", "*");
+}
+
+#[test]
+fn the_child_gets_a_throwaway_home_and_no_netrc_or_proxy() {
+    let home = TempDir::new().expect("isolated home");
+    let mut command = Command::new("true");
+    command
+        .env("NETRC", "/nonexistent/netrc")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9");
+    isolate_network_environment(&mut command, home.path());
+    let envs: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let value = |key: &str| {
+        envs.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    for removed in ["NETRC", "https_proxy", "HTTP_PROXY", "ALL_PROXY"] {
+        assert_eq!(value(removed), Some(None), "{removed} is removed");
+    }
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().into_owned();
+        if is_proxy_or_netrc(OsStr::new(&name)) && !name.eq_ignore_ascii_case("no_proxy") {
+            assert_eq!(value(&name), Some(None), "inherited {name} is removed");
+        }
+    }
+    let home_path = home.path().to_string_lossy().into_owned();
+    assert_eq!(value("HOME"), Some(Some(home_path.clone())));
+    assert_eq!(
+        value("XDG_CONFIG_HOME"),
+        Some(Some(
+            home.path().join(".config").to_string_lossy().into_owned()
+        ))
+    );
+    assert_eq!(value("NO_PROXY"), Some(Some("*".to_owned())));
+    assert_eq!(value("no_proxy"), Some(Some("*".to_owned())));
+}
+
+#[tokio::test]
+async fn the_relaunched_child_runs_in_the_isolated_environment() {
+    if relaunched("the_relaunched_child_runs_in_the_isolated_environment") {
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+    assert!(home.is_dir(), "the throwaway home exists");
+    assert!(
+        home.starts_with(std::env::temp_dir()),
+        "HOME is a temporary directory: {home:?}"
+    );
+    assert!(
+        !home.join(".netrc").exists(),
+        "no .netrc in the throwaway home"
+    );
+    assert_eq!(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        Some(home.join(".config"))
+    );
+    for (name, value) in std::env::vars_os() {
+        if name.eq_ignore_ascii_case("no_proxy") {
+            assert_eq!(value, "*");
+        } else {
+            assert!(!is_proxy_or_netrc(&name), "{name:?} reached the child");
+        }
+    }
 }
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -243,11 +344,24 @@ impl Fixture {
 
     /// The terminal event of a Git Manager push: `finished` or `failed`.
     async fn git_manager_push(&mut self) -> Value {
-        let id = self.id();
         let payload = json!({
             "_tag": "push", "cwd": self.checkout, "projectId": "project-1",
             "remote": "origin", "localBranch": "main", "remoteBranch": null
         });
+        self.git_manager(payload).await
+    }
+
+    /// The terminal event of a Git Manager tag create that pushes the tag to `origin`.
+    async fn git_manager_tag_create_and_push(&mut self) -> Value {
+        let payload = json!({
+            "_tag": "tag-create", "cwd": self.checkout, "projectId": "project-1",
+            "name": "v1", "sha": self.local_head(), "pushRemote": "origin"
+        });
+        self.git_manager(payload).await
+    }
+
+    async fn git_manager(&mut self, payload: Value) -> Value {
+        let id = self.id();
         self.send_claiming_sign_in(&id, "gitManager.runOperation", payload)
             .await;
         let events = drain(&mut self.socket, &id).await;
@@ -341,6 +455,58 @@ async fn remote_push_guidance_known_host_git_manager() {
     assert_eq!(failed["_tag"], "failed", "{failed}");
     assert_eq!(failed["code"], "authentication", "{failed}");
     assert_guidance(&failed, KNOWN_HOST_GUIDANCE);
+}
+
+#[tokio::test]
+async fn remote_push_guidance_after_a_timed_out_helper() {
+    if relaunched("remote_push_guidance_after_a_timed_out_helper") {
+        return;
+    }
+    let mut fixture = Fixture::start(Mode::Remote {
+        label: "example-server",
+    })
+    .await;
+    use_credential_helper(&fixture.checkout, TIMED_OUT_HELPER);
+    let git_manager = fixture.git_manager_push().await;
+    assert_eq!(git_manager["code"], "authentication", "{git_manager}");
+    let stacked = fixture.stacked_push().await;
+    for failed in [&git_manager, &stacked] {
+        assert_guidance(failed, KNOWN_HOST_GUIDANCE);
+        assert!(
+            message(failed).contains("credential lookup timed out"),
+            "{failed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_tag_push_guidance_keeps_the_created_tag_message() {
+    if relaunched("remote_tag_push_guidance_keeps_the_created_tag_message") {
+        return;
+    }
+    let mut fixture = Fixture::start(Mode::Remote {
+        label: "example-server",
+    })
+    .await;
+    let failed = fixture.git_manager_tag_create_and_push().await;
+    assert_eq!(failed["_tag"], "failed", "{failed}");
+    assert_eq!(failed["code"], "tag-push-failed", "{failed}");
+    let message = message(&failed);
+    let rest = message
+        .strip_prefix("Created tag v1 locally, but pushing it to origin failed.\n\n")
+        .unwrap_or_else(|| panic!("the partial-success line comes first: {message}"));
+    assert!(
+        rest.starts_with(&format!("{KNOWN_HOST_GUIDANCE}\n\n")),
+        "{message}"
+    );
+    assert!(
+        rest.trim_end()
+            .lines()
+            .last()
+            .is_some_and(|line| line.starts_with("fatal: could not read Username")),
+        "{message}"
+    );
+    assert_eq!(git(&fixture.checkout, &["tag", "--list", "v1"]), "v1");
 }
 
 #[tokio::test]

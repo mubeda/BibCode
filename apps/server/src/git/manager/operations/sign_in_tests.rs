@@ -375,3 +375,103 @@ async fn local_gcm_refusal_still_offers_sign_in_after_the_guidance_change() {
     assert_eq!(sign_in.direction.as_str(), "push");
     assert_eq!(runner.network_spawns(), 1, "no retry");
 }
+
+const MISSING_USERNAME: &str = concat!(
+    "fatal: could not read Username for 'https:",
+    "//gitlab.example.test': terminal prompts disabled"
+);
+const PUSH_GUIDANCE: &str = "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+
+fn remote_place() -> ExecutionPlace {
+    ExecutionPlace {
+        remote: true,
+        server_name: Some("example-server".to_owned()),
+    }
+}
+
+fn plain_push() -> GitManagerOperationRequest {
+    request(
+        json!({"_tag": "push", "remote": "origin", "localBranch": "main", "remoteBranch": null}),
+    )
+}
+
+fn tag_create_and_push() -> GitManagerOperationRequest {
+    request(
+        json!({"_tag": "tag-create", "name": "v1", "sha": "a".repeat(40), "pushRemote": "origin"}),
+    )
+}
+
+#[tokio::test]
+async fn a_remote_missing_username_after_a_timed_out_helper_gets_the_guidance() {
+    let stderr = format!("credential lookup timed out\n{MISSING_USERNAME}\n");
+    let runner = RemoteRunner::new(DESTINATION, &stderr);
+    let error = run_at(
+        &runner,
+        &plain_push(),
+        CredentialPrompt::Never,
+        &remote_place(),
+    )
+    .await
+    .expect_err("push refused");
+    assert_eq!(error.code, "authentication");
+    assert_eq!(
+        error.message,
+        format!("{PUSH_GUIDANCE}\n\n{}", stderr.trim())
+    );
+    assert!(error.sign_in.is_none());
+}
+
+#[tokio::test]
+async fn a_local_cancelled_sign_in_before_the_missing_username_reads_as_before() {
+    let stderr = format!("credential lookup cancelled\n{MISSING_USERNAME}\n");
+    let local = ExecutionPlace {
+        remote: false,
+        server_name: None,
+    };
+    let runner = RemoteRunner::new(DESTINATION, &stderr);
+    let error = run_at(&runner, &plain_push(), CredentialPrompt::Never, &local)
+        .await
+        .expect_err("push refused");
+    assert_eq!(error.code, "cancelled");
+    assert_eq!(error.message, "The Git Manager operation was cancelled.");
+}
+
+#[tokio::test]
+async fn a_created_tag_whose_push_lacks_credentials_on_a_remote_server_gets_the_guidance() {
+    let stderr = format!("credential lookup timed out\n{MISSING_USERNAME}\n");
+    let runner = RemoteRunner::new(DESTINATION, &stderr);
+    let error = run_at(
+        &runner,
+        &tag_create_and_push(),
+        CredentialPrompt::Never,
+        &remote_place(),
+    )
+    .await
+    .expect_err("tag push refused");
+    assert_eq!(error.code, "tag-push-failed");
+    assert_eq!(
+        error.message,
+        format!(
+            "Created tag v1 locally, but pushing it to origin failed.\n\n{PUSH_GUIDANCE}\n\n{}",
+            stderr.trim()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_created_tag_whose_push_fails_locally_keeps_todays_message() {
+    let runner = RemoteRunner::new(DESTINATION, &format!("{MISSING_USERNAME}\n"));
+    let error = run_at(
+        &runner,
+        &tag_create_and_push(),
+        CredentialPrompt::Never,
+        &ExecutionPlace::default(),
+    )
+    .await
+    .expect_err("tag push refused");
+    assert_eq!(error.code, "tag-push-failed");
+    assert_eq!(
+        error.message,
+        format!("Created tag v1 locally, but pushing it to origin failed: {MISSING_USERNAME}")
+    );
+}
