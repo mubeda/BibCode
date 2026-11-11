@@ -161,6 +161,9 @@ export async function chooseDesktopUiMenuItem(itemPrefix: string): Promise<void>
   if (desktopUiPlatform() !== "mac") {
     throw new Error("Native menu items are only driven on macOS.");
   }
+  // The service updates every registered mock after each command; once the item ends the app,
+  // that update fails the case, so drop the mocks first.
+  await browser.tauri.restoreAllMocks();
   // A freshly launched app publishes its menu bar to accessibility a moment after it serves.
   for (let attempt = 1; ; attempt += 1) {
     try {
