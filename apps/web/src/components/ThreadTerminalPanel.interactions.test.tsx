@@ -112,6 +112,8 @@ const xtermState = vi.hoisted(() => ({
   deferWrites: false,
   pendingWrites: [] as Array<() => void>,
   fitShouldThrow: false,
+  /** Makes fit resize the fake grid to the proposed size, as xterm's addon does. */
+  fitAppliesProposal: false,
   proposedDimensions: { cols: 80, rows: 24 } as { cols: number; rows: number } | null,
   loadWebglShouldThrow: false,
 }));
@@ -146,7 +148,16 @@ const webglState = vi.hoisted(() => ({
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class FitAddon {
-    readonly fit = vi.fn();
+    private terminal: { cols: number; rows: number } | null = null;
+    readonly fit = vi.fn(() => {
+      const proposed = xtermState.proposedDimensions;
+      if (!xtermState.fitAppliesProposal || !this.terminal || !proposed) return;
+      this.terminal.cols = proposed.cols;
+      this.terminal.rows = proposed.rows;
+    });
+    activate(terminal: { cols: number; rows: number }): void {
+      this.terminal = terminal;
+    }
     readonly proposeDimensions = vi.fn(() => xtermState.proposedDimensions ?? undefined);
     constructor() {
       if (xtermState.fitShouldThrow) {
@@ -1242,6 +1253,7 @@ beforeEach(() => {
   xtermState.terminals = [];
   xtermState.fitAddons = [];
   xtermState.fitShouldThrow = false;
+  xtermState.fitAppliesProposal = false;
   xtermState.answerQueriesOnWrite = false;
   xtermState.deferWrites = false;
   xtermState.pendingWrites = [];
@@ -3028,6 +3040,85 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
     expect(view.fakeTerminal).toBeNull();
   });
+
+  it.each([
+    ["pane hidden", "legacy"],
+    ["pane hidden", "owner"],
+    ["document hidden", "legacy"],
+    ["document hidden", "owner"],
+  ] as const)(
+    "sends the smaller box after a height shrink while %s, with no resize event on return (%s)",
+    async (hiddenBy, mode) => {
+      // #348: several rows go missing at once if the mount shrank while the
+      // terminal was not visible and the PTY kept its old row count.
+      xtermState.fitAppliesProposal = true;
+      if (mode === "owner") {
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      }
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const view = await mountViewport({ visible: true });
+      await view.flushFrame();
+      await view.flushMountFit();
+      if (mode === "owner") {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot("prompt"),
+              size: { cols: 80, rows: 24, sizeClaim: null },
+            },
+          }),
+        );
+        const claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "term-1",
+            size: { cols: 80, rows: 24, sizeClaim: claim },
+          }),
+        );
+      }
+      view.resizeSpy.mockClear();
+
+      if (hiddenBy === "pane hidden") await view.setVisible(false);
+      else await view.setDocumentVisible(false);
+      expect(view.fakeTerminal).toBeNull();
+      xtermState.proposedDimensions = { cols: 80, rows: 19 };
+      if (hiddenBy === "pane hidden") await view.setVisible(true);
+      else await view.setDocumentVisible(true);
+      await view.flushFrame();
+      await view.flushMountFit();
+      if (mode === "owner") {
+        // The server drops the hidden renderer's claim when its attachment ends.
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "term-1",
+            size: { cols: 80, rows: 24, sizeClaim: null },
+          }),
+        );
+        await view.flushFrame();
+      }
+
+      const last = view.resizeSpy.mock.calls.at(-1)?.[0].input;
+      expect(last).toMatchObject({ cols: 80, rows: 19 });
+      if (mode === "owner") {
+        const claim = last!.sizeClaim as string;
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "term-1",
+            size: { cols: 80, rows: 19, sizeClaim: claim },
+          }),
+        );
+      }
+      expect(view.fakeTerminal?.rows).toBe(19);
+      expect(view.mounted.container.textContent).not.toContain("Fit to this window");
+    },
+  );
 
   it("resets the exact-size guard when teardown mounts a replacement renderer", async () => {
     const view = await mountViewport({ visible: true });
