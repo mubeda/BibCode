@@ -1053,7 +1053,7 @@ WHEN the person closes the desktop window or quits the app while any Files edit 
 
 ### R63. The left panel shows five distinct levels in every built-in theme [Must] (amendment A9)
 
-The left panel SHALL draw the repository or project card, the environment band, the primary checkout, a worktree and a chat row so that each differs from the others by more than color: the environment band has its own surface and a leading accent rule; the primary checkout has an accent-tinted badge with an icon and a heavier label; a worktree has a branch icon, an indent guide under its environment and its own surface; a chat row is smaller and lighter than a checkout row. This holds in both the Environments and the Repositories view and in each of the six built-in themes, and every text and surface pair of these levels SHALL keep at least 4.5:1.
+The left panel SHALL draw the repository or project card, the environment band, the primary checkout, a worktree and a chat row so that each differs from the others by more than color: the environment band has its own surface and a leading accent rule; the primary checkout has an accent-tinted badge with an icon and a heavier label; a worktree has a branch icon, an indent guide under its environment and its own surface; a chat row is smaller and lighter than a checkout row. This holds in both the Environments and the Repositories view and in each of the six built-in themes, and every text and surface pair of these levels SHALL keep at least 4.5:1. A view marks only the levels it draws: a local environment draws no environment card, so its rows carry no `environment` level.
 
 #### Scenario: fixture sidebar
 
