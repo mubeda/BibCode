@@ -7,53 +7,53 @@ Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 fin
 Executor: mstack-codex-review-workflow
 Branch: claude/next-pr-planning-13d367
 
-| Task | Title                                                                     | Phase | State       | Owner         | Note                               |
-| ---- | ------------------------------------------------------------------------- | ----- | ----------- | ------------- | ---------------------------------- |
-| 1.1  | Restyle the stage header as a group label                                 | 1     | Closed      | A, sonnet     | 58 tests pass; Codex finding fixed |
-| 2.1  | Prove the lock source and make background reads lock-free                 | 2     | Closed      | B to B3, opus | Merged; lib 5324, 4 suites green   |
-| 2.2  | Ask Git to stop before killing it                                         | 2     | Closed      | B to B3, opus | Merged; lib 5324, 4 suites green   |
-| 2.3  | Remove BiBCode's own leftover lock and leave none at shutdown             | 2     | Closed      | B to B3, opus | Merged; lib 5324, 4 suites green   |
-| 3.1  | Let a mutation reopen status reads while it keeps the write lock          | 3     | Closed      | E to E4, opus | Merged; lib 5324, 4 suites green   |
-| 3.2  | Stacked actions deliver status while the push waits                       | 3     | Closed      | E to E4, opus | Merged; lib 5324, 4 suites green   |
-| 3.3  | Git Manager push-family operations deliver status; pull and fetch do not  | 3     | Closed      | E to E4, opus | Merged; lib 5324, 4 suites green   |
-| 4.1  | Server guidance for a remote missing-credentials push                     | 4     | Open        |               |                                    |
-| 4.2  | Show the guidance and keep Git's line readable in both surfaces           | 4     | Open        |               |                                    |
-| 5.1  | Record the worktrees BiBCode creates                                      | 5     | Open        |               |                                    |
-| 5.2  | Warn only for folders with worktree evidence                              | 5     | Open        |               |                                    |
-| 6.1  | Write and review the design note                                          | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.2  | Let the session take rich edits without losing source history             | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.3  | Source-preserving reconcile                                               | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.4  | Editable rendered surface on the existing save path                       | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.5  | Formatting group and its commands                                         | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.6  | Link dialog                                                               | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.7  | Insert image                                                              | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.8  | Frontmatter split and the read-only rule                                  | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 6.9  | Editor packages, schema and a faithful round trip                         | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 7.1  | Write and review the design note                                          | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.2  | Theme file format and validation                                          | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.3  | New color tokens that default to today's look                             | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.4  | Built-in theme files and the contrast check                               | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.5  | Theme library and slots store                                             | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.6  | Apply a theme, and paint it before the app appears                        | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.7  | New terminal sessions follow the theme when asked to                      | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.8  | Appearance section, theme list and its actions                            | 7     | In progress | D to D4, opus | Reopened by amendment A8           |
-| 7.9  | Theme editor with live preview, terminal colors and contrast warnings     | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.10 | Export and import                                                         | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.11 | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.12 | Focus ring and control shadow tokens                                      | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.13 | One color parser and one token resolver                                   | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 7.14 | The pipeline job log follows the terminal palette                         | 7     | Closed      | D to D4, opus | Merged; web 11028, scripts 921     |
-| 8.1  | Desktop end-to-end test for rich Markdown editing                         | 8     | Open        |               |                                    |
-| 8.2  | Desktop end-to-end test for themes                                        | 8     | Open        |               |                                    |
-| 8.3  | User guide, runbooks and notices                                          | 8     | Open        |               |                                    |
-| 8.4  | Last token switch and changelog                                           | 8     | Open        |               |                                    |
-| 8.5  | Final gates, follow-up issue and report                                   | 8     | Open        |               |                                    |
-| 9.1  | Export a theme through the native Save dialog                             | 9     | Closed      | G to G5, opus | Merged; desktop 517, web 11079     |
-| 9.2  | Ask before closing with unsaved Files edits                               | 9     | Closed      | G to G5, opus | Merged; desktop 517, web 11079     |
-| 9.3  | The native close protocol                                                 | 9     | Closed      | G to G5, opus | Merged; desktop 517, web 11079     |
-| 8.6  | Desktop end-to-end test for export and the close dialog                   | 8     | Open        |               | Added by plan review 3             |
-| 6.10 | A checkbox in a read-only file keeps source history                       | 6     | Closed      | C to C5, opus | Merged; files 604 tests, web 11028 |
-| 3.4  | A status refresh does not wait on a slow pull-request lookup              | 3     | Closed      | E to E4, opus | Merged; A7 table, 26 lookup tests  |
+| Task | Title                                                                     | Phase | State  | Owner         | Note                               |
+| ---- | ------------------------------------------------------------------------- | ----- | ------ | ------------- | ---------------------------------- |
+| 1.1  | Restyle the stage header as a group label                                 | 1     | Closed | A, sonnet     | 58 tests pass; Codex finding fixed |
+| 2.1  | Prove the lock source and make background reads lock-free                 | 2     | Closed | B to B3, opus | Merged; lib 5324, 4 suites green   |
+| 2.2  | Ask Git to stop before killing it                                         | 2     | Closed | B to B3, opus | Merged; lib 5324, 4 suites green   |
+| 2.3  | Remove BiBCode's own leftover lock and leave none at shutdown             | 2     | Closed | B to B3, opus | Merged; lib 5324, 4 suites green   |
+| 3.1  | Let a mutation reopen status reads while it keeps the write lock          | 3     | Closed | E to E4, opus | Merged; lib 5324, 4 suites green   |
+| 3.2  | Stacked actions deliver status while the push waits                       | 3     | Closed | E to E4, opus | Merged; lib 5324, 4 suites green   |
+| 3.3  | Git Manager push-family operations deliver status; pull and fetch do not  | 3     | Closed | E to E4, opus | Merged; lib 5324, 4 suites green   |
+| 4.1  | Server guidance for a remote missing-credentials push                     | 4     | Open   |               |                                    |
+| 4.2  | Show the guidance and keep Git's line readable in both surfaces           | 4     | Open   |               |                                    |
+| 5.1  | Record the worktrees BiBCode creates                                      | 5     | Open   |               |                                    |
+| 5.2  | Warn only for folders with worktree evidence                              | 5     | Open   |               |                                    |
+| 6.1  | Write and review the design note                                          | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.2  | Let the session take rich edits without losing source history             | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.3  | Source-preserving reconcile                                               | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.4  | Editable rendered surface on the existing save path                       | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.5  | Formatting group and its commands                                         | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.6  | Link dialog                                                               | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.7  | Insert image                                                              | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.8  | Frontmatter split and the read-only rule                                  | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 6.9  | Editor packages, schema and a faithful round trip                         | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 7.1  | Write and review the design note                                          | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.2  | Theme file format and validation                                          | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.3  | New color tokens that default to today's look                             | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.4  | Built-in theme files and the contrast check                               | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.5  | Theme library and slots store                                             | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.6  | Apply a theme, and paint it before the app appears                        | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.7  | New terminal sessions follow the theme when asked to                      | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.8  | Appearance section, theme list and its actions                            | 7     | Closed | D to D6, opus | Merged; A8 row click, web 11093    |
+| 7.9  | Theme editor with live preview, terminal colors and contrast warnings     | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.10 | Export and import                                                         | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.11 | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.12 | Focus ring and control shadow tokens                                      | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.13 | One color parser and one token resolver                                   | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 7.14 | The pipeline job log follows the terminal palette                         | 7     | Closed | D to D4, opus | Merged; web 11028, scripts 921     |
+| 8.1  | Desktop end-to-end test for rich Markdown editing                         | 8     | Open   |               |                                    |
+| 8.2  | Desktop end-to-end test for themes                                        | 8     | Open   |               |                                    |
+| 8.3  | User guide, runbooks and notices                                          | 8     | Open   |               |                                    |
+| 8.4  | Last token switch and changelog                                           | 8     | Open   |               |                                    |
+| 8.5  | Final gates, follow-up issue and report                                   | 8     | Open   |               |                                    |
+| 9.1  | Export a theme through the native Save dialog                             | 9     | Closed | G to G5, opus | Merged; desktop 517, web 11079     |
+| 9.2  | Ask before closing with unsaved Files edits                               | 9     | Closed | G to G5, opus | Merged; desktop 517, web 11079     |
+| 9.3  | The native close protocol                                                 | 9     | Closed | G to G5, opus | Merged; desktop 517, web 11079     |
+| 8.6  | Desktop end-to-end test for export and the close dialog                   | 8     | Open   |               | Added by plan review 3             |
+| 6.10 | A checkbox in a read-only file keeps source history                       | 6     | Closed | C to C5, opus | Merged; files 604 tests, web 11028 |
+| 3.4  | A status refresh does not wait on a slow pull-request lookup              | 3     | Closed | E to E4, opus | Merged; A7 table, 26 lookup tests  |
 
 ## Log
 
@@ -76,6 +76,9 @@ Branch: claude/next-pr-planning-13d367
 ## Follow-ups to ticket
 
 - Profiler events reference does not name the new `git-writes` shutdown step; `docs/testing/cross-platform-validation.md` lacks the new `background_status_`, `git_stop_` and `index_lock_cleanup_` filters (Phase 8).
+- Task 7.8 (A8): Undo restores the slot but not the mode if only the mode write fails, with no error shown; a Delete whose slot write fails after the library write loses focus (both need an injected storage failure). The gap beside the row menu is 4 px, under the 8 px touch-spacing rule.
+- Desktop e2e: `platform-capabilities.e2e.ts` and `chat-activity-panel.e2e.ts` were broken by Phase 7 moving the theme control; lane D6 changed them by reading only, and they are unrun until Task 8.2.
+- Seen in passing: the Keybindings page logs React duplicate-key errors ("Chat: New" twice) and its table overflows at 320 px; pairing over a LAN address in the dev build answers "Invalid pairing token" although the same token redeems with a direct request (cause not found).
 - Phase 3: teardown drains the hand-off task but not the untracked shared lookup task in `open_pull_request_lookups.rs`, so quiesce can reach the profiler teardown before a `gh` child is reaped (needs an injected fault to prove).
 - Phase 3: failed pull-request lookups are not cached and retry without backoff; under steady local events a slow or failing `gh` runs back to back, one per flight (the PR base ran one per event).
 - Phase 3: a status-neutral local change publishes nothing, so a lookup answer from before an invalidation survives it; a refresh with no subscriber never warms the cache; an upstream change under the same branch name keeps the request until the next lookup; the known request has no expiry while lookups keep failing.
@@ -116,3 +119,5 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-10 18:10 Lane G3 (lane-g3, 415eee61b..308942522) fixed both: a new `desktop:update-install-ended` event from an `AllowedInstall` guard on every not-completed return after allow, and a blocking "Installing an update" dialog that holds saving until restart or that event; React and UI.md reviews of lane G's web diff done (leave question names the reason, spinner added). Codex review of G3 (astra), triaged with the advisor: copy finding fixed by lane G4 (bbdc2afbe); reload, missed event and rejected reply parked under the stop rule (each needs a forced failure; the main window reloads only when its content process ends).
 - 2026-11-10 18:35 9.1-9.3 Closed and integrated (cherry-picked aebb7b148..bbdc2afbe, plus lane G5's 3745836e7, which mocks the leave question in the Sidebar test harness after Phase 9 broke two Sidebar tests). Evidence on the branch: cargo fmt check, clippy -D warnings (default and desktop-e2e), bibcode-desktop lib 517 passed, check:contracts, vp check, vp run typecheck, web suite 11079 passed, scripts 921 passed, markdown links: all exit 0.
 - 2026-11-10 19:45 Ruling: amendment A8 to R40 and D9, from the user after trying the dev build: clicking a theme row applies it and switches the mode to its base (System included), with Undo; the list groups Light and Dark themes, marks the one in use, and keeps Duplicate, Edit, Export and Delete off the row's click target. Task 7.8 reopens for it. The sidebar-hierarchy extension stays out of this PR (D2) and is filed in Task 8.5.
+- 2026-11-10 20:25 Lane D5 (lane-d5, f1897c4bf..a8e52af4f) built A8: the theme row is the control, cross-mode clicks switch the mode with Undo, themes grouped Light and Dark, secondary actions in a row menu. Codex review (astra), triaged with the advisor: accepted Undo half-applying or overwriting a newer choice, the row menu's touch area overlapping the row, focus lost after the Delete confirmation, and two desktop e2e specs left looking for the removed General theme control.
+- 2026-11-11 07:20 Lane D6 (lane-d6, 2b8292863..482b81df2) fixed them: Undo is an inline status line under the theme's group, valid only while the live mode and slot match; 44 px reserved for the row menu; focus moves after Cancel and Delete; the two specs and two runbook lines point at Settings > Appearance > Mode. Codex review of D6 (astra), triaged with the advisor: two storage-failure findings parked under the stop rule. 7.8 Closed and integrated (cherry-picked f1897c4bf..482b81df2). Evidence on the branch: web suite 11093 passed, scripts 921 passed, vp check, vp run typecheck, markdown links, all exit 0; a cross-mode row click and Undo checked in the dev build.
