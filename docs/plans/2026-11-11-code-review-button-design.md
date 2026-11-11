@@ -56,9 +56,13 @@ Everything below was read at commit `3cd0fbab8` unless marked otherwise.
   `open_permission_request` (line 2548), so BiBCode never answers a Claude permission request.
   The `--settings` BiBCode adds (`claude_session_settings`, `provider_runtime.rs` line 18686)
   carries only HTTP hooks for activity, and the hook sink answers `204 No Content` with no
-  decision (`provider/claude/hook_sink.rs`), so no hook grants a permission either. Inferred, not
-  run: Claude denies a tool that needs permission, so it cannot leave plan mode on its own in a
-  BiBCode chat.
+  decision (`provider/claude/hook_sink.rs`), so no BiBCode hook grants a permission. But the same
+  launch passes `--setting-sources=user,project,local` (`provider_runtime.rs` near 18635), so the
+  person's and the repository's own Claude settings load too. Claude's documentation (cited by the
+  plan review, not re-read here) says such a hook can approve `ExitPlanMode`, allow rules can let
+  edit tools run, and `permissions.defaultMode: "bypassPermissions"` adds bypass to the mode cycle.
+  So plan mode is the mechanism BiBCode sets, not a guarantee: configuration it loads can weaken
+  it.
 - A panel thread takes its host's `branch` and `worktreePath` on the server
   (`worktree_catalog_rpc.rs`, the `thread.create` it dispatches near line 1545), and the engine
   refuses a panel whose host is itself a panel (`engine.rs` line 4915), so a review from a panel is
@@ -133,28 +137,39 @@ CLI still accepts `default` is unverified and outside this issue (it does not af
 
 ### Read-only, per reviewer
 
-The guard each reviewer gets, and the words the UI may use for it. ENFORCED means the provider
-blocks the edit, or holds it for the person's approval; INSTRUCTED means only the prompt asks.
+The guard each reviewer gets, what can weaken it, and the words the UI may use. The UI names
+the mechanism BiBCode sets and never promises the outcome ("cannot edit"). MECHANISM means the
+provider applies a block or an approval gate that BiBCode requests; INSTRUCTED means only the
+prompt asks.
 
-| Reviewer        | What BiBCode sets                                               | Guard                                                                                         | UI line                                                        |
-| --------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Claude chat     | interaction `plan`, runtime `approval-required`                 | ENFORCED: Claude plan mode blocks edit tools                                                  | "Claude plan mode blocks edits."                               |
-| Codex chat      | interaction `default`, runtime `approval-required`              | ENFORCED: `readOnly` sandbox; a write escalation waits for the person's approval              | "Codex read-only sandbox. A write needs your approval."        |
-| OpenCode chat   | interaction `default`, runtime `approval-required`              | ENFORCED: OpenCode `ask` rules hold every edit and command for approval                       | "Edits and commands ask for your approval."                    |
-| Cursor chat     | interaction `default`, runtime `approval-required` (`ask` mode) | INSTRUCTED: the agent's own mode; BiBCode holds only the permission requests the agent raises | "Told not to edit. BiBCode cannot block edits for this agent." |
-| Grok chat       | as Cursor                                                       | INSTRUCTED                                                                                    | as Cursor                                                      |
-| Claude Terminal | `--permission-mode plan`, no bypass flags                       | ENFORCED: plan mode; bypass is not in the mode cycle                                          | "Claude plan mode blocks edits."                               |
-| Codex Terminal  | `--sandbox read-only --ask-for-approval never`, no bypass flag  | ENFORCED: a write fails back to the model                                                     | "Codex read-only sandbox. Writes fail."                        |
+| Reviewer        | What BiBCode sets                                               | Guard                                                                          | Can be weakened by                                                                                                                                   | UI line                                                            |
+| --------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Claude chat     | interaction `plan`, runtime `approval-required`                 | MECHANISM: Claude plan mode                                                    | user, project or local Claude settings: a hook that approves `ExitPlanMode`, allow rules for edit tools, a default bypass mode; the composer pickers | "Starts in Claude's plan mode."                                    |
+| Codex chat      | interaction `default`, runtime `approval-required`              | MECHANISM: `readOnly` sandbox; a write escalation waits for the person         | the person approving an escalation; the runtime picker                                                                                               | "Runs in Codex's read-only sandbox. Writes ask for your approval." |
+| OpenCode chat   | interaction `default`, runtime `approval-required`              | MECHANISM: OpenCode `ask` rules hold edits and commands for approval           | the person approving; the runtime picker                                                                                                             | "Edits and commands ask for your approval."                        |
+| Cursor chat     | interaction `default`, runtime `approval-required` (`ask` mode) | INSTRUCTED: the agent's own mode; BiBCode holds only requests the agent raises | anything the agent does without asking                                                                                                               | "Told not to edit. BiBCode cannot block edits for this agent."     |
+| Grok chat       | as Cursor                                                       | INSTRUCTED                                                                     | as Cursor                                                                                                                                            | as Cursor                                                          |
+| Claude Terminal | `--permission-mode plan`, no bypass flags                       | MECHANISM: Claude plan mode                                                    | the same Claude settings as the chat, including a user or managed `defaultMode` of `bypassPermissions`; Shift+Tab in the terminal                    | "Starts in Claude's plan mode."                                    |
+| Codex Terminal  | `--sandbox read-only --ask-for-approval never`, no bypass flag  | MECHANISM: a write fails back to the model                                     | Codex's sandbox support on the platform (unverified on Windows); commands typed in the terminal                                                      | "Runs in Codex's read-only sandbox."                               |
 
-Every review prompt also starts with "Do not edit files." (the lead-in below), so the instructed
-rows keep that line even when a custom prompt drops it. The person can still change a review
-thread's runtime or interaction mode with the composer pickers, or leave plan mode in a Claude
-terminal with Shift+Tab; that is their explicit choice. The Codex sandbox guarantee rests on
-Codex's own sandbox per platform; this branch cannot verify it on Windows, so the copy names the
-mechanism ("read-only sandbox") instead of promising an outcome.
+Every review prompt also starts with "Do not edit files." (the lead-in below), so every row keeps
+that line even when a custom prompt drops it. The UI shows the line in the Settings → Agents
+reviewer row and in the button's tooltip. The changelog, the user guide and the requirements use the
+same mechanism wording.
 
-The UI shows the line in the Settings → Agents reviewer row and in the button's tooltip, so a
-person who picks an instructed reviewer sees that before the first review.
+**Open decision for the user (not changed by this plan): which Claude settings a review loads.**
+Options:
+
+1. Keep loading user, project and local settings, as every Claude chat does, and name only the
+   mechanism. This plan's default; no code change.
+2. Load user settings only for review sessions (`--setting-sources user`), so a repository cannot
+   weaken plan mode, at the cost of the repository's own settings (its hooks, permissions and
+   plugins; CLAUDE.md is separate).
+3. Add deny rules for edit tools on review sessions. Claude 2.1.322's `--help` offers
+   `--disallowedTools` ("tool names to deny", for example `Edit`). Deny rules do not stop a write
+   made through Bash, and whether a hook can override them was not checked here.
+
+Options 2 and 3 can combine. Each would add a requirement and a task once chosen.
 
 ### Prompt lead-in
 
@@ -185,8 +200,9 @@ so a review from a worktree would read the main checkout); a new dedicated serve
 a top-level thread in a worktree (new authority surface, a new RPC to cover in the profiler, and
 nothing the panel path lacks). The panel path is server-resolved, already covers close-while-
 creating and unknown outcomes, and puts the findings beside the work as Conductor does. Agent's
-call. A draft chat (no server thread yet) has no host: the chat reviewer is disabled there with a
-reason (D48).
+call. A draft chat (no server thread yet) has no host and no terminal launch context
+(`resolveCenterPanelLaunchContext` returns `null` for it, `ChatView.logic.ts` line 211), so both
+reviewer kinds are disabled there with a reason (D48).
 
 **D41. Review chats run with `approval-required`, and `plan` only where plan mode is the block.**
 The issue's open question 1 recommends the user's default runtime mode. On this branch that
@@ -219,20 +235,28 @@ for a leading `-`, but Claude still dispatches a bare subcommand word after `--`
 read the interactive prompt from stdin. The lead-in makes the argument always start with "Code
 review requested", so trimming is not needed and saved text is never changed. Agent's call.
 
-**D44. Windows terminal reviews flatten line breaks by the environment's OS, are length-checked,
-and refuse any character a native round trip does not prove.** The web knows
-`serverConfig.environment.platform.os`, not the resolved file, so it replaces each line break with
-one space whenever the environment is Windows (harmless for a `.exe`). A conservative bound of
-7,000 for `length + 8 × (count of %) + (count of ")` keeps the `cmd.exe` line under its 8,191
-limit. New Windows-only tests send one argument per character class (`"`, `%` and `%PATH%`, `&`,
-`^`, `|`, `<` with `>`, `!`) through a `%*` shim to `node` and compare `process.argv`, and a CI
-step runs them on the Windows job. Only the classes that pass are committed as tests; for a class
-that fails, the web refuses a prompt holding that character on Windows with "Review prompt contains
-a character a Windows terminal cannot pass. Remove it or pick a chat reviewer.", a web test pins
-the refusal, and the failure is reported for a separate fix. This phase does not change the
-server's escaping. The existing batch test passes `percent-value`, not a real `%`, so the `%`
-class is the one most worth watching. Alternative: a server-side line-break replacement for batch targets (changes every
-terminal launch, and the server would rewrite text it was asked to pass). Agent's call.
+**D44. Windows terminal reviews start disabled; the server refuses a batch command line that is
+too long.** The web knows `serverConfig.environment.platform.os`, not the resolved file, so it
+replaces each line break with one space whenever the environment is Windows (harmless for a
+`.exe`). The length limit sits beside the encoder: `make_windows_batch_command_line` in
+`apps/server/src/process/executable.rs` has no length check today, so it gains one that refuses an
+encoded command line over the `cmd.exe` limit of 8,191 characters with "The command is too long
+for a Windows terminal (N of 8,191 characters). Shorten the review prompt or pick a chat
+reviewer." The terminal open path already shows a refused launch in a toast. No web-side estimate
+duplicates the encoder (backslash doubling before quotes and at a quoted end, `""` and the `%`
+expansion all count).
+
+Because a suspected `%` fault sits on this path and the prompt is project data, the terminal
+reviewer stays disabled on Windows environments ("Terminal reviews are off on Windows for now. Pick
+a chat reviewer in Settings → Agents.") until native tests (Task 12.4) have run green on real
+Windows, in CI or the local Windows VM. Those tests send one argument per class through a `%*`
+shim to `node` and compare `process.argv`: quotes, `%` and `%PATH%`, `&`, `^`, `|`, `<` with `>`,
+`!`, trailing backslashes, a backslash before a quote, and one argument combining them all.
+Enabling is its own small task (12.17) gated on that evidence. If the `%` case fails, fixing the
+encoder is a conditional task (12.18) with its own red-green test, and 12.17 waits for it.
+Alternatives: a web-side length estimate (duplicates the encoder, and the first draft's missed
+backslash doubling); a server-side line-break rewrite for batch targets (changes every terminal
+launch). Decided by the coordinator.
 
 **D45. The base is `origin/<defaultRefName>`; a stale local default branch may enable the
 button.** The issue's open question 4 recommendation, kept: the prompt tells the agent to use the
@@ -253,8 +277,14 @@ refused there. The server advertises `capabilities.codeReviews`; without it the 
 with "Update the BiBCode server on this environment to use Review." and the Settings rows say the
 same. Agent's call.
 
-**D48. Disabled states.** Every disabled state names its reason (UI.md), including loading, which
-the issue left without a tooltip. Agent's call.
+**D48. Disabled states, and no fallback reviewer.** Every disabled state names its reason (UI.md),
+including loading, which the issue left without a tooltip. The saved reviewer is resolved exactly,
+without the fallback to the first chat in `resolveEffectiveProviderAgentAction`
+(`providerAgentActions.ts` line 81): when it is missing or unavailable, the button is disabled with
+"<reviewer> is not available. Change the code review agent in Settings → Agents.", or "The code
+review agent is not available on this environment. Change it in Settings → Agents." when it is not
+listed at all, because a fallback would change the provider and its guard silently. Decided by the
+coordinator.
 
 **D49. Settings are per environment; the model override applies only to its own instance.** A
 review uses the settings of the environment that runs it, as the Default Agent does. A stored
@@ -296,12 +326,14 @@ session default applies. Agent's call.
   the launcher refuses a resolved prompt with control characters other than tab and line breaks.
   The person sees the full prompt as the panel's first message, and the dialog shows the project's
   prompt before they review.
-- **Prompt injection.** A hostile prompt can ask the reviewer to edit or exfiltrate. The guards in
-  the table are what stops edits; the instructed rows say so in the UI. Network access is not
+- **Prompt injection.** A hostile prompt can ask the reviewer to edit or exfiltrate. The mechanisms
+  in the table are what limit edits, within the weaknesses the table lists; the instructed rows
+  say so in the UI. Network access is not
   changed by this issue.
-- **Repository settings.** A project's `.claude/settings.json` or `.codex/config.toml` is read by
-  the CLI as today. Command-line flags take precedence over them in both CLIs (inferred from their
-  documentation, not tested here).
+- **Repository settings.** A project's `.claude/settings.json` (loaded through
+  `--setting-sources=user,project,local`) or `.codex/config.toml` is read by the CLI as today, and
+  for Claude it can weaken plan mode (see the open decision above). This plan does not change which
+  settings a review loads.
 - **No new privileged path.** The web reuses `worktree.createPanel`, `orchestration.dispatchCommand`
   and the terminal open path; the server resolves the checkout.
 

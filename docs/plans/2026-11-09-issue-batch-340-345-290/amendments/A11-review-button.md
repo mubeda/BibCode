@@ -2,8 +2,9 @@
 
 Amendment A11 (2026-11-11, user, adding #293 to this batch) brings in the Review button of issue
 #293: one click in the Source Control panel starts a review of the current branch and its
-uncommitted changes, by a chat or AI Terminal agent picked in Settings → Agents, guarded against
-edits wherever the agent's provider can enforce it. Its first priority tier is in scope, then the
+uncommitted changes, by a chat or AI Terminal agent picked in Settings → Agents, started in the
+provider's own read-only or approval mechanism wherever one exists (plan mode, a read-only sandbox,
+approval rules), and saying so where none exists. Its first priority tier is in scope, then the
 shortcut, the one-off reviewer menu, the scope tooltip and one-off instructions as separate later
 tasks. Terminal reviewers for Cursor, Grok and OpenCode stay out (their read-only flags are
 unverified). The design is in `docs/plans/2026-11-11-code-review-button-design.md`. Requirements
@@ -45,6 +46,30 @@ with a tooltip that names the reason.
 - GIVEN an environment whose server does not advertise code reviews
 - WHEN the panel is shown with changes
 - THEN the button is disabled with the tooltip "Update the BiBCode server on this environment to use Review."
+
+#### Scenario: saved reviewer unavailable
+
+- GIVEN the saved code review agent is chat `claudeAgent`, Claude is disabled on this environment, and chat `cursor` is available
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "Claude is not available. Change the code review agent in Settings → Agents.", and clicking it starts no review with Cursor or any other agent
+
+#### Scenario: saved reviewer not listed
+
+- GIVEN the saved code review agent names a provider instance that this environment does not list
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "The code review agent is not available on this environment. Change it in Settings → Agents."
+
+#### Scenario: draft chat with a chat reviewer
+
+- GIVEN the current chat has not been sent yet and the reviewer is chat `codex`
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "Send a first message in this chat, then review from here."
+
+#### Scenario: draft chat with a terminal reviewer
+
+- GIVEN the current chat has not been sent yet and the reviewer is Claude Terminal
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the same tooltip and no terminal is opened
 
 ### R91. A review covers the branch and the uncommitted changes against the remote base [Must] (amendment A11)
 
@@ -107,7 +132,13 @@ settings.
 
 - GIVEN a patch setting the agent to terminal `claudeAgent`, the model to `claudeAgent` / `opus` and the prompt to "Look at tests."
 - WHEN it is applied and the settings are read back
-- THEN all three values are returned, and a later patch with model null clears the model
+- THEN all three values are returned
+
+#### Scenario: replacing a model drops its old options
+
+- GIVEN a stored review model `claudeAgent` / `opus` with options `[{"id":"effort","value":"high"}]`
+- WHEN a patch sets the review model to `codex` / `gpt-5` with no options
+- THEN the stored review model is exactly `codex` / `gpt-5` with no `options` key
 
 #### Scenario: oversized prompt
 
@@ -165,12 +196,6 @@ send the resolved prompt as its first message.
 - WHEN "Review changes" is clicked again
 - THEN no second panel or message is created
 
-#### Scenario: draft chat
-
-- GIVEN the current chat has not been sent yet and the reviewer is a chat agent
-- WHEN the panel is shown with changes
-- THEN the button is disabled with the tooltip "Send a first message in this chat, then review from here."
-
 #### Scenario: first message fails
 
 - GIVEN panel creation succeeds and the first message is refused
@@ -221,30 +246,37 @@ review launcher SHALL start nothing and show the reason.
 - WHEN the review command is built
 - THEN no command is returned and the reason is "Review prompt is longer than 8,192 characters. Shorten it in Settings → Agents."
 
-### R98. A Windows terminal review passes the prompt intact or does not start [Must] (amendment A11)
+### R98. A Windows terminal review starts only on a proven path and with the prompt intact [Must] (amendment A11)
 
-WHILE the reviewing environment runs Windows, the review launcher SHALL replace each line break in
-the prompt with one space, and IF the prompt's length plus eight per `%` and one per `"` exceeds
-7,000, or the prompt holds a character that a Windows batch launch is not proven to pass intact,
-THEN it SHALL start no terminal review and name the reason.
+WHILE the reviewing environment runs Windows, the review launcher SHALL keep terminal reviewers
+disabled with a reason until native batch-launch tests have passed on Windows, and once enabled
+SHALL replace each line break in the prompt with one space; IF the encoded batch command line
+exceeds the 8,191 characters `cmd.exe` accepts, THEN the terminal service SHALL refuse the launch
+with an error that names the length, and the UI SHALL show it.
+
+#### Scenario: off until proven
+
+- GIVEN a Windows environment, the reviewer Claude Terminal and a dirty tree, before the Windows terminal reviews are enabled
+- WHEN the panel is shown
+- THEN the button is disabled with the tooltip "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.", and macOS and Linux environments are not affected
 
 #### Scenario: line breaks
 
-- GIVEN a Windows environment and a prompt "a\nb\r\nc"
+- GIVEN a Windows environment with terminal reviews enabled and a prompt "a\nb\r\nc"
 - WHEN the review command is built
 - THEN the prompt argument is "a b c"
 
-#### Scenario: metacharacters through an npm-style shim
+#### Scenario: arguments through an npm-style shim
 
-- GIVEN a Windows `.cmd` shim that forwards `%*` to `node`, and one argument per character class: `say "hi"`, `100% %PATH%`, `a & b`, `a ^ b`, `a | b`, `c < d > e` and `!x!`
+- GIVEN a Windows `.cmd` shim that forwards `%*` to `node`, and one argument per class: `say "hi"`, `100% %PATH%`, `a & b`, `a ^ b`, `a | b`, `c < d > e`, `!x!`, `ends with \\\`, `back\\"slash` and one argument combining all of them
 - WHEN each is launched through the terminal launch path
-- THEN `node` receives each argument exactly and no redirect or second command runs, and for any class where that does not hold, the review launcher refuses a prompt holding that character on Windows with "Review prompt contains a character a Windows terminal cannot pass. Remove it or pick a chat reviewer."
+- THEN `node` receives each argument exactly, and no redirect or second command runs
 
 #### Scenario: too long for cmd.exe
 
-- GIVEN a Windows environment and a prompt of 6,000 characters holding 200 `%`
-- WHEN the review command is built
-- THEN no command is returned and the reason is "Review prompt is too long for a Windows terminal. Shorten it or pick a chat reviewer."
+- GIVEN a Windows batch target and arguments whose encoded command line is 8,192 characters or longer, for example a prompt ending in 4,200 backslashes
+- WHEN the terminal service prepares the launch
+- THEN it refuses with "The command is too long for a Windows terminal (N of 8,191 characters). Shorten the review prompt or pick a chat reviewer.", nothing is spawned, and the UI shows that message
 
 ### R99. Settings → Agents shows the reviewer, its model, its prompt and its guard [Must] (amendment A11)
 
@@ -292,8 +324,9 @@ and show the reason next to the field.
 
 ### R101. Documentation and an end-to-end check cover the flow [Must] (amendment A11)
 
-The user guide and the changelog SHALL describe the Review button, its settings and the guard per
-reviewer without claiming a block for an instructed reviewer, and a packaged desktop test SHALL
+The user guide and the changelog SHALL describe the Review button, its settings and the mechanism
+each reviewer starts with (for example "starts in Claude's plan mode", "runs in Codex's read-only
+sandbox") without promising that a review cannot edit, and a packaged desktop test SHALL
 start a review from Source Control and observe the panel, its first message and the absent
 Implement action.
 
@@ -301,7 +334,13 @@ Implement action.
 
 - GIVEN the packaged desktop fixture project with one modified file
 - WHEN Source Control's "Review changes" is clicked
-- THEN a "Code review · " tab opens, the fixture provider receives a first message that contains "Scope: the staged, unstaged and untracked changes in the working tree", and no Implement button is shown
+- THEN a "Code review · " tab opens and the fixture provider receives a first message that contains "Scope: the staged, unstaged and untracked changes in the working tree"
+
+#### Scenario: packaged Claude review ending in a plan
+
+- GIVEN the packaged fixture with the code review agent set to chat `claudeAgent`, and a fixture Claude response to the review prompt that calls `ExitPlanMode` with a plan
+- WHEN the review runs, the turn completes and the window reloads
+- THEN the plan card reads "Review findings", and no Implement, Refine or "Implement in a new thread" action is shown before or after the reload; the same case without the review flag shows Implement
 
 ### R102. A keyboard shortcut starts a review [Should] (amendment A11)
 
@@ -334,7 +373,7 @@ guard line.
 
 - GIVEN branch scope against `origin/main` and reviewer chat `claudeAgent`
 - WHEN the button is hovered or focused
-- THEN the tooltip reads "Review branch vs origin/main and uncommitted changes" and "Claude plan mode blocks edits."
+- THEN the tooltip reads "Review branch vs origin/main and uncommitted changes" and "Starts in Claude's plan mode."
 
 ### R105. One-off instructions can be added to a review [Should] (amendment A11)
 
@@ -351,13 +390,13 @@ appends them after a blank line to the resolved prompt of that one review only.
 
 D40. A review opens as a chat panel of the current thread through the side-chat creation path, not as a new top-level thread through `thread.turn.start` with `bootstrap.createThread`, because a public client cannot give a new thread a worktree that way and the review would read the main checkout. Alternatives considered: the issue's top-level thread (wrong checkout from a worktree); a new server RPC for a top-level thread in a worktree (new authority surface and RPC for what the panel path already does). Decided by: agent's call. Source: #293 "Start a thread with a prompt"; `decode_public_orchestration_command`.
 
-D41. Review chats run with `approval-required` for every provider and in plan mode only for Claude. Alternatives considered: the user's default runtime mode (the issue's recommendation for open question 1; on this branch it is `full-access`, which leaves Codex, Cursor, Grok and OpenCode unguarded); `approval-required` with plan everywhere (plan adds no block to Codex and makes Codex, Cursor and Grok end with plan cards). UI copy claims a block only for the rows the design note marks ENFORCED. Decided by: agent's call. Source: #293 open question 1; driver mappings in the design note.
+D41. Review chats run with `approval-required` for every provider and in plan mode only for Claude. Alternatives considered: the user's default runtime mode (the issue's recommendation for open question 1; on this branch it is `full-access`, which leaves Codex, Cursor, Grok and OpenCode unguarded); `approval-required` with plan everywhere (plan adds no block to Codex and makes Codex, Cursor and Grok end with plan cards). UI copy names the mechanism ("Starts in Claude's plan mode.", "Runs in Codex's read-only sandbox.") and never promises the outcome, because user, project and local Claude settings load and can weaken plan mode; which settings a review loads is an open decision for the user. Decided by: agent's call. Source: #293 open question 1; driver mappings in the design note.
 
 D42. A review thread carries a durable `codeReview` flag set at panel creation, and a review thread shows no Implement, Refine or "Implement in a new thread"; its plan card reads "Review findings". Alternatives considered: matching the title (breaks on rename); a client-only flag (lost on reload); keeping Implement (one-click auto-fixing is a non-goal). Decided by: agent's call. Source: #293 open question 2.
 
 D43. A terminal prompt is passed as one argument after `--`, behind the fixed lead-in, and never through stdin; saved text is never trimmed or rewritten. Alternatives considered: `--` alone (Claude 2.1.322 still runs a subcommand named by the prompt); trimming leading dashes at save time (changes the person's text and misses subcommand words); stdin (interactive Codex refuses it). Decided by: agent's call. Source: #293 open question 3; CLI probes recorded in the design note.
 
-D44. On Windows the web replaces line breaks by the environment's OS, bounds the escaped length at 7,000, and refuses on Windows any character whose native `%*` round trip does not pass in Windows CI; this phase does not change the server's escaping. Alternatives considered: the issue's rule keyed on the resolved `.cmd` (the web never sees it); a server-side rewrite for batch targets (changes every terminal launch). Decided by: agent's call. Source: #293 "Handle the argument limits".
+D44. On Windows the web replaces line breaks by the environment's OS; the server's batch encoder refuses an encoded command line over 8,191 characters; and terminal reviewers stay disabled on Windows until native batch-launch tests (quotes, `%`, `&`, `^`, `|`, redirects, `!`, trailing backslashes, a backslash before a quote, combined) have passed on real Windows, with enabling as its own task and an encoder fix as a conditional task if the `%` case fails. Alternatives considered: the issue's rule keyed on the resolved `.cmd` (the web never sees it); a web-side length estimate (duplicates the encoder and missed backslash doubling); enabling on the first draft's per-character refusal (the prompt is project data and a `%` fault is suspected on this path). Decided by: coordinator. Source: #293 "Handle the argument limits"; plan review.
 
 D45. The base is `origin/<default>` with the local branch as the prompt's fallback, and a stale local default branch may enable the button. Alternatives considered: counting against the remote ref (a server change outside this issue). Decided by: agent's call (the issue's recommendation for open question 4). Source: #293 open question 4.
 
@@ -365,6 +404,6 @@ D46. The shortcut defaults to `mod+alt+shift+r`. Alternatives considered: `mod+s
 
 D47. A `codeReviews` server capability gates the button and the settings rows, with the reason "Update the BiBCode server on this environment to use Review." Alternatives considered: sending the new fields to any server (an older server refuses the panel field). Decided by: agent's call. Source: the `sideChats` precedent.
 
-D48. Every disabled state of the button names its reason, including loading ("Checking for changes"), and a draft chat disables the chat reviewer with "Send a first message in this chat, then review from here." Alternatives considered: the issue's loading state without a tooltip (against `UI.md`); creating a top-level thread from a draft (see D40). Decided by: agent's call. Source: `UI.md` Buttons and Errors.
+D48. Every disabled state of the button names its reason, including loading ("Checking for changes"); a draft chat disables both reviewer kinds with "Send a first message in this chat, then review from here." (a draft has neither a panel host nor a terminal launch context); and the saved reviewer is resolved without falling back to another agent, so a missing or unavailable reviewer disables the button with a reason that names it and Settings → Agents. Alternatives considered: the issue's loading state without a tooltip (against `UI.md`); creating a top-level thread from a draft (see D40); falling back to the first available chat (silently changes the provider and its guard). Decided by: coordinator (draft and fallback rules), agent's call (loading). Source: `UI.md` Buttons and Errors; plan review.
 
 D49. Review settings belong to the environment that runs the review, and a review model whose provider instance differs from the reviewer's is ignored in favour of the provider's session default. Alternatives considered: one review model per provider (more settings than the issue asks for). Decided by: agent's call. Source: #293 "Settings".
