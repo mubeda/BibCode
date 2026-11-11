@@ -63,9 +63,17 @@ describe("resolveToken against the stylesheet", () => {
         const source = DERIVED_SOURCES[token];
         expect(source, `${base} ${token} has a known source`).toBeDefined();
         const overrides = { [source!]: "#123456" };
-        expect(resolveToken(theme(base, overrides), token), `${base} ${token}`).toBe(
-          evaluateCssTokens(base, overrides)(token),
-        );
+        // The resolver starts from the base values in hex, while the stylesheet keeps Dark's
+        // `background` unrounded, so a token two steps from it may differ by one channel step.
+        const resolved = parseColor(resolveToken(theme(base, overrides), token))!;
+        const painted = parseColor(evaluateCssTokens(base, overrides)(token))!;
+        for (const channel of ["r", "g", "b"] as const) {
+          expect(
+            Math.abs(resolved[channel] - painted[channel]),
+            `${base} ${token} ${channel}`,
+          ).toBeLessThanOrEqual(1);
+        }
+        expect(Math.abs(resolved.a - painted.a), `${base} ${token} alpha`).toBeLessThan(0.005);
       }
     }
   });

@@ -30,9 +30,7 @@ describe("SidebarLevelsPreview", () => {
     expect(levels("checkout")).toHaveLength(1);
     expect(levels("worktree")).toHaveLength(2);
     expect(levels("chat").length).toBeGreaterThanOrEqual(3);
-    expect(levels("chat").some((row) => /^\d+ more chats$/.test(row.textContent ?? ""))).toBe(
-      true,
-    );
+    expect(levels("chat").some((row) => /^\d+ more chats$/.test(row.textContent ?? ""))).toBe(true);
   });
 
   it("marks the primary checkout with data-primary, an icon, a badge and a label", () => {

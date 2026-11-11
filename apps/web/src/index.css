@@ -70,6 +70,14 @@
   --color-sidebar-card-border: var(--sidebar-card-border);
   --color-sidebar-env-band: var(--sidebar-env-band);
   --shadow-sidebar-card: var(--sidebar-card-shadow);
+  --color-sidebar-env-accent: var(--sidebar-env-accent);
+  --color-sidebar-primary-badge: var(--sidebar-primary-badge);
+  --color-sidebar-primary-badge-foreground: var(--sidebar-primary-badge-foreground);
+  --color-sidebar-worktree: var(--sidebar-worktree);
+  --color-sidebar-worktree-border: var(--sidebar-worktree-border);
+  --color-sidebar-worktree-icon: var(--sidebar-worktree-icon);
+  --color-sidebar-chat-foreground: var(--sidebar-chat-foreground);
+  --color-sidebar-indent-guide: var(--sidebar-indent-guide);
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
@@ -287,6 +295,15 @@
   --sidebar-card-border: --alpha(var(--color-black) / 9%);
   --sidebar-card-shadow: 0 1px 2px --alpha(var(--color-black) / 6%);
   --sidebar-env-band: color-mix(in srgb, var(--color-black) 2.5%, var(--background));
+  /* Sidebar levels (#290, R65): each follows the tokens a theme overrides. */
+  --sidebar-env-accent: var(--primary);
+  --sidebar-primary-badge: color-mix(in srgb, var(--primary) 14%, var(--sidebar-card));
+  --sidebar-primary-badge-foreground: color-mix(in srgb, var(--primary) 65%, var(--color-black));
+  --sidebar-worktree: color-mix(in srgb, var(--primary) 5%, var(--sidebar-card));
+  --sidebar-worktree-border: color-mix(in srgb, var(--foreground) 16%, var(--sidebar-worktree));
+  --sidebar-worktree-icon: color-mix(in srgb, var(--primary) 80%, var(--color-black));
+  --sidebar-chat-foreground: color-mix(in srgb, var(--foreground) 80%, var(--sidebar-card));
+  --sidebar-indent-guide: color-mix(in srgb, var(--foreground) 45%, var(--sidebar-env-band));
   --destructive-foreground: var(--color-red-700);
   --link: var(--color-blue-700);
   --info: var(--color-blue-500);
@@ -336,6 +353,13 @@
     --sidebar-card-shadow:
       inset 0 1px 0 --alpha(var(--color-white) / 5%), 0 2px 6px --alpha(var(--color-black) / 60%);
     --sidebar-env-band: color-mix(in srgb, var(--color-white) 7%, var(--background));
+    /* Dark tints lighten instead of darken, and a worktree lifts off the band. */
+    --sidebar-primary-badge: color-mix(in srgb, var(--primary) 24%, var(--sidebar-card));
+    --sidebar-primary-badge-foreground: color-mix(in srgb, var(--primary) 55%, var(--color-white));
+    --sidebar-worktree: color-mix(in srgb, var(--primary) 7%, var(--sidebar-env-band));
+    --sidebar-worktree-border: color-mix(in srgb, var(--foreground) 18%, var(--sidebar-worktree));
+    --sidebar-worktree-icon: color-mix(in srgb, var(--primary) 70%, var(--color-white));
+    --sidebar-chat-foreground: color-mix(in srgb, var(--foreground) 78%, var(--sidebar-card));
     --destructive-foreground: var(--color-red-400);
     --link: var(--color-blue-400);
     --info: var(--color-blue-500);
@@ -419,6 +443,73 @@
 /* Secondary text on a sidebar card; the dark default is brighter than the global muted grey. */
 [data-sidebar-card] {
   --muted-foreground: var(--sidebar-card-muted-foreground);
+}
+
+/* The five sidebar levels (#290, R63 to R65), drawn for the left panel and the theme editor's
+   preview alike from data-sidebar-level and data-primary. The repository card keeps
+   SIDEBAR_CARD_CLASS. These rules sit in the components layer, so the card state utilities
+   (selected, active, hover, unavailable) still win over a level's resting look (R64). */
+@layer components {
+  [data-sidebar-level="environment"] {
+    border-radius: calc(var(--radius) - 2px);
+    background-color: var(--sidebar-env-band);
+    box-shadow: inset 3px 0 0 var(--sidebar-env-accent);
+  }
+
+  [data-sidebar-level="checkout"] {
+    font-size: 13px;
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-label] {
+    font-weight: 600;
+    color: var(--foreground-strong, var(--foreground));
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-icon] {
+    color: var(--sidebar-primary-badge-foreground);
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-badge] {
+    border-radius: calc(var(--radius) - 6px);
+    background-color: var(--sidebar-primary-badge);
+    color: var(--sidebar-primary-badge-foreground);
+    font-weight: 500;
+  }
+
+  [data-sidebar-level="worktree"] {
+    position: relative;
+    margin-inline-start: 0.75rem;
+    background-color: var(--sidebar-worktree);
+    font-size: 13px;
+  }
+
+  /* The indent guide runs beside the worktree, under its environment. */
+  [data-sidebar-level="worktree"]::before {
+    position: absolute;
+    inset-block: -2px;
+    inset-inline-start: calc(-0.5rem - 1px);
+    width: 1px;
+    background-color: var(--sidebar-indent-guide);
+    content: "";
+  }
+
+  [data-sidebar-level="worktree"] [data-sidebar-icon] {
+    color: var(--sidebar-worktree-icon);
+  }
+
+  [data-sidebar-level="chat"] {
+    /* text-xs, the app's smallest size (UI.md, Typography). */
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1rem;
+    color: var(--sidebar-chat-foreground);
+  }
+}
+
+/* Outside the layers, so a resting worktree keeps its outline over the card's transparent
+   border; a selected worktree keeps the selection border (R64). */
+[data-sidebar-level="worktree"]:not([data-selected="true"]) {
+  border-color: var(--sidebar-worktree-border);
 }
 
 body {

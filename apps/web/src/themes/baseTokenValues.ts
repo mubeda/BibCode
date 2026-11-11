@@ -1,4 +1,4 @@
-import { mixHex } from "./themeColor";
+import { mixColor } from "./themeColor";
 
 type Resolve = (token: string) => string;
 type Formula = (resolve: Resolve) => string;
@@ -8,11 +8,18 @@ const WHITE = "#ffffff";
 // Tailwind amber-400, oklch(82.8% 0.189 84.429).
 const AMBER_400 = "#ffb900";
 
+/** The sidebar level tokens both bases share (index.css light block, R65). */
+const SIDEBAR_LEVEL_DEFAULTS: Record<string, Formula> = {
+  "sidebar-env-accent": (resolve) => resolve("primary"),
+  "sidebar-indent-guide": (resolve) =>
+    mixColor(resolve("foreground"), resolve("sidebar-env-band"), 45),
+};
+
 const THEME_ONLY_DEFAULTS: Record<string, Formula> = {
   "foreground-strong": (resolve) => resolve("foreground"),
-  placeholder: (resolve) => mixHex(resolve("muted-foreground"), "transparent", 72),
-  "primary-hover": (resolve) => mixHex(resolve("primary"), "transparent", 90),
-  "primary-active": (resolve) => mixHex(resolve("primary"), "transparent", 90),
+  placeholder: (resolve) => mixColor(resolve("muted-foreground"), "transparent", 72),
+  "primary-hover": (resolve) => mixColor(resolve("primary"), "transparent", 90),
+  "primary-active": (resolve) => mixColor(resolve("primary"), "transparent", 90),
   selected: (resolve) => resolve("accent"),
   "selected-foreground": (resolve) => resolve("accent-foreground"),
 };
@@ -24,21 +31,39 @@ const THEME_ONLY_DEFAULTS: Record<string, Formula> = {
 export const DERIVED_DEFAULTS: Record<"light" | "dark", Record<string, Formula>> = {
   light: {
     "app-chrome-background": (resolve) => resolve("background"),
-    "panel-separator": (resolve) => mixHex(resolve("ring"), "transparent", 25),
-    "sidebar-well": (resolve) => mixHex(BLACK, resolve("background"), 4.5),
+    "panel-separator": (resolve) => mixColor(resolve("ring"), "transparent", 25),
+    "sidebar-well": (resolve) => mixColor(BLACK, resolve("background"), 4.5),
     "sidebar-card": (resolve) => resolve("background"),
-    "sidebar-env-band": (resolve) => mixHex(BLACK, resolve("background"), 2.5),
+    "sidebar-env-band": (resolve) => mixColor(BLACK, resolve("background"), 2.5),
+    "sidebar-primary-badge": (resolve) => mixColor(resolve("primary"), resolve("sidebar-card"), 14),
+    "sidebar-primary-badge-foreground": (resolve) => mixColor(resolve("primary"), BLACK, 65),
+    "sidebar-worktree": (resolve) => mixColor(resolve("primary"), resolve("sidebar-card"), 5),
+    "sidebar-worktree-border": (resolve) =>
+      mixColor(resolve("foreground"), resolve("sidebar-worktree"), 16),
+    "sidebar-worktree-icon": (resolve) => mixColor(resolve("primary"), BLACK, 80),
+    "sidebar-chat-foreground": (resolve) =>
+      mixColor(resolve("foreground"), resolve("sidebar-card"), 80),
+    ...SIDEBAR_LEVEL_DEFAULTS,
     ...THEME_ONLY_DEFAULTS,
   },
   dark: {
     "app-chrome-background": (resolve) => resolve("background"),
-    card: (resolve) => mixHex(resolve("background"), WHITE, 98),
-    popover: (resolve) => mixHex(resolve("background"), WHITE, 98),
-    "panel-separator": (resolve) => mixHex(resolve("ring"), "transparent", 25),
-    "sidebar-well": (resolve) => mixHex(BLACK, resolve("background"), 55),
-    "sidebar-card": (resolve) => mixHex(WHITE, resolve("background"), 4),
-    "sidebar-env-band": (resolve) => mixHex(WHITE, resolve("background"), 7),
-    "find-match": (resolve) => mixHex(AMBER_400, resolve("background"), 35),
+    card: (resolve) => mixColor(resolve("background"), WHITE, 98),
+    popover: (resolve) => mixColor(resolve("background"), WHITE, 98),
+    "panel-separator": (resolve) => mixColor(resolve("ring"), "transparent", 25),
+    "sidebar-well": (resolve) => mixColor(BLACK, resolve("background"), 55),
+    "sidebar-card": (resolve) => mixColor(WHITE, resolve("background"), 4),
+    "sidebar-env-band": (resolve) => mixColor(WHITE, resolve("background"), 7),
+    "find-match": (resolve) => mixColor(AMBER_400, resolve("background"), 35),
+    "sidebar-primary-badge": (resolve) => mixColor(resolve("primary"), resolve("sidebar-card"), 24),
+    "sidebar-primary-badge-foreground": (resolve) => mixColor(resolve("primary"), WHITE, 55),
+    "sidebar-worktree": (resolve) => mixColor(resolve("primary"), resolve("sidebar-env-band"), 7),
+    "sidebar-worktree-border": (resolve) =>
+      mixColor(resolve("foreground"), resolve("sidebar-worktree"), 18),
+    "sidebar-worktree-icon": (resolve) => mixColor(resolve("primary"), WHITE, 70),
+    "sidebar-chat-foreground": (resolve) =>
+      mixColor(resolve("foreground"), resolve("sidebar-card"), 78),
+    ...SIDEBAR_LEVEL_DEFAULTS,
     ...THEME_ONLY_DEFAULTS,
   },
 };
@@ -81,6 +106,14 @@ export const BASE_TOKEN_VALUES: Record<"light" | "dark", Record<string, string>>
     "sidebar-card": "#ffffff",
     "sidebar-card-border": "#00000017",
     "sidebar-env-band": "#f9f9f9",
+    "sidebar-env-accent": "#d8610e",
+    "sidebar-primary-badge": "#fae9dd",
+    "sidebar-primary-badge-foreground": "#8c3f09",
+    "sidebar-worktree": "#fdf7f3",
+    "sidebar-worktree-border": "#dbd6d2",
+    "sidebar-worktree-icon": "#ad4e0b",
+    "sidebar-chat-foreground": "#515151",
+    "sidebar-indent-guide": "#9a9a9a",
     link: "#1447e6",
     info: "#2b7fff",
     "info-foreground": "#1447e6",
@@ -146,6 +179,14 @@ export const BASE_TOKEN_VALUES: Record<"light" | "dark", Record<string, string>>
     "sidebar-card": "#202020",
     "sidebar-card-border": "#ffffff21",
     "sidebar-env-band": "#272727",
+    "sidebar-env-accent": "#d8610e",
+    "sidebar-primary-badge": "#4c2f1b",
+    "sidebar-primary-badge-foreground": "#eaa87a",
+    "sidebar-worktree": "#332b25",
+    "sidebar-worktree-border": "#564f4a",
+    "sidebar-worktree-icon": "#e49056",
+    "sidebar-chat-foreground": "#c6c6c6",
+    "sidebar-indent-guide": "#838383",
     link: "#51a2ff",
     info: "#2b7fff",
     "info-foreground": "#51a2ff",

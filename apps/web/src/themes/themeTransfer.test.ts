@@ -154,7 +154,7 @@ describe("theme export and import", () => {
     const badge = {
       "sidebar-primary-badge": "#3a2a1a",
       "sidebar-primary-badge-foreground": "#3b2b1b",
-      "sidebar-worktree": "#202830",
+      "sidebar-worktree": "#10141a",
     };
     const plan = transfer.planThemeImport(
       JSON.stringify({ ...night, ui: { ...night.ui, ...badge } }),
@@ -167,7 +167,7 @@ describe("theme export and import", () => {
     expect(plan.theme.ui).toEqual({
       ...night.ui,
       "sidebar-primary-badge": "#3a2a1a",
-      "sidebar-worktree": "#202830",
+      "sidebar-worktree": "#10141a",
     });
     const again = transfer.planThemeImport(transfer.exportThemeJson(plan.theme));
     expect(again).toMatchObject({ ok: true, theme: plan.theme, resetPairs: [] });

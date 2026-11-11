@@ -130,9 +130,14 @@ export function mix(a: Rgba, b: Rgba, percentOfA: number): Rgba {
   return { r: channel("r"), g: channel("g"), b: channel("b"), a: alpha };
 }
 
-/** `mix` on color strings, returned as hex. */
-export function mixHex(a: string, b: string, percentOfA: number): string {
-  return formatHex(mix(parseOrThrow(a), parseOrThrow(b), percentOfA));
+/**
+ * `mix` on color strings, unrounded as `rgb(r g b / a)`, so a formula built on another formula
+ * rounds once, like the browser (`resolveToken` returns hex).
+ */
+export function mixColor(a: string, b: string, percentOfA: number): string {
+  const { r, g, b: blue, a: alpha } = mix(parseOrThrow(a), parseOrThrow(b), percentOfA);
+  const fixed = (value: number) => value.toFixed(4);
+  return `rgb(${fixed(r)} ${fixed(g)} ${fixed(blue)} / ${fixed(alpha)})`;
 }
 
 function parseOrThrow(value: string): Rgba {
@@ -209,6 +214,24 @@ export const FIXED_PAIRS: readonly FixedPair[] = [
     surface: "terminal.background",
     label: "Terminal text on terminal background",
   },
+  // The sidebar levels (R65). Each text is a sidebar token, so an import reset removes only it.
+  {
+    text: "sidebar-primary-badge-foreground",
+    surface: "sidebar-primary-badge",
+    label: "Primary badge text on primary badge",
+  },
+  { text: "sidebar-chat-foreground", surface: "sidebar-card", label: "Chat text on sidebar card" },
+  {
+    text: "sidebar-chat-foreground",
+    surface: "sidebar-env-band",
+    label: "Chat text on environment band",
+  },
+  { text: "sidebar-chat-foreground", surface: "sidebar-worktree", label: "Chat text on worktree" },
+  {
+    text: "sidebar-worktree-icon",
+    surface: "sidebar-worktree",
+    label: "Worktree icon on worktree",
+  },
 ];
 
 /**
@@ -217,6 +240,10 @@ export const FIXED_PAIRS: readonly FixedPair[] = [
  * `terminal.<name>`.
  */
 export function resolveToken(theme: ThemeFile, token: string): string {
+  return toHex(resolveUnrounded(theme, token));
+}
+
+function resolveUnrounded(theme: ThemeFile, token: string): string {
   if (token.startsWith("terminal.")) {
     const own = theme.terminal?.[token.slice("terminal.".length) as keyof typeof theme.terminal];
     return own === undefined ? baseValue(theme, token) : toHex(own);
@@ -224,7 +251,7 @@ export function resolveToken(theme: ThemeFile, token: string): string {
   const own = theme.ui?.[token as keyof typeof theme.ui];
   if (own !== undefined) return toHex(own);
   const formula = DERIVED_DEFAULTS[theme.base][token];
-  return formula ? formula((source) => resolveToken(theme, source)) : baseValue(theme, token);
+  return formula ? formula((source) => resolveUnrounded(theme, source)) : baseValue(theme, token);
 }
 
 function baseValue(theme: ThemeFile, token: string): string {

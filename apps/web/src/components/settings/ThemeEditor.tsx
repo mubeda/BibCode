@@ -19,6 +19,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { Switch } from "../ui/switch";
 import { ThemeColorField } from "./ThemeColorField";
 import { SettingsSection } from "./settingsLayout";
+import { SidebarLevelsPreview } from "./SidebarLevelsPreview";
 
 /** Editor groups from the design note's token list; every supported token appears once. */
 const UI_GROUPS: { title: string; tokens: readonly UiToken[] }[] = [
@@ -92,6 +93,14 @@ const UI_GROUPS: { title: string; tokens: readonly UiToken[] }[] = [
       "sidebar-card-border",
       "sidebar-env-band",
       "sidebar-card-shadow",
+      "sidebar-env-accent",
+      "sidebar-primary-badge",
+      "sidebar-primary-badge-foreground",
+      "sidebar-worktree",
+      "sidebar-worktree-border",
+      "sidebar-worktree-icon",
+      "sidebar-chat-foreground",
+      "sidebar-indent-guide",
     ],
   },
 ];
@@ -369,6 +378,7 @@ export function ThemeEditor({ themeId, onClose }: { themeId: string; onClose(): 
               <legend className="mb-2 text-sm font-medium text-foreground-strong">
                 {group.title}
               </legend>
+              {group.title === "Sidebar" ? <SidebarLevelsPreview /> : null}
               {group.tokens.map(renderUiField)}
             </fieldset>
           ))}

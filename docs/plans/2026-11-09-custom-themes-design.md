@@ -73,17 +73,18 @@ ThemeFile = {
 
 Each token's editor group is fixed here. The editor shows every token exactly once (R47, D20).
 
-| Group            | Tokens                                                                                                                                                                                                                           |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Surfaces         | `background`, `app-chrome-background`, `card`, `popover`, `secondary`, `muted`, `accent`, `selected`, `border`, `input`, `panel-separator`                                                                                       |
-| Text             | `foreground`, `foreground-strong`, `card-foreground`, `popover-foreground`, `secondary-foreground`, `muted-foreground`, `accent-foreground`, `selected-foreground`, `placeholder`, `link`                                        |
-| Accent and focus | `primary`, `primary-foreground`, `primary-hover`, `primary-active`, `ring`                                                                                                                                                       |
-| Status           | `destructive`, `destructive-foreground`, `info`, `info-foreground`, `success`, `success-foreground`, `warning`, `warning-foreground`, `find-match`, `find-match-foreground`, `find-match-active`, `find-match-active-foreground` |
-| Sidebar          | `sidebar-well`, `sidebar-card`, `sidebar-card-border`, `sidebar-env-band`                                                                                                                                                        |
-| Terminal         | the `TERMINAL_TOKENS` below                                                                                                                                                                                                      |
+| Group            | Tokens                                                                                                                                                                                                                                                                                                                     |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Surfaces         | `background`, `app-chrome-background`, `card`, `popover`, `secondary`, `muted`, `accent`, `selected`, `border`, `input`, `panel-separator`                                                                                                                                                                                 |
+| Text             | `foreground`, `foreground-strong`, `card-foreground`, `popover-foreground`, `secondary-foreground`, `muted-foreground`, `accent-foreground`, `selected-foreground`, `placeholder`, `link`                                                                                                                                  |
+| Accent and focus | `primary`, `primary-foreground`, `primary-hover`, `primary-active`, `ring`                                                                                                                                                                                                                                                 |
+| Status           | `destructive`, `destructive-foreground`, `info`, `info-foreground`, `success`, `success-foreground`, `warning`, `warning-foreground`, `find-match`, `find-match-foreground`, `find-match-active`, `find-match-active-foreground`                                                                                           |
+| Sidebar          | `sidebar-well`, `sidebar-card`, `sidebar-card-border`, `sidebar-env-band`, and the eight level tokens of R65: `sidebar-env-accent`, `sidebar-primary-badge`, `sidebar-primary-badge-foreground`, `sidebar-worktree`, `sidebar-worktree-border`, `sidebar-worktree-icon`, `sidebar-chat-foreground`, `sidebar-indent-guide` |
+| Terminal         | the `TERMINAL_TOKENS` below                                                                                                                                                                                                                                                                                                |
 
-That is 42 color tokens: the 36 the base stylesheet defines (spec, Supported tokens) and the six
-of D17.
+That is 50 color tokens: the 36 the base stylesheet defines (spec, Supported tokens), the six
+of D17 and the eight sidebar level tokens of R65 (amendment A9). Their recipes, values and
+contrast are in `2026-11-11-sidebar-hierarchy-design.md`.
 
 ### The six new color tokens (D17, R50)
 
@@ -132,22 +133,24 @@ Phase 1 and is switched by Task 8.4.
 previews and the paint record agree with the painted page. The inventory comes from
 `index.css` lines 243 to 331.
 
-| Token                             | Light                                  | Dark                                                       |
-| --------------------------------- | -------------------------------------- | ---------------------------------------------------------- |
-| `app-chrome-background`           | `background`                           | `background`                                               |
-| `card`, `popover`                 | literal                                | `background` 98 percent with white                         |
-| `panel-separator`                 | `ring` at 25 percent alpha             | inherited from the light block, `ring` at 25 percent alpha |
-| `sidebar-well`                    | black 4.5 percent over `background`    | black 55 percent over `background`                         |
-| `sidebar-card`                    | `background`                           | white 4 percent over `background`                          |
-| `sidebar-env-band`                | black 2.5 percent over `background`    | white 7 percent over `background`                          |
-| `find-match`                      | literal                                | amber-400 35 percent over `background`                     |
-| `foreground-strong`               | `foreground`                           | `foreground`                                               |
-| `placeholder`                     | `muted-foreground` at 72 percent alpha | same                                                       |
-| `primary-hover`, `primary-active` | `primary` at 90 percent alpha          | same                                                       |
-| `selected`, `selected-foreground` | `accent`, `accent-foreground`          | same                                                       |
+| Token                             | Light                                        | Dark                                                       |
+| --------------------------------- | -------------------------------------------- | ---------------------------------------------------------- |
+| `app-chrome-background`           | `background`                                 | `background`                                               |
+| `card`, `popover`                 | literal                                      | `background` 98 percent with white                         |
+| `panel-separator`                 | `ring` at 25 percent alpha                   | inherited from the light block, `ring` at 25 percent alpha |
+| `sidebar-well`                    | black 4.5 percent over `background`          | black 55 percent over `background`                         |
+| `sidebar-card`                    | `background`                                 | white 4 percent over `background`                          |
+| `sidebar-env-band`                | black 2.5 percent over `background`          | white 7 percent over `background`                          |
+| `find-match`                      | literal                                      | amber-400 35 percent over `background`                     |
+| `foreground-strong`               | `foreground`                                 | `foreground`                                               |
+| `placeholder`                     | `muted-foreground` at 72 percent alpha       | same                                                       |
+| `primary-hover`, `primary-active` | `primary` at 90 percent alpha                | same                                                       |
+| `selected`, `selected-foreground` | `accent`, `accent-foreground`                | same                                                       |
+| the eight sidebar level tokens    | see `2026-11-11-sidebar-hierarchy-design.md` | see the same note                                          |
 
 A formula keeps its alpha (`#rrggbbaa`). Only `contrastRatio` composites a translucent color over
-the surface it is measured on.
+the surface it is measured on. A formula built on another formula rounds to hex once, at the end
+of the chain.
 
 ### Non-color tokens
 
@@ -378,7 +381,10 @@ fixed keyword (spec, Anti-goals; R48).
   `muted-foreground` on `background`, on `card` and on `accent`; `selected-foreground` on
   `selected`; `placeholder` on `background`; `find-match-foreground` on `find-match`;
   `find-match-active-foreground` on `find-match-active`; `terminal.foreground` on
-  `terminal.background`.
+  `terminal.background`. Amendment A9 (R65) appends five sidebar level pairs:
+  `sidebar-primary-badge-foreground` on `sidebar-primary-badge`; `sidebar-chat-foreground` on
+  `sidebar-card`, on `sidebar-env-band` and on `sidebar-worktree`; `sidebar-worktree-icon` on
+  `sidebar-worktree`.
 - The editor lists each pair with its ratio to two decimals and marks a pair below 4.5:1 with a
   warning icon and the text "Low contrast", naming both tokens. Save stays enabled (R54).
 - Import: a fixed pair below 4.5:1 is reset only when the same pair at the theme's base values
