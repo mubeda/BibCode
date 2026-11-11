@@ -3868,12 +3868,10 @@ const SidebarProjectListRow = memo(function SidebarProjectListRow(props: Sidebar
   return (
     <SidebarMenuItem
       // ps-1 keeps the band's 3px leading rule clear of the header; pb-1 lifts its last row off its edge.
-      // An unavailable environment dims its whole band, surface and accent rule included.
-      className={
-        isCard
-          ? cn(SIDEBAR_CARD_CLASS, "p-1")
-          : cn("ps-1 pb-1", !props.environmentCard?.available && "opacity-60")
-      }
+      // An unavailable environment weakens its band through data-unavailable (index.css); no opacity,
+      // so the rows stay readable and keep their focus ring. Only the header dims.
+      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "ps-1 pb-1"}
+      data-unavailable={props.environmentCard?.available === false ? "true" : undefined}
       data-sidebar-card={isCard ? "true" : undefined}
       data-sidebar-level={isCard ? "repo" : "environment"}
     >

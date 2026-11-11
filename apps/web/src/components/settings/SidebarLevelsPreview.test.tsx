@@ -28,7 +28,7 @@ describe("SidebarLevelsPreview", () => {
   it("draws one repository, two environments, a primary checkout, two worktrees and chat rows", () => {
     expect(levels("repo")).toHaveLength(1);
     expect(levels("environment")).toHaveLength(2);
-    expect(levels("checkout")).toHaveLength(1);
+    expect(levels("checkout")).toHaveLength(2);
     expect(levels("worktree")).toHaveLength(2);
     expect(levels("chat").length).toBeGreaterThanOrEqual(3);
     expect(levels("chat").some((row) => /^\d+ more chats$/.test(row.textContent ?? ""))).toBe(true);
@@ -55,7 +55,9 @@ describe("SidebarLevelsPreview", () => {
     expect(active[0]).toBe(levels("checkout")[0]);
     expect(levels("checkout")[0]!.dataset.selected).toBeUndefined();
     const [, unavailable] = levels("environment");
-    expect(unavailable!.className).toContain("opacity-60");
+    expect(unavailable!.dataset.unavailable).toBe("true");
+    expect(unavailable!.className).not.toMatch(/\bopacity-/);
+    expect(unavailable!.querySelector('[data-sidebar-level="chat"]')).not.toBeNull();
     expect(unavailable!.textContent).toContain("Unavailable");
   });
 

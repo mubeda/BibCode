@@ -16,10 +16,17 @@ function EnvironmentHeader(props: {
   name: string;
   status: string;
   path?: string;
+  /** The header of an unavailable environment dims; its rows do not. */
+  dimmed?: boolean;
 }) {
   const Icon = props.icon;
   return (
-    <div className="flex min-w-0 items-center gap-2 px-1 text-[13px] font-medium text-foreground/90">
+    <div
+      className={cn(
+        "flex min-w-0 items-center gap-2 px-1 text-[13px] font-medium text-foreground/90",
+        props.dimmed && "opacity-60",
+      )}
+    >
       <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 truncate">{props.name}</span>
       <span className="shrink-0 text-xs font-normal text-muted-foreground">{props.status}</span>
@@ -150,9 +157,32 @@ export function SidebarLevelsPreview() {
             </li>
             <li
               data-sidebar-level="environment"
-              className="grid gap-1 py-1.5 ps-2.5 pe-1.5 opacity-60"
+              data-unavailable="true"
+              className="grid gap-1 py-1.5 ps-2.5 pe-1.5"
             >
-              <EnvironmentHeader icon={ServerIcon} name="example-server" status="Unavailable" />
+              <EnvironmentHeader
+                icon={ServerIcon}
+                name="example-server"
+                status="Unavailable"
+                dimmed
+              />
+              <ul className="grid gap-1">
+                <li
+                  data-sidebar-level="checkout"
+                  className={cn(
+                    resolveWorkspaceCardClassName({ isActive: false, isSelected: false }),
+                    "px-2 py-1",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
+                    <span data-sidebar-label className="min-w-0 truncate">
+                      develop
+                    </span>
+                  </div>
+                  <ChatRows chats={["Cached: review the schema"]} />
+                </li>
+              </ul>
             </li>
           </ul>
         </li>

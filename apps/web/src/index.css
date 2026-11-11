@@ -459,6 +459,13 @@
     box-shadow: inset 3px 0 0 var(--sidebar-env-accent);
   }
 
+  /* An unavailable environment weakens its band and rule instead of fading it with opacity, which
+     would drop its rows' text and focus ring below contrast. Only the header dims. */
+  [data-sidebar-level="environment"][data-unavailable="true"] {
+    background-color: color-mix(in srgb, var(--sidebar-env-band) 50%, transparent);
+    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--sidebar-env-accent) 50%, transparent);
+  }
+
   [data-sidebar-level="checkout"] {
     font-size: 13px;
   }

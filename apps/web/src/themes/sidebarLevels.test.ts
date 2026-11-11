@@ -346,3 +346,40 @@ describe("environment band outside a repository card (R63)", () => {
     );
   });
 });
+
+describe("unavailable environment band (R63)", () => {
+  const UNAVAILABLE = '[data-sidebar-level="environment"][data-unavailable="true"]';
+
+  it("weakens the band fill and the accent rule, with no opacity that would fade its rows", () => {
+    const rule = ruleDeclarations(UNAVAILABLE);
+    expect(rule.get("background-color")).toContain("var(--sidebar-env-band)");
+    expect(rule.get("box-shadow")).toContain("var(--sidebar-env-accent)");
+    expect(rule.has("opacity")).toBe(false);
+  });
+
+  for (const theme of BUILTIN_THEMES) {
+    it(`${theme.name} keeps label, chat and muted text at 4.5:1 on the weaker band fill`, () => {
+      const overrides = themeOverrides(theme);
+      const evaluate = (expression: string) =>
+        evaluateCssTokens(theme.base, { ...overrides, "probe-value": expression })("probe-value");
+      const resolve = (token: string) => resolveToken(theme, token);
+      const card = compositeHex(
+        resolve("sidebar-card"),
+        compositeHex(resolve("sidebar-well"), resolve("background")),
+      );
+      const fill = compositeHex(
+        evaluate(ruleDeclarations(UNAVAILABLE).get("background-color")!),
+        card,
+      );
+      const text = {
+        label: evaluate(ruleDeclarations("[data-sidebar-label]").get("color")!),
+        chat: resolve("sidebar-chat-foreground"),
+        muted: resolveSidebarMuted(theme),
+      };
+      for (const [name, color] of Object.entries(text)) {
+        const ratio = contrastRatio(color, fill);
+        expect(ratio, `${name} on the unavailable band`).toBeGreaterThanOrEqual(4.5);
+      }
+    });
+  }
+});

@@ -154,9 +154,10 @@ fill.
 `resolveWorkspaceCardClassName` in `Sidebar.logic.ts` keeps its classes for every card: outlined,
 the active card's `bg-foreground/8`, the selected card's `bg-primary/15` with `border-primary/40`,
 the selected and active card's `bg-primary/22` with `border-primary/60`, the hover `bg-accent/60`,
-the inner button's orange focus ring. An unavailable environment puts `opacity-60` on the element
-that owns the band, as the preview does, so the band surface and accent rule dim with the header
-(and with any rows the band still holds).
+the inner button's orange focus ring. An unavailable environment puts `data-unavailable="true"` on the
+element that owns the band, as the preview does, and no opacity: the level rule paints a weaker
+band fill and accent rule, the header keeps `opacity-60`, and any rows the band still holds paint
+at full strength so their text and focus ring keep their contrast.
 
 In the Environments view a remote's context card (`EnvironmentContextCard`) is the environment
 level band, drawn by the same rule. The rule also maps `--muted-foreground` to the sidebar card's

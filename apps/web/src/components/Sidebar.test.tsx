@@ -4723,10 +4723,14 @@ staticDescribe("Sidebar levels (R63, R64)", () => {
       "data-selected",
     );
     const remoteBand = liWith(markup, `data-testid="environment-card-header-${ENV_REMOTE}"`);
-    // The band owns the dim, as in the preview, so its surface and rule dim with the header.
+    // The band carries the attribute and no opacity, so its rows keep full contrast and focus ring;
+    // only the header dims.
     expect(openingTag(remoteBand)).toContain('data-sidebar-level="environment"');
-    expect(openingTag(remoteBand)).toMatch(/class="[^"]*\bopacity-60\b/);
-    expect(remoteBand).not.toMatch(/group\/project-header[^"]*opacity-60/);
+    expect(openingTag(remoteBand)).toContain('data-unavailable="true"');
+    expect(openingTag(remoteBand)).not.toMatch(/class="[^"]*\bopacity-/);
+    expect(remoteBand).toMatch(
+      /<span[^>]*\bopacity-60\b[^>]*data-testid="environment-card-header-/,
+    );
   });
 
   it("draws the hidden worktrees row as chat level without its own text colour", () => {

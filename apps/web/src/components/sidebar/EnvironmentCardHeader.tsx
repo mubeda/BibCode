@@ -1,6 +1,7 @@
 import { MonitorIcon } from "lucide-react";
 import { memo } from "react";
 
+import { cn } from "../../lib/utils";
 import { EnvironmentStatusDot } from "./EnvironmentRail";
 import type { EnvironmentCardIdentity } from "./repositoryView.logic";
 
@@ -14,7 +15,7 @@ export const EnvironmentCardHeader = memo(function EnvironmentCardHeader({
 }) {
   return (
     <span
-      className="flex min-w-0 flex-1 items-center gap-2"
+      className={cn("flex min-w-0 flex-1 items-center gap-2", !identity.available && "opacity-60")}
       data-testid={`environment-card-header-${identity.environmentId}`}
     >
       <span className="relative inline-flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-xs font-semibold text-foreground">
