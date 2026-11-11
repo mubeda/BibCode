@@ -84,6 +84,7 @@ describe("resolveThreadProviderBinding", () => {
       projectDefaultModelSelection: null,
       selectedProviderInstanceId: claudeInstanceId,
       providers: [codexProvider, claudeProvider],
+      providerChosen: true,
     });
 
     expect(binding).toMatchObject({
@@ -113,6 +114,7 @@ describe("resolveThreadProviderBinding", () => {
       projectDefaultModelSelection: null,
       selectedProviderInstanceId: claudeInstanceId,
       providers: [codexProvider, claudeProvider],
+      providerChosen: true,
     });
 
     expect(binding).toMatchObject({
@@ -151,6 +153,7 @@ describe("resolveThreadProviderBinding", () => {
       projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
       selectedProviderInstanceId: codexInstanceId,
       providers: [],
+      providerChosen: true,
     });
 
     expect(binding).toEqual({
@@ -186,6 +189,7 @@ describe("resolveThreadProviderBinding", () => {
       projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
       selectedProviderInstanceId: codexInstanceId,
       providers: [contradictoryStatus, codexProvider],
+      providerChosen: true,
     });
 
     expect(binding).toEqual({
@@ -215,6 +219,7 @@ describe("resolveThreadProviderBinding", () => {
       projectDefaultModelSelection: null,
       selectedProviderInstanceId: claudeInstanceId,
       providers: [claudeProvider],
+      providerChosen: true,
     });
 
     expect(binding).toMatchObject({
@@ -226,12 +231,13 @@ describe("resolveThreadProviderBinding", () => {
     });
   });
 
-  it("keeps a pre-start live composer selection unlocked", () => {
+  it("keeps a blank draft's live composer selection unlocked", () => {
     const binding = resolveThreadProviderBinding({
       thread: thread(),
       projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
       selectedProviderInstanceId: claudeInstanceId,
       providers: [codexProvider, claudeProvider],
+      providerChosen: false,
     });
 
     expect(binding).toMatchObject({
@@ -240,6 +246,60 @@ describe("resolveThreadProviderBinding", () => {
       status: { instanceId: "claude" },
       lockedProvider: null,
       lockedProviderInstanceId: null,
+    });
+  });
+
+  it("locks a never-started chat created for a provider to that exact instance", () => {
+    const binding = resolveThreadProviderBinding({
+      thread: thread({ modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" } }),
+      projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      selectedProviderInstanceId: null,
+      providers: [codexProvider, claudeProvider],
+      providerChosen: true,
+    });
+
+    expect(binding).toMatchObject({
+      instanceId: "claude",
+      driver: "claude",
+      status: { instanceId: "claude" },
+      lockedProvider: null,
+      lockedProviderInstanceId: "claude",
+      conflict: null,
+    });
+  });
+
+  it("keeps a never-started chat on its disabled provider instead of another one", () => {
+    const binding = resolveThreadProviderBinding({
+      thread: thread({ modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" } }),
+      projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      selectedProviderInstanceId: null,
+      providers: [codexProvider, { ...claudeProvider, enabled: false }],
+      providerChosen: true,
+    });
+
+    expect(binding).toMatchObject({
+      instanceId: "claude",
+      status: { instanceId: "claude", enabled: false },
+      lockedProvider: null,
+      lockedProviderInstanceId: "claude",
+    });
+  });
+
+  it("keeps a never-started chat on its provider while that provider reports no status", () => {
+    const binding = resolveThreadProviderBinding({
+      thread: thread({ modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" } }),
+      projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      selectedProviderInstanceId: null,
+      providers: [codexProvider],
+      providerChosen: true,
+    });
+
+    expect(binding).toMatchObject({
+      instanceId: "claude",
+      driver: null,
+      status: null,
+      lockedProvider: null,
+      lockedProviderInstanceId: "claude",
     });
   });
 });

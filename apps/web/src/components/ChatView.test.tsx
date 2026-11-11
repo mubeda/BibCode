@@ -75,6 +75,8 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     /** Renders the real ChatComposer and ThreadErrorBanner behind their capturing mocks. */
     realChildren: false,
+    /** With `realChildren`, also renders the real model picker instead of its stub. */
+    realModelPicker: false,
     realTimeline: false,
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
@@ -246,9 +248,14 @@ vi.mock("./device/deviceAvailability", () => ({
 }));
 
 // What the real ChatComposer reads when `h.realChildren` renders it; ChatView reads none of it.
-vi.mock("./chat/ProviderModelPicker", () => ({
-  ProviderModelPicker: () => <div data-mock="provider-model-picker" />,
-}));
+vi.mock("./chat/ProviderModelPicker", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ProviderModelPicker")>();
+  const RealPicker = actual.ProviderModelPicker as unknown as (props: object) => ReactNode;
+  return {
+    ProviderModelPicker: (props: Record<string, unknown>) =>
+      h.realModelPicker ? <RealPicker {...props} /> : <div data-mock="provider-model-picker" />,
+  };
+});
 vi.mock("../state/providerCapabilities", () => ({
   useProviderCapabilities: () => ({
     data: { slashCommands: [], skills: [], agents: [], issues: [] },
@@ -399,6 +406,7 @@ vi.mock("../hooks/useSettings", () => ({
   // Read by the real composer's model picker when `h.realChildren` renders it.
   useClientSettings: (selector?: (settings: Record<string, unknown>) => unknown) =>
     selector ? selector(h.settings) : h.settings,
+  useUpdateClientSettings: () => () => undefined,
 }));
 
 vi.mock("../assets/assetUrls", () => ({
@@ -1085,6 +1093,7 @@ beforeEach(() => {
   h.openThreadFindTargets.length = 0;
   h.captured = {};
   h.realChildren = false;
+  h.realModelPicker = false;
   h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -3874,7 +3883,7 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
     });
 
-    it("updates the pre-start host tab label when the selected provider changes", () => {
+    it("keeps a never-started main chat on its provider when another provider is selected (#347)", () => {
       const claudeInstanceId = ProviderInstanceId.make("claude");
       const claudeProvider: ServerProvider = {
         ...codexProvider,
@@ -3897,7 +3906,7 @@ describe("ChatView", () => {
       renderServerRoute();
       expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
       const initialComposer = capturedProps<Record<string, unknown>>("chatComposer");
-      expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(false);
+      expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(true);
       const initialSurfaces =
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces;
 
@@ -3909,7 +3918,10 @@ describe("ChatView", () => {
       publishSeededStoreState(useComposerDraftStore);
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Claude");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.activeProvider).not.toBe(
+        "claude",
+      );
       expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
@@ -7698,5 +7710,282 @@ describe("ChatView long-lived handlers (#204)", () => {
     expect(bannerError()).toBeNull();
     await renderRoute(environmentId, threadId);
     expect(bannerError()).toBe("Compaction refused.");
+  });
+});
+
+describe("ChatView composer model picker provider scope (#347)", () => {
+  const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+  const claudeProvider: ServerProvider = {
+    ...codexProvider,
+    instanceId: claudeInstanceId,
+    driver: ProviderDriverKind.make("claudeAgent"),
+    displayName: "Claude",
+    models: [
+      { slug: "claude-opus-4-6", name: "Claude Opus 4.6", isCustom: false, capabilities: null },
+      { slug: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", isCustom: false, capabilities: null },
+    ],
+  };
+  // A second account of the Claude driver with its own catalog.
+  const claudeWorkProvider: ServerProvider = {
+    ...claudeProvider,
+    instanceId: ProviderInstanceId.make("claude_work"),
+    displayName: "Claude Work",
+    models: [{ slug: "claude-work-only", name: "Work Only", isCustom: false, capabilities: null }],
+  };
+  const codexSelection = { instanceId: codexInstanceId, model: "gpt-5.4" };
+  const claudeSelection = { instanceId: claudeInstanceId, model: "claude-opus-4-6" };
+
+  function enableClaudeWorkInstance(): void {
+    h.settings = {
+      ...h.settings,
+      providerInstances: { claude_work: { driver: "claudeAgent", enabled: true } },
+    };
+  }
+
+  let mounted: { container: HTMLDivElement; root: Root } | null = null;
+
+  afterEach(async () => {
+    if (!mounted) return;
+    const { container, root } = mounted;
+    mounted = null;
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
+  async function mount(element: ReactElement): Promise<HTMLDivElement> {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    h.realChildren = true;
+    h.realModelPicker = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mounted = { container, root };
+    await act(async () => {
+      root.render(element);
+      await Promise.resolve();
+    });
+    return container;
+  }
+
+  /** Opens the real picker from its trigger and returns the instance of every listed model. */
+  async function openPickerAndListInstances(container: HTMLElement): Promise<string[]> {
+    const trigger = container.querySelector<HTMLButtonElement>(
+      "[data-chat-provider-model-picker='true']",
+    );
+    expect(trigger, "model picker trigger").not.toBeNull();
+    await act(async () => {
+      trigger!.click();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() =>
+      expect(document.querySelector("[data-model-picker-content]")).not.toBeNull(),
+    );
+    return [...document.querySelectorAll<HTMLElement>("[data-model-picker-instance-id]")].map(
+      (row) => row.dataset.modelPickerInstanceId ?? "",
+    );
+  }
+
+  function seedTwoReadyProviders(): void {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+  }
+
+  const serverRoute = (
+    <ChatView
+      environmentId={environmentId}
+      threadId={threadId}
+      routeKind="server"
+      reserveTitleBarControlInset
+    />
+  );
+
+  it.each([
+    { label: "Claude", selection: claudeSelection, other: codexInstanceId },
+    { label: "Codex", selection: codexSelection, other: claudeInstanceId },
+  ])(
+    "lists only $label models in a never-started main chat created with $label (A1, A2)",
+    async ({ selection, other }) => {
+      seedTwoReadyProviders();
+      seedProject(makeProject());
+      seedServerThread(makeThread({ modelSelection: selection }));
+
+      const container = await mount(serverRoute);
+      const listed = await openPickerAndListInstances(container);
+
+      expect(listed.length).toBeGreaterThan(0);
+      expect(listed).not.toContain(other);
+      expect(new Set(listed)).toEqual(new Set([selection.instanceId]));
+    },
+  );
+
+  it("leaves out a second account of the same driver in a never-started main chat (A5)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider, claudeWorkProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    enableClaudeWorkInstance();
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+
+    const container = await mount(serverRoute);
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([claudeInstanceId]),
+    );
+  });
+
+  it("rejects a selection for another provider and keeps the chat, model and draft text (A4)", async () => {
+    seedTwoReadyProviders();
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+    useComposerDraftStore.getState().setPrompt(threadRef, "keep this text");
+    publishSeededStoreState(useComposerDraftStore);
+    await mount(serverRoute);
+
+    const select = capturedProps<Record<string, unknown>>("chatComposer")[
+      "onProviderModelSelect"
+    ] as (instanceId: ProviderInstanceId, model: string) => void;
+    await act(async () => select(codexInstanceId, "gpt-5.4"));
+
+    const draft = useComposerDraftStore.getState().getComposerDraft(threadRef);
+    expect(draft?.activeProvider ?? claudeInstanceId).toBe(claudeInstanceId);
+    expect(draft?.modelSelectionByProvider?.[codexInstanceId]).toBeUndefined();
+    expect(draft?.prompt).toBe("keep this text");
+
+    await act(async () => select(claudeInstanceId, "claude-sonnet-4-6"));
+    expect(
+      useComposerDraftStore.getState().getComposerDraft(threadRef)?.modelSelectionByProvider?.[
+        claudeInstanceId
+      ]?.model,
+    ).toBe("claude-sonnet-4-6");
+  });
+
+  it.each([
+    {
+      label: "disabled",
+      provider: { ...claudeProvider, enabled: false },
+      disable: true,
+    },
+    {
+      label: "not ready",
+      provider: { ...claudeProvider, status: "error" as const },
+      disable: false,
+    },
+  ])(
+    "offers no other provider's models when the chat's provider is $label (A6)",
+    async ({ provider, disable }) => {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [codexProvider, provider], environment: { label: "Local" } },
+        }),
+      );
+      seedGitStatus(true);
+      if (disable) {
+        const providerSettings = h.settings["providers"] as Record<string, object>;
+        h.settings = {
+          ...h.settings,
+          providers: {
+            ...providerSettings,
+            claudeAgent: { ...providerSettings["claudeAgent"], enabled: false },
+          },
+        };
+      }
+      seedProject(makeProject());
+      seedServerThread(makeThread({ modelSelection: claudeSelection }));
+
+      const container = await mount(serverRoute);
+
+      expect(await openPickerAndListInstances(container)).toEqual([]);
+      expect(
+        capturedProps<Record<string, unknown>>("chatComposer")["providerBindingInstanceId"],
+      ).toBe(claudeInstanceId);
+    },
+  );
+
+  it("still lists every ready provider in a blank new draft, where the picker chooses the provider", async () => {
+    seedTwoReadyProviders();
+    seedProject(makeProject());
+    const draftId = newDraftId();
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId(
+        "logical-project-1",
+        scopeProjectRef(environmentId, projectId),
+        draftId,
+        { threadId, createdAt: now, envMode: "local" },
+      );
+    useComposerDraftStore.getState().setModelSelection(draftId, codexSelection);
+    publishSeededStoreState(useComposerDraftStore);
+    const container = await mount(
+      <ChatView
+        environmentId={environmentId}
+        threadId={threadId}
+        routeKind="draft"
+        draftId={draftId}
+      />,
+    );
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([codexInstanceId, claudeInstanceId]),
+    );
+    const select = capturedProps<Record<string, unknown>>("chatComposer")[
+      "onProviderModelSelect"
+    ] as (instanceId: ProviderInstanceId, model: string) => void;
+    await act(async () => select(claudeInstanceId, "claude-opus-4-6"));
+    expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.activeProvider).toBe(
+      claudeInstanceId,
+    );
+  });
+
+  it("keeps a started chat on its driver, where its own accounts stay switchable", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider, claudeWorkProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    enableClaudeWorkInstance();
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: claudeSelection,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "claudeAgent",
+          providerInstanceId: claudeInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+    );
+
+    const container = await mount(serverRoute);
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([claudeInstanceId, claudeWorkProvider.instanceId]),
+    );
   });
 });
