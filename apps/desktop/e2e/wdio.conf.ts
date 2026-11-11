@@ -8,7 +8,12 @@ import { installDesktopUiMotionGuard } from "./support/motion-guard.ts";
 import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
-import { isFinalDesktopUiSpec, requestDesktopUiApplicationExit } from "./support/app-lifecycle.ts";
+import {
+  isDesktopUiApplicationRunning,
+  isFinalDesktopUiSpec,
+  requestDesktopUiApplicationExit,
+  stopRelaunchedDesktopUiApplication,
+} from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
   prepareDesktopUiTestContext,
@@ -185,7 +190,8 @@ export const config = {
     _context: unknown,
     result: { readonly passed: boolean },
   ) => {
-    if (!result.passed) {
+    // A closing case may have ended the app; there is no window left to record.
+    if (!result.passed && (await isDesktopUiApplicationRunning())) {
       await browser.saveScreenshot(screenshotPath(`failure-${test.title}`));
       NodeFS.writeFileSync(
         screenshotPath(`failure-source-${test.title}`).replace(/\.png$/, ".html"),
@@ -198,6 +204,8 @@ export const config = {
     // Ask Tauri to run its normal ExitRequested path so the in-process backend and provider
     // children release Windows filesystem handles before the launcher service stops the driver.
     await requestDesktopUiApplicationExit();
+    // The service stops only the app it started; an app a closing case relaunched is stopped here.
+    await stopRelaunchedDesktopUiApplication();
   },
   onComplete: () => {
     // Keep the app's own logs (native page loads, webview process failures, server errors)
