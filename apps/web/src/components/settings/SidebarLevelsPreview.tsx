@@ -103,7 +103,15 @@ export function SidebarLevelsPreview() {
                 path="~/sample-project"
               />
               <ul className="grid gap-1">
-                <li data-sidebar-level="checkout" data-primary="" className="rounded-md px-2 py-1">
+                <li
+                  data-sidebar-level="checkout"
+                  data-primary=""
+                  data-active="true"
+                  className={cn(
+                    resolveWorkspaceCardClassName({ isActive: true, isSelected: false }),
+                    "px-2 py-1",
+                  )}
+                >
                   <div className="flex min-w-0 items-center gap-1.5 text-foreground/90">
                     <HouseIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
                     <span data-sidebar-label className="min-w-0 truncate">
@@ -118,7 +126,6 @@ export function SidebarLevelsPreview() {
                 <Worktree branch="feature/sample" selected chats={["Fix the sign-in redirect"]} />
                 <Worktree
                   branch="feature/sample-docs"
-                  active
                   chats={["Update the setup guide"]}
                   more={3}
                 />

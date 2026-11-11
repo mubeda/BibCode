@@ -176,8 +176,8 @@ same element that carries `resolveWorkspaceCardClassName`:
 - `data-sidebar-level="chat"` on each chat row and on the "N more chats" row inside a checkout or
   worktree, so the muted text and chat rules reach them.
 
-`SidebarLevelsPreview` sets the same attributes: `feature/sample` is selected and
-`feature/sample-docs` is active and not selected.
+`SidebarLevelsPreview` sets the same attributes: the primary checkout `main` is active and not
+selected, `feature/sample` is selected, and `feature/sample-docs` is at rest.
 
 ## Where the styles live
 
@@ -185,9 +185,9 @@ All level rules are in one block of `apps/web/src/index.css`, after the `[data-s
 rule, keyed on `data-sidebar-level`, `data-primary` and the three child markers. The theme editor's
 Sidebar group shows `SidebarLevelsPreview` (`apps/web/src/components/settings/`), a static,
 `inert` figure of fixture data: one repository (`example-group/sample-project`) with two
-environments (Local, connected, and `example-server`, unavailable), the primary checkout `main`,
-two worktrees (`feature/sample`, selected, and `feature/sample-docs`, active), chat rows and a "3
-more chats" row. It uses `SIDEBAR_CARD_CLASS` and `resolveWorkspaceCardClassName` from
+environments (Local, connected, and `example-server`, unavailable), the primary checkout `main`
+(active), two worktrees (`feature/sample`, selected, and `feature/sample-docs`, at rest), chat rows
+and a "3 more chats" row. It uses `SIDEBAR_CARD_CLASS` and `resolveWorkspaceCardClassName` from
 `Sidebar.logic.ts`, so it is drawn by the same rules and state classes as the left panel. Editing
 a token repaints the preview through the editor's live theme preview, with no subscription in the
 preview.
