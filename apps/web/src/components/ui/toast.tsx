@@ -78,9 +78,17 @@ const TOAST_ICONS = {
   warning: TriangleAlertIcon,
 } as const;
 
+/** Multi-line text (e.g. guidance, a blank line, then Git's own line) keeps its breaks and scrolls past ~6 lines instead of being clamped. */
+function isMultiLineDescription(description: unknown): description is string {
+  return typeof description === "string" && description.includes("\n");
+}
+
 /** Visually shorten long error bodies; clipboard copy still uses the full `description` string. */
 const ERROR_DESCRIPTION_CLAMP_MIN_CHARS = 180;
 function errorDescriptionClampClass(type: unknown, description: unknown): string | undefined {
+  if (isMultiLineDescription(description)) {
+    return "max-h-32 overflow-y-auto whitespace-pre-line";
+  }
   if (type !== "error" || typeof description !== "string") {
     return undefined;
   }
@@ -234,6 +242,7 @@ function ToastBodyContent({
               errorDescriptionClampClass(toastType, toastDescription),
             )}
             data-slot="toast-description"
+            {...(isMultiLineDescription(toastDescription) ? { tabIndex: 0 } : {})}
           />
         </div>
       </div>

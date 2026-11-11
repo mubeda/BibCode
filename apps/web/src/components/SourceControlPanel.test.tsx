@@ -8,7 +8,7 @@ import {
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
-import { isValidElement, type Dispatch, type ReactElement, type SetStateAction } from "react";
+import { type Dispatch, type ReactElement, type SetStateAction } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -755,20 +755,9 @@ const GIT_USERNAME_LINE =
   "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
 const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
 
-/** The failure toast's description keeps both paragraphs, line breaks and selection. */
+/** The failure toast's description is the raw string; the shared toast renders the line breaks. */
 function expectMultiLineDescription(description: unknown): void {
-  expect(isValidElement(description)).toBe(true);
-  const { className, children } = (
-    description as ReactElement<{
-      className: string;
-      children: string;
-    }>
-  ).props;
-  expect(className.split(" ")).toEqual(
-    expect.arrayContaining(["whitespace-pre-line", "select-text"]),
-  );
-  expect(children.startsWith(`${REMOTE_PUSH_GUIDANCE}\n\n`)).toBe(true);
-  expect(children.split("\n").at(-1)).toBe(GIT_USERNAME_LINE);
+  expect(description).toBe(REMOTE_PUSH_FAILURE);
 }
 
 describe("SourceControlPanel", () => {

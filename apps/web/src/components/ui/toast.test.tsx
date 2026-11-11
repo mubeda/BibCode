@@ -315,6 +315,31 @@ describe("ToastProvider rendering", () => {
     expect(renderProvider(<ToastProvider />)).not.toContain("line-clamp-4");
   });
 
+  it("keeps line breaks, Copy, and a bounded keyboard-reachable region for multi-line failures", () => {
+    const copy = vi.fn();
+    testState.copyToClipboard = copy;
+    const raw = "Sign in first.\n\nfatal: could not read Username ".concat("x".repeat(200));
+    testState.toasts = [makeToast({ type: "error", description: raw })];
+    const markup = renderProvider(<ToastProvider />);
+    const [description] = ui.filter("Description") as [Record<string, unknown>];
+    expect(String(description["className"])).toContain("whitespace-pre-line");
+    expect(String(description["className"])).toContain("max-h-32");
+    expect(String(description["className"])).toContain("overflow-y-auto");
+    expect(String(description["className"])).not.toContain("line-clamp-4");
+    expect(description["tabIndex"]).toBe(0);
+    expect(markup).toContain('aria-label="Copy error"');
+    (findHostByAria("Copy error")!["onClick"] as () => void)();
+    expect(copy).toHaveBeenCalledWith(raw);
+  });
+
+  it("leaves single-line descriptions out of the scroll region", () => {
+    testState.toasts = [makeToast({ type: "error", description: "one line" })];
+    renderProvider(<ToastProvider />);
+    const [description] = ui.filter("Description") as [Record<string, unknown>];
+    expect(String(description["className"])).not.toContain("whitespace-pre-line");
+    expect(description["tabIndex"]).toBeUndefined();
+  });
+
   it("shows the copy-error control and tighter padding for string error descriptions", () => {
     testState.toasts = [makeToast({ type: "error", description: "boom" })];
     const markup = renderProvider(<ToastProvider />);

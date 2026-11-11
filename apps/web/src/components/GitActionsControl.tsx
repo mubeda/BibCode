@@ -19,15 +19,7 @@ import type {
 } from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import * as Option from "effect/Option";
-import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useEffectEvent,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   CheckIcon,
@@ -131,18 +123,6 @@ type PublishProviderKind = Extract<
   SourceControlProviderKind,
   "github" | "gitlab" | "bitbucket" | "azure-devops"
 >;
-
-/**
- * A multi-line failure (#343: where to sign in, a blank line, then Git's own line) keeps its
- * line breaks; a one-line failure stays a string so the toast keeps its Copy button.
- */
-function failureDescription(message: string): ReactNode {
-  return message.includes("\n") ? (
-    <span className="select-text whitespace-pre-line">{message}</span>
-  ) : (
-    message
-  );
-}
 
 type GitActionToastId = ReturnType<typeof toastManager.add>;
 
@@ -1494,9 +1474,7 @@ export default function GitActionsControl({
           stackedThreadToast({
             type: "error",
             title: stackedActionFailureTitle(error),
-            description: failureDescription(
-              error instanceof Error ? error.message : "An error occurred.",
-            ),
+            description: error instanceof Error ? error.message : "An error occurred.",
             ...(scopedToastData !== undefined ? { data: scopedToastData } : {}),
           }),
         );
