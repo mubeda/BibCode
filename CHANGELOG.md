@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Pipelines
+
+- Stage, layer and Jobs headers in the pipeline detail view now read as group labels on their own strip, apart from the job rows below them, in the wide and the stacked layout; each is still one heading with its status, name and job count. (#340)
+
+### Git
+
+- A push that fails for missing credentials on a remote server now says that Git ran on that server, names it, and tells you to run `git push` in a terminal there; Source Control and the Git Manager show the same guidance. (#343)
+- Background status reads no longer take Git's index lock, so your own `git add` or `git commit` in a terminal no longer fails with "index.lock: File exists" while BiBCode is open. BiBCode asks Git to stop before killing it, removes only an `index.lock` its own killed process left, and leaves none behind when it quits. (#341)
+- Local status for a worktree is delivered while a stacked action or a Git Manager push, publish, force push or remote branch delete waits on the network. Writes stay one at a time; pull and fetch still wait. (#345)
+- The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
+
+### Files
+
+- Markdown opens editable in rendered view, with a formatting group in the Files toolbar (paragraph, headings 1 to 5, bold, italic, strikethrough, bullet, numbered and task lists, block quote, a link dialog, Insert image next to the file, collapsible section). Undo and Redo work in both views and a save changes only what you edited; frontmatter and constructs the editor cannot represent stay as written or read-only. (#342)
+- Ticking a task checkbox in a read-only Markdown or `.mdx` file keeps the file's source Undo history. (#342)
+
+### Appearance
+
+- Settings > Appearance lists six built-in themes (Tokyo Night, Matrix Dark, Matrix Light, Verdant Light and the existing Light and Dark) and lets you duplicate, edit with a live preview, import, export and delete custom themes, with contrast warnings. New terminal sessions and the pipeline job log can follow the theme's terminal colors, and a theme can also set scrollbars, focus rings, control shadows and selected rows. (#290)
+- Clicking a theme row applies it and, when the theme's base differs from the mode on screen, switches the mode with an Undo that restores the previous mode and theme. (#290)
+- The left panel draws its repository, environment, primary checkout, worktree and chat rows as five visually distinct levels in every built-in theme, and a theme can style each level. (#290)
+- On the desktop app, exporting a theme or plan opens the native Save dialog, and closing, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel. (#290, #342)
+
 ## [v0.15.3] - 2026-11-08
 
 BiBCode v0.15.3 guards checkpoint restores in shared checkouts, offers Git Credential Manager sign-in on the desktop, keeps named MCP clients across runs, reworks the Pipelines and Files views, loads pipelines for self-hosted GitLab on any port, and hardens load-sensitive tests and secret scanning. This release includes PR #337 since v0.15.2.
