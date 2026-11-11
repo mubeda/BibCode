@@ -1,13 +1,13 @@
 # Phase 12: Review button
 
 - Goal: One click on "Review changes" in Source Control starts a review of the branch and its uncommitted changes in a chat panel or an AI Terminal, started in the provider's own read-only or approval mechanism wherever one exists and saying so where none exists (copy names the mechanism, never the outcome), with per-user and per-project prompts, a reviewed design note, tests, docs and a packaged end-to-end check (amendment A11; R90 to R105).
-- Round: set by the coordinator, who also registers this phase and makes the batch's final gates depend on it
+- Round: 6
 - Depends on: 5 (migration 72 and its applied-id lists), 10 (no shared files, but both change `CHANGELOG.md` and `docs/user/workspace-ui.md`)
 - Owns: `docs/plans/2026-11-11-code-review-button-design.md`; in `packages/contracts/src/`: `settings.ts`, `orchestration.ts`, `rpc.ts`, `environment.ts`, `keybindings.ts` and their tests; the regenerated files under `packages/contracts/fixtures/`; `apps/server/src/production/control.rs`, `apps/server/src/orchestration/engine.rs`, `apps/server/src/persistence/repositories.rs`, `apps/server/src/persistence/migrations.rs` (migrations 73 and 74 only), `apps/server/src/production/orchestration_rpc.rs`, `apps/server/src/production/worktree_catalog_rpc.rs`, `apps/server/src/lifecycle.rs` (capability only), the `ProjectionProject` and `ProjectionThread` literals the new fields break, `apps/server/src/process/executable.rs` (the batch command-line length check of Task 12.4, and the conditional encoder fix of Task 12.18 only), `apps/server/tests/{orchestration,repositories,windows_terminal_shims}.rs`; `.github/workflows/ci.yml` (one Windows step); `apps/web/src/codeReview.ts` and its test; `apps/web/src/components/SourceControlPanel.tsx`, `SourceControlPanel.logic.ts` and their tests; `apps/web/src/components/sourceControl/CodeReviewProjectPromptDialog.tsx` and its test; `apps/web/src/components/chat/providerTerminalActions.ts` and its test; `apps/web/src/centerPanelActions.ts` and its test; `apps/web/src/components/ChatView.tsx` (the review handler, its prop to the panel, and the Implement gates); `apps/web/src/components/chat/ComposerPrimaryActions.tsx`, `ProposedPlanCard.tsx`, `MessagesTimeline.tsx` (the card's caller), `apps/web/src/components/PlanSidebar.tsx` and their tests (the review gate only); `apps/web/src/components/settings/SettingsPanels.tsx` and its test (the Code review group); `packages/shared/src/keybindings.defaults.json` and its test; `apps/desktop/e2e/specs/source-control-review.e2e.ts` and the Claude fixture's review reply in `apps/desktop/e2e/support/test-project.ts`; `docs/architecture/rpc-and-orchestration.md` (the review panel paragraph)
 - Must not touch: other migrations and other phases' rows in the applied-id lists beyond appending 73 and 74; `apps/server/src/terminal/pty.rs` (the length check lives beside the encoder in `executable.rs`); `apps/server/src/provider/**` (no driver mapping changes); `docs/plans/2026-11-09-issue-batch-340-345-290/{spec.md,plan.md,progress.md}` and other phase files
 - Shared files: `packages/contracts/**` and its fixtures, `apps/server/src/persistence/migrations.rs` (migrations 73 and 74 are this phase's; it appends them to every hard-coded applied-id list, about 17 places that end in 72 today; the other phase drafted in parallel uses no migration), `CHANGELOG.md`, `docs/user/workspace-ui.md`, `apps/desktop/e2e/wdio.conf.ts` and `.github/workflows/ci.yml` are also changed by that other phase; the coordinator sequences them.
 - Skills: test-driven-development (every behaviour starts from a failing test); vercel-react-best-practices (AGENTS.md requires it for the changed components and hooks); better-accessibility (the icon button, its menu, the dialog and their names)
-- Read first: the design note `docs/plans/2026-11-11-code-review-button-design.md` (all of it: the guard table, the lead-in, D40 to D49); `amendments/A11-review-button.md` (R90 to R105); `UI.md` (Buttons and Actions, Forms, Errors, Text and Copy: no em dashes); `docs/architecture/rpc-and-orchestration.md` lines 2335 to 2350 (how `sideChat` is carried, the model for `codeReview`)
+- Read first: the design note `docs/plans/2026-11-11-code-review-button-design.md` (all of it: the guard table, the lead-in, D40 to D49); `spec.md` (R90 to R105); `UI.md` (Buttons and Actions, Forms, Errors, Text and Copy: no em dashes); `docs/architecture/rpc-and-orchestration.md` lines 2335 to 2350 (how `sideChat` is carried, the model for `codeReview`)
 - Checkpoint: `cargo test -p bibcode-server --lib -j 2 code_review`, `cargo test -p bibcode-server --test orchestration -j 2 code_review` and, from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/codeReview.test.ts src/components/SourceControlPanel.logic.test.ts src/components/chat/providerTerminalActions.test.ts src/centerPanelActions.test.ts` exit 0. In the app, "Review changes" in Source Control opens a "Code review · Codex" tab whose first message is the review prompt.
 
 Rust build slot: Tasks 12.1 to 12.4 compile Rust and run `vp run check:contracts` (which runs `cargo test -p bibcode-server --test rpc_wire`); they run only when no other lane compiles Rust. Tasks 12.5 onward are TypeScript, except that 12.11 needs a packaged build and the conditional 12.18 compiles Rust.
@@ -224,7 +224,8 @@ Steps
 - Skills: none
 - Read first: `apps/desktop/e2e/specs/chat-side-chat.e2e.ts` (fixture import, panel tab selectors, provider input log); `apps/desktop/e2e/support/test-project.ts` lines 588 to 810 (the Claude fixture); `docs/testing/cross-platform-validation.md` (how a packaged spec runs per platform)
 - Tier: standard
-- TDD: red-green (the spec fails before 12.8 lands, and the Claude case fails without the review flag)
+- TDD: red-green
+- TDD note: the spec fails before the button lands, and the Claude case fails without the review flag
 - Done when: the packaged desktop E2E run for the host platform, as `docs/testing/cross-platform-validation.md` describes it, exits 0 with `source-control-review.e2e.ts` passing both cases
 
 Steps
@@ -338,7 +339,7 @@ Steps
 
 Steps
 
-1. [ ] Gate: confirm the green Windows run of `review_prompt_shim_` with no ignored test. Without it, stop: this task stays Open.
+1. [ ] Gate: confirm the green Windows run of `review_prompt_shim_` with no ignored test. Expected: a run on real Windows whose output lists every `review_prompt_shim_` case as ok and none as ignored. Without it, stop: this task stays Open.
 2. [ ] Change the Windows-off test to expect an enabled action with flattened line breaks on Windows. Run. Expected: FAIL. Set the switch. Run. Expected: PASS.
 3. [ ] Update the two docs, run `vp check`. Expected: no errors.
 

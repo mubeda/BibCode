@@ -1,8 +1,8 @@
 # Phase 8: End-to-end tests, documents and final gates
 
 - Goal: The combined branch is proven in the packaged desktop app, the user guide, runbooks, notices and changelog describe the seven changes, every repository gate passes, and the final report is written.
-- Round: 5
-- Depends on: 1, 2, 3, 4, 5, 6, 7, 9, 10
+- Round: 7
+- Depends on: 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12
 - Owns: `apps/desktop/e2e/specs/files-rich-markdown.e2e.ts`, `apps/desktop/e2e/specs/appearance-themes.e2e.ts`, `apps/desktop/e2e/specs/desktop-save-and-close.e2e.ts`, `apps/desktop/e2e/support/app-lifecycle.ts`, `apps/desktop/e2e/wdio.conf.ts`, `docs/user/workspace-ui.md`, `docs/testing/**`, `apps/web/THIRD_PARTY_NOTICES.md`, `CHANGELOG.md`, and the one selected-state class in `apps/web/src/components/pipelines/detail/PipelineStageColumns.tsx`
 - Must not touch: source files of Phases 2 to 7 except to fix a defect an end-to-end test or a gate exposes, which reopens the owning task
 - Skills: issue-delivery (acceptance evidence per issue before any costly run)
@@ -119,7 +119,7 @@ Steps
 ### Task 8.5: Final gates, follow-up issue and report
 
 - Satisfies: support (closes the plan: the gates of AGENTS.md and the spec's open question)
-- Depends on: 8.3, 8.6
+- Depends on: 8.3, 8.6, 11.15, 12.12
 - Files: modify `progress.md` of this plan folder (the executor's own record)
 - Interfaces: consumes every earlier task; produces the final report and one new GitHub issue.
 - Skills: none

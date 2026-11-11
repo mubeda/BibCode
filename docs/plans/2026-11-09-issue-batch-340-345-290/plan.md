@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 e4ab07f2c50a)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 4c0e9570defa)
 Repository: this repository
 Base: main
 
@@ -39,6 +39,8 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A7 (R18, approved by the user in chat on 2026-11-10 during execution). A status refresh does not wait on a slow pull-request lookup: it answers with local status within a bound and the details follow on the status stream (Task 3.4).
 - A8 (R40, D9, approved by the user in chat on 2026-11-10 during execution). Clicking a theme row applies the theme and switches the mode to its base, with Undo (Task 7.8 reopened and closed again).
 - A9 (approved by the user in chat on 2026-11-11 during execution). The sidebar-hierarchy extension of #290 comes into this plan as Phase 10 (R63 to R65, D21), reversing that part of D2. Task 8.5 no longer files a follow-up issue for it.
+- A10 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #292 joins this pull request as Phase 11 (R66 to R85, D22 to D33): a Host dashboard per environment. Its design note is `docs/plans/2026-11-11-host-metrics-dashboard-design.md`. Reviewed by Codex in two rounds and triaged with the advisor; its agent's calls await the user's confirmation before the push.
+- A11 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #293 joins this pull request as Phase 12 (R90 to R105, D40 to D49; R86 to R89 and D34 to D39 are unused): a Review button in Source Control. Its design note is `docs/plans/2026-11-11-code-review-button-design.md`. Reviewed the same way. Phase 12 runs after Phase 11 because both change the contracts and their generated fixtures; Task 8.5 depends on both.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus
@@ -79,18 +81,20 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 
 ## Phases
 
-| Phase | File                                          | Goal                                                                   | Round | Depends on                 | Tier         |
-| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | -------------------------- | ------------ |
-| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                       | standard     |
-| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                       | most capable |
-| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                          | most capable |
-| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                          | most capable |
-| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                          | most capable |
-| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                       | most capable |
-| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                       | most capable |
-| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates                                     | 5     | 1, 2, 3, 4, 5, 6, 7, 9, 10 | standard     |
-| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                       | most capable |
-| 10    | phases/PHASE-10-sidebar-hierarchy.md          | Five readable sidebar levels that themes can style (A9)                | 3     | 7, 9                       | most capable |
+| Phase | File                                          | Goal                                                                   | Round | Depends on                         | Tier         |
+| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | ---------------------------------- | ------------ |
+| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                               | standard     |
+| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                               | most capable |
+| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                                  | most capable |
+| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                                  | most capable |
+| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                                  | most capable |
+| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                               | most capable |
+| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                               | most capable |
+| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates                                     | 7     | 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12 | standard     |
+| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                               | most capable |
+| 10    | phases/PHASE-10-sidebar-hierarchy.md          | Five readable sidebar levels that themes can style (A9)                | 3     | 7, 9                               | most capable |
+| 11    | phases/PHASE-11-host-dashboard.md             | A Host dashboard for each environment (#292, A10)                      | 5     | 10                                 | most capable |
+| 12    | phases/PHASE-12-review-button.md              | A Review button that starts a guarded review session (#293, A11)       | 6     | 11                                 | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds. Tasks inside a phase run one after another, in the order their Depends on lines give: one lane per phase, never one lane per task. The four server phases (2, 3, 4, 5) are a chain because they share `repository.rs`, `git_vcs.rs` and `manager/operations.rs`. Run at most one lane that compiles Rust at a time, and check `df -h .` for at least 60 GB free before a lane starts a build.
 
@@ -159,73 +163,109 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 
 ## Traceability
 
-| Requirement | Tasks               |
-| ----------- | ------------------- |
-| R1          | 1.1                 |
-| R2          | 1.1                 |
-| R3          | 5.2                 |
-| R4          | 5.1                 |
-| R5          | 5.2                 |
-| R6          | 5.2                 |
-| R7          | 5.2                 |
-| R8          | 4.1                 |
-| R9          | 4.2                 |
-| R10         | 4.1                 |
-| R11         | 4.1                 |
-| R12         | 4.1                 |
-| R13         | 8.3                 |
-| R14         | 2.1                 |
-| R15         | 2.2                 |
-| R16         | 2.3                 |
-| R17         | 2.3                 |
-| R18         | 3.2                 |
-| R19         | 3.3                 |
-| R20         | 3.1, 3.2            |
-| R21         | 3.2, 3.3            |
-| R22         | 3.2                 |
-| R23         | 3.1                 |
-| R24         | 6.5                 |
-| R25         | 6.9, 6.4, 8.1       |
-| R26         | 6.5                 |
-| R27         | 6.6                 |
-| R28         | 6.7                 |
-| R29         | 6.4, 8.1            |
-| R30         | 6.2, 6.4, 8.1       |
-| R31         | 6.3, 6.9, 8.1       |
-| R32         | 6.8, 6.4            |
-| R33         | 6.3                 |
-| R34         | 6.8, 6.9, 6.4, 6.10 |
-| R35         | 6.5                 |
-| R36         | 7.2                 |
-| R37         | 7.4, 7.6, 8.2       |
-| R38         | 7.3, 7.5            |
-| R39         | 7.5, 7.6            |
-| R40         | 7.8                 |
-| R41         | 7.6, 8.2            |
-| R42         | 7.6, 8.2            |
-| R43         | 7.8                 |
-| R44         | 7.8, 8.2            |
-| R45         | 7.8                 |
-| R46         | 7.8                 |
-| R47         | 7.9, 8.2            |
-| R48         | 7.2                 |
-| R49         | 7.5                 |
-| R50         | 7.3, 8.4            |
-| R51         | 7.7, 7.14           |
-| R52         | 7.9                 |
-| R53         | 7.10, 9.1, 8.6      |
-| R54         | 7.9                 |
-| R55         | 7.10                |
-| R56         | 7.4                 |
-| R57         | 7.11                |
-| R58         | 7.11                |
-| R59         | 7.12                |
-| R60         | 7.8                 |
-| R61         | 7.5                 |
-| R62         | 9.2, 9.3, 8.6       |
-| R63         | 10.1, 10.2, 8.2     |
-| R64         | 10.2                |
-| R65         | 10.1                |
+| Requirement | Tasks                    |
+| ----------- | ------------------------ |
+| R1          | 1.1                      |
+| R2          | 1.1                      |
+| R3          | 5.2                      |
+| R4          | 5.1                      |
+| R5          | 5.2                      |
+| R6          | 5.2                      |
+| R7          | 5.2                      |
+| R8          | 4.1                      |
+| R9          | 4.2                      |
+| R10         | 4.1                      |
+| R11         | 4.1                      |
+| R12         | 4.1                      |
+| R13         | 8.3                      |
+| R14         | 2.1                      |
+| R15         | 2.2                      |
+| R16         | 2.3                      |
+| R17         | 2.3                      |
+| R18         | 3.2                      |
+| R19         | 3.3                      |
+| R20         | 3.1, 3.2                 |
+| R21         | 3.2, 3.3                 |
+| R22         | 3.2                      |
+| R23         | 3.1                      |
+| R24         | 6.5                      |
+| R25         | 6.9, 6.4, 8.1            |
+| R26         | 6.5                      |
+| R27         | 6.6                      |
+| R28         | 6.7                      |
+| R29         | 6.4, 8.1                 |
+| R30         | 6.2, 6.4, 8.1            |
+| R31         | 6.3, 6.9, 8.1            |
+| R32         | 6.8, 6.4                 |
+| R33         | 6.3                      |
+| R34         | 6.8, 6.9, 6.4, 6.10      |
+| R35         | 6.5                      |
+| R36         | 7.2                      |
+| R37         | 7.4, 7.6, 8.2            |
+| R38         | 7.3, 7.5                 |
+| R39         | 7.5, 7.6                 |
+| R40         | 7.8                      |
+| R41         | 7.6, 8.2                 |
+| R42         | 7.6, 8.2                 |
+| R43         | 7.8                      |
+| R44         | 7.8, 8.2                 |
+| R45         | 7.8                      |
+| R46         | 7.8                      |
+| R47         | 7.9, 8.2                 |
+| R48         | 7.2                      |
+| R49         | 7.5                      |
+| R50         | 7.3, 8.4                 |
+| R51         | 7.7, 7.14                |
+| R52         | 7.9                      |
+| R53         | 7.10, 9.1, 8.6           |
+| R54         | 7.9                      |
+| R55         | 7.10                     |
+| R56         | 7.4                      |
+| R57         | 7.11                     |
+| R58         | 7.11                     |
+| R59         | 7.12                     |
+| R60         | 7.8                      |
+| R61         | 7.5                      |
+| R62         | 9.2, 9.3, 8.6            |
+| R63         | 10.1, 10.2, 8.2          |
+| R64         | 10.2                     |
+| R65         | 10.1                     |
+| R66         | 11.2, 11.3               |
+| R67         | 11.1, 11.3               |
+| R68         | 11.2                     |
+| R69         | 11.1                     |
+| R70         | 11.2, 11.6               |
+| R71         | 11.4                     |
+| R72         | 11.5, 11.6               |
+| R73         | 11.5, 11.7, 11.8, 11.15  |
+| R74         | 11.2, 11.5, 11.15        |
+| R75         | 11.9, 11.14, 11.15       |
+| R76         | 11.8, 11.14, 11.15       |
+| R77         | 11.7, 11.8, 11.15        |
+| R78         | 11.7, 11.8, 11.14, 11.15 |
+| R79         | 11.2, 11.3, 11.6         |
+| R80         | 11.10                    |
+| R81         | 11.11                    |
+| R82         | 11.12                    |
+| R83         | 11.13                    |
+| R84         | 11.2, 11.6               |
+| R85         | 11.5, 11.7               |
+| R90         | 12.3, 12.5, 12.8         |
+| R91         | 12.5                     |
+| R92         | 12.5, 12.6               |
+| R93         | 12.1                     |
+| R94         | 12.2                     |
+| R95         | 12.8                     |
+| R96         | 12.3, 12.7               |
+| R97         | 12.6, 12.8               |
+| R98         | 12.4, 12.6, 12.17, 12.18 |
+| R99         | 12.10                    |
+| R100        | 12.9                     |
+| R101        | 12.11, 12.12             |
+| R102        | 12.13                    |
+| R103        | 12.14                    |
+| R104        | 12.15                    |
+| R105        | 12.16                    |
 
 ## End-to-end verification
 

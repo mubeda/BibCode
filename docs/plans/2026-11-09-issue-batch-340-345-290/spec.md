@@ -1,8 +1,8 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution; amendments A10 and A11 added on the user's instruction of 2026-11-11 and reviewed by Codex and the advisor, with their agent's calls listed for the user before the push)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
-Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09. One pull request closes all seven.
+Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09; issues #292 and #293 by amendments A10 and A11. One pull request closes all nine.
 
 This spec is longer than the usual 25 requirements because the maintainer chose one pull request for seven issues. Each issue has its own section and its requirements can be planned and reviewed on their own. Built-in theme values are in [theme-palettes.md](theme-palettes.md).
 
@@ -1099,6 +1099,701 @@ The supported tokens SHALL include `sidebar-env-accent`, `sidebar-primary-badge`
 - WHEN it is imported
 - THEN that pair falls back as R55 describes
 
+#### Amendment A10: host dashboard (#292)
+
+A10 (proposed 2026-11-11, awaiting the user's approval in chat). Issue #292 joins this pull
+request: a **Host dashboard** for each environment that shows the CPU, memory and volume space of
+the host its server runs on, live and since the server process started. Scope: all of the issue's
+P0, its P1.1 charts inside P0, then P1.2, P1.3 and P1.4, and P2.1 and P2.2 as separate tasks
+that can be cut. The issue was verified at an older commit; its corrections on this branch are in
+[the design note](../2026-11-11-host-metrics-dashboard-design.md#where-the-issue-is-wrong-or-stale-on-this-branch).
+Requirements R66 to R85, decisions D22 to D33. Plan phase: Phase 11.
+
+Names used in these requirements:
+
+- **Host collector**: the server part that reads the host's CPU, memory and volumes.
+- **Background rate**: one reading every 60 seconds. **Live rate**: one reading every second.
+- **Host stream**: the subscription a client opens to receive host readings.
+- **Host dashboard**: the sheet that shows one environment's host readings.
+
+### R66. The host collector reads CPU, memory and volume space without a process scan [Must] (amendment A10)
+
+The host collector SHALL report CPU use as a percentage of all logical cores between 0 and 100, memory total, used and available bytes where used is the operating system's own used figure and available is total minus used, and for each volume its mount point, name, file system, total, free (free space on the volume as the operating system reports it; per-user quotas are not applied) and used (total minus free) bytes, and whether it is removable or read-only (on Linux from the mount options), and it SHALL NOT enumerate processes to do so.
+
+#### Scenario: memory figures
+
+- GIVEN a source that reports 32,000,000,000 bytes total and 11,200,000,000 bytes used
+- WHEN the collector takes a reading
+- THEN the reading has `memoryTotalBytes` 32,000,000,000, `memoryUsedBytes` 11,200,000,000 and `memoryAvailableBytes` 20,800,000,000
+
+#### Scenario: CPU outside its range
+
+- GIVEN a source that reports CPU use of 104.5 and then of -0.2
+- WHEN the collector takes two readings
+- THEN their `cpuPercent` values are 100 and 0
+
+#### Scenario: read-only mount on Linux
+
+- GIVEN a Linux host with an ext4 image mounted read-only at `/mnt/ro-test`
+- WHEN the native source lists and reads its volumes
+- THEN `/mnt/ro-test` has `readOnly` true and `/` has `readOnly` false
+
+#### Scenario: no process table
+
+- GIVEN the native source
+- WHEN it takes 10 readings
+- THEN no process list was refreshed (the source exposes no process refresh and its process count stays 0)
+
+### R67. The volume list shows each local volume once [Must] (amendment A10)
+
+The host collector SHALL skip zero-size volumes, `overlay` volumes not mounted at `/`, mount points that are files, and network volumes, SHALL merge volumes that share storage (same file system, total and free bytes) into one entry mounted at `/` when there is one and otherwise at the shortest mount point, and SHALL keep removable and read-only volumes with their markers.
+
+#### Scenario: container and APFS lists
+
+- GIVEN a source listing `/` (overlay, 100 GB total, 40 GB free), `/etc/hosts` (a file, ext4, 100 GB, 40 GB), `/var/lib/docker/overlay2/x/merged` (overlay, 100 GB, 40 GB), `/System/Volumes/Data` and `/` (both apfs, 2,000 GB total, 600 GB free, on another host), `/snap/core/1` (squashfs, 0 bytes) and `/media/usb` (exfat, 64 GB, 10 GB, removable)
+- WHEN the container list and the APFS list are filtered
+- THEN the container list is `/` and `/media/usb` (removable), and the APFS list is `/` only
+
+#### Scenario: two volumes that only look alike
+
+- GIVEN `/` (ext4, 500 GB, 200 GB free) and `/data` (ext4, 500 GB, 199 GB free)
+- WHEN the list is filtered
+- THEN both are kept
+
+#### Scenario: network volume
+
+- GIVEN a volume of file system `nfs4` mounted at `/mnt/share`
+- WHEN the list is filtered
+- THEN it is not in the list and no space read was attempted for it
+
+### R68. A volume that does not answer does not hold back the rest [Must] (amendment A10)
+
+The host collector SHALL make every volume list and space read on a fixed pool of 4 disk worker threads and never in the CPU and memory sampling; WHILE a volume's read has run longer than 2 seconds, it SHALL report that volume as not responding with its last known sizes, or none before its first answer, SHALL NOT admit another read of that volume, and SHALL apply the late result when it arrives; IF the volume list takes longer than 2 seconds, THEN it SHALL keep the last list; and WHILE all 4 workers are held by calls that have not returned, it SHALL stop admitting disk reads, mark each reading with disk reads paused, and keep publishing CPU and memory at the current rate.
+
+#### Scenario: CPU and memory keep their pace
+
+- GIVEN a source whose volume list call and whose space read of `/mnt/slow` each block a real thread on a channel the test holds, at the live rate of 1 second
+- WHEN 4 seconds pass
+- THEN 4 readings arrive with `sampledAt` values 1 second apart (within 200 ms), each with CPU and memory, `/` from the last list as `ok` and `/mnt/slow` as `notResponding`, and the source received exactly one space read for `/mnt/slow`
+
+#### Scenario: the volume answers late
+
+- GIVEN the held read of `/mnt/slow` from the scenario above
+- WHEN the test releases it with 100 GB total and 30 GB free after 12 seconds
+- THEN the next reading shows `/mnt/slow` as `ok` with those sizes, and the next volume tick admits a new space read for `/mnt/slow`
+
+#### Scenario: every worker is held
+
+- GIVEN a source whose space reads of `/a`, `/b`, `/c` and `/d` all block
+- WHEN 10 seconds pass at the live rate
+- THEN every reading after the fourth call blocked has `volumesPaused` true, no fifth disk call was made, and the readings still arrive once a second
+
+### R69. Statistics since server start keep a fixed size [Must] (amendment A10)
+
+The host collector SHALL keep, for CPU percent and memory used percent since the server process started, the current value, the minimum, the maximum, an average weighted by each reading's interval and a p95 from 1-percentage-point bins (the whole percent at which 95 percent of the weight is reached), in a size that does not grow with uptime, and SHALL keep chart history of the last 15 minutes of readings, 1-minute buckets for the last 24 hours and 15-minute buckets beyond, each bucket with average and peak, with the oldest tier held under 1 MiB.
+
+#### Scenario: known values
+
+- GIVEN background readings of CPU 10, 20, 30, 40 and 90 percent
+- WHEN the statistics are read
+- THEN current is 90, minimum 10, maximum 90, average 38 and p95 is 90
+
+#### Scenario: a watched minute does not outweigh an unwatched hour
+
+- GIVEN 60 background readings of CPU 10 percent (one hour) and then 60 live readings of CPU 90 percent (one minute)
+- WHEN the statistics are read
+- THEN the average is between 11.3 and 11.4 and the p95 is 10
+
+#### Scenario: a week of uptime
+
+- GIVEN one week of simulated background readings on a paused clock
+- WHEN the history is read
+- THEN the raw tier holds at most 900 readings, the minute tier at most 1,440 buckets, and the statistics start at the first reading's time
+
+#### Scenario: the oldest tier compacts
+
+- GIVEN chart history whose oldest tier holds at most 8 buckets, fed 64 closed 15-minute buckets of CPU 10 percent, then 64 of CPU 30 percent of which one contains a reading of 95 percent
+- WHEN the history is read after the compactions this forces
+- THEN the oldest tier holds at most 8 buckets, its first bucket starts at the first reading, the weighted average across its buckets is within 0.1 of 20 percent, and the highest bucket peak is 95
+
+### R70. The collector samples in the background and faster while watched [Must] (amendment A10)
+
+WHILE no host stream is open, the host collector SHALL read CPU and memory at the background rate from server start and volumes every fifth reading; WHILE at least one host stream is open, it SHALL read at the live rate, with volumes every fifth reading; and WHEN the last host stream closes, it SHALL return to the background rate.
+
+#### Scenario: reads per subscriber count
+
+- GIVEN a collector with a fake source on a paused clock
+- WHEN 120 seconds pass with no stream, then 10 seconds with one stream, then 10 seconds with two, then 120 seconds after both closed
+- THEN the source received 2 or 3 CPU and memory reads in the first period, 9 to 11 in each live period (not 18 or more with two streams), and 2 or 3 in the last, and volume reads only on every fifth reading
+
+### R71. The collector's cost is measured, and the sampling policy follows the measurement [Must] (amendment A10)
+
+The host collector's CPU cost SHALL be measured through the real collector path (both loops, statistics, chart production and the encoding of every item one subscriber receives) as CPU time per background reading and per live reading on a macOS host and in a Linux container, and the sampling policy SHALL be the outcome of D22 that the measurement selects: always on with a 1-second live rate when background costs at most 0.1 percent of one core at 60 seconds and live at most 1 percent at 1 second; IF background costs more, THEN collection SHALL start at the first host stream; IF live costs more than 1 percent at 1 second, THEN the live rate SHALL be 2 seconds; and a fallback outcome SHALL take effect only after the user approves it.
+
+#### Scenario: measured cost
+
+- GIVEN the real collector with the native source on this repository's macOS development host and in the Linux lab container, at test rates no faster than 250 ms so that every CPU refresh does its work
+- WHEN the cost probe runs 300 background-shaped and 300 live-shaped readings with one subscriber whose items are encoded
+- THEN the probe reports CPU time per reading of each kind and the derived percent of one core at 60 s and at 1 s, and the design note records the figures, the method and the selected outcome
+
+### R72. The host stream sends a snapshot first, then readings, to an authorized client only [Must] (amendment A10)
+
+WHEN a client with the `orchestration:read` scope opens the host stream, the server SHALL send first a snapshot with the host's operating system, architecture, logical CPU count and total memory, the server's start time and boot ID, the current reading, the statistics and both charts, then one reading with the updated statistics each live tick, and SHALL end the stream when the client closes it or disconnects; IF the client lacks that scope, THEN the server SHALL refuse the stream with an authorization error and send no reading.
+
+#### Scenario: snapshot then sample
+
+- GIVEN a server whose collector has a fake source
+- WHEN a client opens the host stream and waits 2 seconds
+- THEN the first item is a `Snapshot` with `bootId`, `startedAt`, `host.cpuCount` and statistics, and the next items are `Sample` items one second apart
+
+#### Scenario: under-scoped session
+
+- GIVEN a session whose token has only the `orchestration:operate` scope
+- WHEN it opens the host stream
+- THEN it receives `EnvironmentAuthorizationError` with `requiredScope` `orchestration:read` and no chunk
+
+#### Scenario: client leaves
+
+- GIVEN an open host stream
+- WHEN the client closes it
+- THEN the stream's task ends and the collector is back at the background rate within one second
+
+### R73. Servers advertise host metrics, and the client never asks one that does not [Must] (amendment A10)
+
+The server SHALL advertise `hostMetrics: true` in both of its environment descriptors, a descriptor without the flag SHALL decode as `false`, and WHILE an environment's `hostMetrics` is false, the client SHALL NOT send the host stream request and the host dashboard SHALL say "This server's version doesn't report host metrics. Update it to see this dashboard." with an **Open Remote Servers** button.
+
+#### Scenario: older server
+
+- GIVEN a remote environment whose descriptor has no `hostMetrics` field
+- WHEN its host dashboard is opened
+- THEN the sheet shows the unsupported message and the button, and no `server.subscribeHostMetrics` request was sent
+
+### R74. Mount points stay out of logs, profiler records and fingerprints [Must] (amendment A10)
+
+The host collector SHALL name a volume in log lines only by its file system type and position in the list, and no profiler event, finding or fingerprint SHALL contain a mount point or volume name.
+
+#### Scenario: hung volume log
+
+- GIVEN a volume mounted at `/media/test-user/backup` that does not answer
+- WHEN the collector logs it
+- THEN the log line is `host volume did not answer` with `file_system` and `position` fields and contains neither `test-user` nor `backup`
+
+### R75. Every environment has a Host dashboard entry [Must] (amendment A10)
+
+The web client SHALL offer **Host dashboard** in a remote environment's Environment actions menu, in each connected saved server row in Settings, Remote Servers, and in the status bar's Resource Manager popover for the selected environment, local or remote, and each SHALL open the host dashboard of that environment.
+
+#### Scenario: three entry points
+
+- GIVEN a connected remote environment `example-server` and the local environment
+- WHEN Host dashboard is chosen from the environment menu, from the `example-server` row, and from the Resource Manager popover with the local environment selected
+- THEN the sheet opens titled `example-server`, `example-server` and the local environment's name
+
+#### Scenario: disconnected row
+
+- GIVEN a saved server that is not connected
+- WHEN its row is shown
+- THEN it has no Host dashboard button
+
+### R76. The host dashboard shows CPU, memory, volumes and statistics since start [Must] (amendment A10)
+
+The host dashboard SHALL show the CPU percentage with the logical core count and a chart of the last 15 minutes, memory as used of total with its percentage and a chart, one row per volume with a usage bar, used of total, free, and Removable, Read-only or Not responding badges, and a "Since <time> (up <duration>)" section with current, minimum, average, p95 and maximum for CPU and memory and a chart of the whole uptime with average and peak per bar, and its text SHALL contain no em dash.
+
+#### Scenario: populated dashboard
+
+- GIVEN a snapshot with CPU 23.5 percent on 12 cores, memory 12,025,908,428 of 34,359,738,368 bytes, volume `/` with 2,147,483,648,000 bytes total and 671,088,640,000 bytes free, and a start time 3 hours 5 minutes ago, in the `en-US` locale
+- WHEN the dashboard renders
+- THEN it shows "23.5%", "12 cores", "11.2 GB of 32.0 GB, 35%", a row for `/` with "625.0 GB free", and "Since" followed by the start time and "(up 3h)"
+
+### R77. The host dashboard shows loading, live, stale, disconnected, restarted, unsupported and error states [Must] (amendment A10)
+
+The host dashboard SHALL show skeletons until the first snapshot; WHEN no item has arrived for 3 seconds while subscribed, it SHALL dim the values and show "Last updated <n> s ago"; WHILE the environment is not connected, it SHALL keep the last values dimmed with "Disconnected" and SHALL subscribe again after reconnect; WHEN a snapshot after reconnect has a different boot ID, it SHALL reset the statistics and show "Server restarted at <time>"; and IF the stream fails, THEN it SHALL show the failure message and a **Retry** button that subscribes again.
+
+#### Scenario: one test per state
+
+- GIVEN a fake host stream
+- WHEN it sends nothing; a snapshot; nothing for 3 seconds; a disconnect; a reconnect with a new boot ID; a failure; and Retry is pressed
+- THEN the sheet shows skeletons; values; "Last updated 3 s ago"; "Disconnected" with the last values; "Server restarted at" and reset statistics; the failure message with Retry; and a new subscription
+
+### R78. The host stream runs only while the dashboard can be seen [Must] (amendment A10)
+
+WHEN the host dashboard closes or the document becomes hidden, the web client SHALL close the host stream, and WHEN the document becomes visible again with the dashboard open, it SHALL open the stream again.
+
+#### Scenario: hidden document
+
+- GIVEN an open host dashboard with an active stream
+- WHEN the document's visibility becomes `hidden`, then `visible`
+- THEN the subscription ends, and a new one starts with a new snapshot
+
+#### Scenario: unfocused but visible
+
+- GIVEN an open host dashboard
+- WHEN the window loses focus but stays visible
+- THEN the stream stays open
+
+### R79. The collector builds and passes its tests on Linux, macOS and Windows [Must] (amendment A10)
+
+The host collector and its tests SHALL compile and pass on the Linux, macOS and Windows CI runners.
+
+#### Scenario: CI
+
+- GIVEN the pull request's CI run
+- WHEN the server test jobs finish on Linux, macOS and Windows
+- THEN the host collector's tests pass on all three
+
+### R80. The readings match the operating system's own tools [Should] (amendment A10)
+
+The host collector's readings SHALL agree with the operating system's command-line tools: memory used within 3 percentage points, each volume's total within 1 percent, free space within 1 percent of the same figure as the operating system reports it (on macOS, the volume's available capacity for important usage, falling back to its available capacity as the collector does, read through the system's JavaScript bridge, and at least `df`'s Available), and CPU within 10 percentage points over the same 5-second window.
+
+#### Scenario: macOS host and Linux container
+
+- GIVEN this repository's macOS development host and the Linux lab container
+- WHEN the comparison probe runs against `vm_stat`, `df -k`, `osascript -l JavaScript` (`NSURL` volume resource values) and `top` on macOS, and `/proc/meminfo` (`MemTotal` minus `MemAvailable`), `df -k -P` and `/proc/stat` on Linux
+- THEN every comparison is inside its tolerance and the probe prints the figures it compared
+
+### R81. Hidden volumes can be listed [Should] (amendment A10)
+
+The host dashboard SHALL list the volumes the filter hid under a closed **Hidden volumes (N)** disclosure, each with its mount point and the reason it was hidden, and SHALL NOT read the space of a volume rejected before sampling (network, overlay not at `/`, file mount); volumes hidden as empty or as sharing storage are hidden after their space read.
+
+#### Scenario: one network volume hidden
+
+- GIVEN a host with `/` and an `nfs4` volume at `/mnt/share`
+- WHEN the disclosure is opened
+- THEN it shows `/mnt/share` with "Network volume" and no sizes, and the source received no space read for it
+
+### R82. Agents can read a host snapshot without paths [Could] (amendment A10)
+
+WHERE the MCP diagnostics tools are enabled, the server SHALL offer a read-only `host_metrics` tool that returns the host facts, current reading and statistics, with each mount point kept only when it is a file system root and reported as `null` otherwise, and without volume names.
+
+#### Scenario: user name in a mount point
+
+- GIVEN volumes `/`, `C:\` and `/media/test-user/usb`
+- WHEN an agent calls `host_metrics`
+- THEN the volumes' `mountPoint` values are `/`, `C:\` and `null`, and the result contains neither `test-user` nor `usb`
+
+### R83. Each volume has statistics since start [Could] (amendment A10)
+
+The host collector SHALL keep, for each volume's used percent, the same five statistics as R69, and the host dashboard SHALL show them in its "Since" section.
+
+#### Scenario: a volume that filled up
+
+- GIVEN volume `/` read at 40, 50 and 60 percent used over three background readings with volumes
+- WHEN the statistics are read
+- THEN `/` has current 60, minimum 40, maximum 60 and average 50
+
+### R84. A hung volume never delays server exit [Must] (amendment A10)
+
+WHEN the server shuts down while a disk call has not returned, the host collector SHALL stop without waiting for that call, and the server process SHALL exit.
+
+#### Scenario: exit with a read held
+
+- GIVEN a child process that runs the collector in a multi-thread Tokio runtime dropped after `block_on`, as the server's `main` does, with a space read blocked forever
+- WHEN the child shuts the collector down and returns from `block_on`
+- THEN the child exits with status 0 within 5 seconds
+
+### R85. A slow client still receives the latest charts [Must] (amendment A10)
+
+WHEN a subscriber falls behind while the uptime chart or the hidden-volume list changes, the server SHALL include the latest complete chart state in the next item it sends that subscriber, and the client SHALL keep only recent points less than 15 minutes older than its newest one, at most 900 of them.
+
+#### Scenario: blocked across a minute boundary
+
+- GIVEN a subscriber that does not read its stream from 50 seconds into a minute until 70 seconds, on a paused clock
+- WHEN it reads again
+- THEN the first item it receives carries the uptime chart that includes the bucket closed at 60 seconds
+
+#### Scenario: skipped samples
+
+- GIVEN a client view whose newest point is at 20:00:00 and which holds points back to 19:40:00
+- WHEN a sample at 20:00:01 arrives
+- THEN no point older than 19:45:01 remains
+
+#### Amendment A11: Source Control Review button (#293)
+
+Amendment A11 (2026-11-11, user, adding #293 to this batch) brings in the Review button of issue
+#293: one click in the Source Control panel starts a review of the current branch and its
+uncommitted changes, by a chat or AI Terminal agent picked in Settings → Agents, started in the
+provider's own read-only or approval mechanism wherever one exists (plan mode, a read-only sandbox,
+approval rules), and saying so where none exists. Its first priority tier is in scope, then the
+shortcut, the one-off reviewer menu, the scope tooltip and one-off instructions as separate later
+tasks. Terminal reviewers for Cursor, Grok and OpenCode stay out (their read-only flags are
+unverified). The design is in `docs/plans/2026-11-11-code-review-button-design.md`. Requirements
+R90 to R105, decisions D40 to D49.
+
+### R90. The Review button says when it can start a review [Must] (amendment A11)
+
+WHILE the Source Control panel shows a repository, the panel SHALL offer a "Review changes"
+button that is enabled when the working tree has a staged, unstaged or untracked change or the
+branch has at least one commit that its default branch lacks, and SHALL otherwise be disabled
+with a tooltip that names the reason.
+
+#### Scenario: dirty tree on the default branch
+
+- GIVEN branch `main` is the default branch, with one unstaged file and no commits ahead
+- WHEN the panel is shown
+- THEN "Review changes" is enabled
+
+#### Scenario: clean feature branch with commits
+
+- GIVEN branch `feature/a` with a clean tree and 2 commits ahead of `main`
+- WHEN the panel is shown
+- THEN "Review changes" is enabled
+
+#### Scenario: nothing to review
+
+- GIVEN a clean tree and 0 commits ahead, or a clean tree on a server that does not report a count ahead
+- WHEN the panel is shown
+- THEN the button is disabled with the tooltip "No changes to review" and clicking it starts nothing
+
+#### Scenario: status still loading
+
+- GIVEN the panel has not received its first status
+- WHEN it is shown
+- THEN the button is disabled with the tooltip "Checking for changes"
+
+#### Scenario: older server
+
+- GIVEN an environment whose server does not advertise code reviews
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "Update the BiBCode server on this environment to use Review."
+
+#### Scenario: saved reviewer unavailable
+
+- GIVEN the saved code review agent is chat `claudeAgent`, Claude is disabled on this environment, and chat `cursor` is available
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "Claude is not available. Change the code review agent in Settings → Agents.", and clicking it starts no review with Cursor or any other agent
+
+#### Scenario: saved reviewer not listed
+
+- GIVEN the saved code review agent names a provider instance that this environment does not list
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "The code review agent is not available on this environment. Change it in Settings → Agents."
+
+#### Scenario: draft chat with a chat reviewer
+
+- GIVEN the current chat has not been sent yet and the reviewer is chat `codex`
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the tooltip "Send a first message in this chat, then review from here."
+
+#### Scenario: draft chat with a terminal reviewer
+
+- GIVEN the current chat has not been sent yet and the reviewer is Claude Terminal
+- WHEN the panel is shown with changes
+- THEN the button is disabled with the same tooltip and no terminal is opened
+
+### R91. A review covers the branch and the uncommitted changes against the remote base [Must] (amendment A11)
+
+WHEN a review starts, the review launcher SHALL choose branch scope when the branch has commits
+that its default branch lacks and uncommitted scope otherwise, and SHALL name the base as
+`origin/` followed by the default branch name.
+
+#### Scenario: branch scope
+
+- GIVEN branch `feature/a`, default branch `main`, 2 commits ahead and one untracked file
+- WHEN the scope is resolved
+- THEN it is branch scope with base `origin/main`
+
+#### Scenario: uncommitted scope
+
+- GIVEN branch `main` (the default), 0 commits ahead and one staged file
+- WHEN the scope is resolved
+- THEN it is uncommitted scope, and the scope text is "the staged, unstaged and untracked changes in the working tree"
+
+### R92. The review prompt follows project, then user, then default, behind a fixed lead-in [Must] (amendment A11)
+
+WHEN a review starts, the review launcher SHALL send a prompt that begins with "Code review
+requested from BiBCode. Do not edit files. Scope: " and the scope text, adds " Base: " and the base
+for branch scope, and continues with the first non-blank of the project's review prompt, the
+user's review prompt and the built-in default, with every `{scope}` and `{base}` replaced.
+
+#### Scenario: all three set
+
+- GIVEN project prompt "Check our test naming. Base is {base}.", user prompt "User text" and branch scope against `origin/main`
+- WHEN the prompt is resolved
+- THEN it starts with "Code review requested from BiBCode. Do not edit files. Scope: the commits on the current branch that are not on origin/main, plus all staged, unstaged and untracked changes. Base: origin/main." and continues with "Check our test naming. Base is origin/main."
+
+#### Scenario: blank values fall through
+
+- GIVEN a project prompt of three spaces and a user prompt of ""
+- WHEN the prompt is resolved
+- THEN the built-in default follows the lead-in
+
+#### Scenario: a prompt that looks like a command
+
+- GIVEN a project prompt "purge" or "--dangerously-skip-permissions"
+- WHEN a terminal review is resolved
+- THEN the argument after `--` starts with "Code review requested from BiBCode." and no argument before it comes from the prompt
+
+### R93. Review settings decode with defaults and are validated [Must] (amendment A11)
+
+The settings service SHALL store a code review agent, an optional review model and a review prompt
+of at most 7,680 characters, SHALL give a settings document without them the defaults (the default
+agent selection, no model, ""), and IF a patch carries a review prompt longer than 7,680 characters
+or a malformed agent or model, THEN the settings service SHALL reject the patch and keep the stored
+settings.
+
+#### Scenario: old settings document
+
+- GIVEN a settings document with no code review keys
+- WHEN it is decoded
+- THEN the agent is chat `codex`, the model is null and the prompt is ""
+
+#### Scenario: patch round trip
+
+- GIVEN a patch setting the agent to terminal `claudeAgent`, the model to `claudeAgent` / `opus` and the prompt to "Look at tests."
+- WHEN it is applied and the settings are read back
+- THEN all three values are returned
+
+#### Scenario: replacing a model drops its old options
+
+- GIVEN a stored review model `claudeAgent` / `opus` with options `[{"id":"effort","value":"high"}]`
+- WHEN a patch sets the review model to `codex` / `gpt-5` with no options
+- THEN the stored review model is exactly `codex` / `gpt-5` with no `options` key
+
+#### Scenario: oversized prompt
+
+- GIVEN a patch with a review prompt of 7,681 characters
+- WHEN it is applied
+- THEN it is rejected and the stored prompt is unchanged
+
+### R94. A project keeps its own review prompt across restart and replay [Must] (amendment A11)
+
+The orchestration engine SHALL store a project's review prompt of at most 7,680 characters from a
+project metadata update, SHALL keep it when a later update omits it, SHALL store "" when an update
+sets "", and SHALL give a project created or updated before the field existed the value "".
+
+#### Scenario: set, omit, reset, replay
+
+- GIVEN a project whose review prompt is set to "Project text"
+- WHEN a title-only update follows, then the projections are rebuilt from the events
+- THEN the prompt is still "Project text"; after an update with "" and another rebuild it is ""
+
+#### Scenario: old events
+
+- GIVEN a `project.created` and a `project.meta-updated` event recorded without the field
+- WHEN they are decoded and replayed
+- THEN the project's review prompt is "" and nothing is reported as invalid
+
+#### Scenario: oversized project prompt
+
+- GIVEN a metadata update with a 7,681 character review prompt
+- WHEN it is dispatched
+- THEN it is rejected and the stored prompt is unchanged
+
+### R95. A chat review opens beside the work with the guard its provider supports [Must] (amendment A11)
+
+WHEN "Review changes" is clicked and the reviewer is a chat agent, the review launcher SHALL open
+one chat panel of the current thread in that thread's checkout or worktree, titled "Code review ·
+" and the provider name, running with approval required, in plan mode only for Claude, with the
+review model when one is set for that provider (else the provider's session default), and SHALL
+send the resolved prompt as its first message.
+
+#### Scenario: Codex reviewer in a worktree
+
+- GIVEN the current thread is in worktree `wt-a` and the reviewer is chat `codex`
+- WHEN "Review changes" is clicked
+- THEN one panel opens whose thread has runtime mode `approval-required`, interaction mode `default`, worktree `wt-a`, and whose first message is the resolved prompt
+
+#### Scenario: Claude reviewer
+
+- GIVEN the reviewer is chat `claudeAgent`
+- WHEN "Review changes" is clicked
+- THEN the panel thread has interaction mode `plan` and runtime mode `approval-required`
+
+#### Scenario: double click
+
+- GIVEN a review panel is being created for this thread
+- WHEN "Review changes" is clicked again
+- THEN no second panel or message is created
+
+#### Scenario: first message fails
+
+- GIVEN panel creation succeeds and the first message is refused
+- WHEN the review starts
+- THEN the panel stays open with the prompt in its composer and a "Couldn't start the review" toast shows
+
+### R96. A review thread offers no implementation action [Must] (amendment A11)
+
+WHILE a thread was started as a review, the chat SHALL offer no Implement, Refine or "Implement in a
+new thread" action for its proposed plans, and SHALL keep that after a reload or on another client.
+
+#### Scenario: Claude ends with a plan
+
+- GIVEN a review thread whose latest turn produced a proposed plan
+- WHEN the turn settles and the composer is empty
+- THEN no Implement action is shown, pressing Enter sends nothing, and the plan card is titled "Review findings"
+
+#### Scenario: old thread
+
+- GIVEN a thread created before the review flag existed
+- WHEN it is decoded
+- THEN it is not a review thread and its plan actions are unchanged
+
+### R97. A terminal review starts the CLI with read-only flags and the prompt as data [Must] (amendment A11)
+
+WHEN the reviewer is Claude Terminal or Codex Terminal, the review launcher SHALL open an AI
+Terminal labelled with the provider name and "Review" whose arguments contain no bypass flag, start
+with `--permission-mode plan` for Claude or `--sandbox read-only --ask-for-approval never` for
+Codex, and end with `--` and the resolved prompt, and IF the resolved prompt is longer than 8,192
+characters or holds a control character other than tab, carriage return or line feed, THEN the
+review launcher SHALL start nothing and show the reason.
+
+#### Scenario: Claude arguments
+
+- GIVEN the reviewer is Claude Terminal with model `opus`
+- WHEN the review command is built
+- THEN the arguments are `--permission-mode plan --model opus -- <prompt>` and contain neither `--dangerously-skip-permissions` nor `--allow-dangerously-skip-permissions`
+
+#### Scenario: Codex arguments
+
+- GIVEN the reviewer is Codex Terminal
+- WHEN the review command is built
+- THEN the arguments start with `--sandbox read-only --ask-for-approval never`, end with `--` and the prompt, and do not contain `--dangerously-bypass-approvals-and-sandbox`
+
+#### Scenario: oversized prompt
+
+- GIVEN a resolved prompt of 8,193 characters
+- WHEN the review command is built
+- THEN no command is returned and the reason is "Review prompt is longer than 8,192 characters. Shorten it in Settings → Agents."
+
+### R98. A Windows terminal review starts only on a proven path and with the prompt intact [Must] (amendment A11)
+
+WHILE the reviewing environment runs Windows, the review launcher SHALL keep terminal reviewers
+disabled with a reason until native batch-launch tests have passed on Windows, and once enabled
+SHALL replace each line break in the prompt with one space; IF the encoded batch command line
+exceeds the 8,191 characters `cmd.exe` accepts, THEN the terminal service SHALL refuse the launch
+with an error that names the length, and the UI SHALL show it.
+
+#### Scenario: off until proven
+
+- GIVEN a Windows environment, the reviewer Claude Terminal and a dirty tree, before the Windows terminal reviews are enabled
+- WHEN the panel is shown
+- THEN the button is disabled with the tooltip "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.", and macOS and Linux environments are not affected
+
+#### Scenario: line breaks
+
+- GIVEN a Windows environment with terminal reviews enabled and a prompt "a\nb\r\nc"
+- WHEN the review command is built
+- THEN the prompt argument is "a b c"
+
+#### Scenario: arguments through an npm-style shim
+
+- GIVEN a Windows `.cmd` shim that forwards `%*` to `node`, and one argument per class: `say "hi"`, `100% %PATH%`, `a & b`, `a ^ b`, `a | b`, `c < d > e`, `!x!`, `ends with \\\`, `back\\"slash` and one argument combining all of them
+- WHEN each is launched through the terminal launch path
+- THEN `node` receives each argument exactly, and no redirect or second command runs
+
+#### Scenario: too long for cmd.exe
+
+- GIVEN a Windows batch target and arguments whose encoded command line is 8,192 characters or longer, for example a prompt ending in 4,200 backslashes
+- WHEN the terminal service prepares the launch
+- THEN it refuses with "The command is too long for a Windows terminal (N of 8,191 characters). Shorten the review prompt or pick a chat reviewer.", nothing is spawned, and the UI shows that message
+
+### R99. Settings → Agents shows the reviewer, its model, its prompt and its guard [Must] (amendment A11)
+
+The Agents settings page SHALL offer a Code review group with a reviewer picker listing the chat
+agents and the Claude and Codex terminals, a review model picker with "Provider default", and a
+review prompt field of at most 7,680 characters with a counter and Reset, and SHALL show under the
+picker the guard line of the selected reviewer.
+
+#### Scenario: unedited prompt
+
+- GIVEN the stored review prompt is ""
+- WHEN the page opens
+- THEN the field shows the built-in default text and no Reset is offered
+
+#### Scenario: reset and default text
+
+- GIVEN the stored prompt is "Mine"
+- WHEN Reset is clicked, or the field is saved with text equal to the default
+- THEN "" is stored
+
+#### Scenario: instructed reviewer
+
+- GIVEN the reviewer is chat `cursor`
+- WHEN the page shows
+- THEN the line "Told not to edit. BiBCode cannot block edits for this agent." is shown under the picker
+
+### R100. The project review prompt is edited next to the button [Must] (amendment A11)
+
+The Source Control panel SHALL offer, in a menu next to "Review changes", "Review prompt for this
+project…", which opens a dialog showing the project's prompt (or the effective prompt when blank)
+with a counter, Reset and Save, and IF saving fails, THEN the dialog SHALL stay open with the text
+and show the reason next to the field.
+
+#### Scenario: save and reset
+
+- GIVEN the dialog with "Our rules"
+- WHEN Save is clicked, then the dialog is reopened and Reset and Save are clicked
+- THEN the project prompt is "Our rules" and then ""
+
+#### Scenario: save fails
+
+- GIVEN the server refuses the update
+- WHEN Save is clicked
+- THEN the dialog stays open with the typed text and the reason is shown under the field
+
+### R101. Documentation and an end-to-end check cover the flow [Must] (amendment A11)
+
+The user guide and the changelog SHALL describe the Review button, its settings and the mechanism
+each reviewer starts with (for example "starts in Claude's plan mode", "runs in Codex's read-only
+sandbox") without promising that a review cannot edit, and a packaged desktop test SHALL
+start a review from Source Control and observe the panel, its first message and the absent
+Implement action.
+
+#### Scenario: packaged review
+
+- GIVEN the packaged desktop fixture project with one modified file
+- WHEN Source Control's "Review changes" is clicked
+- THEN a "Code review · " tab opens and the fixture provider receives a first message that contains "Scope: the staged, unstaged and untracked changes in the working tree"
+
+#### Scenario: packaged Claude review ending in a plan
+
+- GIVEN the packaged fixture with the code review agent set to chat `claudeAgent`, and a fixture Claude response to the review prompt that calls `ExitPlanMode` with a plan
+- WHEN the review runs, the turn completes and the window reloads
+- THEN the plan card reads "Review findings", and no Implement, Refine or "Implement in a new thread" action is shown before or after the reload; the same case without the review flag shows Implement
+
+### R102. A keyboard shortcut starts a review [Should] (amendment A11)
+
+The keybinding service SHALL offer the command `sourceControl.review`, bound by default to
+`mod+alt+shift+r` outside a focused terminal, which starts a review exactly as the button does.
+
+#### Scenario: shortcut
+
+- GIVEN the Source Control panel would enable "Review changes" and focus is not in a terminal
+- WHEN `mod+alt+shift+r` is pressed
+- THEN a review starts; with focus in a terminal nothing happens, and `mod+shift+r` still reloads in the browser
+
+### R103. A one-off reviewer can be picked from the menu [Should] (amendment A11)
+
+The Source Control panel's review menu SHALL list the same reviewers as Settings with their guard
+lines, and picking one SHALL start a review with that reviewer without changing the saved reviewer.
+
+#### Scenario: one-off reviewer
+
+- GIVEN the saved reviewer is chat `codex`
+- WHEN "Claude Terminal" is picked in the menu
+- THEN a Claude review terminal opens and the saved reviewer is still chat `codex`
+
+### R104. The enabled button names its scope [Should] (amendment A11)
+
+WHILE "Review changes" is enabled, its tooltip SHALL name the scope and base and the reviewer's
+guard line.
+
+#### Scenario: branch scope tooltip
+
+- GIVEN branch scope against `origin/main` and reviewer chat `claudeAgent`
+- WHEN the button is hovered or focused
+- THEN the tooltip reads "Review branch vs origin/main and uncommitted changes" and "Starts in Claude's plan mode."
+
+### R105. One-off instructions can be added to a review [Should] (amendment A11)
+
+The review menu SHALL offer "Review with instructions…", which takes up to 1,000 characters and
+appends them after a blank line to the resolved prompt of that one review only.
+
+#### Scenario: added instructions
+
+- GIVEN "Focus on the parser." typed in the instructions field
+- WHEN the review starts
+- THEN the first message ends with "\n\nFocus on the parser." and the saved prompts are unchanged
+
 ## Constraints and assumptions
 
 - **Public repository.** No real host, organization, person or machine path appears in code, tests, fixtures or this folder. Tests use `example-server`, `gitlab.example.test`, `test-user` and disposable folders. (Repository rule: AGENTS.md, Sensitive Data.)
@@ -1159,6 +1854,50 @@ D21. The sidebar levels reuse the existing sidebar tokens and add eight (R65) in
 
 D19. A theme with no terminal colors uses its base's built-in terminal palette, and the custom theme library holds at most 64 themes. Alternatives considered: deriving the terminal background from the UI background (breaks the reason the terminal is decoupled). Decided by: agent's call. Source: #290 open question 4 and Orca's limit.
 
+D22. The collector samples from server start at 60 seconds, faster while watched, subject to measured cost (R71). Task 11.4 measures first and then applies the policy. Outcomes: always on with live 1 s (background at most 0.1 percent of one core and live at most 1 percent); start at the first host stream (background over 0.1 percent; R69, R70, R71 and R76 then say "since the first dashboard opened"); live 2 seconds (live over 1 percent at 1 s and at most 1 percent at 2 s; R70, R72 and R77's stale threshold, 5 s instead of 3 s, change). A fallback takes effect only after the user approves it, before any web task; if live is over 1 percent even at 2 s, no outcome is accepted and the user decides. Alternatives considered: sampling only while a dashboard is open (cannot answer "since server start"); starting at the first open (the first look of each run has no history). This reverses the process monitor's rule that a server nobody reads samples nothing, for the host collector only. Decided by: agent's call. Source: #292 open question 2 and P1.4.
+
+D23. Statistics cover the current server process only, in memory, reset on restart or update. Alternatives considered: persisting 15-minute buckets for 90 days (a schema change and a migration for a follow-up nobody has asked for yet). Decided by: agent's call, the issue's recommendation. Source: #292 open question 1.
+
+D24. Memory used is the operating system's own used figure on every platform, and available is total minus used. Alternatives considered: total minus the crate's available figure everywhere, which on macOS counts active pages as available and reported about 8 GB used where `top` showed 65 GB on the development host. Decided by: agent's call. Source: `sysinfo` 0.39.6 source and a reading on 2026-11-11.
+
+D25. The dashboard shows local fixed and removable volumes; network volumes stay hidden by default; `overlay` is kept only at `/`; mount points that are files are skipped; volumes with the same file system, total and free bytes are one entry. Alternatives considered: skipping `overlay` everywhere (hides the only disk in a container); merging by device name (does not fold APFS volumes). Decided by: agent's call, the issue's recommendation plus the container finding; confirmed by the probe of Task 11.3. Source: #292 open question 3.
+
+D26. The host stream needs `orchestration:read`, the scope of the process diagnostics that already return command lines. Mount points go only to authorized clients of that server; logs and profiler records never name them; the MCP tool keeps only root mount points. Alternatives considered: a new scope (one more grant for the same trust level); reducing mount points to file names as the other diagnostics tools do (turns `/media/<user>` into the user name and `/` into an empty string). Decided by: agent's call, the issue's recommendation. Source: #292 open question 4.
+
+D27. The dashboard is a sheet, labelled **Host dashboard** at every entry; the local environment's entry is the Resource Manager popover, because the environment context card and its menu exist only for remote environments. Alternatives considered: "Dashboard" alone (says nothing in a server row); a menu on the rail's Local button (a radio, and already a menu with WSL); a Settings page (loses the sidebar's place). Decided by: agent's call. Source: #292 open question 5 and the context card's code.
+
+D28. Each reading counts for its own interval in the average and the p95, and the wire carries at most 900 recent points and 240 uptime bars. Alternatives considered: equal weight per reading (one watched minute outweighs an unwatched hour); statistics from the background rate only (drops the spikes a person watched). Decided by: agent's call. Source: #292 P0.2 and the rate design.
+
+D29. Hidden volumes are a disclosure in the sheet, not a setting, and there is no option to hide removable volumes. Alternatives considered: the issue's two settings (`UI.md`: options should not stand in for a design decision). Decided by: agent's call, for the user to confirm. Source: #292 P1.2 and `UI.md`.
+
+D30. The host stream closes when the document is hidden, not when the window loses focus. Alternatives considered: also closing on blur like the status bar (a dashboard on a second display would freeze). Decided by: agent's call. Source: #292 Web 3 and #168.
+
+D31. Free space is the volume's free space as the operating system reports it, and per-user quotas are not applied; on Windows the crate reports total free bytes, not the caller-available figure. The UI says "free", never "available to you". Alternatives considered: a Windows adapter using the caller-available value (more platform code, and no quota lab to test it). Decided by: agent's call, after review. Source: `sysinfo` 0.39.6 `src/windows/disk.rs`.
+
+D32. Disk calls run on a fixed pool of 4 dedicated OS threads that shutdown never joins, never on the Tokio blocking pool and never inside CPU and memory sampling; all 4 held pauses disk reads with a visible notice. Alternatives considered: the Tokio blocking pool (runtime shutdown waits for every started blocking task, so a hung `statvfs` would keep the server from exiting); a thread per call (no bound). Decided by: the coordinator, after review. Source: the server's `main` drops its runtime after `block_on`.
+
+D33. On Linux the read-only flag comes from the mount options in `/proc/self/mounts`, read while listing on a disk worker. Alternatives considered: listing with a storage refresh, the only way the crate sets the flag (a `statvfs` of every volume on every listing, which can hang). Decided by: agent's call, after review. Source: `sysinfo` 0.39.6 `src/unix/linux/disk.rs`.
+
+D40. A review opens as a chat panel of the current thread through the side-chat creation path, not as a new top-level thread through `thread.turn.start` with `bootstrap.createThread`, because a public client cannot give a new thread a worktree that way and the review would read the main checkout. Alternatives considered: the issue's top-level thread (wrong checkout from a worktree); a new server RPC for a top-level thread in a worktree (new authority surface and RPC for what the panel path already does). Decided by: agent's call. Source: #293 "Start a thread with a prompt"; `decode_public_orchestration_command`.
+
+D41. Review chats run with `approval-required` for every provider and in plan mode only for Claude. Alternatives considered: the user's default runtime mode (the issue's recommendation for open question 1; on this branch it is `full-access`, which leaves Codex, Cursor, Grok and OpenCode unguarded); `approval-required` with plan everywhere (plan adds no block to Codex and makes Codex, Cursor and Grok end with plan cards). UI copy names the mechanism ("Starts in Claude's plan mode.", "Runs in Codex's read-only sandbox.") and never promises the outcome, because user, project and local Claude settings load and can weaken plan mode; which settings a review loads is an open decision for the user. Decided by: agent's call. Source: #293 open question 1; driver mappings in the design note.
+
+D42. A review thread carries a durable `codeReview` flag set at panel creation, and a review thread shows no Implement, Refine or "Implement in a new thread"; its plan card reads "Review findings". Alternatives considered: matching the title (breaks on rename); a client-only flag (lost on reload); keeping Implement (one-click auto-fixing is a non-goal). Decided by: agent's call. Source: #293 open question 2.
+
+D43. A terminal prompt is passed as one argument after `--`, behind the fixed lead-in, and never through stdin; saved text is never trimmed or rewritten. Alternatives considered: `--` alone (Claude 2.1.322 still runs a subcommand named by the prompt); trimming leading dashes at save time (changes the person's text and misses subcommand words); stdin (interactive Codex refuses it). Decided by: agent's call. Source: #293 open question 3; CLI probes recorded in the design note.
+
+D44. On Windows the web replaces line breaks by the environment's OS; the server's batch encoder refuses an encoded command line over 8,191 characters; and terminal reviewers stay disabled on Windows until native batch-launch tests (quotes, `%`, `&`, `^`, `|`, redirects, `!`, trailing backslashes, a backslash before a quote, combined) have passed on real Windows, with enabling as its own task and an encoder fix as a conditional task if the `%` case fails. Alternatives considered: the issue's rule keyed on the resolved `.cmd` (the web never sees it); a web-side length estimate (duplicates the encoder and missed backslash doubling); enabling on the first draft's per-character refusal (the prompt is project data and a `%` fault is suspected on this path). Decided by: coordinator. Source: #293 "Handle the argument limits"; plan review.
+
+D45. The base is `origin/<default>` with the local branch as the prompt's fallback, and a stale local default branch may enable the button. Alternatives considered: counting against the remote ref (a server change outside this issue). Decided by: agent's call (the issue's recommendation for open question 4). Source: #293 open question 4.
+
+D46. The shortcut defaults to `mod+alt+shift+r`. Alternatives considered: `mod+shift+r` (hard reload in browsers and WebView2); no default binding (the issue asks for one). Decided by: agent's call. Source: #293 P1.1.
+
+D47. A `codeReviews` server capability gates the button and the settings rows, with the reason "Update the BiBCode server on this environment to use Review." Alternatives considered: sending the new fields to any server (an older server refuses the panel field). Decided by: agent's call. Source: the `sideChats` precedent.
+
+D48. Every disabled state of the button names its reason, including loading ("Checking for changes"); a draft chat disables both reviewer kinds with "Send a first message in this chat, then review from here." (a draft has neither a panel host nor a terminal launch context); and the saved reviewer is resolved without falling back to another agent, so a missing or unavailable reviewer disables the button with a reason that names it and Settings → Agents. Alternatives considered: the issue's loading state without a tooltip (against `UI.md`); creating a top-level thread from a draft (see D40); falling back to the first available chat (silently changes the provider and its guard). Decided by: coordinator (draft and fallback rules), agent's call (loading). Source: `UI.md` Buttons and Errors; plan review.
+
+D49. Review settings belong to the environment that runs the review, and a review model whose provider instance differs from the reviewer's is ignored in favour of the provider's session default. Alternatives considered: one review model per provider (more settings than the issue asks for). Decided by: agent's call. Source: #293 "Settings".
+
 ## Risks
 
 - The #341 cause is inferred from Git's source. -> The first task is a failing reproduction against real Git on Linux and Windows; the fix follows what it shows.
@@ -1183,6 +1922,16 @@ D19. A theme with no terminal colors uses its base's built-in terminal palette, 
 - **R36 to R61:** schema tests, theme application tests, pre-paint tests, Appearance panel tests, terminal palette tests, a contrast test over every built-in theme, and a desktop end-to-end test that selects a built-in, creates a custom theme and reloads.
 - **Every change:** `vp check`, `vp run typecheck`, `vp run test`; for server changes `cargo fmt --all --check`, Clippy with warnings denied and the affected server tests; the React best-practices review and the UI.md review for changed screens.
 
+- **R66 to R70, R74, R83, R85:** Rust unit tests of the host collector with a fake source and a paused clock; a log-capture test for R74.
+- **R84:** a child-process test shaped like the server's `main`.
+- **R71, R80:** ignored probe tests run on the macOS development host and in the Linux lab container, their output recorded in the pull request; Windows only through CI build and tests (R79) and, if reachable, the Windows lab of `docs/testing/windows-desktop.md`. Unproven by this plan: the graphical tools (Activity Monitor, Disk Utility, Task Manager), Linux on bare metal and on x64, Windows on x64, and containers with cgroup limits.
+- **R72, R73:** server RPC tests over the real registrar, the scope test over a restricted socket, both descriptor tests, the contract fixture decoded and re-encoded by a Rust test, and the capability default test.
+- **R75 to R78, R81:** web component and logic tests with a fake stream; one packaged desktop end-to-end test that opens the local host dashboard and sees CPU, memory and at least one volume.
+- **R82:** an MCP tool test for the projection.
+- **Every change:** `vp check`, `vp run typecheck`, `vp run check:contracts`, `cargo fmt --all --check`, Clippy with warnings denied, the affected tests, and the React best-practices and `UI.md` reviews for the new components.
+
+- **R90 to R105:** contract and settings decode tests, a Rust projection and migration test with replay of events that lack the new fields, web logic and component tests for scope, prompt and reviewer resolution, terminal launch argument tests, native Windows batch argument tests on the Windows CI job, and a packaged desktop end-to-end test that starts a review and finds no Implement action after a reload.
+
 Input classes no scenario names, and their expected behavior:
 
 - A Markdown file larger than the existing preview limit opens in source view as today.
@@ -1196,6 +1945,7 @@ Input classes no scenario names, and their expected behavior:
 ## Open questions
 
 - None since amendment A9 brought the sidebar-hierarchy extension into this spec (R63 to R65).
+- Amendments A10 and A11: every decision marked "agent's call" in D22 to D33 and D40 to D49 awaits the user's confirmation before the push, together with which Claude settings a review session loads (D41 keeps all three sources and names the mechanism only).
 
 ## Appendix: interview record
 
