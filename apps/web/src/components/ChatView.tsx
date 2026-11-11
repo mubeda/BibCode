@@ -2147,6 +2147,7 @@ function ChatViewContent(props: ChatViewProps) {
     projectDefaultModelSelection: activeProject?.defaultModelSelection,
     selectedProviderInstanceId: selectedProviderByThreadId,
     providers: providerStatuses,
+    providerChosen: isServerThread,
   });
   const providerBindingConflictReason = providerBinding.conflict?.reason ?? null;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
