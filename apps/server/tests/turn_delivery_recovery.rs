@@ -1642,7 +1642,10 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
                 .iter()
                 .map(|record| (record.project_cwd.clone(), record.worktree_path.clone()))
                 .collect::<Vec<_>>(),
-            [(repository_root.path().to_string_lossy().into_owned(), path.clone())],
+            [(
+                repository_root.path().to_string_lossy().into_owned(),
+                path.clone()
+            )],
             "the bootstrap records the worktree it created under the thread's path"
         );
         provider.shutdown().await.expect("provider shutdown");

@@ -1301,7 +1301,10 @@ mod tests {
     }
 
     /// The creation records `resolve` finds gone, read before anything below changes.
-    async fn gone_after_read(repositories: &Repositories, managed: &Path) -> Vec<WorktreeCreationRecord> {
+    async fn gone_after_read(
+        repositories: &Repositories,
+        managed: &Path,
+    ) -> Vec<WorktreeCreationRecord> {
         let recorded = repositories.list_worktree_creation_records().await.unwrap();
         resolve(
             Vec::new(),
@@ -1332,7 +1335,10 @@ mod tests {
         let (_root, managed) = managed_dir();
         let repositories = migrated_repositories().await;
         let path = managed.join("feature-a").to_string_lossy().into_owned();
-        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
         let gone = gone_after_read(&repositories, &managed).await;
         assert_eq!(gone.len(), 1, "the folder was never made");
         reap_gone_records(&repositories, gone).await;
@@ -1344,11 +1350,17 @@ mod tests {
         let (_root, managed) = managed_dir();
         let repositories = migrated_repositories().await;
         let path = managed.join("feature-a").to_string_lossy().into_owned();
-        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
         // The audit reads A and finds its folder gone. B is created at the same path and
         // recorded before the delayed delete, with its folder not made yet.
         let gone = gone_after_read(&repositories, &managed).await;
-        repositories.record_worktree_creation("/repo", &path).await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
         reap_gone_records(&repositories, gone).await;
         assert_eq!(recorded_paths(&repositories).await, [path], "B survives");
     }
@@ -1359,7 +1371,10 @@ mod tests {
         let repositories = migrated_repositories().await;
         let path = managed.join("feature-a");
         let written = path.to_string_lossy().into_owned();
-        repositories.record_worktree_creation("/repo", &written).await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", &written)
+            .await
+            .unwrap();
         let gone = gone_after_read(&repositories, &managed).await;
         std::fs::create_dir(&path).unwrap();
         reap_gone_records(&repositories, gone).await;
@@ -1431,7 +1446,10 @@ mod tests {
         std::fs::create_dir(managed.join("linked")).unwrap();
         let link = managed.join("linked/.git");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(!opens_as_git_pointer_file(&link), "the link is not followed");
+        assert!(
+            !opens_as_git_pointer_file(&link),
+            "the link is not followed"
+        );
     }
 
     /// A `.git` swapped for a FIFO after the audit listed the folder is opened without

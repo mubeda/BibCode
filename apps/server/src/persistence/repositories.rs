@@ -5721,7 +5721,10 @@ mod worktree_creation_record_tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(recorded_paths(&repositories).await, ["/worktrees/feature-a"]);
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-a"]
+        );
     }
 
     #[tokio::test]
@@ -5776,7 +5779,10 @@ mod worktree_creation_record_tests {
             .delete_worktree_creation_record("/worktrees/feature-a")
             .await
             .unwrap();
-        assert_eq!(recorded_paths(&repositories).await, ["/worktrees/feature-b"]);
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-b"]
+        );
     }
 
     #[tokio::test]

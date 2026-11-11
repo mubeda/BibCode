@@ -173,7 +173,12 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|finding| finding["fingerprint"].as_str().unwrap_or_default().to_owned())
+        .map(|finding| {
+            finding["fingerprint"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
         .collect();
     for name in ["respelled-record", "respelled-receipt"] {
         let expected = fingerprint(
