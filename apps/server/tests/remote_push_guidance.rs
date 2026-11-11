@@ -55,6 +55,8 @@ const LOCAL_AUTHENTICATION_MESSAGE: &str =
 const GCM_REFUSING_HELPER: &str = "!f() { echo 'fatal: Cannot prompt because user interactivity has been disabled.' >&2; exit 1; }; f";
 /// A credential helper that reports a timed-out lookup and answers nothing.
 const TIMED_OUT_HELPER: &str = "!f() { echo 'credential lookup timed out' >&2; }; f";
+/// A credential helper that reports a cancelled lookup and answers nothing.
+const CANCELLED_HELPER: &str = "!f() { echo 'credential lookup cancelled' >&2; }; f";
 
 /// Re-runs `test_name` alone in a child with an isolated global Git configuration; true in the
 /// parent, which then returns.
@@ -477,6 +479,22 @@ async fn remote_push_guidance_after_a_timed_out_helper() {
             "{failed}"
         );
     }
+}
+
+#[tokio::test]
+async fn local_cancelled_helper_keeps_todays_message() {
+    if relaunched("local_cancelled_helper_keeps_todays_message") {
+        return;
+    }
+    let mut fixture = Fixture::start(Mode::Local).await;
+    use_credential_helper(&fixture.checkout, CANCELLED_HELPER);
+    let git_manager = fixture.git_manager_push().await;
+    assert_eq!(git_manager["code"], "cancelled", "{git_manager}");
+    assert_eq!(
+        message(&git_manager),
+        "The Git Manager operation was cancelled."
+    );
+    assert!(git_manager.get("signIn").is_none(), "{git_manager}");
 }
 
 #[tokio::test]
