@@ -47,7 +47,7 @@ impl Default for RunningStatistic {
     }
 }
 
-fn clamp_percent(percent: f64) -> f64 {
+pub(super) fn clamp_percent(percent: f64) -> f64 {
     if percent.is_nan() {
         0.0
     } else {
@@ -213,6 +213,7 @@ pub(crate) struct ChartHistory {
     open_oldest: Option<OpenBucket>,
     oldest_width_s: u32,
     oldest_capacity: usize,
+    #[cfg(test)]
     compactions: u64,
     revision: u64,
 }
@@ -237,6 +238,7 @@ impl ChartHistory {
             open_oldest: None,
             oldest_width_s: OLDEST_WIDTH_S,
             oldest_capacity: oldest_capacity.max(2),
+            #[cfg(test)]
             compactions: 0,
             revision: 0,
         }
@@ -318,7 +320,10 @@ impl ChartHistory {
             .filter_map(StoredBucket::merge)
             .collect();
         self.oldest_width_s = self.oldest_width_s.saturating_mul(2);
-        self.compactions += 1;
+        #[cfg(test)]
+        {
+            self.compactions += 1;
+        }
         // The bucket that just closed at the old width keeps filling at the new one.
         let mut reopened = OpenBucket::starting_at(closed.start_s);
         reopened.add_bucket(&closed);
