@@ -200,6 +200,22 @@ describe("ThemeEditor", () => {
     expect(getTheme("mine")?.ui?.foreground).toBe("#101820");
   });
 
+  it("a grey environment band warns on the sidebar muted text and the worktree icon is held to 3:1", async () => {
+    await mount();
+    await type(textOf("ui.sidebar-env-band"), "#444444");
+    const muted = container.querySelector(
+      '[data-contrast-pair="sidebar-card-muted-foreground:sidebar-env-band"]',
+    )!;
+    expect(muted.textContent).toContain("Low contrast");
+    // About 3.4:1: under the 4.5:1 of text, over the 3:1 of a graphic.
+    await type(textOf("ui.sidebar-worktree-icon"), "#a06a40");
+    const icon = container.querySelector(
+      '[data-contrast-pair="sidebar-worktree-icon:sidebar-worktree"]',
+    )!;
+    expect(icon.textContent).toContain("needs 3:1");
+    expect(icon.textContent).not.toContain("Low contrast");
+  });
+
   it("the Terminal group sets ANSI red and the saved theme carries terminal.red", async () => {
     await mount();
     await type(textOf("terminal.red"), "#ff5555");

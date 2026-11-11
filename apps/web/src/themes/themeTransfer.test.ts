@@ -186,6 +186,44 @@ describe("theme export and import", () => {
     expect(again).toMatchObject({ ok: true, theme: plan.theme, resetPairs: [] });
   });
 
+  it("sidebar surfaces that make the global text unreadable lose only their own overrides, and an unreadable worktree icon loses its override", async () => {
+    const { transfer } = await load();
+    const grey = {
+      "muted-foreground": "#999999",
+      "sidebar-env-band": "#444444",
+      "sidebar-worktree": "#444444",
+      "sidebar-worktree-icon": "#444444",
+    };
+    const plan = transfer.planThemeImport(JSON.stringify({ ...night, ui: { ...night.ui, ...grey } }));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.theme.ui).toEqual({ ...night.ui, "muted-foreground": "#999999" });
+    const reset = plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`);
+    expect(reset).toContain("sidebar-card-muted-foreground:sidebar-env-band");
+    expect(reset).toContain("sidebar-worktree-icon:sidebar-worktree");
+    const again = transfer.planThemeImport(transfer.exportThemeJson(plan.theme));
+    expect(again).toMatchObject({ ok: true, theme: plan.theme, resetPairs: [] });
+  });
+
+  it("a light theme saved with only sidebar-env-band #262626 loses that override through the chat pair (R65)", async () => {
+    const { transfer } = await load();
+    const old: ThemeFile = {
+      version: 1,
+      id: "old-band",
+      name: "Old band",
+      base: "light",
+      ui: { "sidebar-env-band": "#262626" },
+    };
+    const plan = transfer.planThemeImport(JSON.stringify(old));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    const { ui: _ui, ...withoutUi } = old;
+    expect(plan.theme).toEqual(withoutUi);
+    expect(plan.resetPairs.map((pair) => `${pair.text}:${pair.surface}`)).toEqual([
+      "sidebar-chat-foreground:sidebar-env-band",
+    ]);
+  });
+
   it("a light import that sets only the background, with the default placeholder, keeps its background and resets nothing (amendment A3)", async () => {
     const { transfer } = await load();
     // Built-in Light already fails placeholder on background (about 3.1:1). The import is not
