@@ -9,7 +9,7 @@
 ### Git
 
 - A push that fails for missing credentials on a remote server now says that Git ran on that server, names it, and tells you to run `git push` in a terminal there; Source Control and the Git Manager show the same guidance. (#343)
-- Background status reads no longer take Git's index lock, so your own `git add` or `git commit` in a terminal no longer fails with "index.lock: File exists" while BiBCode is open. BiBCode asks Git to stop before killing it, removes only an `index.lock` its own killed process left, and leaves none behind when it quits. (#341)
+- Background status reads no longer take Git's index lock, so your own `git add` or `git commit` in a terminal no longer fails with "index.lock: File exists" while BiBCode is open. On Linux and macOS BiBCode asks Git to stop before it forces it; on Windows it forces it as before. Either way it then removes an `index.lock` that its own stopped process left and that nothing else is using, including when it quits. (#341)
 - Local status for a worktree is delivered while a stacked action or a Git Manager push, publish, force push or remote branch delete waits on the network. Writes stay one at a time; pull and fetch still wait. (#345)
 - The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
 
