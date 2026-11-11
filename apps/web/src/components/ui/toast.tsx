@@ -87,7 +87,7 @@ function isMultiLineDescription(description: unknown): description is string {
 const ERROR_DESCRIPTION_CLAMP_MIN_CHARS = 180;
 function errorDescriptionClampClass(type: unknown, description: unknown): string | undefined {
   if (isMultiLineDescription(description)) {
-    return "max-h-32 overflow-y-auto whitespace-pre-line";
+    return "whitespace-pre-line";
   }
   if (type !== "error" || typeof description !== "string") {
     return undefined;
@@ -210,6 +210,15 @@ function ToastBodyContent({
   const leadingIcon = toastData?.leadingIcon;
   const { className: secondaryActionClassName, ...secondaryActionRest } =
     secondaryActionProps ?? {};
+  const description = (
+    <Toast.Description
+      className={cn(
+        "min-w-0 select-text wrap-break-word text-muted-foreground",
+        errorDescriptionClampClass(toastType, toastDescription),
+      )}
+      data-slot="toast-description"
+    />
+  );
 
   return (
     <>
@@ -236,14 +245,19 @@ function ToastBodyContent({
           )}
         >
           <Toast.Title className="min-w-0 wrap-break-word font-medium" data-slot="toast-title" />
-          <Toast.Description
-            className={cn(
-              "min-w-0 select-text wrap-break-word text-muted-foreground",
-              errorDescriptionClampClass(toastType, toastDescription),
-            )}
-            data-slot="toast-description"
-            {...(isMultiLineDescription(toastDescription) ? { tabIndex: 0 } : {})}
-          />
+          {isMultiLineDescription(toastDescription) ? (
+            // The label sits here, not on the description, so the toast's aria-describedby still reads the text.
+            <div
+              aria-label={toastType === "error" ? "Error details" : "Details"}
+              className="max-h-32 overflow-y-auto rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              role="group"
+              tabIndex={0}
+            >
+              {description}
+            </div>
+          ) : (
+            description
+          )}
         </div>
       </div>
       {hasTrailingControls ? (
