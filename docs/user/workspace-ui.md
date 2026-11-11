@@ -490,13 +490,17 @@ chat header `+` menu contains:
 
 The composer's model picker lists only the chat's own provider. A worktree's or
 project's chat and a chat panel list the models of the provider account they
-were created with, even before the first message; a started chat lists its
-provider's models, including other accounts of that provider. To use another
-provider, add a chat panel from this `+` menu, or create a worktree with that
-agent. A new chat that has not been sent yet lists every ready provider, and
-choosing a model there also chooses its provider. When the chat's provider is
-disabled or not ready, the picker lists no models rather than another
-provider's.
+were created with, even before the first message. Once a worktree's or
+project's chat has started, it also lists that provider's other accounts that
+can continue the same session; a chat panel stays on its own account. To use
+another provider, add a chat panel from this `+` menu, or create a worktree with
+that agent. A new chat that has not been sent yet lists every ready provider,
+and choosing a model there also chooses its provider. The picker never lists
+another provider's models in place of the chat's own. When the chat's provider
+is not ready, its status banner says why. When it is disabled or removed, the
+banner above the composer names it, offers **Open Providers** (Settings →
+Providers) on this computer's server, and Send stays unavailable until the
+provider is back.
 
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host

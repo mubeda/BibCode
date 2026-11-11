@@ -16,7 +16,7 @@
 
 ### Chats
 
-- A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. (#347)
+- A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. A chat whose provider is disabled or removed now says so above the composer and keeps Send unavailable, and **Add as project** in Files opens the new Main on your Default Agent instead of Codex. (#347)
 
 ### Files
 
