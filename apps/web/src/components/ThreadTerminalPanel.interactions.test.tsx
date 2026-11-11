@@ -1831,6 +1831,25 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(attached.terminal.rows).toBeUndefined();
   });
 
+  it("attaches without dimensions when the mount is created with no area", async () => {
+    // #348: a center terminal created behind a maximized right panel has zero width.
+    const style = document.createElement("style");
+    style.textContent = "[data-terminal-xterm-mount] { width: 0px; }";
+    document.head.append(style);
+    try {
+      xtermState.proposedDimensions = { cols: 2, rows: 24 };
+      const view = await mountViewport({ publishRuntime: false });
+      const attached = testState.attachedSessionInputs.at(-1) as {
+        terminal: { cols?: number; rows?: number };
+      };
+      expect(attached.terminal.cols).toBeUndefined();
+      expect(xtermState.fitAddons.at(-1)!.fit).not.toHaveBeenCalled();
+      expect(view.fakeTerminal).not.toBeNull();
+    } finally {
+      style.remove();
+    }
+  });
+
   it("resets input modes after replaying an exited shell, not a running one", async () => {
     const view = await mountViewport();
     const history = "\x1b[?1000h\x1b[?1004h\x1b[?2004h$ exit\r\n";
@@ -2487,6 +2506,122 @@ describe("TerminalViewport mounted lifecycle", () => {
       environmentId: ENVIRONMENT_ID,
       input: { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 40 },
     });
+  });
+
+  it.each([false, true])(
+    "never sizes the PTY from a mount with no area and refits when it returns (ownership %s)",
+    async (ownership) => {
+      // #348: maximizing the right panel collapses the center column to zero width.
+      if (ownership) {
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      }
+      vi.spyOn(document, "hasFocus").mockReturnValue(true);
+      const view = await mountViewport({ visible: true });
+      const terminal = view.fakeTerminal!;
+      xtermState.fitAddons.at(-1)!.fit.mockImplementation(() => {
+        if (xtermState.proposedDimensions) {
+          terminal.cols = xtermState.proposedDimensions.cols;
+          terminal.rows = xtermState.proposedDimensions.rows;
+        }
+      });
+      await view.flushFrame();
+      await view.flushMountFit();
+      let claim: string | undefined;
+      if (ownership) {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot("prompt"),
+              size: { cols: 80, rows: 24, sizeClaim: null },
+            },
+          }),
+        );
+        claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "term-1",
+            size: { cols: 80, rows: 24, sizeClaim: claim! },
+          }),
+        );
+      }
+      view.resizeSpy.mockClear();
+      const mount = view.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+
+      // What the real fit addon proposes for a zero-width host (terminalSizing.test.ts).
+      mount.style.width = "0px";
+      xtermState.proposedDimensions = { cols: 2, rows: 24 };
+      await view.resizeContainer();
+      await view.flushFrame();
+      expect(view.resizeSpy).not.toHaveBeenCalled();
+      expect(terminal.cols).toBe(80);
+
+      mount.style.width = "";
+      xtermState.proposedDimensions = { cols: 80, rows: 24 };
+      await view.resizeContainer();
+      await view.flushFrame();
+      expect(view.resizeSpy).not.toHaveBeenCalled();
+      expect(terminal.cols).toBe(80);
+
+      xtermState.proposedDimensions = { cols: 80, rows: 30 };
+      await view.resizeContainer();
+      await view.flushFrame();
+      expect(view.resizeSpy).toHaveBeenCalledWith({
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          cols: 80,
+          rows: 30,
+          ...(ownership ? { sizeClaim: claim } : {}),
+        },
+      });
+    },
+  );
+
+  it("sends a height-only change of the mount to the PTY as the size owner", async () => {
+    // #348: an Activity card appearing below an AI terminal shrinks only its height.
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport({ visible: true });
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot("prompt"), size: { cols: 80, rows: 24, sizeClaim: null } },
+      }),
+    );
+    const claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    view.resizeSpy.mockClear();
+
+    xtermState.proposedDimensions = { cols: 80, rows: 19 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    expect(view.resizeSpy).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 19, sizeClaim: claim },
+    });
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 19, sizeClaim: claim },
+      }),
+    );
+    expect(view.fakeTerminal?.rows).toBe(19);
   });
 
   it("performs one trailing renderer refresh after element resize settles", async () => {
