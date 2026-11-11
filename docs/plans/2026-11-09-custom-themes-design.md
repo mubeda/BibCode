@@ -381,18 +381,23 @@ fixed keyword (spec, Anti-goals; R48).
   `muted-foreground` on `background`, on `card` and on `accent`; `selected-foreground` on
   `selected`; `placeholder` on `background`; `find-match-foreground` on `find-match`;
   `find-match-active-foreground` on `find-match-active`; `terminal.foreground` on
-  `terminal.background`. Amendment A9 (R65) appends four sidebar level pairs:
+  `terminal.background`. Amendment A9 (R65) appends nine sidebar level pairs:
   `sidebar-primary-badge-foreground` on `sidebar-primary-badge`; `sidebar-chat-foreground` on
-  `sidebar-card`, on `sidebar-env-band` and on `sidebar-worktree`.
-- The editor lists each pair with its ratio to two decimals and marks a pair below 4.5:1 with a
-  warning icon and the text "Low contrast", naming both tokens. Save stays enabled (R54).
-- Import: a fixed pair below 4.5:1 is reset only when the same pair at the theme's base values
+  `sidebar-card`, on `sidebar-env-band` and on `sidebar-worktree`; `foreground` and the painted
+  sidebar muted text (`sidebar-card-muted-foreground`) on `sidebar-env-band` and on
+  `sidebar-worktree`; `sidebar-worktree-icon` on `sidebar-worktree` at 3:1. The sidebar hierarchy
+  design note gives each pair's import reset.
+- The editor lists each pair with its ratio to two decimals and marks a pair below its minimum
+  (4.5:1, or 3:1 for the worktree icon, which it names) with a warning icon and the text "Low
+  contrast", naming both tokens. Save stays enabled (R54).
+- Import: a fixed pair below its minimum is reset only when the same pair at the theme's base values
   meets 4.5:1 or the import overrides that pair's text token (amendment A3, revised). A pair the
   base already fails, such as placeholder on background in built-in Light (about 3.1:1) and Dark
   (about 3.0:1), is left alone unless the import sets its text token, so an off-white background
   keeps its override. To reset a pair, the text token's override is removed; if the pair still
   fails and the rule still applies, the surface token's override is removed; this repeats until
-  no such pair fails. The notice names only the pairs actually reset. The stored theme is the reset one, so exporting it
+  no such pair fails. A pair of global text on a sidebar surface removes only the surface
+  override, and the worktree icon pair only the icon override. The notice names only the pairs actually reset. The stored theme is the reset one, so exporting it
   and importing it again changes nothing further (R55, D20).
 - The four new built-ins meet every fixed pair at 4.5:1, and Matrix Light and Verdant Light keep
   `input` at 3:1 on the background and every ANSI color at 4.5:1 on the terminal background
