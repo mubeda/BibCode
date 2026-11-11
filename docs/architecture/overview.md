@@ -1286,6 +1286,9 @@ does terminal fitting and its PTY resize RPC. The workspace marks the gesture
 with `data-resizing` and emits `bibcode:center-panel-resize-end` on release or
 cancellation; terminal viewports fit the final dimensions and chats settle
 their live end through the existing follow policy, preserving reader takeover.
+A terminal viewport also refits and repaints when the device pixel ratio
+changes (display scale or zoom), because xterm rounds row heights in device
+pixels and the number of rows that fit can change while the mount keeps its box.
 The timeline clips at the measured composer boundary, and the composer shadow
 fits within its lower padding so split-pane clipping does not cut it off.
 

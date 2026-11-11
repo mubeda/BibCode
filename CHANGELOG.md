@@ -33,7 +33,8 @@
 
 ### Terminals
 
-- Maximizing the right panel no longer resizes a center terminal's program to 2 columns; a terminal with no visible area keeps its size until it is shown again. (#348)
+- A terminal laid out with no width or height, such as a center terminal behind a maximized right panel, keeps its size instead of resizing its program to 2 columns or 1 row. (#348)
+- A terminal refits when the display scale changes, for example after moving the window to another display, so its bottom rows are no longer cut off until a panel is resized. (#348)
 
 ## [v0.15.3] - 2026-11-08
 

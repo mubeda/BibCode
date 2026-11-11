@@ -2436,8 +2436,22 @@ export function TerminalViewport({
     observer.observe(container);
     const workspace = container.closest("[data-center-panel-workspace]");
     workspace?.addEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
+    // xterm rounds row heights in device pixels, so a display scale change alters
+    // how many rows fit an unchanged box, which the ResizeObserver never reports.
+    let pixelRatioQuery: MediaQueryList | null = null;
+    const watchPixelRatio = () => {
+      pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
+      pixelRatioQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      pixelRatioQuery.addEventListener("change", handlePixelRatioChange);
+    };
+    function handlePixelRatioChange() {
+      watchPixelRatio();
+      scheduleResize();
+    }
+    watchPixelRatio();
 
     return () => {
+      pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
       observer.disconnect();
       workspace?.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
       if (frame !== null) {
