@@ -402,6 +402,8 @@ mod firewall;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod gstreamer_environment;
 #[cfg(target_os = "linux")]
+pub use gstreamer_environment::repair_process_environment as repair_gstreamer_environment;
+#[cfg(target_os = "linux")]
 mod linux_text_rendering;
 #[cfg(target_os = "linux")]
 mod linux_theme;

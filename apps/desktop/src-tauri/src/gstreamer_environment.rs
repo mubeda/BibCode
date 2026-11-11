@@ -1,4 +1,4 @@
-//! The AppImage launcher (AppImageKit's `AppRun`) prepends `$APPDIR/usr/lib/gstreamer-1.0:` to
+//! The AppImage launcher (`AppRun.wrapped`) prepends `$APPDIR/usr/lib/gstreamer-1.0:` to
 //! `GST_PLUGIN_SYSTEM_PATH_1_0` (and `$APPDIR/usr/lib/gstreamer:` to `GST_PLUGIN_SYSTEM_PATH`),
 //! but the bundle ships no GStreamer plugins. GStreamer then scans no plugin at all, finds no
 //! `autoaudiosink`, and WebKitGTK's web process dies on the first audio element. Dropping the
@@ -26,8 +26,40 @@ pub(crate) fn repair_plugin_path(
     value: Option<&OsStr>,
     exists: impl Fn(&Path) -> bool,
 ) -> PluginPathRepair {
-    let _ = (value, exists);
-    PluginPathRepair::Keep
+    let Some(value) = value else {
+        return PluginPathRepair::Keep;
+    };
+    let entries: Vec<_> = std::env::split_paths(value)
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    if entries.is_empty() {
+        return PluginPathRepair::Keep;
+    }
+    let existing: Vec<_> = entries.iter().filter(|entry| exists(entry)).collect();
+    if existing.is_empty() {
+        return PluginPathRepair::Remove;
+    }
+    match std::env::join_paths(existing) {
+        Ok(joined) if joined != value => PluginPathRepair::Replace(joined),
+        _ => PluginPathRepair::Keep,
+    }
+}
+
+/// Repairs both plugin path variables in this process. Call it only while the process is
+/// single-threaded: `main` does, right after the crash hook.
+#[cfg(target_os = "linux")]
+pub fn repair_process_environment() {
+    for name in PLUGIN_SYSTEM_PATH_VARIABLES {
+        let repair = repair_plugin_path(std::env::var_os(name).as_deref(), Path::is_dir);
+        // SAFETY: `main` calls this before Tauri, Tokio, GTK or WebKit start, and on Linux the
+        // crash hook attached just before installs signal handlers without spawning a thread,
+        // so no other thread can read or write the environment concurrently.
+        match repair {
+            PluginPathRepair::Keep => {}
+            PluginPathRepair::Remove => unsafe { std::env::remove_var(name) },
+            PluginPathRepair::Replace(value) => unsafe { std::env::set_var(name, value) },
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -81,7 +113,10 @@ mod tests {
     #[test]
     fn ignores_the_launchers_trailing_empty_entry() {
         assert_eq!(
-            decide(Some("/opt/host/gstreamer-1.0:"), &["/opt/host/gstreamer-1.0"]),
+            decide(
+                Some("/opt/host/gstreamer-1.0:"),
+                &["/opt/host/gstreamer-1.0"]
+            ),
             PluginPathRepair::Replace("/opt/host/gstreamer-1.0".into())
         );
     }
@@ -91,7 +126,8 @@ mod tests {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let raw = OsStr::from_bytes(b"/opt/\xff:/missing");
         assert_eq!(
-            repair_plugin_path(Some(raw), |path| path.as_os_str().as_bytes() == b"/opt/\xff"),
+            repair_plugin_path(Some(raw), |path| path.as_os_str().as_bytes()
+                == b"/opt/\xff"),
             PluginPathRepair::Replace(OsString::from_vec(b"/opt/\xff".to_vec()))
         );
     }
