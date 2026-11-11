@@ -1,5 +1,6 @@
-//! Worktree audit: removal outcomes, and a read-only scan every 10 minutes that compares the
-//! worktree catalog with the filesystem, Git and the processes BiBCode owns.
+//! Worktree audit: removal outcomes, and a scan every 10 minutes that compares the worktree
+//! catalog with the filesystem, Git and the processes BiBCode owns. The scan changes neither
+//! the filesystem nor Git, and its only write deletes a creation record whose folder is gone.
 
 use std::{
     collections::{HashMap, HashSet},

@@ -69,7 +69,7 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     assert!(sources.set(fixture.sources()).is_ok());
     let orphan_finding = wait_for_finding(&runtime, "worktree.orphan-dir").await;
     assert_eq!(orphan_finding["severity"], "warn");
-    assert!(orphan.exists(), "the scan is read-only");
+    assert!(orphan.exists(), "the scan leaves the folder in place");
     let events = shutdown_and_read_events(runtime, state.path()).await;
     assert!(
         events
