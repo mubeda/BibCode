@@ -63,13 +63,25 @@ The host collector SHALL skip zero-size volumes, `overlay` volumes not mounted a
 
 ### R68. A volume that does not answer does not hold back the rest [Must] (amendment A10)
 
-IF a volume's space read takes longer than 2 seconds, THEN the host collector SHALL report that volume as not responding with its last known sizes, or none before its first answer, SHALL still report CPU, memory and every other volume in the same reading, and SHALL NOT start another read of that volume while the first is still running.
+IF a volume's space read or the volume list takes longer than 2 seconds, THEN the host collector SHALL use the last volume list and report that volume as not responding with its last known sizes, or none before its first answer, SHALL still report CPU, memory and every other volume in the same reading, and SHALL NOT start another read of that volume while the first is still running.
 
 #### Scenario: one volume hangs
 
 - GIVEN a fake source whose space read for `/mnt/slow` never returns and whose other reads return at once, on a paused clock
 - WHEN two readings with volumes are taken 5 seconds apart
 - THEN both readings have CPU and memory, `/` is `ok`, `/mnt/slow` is `notResponding` with no sizes, and the source received exactly one space read for `/mnt/slow`
+
+#### Scenario: the volume answers late
+
+- GIVEN the hung read of `/mnt/slow` from the scenario above
+- WHEN it returns 100 GB total and 30 GB free after 12 seconds
+- THEN the next reading with volumes shows `/mnt/slow` as `ok` with those sizes, and the reading after it starts a new space read for `/mnt/slow`
+
+#### Scenario: the volume list hangs
+
+- GIVEN a fake source whose volume list never returns after a first list of `/`
+- WHEN a reading with volumes is taken
+- THEN the reading arrives within 3 seconds with CPU, memory and `/` from the last list
 
 ### R69. Statistics since server start keep a fixed size [Must] (amendment A10)
 
@@ -110,7 +122,7 @@ The host collector SHALL cost less than 0.1 percent of one core at the backgroun
 #### Scenario: measured cost
 
 - GIVEN the native source on this repository's macOS development host and in the Linux lab container
-- WHEN the cost probe takes 300 readings of each kind
+- WHEN the cost probe takes 300 readings of each kind, 250 ms apart so that every CPU refresh does its work
 - THEN its report shows CPU time per background reading below 60 ms and per live reading below 10 ms, and the method and figures are recorded in the pull request
 
 ### R72. The host stream sends a snapshot first, then readings, to an authorized client only [Must] (amendment A10)
@@ -125,7 +137,7 @@ WHEN a client with the `orchestration:read` scope opens the host stream, the ser
 
 #### Scenario: under-scoped session
 
-- GIVEN a session whose token has only the `access:read` scope
+- GIVEN a session whose token has only the `orchestration:operate` scope
 - WHEN it opens the host stream
 - THEN it receives `EnvironmentAuthorizationError` with `requiredScope` `orchestration:read` and no chunk
 
@@ -224,7 +236,7 @@ The host collector's readings SHALL agree with the operating system's command-li
 #### Scenario: macOS host and Linux container
 
 - GIVEN this repository's macOS development host and the Linux lab container
-- WHEN the comparison probe runs against `vm_stat`, `df -k`, `diskutil info` and `top` on macOS, and `free -b`, `df -k -P` and `/proc/stat` on Linux
+- WHEN the comparison probe runs against `vm_stat`, `df -k`, `diskutil info` and `top` on macOS, and `/proc/meminfo` (`MemTotal` minus `MemAvailable`), `df -k -P` and `/proc/stat` on Linux
 - THEN every comparison is inside its tolerance and the probe prints the figures it compared
 
 ### R81. Hidden volumes can be listed [Should] (amendment A10)

@@ -27,7 +27,9 @@ for remote servers and for the local environment.
 - `sysinfo = "0.39.6"` in the workspace `Cargo.toml` (line 86) with default features, used by
   `apps/server` through `sysinfo.workspace = true` (`apps/server/Cargo.toml:65`). The default
   features are `component`, `disk`, `network`, `system` and `user`, so `Disks`, CPU and memory
-  need no new feature and the lockfile does not change.
+  need no new feature for P0. Only the P1.2 task adds `linux-netdevs` and `linux-tmpfs`, which
+  change nothing but which mounts the Linux disk list includes; `Cargo.lock` records no
+  features, so it does not change, and that task runs `vp run check:dependency-ledger` anyway.
 - `DiagnosticsMonitor` (`apps/server/src/diagnostics/monitor.rs`) samples BiBCode's own process
   tree every 2 s (`apps/server/src/production/runtime.rs:616-619`) and stops after three
   intervals without a reader (`monitor.rs:24-26`: "a server nobody reads samples nothing").
@@ -90,7 +92,7 @@ for remote servers and for the local environment.
    decodes into a Rust struct and re-encodes byte-identical. The new test follows that one.
 8. **The MCP tool cannot drain a subscription.** `RpcRegistry::invoke_local` runs unary methods
    only (`rpc/session.rs:812`), and the stream drain waits for a terminal event a subscription
-   never sends. P2.1 adds a unary `server.getHostMetrics` (Task 11.11).
+   never sends. P2.1 adds a unary `server.getHostMetrics` (Task 11.12).
 9. **Line numbers moved:** the scope list is at `apps/server/src/auth/scope.rs:69-70` and its
    test at `:252`; the method list at `apps/server/src/rpc/methods.rs:172-173`; the diagnostics
    registrations at `production/server_terminal.rs:620-640`; the descriptor tests at
@@ -101,16 +103,18 @@ for remote servers and for the local environment.
 
 ### Collector
 
-`HostMetricsCollector` lives in `apps/server/src/diagnostics/host_metrics/`. It reads through a
-`HostMetricsSource` trait whose methods return boxed futures, like `ProcessSampler`, so tests
-drive it with a fake and a paused clock:
+`HostMetricsCollector` lives in `apps/server/src/diagnostics/host_metrics/`. It holds an
+`Arc<dyn HostMetricsSource>`, not a generic parameter, so unit tests, the integration tests in
+`apps/server/tests/` and production pass different sources to the same type. The trait's
+methods return boxed futures, like `ProcessSampler`, so tests drive it with a fake and a paused
+clock:
 
 ```rust
 pub trait HostMetricsSource: std::fmt::Debug + Send + Sync + 'static {
     fn host_facts(&self) -> HostFacts;
     fn read_cpu_memory(&self) -> BoxFuture<'_, Result<CpuMemoryReading, SamplingError>>;
     fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeDescriptor>>;
-    fn read_volume_space(&self, mount_point: &Path) -> BoxFuture<'_, VolumeSpaceRead>;
+    fn read_volume_space(&self, mount_point: &Path) -> BoxFuture<'_, Result<VolumeSpace, String>>;
 }
 ```
 
@@ -118,12 +122,21 @@ The native source holds one `System::new()` (never `new_all()`) and the disk lis
 CPU usage and memory only, never processes, on the blocking pool. Each volume is its own
 `Arc<Mutex<Disk>>` (`sysinfo` converts `Disks` into `Vec<Disk>`, `src/common/disk.rs:211`), and a
 space read is `Disk::refresh_specifics(DiskRefreshKind::nothing().with_storage())` on the blocking
-pool. The collector wraps each `read_volume_space` future in a 2 s timeout. A volume that misses
-it shows as not responding. While its read is still running on the blocking thread, its mutex is
-held, so the next read of that volume returns `VolumeSpaceRead::Busy` at once instead of
-starting a second thread. A hung mount therefore costs at most one stuck blocking thread, and CPU
-and memory never wait on disks. On Linux, listing with `DiskRefreshKind::nothing()` reads
-`/proc/mounts` and calls no `statvfs` (`src/unix/linux/disk.rs:141-143`).
+pool.
+
+The collector, not the source, owns the time limit and the "one read at a time" rule, so the
+fake can prove both. It runs each volume read as its own Tokio task and keeps the task's handle
+per mount point. On a volume tick it waits up to 2 s for the new reads. A read still running
+after that leaves its handle in place and the volume shows as not responding; on later ticks the
+collector starts no new read for that mount point while its handle is unfinished, and takes the
+result as soon as the handle finishes, so a volume that answers late recovers on the next volume
+tick. Listing the volumes (`list_volumes`, which includes the `symlink_metadata` check and, on
+macOS, Core Foundation property reads) runs under the same guard: if it does not finish in 2 s,
+the reading reuses the last list. A hung mount therefore costs at most one stuck blocking thread
+per mount point, and CPU and memory never wait on disks. On Linux, listing with
+`DiskRefreshKind::nothing()` reads `/proc/mounts` and calls no `statvfs`, on the first listing
+too (`src/unix/linux/disk.rs:141-143`, and `new_disk` passes the refresh kind through). On
+Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs:311-313`).
 
 One sample holds `sampledAt`, `cpuPercent` (0 to 100, all logical cores), `memoryTotalBytes`,
 `memoryUsedBytes`, `memoryAvailableBytes` and `volumes`. Each volume has `mountPoint`, `name`,
@@ -171,8 +184,10 @@ Kept in memory for the life of the server process (D23), reset on restart:
 - Chart history in three tiers: the last 15 minutes of raw samples, 1-minute buckets for the last
   24 hours, and 15-minute buckets beyond that. Each bucket keeps average and peak for CPU and
   memory, as `ProcessResourceHistory` buckets do. The oldest tier holds at most 20,000 buckets;
-  when it is full, adjacent pairs merge and the bucket width doubles. 20,000 buckets of 24 bytes
-  stay under 1 MiB.
+  when it is full, adjacent pairs merge and the bucket width doubles. Closed buckets are stored
+  compactly (start offset and width in seconds as `u32`, four `f32` values: 24 bytes), so 20,000
+  of them stay under 1 MiB; a test asserts the size. Only the open bucket of each tier keeps sums
+  and weights. The wire type is separate.
 - On the wire the uptime chart is at most 240 bars, aggregated from the tiers on the server, and
   the recent chart at most 900 points.
 
@@ -194,6 +209,11 @@ blocks only its own loop; when it catches up it reads the latest sample, so inte
 are skipped and nothing queues without bound. Statistics are cumulative, so a skipped sample
 loses one chart point only. A test bounds the encoded snapshot at 128 KiB (900 points and 240 buckets); a
 larger item is still delivered, split by the existing E2EE chunking (`rpc/session.rs:2013-2049`).
+
+`bootId` comes from `ServerConfig::boot_id` and is `null` when the server has none, as in the
+descriptor (`lifecycle.rs:62`). `startedAt` is the collector's creation time, which the
+production runtime sets while it starts. The client treats a change of a non-null `bootId` as a
+restart, and falls back to a change of `startedAt` when either `bootId` is `null`.
 
 Capability flag `hostMetrics` in `ExecutionEnvironmentCapabilities`, set to `true` in both
 descriptors in the same task that registers the method.
@@ -353,7 +373,10 @@ The status bar's polling stops on blur too; the dashboard does not. Agent's call
   nothing while it is closed or hidden.
 - Memory: fixed-size statistics, at most 900 raw samples and 1,440 minute buckets, and the
   oldest tier under 1 MiB.
-- Measured in Task 11.4 before any web work; the method and numbers go in the pull request.
+- Measured in Task 11.4 before any web work, with readings 250 ms apart because `sysinfo` skips a
+  CPU refresh closer than 200 ms to the last one (`src/unix/apple/cpu.rs:33-35`,
+  `src/unix/linux/cpu.rs:48`); the method and numbers go in the pull request. JSON encoding of one
+  live item (about 1 KB) is checked again by Task 11.5's size test.
 
 ## Profiler, crash and trace coverage
 
