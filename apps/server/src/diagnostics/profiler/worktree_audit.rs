@@ -461,6 +461,18 @@ pub enum WorktreeEvidence {
 }
 
 impl WorktreeEvidence {
+    const ALL: [Self; 4] = [
+        Self::CreationRecord,
+        Self::IncompleteRemoval,
+        Self::GitPointerFile,
+        Self::RemovalMarker,
+    ];
+
+    /// Whether `reason` is an evidence kind's `reason`.
+    pub(crate) fn is_reason(reason: &str) -> bool {
+        Self::ALL.iter().any(|evidence| evidence.reason() == reason)
+    }
+
     fn reason(self) -> &'static str {
         match self {
             Self::CreationRecord => "creation-record",

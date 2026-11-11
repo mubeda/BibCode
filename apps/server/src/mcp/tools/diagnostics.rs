@@ -18,6 +18,7 @@ use crate::{
     diagnostics::profiler::{
         mcp::{self as profiler, Producer, Refusal},
         redact::redact_message,
+        worktree_audit::WorktreeEvidence,
     },
     mcp::{
         control::{
@@ -923,9 +924,8 @@ fn evidence_fields(kind: &str) -> Vec<&'static str> {
             "cancelled",
             "capacity",
         ]],
-        "worktree.missing" | "worktree.orphan-dir" | "worktree.registration-mismatch" => {
-            &[&["path"]]
-        }
+        "worktree.missing" | "worktree.registration-mismatch" => &[&["path"]],
+        "worktree.orphan-dir" => &[&["path", "name", "reason"]],
         "worktree.stuck-removal" => &[&["path", "minutes"]],
         "worktree.held-open" => &[&["path", "pid"]],
         "git.stacked-action-failed" => &[&[
@@ -976,8 +976,18 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
         }
     }
     clean_client_fields(&mut evidence);
+    // An orphan's reason is one of the audit's evidence kinds, never free text.
+    if kind == "worktree.orphan-dir"
+        && !evidence
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(WorktreeEvidence::is_reason)
+        && let Some(fields) = evidence.as_object_mut()
+    {
+        fields.remove("reason");
+    }
     // Keep home-relative paths; retain a safe relative path or file name outside home.
-    for field in ["worktree", "path"] {
+    for field in ["worktree", "path", "name"] {
         if let Some(path) = evidence.get(field).and_then(Value::as_str) {
             let inside_home = path == "~" || path.starts_with("~/") || path.starts_with("~\\");
             if !inside_home {
