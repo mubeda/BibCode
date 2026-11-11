@@ -406,8 +406,11 @@ describe("SidebarThreadRow browser interactions", () => {
         h.state.commandCalls as Array<{ label: string; input: { input: { title: string } } }>
       ).filter((call) => call.label === "worktree.createManaged");
       expect(created.map((call) => call.input.input.title)).toEqual(["sidebar-check"]);
-      // The dialog closed itself through the Sidebar's callback.
-      expect(captured("Dialog").some((entry) => entry.props["open"] === false)).toBe(true);
+      // The dialog closed itself through the Sidebar's callback and opened the new thread.
+      expect(captured("Dialog").at(-1)?.props["open"]).toBe(false);
+      expect(h.spies.navigate).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "/$environmentId/$threadId" }),
+      );
 
       await openFromProjectRow();
       expect(nameInput().value).toBe("");
