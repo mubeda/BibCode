@@ -1125,7 +1125,9 @@ describe("AgentsSettingsPanel", () => {
   describe("Code review group (R99)", () => {
     const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
     const namedSelect = (name: string) => {
-      const found = h.controls.find((entry) => entry.kind === "select" && entry.props.name === name);
+      const found = h.controls.find(
+        (entry) => entry.kind === "select" && entry.props.name === name,
+      );
       if (!found) throw new Error(`No select named ${name}`);
       return found;
     };
@@ -1149,7 +1151,9 @@ describe("AgentsSettingsPanel", () => {
       expect(markup).toContain('data-section-title="Code review"');
       expect(control("textarea", "Review prompt").props.value).toBe(DEFAULT_CODE_REVIEW_PROMPT);
       expect(findControls("button", "Reset review prompt to default")).toHaveLength(0);
-      expect(markup).toContain(`${DEFAULT_CODE_REVIEW_PROMPT.length.toLocaleString("en-US")} / 7,680`);
+      expect(markup).toContain(
+        `${DEFAULT_CODE_REVIEW_PROMPT.length.toLocaleString("en-US")} / 7,680`,
+      );
     });
 
     it("stores an empty prompt on Reset and when the default text is saved", () => {

@@ -1,8 +1,10 @@
 import { ArchiveIcon, ArchiveX, LoaderIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  CODE_REVIEW_PROMPT_MAX_LENGTH,
+  DEFAULT_CODE_REVIEW_PROMPT,
   DEFAULT_SERVER_SETTINGS,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -46,8 +48,15 @@ import { TraitsPicker } from "../chat/TraitsPicker";
 import {
   buildProviderAgentActions,
   isProviderAgentActionSelectable,
+  type ProviderAgentAction,
   resolveEffectiveProviderAgentAction,
 } from "../chat/providerAgentActions";
+import { CODE_REVIEW_DRIVERS_WITH_TERMINALS } from "../chat/providerTerminalActions";
+import {
+  CODE_REVIEW_SERVER_UPDATE_REASON,
+  codeReviewGuardLine,
+  resolveSavedCodeReviewer,
+} from "../../codeReview";
 import { isDesktopHost } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
 import { useTheme } from "../../hooks/useTheme";
@@ -63,6 +72,7 @@ import {
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  type ProviderInstanceEntry,
   sortProviderInstanceEntries,
 } from "../../providerInstances";
 import { ensureLocalApi, readLocalApi } from "../../localApi";
@@ -82,6 +92,7 @@ import { Badge } from "../ui/badge";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
+import { Textarea } from "../ui/textarea";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { AddProviderInstanceDialog } from "./AddProviderInstanceDialog";
@@ -1179,8 +1190,211 @@ export function AgentsSettingsPanel() {
           }
         />
       </SettingsSection>
+      <CodeReviewSettingsSection
+        actions={defaultAgentActions}
+        instanceEntries={gitModelInstanceEntries}
+      />
       <AgentIntegrationsSection />
     </SettingsPageContainer>
+  );
+}
+
+const PROVIDER_DEFAULT_REVIEW_MODEL = "default";
+const REVIEW_PROMPT_MAX_LABEL = CODE_REVIEW_PROMPT_MAX_LENGTH.toLocaleString("en-US");
+
+/** Settings → Agents → Code review (#293): the reviewer, its model and the user's prompt. */
+function CodeReviewSettingsSection({
+  actions,
+  instanceEntries,
+}: {
+  readonly actions: ReadonlyArray<ProviderAgentAction>;
+  readonly instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
+}) {
+  const settings = usePrimarySettings();
+  const updateSettings = useUpdatePrimarySettings();
+  const supported =
+    usePrimaryEnvironment()?.serverConfig?.environment.capabilities?.codeReviews === true;
+  const unsupportedStatus = supported ? null : CODE_REVIEW_SERVER_UPDATE_REASON;
+  // Terminals only for the CLIs whose read-only flags are verified (design note).
+  const reviewerActions = actions.filter(
+    (action) =>
+      action.kind === "chat" || CODE_REVIEW_DRIVERS_WITH_TERMINALS.has(action.entry.driverKind),
+  );
+  const saved = settings.codeReviewAgent;
+  const savedValue = `${saved.kind}:${saved.instanceId}`;
+  const savedReviewer = resolveSavedCodeReviewer(reviewerActions, saved, instanceEntries);
+  // A saved reviewer that is unavailable stays shown as saved, never as a fallback (D48).
+  const reviewerItems = reviewerActions
+    .filter((action) => !action.disabled || action.value === savedValue)
+    .map((action): { value: string; label: string } => ({
+      value: action.value,
+      label: action.label,
+    }));
+  if (!reviewerItems.some((item) => item.value === savedValue)) {
+    reviewerItems.push({ value: savedValue, label: saved.instanceId });
+  }
+  const reviewerEntry =
+    savedReviewer.action?.entry ??
+    instanceEntries.find((entry) => entry.instanceId === saved.instanceId) ??
+    null;
+  const storedModel = settings.codeReviewModelSelection;
+  const modelValue =
+    reviewerEntry !== null && storedModel?.instanceId === reviewerEntry.instanceId
+      ? storedModel.model
+      : PROVIDER_DEFAULT_REVIEW_MODEL;
+  const modelItems = [
+    { value: PROVIDER_DEFAULT_REVIEW_MODEL, label: "Provider default" },
+    ...(reviewerEntry?.models ?? []).map((model) => ({ value: model.slug, label: model.name })),
+  ];
+  const promptFieldId = useId();
+
+  return (
+    <SettingsSection title="Code review">
+      <SettingsRow
+        title="Code review agent"
+        description="The chat or AI Terminal that Review changes in Source Control starts."
+        status={
+          unsupportedStatus ??
+          (savedReviewer.action
+            ? codeReviewGuardLine({
+                kind: saved.kind,
+                driver: savedReviewer.action.entry.driverKind,
+              })
+            : savedReviewer.reason)
+        }
+        resetAction={
+          Equal.equals(saved, DEFAULT_DEFAULT_AGENT_SELECTION) ? null : (
+            <SettingResetButton
+              label="code review agent"
+              onClick={() => updateSettings({ codeReviewAgent: DEFAULT_DEFAULT_AGENT_SELECTION })}
+            />
+          )
+        }
+        control={
+          <Select
+            name="codeReviewAgent"
+            value={savedValue}
+            disabled={!supported}
+            onValueChange={(value) => {
+              const action = reviewerActions.find((item) => item.value === value);
+              if (action && !action.disabled) updateSettings({ codeReviewAgent: action.selection });
+            }}
+            items={reviewerItems}
+          >
+            <SelectTrigger aria-label="Code review agent">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectPopup>
+              {reviewerItems.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+        }
+      />
+      <SettingsRow
+        title="Review model"
+        description="The model of a review. Provider default uses the agent's own default."
+        status={unsupportedStatus}
+        resetAction={
+          storedModel === null ? null : (
+            <SettingResetButton
+              label="review model"
+              onClick={() => updateSettings({ codeReviewModelSelection: null })}
+            />
+          )
+        }
+        control={
+          <Select
+            name="codeReviewModel"
+            value={modelValue}
+            disabled={!supported || reviewerEntry === null}
+            onValueChange={(value) => {
+              if (!value || value === PROVIDER_DEFAULT_REVIEW_MODEL || reviewerEntry === null) {
+                updateSettings({ codeReviewModelSelection: null });
+                return;
+              }
+              updateSettings({
+                codeReviewModelSelection: { instanceId: reviewerEntry.instanceId, model: value },
+              });
+            }}
+            items={modelItems}
+          >
+            <SelectTrigger aria-label="Review model">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectPopup>
+              {modelItems.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+        }
+      />
+      <SettingsRow
+        title={<label htmlFor={promptFieldId}>Review prompt</label>}
+        description="Sent after a fixed line that names the scope and says not to edit. {scope} and {base} are filled in. A project can set its own in Source Control."
+        status={unsupportedStatus}
+        resetAction={
+          settings.codeReviewPrompt === "" ? null : (
+            <SettingResetButton
+              label="review prompt"
+              onClick={() => updateSettings({ codeReviewPrompt: "" })}
+            />
+          )
+        }
+      >
+        {/* Remounted when the stored prompt changes, so Reset shows the default again. */}
+        <CodeReviewPromptField
+          key={settings.codeReviewPrompt}
+          id={promptFieldId}
+          stored={settings.codeReviewPrompt}
+          disabled={!supported}
+          onSave={(codeReviewPrompt) => updateSettings({ codeReviewPrompt })}
+        />
+      </SettingsRow>
+    </SettingsSection>
+  );
+}
+
+function CodeReviewPromptField({
+  id,
+  stored,
+  disabled,
+  onSave,
+}: {
+  readonly id: string;
+  readonly stored: string;
+  readonly disabled: boolean;
+  readonly onSave: (prompt: string) => void;
+}) {
+  // The draft stays local: the panel re-renders on every settings change.
+  const [draft, setDraft] = useState(stored === "" ? DEFAULT_CODE_REVIEW_PROMPT : stored);
+  return (
+    <div className="grid gap-1 pb-3.5">
+      <Textarea
+        id={id}
+        aria-label="Review prompt"
+        value={draft}
+        rows={8}
+        maxLength={CODE_REVIEW_PROMPT_MAX_LENGTH}
+        disabled={disabled}
+        onChange={(event) => setDraft(event.target.value.slice(0, CODE_REVIEW_PROMPT_MAX_LENGTH))}
+        onBlur={(event) => {
+          const text = event.target.value;
+          // The default's own text stores "", so a later default change still applies.
+          const next = text === DEFAULT_CODE_REVIEW_PROMPT || text.trim() === "" ? "" : text;
+          if (next !== stored) onSave(next);
+        }}
+      />
+      <span aria-live="polite" className="text-end text-xs text-muted-foreground tabular-nums">
+        {`${draft.length.toLocaleString("en-US")} / ${REVIEW_PROMPT_MAX_LABEL}`}
+      </span>
+    </div>
   );
 }
 
