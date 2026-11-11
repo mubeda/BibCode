@@ -15,6 +15,7 @@ import StarterKit from "@tiptap/starter-kit";
 import { createDetailsExtensions } from "./detailsExtension";
 import {
   createMermaidDiagramExtension,
+  FENCE_INFO_ATTRIBUTE,
   fencedCode,
   type MermaidDiagramView,
 } from "./mermaidDiagramExtension";
@@ -92,6 +93,22 @@ const MarkedListItem = ListItem.extend({
 
 // Three backticks would end early at a three-backtick line inside the code.
 const FencedCodeBlock = CodeBlock.extend({
+  // The whole info string (`js title="x"`) survives a copy; the class holds only `js`.
+  addAttributes() {
+    const parent = this.parent?.() ?? {};
+    const language = parent["language"] ?? {};
+    return {
+      ...parent,
+      language: {
+        ...language,
+        rendered: true,
+        parseHTML: (element: HTMLElement) =>
+          element.getAttribute(FENCE_INFO_ATTRIBUTE) ?? language.parseHTML?.(element) ?? null,
+        renderHTML: (attributes: Record<string, unknown>) =>
+          attributes["language"] ? { [FENCE_INFO_ATTRIBUTE]: attributes["language"] } : {},
+      },
+    };
+  },
   renderMarkdown: (node: JSONContent, helpers) => {
     const code = node.content ? helpers.renderChildren(node.content) : "";
     return fencedCode(code, (node.attrs?.["language"] as string | null) ?? "");

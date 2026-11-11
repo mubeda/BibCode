@@ -87,11 +87,7 @@ describe("createRichMarkdownEditor", () => {
       "> Quoted.\n>\n> ```mermaid\n> graph TD\n>\n>   A --> B\n> ```\n\nAfter.\n",
       "Quoted.",
     ],
-    [
-      "a list item",
-      "- item\n\n  ```mermaid\n  graph TD\n\n    A --> B\n  ```\n\n- next\n",
-      "next",
-    ],
+    ["a list item", "- item\n\n  ```mermaid\n  graph TD\n\n    A --> B\n  ```\n\n- next\n", "next"],
     [
       "a details body",
       "<details>\n<summary>More</summary>\n\n```mermaid\ngraph TD\n\n  A --> B\n```\n\n</details>\n\nAfter.\n",
@@ -160,9 +156,14 @@ describe("createRichMarkdownEditor", () => {
   });
 
   it.each([
-    ["a diagram with a title", "~~~mermaid title=\"Flow\"", "graph TD\n  A --> B", "mermaidDiagram"],
-    ["a diagram with a backtick run", "~~~~mermaid", "graph TD\n  %% ```\n  A --> B", "mermaidDiagram"],
-    ["a code block with a title", "~~~js title=\"x\"", "const a = 1;", "codeBlock"],
+    ["a diagram with a title", '~~~mermaid title="Flow"', "graph TD\n  A --> B", "mermaidDiagram"],
+    [
+      "a diagram with a backtick run",
+      "~~~~mermaid",
+      "graph TD\n  %% ```\n  A --> B",
+      "mermaidDiagram",
+    ],
+    ["a code block with a title", '~~~js title="x"', "const a = 1;", "codeBlock"],
     ["a tilde code block", "~~~js", "const a = 1;", "codeBlock"],
     ["a code block with a backtick run", "~~~~text", "a\n```\nb", "codeBlock"],
   ])("cut and pasted, %s keeps its info string and code", (_name, opener, code, type) => {

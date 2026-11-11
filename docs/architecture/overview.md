@@ -3497,8 +3497,10 @@ sees partial source:
   diagram's source is edited in source view, and the block says so. There,
   **Show source** shows plain, unhighlighted source, and copy goes through the
   node's text and HTML serializers instead of `markdown-clipboard.ts`: the
-  copied text is the fenced source, and a diagram pasted back is a code block
-  until the view opens again. A fence title is not shown. Other
+  copied text is the fenced source, and the copied HTML carries the whole info
+  string in `data-fence-info` (a `language-` class keeps only its first word),
+  so a diagram or code block pasted back keeps its fence's info string, and a
+  diagram comes back as a diagram. A fence title is not shown. Other
   fenced code in the editable view has no syntax colors, and a click on a link
   places the caret instead of opening it.
 - **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)

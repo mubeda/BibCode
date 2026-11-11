@@ -17,6 +17,9 @@ export function fencedCode(code: string, info: string): string {
   return `${fence}${info}\n${code}\n${fence}`;
 }
 
+/** The whole info string of a copied fence; its `language-` class keeps only the first word. */
+export const FENCE_INFO_ATTRIBUTE = "data-fence-info";
+const MERMAID_DIAGRAM_ATTRIBUTE = "data-mermaid-diagram";
 const MERMAID_INFO = /^mermaid(?:\s|$)/;
 let nextViewId = 0;
 
@@ -59,10 +62,23 @@ export function createMermaidDiagramExtension(
         info: { default: "mermaid", rendered: false },
       };
     },
-    // Copied out, it pastes back as a code block with the same fence, so no source is lost.
+    // Cut and pasted, it comes back as this diagram with its source and whole info string.
+    // Elsewhere it pastes as a Mermaid code block.
     renderHTML: ({ node }) => [
       "pre",
+      { [MERMAID_DIAGRAM_ATTRIBUTE]: "", [FENCE_INFO_ATTRIBUTE]: node.attrs["info"] as string },
       ["code", { class: "language-mermaid" }, node.attrs["source"] as string],
+    ],
+    parseHTML: () => [
+      {
+        tag: `pre[${MERMAID_DIAGRAM_ATTRIBUTE}]`,
+        // Ahead of the code block's `pre` rule.
+        priority: 60,
+        getAttrs: (element) => ({
+          source: element.textContent,
+          info: element.getAttribute(FENCE_INFO_ATTRIBUTE) ?? "mermaid",
+        }),
+      },
     ],
     renderText: ({ node }) =>
       fencedCode(node.attrs["source"] as string, node.attrs["info"] as string),
