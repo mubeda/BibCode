@@ -1222,7 +1222,22 @@ describe("AgentsSettingsPanel", () => {
 
     it("disables every row on a server without code reviews", () => {
       h.primaryEnvironment = { environmentId: ENVIRONMENT_ID };
+      // Non-default values, so each Reset would show on a server that supports reviews.
+      h.settings = {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        codeReviewAgent: { kind: "terminal", instanceId: ProviderInstanceId.make("claudeAgent") },
+        codeReviewModelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "model-beta",
+        },
+        codeReviewPrompt: "Mine",
+      };
       const markup = render(<AgentsSettingsPanel />);
+      for (const label of ["code review agent", "review model", "review prompt"]) {
+        expect(findControls("button", `Reset ${label} to default`)).toHaveLength(0);
+      }
+      invoke(control("textarea", "Review prompt"), "onBlur", { target: { value: "Other" } });
+      expect(h.updateSettings).not.toHaveBeenCalled();
       expect(
         markup.match(/Update the BiBCode server on this environment to use Review\./g),
       ).toHaveLength(3);
