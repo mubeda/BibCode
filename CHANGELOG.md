@@ -14,6 +14,10 @@
 - The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
 - Create worktree starts fresh every time it opens, after a creation or a close: the last Name, Create From, mode, base override, Advanced, Create more and agent pick no longer come back. Input stays while the dialog is open, and Create more still keeps the project, mode, agent and base override for its batch. (#346)
 
+### Chats
+
+- A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. (#347)
+
 ### Files
 
 - Markdown opens editable in rendered view, with a formatting group in the Files toolbar (paragraph, headings 1 to 5, bold, italic, strikethrough, bullet, numbered and task lists, block quote, a link dialog, Insert image next to the file, collapsible section). Undo and Redo work in both views and a save changes only what you edited; frontmatter and constructs the editor cannot represent stay as written or read-only. (#342)

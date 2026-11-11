@@ -488,6 +488,14 @@ chat header `+` menu contains:
   the current worktree using that provider instance's configured binary path
 - Add custom action, which opens the custom action dialog
 
+The composer's model picker lists only the models of the chat's own provider
+account: a worktree's or project's chat, a chat panel, and any chat that has
+started stay on the agent they were created with. To use another provider, add
+a chat panel from this `+` menu, or create a worktree with that agent. A new
+chat that has not been sent yet lists every ready provider, and choosing a model
+there also chooses its provider. When the chat's provider is disabled or not
+ready, the picker lists no models rather than another provider's.
+
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
 thread's project, branch, and worktree. Panel threads are hidden from the left

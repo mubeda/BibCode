@@ -3486,7 +3486,9 @@ sizes. Cover relevant:
   (#185). Check each of these:
   - **Primary project:** with the app running, change Default Agent to a Claude
     chat, open Create Worktree, and confirm the Agent picker shows it. Create
-    without touching the picker; the new thread runs Claude. Repeat with an AI
+    without touching the picker; the new thread runs Claude. Before sending a
+    message, open its composer model picker with another provider ready: it
+    lists only that Claude account's models (#347). Repeat with an AI
     terminal; Main becomes that terminal.
   - **Remote project:** on a saved server whose own settings still name the
     built-in default, the picker and the created thread use the Settings
