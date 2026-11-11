@@ -139,26 +139,14 @@ export const GitManagerChangeRow = memo(function GitManagerChangeRow({
       )}
       <span
         aria-label={presentation.label}
-        className={cn(
-          "inline-flex size-4 shrink-0 items-center justify-center font-mono text-xs",
-          selected ? "text-selected-foreground/70" : "text-muted-foreground",
-        )}
+        className="inline-flex size-4 shrink-0 items-center justify-center font-mono text-xs text-muted-foreground"
         title={presentation.label}
       >
         <StatusIcon aria-hidden={true} className="size-3.5" />
         <span className="sr-only">{presentation.badge}</span>
       </span>
       <span className="shrink-0 truncate font-mono text-xs">{name}</span>
-      {dir ? (
-        <span
-          className={cn(
-            "min-w-0 truncate",
-            selected ? "text-selected-foreground/70" : "text-muted-foreground",
-          )}
-        >
-          {dir}
-        </span>
-      ) : null}
+      {dir ? <span className="min-w-0 truncate text-muted-foreground">{dir}</span> : null}
       <span className="ml-auto flex shrink-0 items-center gap-1.5">
         {row.conflicted ? (
           <span className="rounded bg-destructive/12 px-1 text-xs font-medium text-destructive">

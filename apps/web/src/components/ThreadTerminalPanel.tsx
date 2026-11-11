@@ -3148,7 +3148,9 @@ export default function ThreadTerminalPanel({
                                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                               }`}
                             >
-                              {showGroupHeaders && <span className="text-xs">└</span>}
+                              {showGroupHeaders && (
+                                <span className="text-xs text-muted-foreground">└</span>
+                              )}
                               <button
                                 type="button"
                                 className="flex min-w-0 flex-1 items-center gap-1 text-left"

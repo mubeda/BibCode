@@ -425,12 +425,7 @@ function SourceControlFileRow({
           // Takes the leftover width, never less than a readable tail.
           <span
             dir="rtl"
-            className={cn(
-              "min-w-[4.5rem] shrink basis-0 grow truncate text-left text-xs",
-              section.selectionMode && isSelected
-                ? "text-selected-foreground/70"
-                : "text-muted-foreground",
-            )}
+            className="min-w-[4.5rem] shrink basis-0 grow truncate text-left text-xs text-muted-foreground"
           >
             <bdi dir="ltr">{dir}</bdi>
           </span>
