@@ -172,6 +172,7 @@ export interface ThreadStatusPill {
 
 type ThreadStatusInput = Pick<
   SidebarThreadSummary,
+  | "codeReview"
   | "hasActionableProposedPlan"
   | "hasPendingApprovals"
   | "hasPendingUserInput"
@@ -517,7 +518,9 @@ export function resolveThreadStatusPill(input: {
     return { label: "Connecting", ...STATUS_TONES.working, pulse: true };
   }
 
+  // A review reports findings, not a plan to implement (#293).
   const hasPlanReadyPrompt =
+    thread.codeReview !== true &&
     !thread.hasPendingUserInput &&
     thread.interactionMode === "plan" &&
     isLatestTurnSettled(thread.latestTurn, thread.session) &&
