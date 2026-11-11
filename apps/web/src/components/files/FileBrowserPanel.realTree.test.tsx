@@ -28,6 +28,9 @@ vi.mock("~/browser/openFileInPreview", () => ({
 }));
 vi.mock("~/editorPreferences", () => ({ usePreferredEditor: () => [null] }));
 vi.mock("~/hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "dark" as const }) }));
+vi.mock("~/hooks/useSettings", () => ({
+  usePrimaryDefaultAgent: () => ({ kind: "chat", instanceId: "codex" }),
+}));
 vi.mock("~/previewStateStore", () => ({ canPreviewAnyUrlInRuntime: () => false }));
 vi.mock("~/state/assets", () => ({ assetEnvironment: { createUrl: { label: "createUrl" } } }));
 vi.mock("~/state/environments", () => ({
