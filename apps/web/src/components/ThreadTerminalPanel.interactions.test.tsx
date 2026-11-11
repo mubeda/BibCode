@@ -2799,6 +2799,156 @@ describe("TerminalViewport mounted lifecycle", () => {
     ]);
   });
 
+  it.each(["legacy", "owner"] as const)(
+    "retries a failed final resize with no further layout event, a bounded number of times (%s)",
+    async (mode) => {
+      // #348: the Activity panel shrinks the mount from 24 to 19 rows and that
+      // resize fails; without a retry the PTY keeps 24 rows and the footer is cut off.
+      if (mode === "owner") {
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      }
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const view = await mountViewport({ visible: true });
+      const terminal = view.fakeTerminal!;
+      xtermState.fitAddons.at(-1)!.fit.mockImplementation(() => {
+        if (xtermState.proposedDimensions) {
+          terminal.cols = xtermState.proposedDimensions.cols;
+          terminal.rows = xtermState.proposedDimensions.rows;
+        }
+      });
+      await view.flushFrame();
+      await view.flushMountFit();
+      let claim: string | undefined;
+      if (mode === "owner") {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot("prompt"),
+              size: { cols: 80, rows: 24, sizeClaim: null },
+            },
+          }),
+        );
+        claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "term-1",
+            size: { cols: 80, rows: 24, sizeClaim: claim! },
+          }),
+        );
+      }
+      view.resizeSpy.mockClear();
+      const failure = AsyncResult.failure(Cause.fail(new Error("resize rejected")));
+      const sent = () => view.resizeSpy.mock.calls.map(([request]) => request.input.rows);
+      const expected = (rows: number) => ({
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          cols: 80,
+          rows,
+          ...(claim ? { sizeClaim: claim } : {}),
+        },
+      });
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        view.resizeSpy.mockResolvedValueOnce(failure);
+        xtermState.proposedDimensions = { cols: 80, rows: 19 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        expect(sent()).toEqual([19]);
+        // No further resize event: only a retry can deliver the size.
+        await act(async () => vi.advanceTimersByTime(10_000));
+        expect(sent()).toEqual([19, 19]);
+        expect(view.resizeSpy).toHaveBeenLastCalledWith(expected(19));
+
+        // A newer desired size replaces the one a pending retry would send.
+        view.resizeSpy.mockClear();
+        view.resizeSpy.mockResolvedValueOnce(failure);
+        xtermState.proposedDimensions = { cols: 80, rows: 18 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        xtermState.proposedDimensions = { cols: 80, rows: 17 };
+        if (mode === "owner") {
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 19, sizeClaim: claim! },
+            }),
+          );
+          view.resizeSpy.mockClear();
+          view.resizeSpy.mockResolvedValueOnce(failure);
+          await view.resizeContainer();
+          await view.flushFrame();
+          expect(sent()).toEqual([17]);
+        }
+        await act(async () => vi.advanceTimersByTime(10_000));
+        expect(view.resizeSpy).toHaveBeenLastCalledWith(expected(17));
+
+        // Retries are bounded when every attempt fails.
+        view.resizeSpy.mockClear();
+        view.resizeSpy.mockResolvedValue(failure);
+        xtermState.proposedDimensions = { cols: 80, rows: 16 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        await act(async () => vi.advanceTimersByTime(120_000));
+        expect(sent()).toEqual([16, 16, 16, 16]);
+
+        // An unmounted renderer never retries.
+        view.resizeSpy.mockClear();
+        xtermState.proposedDimensions = { cols: 80, rows: 15 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        expect(sent()).toEqual([15]);
+        await view.setVisible(false);
+        await act(async () => vi.advanceTimersByTime(120_000));
+        expect(sent()).toEqual([15]);
+      } finally {
+        vi.useRealTimers();
+        view.resizeSpy.mockReset();
+        view.resizeSpy.mockResolvedValue(AsyncResult.success(undefined));
+      }
+    },
+  );
+
+  it("never retries a failed claim taken from another window's size", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: {
+          ...terminalSnapshot("prompt"),
+          size: { cols: 151, rows: 50, sizeClaim: "other" },
+        },
+      }),
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      view.resizeSpy.mockResolvedValueOnce(
+        AsyncResult.failure(Cause.fail(new Error("resize rejected"))),
+      );
+      const mount = view.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      await act(async () =>
+        mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+      );
+      expect(view.resizeSpy).toHaveBeenCalledOnce();
+      await act(async () => vi.advanceTimersByTime(120_000));
+      expect(view.resizeSpy).toHaveBeenCalledOnce();
+      expect(view.fakeTerminal?.rows).toBe(50);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("allows the same exact geometry to retry after a known resize failure", async () => {
     testState.resizeCommand
       .mockResolvedValueOnce(AsyncResult.failure(Cause.fail(new Error("resize rejected"))))
