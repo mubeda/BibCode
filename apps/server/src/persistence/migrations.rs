@@ -3597,6 +3597,10 @@ mod tests {
                 .execute(insert, ["/repo", "/worktrees/a"])
                 .is_err()
         );
+        // A ledger rolled back below 72 runs it again over the existing table.
+        let transaction = connection.transaction()?;
+        super::migration_072(&transaction)?;
+        transaction.commit()?;
         Ok(())
     }
 
