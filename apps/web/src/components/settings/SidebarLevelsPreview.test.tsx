@@ -45,10 +45,13 @@ describe("SidebarLevelsPreview", () => {
     }
   });
 
-  it("selects one worktree with the card selection state and dims the unavailable environment", () => {
+  it("selects one worktree, marks the other active, and dims the unavailable environment", () => {
     const selected = levels("worktree").filter((row) => row.dataset.selected === "true");
     expect(selected).toHaveLength(1);
     expect(selected[0]!.className).toContain("bg-primary/15");
+    const active = levels("worktree").filter((row) => row.dataset.active === "true");
+    expect(active).toHaveLength(1);
+    expect(active[0]!.dataset.selected).toBeUndefined();
     const [, unavailable] = levels("environment");
     expect(unavailable!.className).toContain("opacity-60");
     expect(unavailable!.textContent).toContain("Unavailable");

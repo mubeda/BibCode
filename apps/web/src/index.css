@@ -481,7 +481,6 @@
     /* The card class sets w-full, so the indent also narrows the row. */
     max-width: calc(100% - 0.75rem);
     margin-inline-start: 0.75rem;
-    background-color: var(--sidebar-worktree);
     font-size: 13px;
   }
 
@@ -508,10 +507,53 @@
   }
 }
 
-/* Outside the layers, so a resting worktree keeps its outline over the card's transparent
-   border; a selected worktree keeps the selection border (R64). */
-[data-sidebar-level="worktree"]:not([data-selected="true"]) {
+/* Checkout and worktree row states (R64), keyed on data-selected and data-active. Outside the
+   layers, so they win over the card state utilities, whose translucent fills would replace the
+   worktree surface and drop text under 4.5:1. Every state of either row mixes into the worktree
+   surface, so a selected checkout and a selected worktree look alike. On a state surface the
+   label and the muted text step up one level. Task 10.2 sets both attributes in the left panel. */
+[data-sidebar-level="worktree"] {
   border-color: var(--sidebar-worktree-border);
+  background-color: var(--sidebar-worktree);
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):hover {
+  background-color: color-mix(in srgb, var(--foreground) 3%, var(--sidebar-worktree));
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-active="true"] {
+  border-color: color-mix(in srgb, var(--foreground) 40%, var(--sidebar-worktree));
+  background-color: color-mix(in srgb, var(--foreground) 8%, var(--sidebar-worktree));
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-selected="true"] {
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+  background-color: color-mix(in srgb, var(--primary) 16%, var(--sidebar-worktree));
+}
+
+:is(
+    [data-sidebar-level="checkout"],
+    [data-sidebar-level="worktree"]
+  )[data-selected="true"][data-active="true"] {
+  border-color: color-mix(in srgb, var(--primary) 60%, transparent);
+  background-color: color-mix(in srgb, var(--primary) 20%, var(--sidebar-worktree));
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):is(
+  :hover,
+  [data-active="true"],
+  [data-selected="true"]
+) {
+  --muted-foreground: var(--sidebar-chat-foreground);
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):not([data-primary]):is(
+    :hover,
+    [data-active="true"],
+    [data-selected="true"]
+  )
+  [data-sidebar-label] {
+  color: var(--foreground);
 }
 
 body {

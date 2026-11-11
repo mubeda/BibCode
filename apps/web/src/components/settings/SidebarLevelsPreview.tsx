@@ -46,18 +46,19 @@ function ChatRows(props: { chats: readonly string[]; more?: number | undefined }
 
 function Worktree(props: {
   branch: string;
-  selected: boolean;
+  selected?: boolean;
+  active?: boolean;
   chats: readonly string[];
   more?: number;
 }) {
+  const isSelected = props.selected === true;
+  const isActive = props.active === true;
   return (
     <li
       data-sidebar-level="worktree"
-      data-selected={props.selected ? "true" : undefined}
-      className={cn(
-        resolveWorkspaceCardClassName({ isActive: false, isSelected: props.selected }),
-        "px-2 py-1",
-      )}
+      data-selected={isSelected ? "true" : undefined}
+      data-active={isActive ? "true" : undefined}
+      className={cn(resolveWorkspaceCardClassName({ isActive, isSelected }), "px-2 py-1")}
     >
       <div className="flex min-w-0 items-center gap-1.5 text-foreground/90">
         <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
@@ -117,7 +118,7 @@ export function SidebarLevelsPreview() {
                 <Worktree branch="feature/sample" selected chats={["Fix the sign-in redirect"]} />
                 <Worktree
                   branch="feature/sample-docs"
-                  selected={false}
+                  active
                   chats={["Update the setup guide"]}
                   more={3}
                 />

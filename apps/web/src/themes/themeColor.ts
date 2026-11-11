@@ -254,6 +254,16 @@ function baseValue(theme: ThemeFile, token: string): string {
   return value;
 }
 
+/**
+ * The secondary text a sidebar card paints, `--sidebar-card-muted-foreground`: the theme's
+ * `muted-foreground` when it sets one (`DERIVED_PROPERTIES` in `useTheme.ts`), else the base's,
+ * which in Dark is Tailwind's neutral-400.
+ */
+export function resolveSidebarMuted(theme: ThemeFile): string {
+  if (theme.base === "dark" && theme.ui?.["muted-foreground"] === undefined) return "#a1a1a1";
+  return resolveToken(theme, "muted-foreground");
+}
+
 /** Every fixed pair with its ratio under `theme`, in the spec's order. */
 export function pairRatios(theme: ThemeFile): { pair: FixedPair; ratio: number }[] {
   return FIXED_PAIRS.map((pair) => {

@@ -15,9 +15,10 @@ const require = NodeModule.createRequire(import.meta.url);
 const css = NodeFS.readFileSync(new URL("../index.css", import.meta.url), "utf8");
 const tailwindTheme = NodeFS.readFileSync(require.resolve("tailwindcss/theme.css"), "utf8");
 
-function declarations(text: string): Map<string, string> {
+function declarations(text: string, names = /--[a-z0-9-]+/): Map<string, string> {
   const result = new Map<string, string>();
-  for (const match of text.matchAll(/^\s*(--[a-z0-9-]+):\s*([\s\S]*?);/gm)) {
+  const pattern = new RegExp(String.raw`^\s*(${names.source}):\s*([\s\S]*?);`, "gm");
+  for (const match of text.matchAll(pattern)) {
     result.set(
       match[1]!,
       match[2]!.replace(/\s+/g, " ").replace(/\( /g, "(").replace(/ \)/g, ")").trim(),
@@ -126,4 +127,23 @@ export function derivedDeclarations(base: "light" | "dark"): string[] {
       // Variables outside the token set, such as the scrollbar ones, are not theme tokens.
       .filter((name) => (UI_COLOR_TOKENS as readonly string[]).includes(name))
   );
+}
+
+const normalizeSelector = (selector: string) =>
+  selector.replace(/\s+/g, " ").replace(/\( /g, "(").replace(/ \)/g, ")").trim();
+
+/**
+ * The declarations, custom properties included, of every `index.css` rule for `selector`, a
+ * later rule's value replacing an earlier one's (the unlayered rules follow the layered ones).
+ */
+export function ruleDeclarations(selector: string): Map<string, string> {
+  const wanted = normalizeSelector(selector);
+  const uncommented = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const result = new Map<string, string>();
+  for (const match of uncommented.matchAll(/([^{};]+)\{([^{}]*)\}/g)) {
+    if (normalizeSelector(match[1]!) !== wanted) continue;
+    for (const entry of declarations(match[2]!, /(?:--)?[a-z][a-z0-9-]*/)) result.set(...entry);
+  }
+  if (result.size === 0) throw new Error(`index.css has no rule ${selector}`);
+  return result;
 }
