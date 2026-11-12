@@ -2529,7 +2529,10 @@ describe("TerminalViewport mounted lifecycle", () => {
       const held = { cols: 80, rows: 24, sizeClaim: claim };
       serveResizes(view, held);
       await act(async () =>
-        view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+        view.runtime.ingest({
+          type: "snapshot",
+          snapshot: { ...terminalSnapshot(""), size: held },
+        }),
       );
       await view.flushFrame();
       await view.flushMountFit();
@@ -2571,14 +2574,20 @@ describe("TerminalViewport mounted lifecycle", () => {
         error: Option.none(),
         recentEntries: new Map(),
       };
-      const view = await mountViewport({ terminalId: "terminal-codex", command: observedCommand() });
+      const view = await mountViewport({
+        terminalId: "terminal-codex",
+        command: observedCommand(),
+      });
       const claim = () =>
         (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } }).terminal
           .sizeClaim;
       const held = { cols: 80, rows: 24, sizeClaim: claim() };
       serveResizes(view, held);
       await act(async () =>
-        view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+        view.runtime.ingest({
+          type: "snapshot",
+          snapshot: { ...terminalSnapshot(""), size: held },
+        }),
       );
       await view.flushFrame();
       await view.flushMountFit();

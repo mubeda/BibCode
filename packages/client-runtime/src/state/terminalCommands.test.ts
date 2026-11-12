@@ -78,7 +78,10 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
       [WS_METHODS.terminalClose]: () => Effect.void,
       [WS_METHODS.terminalResize]: (input: { cols: number; sizeClaim?: string }) =>
         Effect.suspend(() => {
-          resizes.push({ cols: input.cols, ...(input.sizeClaim ? { sizeClaim: input.sizeClaim } : {}) });
+          resizes.push({
+            cols: input.cols,
+            ...(input.sizeClaim ? { sizeClaim: input.sizeClaim } : {}),
+          });
           const gate = resizeGate;
           resizeGate = Effect.void;
           return gate;
@@ -152,33 +155,38 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
 });
 
 describe("terminal resize claims", () => {
-  it.effect("executes every renderer's latest claim, so success is that renderer's own (#348)", () =>
-    Effect.gen(function* () {
-      const h = yield* makeHarness(false);
-      const release = yield* Deferred.make<void>();
-      h.holdNextResize(Deferred.await(release));
-      const resize = (cols: number, sizeClaim: string) =>
-        h
-          .invoke(h.atoms.resize, { ...target, input: { ...target.input, cols, rows: 24, sizeClaim } })
-          .pipe(Effect.forkChild({ startImmediately: true }));
-      const first = yield* resize(80, "renderer-a");
-      yield* Effect.yieldNow;
-      const second = yield* resize(81, "renderer-a");
-      const other = yield* resize(90, "renderer-b");
-      yield* Effect.yieldNow;
-      yield* Deferred.succeed(release, undefined);
-      yield* Fiber.join(first);
-      yield* Fiber.join(second);
-      yield* Fiber.join(other);
-      expect(h.resizes).toEqual(
-        expect.arrayContaining([
-          { cols: 80, sizeClaim: "renderer-a" },
-          { cols: 81, sizeClaim: "renderer-a" },
-          { cols: 90, sizeClaim: "renderer-b" },
-        ]),
-      );
-      h.registry.dispose();
-    }),
+  it.effect(
+    "executes every renderer's latest claim, so success is that renderer's own (#348)",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness(false);
+        const release = yield* Deferred.make<void>();
+        h.holdNextResize(Deferred.await(release));
+        const resize = (cols: number, sizeClaim: string) =>
+          h
+            .invoke(h.atoms.resize, {
+              ...target,
+              input: { ...target.input, cols, rows: 24, sizeClaim },
+            })
+            .pipe(Effect.forkChild({ startImmediately: true }));
+        const first = yield* resize(80, "renderer-a");
+        yield* Effect.yieldNow;
+        const second = yield* resize(81, "renderer-a");
+        const other = yield* resize(90, "renderer-b");
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+        yield* Fiber.join(other);
+        expect(h.resizes).toEqual(
+          expect.arrayContaining([
+            { cols: 80, sizeClaim: "renderer-a" },
+            { cols: 81, sizeClaim: "renderer-a" },
+            { cols: 90, sizeClaim: "renderer-b" },
+          ]),
+        );
+        h.registry.dispose();
+      }),
   );
 });
 
