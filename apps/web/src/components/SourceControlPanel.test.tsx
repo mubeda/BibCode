@@ -1153,7 +1153,7 @@ describe("SourceControlPanel", () => {
       const markup = render(reviewProps(null, onStart));
       expect(reviewButton()).toBeDefined();
       expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(false);
-      expect(tooltipText(markup).join("|")).toContain("Review changes");
+      expect(tooltipText(markup).join("|")).toContain("Review uncommitted changes");
       expect(tooltipText(markup).join("|")).toContain(GUARD);
       reviewButton()!.onClick!();
       expect(onStart).toHaveBeenCalledWith({ kind: "uncommitted", base: "origin/main" });
@@ -1162,7 +1162,11 @@ describe("SourceControlPanel", () => {
     it("is enabled for a clean branch with commits ahead and starts a branch review", () => {
       testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 2 });
       const onStart = vi.fn();
-      render(reviewProps(null, onStart));
+      const markup = render(reviewProps(null, onStart));
+      // R104: the scope and base, then the guard line.
+      expect(tooltipText(markup)).toEqual([
+        `<span class="block">Review branch vs origin/main and uncommitted changes</span><span class="block text-muted-foreground">${GUARD}</span>`,
+      ]);
       reviewButton()!.onClick!();
       expect(onStart).toHaveBeenCalledWith({ kind: "branch", base: "origin/main" });
     });

@@ -11,6 +11,7 @@ import {
   type PendingDiscard,
   resolveCodeReviewButtonState,
   resolveCodeReviewScope,
+  codeReviewTooltip,
   resolveDiscardDialogCopy,
   resolveStagingToggleAction,
   resolveVsBaseLabel,
@@ -340,6 +341,17 @@ describe("resolveCodeReviewScope", () => {
   it("returns null without a status", () => {
     expect(resolveCodeReviewScope(null)).toBeNull();
     expect(resolveCodeReviewScope(undefined)).toBeNull();
+  });
+});
+
+describe("codeReviewTooltip (R104)", () => {
+  it("names the scope and its base", () => {
+    expect(codeReviewTooltip({ kind: "branch", base: "origin/main" })).toBe(
+      "Review branch vs origin/main and uncommitted changes",
+    );
+    expect(codeReviewTooltip({ kind: "uncommitted", base: "origin/main" })).toBe(
+      "Review uncommitted changes",
+    );
   });
 });
 
