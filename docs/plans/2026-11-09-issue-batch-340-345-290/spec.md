@@ -308,6 +308,8 @@ WHEN the server stops a Git process because of a timeout, a cancellation or shut
 
 IF a Git process that BiBCode forced to stop leaves an `index.lock` that did not exist when the process started and that does not change for 2 seconds after the stop, THEN the server SHALL remove that lock and log the removal as a warning.
 
+On Linux and macOS, the server SHALL remove such a lock only if its killed Git process still held the lock open just before the kill, so a lock another Git process took meanwhile is kept even when it stays unchanged. Windows cannot check this: there a foreign lock that appeared while BiBCode's command held none and stayed unchanged for 2 seconds can still be removed (added after the review of the pull request).
+
 #### Scenario: own lock
 
 - GIVEN a BiBCode Git write that created `index.lock` and was forced to stop
