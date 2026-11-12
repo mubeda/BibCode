@@ -21,10 +21,14 @@ export function codeReviewScopeText(scope: CodeReviewScope): string {
  * The fixed lead-in keeps a saved prompt from ever reaching a CLI as its first token and keeps
  * the scope and "do not edit" line in every review (design note, "Prompt lead-in").
  */
+export const CODE_REVIEW_INSTRUCTIONS_MAX_LENGTH = 1_000;
+
 export function resolveCodeReviewPrompt(input: {
   readonly project: string;
   readonly user: string;
   readonly scope: CodeReviewScope;
+  /** One review's added instructions (R105), appended after the placeholders are replaced. */
+  readonly extra?: string;
 }): string {
   const scopeText = codeReviewScopeText(input.scope);
   const base = input.scope.base ?? "HEAD";
@@ -38,7 +42,8 @@ export function resolveCodeReviewPrompt(input: {
   const resolved = body.replace(/\{scope\}|\{base\}/g, (match) =>
     match === "{scope}" ? scopeText : base,
   );
-  return `${lead}\n\n${resolved}`;
+  const extra = input.extra?.trim() ? `\n\n${input.extra}` : "";
+  return `${lead}\n\n${resolved}${extra}`;
 }
 
 export function resolveCodeReviewChatModes(driver: ProviderDriverKind): {

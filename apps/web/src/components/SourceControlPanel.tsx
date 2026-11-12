@@ -141,6 +141,7 @@ import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog"
 import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
 import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
+import { CodeReviewInstructionsDialog } from "./sourceControl/CodeReviewInstructionsDialog";
 import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
 import { CODE_REVIEW_SERVER_UPDATE_REASON, type CodeReviewMenuReviewer } from "~/codeReview";
 import {
@@ -160,7 +161,11 @@ interface SourceControlPanelProps {
     readonly unavailableReason: string | null;
     readonly guardLine: string | null;
     /** `reviewer` is a one-off pick from the review menu; absent means the saved reviewer. */
-    readonly onStart: (scope: CodeReviewScope, reviewer?: DefaultAgentSelection) => void;
+    readonly onStart: (
+      scope: CodeReviewScope,
+      reviewer?: DefaultAgentSelection,
+      instructions?: string,
+    ) => void;
     /** The reviewers the review menu offers for one review (R103). */
     readonly reviewers?: ReadonlyArray<CodeReviewMenuReviewer>;
     /** The thread's project, whose review prompt the menu edits; `null` hides the menu. */
@@ -387,6 +392,7 @@ export default function SourceControlPanel({
   const hasPrimaryRemote = status?.hasPrimaryRemote ?? false;
   const vsBaseLabel = useMemo(() => resolveVsBaseLabel(status), [status]);
   const [reviewPromptDialogOpen, setReviewPromptDialogOpen] = useState(false);
+  const [reviewInstructionsOpen, setReviewInstructionsOpen] = useState(false);
   // An older server would drop the project prompt without an error (D47).
   const codeReviewsSupported = capabilities?.codeReviews === true;
   // Read once at the click: a later status change does not alter a started review.
@@ -1188,7 +1194,7 @@ export default function SourceControlPanel({
           </TooltipPopup>
         </Tooltip>
       ) : null}
-      {codeReview && (codeReview.projectId || codeReviewMenuItems.length > 0) ? (
+      {codeReview ? (
         <Menu>
           <MenuTrigger
             render={<Button aria-label="Review options" size="icon-xs" variant="ghost" />}
@@ -1196,6 +1202,20 @@ export default function SourceControlPanel({
             <ChevronDownIcon aria-hidden="true" className="size-3.5" />
           </MenuTrigger>
           <MenuPopup align="end">
+            <MenuItem
+              disabled={codeReviewButton.disabled}
+              onClick={() => {
+                if (!codeReviewButton.disabled) setReviewInstructionsOpen(true);
+              }}
+            >
+              <span className="flex flex-col">
+                <span>Review with instructions…</span>
+                {codeReviewButton.reason ? (
+                  <span className="text-xs text-muted-foreground">{codeReviewButton.reason}</span>
+                ) : null}
+              </span>
+            </MenuItem>
+            {codeReviewMenuItems.length > 0 ? <MenuSeparator /> : null}
             {codeReviewMenuItems.length > 0 ? (
               <MenuGroup>
                 <MenuGroupLabel>Review once with</MenuGroupLabel>
@@ -1222,7 +1242,7 @@ export default function SourceControlPanel({
             ) : null}
             {codeReview.projectId ? (
               <>
-                {codeReviewMenuItems.length > 0 ? <MenuSeparator /> : null}
+                <MenuSeparator />
                 <MenuItem
                   disabled={!codeReviewsSupported}
                   {...(codeReviewsSupported ? {} : { title: CODE_REVIEW_SERVER_UPDATE_REASON })}
@@ -1709,6 +1729,18 @@ export default function SourceControlPanel({
         ) : null}
       </div>
 
+      {codeReview ? (
+        <CodeReviewInstructionsDialog
+          open={reviewInstructionsOpen}
+          onOpenChange={setReviewInstructionsOpen}
+          onStart={(instructions) => {
+            // The scope at Start, as the button reads it at its click.
+            if (!codeReviewButton.disabled && codeReviewScope) {
+              codeReview.onStart(codeReviewScope, undefined, instructions);
+            }
+          }}
+        />
+      ) : null}
       {codeReview?.projectId ? (
         <CodeReviewProjectPromptDialog
           open={reviewPromptDialogOpen}

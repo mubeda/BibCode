@@ -4966,8 +4966,9 @@ function ChatViewContent(props: ChatViewProps) {
       })
     : null;
   // `selection` is a one-off reviewer from the menu; the saved reviewer stays as saved (R103).
+  // `instructions` are added to this review only, in both the chat and the terminal (R105).
   const handleStartCodeReview = useLatestHandler(
-    (scope: CodeReviewScope, selection?: DefaultAgentSelection) => {
+    (scope: CodeReviewScope, selection?: DefaultAgentSelection, instructions?: string) => {
       const resolved =
         selection === undefined
           ? savedCodeReviewer
@@ -4981,6 +4982,7 @@ function ChatViewContent(props: ChatViewProps) {
         project: activeProject?.codeReviewPrompt ?? "",
         user: settings.codeReviewPrompt,
         scope,
+        ...(instructions === undefined ? {} : { extra: instructions }),
       });
       const modelSelection = resolveCodeReviewModelSelection(
         settings.codeReviewModelSelection,
