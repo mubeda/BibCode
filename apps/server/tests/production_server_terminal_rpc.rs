@@ -1861,6 +1861,8 @@ async fn terminal_rpc_repair_claim_for_the_held_size_is_answered_and_acknowledge
         resize["cols"] = json!(80);
         resize["rows"] = json!(20);
         resize["sizeClaim"] = json!("owner-viewer");
+        // A current client reads the structured answer; an older one gets null (#348).
+        resize["structuredResult"] = json!(true);
         let applied = success_value(request(control, "2", "terminal.resize", resize.clone()).await);
         assert_eq!(applied["outcome"], "applied");
         assert_eq!(applied["generation"], generation);
@@ -1909,6 +1911,7 @@ async fn terminal_rpc_repair_claim_for_the_held_size_is_answered_and_acknowledge
         unknown["cols"] = json!(90);
         unknown["rows"] = json!(40);
         unknown["sizeClaim"] = json!("departed-viewer");
+        unknown["structuredResult"] = json!(true);
         let declined = success_value(request(control, "5", "terminal.resize", unknown).await);
         assert_eq!(declined["outcome"], "claimNotRegistered");
         assert_eq!(declined["size"]["rows"], 20);
