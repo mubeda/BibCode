@@ -369,7 +369,7 @@ impl HostMetricsCollector {
         let source = self.shared.source.clone();
         let facts = tokio::task::spawn_blocking(move || source.host_facts())
             .await
-            .unwrap_or_else(|_| HostFacts {
+            .unwrap_or(HostFacts {
                 os: std::env::consts::OS,
                 arch: std::env::consts::ARCH,
                 cpu_count: 0,
@@ -458,11 +458,12 @@ impl Shared {
             }
             readings += 1;
             let rate = self.rate(live);
+            // Paced from the start of the read, so the read's own time does not add up.
+            let mut next = Instant::now() + rate;
             let Some(sampled) = self.read_cpu_memory().await else {
                 return;
             };
             self.publish(sampled, rate);
-            let mut next = Instant::now() + rate;
             loop {
                 tokio::select! {
                     () = self.shutdown.cancelled() => return,

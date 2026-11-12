@@ -629,7 +629,6 @@ impl ProductionRuntime {
                 started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
             },
         ));
-        host_metrics.start_background();
         let provider_usage =
             ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
         let relay = relay_client_service(config.state_dir());
@@ -815,6 +814,8 @@ impl ProductionRuntime {
         );
         mcp_control.attach_terminals(mcp_terminals);
 
+        // Last before the runtime exists, so a failed start leaves no collector running.
+        host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,

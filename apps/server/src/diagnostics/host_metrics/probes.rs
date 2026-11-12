@@ -257,7 +257,7 @@ fn cost_probe() {
                 };
                 items += 1;
                 bytes += serde_json::to_vec(&values).map_or(0, |encoded| encoded.len());
-                if items % 5 == 0 {
+                if items.is_multiple_of(5) {
                     // A chart revision every fifth reading: rebuild the uptime chart and send it.
                     let uptime = lock(&live.shared.statistics).chart.uptime(240);
                     let latest = lock(&live.shared.statistics).current.clone();
