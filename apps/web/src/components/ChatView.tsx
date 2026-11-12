@@ -253,6 +253,7 @@ import {
   resolveShortcutCommand,
   shortcutLabelForCommand,
   shouldOpenChatFind,
+  shouldStartCodeReview,
 } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalPanel, {
@@ -354,7 +355,11 @@ import {
   resolveCodeReviewPrompt,
   resolveSavedCodeReviewer,
 } from "../codeReview";
-import type { CodeReviewScope } from "./SourceControlPanel.logic";
+import {
+  type CodeReviewScope,
+  resolveCodeReviewButtonState,
+  resolveCodeReviewScope,
+} from "./SourceControlPanel.logic";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { ChatPanelOpeningState, NoActiveThreadState } from "./NoActiveThreadState";
@@ -4997,6 +5002,18 @@ function ChatViewContent(props: ChatViewProps) {
       codeReview: true,
     });
   });
+  // The shortcut does what the button would do now, from the status the header already reads
+  // for the same checkout (R102).
+  const handleCodeReviewShortcut = useLatestHandler(() => {
+    const status = gitStatusQuery.data ?? null;
+    const scope = resolveCodeReviewScope(status);
+    const button = resolveCodeReviewButtonState({
+      status,
+      scope,
+      unavailableReason: codeReviewUnavailableReason,
+    });
+    if (!button.disabled && scope) handleStartCodeReview(scope);
+  });
   const sourceControlCodeReview = useMemo(
     () => ({
       unavailableReason: codeReviewUnavailableReason,
@@ -5225,6 +5242,12 @@ function ChatViewContent(props: ChatViewProps) {
         openThreadFindForTarget(event.target);
         return;
       }
+      if (shouldStartCodeReview(command, event, keybindings, shortcutContext)) {
+        event.preventDefault();
+        event.stopPropagation();
+        handleCodeReviewShortcut();
+        return;
+      }
       if (!command) return;
 
       if (command === "terminal.newCenter") {
@@ -5366,6 +5389,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeThreadId,
     closeCenterPanelSurface,
     closePanelTerminal,
+    handleCodeReviewShortcut,
     hasTerminalSurface,
     openCenterTerminal,
     runProjectScript,

@@ -330,6 +330,40 @@ export function chatFindShortcutLabel(
   return formatShortcutLabel(CHAT_FIND_FALLBACK_SHORTCUT, platform);
 }
 
+/**
+ * Review changes' built-in key (D46). Not a shipped rule, for the reasons Mod+F is not one.
+ * Mod+Shift+R stays the browser's hard reload.
+ */
+const CODE_REVIEW_FALLBACK_SHORTCUT: KeybindingShortcut = {
+  key: "r",
+  metaKey: false,
+  ctrlKey: false,
+  shiftKey: true,
+  altKey: true,
+  modKey: true,
+};
+
+/**
+ * Whether a keydown starts a code review: a rule that resolves to `sourceControl.review`, or the
+ * built-in Mod+Alt+Shift+R outside a terminal when no rule claimed the key and none names the
+ * command.
+ */
+export function shouldStartCodeReview(
+  command: KeybindingCommand | null,
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  context: Pick<ShortcutMatchContext, "terminalFocus">,
+  platform = navigator.platform,
+): boolean {
+  if (command === "sourceControl.review") return true;
+  if (command !== null) return false;
+  return (
+    !context.terminalFocus &&
+    !keybindings.some((binding) => binding.command === "sourceControl.review") &&
+    matchesShortcut(event, CODE_REVIEW_FALLBACK_SHORTCUT, platform)
+  );
+}
+
 /** The context of a keydown inside a diff view: Compare, or the Git Manager's Changes diff. */
 export const DIFF_FOCUS_CONTEXT = {
   diffFocus: true,

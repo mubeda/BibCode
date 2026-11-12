@@ -70,6 +70,7 @@ const STATIC_KEYBINDING_COMMANDS = [
   "chat.find",
   "editor.openFavorite",
   "thread.steerQueuedMessage",
+  "sourceControl.review",
   ...MODEL_PICKER_KEYBINDING_COMMANDS,
   ...THREAD_KEYBINDING_COMMANDS,
 ] as const;
