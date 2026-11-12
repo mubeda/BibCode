@@ -2086,6 +2086,7 @@ fn registrar_source_contains_every_owned_rpc_name() {
         "server.getConfig",
         "server.getProcessDiagnostics",
         "server.getProcessResourceHistory",
+        "server.subscribeHostMetrics",
         "server.getProfilerStatus",
         "server.reportProfilerClientBatch",
         "server.getProviderUsage",
@@ -2567,4 +2568,148 @@ fn expected_killed_exit_code() -> Value {
 
 fn expected_killed_exit_signal() -> Value {
     Value::Null
+}
+
+/// A host source for the host metrics stream tests: fixed readings at once, no volumes.
+#[derive(Debug)]
+struct FixtureHostMetricsSource;
+
+impl diagnostics::HostMetricsSource for FixtureHostMetricsSource {
+    fn host_facts(&self) -> diagnostics::host_metrics::HostFacts {
+        diagnostics::host_metrics::HostFacts {
+            os: "linux",
+            arch: "x86_64",
+            cpu_count: 12,
+            memory_total_bytes: 34_359_738_368,
+        }
+    }
+
+    fn read_cpu_memory(
+        &self,
+    ) -> Result<diagnostics::host_metrics::CpuMemoryReading, diagnostics::SamplingError> {
+        Ok(diagnostics::host_metrics::CpuMemoryReading {
+            cpu_percent: 23.5,
+            memory_total_bytes: 34_359_738_368,
+            memory_used_bytes: 12_025_908_428,
+        })
+    }
+
+    fn list_volumes(&self) -> Vec<diagnostics::host_metrics::VolumeDescriptor> {
+        Vec::new()
+    }
+
+    fn read_volume_space(
+        &self,
+        _mount_point: &std::path::Path,
+    ) -> Result<diagnostics::host_metrics::VolumeSpace, String> {
+        Err("no volumes".to_owned())
+    }
+}
+
+fn fixture_host_metrics() -> Arc<diagnostics::HostMetricsCollector> {
+    Arc::new(diagnostics::HostMetricsCollector::new(
+        Arc::new(FixtureHostMetricsSource),
+        diagnostics::HostMetricsRates::default(),
+        diagnostics::HostMetricsIdentity {
+            boot_id: Some("00000000-0000-0000-0000-000000000000".to_owned()),
+            started_at_ms: 1_700_000_000_000,
+        },
+    ))
+}
+
+fn sampled_at_ms(item: &Value) -> i128 {
+    let text = item["sample"]["sampledAt"].as_str().expect("sampledAt");
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .expect("an RFC 3339 time")
+        .unix_timestamp_nanos()
+        / 1_000_000
+}
+
+#[tokio::test]
+async fn host_metrics_stream_sends_a_snapshot_then_samples() {
+    let temp = TempDir::new().expect("temporary directory");
+    let collector = fixture_host_metrics();
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(
+        &mut registry,
+        fixture_services().with_host_metrics(collector.clone()),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let result = AssertUnwindSafe(async {
+        let socket = socket.as_mut().expect("socket");
+        send_request(socket, "1", "server.subscribeHostMetrics", json!({})).await;
+
+        let snapshot = next_chunk_and_ack(socket, "1").await;
+        let [snapshot] = snapshot.as_slice() else {
+            panic!("one snapshot, got {snapshot:?}");
+        };
+        assert_eq!(snapshot["_tag"], "Snapshot");
+        assert_eq!(snapshot["bootId"], "00000000-0000-0000-0000-000000000000");
+        assert!(snapshot["startedAt"].is_string());
+        assert_eq!(snapshot["host"]["cpuCount"], 12);
+        let mut samples = Vec::new();
+        while samples.len() < 2 {
+            samples.extend(next_chunk_and_ack(socket, "1").await);
+        }
+        for sample in &samples {
+            assert_eq!(sample["_tag"], "Sample");
+            assert_eq!(sample["cpu"]["current"], 23.5);
+        }
+        let gap = sampled_at_ms(&samples[1]) - sampled_at_ms(&samples[0]);
+        assert!((800..=1_200).contains(&gap), "samples {gap} ms apart");
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    collector.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn host_metrics_stream_ends_when_the_client_leaves() {
+    let temp = TempDir::new().expect("temporary directory");
+    let collector = fixture_host_metrics();
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(
+        &mut registry,
+        fixture_services().with_host_metrics(collector.clone()),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let result = AssertUnwindSafe(async {
+        let socket_ref = socket.as_mut().expect("socket");
+        send_request(socket_ref, "1", "server.subscribeHostMetrics", json!({})).await;
+        let _ = next_chunk_and_ack(socket_ref, "1").await;
+        assert_eq!(collector.live_subscribers(), 1);
+
+        close_socket(&mut socket).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while collector.live_subscribers() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream still holds the collector live"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    collector.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

@@ -537,6 +537,92 @@ export const ServerProcessResourceHistoryResult = Schema.Struct({
 });
 export type ServerProcessResourceHistoryResult = typeof ServerProcessResourceHistoryResult.Type;
 
+/** Facts about the host a server runs on (#292). */
+export const ServerHostFacts = Schema.Struct({
+  os: Schema.String,
+  arch: Schema.String,
+  cpuCount: NonNegativeInt,
+  memoryTotalBytes: NonNegativeInt,
+});
+export type ServerHostFacts = typeof ServerHostFacts.Type;
+
+/** A volume's total and free bytes are relative to the user the server runs as. */
+export const ServerHostMetricsVolume = Schema.Struct({
+  mountPoint: Schema.String,
+  name: Schema.String,
+  fileSystem: Schema.String,
+  totalBytes: Schema.NullOr(NonNegativeInt),
+  freeBytes: Schema.NullOr(NonNegativeInt),
+  usedBytes: Schema.NullOr(NonNegativeInt),
+  removable: Schema.Boolean,
+  readOnly: Schema.Boolean,
+  state: Schema.Literals(["ok", "notResponding"]),
+});
+export type ServerHostMetricsVolume = typeof ServerHostMetricsVolume.Type;
+
+export const ServerHostMetricsSample = Schema.Struct({
+  sampledAt: IsoDateTime,
+  cpuPercent: Schema.Finite,
+  memoryTotalBytes: NonNegativeInt,
+  memoryUsedBytes: NonNegativeInt,
+  memoryAvailableBytes: NonNegativeInt,
+  volumes: Schema.Array(ServerHostMetricsVolume),
+  volumesPaused: Schema.Boolean,
+});
+export type ServerHostMetricsSample = typeof ServerHostMetricsSample.Type;
+
+/** Since the server started: CPU percent or memory used percent. */
+export const ServerHostMetricsStatistic = Schema.Struct({
+  current: Schema.Finite,
+  minimum: Schema.Finite,
+  average: Schema.Finite,
+  p95: Schema.Finite,
+  maximum: Schema.Finite,
+});
+export type ServerHostMetricsStatistic = typeof ServerHostMetricsStatistic.Type;
+
+export const ServerHostMetricsChartPoint = Schema.Struct({
+  sampledAt: IsoDateTime,
+  cpuPercent: Schema.Finite,
+  memoryPercent: Schema.Finite,
+});
+export type ServerHostMetricsChartPoint = typeof ServerHostMetricsChartPoint.Type;
+
+export const ServerHostMetricsChartBucket = Schema.Struct({
+  startedAt: IsoDateTime,
+  durationMs: NonNegativeInt,
+  cpuAverage: Schema.Finite,
+  cpuPeak: Schema.Finite,
+  memoryAverage: Schema.Finite,
+  memoryPeak: Schema.Finite,
+});
+export type ServerHostMetricsChartBucket = typeof ServerHostMetricsChartBucket.Type;
+
+/**
+ * An item of `server.subscribeHostMetrics`: a `Snapshot` first, then one `Sample` per live
+ * reading. A Sample carries `uptime` only when the subscriber has not been sent that chart yet.
+ */
+export const ServerHostMetricsEvent = Schema.Union([
+  Schema.TaggedStruct("Snapshot", {
+    host: ServerHostFacts,
+    bootId: Schema.NullOr(Schema.String),
+    startedAt: IsoDateTime,
+    statisticsSince: Schema.NullOr(IsoDateTime),
+    sample: Schema.NullOr(ServerHostMetricsSample),
+    cpu: Schema.NullOr(ServerHostMetricsStatistic),
+    memory: Schema.NullOr(ServerHostMetricsStatistic),
+    recent: Schema.Array(ServerHostMetricsChartPoint),
+    uptime: Schema.Array(ServerHostMetricsChartBucket),
+  }),
+  Schema.TaggedStruct("Sample", {
+    sample: ServerHostMetricsSample,
+    cpu: ServerHostMetricsStatistic,
+    memory: ServerHostMetricsStatistic,
+    uptime: Schema.NullOr(Schema.Array(ServerHostMetricsChartBucket)),
+  }),
+]);
+export type ServerHostMetricsEvent = typeof ServerHostMetricsEvent.Type;
+
 export const ServerSignalProcessInput = Schema.Struct({
   pid: PositiveInt,
   processKey: TrimmedNonEmptyString,

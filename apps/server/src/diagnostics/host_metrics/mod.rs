@@ -23,10 +23,12 @@ mod native;
 mod probes;
 mod stats;
 mod volumes;
+mod wire;
 
 pub use crate::diagnostics::SamplingError;
 pub use native::NativeHostMetricsSource;
 pub use stats::{ChartBucket, ChartPoint, MeasureStatistics};
+pub(crate) use wire::send_host_metrics;
 
 use disk_workers::{Admission, DiskJob, DiskJobKey, DiskJobResult, DiskOutcome, DiskWorkers};
 use stats::{ChartHistory, RunningStatistic, clamp_percent};

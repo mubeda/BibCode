@@ -1,0 +1,56 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "_tag": "Sample",
+      "sample": {
+        "sampledAt": "2026-07-22T12:00:01.000Z",
+        "cpuPercent": 23.5,
+        "memoryTotalBytes": 34359738368,
+        "memoryUsedBytes": 12025908428,
+        "memoryAvailableBytes": 22333829940,
+        "volumes": [
+          {
+            "mountPoint": "/",
+            "name": "",
+            "fileSystem": "ext4",
+            "totalBytes": 2147483648000,
+            "freeBytes": 671088640000,
+            "usedBytes": 1476395008000,
+            "removable": false,
+            "readOnly": false,
+            "state": "ok"
+          },
+          {
+            "mountPoint": "/mnt/slow",
+            "name": "",
+            "fileSystem": "ext4",
+            "totalBytes": null,
+            "freeBytes": null,
+            "usedBytes": null,
+            "removable": false,
+            "readOnly": false,
+            "state": "notResponding"
+          }
+        ],
+        "volumesPaused": false
+      },
+      "cpu": {
+        "current": 23.5,
+        "minimum": 1.5,
+        "average": 11.25,
+        "p95": 40.5,
+        "maximum": 97.5
+      },
+      "memory": {
+        "current": 23.5,
+        "minimum": 1.5,
+        "average": 11.25,
+        "p95": 40.5,
+        "maximum": 97.5
+      },
+      "uptime": null
+    }
+  ]
+}

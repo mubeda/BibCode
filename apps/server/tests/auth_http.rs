@@ -1451,6 +1451,30 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
         stream_denied["exit"]["cause"][0]["error"]["requiredScope"],
         "orchestration:read"
     );
+    send_ws_json(
+        &mut operate_socket,
+        json!({
+            "_tag": "Request",
+            "id": "1080",
+            "tag": "server.subscribeHostMetrics",
+            "payload": {},
+            "headers": []
+        }),
+    )
+    .await;
+    // The first message is the refusal: no host reading is sent before it.
+    let host_denied = next_ws_json(&mut operate_socket).await;
+    assert_eq!(host_denied["_tag"], "Exit", "{host_denied}");
+    assert_eq!(host_denied["requestId"], "1080");
+    assert_eq!(host_denied["exit"]["_tag"], "Failure");
+    assert_eq!(
+        host_denied["exit"]["cause"][0]["error"]["_tag"],
+        "EnvironmentAuthorizationError"
+    );
+    assert_eq!(
+        host_denied["exit"]["cause"][0]["error"]["requiredScope"],
+        "orchestration:read"
+    );
     for (id, tag) in [
         ("109", "activity.cancelSubtree"),
         ("1090", "activity.retrySubtreeCancellation"),

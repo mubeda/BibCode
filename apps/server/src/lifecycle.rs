@@ -85,6 +85,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "webhookStatusKinds": true,
             "sideChats": true,
             "codeReviews": true,
+            "hostMetrics": true,
             "conversationOnlyRewind": true,
             "threadDeleteOnlyIfUnused": true,
         },
@@ -1354,6 +1355,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
+        assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);

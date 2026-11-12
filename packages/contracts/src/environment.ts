@@ -106,6 +106,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   codeReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
   threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `server.subscribeHostMetrics`: the host's CPU, memory and volumes (#292). */
+  hostMetrics: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

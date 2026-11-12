@@ -371,6 +371,7 @@ import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
+  ServerHostMetricsEvent,
   ServerSignalProcessInput,
   ServerSignalProcessResult,
   ServerUpsertKeybindingInput,
@@ -706,6 +707,7 @@ export const WS_METHODS = {
   serverSendDiagnosticLogsRelayItem: "server.sendDiagnosticLogsRelayItem",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
+  serverSubscribeHostMetrics: "server.subscribeHostMetrics",
   serverGetProfilerStatus: "server.getProfilerStatus",
   serverReportProfilerClientBatch: "server.reportProfilerClientBatch",
   serverSignalProcess: "server.signalProcess",
@@ -932,6 +934,13 @@ export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
     error: EnvironmentRpcError,
   },
 );
+
+export const WsServerSubscribeHostMetricsRpc = Rpc.make(WS_METHODS.serverSubscribeHostMetrics, {
+  payload: Schema.Struct({}),
+  success: ServerHostMetricsEvent,
+  error: EnvironmentRpcError,
+  stream: true,
+});
 
 export const WsServerGetProfilerStatusRpc = Rpc.make(WS_METHODS.serverGetProfilerStatus, {
   payload: Schema.Struct({}),
@@ -2359,6 +2368,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerSendDiagnosticLogsRelayItemRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
+  WsServerSubscribeHostMetricsRpc,
   WsServerGetProfilerStatusRpc,
   WsServerReportProfilerClientBatchRpc,
   WsServerSignalProcessRpc,

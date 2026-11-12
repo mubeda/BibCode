@@ -2867,6 +2867,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookStatusKinds": true,
         "sideChats": true,
         "codeReviews": true,
+        "hostMetrics": true,
         "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
@@ -7458,6 +7459,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
+        assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
         // environment's logs only when it says so (#194).

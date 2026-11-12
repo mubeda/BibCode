@@ -17,11 +17,13 @@ use crate::{
     cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
     diagnostics::{
         AttributedProcess, AttributionConfidence, AttributionKind, AttributionScope, BucketMetric,
-        CurrentProcessDiagnostics, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionRegistry, ProcessAttributionTotals, ProcessIdentity,
-        ProcessResourceHistory, ProcessResourceTotals, ProcessRow, ProcessSignal,
-        RuntimeProcessOwnership, SplitMetric, UiCoverage, UiCoverageStatus,
-        bound_diagnostic_string, process_tree_metadata,
+        CurrentProcessDiagnostics, DiagnosticsMonitor, HostMetricsCollector, HostMetricsIdentity,
+        HostMetricsRates, NativeProcessSampler, NativeResourceSampler, ProcessAttributionRegistry,
+        ProcessAttributionTotals, ProcessIdentity, ProcessResourceHistory, ProcessResourceTotals,
+        ProcessRow, ProcessSignal, RuntimeProcessOwnership, SplitMetric, UiCoverage,
+        UiCoverageStatus, bound_diagnostic_string,
+        host_metrics::{NativeHostMetricsSource, send_host_metrics},
+        process_tree_metadata,
         profiler::{client::ingest_client_batch, runtime::ProfilerRuntime},
     },
     persistence::{OrchestrationEvent, Repositories},
@@ -108,6 +110,8 @@ pub struct ServerTerminalServices {
     profiler: Option<Weak<ProfilerRuntime>>,
     /// Tags client profiler reports; empty when the host sets none.
     environment_id: Arc<str>,
+    /// The host collector behind `server.subscribeHostMetrics`; idle until started or watched.
+    host_metrics: Arc<HostMetricsCollector>,
 }
 
 impl ServerTerminalServices {
@@ -168,12 +172,27 @@ impl ServerTerminalServices {
             workspace_watch: CancellationToken::new(),
             profiler: None,
             environment_id: Arc::from(""),
+            host_metrics: Arc::new(HostMetricsCollector::new(
+                Arc::new(NativeHostMetricsSource::new()),
+                HostMetricsRates::default(),
+                HostMetricsIdentity {
+                    boot_id: None,
+                    started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+                },
+            )),
         }
     }
 
     #[must_use]
     pub(crate) fn with_profiler(mut self, profiler: &Arc<ProfilerRuntime>) -> Self {
         self.profiler = Some(Arc::downgrade(profiler));
+        self
+    }
+
+    /// Serves this collector instead of the idle default.
+    #[must_use]
+    pub fn with_host_metrics(mut self, collector: Arc<HostMetricsCollector>) -> Self {
+        self.host_metrics = collector;
         self
     }
 
@@ -617,6 +636,17 @@ async fn send_discovered_local_servers(
 }
 
 fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
+    let collector = services.host_metrics.clone();
+    registry.register_stream(
+        "server.subscribeHostMetrics",
+        move |_request, cancellation| {
+            let collector = collector.clone();
+            spawn_stream(cancellation, move |sender, cancellation| {
+                send_host_metrics(collector, sender, cancellation)
+            })
+        },
+    );
+
     let monitor = services.process_monitor.clone();
     registry.register_unary(
         "server.getProcessDiagnostics",

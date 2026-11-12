@@ -98,20 +98,20 @@ describe("RPC wire fixture exporter", () => {
         },
       },
     ]);
-    expect(manifest.methods).toHaveLength(196);
+    expect(manifest.methods).toHaveLength(197);
     expect(manifest.protocolVersion).toBe("effect-4.0.0-beta.107");
-    expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(29);
-    expect(manifest.streamMethodCount).toBe(29);
-    expect(manifest.expectedTopLevelStreamShapes).toBe(94);
+    expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(30);
+    expect(manifest.streamMethodCount).toBe(30);
+    expect(manifest.expectedTopLevelStreamShapes).toBe(96);
     expect(manifest.expectedOrchestrationEventShapes).toBe(27);
-    expect(manifest.streamShapeFixtures).toHaveLength(94);
+    expect(manifest.streamShapeFixtures).toHaveLength(96);
     expect(manifest.typedFailureFixtures).toHaveLength(413);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(548);
+    expect(manifest.fixtures).toHaveLength(550);
     expect(manifest.fixtures).toContain(
       "contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
     );
@@ -128,7 +128,7 @@ describe("RPC wire fixture exporter", () => {
       ]),
     );
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(507);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(509);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));
