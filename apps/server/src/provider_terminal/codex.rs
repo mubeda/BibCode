@@ -570,9 +570,18 @@ impl CodexTerminalObserverFactory {
             return Err(CodexPreparationSkip::new("unsupported_capabilities"));
         }
         stage.set("arguments");
-        let args = remote_tui_args(&input.launch.args)
+        // A review ends its options with `--`: the prompt after it stays last, unparsed.
+        let end_of_options = input
+            .launch
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(input.launch.args.len());
+        let (options, positional) = input.launch.args.split_at(end_of_options);
+        let args = remote_tui_args(options)
             .ok_or_else(|| CodexPreparationSkip::new("rejected_args"))?;
         let expected_cwd = effective_tui_cwd(&args, &input.launch.cwd);
+        let positional = positional.to_vec();
         let generation_key = input.launch.generation.id().simple().to_string();
         stage.set("generation_dir");
         let generation_dir = create_owned_generation_directory(
@@ -623,6 +632,7 @@ impl CodexTerminalObserverFactory {
         let mut tui_args = args;
         tui_args.push("--remote".to_owned());
         tui_args.push(endpoint.clone());
+        tui_args.extend(positional);
         let observer = CodexPreparedTerminalObserver {
             inner: Arc::new(CodexObserverInner {
                 resources,
