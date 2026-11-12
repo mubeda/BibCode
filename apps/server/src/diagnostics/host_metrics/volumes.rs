@@ -279,6 +279,31 @@ mod tests {
         assert!(shown[2].descriptor.read_only && !shown[2].descriptor.removable);
     }
 
+    /// #292 review: the APFS container shown at `/` stands for the writable Data volume too, so
+    /// a merged entry is read-only only when every merged member is.
+    #[test]
+    fn a_merged_entry_is_read_only_only_when_every_member_is() {
+        let sealed = |mount_point: &str, read_only: bool| {
+            let mut volume = descriptor(mount_point, "apfs");
+            volume.read_only = read_only;
+            (volume, 2_000 * GB, 600 * GB)
+        };
+
+        let (shown, _) = filter(vec![
+            sealed("/System/Volumes/Data", false),
+            sealed("/", true),
+        ]);
+        assert_eq!(mount_points(&shown), [Path::new("/")]);
+        assert!(!shown[0].descriptor.read_only, "{shown:?}");
+
+        let (shown, hidden) = filter(vec![sealed("/Volumes/Image", true), sealed("/", true)]);
+        assert!(shown[0].descriptor.read_only, "{shown:?}");
+        assert!(
+            hidden[0].descriptor.read_only,
+            "a hidden member keeps its own flag"
+        );
+    }
+
     #[test]
     fn a_hidden_volume_carries_its_reason() {
         let mut file = descriptor("/etc/hostname", "ext4");

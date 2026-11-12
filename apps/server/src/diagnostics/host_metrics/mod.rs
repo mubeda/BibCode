@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use time::OffsetDateTime;
 use tokio::{
     sync::{Notify, watch},
     task::JoinHandle,
@@ -231,6 +230,8 @@ struct Shared {
     source: Arc<dyn HostMetricsSource>,
     rates: HostMetricsRates,
     identity: HostMetricsIdentity,
+    /// Where the test wall clock starts.
+    #[cfg(test)]
     clock_origin: Instant,
     statistics: SyncMutex<Statistics>,
     chart: SyncMutex<(u64, Arc<ChartState>)>,
@@ -244,6 +245,9 @@ struct Shared {
     shutdown: CancellationToken,
     #[cfg(test)]
     volume_cadence: Option<Duration>,
+    /// Added to the test wall clock, so a test can move it as an administrator would.
+    #[cfg(test)]
+    wall_offset_ms: std::sync::atomic::AtomicI64,
 }
 
 /// Reads the host's CPU, memory and volumes: in the background from `start_background`, and once
@@ -290,6 +294,7 @@ impl HostMetricsCollector {
                 source,
                 rates,
                 identity,
+                #[cfg(test)]
                 clock_origin: Instant::now(),
                 statistics: SyncMutex::new(Statistics {
                     cpu: RunningStatistic::default(),
@@ -317,6 +322,8 @@ impl HostMetricsCollector {
                 shutdown: CancellationToken::new(),
                 #[cfg(test)]
                 volume_cadence: None,
+                #[cfg(test)]
+                wall_offset_ms: std::sync::atomic::AtomicI64::new(0),
             }),
         }
     }
@@ -411,10 +418,15 @@ impl HostMetricsCollector {
 impl Shared {
     fn now_ms(&self) -> i128 {
         // Tests run on a paused clock, which the wall clock does not follow.
-        if cfg!(test) {
-            self.identity.started_at_ms + self.clock_origin.elapsed().as_millis() as i128
-        } else {
-            OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000
+        #[cfg(test)]
+        {
+            self.identity.started_at_ms
+                + self.clock_origin.elapsed().as_millis() as i128
+                + i128::from(self.wall_offset_ms.load(Ordering::Acquire))
+        }
+        #[cfg(not(test))]
+        {
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000
         }
     }
 

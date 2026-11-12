@@ -548,6 +548,37 @@ mod tests {
         );
     }
 
+    /// #292 review: an oldest-tier bucket that spans a suspend keeps the weight of the time it
+    /// observed, so merging it again (compaction or the 240-bar chart) never counts the gap.
+    #[test]
+    fn a_bucket_spanning_a_sleep_gap_weighs_only_its_observed_time() {
+        let mut history = ChartHistory::new();
+        // Five minutes at 90 percent, three hours asleep, then a day and a half at 10 percent.
+        for minute in 0..5 {
+            history.record(point(minute * 60, 90.0), MINUTE);
+        }
+        let awake = 200;
+        let minutes_after = 1_440 + 120;
+        for minute in awake..awake + minutes_after {
+            history.record(point(minute * 60, 10.0), MINUTE);
+        }
+
+        let all = history.uptime(1);
+        assert_eq!(all.len(), 1);
+        // Closed minutes: the five at 90 and all but the open one at 10.
+        let closed_after = (minutes_after - 1) as f64;
+        let expected = (90.0 * 5.0 + 10.0 * closed_after) / (5.0 + closed_after);
+        assert!(
+            (all[0].cpu_average - expected).abs() < 0.05,
+            "average {} instead of {expected}",
+            all[0].cpu_average
+        );
+        assert!(
+            history.oldest_buckets()[0].duration_ms > 3 * 3_600_000,
+            "the bar still spans the gap"
+        );
+    }
+
     #[test]
     fn the_oldest_tier_fits_in_one_mebibyte() {
         assert_eq!(std::mem::size_of::<StoredBucket>(), 24);

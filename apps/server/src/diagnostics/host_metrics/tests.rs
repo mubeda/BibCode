@@ -592,6 +592,67 @@ async fn the_chart_revision_rises_when_a_minute_bucket_closes() {
     collector.shutdown().await;
 }
 
+/// #292 review: a wall clock moved back an hour neither freezes the chart nor folds new
+/// readings into an older bucket; readings keep their wall time as a label.
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_moved_back_keeps_the_chart_moving() {
+    let source = Arc::new(FakeHostMetricsSource::new(vec![]));
+    let collector = collector(source);
+    collector.start_background();
+    run_for(Duration::from_secs(180), Duration::from_secs(60)).await;
+    let before = collector.snapshot().await;
+
+    collector
+        .shared
+        .wall_offset_ms
+        .store(-3_600_000, Ordering::Release);
+    run_for(Duration::from_secs(180), Duration::from_secs(60)).await;
+    let after = collector.snapshot().await;
+
+    assert!(
+        after.chart.uptime.len() >= before.chart.uptime.len() + 3,
+        "{} bars before, {} after",
+        before.chart.uptime.len(),
+        after.chart.uptime.len()
+    );
+    let newest = after.recent.last().expect("recent points");
+    let previous = before.recent.last().expect("recent points");
+    assert!(
+        newest.sampled_at_ms > previous.sampled_at_ms,
+        "{:?}",
+        after.recent
+    );
+    collector.shutdown().await;
+}
+
+/// #292 review: a listing that hangs is reported apart from any volume, and its recovery too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hung_listing_is_reported_and_recovers() {
+    let log = CapturedLog::default();
+    let _logging = capture(&log);
+    let source = blocking(vec![descriptor("/", "ext4")]);
+    let list = source.hold_list(1);
+    let rates = HostMetricsRates {
+        volumes_every: 1_000,
+        ..HostMetricsRates::default()
+    };
+    let collector = HostMetricsCollector::new(source.clone(), rates, identity())
+        .with_volume_cadence(Duration::from_millis(200));
+    collector.start_background();
+
+    wait_until("the hung listing is logged", || {
+        log.text().contains("host volume listing did not answer")
+    })
+    .await;
+    list.send(vec![descriptor("/", "ext4")])
+        .expect("the listing is held");
+    wait_until("the listing's recovery is logged", || {
+        log.text().contains("host volume listing answered again")
+    })
+    .await;
+    collector.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn after_shutdown_a_subscription_gets_no_reading() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![]));
@@ -895,4 +956,90 @@ fn capture(log: &CapturedLog) -> tracing::subscriber::DefaultGuard {
             .with_writer(move || log.clone())
             .finish(),
     )
+}
+
+/// Panics on the first listing and on the first space read, then answers.
+#[derive(Debug, Default)]
+struct PanickingOnceSource {
+    lists: AtomicUsize,
+    reads: AtomicUsize,
+}
+
+impl HostMetricsSource for PanickingOnceSource {
+    fn host_facts(&self) -> HostFacts {
+        FakeHostMetricsSource::new(vec![]).host_facts()
+    }
+
+    fn read_cpu_memory(&self) -> Result<CpuMemoryReading, SamplingError> {
+        cpu(10.0).map_err(SamplingError::Failed)
+    }
+
+    fn list_volumes(&self) -> Vec<VolumeDescriptor> {
+        assert!(
+            self.lists.fetch_add(1, Ordering::AcqRel) > 0,
+            "listing failed at /media/test-user/backup"
+        );
+        vec![descriptor("/", "ext4")]
+    }
+
+    fn read_volume_space(&self, _mount_point: &Path) -> Result<VolumeSpace, String> {
+        assert!(
+            self.reads.fetch_add(1, Ordering::AcqRel) > 0,
+            "read failed at /media/test-user/backup"
+        );
+        Ok(VolumeSpace {
+            total_bytes: 100 * GB,
+            free_bytes: 40 * GB,
+        })
+    }
+}
+
+/// Waits on the real clock until the workers hold a result, then takes them as debug text.
+async fn next_results(workers: &disk_workers::DiskWorkers) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let results = workers.take_results();
+            if !results.is_empty() {
+                return format!("{results:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a disk result arrives")
+}
+
+/// #292 review P1: a disk call that panics frees its key, reports a failure that names no
+/// path, and leaves the only worker able to run the next job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_disk_call_fails_its_job_and_keeps_the_worker() {
+    let workers = disk_workers::DiskWorkers::start(
+        Arc::new(PanickingOnceSource::default()),
+        1,
+        Duration::from_secs(60),
+    );
+    let admit = |mount_point: Option<&str>| {
+        workers.admit(DiskJob {
+            key: DiskJobKey {
+                mount_point: mount_point.map(PathBuf::from),
+                generation: 0,
+            },
+        })
+    };
+
+    assert_eq!(admit(None), Admission::Admitted);
+    let failed_list = next_results(&workers).await;
+    assert!(failed_list.contains("Listed(Err("), "{failed_list}");
+    assert_eq!(admit(Some("/")), Admission::Admitted);
+    let failed_read = next_results(&workers).await;
+    assert!(failed_read.contains("Space(Err("), "{failed_read}");
+    assert_eq!(admit(None), Admission::Admitted, "the listing key is free");
+    let listed = next_results(&workers).await;
+    assert!(
+        listed.contains("Listed(Ok("),
+        "the worker runs on: {listed}"
+    );
+    assert!(!failed_list.contains("test-user"), "{failed_list}");
+    assert!(!failed_read.contains("test-user"), "{failed_read}");
+    workers.stop();
 }
