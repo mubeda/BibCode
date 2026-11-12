@@ -842,7 +842,7 @@ describe("createTerminalTranscriptRuntime ordered by server generation (#348)", 
     ]);
     expect(runtime.snapshot()).toBe("h!");
     // Once delivered, the same size position is not delivered again.
-    runtime.ingest({ ...snapshotAt(1, 12, "h!"), resync: true }, other);
+    runtime.ingest({ ...snapshotAt(1, 12, "h!"), resync: true }, requester);
     expect(signals).toHaveLength(3);
   });
 

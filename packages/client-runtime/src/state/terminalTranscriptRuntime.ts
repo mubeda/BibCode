@@ -229,6 +229,20 @@ export function createTerminalTranscriptRuntime(
         appliedSequence !== undefined &&
         sequence <= appliedSequence
       ) {
+        // Another stream already applied this transcript, but sizes reach only claimed streams
+        // and an acknowledgement only its requester: a catch-up can carry the one this
+        // runtime lacks, which the requester waits for (#348).
+        const snapshotSize = event.snapshot.size;
+        if (snapshotSize !== undefined && (sizeSequence === undefined || sequence > sizeSequence)) {
+          sizeSequence = sequence;
+          processEvent({
+            type: "resized",
+            threadId: event.snapshot.threadId,
+            terminalId: event.snapshot.terminalId,
+            sequence,
+            size: snapshotSize,
+          });
+        }
         // Another stream already applied this state of the same process.
         if (event.snapshot.firstAttachmentGrant) {
           firstAttachmentGrantClaim = event.snapshot.size?.sizeClaim ?? null;
