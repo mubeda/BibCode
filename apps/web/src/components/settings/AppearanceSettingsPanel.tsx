@@ -268,7 +268,12 @@ export function AppearanceSettingsPanel() {
     if (!setSlot(offer.base, offer.previousSlot).ok) {
       return setActionError("Could not undo the theme choice.");
     }
-    setTheme(offer.previousMode);
+    if (!setTheme(offer.previousMode)) {
+      // All or nothing: put the clicked theme back so the slot and the mode still agree.
+      setSlot(offer.base, offer.themeId);
+      setUndoOffer(offer);
+      return setActionError("Could not undo the theme choice.");
+    }
     rowControl(offer.themeId, "select")?.focus();
   };
   const duplicate = (theme: ThemeFile) => {

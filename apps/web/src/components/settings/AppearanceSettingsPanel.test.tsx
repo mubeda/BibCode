@@ -306,6 +306,26 @@ describe("AppearanceSettingsPanel", () => {
     );
   });
 
+  it("an Undo whose mode write fails leaves the theme and mode as the click set them, says so, and keeps Undo offered", async () => {
+    setSlot("dark", "matrix-dark");
+    await mount();
+    await click(select("tokyo-night"));
+    const realSetItem = Storage.prototype.setItem;
+    const setItem = vi.spyOn(window.localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === "bibcode:theme") throw new Error("quota");
+      realSetItem.call(window.localStorage, key, value);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await undo();
+    setItem.mockRestore();
+    expect(mode()).toBe("dark");
+    expect(readSlots().dark).toBe("tokyo-night");
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      "Could not undo the theme choice.",
+    );
+    expect(undoButton()).not.toBeNull();
+  });
+
   it("a remounted panel offers no Undo for an earlier click", async () => {
     await mount();
     await click(select("tokyo-night"));

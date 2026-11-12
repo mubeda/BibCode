@@ -417,8 +417,9 @@ export function useTheme() {
   // The active theme's base: a slot's theme always has the base of its mode.
   const resolvedTheme = snapshot.base;
 
-  const setTheme = useCallback((next: Theme) => {
-    if (typeof window === "undefined") return;
+  /** Returns false when the mode could not be stored, so a caller can undo its own related writes. */
+  const setTheme = useCallback((next: Theme): boolean => {
+    if (typeof window === "undefined") return false;
     try {
       writeThemePreference(next);
     } catch (cause) {
@@ -436,10 +437,11 @@ export function useTheme() {
         theme: next,
         ...safeErrorLogAttributes(error),
       });
-      return;
+      return false;
     }
     applyTheme(next, true);
     emitChange();
+    return true;
   }, []);
 
   // Keep DOM in sync on mount/change
