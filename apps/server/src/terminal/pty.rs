@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -164,6 +164,16 @@ pub trait PtyProcess: fmt::Debug + Send + Sync {
     /// records: an equal request must be sent again rather than treated as a no-op (#348).
     fn resize_needs_retry(&self) -> bool {
         false
+    }
+    /// Reports the size the PTY still has once it kept refusing a size past every retry;
+    /// `None` for a backend that never refuses. The manager publishes that size (#348).
+    fn subscribe_resize_exhausted(&self) -> Option<watch::Receiver<Option<ExhaustedResize>>> {
+        None
+    }
+    /// How many sizes were sent to the PTY: an [`ExhaustedResize`] is current only while its
+    /// `requests` still equals it, since a newer request settles on its own.
+    fn resize_requests_sent(&self) -> u64 {
+        0
     }
     fn kill(&self) -> Result<(), String>;
     fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
@@ -360,6 +370,24 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
+/// A size the PTY refused on every retry: after `requests` requests, it is still at
+/// `cols` x `rows`, the last size it accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExhaustedResize {
+    pub requests: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// How long the resize worker waits before each retry of a size the PTY refused, without
+/// waiting for another request: the manager has already published that size, and a client
+/// holding it never asks again (#348). About 2.6 s in all, then the PTY's own size is published.
+const RESIZE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+
 /// Collapses a burst of queued resizes down to the newest one.
 ///
 /// A window drag emits many sizes while a single `master.resize` is still in
@@ -368,38 +396,100 @@ impl Drop for SpawnedChildGuard {
 /// actually looking at, so intermediate sizes are skipped rather than replayed.
 /// Skipping them must never skip the last one: a PTY left at an intermediate
 /// size strands every full-screen TUI that anchors to the reported row count.
-fn coalesce_pending_resizes(first: PtySize, requests: &mpsc::Receiver<PtySize>) -> PtySize {
+/// `received` counts every request taken off the queue, the first included.
+fn coalesce_pending_resizes(
+    first: PtySize,
+    requests: &mpsc::Receiver<PtySize>,
+    received: &mut u64,
+) -> PtySize {
     let mut newest = first;
+    *received += 1;
     while let Ok(size) = requests.try_recv() {
         newest = size;
+        *received += 1;
     }
     newest
 }
 
 /// Applies queued sizes, newest first, until the process drops its sender. `failed` says
 /// whether the PTY refused the last one: the manager has already recorded and published that
-/// size, so the next request for it must reach the PTY again instead of being a no-op.
+/// size, so the next request for it must reach the PTY again instead of being a no-op. A
+/// refused size is retried after each of `retry_delays` unless a newer request replaces it;
+/// when they run out, `exhausted` gets the size the PTY still has (#348).
 fn run_resize_worker<E: fmt::Display>(
     pid: u32,
+    initial: PtySize,
     requests: &mpsc::Receiver<PtySize>,
     failed: &AtomicBool,
+    retry_delays: &[Duration],
     mut resize: impl FnMut(PtySize) -> Result<(), E>,
+    mut exhausted: impl FnMut(ExhaustedResize),
 ) {
-    while let Ok(size) = requests.recv() {
-        let size = coalesce_pending_resizes(size, requests);
+    // Tracked rather than read back, so ConPTY and Unix agree on what the PTY holds.
+    let mut accepted = initial;
+    let mut received = 0;
+    let mut refused: Option<PtySize> = None;
+    let mut retries = 0;
+    loop {
+        let size = match refused {
+            None => match requests.recv() {
+                Ok(size) => coalesce_pending_resizes(size, requests, &mut received),
+                Err(_) => return,
+            },
+            Some(size) => match requests.recv_timeout(retry_delays[retries]) {
+                Ok(newer) => {
+                    retries = 0;
+                    coalesce_pending_resizes(newer, requests, &mut received)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    retries += 1;
+                    size
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+        };
         match resize(size) {
-            Ok(()) => failed.store(false, Ordering::Release),
+            Ok(()) => {
+                failed.store(false, Ordering::Release);
+                accepted = size;
+                refused = None;
+                retries = 0;
+            }
             Err(error) => {
                 failed.store(true, Ordering::Release);
-                // A dropped resize strands full-screen TUIs at a stale row count, so make the
-                // failure visible; the next request for this size retries it.
+                if retries < retry_delays.len() {
+                    // A dropped resize strands full-screen TUIs at a stale row count, so make
+                    // the first failure visible; the retries are quiet until they run out.
+                    if retries == 0 {
+                        tracing::warn!(
+                            %error,
+                            pid,
+                            cols = size.cols,
+                            rows = size.rows,
+                            "failed to resize PTY; retrying"
+                        );
+                    }
+                    refused = Some(size);
+                    continue;
+                }
                 tracing::warn!(
                     %error,
                     pid,
                     cols = size.cols,
                     rows = size.rows,
-                    "failed to resize PTY"
+                    kept_cols = accepted.cols,
+                    kept_rows = accepted.rows,
+                    "PTY refused a size on every retry; publishing the size it kept"
                 );
+                refused = None;
+                retries = 0;
+                // The manager publishes the size the PTY has, so nothing needs sending again.
+                failed.store(false, Ordering::Release);
+                exhausted(ExhaustedResize {
+                    requests: received,
+                    cols: accepted.cols,
+                    rows: accepted.rows,
+                });
             }
         }
     }
@@ -494,6 +584,14 @@ impl PortablePtyBackend {
         let (resize, resize_requests) = mpsc::channel();
         let resize_failed = Arc::new(AtomicBool::new(false));
         let worker_resize_failed = Arc::clone(&resize_failed);
+        let (resize_exhausted, _) = watch::channel(None);
+        let worker_resize_exhausted = resize_exhausted.clone();
+        let initial_size = PtySize {
+            rows: input.rows,
+            cols: input.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
 
         // Answer OSC color queries (e.g. OpenCode's OSC 11 light/dark probe) at
         // the PTY layer, using the app's resolved theme colors, so detection
@@ -519,9 +617,17 @@ impl PortablePtyBackend {
         if let Err(error) = thread::Builder::new()
             .name(format!("bibcode-pty-resize-{pid}"))
             .spawn(move || {
-                run_resize_worker(pid, &resize_requests, &worker_resize_failed, |size| {
-                    pair.master.resize(size)
-                });
+                run_resize_worker(
+                    pid,
+                    initial_size,
+                    &resize_requests,
+                    &worker_resize_failed,
+                    &RESIZE_RETRY_DELAYS,
+                    |size| pair.master.resize(size),
+                    |report| {
+                        worker_resize_exhausted.send_replace(Some(report));
+                    },
+                );
             })
         {
             return Err(error.to_string());
@@ -634,6 +740,8 @@ impl PortablePtyBackend {
             osc_color_responder_active,
             resize,
             resize_failed,
+            resize_requests: AtomicU64::new(0),
+            resize_exhausted,
             writer,
             #[cfg(not(windows))]
             killer: Mutex::new(killer),
@@ -1065,6 +1173,9 @@ struct PortablePtyProcess {
     resize: mpsc::Sender<PtySize>,
     /// Set by the resize worker while the PTY refuses the last size it was sent.
     resize_failed: Arc<AtomicBool>,
+    /// Sizes sent to the resize worker, counted before each is queued.
+    resize_requests: AtomicU64,
+    resize_exhausted: watch::Sender<Option<ExhaustedResize>>,
     writer: SharedPtyWriter,
     #[cfg(not(windows))]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
@@ -1132,6 +1243,7 @@ impl PtyProcess for PortablePtyProcess {
         // Never drop a request: callers and `TerminalSession` both record the
         // requested size as applied, so a discarded resize desyncs the PTY from
         // the client permanently. The worker coalesces any backlog instead.
+        self.resize_requests.fetch_add(1, Ordering::AcqRel);
         match self.resize.send(PtySize {
             rows,
             cols,
@@ -1145,6 +1257,14 @@ impl PtyProcess for PortablePtyProcess {
 
     fn resize_needs_retry(&self) -> bool {
         self.resize_failed.load(Ordering::Acquire)
+    }
+
+    fn subscribe_resize_exhausted(&self) -> Option<watch::Receiver<Option<ExhaustedResize>>> {
+        Some(self.resize_exhausted.subscribe())
+    }
+
+    fn resize_requests_sent(&self) -> u64 {
+        self.resize_requests.load(Ordering::Acquire)
     }
 
     fn kill(&self) -> Result<(), String> {
@@ -3220,76 +3340,156 @@ mod tests {
         resize.send(size(206, 69)).unwrap();
 
         let first = requests.recv().unwrap();
-        assert_eq!(coalesce_pending_resizes(first, &requests), size(206, 69));
+        assert_eq!(
+            coalesce_pending_resizes(first, &requests, &mut 0),
+            size(206, 69)
+        );
         assert!(requests.try_recv().is_err(), "backlog must be drained");
     }
 
-    /// A refused resize leaves the real PTY at its old size and says so; the next request
-    /// for the same size reaches the PTY and clears it (#348).
     #[cfg(unix)]
-    #[test]
-    fn a_refused_resize_is_reported_and_an_equal_request_retries_it() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 30,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
+    struct RefusingResizeWorker {
+        requests: mpsc::Sender<PtySize>,
+        /// The size the child sees after each attempt.
+        attempts: mpsc::Receiver<(u16, u16)>,
+        exhausted: mpsc::Receiver<ExhaustedResize>,
+        failed: Arc<AtomicBool>,
+        worker: thread::JoinHandle<()>,
+    }
+
+    /// The resize worker on a real PTY at 80x30 whose resize is refused `refusals` times, an
+    /// injected failure of `MasterPty::resize`, before it reaches the PTY.
+    #[cfg(unix)]
+    fn refusing_resize_worker(
+        refusals: usize,
+        retry_delays: &'static [Duration],
+    ) -> RefusingResizeWorker {
+        let initial = PtySize {
+            rows: 30,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = native_pty_system().openpty(initial).unwrap();
+        let (requests, worker_requests) = mpsc::channel();
+        let (attempted, attempts) = mpsc::channel();
+        let (reported, exhausted) = mpsc::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let failed = Arc::clone(&failed);
+            thread::spawn(move || {
+                let mut refused = 0;
+                run_resize_worker(
+                    7,
+                    initial,
+                    &worker_requests,
+                    &failed,
+                    retry_delays,
+                    |size| {
+                        let result = if refused < refusals {
+                            refused += 1;
+                            Err("injected refusal".to_owned())
+                        } else {
+                            pair.master.resize(size).map_err(|error| error.to_string())
+                        };
+                        // TIOCGWINSZ on the master reads the size the child sees.
+                        let held = pair.master.get_size().unwrap();
+                        attempted.send((held.cols, held.rows)).unwrap();
+                        result
+                    },
+                    |report| reported.send(report).unwrap(),
+                );
             })
-            .unwrap();
-        let size = |cols, rows| PtySize {
+        };
+        RefusingResizeWorker {
+            requests,
+            attempts,
+            exhausted,
+            failed,
+            worker,
+        }
+    }
+
+    #[cfg(unix)]
+    const QUICK_RETRIES: [Duration; 3] = [Duration::from_millis(5); 3];
+    #[cfg(unix)]
+    const NO_RETRY_YET: [Duration; 1] = [Duration::from_secs(30)];
+
+    #[cfg(unix)]
+    fn pty_size(cols: u16, rows: u16) -> PtySize {
+        PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
-        };
-        let (requests, worker_requests) = mpsc::channel();
-        let failed = Arc::new(AtomicBool::new(false));
-        let refuse_next = Arc::new(AtomicBool::new(true));
-        let (applied, outcomes) = mpsc::channel();
-        let worker = {
-            let failed = Arc::clone(&failed);
-            let refuse_next = Arc::clone(&refuse_next);
-            thread::spawn(move || {
-                run_resize_worker(7, &worker_requests, &failed, |size| {
-                    let result = if refuse_next.swap(false, Ordering::AcqRel) {
-                        Err("injected refusal".to_owned())
-                    } else {
-                        pair.master.resize(size).map_err(|error| error.to_string())
-                    };
-                    // TIOCGWINSZ on the master reads the size the child sees.
-                    applied.send(pair.master.get_size().unwrap()).unwrap();
-                    result
-                });
-            })
-        };
+        }
+    }
 
-        requests.send(size(80, 20)).unwrap();
-        let held = outcomes.recv_timeout(Duration::from_secs(5)).unwrap();
+    /// The manager has already published a size the PTY refused, and a client holding it
+    /// never asks again: the worker retries it by itself until the PTY takes it (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_resize_is_retried_without_another_request() {
+        let pty = refusing_resize_worker(2, &QUICK_RETRIES);
+        pty.requests.send(pty_size(80, 20)).unwrap();
+        let next = || pty.attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!([next(), next(), next()], [(80, 30), (80, 30), (80, 20)]);
+        drop(pty.requests);
+        pty.worker.join().unwrap();
+        assert!(!pty.failed.load(Ordering::Acquire));
+        assert!(pty.exhausted.try_recv().is_err(), "the PTY took the size");
+    }
+
+    /// A size refused on every retry is given up, reporting the size the PTY kept so the
+    /// manager publishes it and every viewer converges on the real one (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_size_refused_on_every_retry_reports_the_size_the_pty_kept() {
+        let pty = refusing_resize_worker(usize::MAX, &QUICK_RETRIES);
+        pty.requests.send(pty_size(80, 20)).unwrap();
+        let report = pty
+            .exhausted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker gives up");
         assert_eq!(
-            (held.cols, held.rows),
-            (80, 30),
-            "the refused size never reached the PTY"
-        );
-        // The worker records the outcome once the attempt returns.
-        let settles_to = |expected: bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while failed.load(Ordering::Acquire) != expected {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "outcome never recorded"
-                );
-                thread::sleep(Duration::from_millis(1));
+            report,
+            ExhaustedResize {
+                requests: 1,
+                cols: 80,
+                rows: 30,
             }
-        };
-        settles_to(true);
+        );
+        assert_eq!(
+            pty.attempts.try_iter().collect::<Vec<_>>(),
+            [(80, 30); 1 + QUICK_RETRIES.len()],
+            "one attempt and one per retry, none reaching the PTY"
+        );
+        // Nothing to send again: the manager publishes the size the PTY has.
+        assert!(!pty.failed.load(Ordering::Acquire));
+        drop(pty.requests);
+        pty.worker.join().unwrap();
+    }
 
-        requests.send(size(80, 20)).unwrap();
-        let held = outcomes.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!((held.cols, held.rows), (80, 20));
-        settles_to(false);
-        drop(requests);
-        worker.join().unwrap();
+    /// A newer size replaces a refused one waiting for its retry.
+    #[cfg(unix)]
+    #[test]
+    fn a_newer_request_replaces_a_refused_size_waiting_for_its_retry() {
+        let pty = refusing_resize_worker(1, &NO_RETRY_YET);
+        pty.requests.send(pty_size(80, 20)).unwrap();
+        let next = || pty.attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(next(), (80, 30));
+        pty.requests.send(pty_size(100, 40)).unwrap();
+        assert_eq!(next(), (100, 40));
+        assert!(
+            pty.attempts
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the refused size is not tried again"
+        );
+        drop(pty.requests);
+        pty.worker.join().unwrap();
+        assert!(!pty.failed.load(Ordering::Acquire));
+        assert!(pty.exhausted.try_recv().is_err());
     }
 
     #[test]
@@ -3304,7 +3504,7 @@ mod tests {
         resize.send(only).unwrap();
 
         let first = requests.recv().unwrap();
-        assert_eq!(coalesce_pending_resizes(first, &requests), only);
+        assert_eq!(coalesce_pending_resizes(first, &requests, &mut 0), only);
     }
 
     #[cfg(not(windows))]
@@ -3323,6 +3523,8 @@ mod tests {
             process_identity: None,
             resize,
             resize_failed: Arc::default(),
+            resize_requests: AtomicU64::new(0),
+            resize_exhausted: watch::channel(None).0,
             writer: Arc::new(Mutex::new(Box::new(TestWriter::WriteError))),
             killer: Mutex::new(Box::new(TestKiller { fail: false })),
             output,
@@ -3342,7 +3544,7 @@ mod tests {
         process.resize(206, 69).unwrap();
 
         let first = resize_requests.recv().unwrap();
-        let applied = coalesce_pending_resizes(first, &resize_requests);
+        let applied = coalesce_pending_resizes(first, &resize_requests, &mut 0);
         assert_eq!((applied.cols, applied.rows), (206, 69));
     }
 
@@ -3358,6 +3560,8 @@ mod tests {
             process_identity: None,
             resize,
             resize_failed: Arc::default(),
+            resize_requests: AtomicU64::new(0),
+            resize_exhausted: watch::channel(None).0,
             writer: Arc::new(Mutex::new(Box::new(TestWriter::WriteError))),
             killer: Mutex::new(Box::new(TestKiller { fail: true })),
             output,
@@ -3407,6 +3611,8 @@ mod tests {
             process_identity: None,
             resize,
             resize_failed: Arc::default(),
+            resize_requests: AtomicU64::new(0),
+            resize_exhausted: watch::channel(None).0,
             writer: Arc::new(Mutex::new(Box::new(TestWriter::FlushError))),
             killer: Mutex::new(Box::new(TestKiller { fail: false })),
             output,

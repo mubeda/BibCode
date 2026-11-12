@@ -24,4 +24,6 @@ pub use model::{
     TerminalRemovalReason, TerminalResizeOutcome, TerminalResizeResult, TerminalRestartInput,
     TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
 };
-pub use pty::{PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput};
+pub use pty::{
+    ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
+};

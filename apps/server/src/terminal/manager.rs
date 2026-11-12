@@ -20,10 +20,10 @@ use super::model::{
     TerminalResizeResult, terminal_console_theme_from_env,
 };
 use super::{
-    PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
-    TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
-    TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
-    TerminalStatus, TerminalSummary,
+    ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
+    TerminalAttachInput, TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent,
+    TerminalOpenInput, TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot,
+    TerminalSize, TerminalStatus, TerminalSummary,
     history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
 use super::{TerminalAgentStatus, TerminalAgentStatusState};
@@ -302,6 +302,9 @@ struct Session {
     /// goes to the one used last when its owner leaves several viewers (#348).
     user_input_order: HashMap<String, u64>,
     user_input_clock: u64,
+    /// A size the PTY refused on every retry; the session holds the size it kept instead.
+    /// Asking for it again changes nothing until another size is asked for (#348).
+    refused_size: Option<(u16, u16)>,
     first_attachment_grant_used: bool,
     osc_color_responder_active: bool,
     process: Option<Arc<dyn PtyProcess>>,
@@ -369,6 +372,25 @@ impl SessionAgentStatus {
 /// left panel's 30-minute staleness is measured from recent evidence, rarely enough that a busy
 /// agent's tool calls do not flood the metadata stream.
 const AGENT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The next size a PTY kept after refusing one on every retry; never for a backend that
+/// does not report them.
+async fn next_exhausted_resize(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Option<ExhaustedResize>>>,
+) -> ExhaustedResize {
+    loop {
+        let Some(current) = receiver.as_mut() else {
+            return std::future::pending().await;
+        };
+        if current.changed().await.is_err() {
+            *receiver = None;
+            continue;
+        }
+        if let Some(report) = *current.borrow_and_update() {
+            return report;
+        }
+    }
+}
 
 /// The windows whose typing a session orders at once; more are not tracked (#348).
 const MAX_USER_INPUT_CLAIMS: usize = 64;
@@ -2677,6 +2699,7 @@ impl TerminalManager {
             owner_unused_since_handoff: false,
             user_input_order: HashMap::new(),
             user_input_clock: 0,
+            refused_size: None,
             first_attachment_grant_used: false,
             osc_color_responder_active: process.osc_color_responder_active(),
             process: Some(process.clone()),
@@ -2930,6 +2953,10 @@ impl TerminalManager {
         let exit_inner = inner.clone();
         let exit_session = session.clone();
         let exit_generation = generation.clone();
+        // This task also publishes the size a PTY kept after refusing one on every retry, so
+        // that ends with the process, its generation, or the manager (#348).
+        let mut exhausted_resizes = process.subscribe_resize_exhausted();
+        let exit_process = process.clone();
         tokio::spawn(async move {
             loop {
                 let observed_exit = exit.borrow().clone();
@@ -2941,6 +2968,16 @@ impl TerminalManager {
                             if result.is_err() {
                                 return;
                             }
+                        }
+                        report = next_exhausted_resize(&mut exhausted_resizes) => {
+                            Self::publish_kept_size(
+                                &exit_inner,
+                                &exit_session,
+                                &exit_generation,
+                                &exit_process,
+                                report,
+                            )
+                            .await;
                         }
                     }
                     continue;
@@ -3791,9 +3828,17 @@ impl TerminalManager {
         let size_changed = session.cols != cols || session.rows != rows;
         let owner_changed = session.size_owner.as_ref().map(|owner| &owner.claim)
             != size_owner.as_ref().map(|owner| &owner.claim);
+        // The PTY refused this size on every retry and the session holds the size it kept:
+        // asking for it again sends and publishes nothing, so a renderer that claims its fit
+        // after each publication settles instead of cycling (#348).
+        if !owner_changed && session.refused_size == Some((cols, rows)) {
+            session.first_attachment_grant_used |= size_owner.is_some();
+            return Ok(session.resize_result(TerminalResizeOutcome::Unchanged));
+        }
         // The PTY refused the size the session records: an equal request sends it again.
         if size_changed || process.resize_needs_retry() {
             process.resize(cols, rows).map_err(TerminalError::Io)?;
+            session.refused_size = None;
             generation
                 .activity_wake
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3819,6 +3864,42 @@ impl TerminalManager {
         session.size_owner = size_owner;
         let _ = self.inner.events.send(session.resized());
         Ok(session.resize_result(TerminalResizeOutcome::Applied))
+    }
+
+    /// The PTY refused the size the session records on every retry and kept the size in
+    /// `report`: publish that size with a new sequence, so every viewer converges on what the
+    /// PTY really has (#348). A report a newer request overtook is left to that request.
+    async fn publish_kept_size(
+        inner: &Inner,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+        process: &Arc<dyn PtyProcess>,
+        report: ExhaustedResize,
+    ) {
+        let _publication = tokio::select! {
+            () = inner.cancellation.cancelled() => return,
+            () = generation.cancellation.cancelled() => return,
+            guard = generation.publication.lock() => guard,
+        };
+        let mut session = session.lock().await;
+        if generation.is_invalidated()
+            || !Arc::ptr_eq(&session.generation, generation)
+            || !session
+                .process
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, process))
+            || report.requests != process.resize_requests_sent()
+        {
+            return;
+        }
+        let refused = (session.cols, session.rows);
+        if refused == (report.cols, report.rows) {
+            return;
+        }
+        session.refused_size = Some(refused);
+        session.cols = report.cols;
+        session.rows = report.rows;
+        let _ = inner.events.send(session.resized());
     }
 
     async fn release_size_claim(inner: &Inner, key: &SessionKey, attachment_id: uuid::Uuid) {
@@ -5290,6 +5371,9 @@ mod tests {
         output_on_resize: std::sync::Mutex<Option<String>>,
         /// Reports that the PTY refused its last size, as the resize worker does.
         resize_needs_retry: std::sync::atomic::AtomicBool,
+        /// Sizes asked of this PTY, and the resize worker's report of one it kept refusing.
+        resize_requests: std::sync::atomic::AtomicU64,
+        resize_exhausted: tokio::sync::watch::Sender<Option<ExhaustedResize>>,
     }
 
     /// Holds PTY writes until opened. Opening it on drop keeps a failed test from hanging in
@@ -5373,6 +5457,8 @@ mod tests {
                 resizes: std::sync::Mutex::new(Vec::new()),
                 output_on_resize: std::sync::Mutex::new(None),
                 resize_needs_retry: std::sync::atomic::AtomicBool::new(false),
+                resize_requests: std::sync::atomic::AtomicU64::new(0),
+                resize_exhausted: tokio::sync::watch::channel(None).0,
             }
         }
 
@@ -5474,6 +5560,8 @@ mod tests {
         }
 
         fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            self.resize_requests
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(error) = self.resize_error.lock().unwrap().clone() {
                 return Err(error);
             }
@@ -5486,6 +5574,17 @@ mod tests {
 
         fn resize_needs_retry(&self) -> bool {
             self.resize_needs_retry
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn subscribe_resize_exhausted(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<Option<ExhaustedResize>>> {
+            Some(self.resize_exhausted.subscribe())
+        }
+
+        fn resize_requests_sent(&self) -> u64 {
+            self.resize_requests
                 .load(std::sync::atomic::Ordering::Acquire)
         }
 
@@ -6200,6 +6299,83 @@ mod tests {
             .unwrap();
         assert_eq!(retried.outcome, TerminalResizeOutcome::Unchanged);
         assert_eq!(*pty.resizes.lock().unwrap(), [(80, 24)]);
+        manager.shutdown().await;
+    }
+
+    /// The PTY kept refusing a size the session published: the size it kept is published
+    /// with a new sequence, so every viewer converges on it. Asking for the refused size again
+    /// then changes nothing, until another size is asked for (#348).
+    #[tokio::test]
+    async fn a_size_the_pty_kept_refusing_is_replaced_by_the_size_it_kept() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        let pty = backend.latest();
+        let applied = manager
+            .resize("sizing", "term", 100, 30, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        for attachment in [&mut owner, &mut mirror] {
+            assert!(matches!(
+                next_attachment_event(attachment).await,
+                TerminalEvent::Resized { .. }
+            ));
+        }
+        let report = |requests| ExhaustedResize {
+            requests,
+            cols: 80,
+            rows: 24,
+        };
+        // A report a newer request overtook changes nothing.
+        pty.resize_exhausted.send_replace(Some(report(0)));
+        pty.emit("after a stale report");
+        assert!(matches!(
+            next_attachment_event(&mut mirror).await,
+            TerminalEvent::Output { .. }
+        ));
+        assert!(matches!(
+            next_attachment_event(&mut owner).await,
+            TerminalEvent::Output { .. }
+        ));
+
+        pty.resize_exhausted.send_replace(Some(report(1)));
+        for attachment in [&mut owner, &mut mirror] {
+            match next_attachment_event(attachment).await {
+                TerminalEvent::Resized { size, sequence, .. } => {
+                    assert_eq!((size.cols, size.rows), (80, 24));
+                    assert_eq!(size.size_claim.as_deref(), Some("owner"));
+                    assert!(sequence > applied.sequence.unwrap());
+                }
+                other => panic!("expected the size the PTY kept, got {other:?}"),
+            }
+        }
+
+        let again = manager
+            .resize("sizing", "term", 100, 30, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, TerminalResizeOutcome::Unchanged);
+        assert_eq!(
+            again.size.as_ref().map(|size| (size.cols, size.rows)),
+            Some((80, 24))
+        );
+        assert_eq!(*pty.resizes.lock().unwrap(), [(100, 30)]);
+        pty.emit("nothing published for the refused size");
+        assert!(matches!(
+            next_attachment_event(&mut owner).await,
+            TerminalEvent::Output { .. }
+        ));
+
+        for (cols, rows) in [(90, 30), (100, 30)] {
+            manager
+                .resize("sizing", "term", cols, rows, Some("owner".to_owned()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *pty.resizes.lock().unwrap(),
+            [(100, 30), (90, 30), (100, 30)]
+        );
         manager.shutdown().await;
     }
 

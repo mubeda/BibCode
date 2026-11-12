@@ -1634,6 +1634,10 @@ export function TerminalViewport({
     const completeClaim = (request: TerminalSize, result: TerminalResizeResult | null) => {
       const accepted = result?.outcome === "applied" || result?.outcome === "unchanged";
       if (accepted && result.sequence !== null) {
+        // The server kept another size: its PTY refused this one on every retry. The same
+        // geometry is not sent again until the server's state changes (#348).
+        if (result.size !== null && !terminalDimensionsEqual(result.size, request))
+          declinedRequest = request;
         const acknowledgement = {
           request,
           sequence: result.sequence,

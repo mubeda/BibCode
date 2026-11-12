@@ -1472,7 +1472,16 @@ answers with what the session then holds (outcome, size, generation, last size
 sequence; see [Terminal size and reply ownership](rpc-and-orchestration.md#terminal-size-and-reply-ownership)).
 Failed resizes preserve the prior state. The PTY resize worker records a size
 the PTY refused, and the next request for that size sends it again instead of
-treating it as a no-op. Legacy resizes without a claim clear the owner.
+treating it as a no-op. It also retries a refused size by itself, after 100 ms,
+500 ms and 2 s, unless a newer request replaces it, since the session has
+already published that size and a renderer holding it asks no more. When the
+retries run out it logs a warning and reports the size the PTY kept; the
+session's exit task publishes that size with a new sequence, so every viewer
+converges on it, unless a request sent since overtook the report. The owner asking for the
+refused size again then sends and publishes nothing until another size is
+asked for, so the owner's renderer, which claims its fit after each
+publication, settles instead of cycling. Legacy resizes without a claim clear
+the owner.
 Open/attach dimensions initialize new PTYs; attaching to an existing process
 preserves its dimensions.
 

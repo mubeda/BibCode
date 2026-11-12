@@ -2605,6 +2605,45 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.fakeTerminal!.rows).toBe(20);
   });
 
+  it("does not ask again on every key for a size the server's PTY kept refusing (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 100, rows: 30 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    // The PTY kept 80x24 after refusing 100x30 on every retry, and the server published it.
+    const kept = { cols: 80, rows: 24, sizeClaim: claim };
+    view.resizeSpy.mockResolvedValue(
+      AsyncResult.success({
+        outcome: "unchanged",
+        size: kept,
+        generation: null,
+        sequence: 12,
+      } satisfies TerminalResizeResult),
+    );
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot(""), sequence: 12, size: kept },
+      }),
+    );
+    await view.flushFrame();
+    const asked = view.resizeSpy.mock.calls.length;
+    expect(asked).toBeGreaterThanOrEqual(1);
+    for (const key of ["a", "b", "c"]) {
+      await act(async () => view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key })));
+      await view.flushFrame();
+    }
+    expect(view.resizeSpy).toHaveBeenCalledTimes(asked);
+    expect(view.fakeTerminal!.rows).toBe(24);
+    // Another fit is asked for again.
+    xtermState.proposedDimensions = { cols: 90, rows: 30 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(asked + 1);
+  });
+
   it("shows the size notice when a takeover claim succeeds without changing the owner (#348)", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
