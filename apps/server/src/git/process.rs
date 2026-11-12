@@ -1248,6 +1248,119 @@ mod tests {
         assert!(lock.exists(), "the person's index.lock is kept");
     }
 
+    /// A `git add` behind a wrapper that ignores the request to stop, so the stop is forced. It
+    /// marks `started` once running and, with `holds_lock`, first opens `index.lock` itself and
+    /// keeps it open, as a Git process killed while writing the index does.
+    #[cfg(unix)]
+    fn forced_add(
+        sandbox: &TestSandbox,
+        config: &IsolatedGitConfig,
+        holds_lock: bool,
+    ) -> HeldWrite {
+        let repository = sandbox.path("repository");
+        let bin = sandbox.path("bin");
+        let started = sandbox.path("add-started");
+        for folder in [&repository, &bin] {
+            std::fs::create_dir_all(folder).expect("fixture folder");
+        }
+        fixture_git(config, &repository, &["init", "-q", "-b", "main"]);
+        let lock = repository.join(".git").join("index.lock");
+        let real_git = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate Git");
+        let real_git = String::from_utf8(real_git.stdout).expect("Git path");
+        let open_lock = if holds_lock {
+            format!("exec 3>'{}'\n", lock.display())
+        } else {
+            String::new()
+        };
+        let git = bin.join("git");
+        TestSandbox::write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = add ]; then\ntrap '' TERM\n{open_lock}touch '{}'\nexec sleep 30\nfi\nexec '{}' \"$@\"\n",
+                started.display(),
+                real_git.trim()
+            ),
+        );
+        let mut request = git_request(config, &repository, &["add", "--", "file.txt"]);
+        request.command = git;
+        HeldWrite {
+            request,
+            started,
+            lock,
+        }
+    }
+
+    /// Cancels the write once it has started (after `meanwhile`), waits for its settlement and
+    /// returns the settled outcome.
+    #[cfg(unix)]
+    async fn cancel_forced_write(held: &HeldWrite, meanwhile: impl FnOnce()) -> QuiesceOutcome {
+        let cancellation = CancellationToken::new();
+        let registry = GitWriteRegistry::default();
+        let write = tokio::spawn({
+            let (cancellation, registry, request) =
+                (cancellation.clone(), registry.clone(), held.request.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &cancellation)
+                    .await
+            }
+        });
+        wait_until_exists(&held.started).await;
+        meanwhile();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(20), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+        registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(5))
+            .await
+    }
+
+    /// PR review of #341: a write that takes the lock can still be stopped while it holds none
+    /// (in a hook, at a prompt), and another Git process can take the lock meanwhile and keep
+    /// it unchanged for longer than the wait, such as a person's large `git add`. The forced
+    /// stop must leave that lock alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_keeps_a_lock_another_git_took_during_a_forced_write() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-foreign-during-write");
+        let config = IsolatedGitConfig::new();
+        let held = forced_add(&sandbox, &config, false);
+
+        let settled = cancel_forced_write(&held, || {
+            std::fs::write(&held.lock, "").expect("another Git process takes the lock");
+        })
+        .await;
+
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(held.lock.exists(), "the other Git process's index.lock is kept");
+    }
+
+    /// R16: a lock the forced write itself held is removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_removes_the_lock_a_forced_write_held() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-own-forced-write");
+        let config = IsolatedGitConfig::new();
+        let held = forced_add(&sandbox, &config, true);
+
+        let settled = cancel_forced_write(&held, || {
+            assert!(held.lock.exists(), "the write holds index.lock");
+        })
+        .await;
+
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(!held.lock.exists(), "the forced write's index.lock is removed");
+    }
+
     /// Every command shape the server runs as a write, with whether a real Git took
     /// `index.lock` for it. [`takes_index_lock`] may list only commands a real Git took the
     /// lock for, and must list each `Locks` row, a shape it once misread.
