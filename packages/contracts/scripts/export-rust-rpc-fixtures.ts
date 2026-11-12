@@ -485,6 +485,8 @@ const manualStreamSamples = new Map<string, unknown>([
         ...fixtureHostMetricsSample,
         volumeListingNotResponding: false,
         sequence: 3_601,
+        // The chart clock ran ahead of a wall clock moved back.
+        chartAt: "2026-07-22T12:00:01.250Z",
         ageMs: 120,
       },
       cpu: fixtureHostMetricsStatistic,
