@@ -210,7 +210,7 @@ describe("presentHostDashboard", () => {
 });
 
 describe("host metric bars", () => {
-  it("groups 900 recent readings into 60 bars of average and peak", () => {
+  it("groups 900 recent readings into 60 slot bars of average and peak", () => {
     const recent = Array.from({ length: 900 }, (_, index) => ({
       sampledAt: new Date(NOW_MS - (900 - index) * 1_000).toISOString(),
       cpuPercent: index % 15 === 0 ? 90 : 10,
@@ -221,7 +221,14 @@ describe("host metric bars", () => {
     expect(bars[0]?.peak).toBe(90);
     expect(bars[0]?.average).toBeCloseTo((90 + 14 * 10) / 15);
     expect(bars[0]?.tooltip).toMatch(/: average 15\.3%, peak 90\.0%$/);
-    expect(hostMetricsRecentBars(recent.slice(0, 3), "memory", "locale")).toHaveLength(3);
+    expect(hostMetricsRecentBars(recent.slice(0, 3), "memory", "locale")).toHaveLength(1);
+    // A new reading changes only the newest bar; older bars keep their keys.
+    const next = [
+      ...recent.slice(1),
+      { sampledAt: new Date(NOW_MS).toISOString(), cpuPercent: 10, memoryPercent: 40 },
+    ];
+    const after = hostMetricsRecentBars(next, "cpu", "locale");
+    expect(after.slice(0, -1).map((bar) => bar.key)).toEqual(bars.map((bar) => bar.key));
   });
 
   it("draws one uptime bar per bucket", () => {

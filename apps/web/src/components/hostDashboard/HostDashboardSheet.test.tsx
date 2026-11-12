@@ -234,7 +234,7 @@ describe("HostDashboardSheet", () => {
   it("dims the values after 3 seconds without an item", async () => {
     vi.useFakeTimers({
       now: Date.UTC(2026, 10, 11, 20, 0, 0),
-      toFake: ["Date", "setInterval", "clearInterval"],
+      toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"],
     });
     h.data = view();
     await render();
@@ -279,12 +279,33 @@ describe("HostDashboardSheet", () => {
     h.error = "The server refused the request.";
     await render();
     expect(text()).toContain("The server refused the request.");
+    expect(container?.querySelector('[data-slot="skeleton"]')).toBeNull();
     const retry = [...container!.querySelectorAll("button")].find(
       (button) => button.textContent === "Retry",
     );
     expect(retry).toBeDefined();
     await act(async () => retry!.click());
     expect(h.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not flash a stale age for the snapshot after the document was hidden", async () => {
+    vi.useFakeTimers({
+      now: Date.UTC(2026, 10, 11, 20, 0, 0),
+      toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"],
+    });
+    h.data = view();
+    await render();
+    h.visibility = "hidden";
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    await act(async () => vi.advanceTimersByTime(60_000));
+    h.data = null;
+    h.visibility = "visible";
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    await act(async () => vi.advanceTimersByTime(0));
+    h.data = view({ bootId: "boot-1" });
+    await render();
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(text()).not.toContain("Last updated");
   });
 
   it("never asks an older server and points to Remote Servers", async () => {

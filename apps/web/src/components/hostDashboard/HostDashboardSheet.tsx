@@ -2,7 +2,7 @@ import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
 import type { EnvironmentId } from "@bibcode/contracts";
 import type { ClientSettings } from "@bibcode/contracts/settings";
-import { type JSX, useCallback, useContext, useMemo, useState } from "react";
+import { type JSX, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { useClientSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
@@ -12,7 +12,6 @@ import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
 
 import { useDocumentVisible } from "../pullRequests/useDocumentVisible";
-import { useRelativeTimeTick } from "../settings/settingsLayout";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { RetryButton } from "../ui/retry-button";
@@ -59,6 +58,25 @@ export function HostDashboardCoordinator({
 
 const selectTimestampFormat = (settings: ClientSettings) => settings.timestampFormat;
 
+/**
+ * A 1 s clock that stops while the document is hidden and restarts fresh when it shows again,
+ * so the snapshot after a return is never stamped with a time from before it hid.
+ */
+function useVisibleSecondTick(visible: boolean): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!visible) return;
+    const tick = () => setNowMs(Date.now());
+    const first = setTimeout(tick, 0);
+    const id = setInterval(tick, 1_000);
+    return () => {
+      clearTimeout(first);
+      clearInterval(id);
+    };
+  }, [visible]);
+  return nowMs;
+}
+
 interface ShownViews {
   /** The latest view of any subscription. */
   readonly last: HostMetricsView | null;
@@ -82,7 +100,7 @@ export function HostDashboardSheet({
   const environment = useEnvironment(environmentId);
   const visible = useDocumentVisible();
   const timestampFormat = useClientSettings(selectTimestampFormat);
-  const nowMs = useRelativeTimeTick();
+  const nowMs = useVisibleSecondTick(visible);
   const connected = environment?.connection.phase === "connected";
   const capabilities = environment?.serverConfig?.environment.capabilities;
   const supported = capabilities === undefined ? null : capabilities.hostMetrics;
@@ -146,8 +164,10 @@ export function HostDashboardSheet({
                 ) : null}
               </div>
             )}
-            {presentation.state === "unsupported" ? null : presentation.values === null ? (
-              <HostDashboardSkeleton />
+            {presentation.values === null ? (
+              presentation.state === "loading" ? (
+                <HostDashboardSkeleton />
+              ) : null
             ) : (
               <div
                 className={cn("grid gap-6 transition-opacity", presentation.dimmed && "opacity-64")}

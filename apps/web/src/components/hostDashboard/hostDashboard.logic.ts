@@ -224,36 +224,43 @@ export interface HostMetricBar {
   readonly tooltip: string;
 }
 
-/** The recent chart draws at most this many bars; each groups consecutive readings. */
-export const HOST_DASHBOARD_RECENT_BARS = 60;
+/** Each recent bar covers one aligned slot, so 15 minutes draw about 60 bars. */
+export const HOST_DASHBOARD_RECENT_SLOT_MS = 15_000;
 
 function barTooltip(time: string, average: number, peak: number): string {
   return `${time}: average ${formatCpuPercent(average)}, peak ${formatCpuPercent(peak)}`;
 }
 
-/** Groups the last 15 minutes of readings into at most 60 bars of average and peak. */
+/**
+ * Groups recent readings into bars of average and peak per aligned 15 s slot, keyed by the
+ * slot's start, so a new reading changes only the newest bar and older bars keep their tooltips.
+ */
 export function hostMetricsRecentBars(
   recent: ReadonlyArray<ServerHostMetricsChartPoint>,
   measure: HostMetricMeasure,
   timestampFormat: TimestampFormat,
 ): ReadonlyArray<HostMetricBar> {
-  const size = Math.max(1, Math.ceil(recent.length / HOST_DASHBOARD_RECENT_BARS));
-  const bars: HostMetricBar[] = [];
-  for (let start = 0; start < recent.length; start += size) {
-    const group = recent.slice(start, start + size);
-    const values = group.map((point) =>
-      measure === "cpu" ? point.cpuPercent : point.memoryPercent,
-    );
+  const slots: Array<{ startMs: number; values: number[] }> = [];
+  for (const point of recent) {
+    const startMs =
+      Math.floor(Date.parse(point.sampledAt) / HOST_DASHBOARD_RECENT_SLOT_MS) *
+      HOST_DASHBOARD_RECENT_SLOT_MS;
+    const value = measure === "cpu" ? point.cpuPercent : point.memoryPercent;
+    const last = slots.at(-1);
+    if (last !== undefined && last.startMs === startMs) last.values.push(value);
+    else slots.push({ startMs, values: [value] });
+  }
+  return slots.map(({ startMs, values }) => {
+    const key = new Date(startMs).toISOString();
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
     const peak = Math.max(...values);
-    bars.push({
-      key: group[0]!.sampledAt,
+    return {
+      key,
       average,
       peak,
-      tooltip: barTooltip(formatTimestamp(group[0]!.sampledAt, timestampFormat), average, peak),
-    });
-  }
-  return bars;
+      tooltip: barTooltip(formatTimestamp(key, timestampFormat), average, peak),
+    };
+  });
 }
 
 /** One bar per uptime bucket; the server sends at most 240 (D28). */
