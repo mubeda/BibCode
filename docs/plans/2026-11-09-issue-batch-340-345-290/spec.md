@@ -1936,6 +1936,20 @@ WHEN a person focuses, types in or clicks a terminal in one window, that window 
 - WHEN the person clicks the terminal in it
 - THEN that window owns the size and the program is told its fit
 
+WHEN the window that sizes the terminal leaves, the server SHALL hand the size to the one remaining window, or to the remaining window typed in last; with several windows left and none typed in, the size SHALL stay un-owned until a window is used, the server SHALL name one of them to answer the terminal's queries, and a window that only reloads or is shown again SHALL NOT take it. WHEN the terminal's process restarts while the sizing window is still attached, that window SHALL keep the size.
+
+#### Scenario: an un-owned size waits for use
+
+- GIVEN three windows, the owner and two idle ones
+- WHEN the owner leaves and one idle window reloads
+- THEN the size is un-owned, the reloaded window shows the whole grid, and exactly one window answers a terminal query
+
+#### Scenario: a restart keeps the owner
+
+- GIVEN a window that owns the size and a second window
+- WHEN the terminal's process restarts
+- THEN the first window still owns the size
+
 ### R114. A window that does not size the terminal shows all of it [Must] (amendment A14)
 
 WHILE another window sizes the terminal, a window SHALL show the whole grid: scaled down to fit when the grid is larger than its space, never below half size, after which it scrolls pinned to the bottom; at normal size with empty space when the grid is smaller. It SHALL say that another window sizes the terminal and at what scale.
