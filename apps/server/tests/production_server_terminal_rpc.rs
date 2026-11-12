@@ -1799,6 +1799,133 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
     }
 }
 
+/// Two viewers of one terminal (#348). The owner's renderer holds a stale size, so its fit
+/// differs from what it shows while the server already holds that fit: the repair claim is an
+/// exact no-op. The server answers with the size it holds and acknowledges the claim on the
+/// owner's stream alone, in order, so the owner ends at the right size with no width change.
+#[tokio::test]
+async fn terminal_rpc_repair_claim_for_the_held_size_is_answered_and_acknowledged_in_order() {
+    let temp = TempDir::new().expect("temporary directory");
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut registry, fixture_services());
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut owner = Some(open_socket(handle.local_addr()).await);
+    let mut mirror = Some(open_socket(handle.local_addr()).await);
+    let mut control = Some(open_socket(handle.local_addr()).await);
+    let ids = json!({ "threadId": "thread-repair", "terminalId": "term-repair" });
+
+    let result = AssertUnwindSafe(async {
+        let owner = owner.as_mut().expect("owner socket");
+        let mirror = mirror.as_mut().expect("mirror socket");
+        let control = control.as_mut().expect("control socket");
+        success_value(
+            request(
+                control,
+                "1",
+                "terminal.open",
+                json!({
+                    "threadId": "thread-repair",
+                    "terminalId": "term-repair",
+                    "cwd": temp.path().to_string_lossy(),
+                    "cols": 80,
+                    "rows": 30,
+                    "env": {
+                        "HOME": hermetic_providers::isolated_terminal_home(temp.path()),
+                        "USERPROFILE": hermetic_providers::isolated_terminal_home(temp.path()),
+                    }
+                }),
+            )
+            .await,
+        );
+        let attach = |claim: &str| {
+            let mut input = ids.clone();
+            input["sizeClaim"] = json!(claim);
+            input
+        };
+        send_request(owner, "1", "terminal.attach", attach("owner-viewer")).await;
+        let owned = next_chunk_and_ack(owner, "1").await;
+        assert_eq!(owned[0]["snapshot"]["size"]["sizeClaim"], "owner-viewer");
+        let generation = owned[0]["snapshot"]["generation"].clone();
+        assert!(
+            generation["process"]
+                .as_u64()
+                .is_some_and(|process| process >= 1)
+        );
+        send_request(mirror, "1", "terminal.attach", attach("mirror-viewer")).await;
+        next_chunk_and_ack(mirror, "1").await;
+
+        // The owner fits 20 rows; both viewers see the applied size.
+        let mut resize = ids.clone();
+        resize["cols"] = json!(80);
+        resize["rows"] = json!(20);
+        resize["sizeClaim"] = json!("owner-viewer");
+        let applied = success_value(request(control, "2", "terminal.resize", resize.clone()).await);
+        assert_eq!(applied["outcome"], "applied");
+        assert_eq!(applied["generation"], generation);
+        for socket in [&mut *owner, &mut *mirror] {
+            let event = next_terminal_event_and_ack(socket, "1", "applied size", |value| {
+                value["type"] == "resized"
+            })
+            .await;
+            assert_eq!(event["sequence"], applied["sequence"]);
+            assert_eq!(event["size"]["rows"], 20);
+        }
+
+        // The owner's renderer kept 30 rows (a stale size); it claims its fit again, which the
+        // server already holds.
+        let repair = success_value(request(control, "3", "terminal.resize", resize).await);
+        assert_eq!(repair["outcome"], "unchanged");
+        assert_eq!(
+            repair["size"],
+            json!({ "cols": 80, "rows": 20, "sizeClaim": "owner-viewer" })
+        );
+        let acknowledgement = next_terminal_event_and_ack(owner, "1", "acknowledgement", |value| {
+            value["type"] == "resized"
+        })
+        .await;
+        assert_eq!(acknowledgement["sequence"], repair["sequence"]);
+        assert_eq!(acknowledgement["size"]["rows"], 20);
+        assert_eq!(acknowledgement["size"]["cols"], 80);
+
+        // The mirror gets no acknowledgement of another viewer's claim.
+        maybe_prime_terminal(control, "thread-repair", "term-repair").await;
+        let token = "BIBCODE_RPC_REPAIR";
+        let mut write = ids.clone();
+        write["data"] = json!(shell_echo_command(token));
+        assert_success(request(control, "4", "terminal.write", write).await);
+        let next = next_terminal_event_and_ack(mirror, "1", "mirror output", |value| {
+            value["type"] == "resized"
+                || value["data"]
+                    .as_str()
+                    .is_some_and(|data| data.contains(token))
+        })
+        .await;
+        assert_eq!(next["type"], "output");
+
+        // A claim from a viewer the server does not know changes nothing and says so.
+        let mut unknown = ids.clone();
+        unknown["cols"] = json!(90);
+        unknown["rows"] = json!(40);
+        unknown["sizeClaim"] = json!("departed-viewer");
+        let declined = success_value(request(control, "5", "terminal.resize", unknown).await);
+        assert_eq!(declined["outcome"], "claimNotRegistered");
+        assert_eq!(declined["size"]["rows"], 20);
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut owner).await;
+    close_socket(&mut mirror).await;
+    close_socket(&mut control).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// In a process of its own: it checks that client batches are refused while the profiler is
 /// off, and the profiler is process-wide, so a sibling test that turns it on would make them
 /// accepted.

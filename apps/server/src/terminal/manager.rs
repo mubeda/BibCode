@@ -293,6 +293,11 @@ struct Session {
     size_owner: Option<SizeOwner>,
     /// The sequence of the last published size event, reported by resize results.
     size_sequence: u64,
+    /// The claim whose attachment left while it owned the size: the window last used. It gets
+    /// the size back when it returns, unless the window the size went to was used since.
+    departed_owner: Option<String>,
+    /// The owner received the size when the previous owner left, and nobody typed since.
+    owner_unused_since_handoff: bool,
     first_attachment_grant_used: bool,
     osc_color_responder_active: bool,
     process: Option<Arc<dyn PtyProcess>>,
@@ -404,7 +409,7 @@ impl TerminalSessionIdentity {
             () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
             guard = self.generation.publication.lock() => guard,
         };
-        let session = self.session.lock().await;
+        let mut session = self.session.lock().await;
         if cancelled.is_cancelled()
             || connection_closed.is_cancelled()
             || self.generation.is_invalidated()
@@ -424,6 +429,9 @@ impl TerminalSessionIdentity {
                 terminal_id: self.key.1.clone(),
             });
         }
+        // Typing uses the window the size went to: it keeps the size from now on.
+        session.departed_owner = None;
+        session.owner_unused_since_handoff = false;
         drop(session);
         let pending = self.generation.writer.enqueue(&self.process, data, true)?;
         self.generation
@@ -2636,6 +2644,8 @@ impl TerminalManager {
             rows: input.rows,
             size_owner: None,
             size_sequence: 1,
+            departed_owner: None,
+            owner_unused_since_handoff: false,
             first_attachment_grant_used: false,
             osc_color_responder_active: process.osc_color_responder_active(),
             process: Some(process.clone()),
@@ -3453,6 +3463,18 @@ impl TerminalManager {
                     // A reconnect may reuse a renderer's claim. Its departed stream
                     // must not clear ownership from this replacement attachment.
                     owner.attachment = id;
+                } else if current.owner_unused_since_handoff
+                    && current.departed_owner.as_deref() == Some(claim.as_str())
+                {
+                    // The window last used came back before anyone used the one the size
+                    // went to: an unattended window does not keep the size (#348).
+                    current.size_owner = Some(SizeOwner {
+                        claim: claim.clone(),
+                        attachment: id,
+                    });
+                    current.departed_owner = None;
+                    current.owner_unused_since_handoff = false;
+                    let _ = self.inner.events.send(current.resized());
                 }
                 let dropped = CancellationToken::new();
                 let inner = self.inner.clone();
@@ -3624,7 +3646,10 @@ impl TerminalManager {
         let mut pending = {
             let _publication = generation.publication.lock().await;
             let (process, status) = {
-                let session = session.lock().await;
+                let mut session = session.lock().await;
+                // Typing uses the window the size went to: it keeps the size from now on.
+                session.departed_owner = None;
+                session.owner_unused_since_handoff = false;
                 (session.process.clone(), session.status)
             };
             // An exit invalidates the generation and then marks the session exited, both under
@@ -3727,6 +3752,10 @@ impl TerminalManager {
             }
             return Ok(session.resize_result(TerminalResizeOutcome::Unchanged));
         }
+        if owner_changed {
+            session.departed_owner = None;
+            session.owner_unused_since_handoff = false;
+        }
         session.cols = cols;
         session.rows = rows;
         session.size_owner = size_owner;
@@ -3756,7 +3785,26 @@ impl TerminalManager {
         if session.size_owner.as_ref().map(|owner| owner.attachment) != Some(attachment_id) {
             return;
         }
-        session.size_owner = None;
+        // The window last used sizes the terminal (#348). A lone remaining viewer takes the
+        // size at once; among several, none is known to be in use, so it stays un-owned until
+        // one claims it. The departed owner gets it back if it returns before anyone types.
+        let remaining = {
+            let attachments = inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims");
+            attachments
+                .get(key)
+                .filter(|claims| claims.len() == 1)
+                .and_then(|claims| claims.iter().next())
+                .map(|(claim, id)| SizeOwner {
+                    claim: claim.clone(),
+                    attachment: *id,
+                })
+        };
+        session.departed_owner = session.size_owner.take().map(|owner| owner.claim);
+        session.owner_unused_since_handoff = remaining.is_some();
+        session.size_owner = remaining;
         let _ = inner.events.send(session.resized());
     }
 
@@ -6533,7 +6581,8 @@ mod tests {
         let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
         drop(owner);
         assert!(
-            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none() && (size.cols, size.rows) == (80, 24))
+            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("mirror") && (size.cols, size.rows) == (80, 24)),
+            "a lone remaining viewer takes the size at once"
         );
         manager
             .resize("sizing", "term", 91, 42, Some("mirror".to_owned()))
@@ -6561,7 +6610,7 @@ mod tests {
         let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
         drop(replacement);
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))
         );
         manager
             .resize("sizing", "term", 10, 10, Some("reconnect".to_owned()))
@@ -6604,7 +6653,68 @@ mod tests {
         ));
         drop(owner);
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))
+        );
+        manager.shutdown().await;
+    }
+
+    /// The window last used sizes the terminal (#348): when its stream drops, the lone idle
+    /// viewer takes the size so it keeps working, and the owner gets it back on return without
+    /// a click, unless someone typed in the other window meanwhile. With several viewers
+    /// left, none is assumed to be in use.
+    #[tokio::test]
+    async fn a_returning_owner_takes_the_size_back_from_an_unused_window() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let client = manager.attach(size_attachment("client")).await.unwrap();
+        let mut host = manager.attach(size_attachment("host")).await.unwrap();
+        drop(client);
+        assert!(
+            matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("host"))
+        );
+        // The host fits the size to its own box, which is not use.
+        manager
+            .resize("sizing", "term", 100, 30, Some("host".to_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_attachment_event(&mut host).await,
+            TerminalEvent::Resized { .. }
+        ));
+        let returned = manager.attach(size_attachment("client")).await.unwrap();
+        assert_eq!(
+            returned
+                .initial
+                .size
+                .as_ref()
+                .and_then(|size| size.size_claim.as_deref()),
+            Some("client")
+        );
+        assert!(
+            matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("client"))
+        );
+
+        // Typed in the host while the client was away: the host keeps the size.
+        drop(returned);
+        assert!(matches!(
+            next_attachment_event(&mut host).await,
+            TerminalEvent::Resized { .. }
+        ));
+        manager.write("sizing", "term", "x").await.unwrap();
+        let back = manager.attach(size_attachment("client")).await.unwrap();
+        assert_eq!(
+            back.initial
+                .size
+                .as_ref()
+                .and_then(|size| size.size_claim.as_deref()),
+            Some("host")
+        );
+
+        // Two viewers left: neither is known to be in use.
+        let _third = manager.attach(size_attachment("third")).await.unwrap();
+        drop(host);
+        let mut back = back;
+        assert!(
+            matches!(next_attachment_event(&mut back).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
         );
         manager.shutdown().await;
     }
