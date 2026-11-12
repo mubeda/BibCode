@@ -515,9 +515,12 @@ describe("tool update contracts", () => {
   });
 });
 
+const decodeHostMetricsEvent = Schema.decodeUnknownSync(ServerHostMetricsEvent);
+const encodeHostMetricsEvent = Schema.encodeSync(ServerHostMetricsEvent);
+
 describe("ServerHostMetricsEvent", () => {
-  const decode = Schema.decodeUnknownSync(ServerHostMetricsEvent);
-  const encode = Schema.encodeSync(ServerHostMetricsEvent);
+  const decode = decodeHostMetricsEvent;
+  const encode = encodeHostMetricsEvent;
   const sample = {
     sampledAt: "2026-11-11T12:00:01.000Z",
     cpuPercent: 23.5,
