@@ -4950,7 +4950,7 @@ async fn validate_cwd(cwd: &Path) -> Result<(), TerminalError> {
     }
 }
 
-fn validate_dimensions(cols: u16, rows: u16) -> Result<(), TerminalError> {
+pub(super) fn validate_dimensions(cols: u16, rows: u16) -> Result<(), TerminalError> {
     if !(1..=1_000).contains(&cols) || !(1..=500).contains(&rows) {
         return Err(TerminalError::Io(format!(
             "invalid terminal size {cols}x{rows}"
