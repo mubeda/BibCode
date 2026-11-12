@@ -4,8 +4,20 @@ use std::path::{Path, PathBuf};
 
 use super::{HiddenReason, HiddenVolume, VolumeDescriptor, VolumeReading};
 
+/// The file system recorded for a Windows remote drive letter: its real one is never asked, since
+/// that would reach the share.
+pub(crate) const REMOTE_DRIVE: &str = "remote";
+
 /// Network file systems `sysinfo` does not already skip, or that a FUSE mount reports.
-const NETWORK_FILE_SYSTEMS: [&str; 6] = ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"];
+const NETWORK_FILE_SYSTEMS: [&str; 7] = [
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smbfs",
+    "autofs",
+    "fuse.sshfs",
+    REMOTE_DRIVE,
+];
 
 /// A network file system: any call on its mount point, an `lstat` included, can hang.
 pub(crate) fn is_network(file_system: &str) -> bool {
@@ -24,10 +36,25 @@ pub(crate) fn is_file_mount(
         && symlink_metadata(mount_point).is_ok_and(|metadata| metadata.is_file())
 }
 
+/// The root (`X:\`) of each drive letter set in `mask` (`GetLogicalDrives`) that `is_remote`
+/// (`GetDriveTypeW`) calls remote, as a mounted network file system for `add_unlisted_network`.
+#[cfg(any(windows, test))]
+pub(crate) fn remote_drives(
+    mask: u32,
+    mut is_remote: impl FnMut(&str) -> bool,
+) -> Vec<(PathBuf, String)> {
+    (0..26_u8)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| format!("{}:\\", char::from(b'A' + bit)))
+        .filter(|root| is_remote(root))
+        .map(|root| (PathBuf::from(root), REMOTE_DRIVE.to_owned()))
+        .collect()
+}
+
 /// Adds the mounted network file systems the listing left out (on macOS `sysinfo` skips every
-/// volume that is not local), so the filter hides and discloses them too. Only the file system
-/// type decides; nothing here touches a mount point.
-#[cfg(any(target_os = "macos", test))]
+/// volume that is not local, on Windows every mapped network drive), so the filter hides and
+/// discloses them too. Only the file system type decides; nothing here touches a mount point.
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn add_unlisted_network(
     listed: &mut Vec<VolumeDescriptor>,
     mounted: Vec<(PathBuf, String)>,
@@ -193,7 +220,15 @@ mod tests {
     #[test]
     fn network_file_systems_are_never_stat_by_the_listing() {
         let file = tempfile::NamedTempFile::new().expect("a temporary file");
-        for file_system in ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"] {
+        for file_system in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smbfs",
+            "autofs",
+            "fuse.sshfs",
+            REMOTE_DRIVE,
+        ] {
             assert!(is_network(file_system), "{file_system}");
             let is_file = is_file_mount(file_system, Path::new("/mnt/share"), |_| {
                 panic!("{file_system}: a network mount point was stat")
@@ -246,6 +281,38 @@ mod tests {
             ]
         );
         assert!(listed[2].name.is_empty() && !listed[2].is_file);
+    }
+
+    /// Windows: a remote drive letter the listing left out is added and hidden as a network
+    /// volume, from the drive table alone; a listed or local letter is left as it is (#292).
+    #[test]
+    fn unlisted_remote_drive_letters_are_added_as_hidden_network_volumes() {
+        // C:, D:, Y: and Z: are present; Y: and Z: are remote, and Z: is already listed.
+        let mask = 1 << 2 | 1 << 3 | 1 << 24 | 1 << 25;
+        let mut asked = Vec::new();
+        let drives = remote_drives(mask, |root| {
+            asked.push(root.to_owned());
+            matches!(root, "Y:\\" | "Z:\\")
+        });
+        assert_eq!(asked, ["C:\\", "D:\\", "Y:\\", "Z:\\"]);
+        assert_eq!(
+            drives,
+            [
+                (PathBuf::from("Y:\\"), REMOTE_DRIVE.to_owned()),
+                (PathBuf::from("Z:\\"), REMOTE_DRIVE.to_owned()),
+            ]
+        );
+
+        let mut listed = vec![descriptor("C:\\", "NTFS"), descriptor("Z:\\", "NTFS")];
+        add_unlisted_network(&mut listed, drives);
+        let (kept, hidden) = pre_filter(listed, None);
+        let kept = kept
+            .iter()
+            .map(|volume| volume.mount_point.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, [Path::new("C:\\"), Path::new("Z:\\")]);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert_eq!(reason_of(&hidden, "Y:\\"), &HiddenReason::Network);
     }
 
     fn reading(descriptor: VolumeDescriptor, total: u64, free: u64) -> VolumeReading {
@@ -357,7 +424,15 @@ mod tests {
 
     #[test]
     fn a_network_volume_is_hidden_before_it_is_read() {
-        for file_system in ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"] {
+        for file_system in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smbfs",
+            "autofs",
+            "fuse.sshfs",
+            REMOTE_DRIVE,
+        ] {
             let (kept, hidden) = pre_filter(
                 vec![
                     descriptor("/", "ext4"),

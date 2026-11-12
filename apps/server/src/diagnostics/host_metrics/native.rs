@@ -133,6 +133,8 @@ impl HostMetricsSource for NativeHostMetricsSource {
         *lock(&self.disks) = by_mount;
         #[cfg(target_os = "macos")]
         super::volumes::add_unlisted_network(&mut listed, mounted_file_systems());
+        #[cfg(windows)]
+        super::volumes::add_unlisted_network(&mut listed, remote_drive_letters());
         listed
     }
 
@@ -194,6 +196,23 @@ fn mounted_file_systems() -> Vec<(PathBuf, String)> {
             )
         })
         .collect()
+}
+
+/// The remote (mapped network) drive letters, which `sysinfo` does not list. `GetLogicalDrives`
+/// and `GetDriveTypeW` answer from the drive table, so no share is reached (D25).
+#[cfg(windows)]
+fn remote_drive_letters() -> Vec<(PathBuf, String)> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    // `DRIVE_REMOTE` from `Win32_System_WindowsProgramming`, a feature this crate does not enable.
+    const DRIVE_REMOTE: u32 = 4;
+
+    // SAFETY: takes no arguments.
+    let mask = unsafe { GetLogicalDrives() };
+    super::volumes::remote_drives(mask, |root| {
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_REMOTE }
+    })
 }
 
 /// Total and available blocks from `statvfs` on Linux; total capacity and available capacity for

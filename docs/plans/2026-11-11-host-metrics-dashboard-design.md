@@ -199,6 +199,11 @@ logical CPU count and total memory.
 
 1. Keep what `sysinfo` already lists: it skips pseudo, `squashfs` and network file systems on
    Linux and non-browsable or non-local volumes on macOS.
+   Then add the network volumes it left out, to be hidden as network ones and never read: on
+   macOS the network file systems of the kernel's mount table (`getfsstat` with `MNT_NOWAIT`,
+   automount maps skipped), on Windows each drive letter of `GetLogicalDrives` that
+   `GetDriveTypeW` calls `DRIVE_REMOTE` (file system `remote`; both answer from the drive table,
+   so no share is reached).
 2. Skip zero-size volumes.
 3. Skip `overlay` unless it is mounted at `/`.
 4. Skip a mount point that is a file, not a folder (Docker's `/etc/hosts`, `/etc/hostname` and
