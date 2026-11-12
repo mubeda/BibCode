@@ -134,6 +134,41 @@ for required in \
   fi
 done
 
+# The upstream hook builds its paths from $APPDIR, which is unset when the extracted AppRun runs
+# and names another AppDir when inherited from another AppImage; the GTK hook keeps either.
+# Root the paths at the hook's own AppDir instead. Check the pinned hook first so upstream drift
+# fails the build instead of shipping a half-rewritten hook.
+gstreamer_hook="$appdir/apprun-hooks/linuxdeploy-plugin-gstreamer.sh"
+upstream_hook_lines=(
+  'export GST_PLUGIN_SYSTEM_PATH_1_0="${APPDIR}/usr/lib/gstreamer-1.0"'
+  'export GST_PLUGIN_PATH_1_0="${APPDIR}/usr/lib/gstreamer-1.0"'
+  'export GST_PLUGIN_SCANNER_1_0="${APPDIR}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"'
+  'export GST_PTP_HELPER_1_0="${APPDIR}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"'
+)
+for line in "${upstream_hook_lines[@]}"; do
+  line_count="$(grep -Fxc -- "$line" "$gstreamer_hook" || true)"
+  if [[ "$line_count" != 1 ]]; then
+    printf 'BiBCode AppImage packaging error: expected exactly one line %s in %s; found %s.\n' \
+      "$line" "$gstreamer_hook" "$line_count" >&2
+    exit 1
+  fi
+done
+if [[ "$(grep -c 'APPDIR' "$gstreamer_hook" || true)" != "${#upstream_hook_lines[@]}" ]]; then
+  printf 'BiBCode AppImage packaging error: unexpected APPDIR use in %s\n' "$gstreamer_hook" >&2
+  exit 1
+fi
+sed -i.bak \
+  -e 's/\${APPDIR}/${bibcode_gstreamer_appdir}/g' \
+  -e '1a\
+bibcode_gstreamer_appdir="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")/..")"' \
+  "$gstreamer_hook"
+rm -f "$gstreamer_hook.bak"
+if grep -q 'APPDIR' "$gstreamer_hook" ||
+  [[ "$(grep -c 'bibcode_gstreamer_appdir' "$gstreamer_hook")" != $((${#upstream_hook_lines[@]} + 1)) ]]; then
+  printf 'BiBCode AppImage packaging error: GStreamer hook rewrite failed in %s\n' "$gstreamer_hook" >&2
+  exit 1
+fi
+
 bundled="$(cd "$appdir/usr/lib/gstreamer-1.0" && ls -1 | LC_ALL=C sort)"
 expected="$(printf '%s\n' "${allowed_plugins[@]}" | LC_ALL=C sort)"
 if [[ "$bundled" != "$expected" ]]; then

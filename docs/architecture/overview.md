@@ -1576,7 +1576,11 @@ each exact path and that the package's source is `gstreamer1.0`,
 there. It then removes the Wayland client the nested linuxdeploy run
 redeploys, and requires the plugin scanner, the AppRun hook and a bundled
 plugin folder equal to the allowlist. Other plugins on the build host never
-reach the bundle.
+reach the bundle. The upstream AppRun hook builds its GStreamer paths from
+`$APPDIR`, which is unset when the extracted `AppRun` runs and names another
+AppDir when inherited from another AppImage; the wrapper checks the hook's four
+expected lines and rewrites them to the AppDir the hook file itself lives in,
+failing the build if the upstream hook drifts.
 
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it

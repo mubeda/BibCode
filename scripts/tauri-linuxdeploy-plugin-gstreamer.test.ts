@@ -42,6 +42,16 @@ case "$3" in
 esac
 `;
 // A fake upstream plugin: records its call, then builds what the real one leaves behind.
+// The AppRun hook the pinned upstream plugin writes, byte for byte.
+const UPSTREAM_HOOK = `#! /bin/bash
+
+export GST_REGISTRY_REUSE_PLUGIN_SCANNER="no"
+export GST_PLUGIN_SYSTEM_PATH_1_0="\${APPDIR}/usr/lib/gstreamer-1.0"
+export GST_PLUGIN_PATH_1_0="\${APPDIR}/usr/lib/gstreamer-1.0"
+
+export GST_PLUGIN_SCANNER_1_0="\${APPDIR}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
+export GST_PTP_HELPER_1_0="\${APPDIR}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"
+`;
 const UPSTREAM_SOURCE = `#!/usr/bin/env bash
 set -e
 printf '%s\\n' "$*" > "$(dirname "$0")/upstream-call"
@@ -50,7 +60,10 @@ mkdir -p "$2/usr/lib/gstreamer-1.0" "$2/apprun-hooks"
 cp "$GSTREAMER_PLUGINS_DIR"/* "$2/usr/lib/gstreamer-1.0/"
 [ -z "$EXTRA_PLUGIN" ] || touch "$2/usr/lib/gstreamer-1.0/$EXTRA_PLUGIN"
 [ -n "$SKIP_SCANNER" ] || { mkdir -p "$2/usr/lib/gstreamer1.0/gstreamer-1.0"; touch "$2/${SCANNER}"; }
-touch "$2/${HOOK}" "$2/usr/lib/libwayland-client.so.0"
+touch "$2/usr/lib/libwayland-client.so.0"
+cat > "$2/${HOOK}" <<\\EOF
+${UPSTREAM_HOOK}EOF
+[ -z "$DRIFT_HOOK" ] || sed -i.bak '/GST_PTP_HELPER_1_0/d' "$2/${HOOK}"
 `;
 const temporaryDirectories: Array<string> = [];
 
@@ -188,6 +201,60 @@ describe.skipIf(process.platform === "win32")(
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`did not produce ${appdir}/${SCANNER}`);
+    });
+
+    for (const [label, appdirValue] of [
+      ["the AppImage's own APPDIR", "own"],
+      ["no APPDIR", undefined],
+      ["another AppImage's APPDIR", "/tmp/.mount_otherX"],
+    ] as const) {
+      it(`roots the GStreamer hook at its own AppDir with ${label}`, () => {
+        const { directory, pluginsDirectory, appdir } = setUp(allowlist());
+        expect(
+          run(directory, ["--appdir", appdir], { GSTREAMER_PLUGINS_DIR: pluginsDirectory }).status,
+        ).toBe(0);
+        const realAppdir = NodeFS.realpathSync(appdir);
+        const env: Record<string, string | undefined> = { ...process.env };
+        delete env.APPDIR;
+        if (appdirValue !== undefined)
+          env.APPDIR = appdirValue === "own" ? realAppdir : appdirValue;
+
+        // Source it the way linuxdeploy's AppRun does, then print what it exported.
+        const result = NodeChildProcess.spawnSync(
+          "bash",
+          [
+            "-c",
+            'source "$1"; printf "%s\\n" "$GST_PLUGIN_SYSTEM_PATH_1_0" "$GST_PLUGIN_PATH_1_0" "$GST_PLUGIN_SCANNER_1_0" "$GST_PTP_HELPER_1_0" "$GST_REGISTRY_REUSE_PLUGIN_SCANNER" "$APPDIR"',
+            "bash",
+            NodePath.join(appdir, HOOK),
+          ],
+          { encoding: "utf8", env },
+        );
+
+        expect(result.stderr).toBe("");
+        expect(result.stdout.split("\n").slice(0, 6)).toEqual([
+          `${realAppdir}/usr/lib/gstreamer-1.0`,
+          `${realAppdir}/usr/lib/gstreamer-1.0`,
+          `${realAppdir}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner`,
+          `${realAppdir}/usr/lib/gstreamer1.0/gstreamer-1.0/gst-ptp-helper`,
+          "no",
+          // The hook leaves APPDIR itself alone.
+          env.APPDIR ?? "",
+        ]);
+      });
+    }
+
+    it("fails without rewriting when the upstream GStreamer hook drifts", () => {
+      const { directory, pluginsDirectory, appdir } = setUp(allowlist());
+
+      const result = run(directory, ["--appdir", appdir], {
+        GSTREAMER_PLUGINS_DIR: pluginsDirectory,
+        DRIFT_HOOK: "1",
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("GST_PTP_HELPER_1_0");
+      expect(NodeFS.readFileSync(NodePath.join(appdir, HOOK), "utf8")).toContain("${APPDIR}");
     });
 
     it("passes plugin discovery through to the upstream plugin", () => {
