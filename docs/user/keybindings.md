@@ -103,6 +103,16 @@ Invalid rules are ignored. A malformed config file contributes no overrides.
 The server reports both cases as configuration issues so the connected app can
 surface them.
 
+### Clients older than the server
+
+The server sends the resolved rules to every connected client as they are, and
+it cannot tell which commands a client knows. A client released after v0.15.3
+skips a rule whose command it does not have and loads the rest. A v0.15.3 or
+older client cannot decode a server configuration whose rules name a command it
+lacks (for v0.15.3, `sourceControl.review`; for older clients also commands
+such as `chat.find`), so on such a client the server's configuration does not
+load until the rule is removed or the client is updated.
+
 ### Available Commands
 
 - `sidebar.toggle`: open/close the left workspace panel
@@ -133,8 +143,8 @@ surface them.
 - `commandPalette.toggle`: open or close the global command palette
 - `chat.new`: create a new worktree/chat thread preserving the active context where possible
 - `chat.newLocal`: create a new chat thread for the active project in a new environment (local/worktree determined by app settings (default `local`))
-- `chat.find`: open Find in thread in the chat that holds focus, or the host chat. It has no default rule; binding it replaces the built-in Mod+F. A client older than this command cannot decode a server configuration that names it, so on such a client every rule from that server fails to load until the rule is removed; an updated client is unaffected
-- `sourceControl.review`: start a code review of the active checkout, as Source Control's **Review changes** would; nothing happens while that button is disabled. It has no default rule; binding it replaces the built-in Mod+Alt+Shift+R. As with `chat.find`, a client older than this command cannot decode a server configuration that names it
+- `chat.find`: open Find in thread in the chat that holds focus, or the host chat. It has no default rule; binding it replaces the built-in Mod+F. A client older than this command cannot decode a server configuration that names it (see [Clients older than the server](#clients-older-than-the-server))
+- `sourceControl.review`: start a code review of the active checkout, as Source Control's **Review changes** would; nothing happens while that button is disabled. It has no default rule; binding it replaces the built-in Mod+Alt+Shift+R. A v0.15.3 or older client cannot decode a server configuration that names it (see [Clients older than the server](#clients-older-than-the-server))
 - `modelPicker.toggle`: open/close the model picker
 - `editor.openFavorite`: open current project/worktree in the last-used editor
 - `thread.previous` / `thread.next`: jump through visible left-panel workspace cards

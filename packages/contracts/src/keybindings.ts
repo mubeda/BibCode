@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { TrimmedString } from "./baseSchemas.ts";
 
 export const MAX_KEYBINDING_VALUE_LENGTH = 64;
@@ -157,8 +158,34 @@ export const ResolvedKeybindingRule = Schema.Struct({
 });
 export type ResolvedKeybindingRule = typeof ResolvedKeybindingRule.Type;
 
-export const ResolvedKeybindingsConfig = Schema.Array(ResolvedKeybindingRule).check(
-  Schema.isMaxLength(MAX_KEYBINDINGS_COUNT),
+type ResolvedKeybindingRuleEncoded = typeof ResolvedKeybindingRule.Encoded;
+
+const isKeybindingCommand = Schema.is(KeybindingCommand);
+
+/** A rule a newer server sent whose command this client does not have. */
+const namesUnknownCommand = (rule: unknown): boolean =>
+  typeof rule === "object" &&
+  rule !== null &&
+  typeof (rule as { readonly command?: unknown }).command === "string" &&
+  !isKeybindingCommand((rule as { readonly command: string }).command);
+
+/**
+ * What a server sends. A rule naming a command this client does not know is dropped, so a
+ * command added later cannot fail a client's whole server configuration (#293); every other
+ * rule is still decoded strictly. User-written `KeybindingsConfig` stays strict.
+ */
+export const ResolvedKeybindingsConfig = Schema.Array(Schema.Unknown).pipe(
+  Schema.decodeTo(
+    Schema.Array(ResolvedKeybindingRule).check(Schema.isMaxLength(MAX_KEYBINDINGS_COUNT)),
+    SchemaTransformation.transform({
+      // The kept rules are then decoded by the strict target schema.
+      decode: (rules) =>
+        rules.filter(
+          (rule) => !namesUnknownCommand(rule),
+        ) as ReadonlyArray<ResolvedKeybindingRuleEncoded>,
+      encode: (rules) => rules,
+    }),
+  ),
 );
 export type ResolvedKeybindingsConfig = typeof ResolvedKeybindingsConfig.Type;
 
