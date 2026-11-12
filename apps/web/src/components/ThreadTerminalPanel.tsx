@@ -1410,7 +1410,9 @@ export function TerminalViewport({
     let appliedSize: TerminalSize | null = null;
     let claimInFlight: TerminalSize | null = null;
     let layoutChangedWhileClaimPending = false;
+    // Hides the notice only while a claim is pending or its success has not settled.
     let claimNoticeSuppressed = false;
+    let keypressMeasureFrame: number | null = null;
     let oscColorResponderActive = false;
     let disposed = false;
     let resizeRetryTimer: number | null = null;
@@ -1506,6 +1508,24 @@ export function TerminalViewport({
           }),
       );
     };
+    // The server answers a claim for the size and owner it already holds with success and no
+    // echo, so a stale applied size survived its own repair (#348). Once queued output and any
+    // echo have parsed: if no size arrived since the claim and this renderer already owned the
+    // size, the claim is the applied state; a later echo or snapshot still wins. A takeover
+    // always echoes its owner change, so one without an echo was not applied.
+    const settleSuccessfulClaim = (request: TerminalSize, appliedAtClaim: TerminalSize | null) =>
+      outputSink.barrier(() => {
+        if (
+          disposed ||
+          resizeRendererGenerationRef.current !== resizeRendererGeneration ||
+          claimInFlight !== null
+        )
+          return;
+        claimNoticeSuppressed = false;
+        if (appliedSize === appliedAtClaim && appliedAtClaim?.sizeClaim === sizeClaim)
+          applySize(request);
+        else updateSizeNotice();
+      });
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
@@ -1529,9 +1549,16 @@ export function TerminalViewport({
           documentFocused: document.hasFocus(),
           claimInFlight: claimInFlight !== null,
         });
-      // Use the same policy with cached geometry before measuring on keydown.
-      if (trigger === "keypress" && fittedDimensions !== null && !shouldClaim(fittedDimensions))
-        return;
+      // Typing measures at most once per frame; other keydowns in that frame reuse the fit.
+      if (trigger === "keypress") {
+        if (keypressMeasureFrame !== null) {
+          if (fittedDimensions === null || !shouldClaim(fittedDimensions)) return;
+        } else {
+          keypressMeasureFrame = window.requestAnimationFrame(() => {
+            keypressMeasureFrame = null;
+          });
+        }
+      }
       const fitted = updateFittedDimensions();
       if (
         trigger === "layout" &&
@@ -1543,6 +1570,7 @@ export function TerminalViewport({
       }
       if (fitted && shouldClaim(fitted)) {
         const request = { ...fitted, sizeClaim };
+        const appliedAtClaim = appliedSize;
         claimInFlight = request;
         claimNoticeSuppressed = true;
         const finishClaim = (succeeded: boolean) => {
@@ -1553,8 +1581,10 @@ export function TerminalViewport({
           )
             return;
           claimInFlight = null;
-          if (succeeded) resizeRetries = 0;
-          else claimNoticeSuppressed = false;
+          if (succeeded) {
+            resizeRetries = 0;
+            settleSuccessfulClaim(request, appliedAtClaim);
+          } else claimNoticeSuppressed = false;
           const refit = layoutChangedWhileClaimPending;
           layoutChangedWhileClaimPending = false;
           if (refit) handleSizeTrigger("layout");
@@ -1614,6 +1644,8 @@ export function TerminalViewport({
           layoutChangedWhileClaimPending = false;
           claimNoticeSuppressed = false;
         }
+        // A reset drops the old sink's pending claim settlement with it.
+        if (claimInFlight === null) claimNoticeSuppressed = false;
         oscColorResponderActive = signal.oscColorResponderActive ?? false;
         if (sizeOwnership) applySize(signal.size, claimOnAttach);
         else {
@@ -2084,6 +2116,7 @@ export function TerminalViewport({
       lastRequestedSizeRef.current = null;
       window.clearTimeout(fitTimer);
       if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
+      if (keypressMeasureFrame !== null) window.cancelAnimationFrame(keypressMeasureFrame);
       outputSink.dispose();
       replyGuard.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;

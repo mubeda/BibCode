@@ -2283,7 +2283,7 @@ describe("TerminalViewport mounted lifecycle", () => {
   });
 
   it.each(["size", "owner", "generation"] as const)(
-    "clears no-echo claim notice suppression on the next %s change",
+    "ends no-echo claim notice suppression once the claim settles and keeps it off after a %s change",
     async (change) => {
       testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
       vi.spyOn(document, "hasFocus").mockReturnValue(false);
@@ -2301,7 +2301,8 @@ describe("TerminalViewport mounted lifecycle", () => {
         view.runtime.ingest({ type: "resized", threadId: THREAD_ID, terminalId: "term-1", size }),
       );
       await flushTerminalWrites();
-      expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+      // The other window still owns a different size: suppression ended with the claim (#348).
+      expect(view.mounted.container.textContent).toContain("Sized for another window.");
       await act(async () =>
         view.runtime.ingest(
           change === "generation"
@@ -2551,7 +2552,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     },
   );
 
-  it("skips measuring and resize requests for owner keypresses at the applied size", async () => {
+  it("measures once per frame and sends no resize for owner keypresses at the applied size", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     const view = await mountViewport();
     const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
@@ -2570,7 +2571,7 @@ describe("TerminalViewport mounted lifecycle", () => {
       for (let index = 0; index < 100; index += 1)
         view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" }));
     });
-    expect(xtermState.fitAddons[0]!.proposeDimensions).not.toHaveBeenCalled();
+    expect(xtermState.fitAddons[0]!.proposeDimensions).toHaveBeenCalledOnce();
     expect(view.resizeSpy).not.toHaveBeenCalled();
   });
 
@@ -3010,6 +3011,9 @@ describe("TerminalViewport mounted lifecycle", () => {
         await view.flushFrame();
         xtermState.proposedDimensions = { cols: 80, rows: 17 };
         if (mode === "owner") {
+          // The echo re-measures and claims the newer size at once.
+          view.resizeSpy.mockClear();
+          view.resizeSpy.mockResolvedValueOnce(failure);
           await act(async () =>
             view.runtime.ingest({
               type: "resized",
@@ -3018,9 +3022,6 @@ describe("TerminalViewport mounted lifecycle", () => {
               size: { cols: 80, rows: 19, sizeClaim: claim! },
             }),
           );
-          view.resizeSpy.mockClear();
-          view.resizeSpy.mockResolvedValueOnce(failure);
-          await view.resizeContainer();
           await view.flushFrame();
           expect(sent()).toEqual([17]);
         }

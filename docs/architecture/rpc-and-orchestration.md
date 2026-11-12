@@ -5071,14 +5071,33 @@ workers.
 Accepted resize/claim changes publish before subsequent PTY output under the
 same lock; failed resizes preserve state and exact no-ops emit nothing. A
 renderer retains one pending claim until RPC completion, on success or failure.
-The ordered echo updates applied dimensions and reply ownership. Notice
-suppression persists through successful RPC completion until applied size,
-ownership, or generation changes, including when success emits no echo. Input
+Resize requests queue per terminal and renderer claim, so a successful result
+is always the result of that renderer's own latest claim. The ordered echo
+updates applied dimensions and reply ownership. Because an exact no-op succeeds
+without an echo, a successful claim settles behind the output already queued
+for xterm: if this renderer already owned the size and no size arrived since the
+claim, the claimed size becomes the applied size, so a stale applied size cannot
+survive its own repair; any later echo or snapshot still wins. A takeover always
+echoes its owner change, so a successful takeover without one leaves the other
+owner's size applied. Notice suppression covers only the pending claim and its
+settlement; after it the notice shows whenever another owner's size differs
+from this renderer's fit. Input
 and reply decisions do not treat a pending claim as applied ownership. Null
 ownership permits live replies while attached renderers immediately try to claim
 it; mirrors suppress device/status/palette query replies. OSC 10/11/12 are
 suppressed for all renderers when the server responder is active; otherwise the
 owner can answer. The server continues handling `CSI ? 996 n`.
+
+Each attach stream is in sequence order, but several streams for one terminal
+(a remounted renderer's old and new attachment while the old one is still being
+released, or two viewports of one terminal) feed the same transcript runtime.
+The runtime applies each server sequence once per process: an event at or below
+the highest sequence another stream already applied is skipped, a stream's
+events count only once it has delivered the snapshot or restart of the current
+process (identified by its `pid`), and a same-process snapshot or restart that
+another stream has already passed is not applied again. A snapshot of a different
+process always resets. Pointer-down, focus and the first keydown of each frame
+re-measure the mount before deciding a claim.
 
 The transcript runtime delivers the first-attachment grant once to the renderer
 with the matching claim. Its history replay may answer startup DSR/DA; ordinary

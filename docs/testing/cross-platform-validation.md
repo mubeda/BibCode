@@ -303,7 +303,10 @@ visible.
 Resize the mirror's container: it must not resize the program. Focus, click, or
 type in a mirror, including an equal-size mirror, to transfer ownership. After
 a click or keypress, the notice must stay hidden without flashing back while
-the terminal catches up. Try **Fit to this window** on an exited terminal,
+the terminal catches up. As owner, shrink the terminal's box without resizing
+the window (open an AI terminal's Activity panel); then click and type: the
+terminal must end at the rows that fit, with its bottom line visible, without a
+width change. Try **Fit to this window** on an exited terminal,
 then reopen or restart it: the window must remain usable, with the notice and
 fit action available when another window owns a different size.
 Close or disconnect the owner: other windows receive a null claim, immediately

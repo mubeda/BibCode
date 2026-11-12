@@ -1494,9 +1494,12 @@ successfully or with failure; the echo updates the applied size. A layout change
 deferred during a pending claim is reconsidered on completion; a new
 attachment/process snapshot retires the prior generation's request.
 
-The notice stays hidden while claiming and after success until applied size,
-ownership, or generation changes, avoiding a flash before xterm parses the echo.
-Failure releases that suppression immediately. Mirrors resize xterm to the PTY
+The notice stays hidden while claiming and until a successful claim settles
+behind the output and echo xterm has not parsed yet, avoiding a flash. Failure
+releases that suppression immediately. A successful claim for a size this
+renderer already owned settles as the applied size even when the server, already
+holding it, sends no echo; a successful takeover without an echo leaves the other
+owner's size and the notice in place. Mirrors resize xterm to the PTY
 dimensions instead of fitting their container; only a different-size mirror
 shows **Sized for another window** with fit and dismiss actions. Manual
 dismissal is retained by terminal identity and applied dimensions/owner across

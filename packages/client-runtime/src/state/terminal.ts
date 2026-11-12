@@ -283,7 +283,13 @@ export function createTerminalEnvironmentAtoms<R, E>(
       label: "environment-data:terminal:resize",
       tag: WS_METHODS.terminalResize,
       scheduler: resizeScheduler,
-      concurrency: { mode: "latest", key: terminalSessionKey },
+      // One lane per renderer claim: a superseded request resolves with the result of the one
+      // that ran, so a shared lane could report another renderer's claim as this one's (#348).
+      concurrency: {
+        mode: "latest",
+        key: (target) =>
+          JSON.stringify([terminalSessionKey(target), target.input.sizeClaim ?? null]),
+      },
     }),
     clear: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:clear",
