@@ -357,9 +357,19 @@ macOS development host (Apple silicon, 12 logical CPUs, macOS 27), three runs:
 
 The runs agree within 12 percent. Background costs about a tenth of the 0.1% limit and live
 about two thirds of the 1% limit, so the macOS figures select **(c) always on, live 1 s**, which
-needs no approval. The Linux lab run (`taskset -c 0,1`, Ubuntu 22.04 container) is pending: the
-lab was in use by another lane. The policy applies to the higher of the two hosts, so the
-outcome is provisional until that run is recorded here with its tree identity.
+needs no approval.
+
+Linux lab (Ubuntu 22.04 arm64 container, 12 CPUs visible, run under `taskset -c 0,1`,
+2026-11-12), one run on the tree of commit 12edddac9 with the probe file of commit 436561914
+copied in (the probe file's sha256 matched on the Mac and in the container; nothing else
+differed from 12edddac9):
+
+| Run | Background ms per reading | % of one core at 60 s | Live ms per reading | % at 1 s | % at 2 s |
+| --- | ------------------------- | --------------------- | ------------------- | -------- | -------- |
+| 1   | 3.959                     | 0.0066                | 2.466               | 0.247    | 0.123    |
+
+Linux is cheaper than macOS on both counts, so the higher figures are the macOS ones and the
+outcome stays **(c) always on, live 1 s**, now on both hosts.
 
 What makes (c) cheap: no process table walk (#24, #232), one `System` with CPU and memory
 refreshes only, `/proc/stat` and `/proc/meminfo` on Linux, one host statistics call on macOS,
@@ -516,7 +526,13 @@ each time, which can hang and repeats the space reads the disk loop already make
   sheet shows an unknown one as "Hidden by the volume filter". A Sample carries the list only
   with `uptime`; a Snapshot from an older server decodes with an empty list. The `sysinfo`
   features `linux-netdevs` and `linux-tmpfs` add network and tmpfs mounts to the Linux listing,
-  which makes no `statvfs` call, so the filter sees and discloses them.
+  which makes no `statvfs` call, so the filter sees and discloses them. Linux lab, 2026-11-12:
+  with a loopback `fuse.sshfs` mount at `/mnt/share`, `volume_probe` listed it as hidden
+  (network) with no sizes, next to `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` hidden
+  as file mounts and `/usr/sbin/docker-init` as a container layer. With the mount's SFTP server
+  stopped (a `stat` of the mount then hangs), the packaged app still listed it under Hidden
+  volumes as "Network volume", showed no volume as not responding and logged no
+  `host volume did not answer` line, so it is never read.
 
 - **MCP snapshot (Task 11.12).** `server.getHostMetrics` answers one Snapshot from memory and
   never switches the collector to the live rate. The `host_metrics` tool keeps a mount point only
@@ -527,6 +543,31 @@ each time, which can hang and repeats the space reads the disk loop already make
   nominal time between volume reads at the rate of that tick (five background or five live
   readings), as D28 weighs CPU and memory. At most 64 mount points get statistics; one that
   disappears keeps its entry until restart. Every Snapshot and Sample carries `volumeStatistics`.
+
+## Checked against the OS tools (Task 11.10)
+
+The ignored `os_tools_probe` in `diagnostics/host_metrics/probes.rs` primes the native source,
+reads the system's own tools over one 5 s window and reads the source again, then compares
+(R80 tolerances: CPU within 10 points, memory used within 3 points, the total and free space of
+`/` within 1 percent). It names only `/`.
+
+| Measure                   | macOS development host (2026-11-12)                                                   | Linux lab container (2026-11-12)                      |
+| ------------------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| Tools                     | `top -l 2 -s 5`, `vm_stat` with `hw.memsize`, `df -k -P /`, NSURL capacity (JXA)      | two `/proc/stat` reads, `/proc/meminfo`, `df -k -P /` |
+| CPU busy, source and tool | 56.9% and 55.5% (1.5 points apart)                                                    | 0.2% and 0.2% (0.0 points)                            |
+| Memory used               | 65.7% and 65.7% (0.0 points)                                                          | 6.0% and 6.0% (0.0 points)                            |
+| `/` total                 | 100.0% of `df`'s total                                                                | 100.0% of `df`'s total                                |
+| `/` free                  | 26.7% of `df`'s total, equal to the important-usage capacity; `df` Available is 25.2% | 92.7% of `df`'s total, equal to `df` Available        |
+
+Both runs printed `running 1 test` and `1 passed`. In the container the totals are the kernel's
+(the container has no cgroup memory limit, and the probe does not read one), as `free` reports
+them there. The Linux run used the same tree identity as the cost run above. The macOS CPU
+window was not idle (other lanes were building), which the 10 point tolerance absorbs; the
+Linux one was.
+
+Unproven: the graphical tools (Activity Monitor, Disk Utility, Task Manager), Linux on bare
+metal and on x64, Windows on x64, containers with cgroup limits, and Windows altogether: the
+probe has no Windows part (Windows: CI build and unit tests only).
 
 ## Open points from the build
 
