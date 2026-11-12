@@ -477,7 +477,9 @@ fn run_resize_worker<E: fmt::Display>(
                 }
                 // A child can set any size, 0 by 0 included; publish only one the wire accepts.
                 let kept = read_size()
-                    .filter(|size| super::manager::validate_dimensions(size.cols, size.rows).is_ok())
+                    .filter(|size| {
+                        super::manager::validate_dimensions(size.cols, size.rows).is_ok()
+                    })
                     .unwrap_or(accepted);
                 tracing::warn!(
                     %error,
