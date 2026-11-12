@@ -578,8 +578,8 @@ impl CodexTerminalObserverFactory {
             .position(|arg| arg == "--")
             .unwrap_or(input.launch.args.len());
         let (options, positional) = input.launch.args.split_at(end_of_options);
-        let args = remote_tui_args(options)
-            .ok_or_else(|| CodexPreparationSkip::new("rejected_args"))?;
+        let args =
+            remote_tui_args(options).ok_or_else(|| CodexPreparationSkip::new("rejected_args"))?;
         let expected_cwd = effective_tui_cwd(&args, &input.launch.cwd);
         let positional = positional.to_vec();
         let generation_key = input.launch.generation.id().simple().to_string();
