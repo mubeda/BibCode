@@ -62,9 +62,17 @@ pub(crate) fn merge_shared(read: Vec<VolumeReading>) -> (Vec<VolumeReading>, Vec
         .map(|winner| winner.map(|index| read[index].descriptor.mount_point.clone()))
         .collect();
 
+    // A merged entry stands for every member, so it is read-only only when all of them are
+    // (macOS: `/` is the sealed system volume, its Data volume is writable).
+    let writable_groups = winners
+        .iter()
+        .zip(&read)
+        .filter(|(_, reading)| !reading.descriptor.read_only)
+        .filter_map(|(winner, _)| *winner)
+        .collect::<Vec<_>>();
     let mut shown = Vec::with_capacity(read.len());
     let mut hidden = Vec::new();
-    for (index, reading) in read.into_iter().enumerate() {
+    for (index, mut reading) in read.into_iter().enumerate() {
         if reading.total_bytes == Some(0) {
             hidden.push(HiddenVolume {
                 descriptor: reading.descriptor,
@@ -78,6 +86,9 @@ pub(crate) fn merge_shared(read: Vec<VolumeReading>) -> (Vec<VolumeReading>, Vec
                 reason: HiddenReason::SameStorage { as_mount },
             });
         } else {
+            if writable_groups.contains(&index) {
+                reading.descriptor.read_only = false;
+            }
             shown.push(reading);
         }
     }
