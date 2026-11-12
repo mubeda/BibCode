@@ -5947,8 +5947,6 @@ describe("ChatView handlers (captured from mocked children)", () => {
     };
     const SCOPE = { kind: "uncommitted", base: "origin/main" } as const;
     const DRAFT_REASON = "Send a first message in this chat, then review from here.";
-    const WINDOWS_REASON =
-      "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.";
 
     function seedReviewEnvironment(input: {
       readonly reviewer: { kind: "chat" | "terminal"; instanceId: ProviderInstanceId };
@@ -6170,32 +6168,21 @@ describe("ChatView handlers (captured from mocked children)", () => {
       }
     });
 
-    it.each([
-      ["windows", WINDOWS_REASON],
-      ["darwin", null],
-      ["linux", null],
-    ])(
-      "offers a Claude Terminal review on %s only when terminal reviews are on",
-      async (os, reason) => {
-        seedReviewEnvironment({
-          reviewer: { kind: "terminal", instanceId: claudeInstanceId },
-          os,
-        });
-        seedServerThread(makeThread());
-        const view = await mountServerReview();
-        try {
-          expect(view.review().unavailableReason).toBe(reason);
-          await act(async () => view.review().onStart(SCOPE));
-          if (reason !== null) {
-            expect(commandCallsFor("terminal.open")).toEqual([]);
-          } else {
-            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
-          }
-        } finally {
-          await view.unmount();
-        }
-      },
-    );
+    it.each(["windows", "darwin", "linux"])("offers a Claude Terminal review on %s", async (os) => {
+      seedReviewEnvironment({
+        reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+        os,
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+      } finally {
+        await view.unmount();
+      }
+    });
 
     describe("with a one-off reviewer from the menu (R103)", () => {
       type MenuReviewer = {
@@ -6298,28 +6285,20 @@ describe("ChatView handlers (captured from mocked children)", () => {
         }
       });
 
-      it.each([
-        ["windows", WINDOWS_REASON],
-        ["darwin", null],
-        ["linux", null],
-      ])(
-        "offers the Claude and Codex Terminals on %s only when terminal reviews are on",
-        async (os, reason) => {
+      it.each(["windows", "darwin", "linux"])(
+        "offers the Claude and Codex Terminals on %s",
+        async (os) => {
           seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId }, os });
           seedServerThread(makeThread());
           const view = await mountServerReview();
           try {
-            expect(reviewerByLabel(view, "Claude Terminal").disabledReason).toBe(reason);
-            expect(reviewerByLabel(view, "Codex Terminal").disabledReason).toBe(reason);
+            expect(reviewerByLabel(view, "Claude Terminal").disabledReason).toBeNull();
+            expect(reviewerByLabel(view, "Codex Terminal").disabledReason).toBeNull();
             expect(reviewerByLabel(view, "Codex").disabledReason).toBeNull();
             await act(async () =>
               startWith(view, reviewerByLabel(view, "Claude Terminal").selection),
             );
-            if (reason !== null) {
-              expect(commandCallsFor("terminal.open")).toEqual([]);
-            } else {
-              await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
-            }
+            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
           } finally {
             await view.unmount();
           }

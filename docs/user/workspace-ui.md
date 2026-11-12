@@ -2352,9 +2352,8 @@ review of the checkout the panel shows:
   prompt as its one argument. Like other AI Terminals, it shows the agent's
   Activity. A double click opens one terminal. A prompt longer than 8,192
   characters, or one with a control character other than tab and line breaks,
-  is refused with a reason. Terminal reviews are off on Windows for now: the
-  button and the menu say "Terminal reviews are off on Windows for now. Pick a
-  chat reviewer in Settings → Agents."
+  is refused with a reason. On Windows, line breaks in the prompt become
+  spaces, because a Windows command line cannot carry them.
 - **The prompt** always starts with a fixed line from BiBCode: "Code review
   requested from BiBCode. Do not edit files." followed by the scope and, for a
   branch, the base. The text after it is the project's review prompt, or your

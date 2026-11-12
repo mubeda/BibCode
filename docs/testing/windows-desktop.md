@@ -409,8 +409,9 @@ run them, and a native Windows pass runs the same command:
 node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -j 2 -- review_prompt_shim_
 ```
 
-Terminal reviews stay off on Windows environments until these pass on real
-Windows; record the result in the execution report.
+Terminal reviews are on for Windows environments because these pass on real
+Windows; a failing class means they must go off again. Record the result in the
+execution report.
 
 Two native checks need Git for Windows with its default system LFS filter and
 Git Credential Manager, and go in the execution report:

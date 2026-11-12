@@ -847,28 +847,22 @@ describe("resolveProviderReviewTerminalAction", () => {
     expect(args.indexOf("--dangerously-skip-permissions")).toBe(args.length - 1);
   });
 
-  it("is off on Windows only, with the reason (R98)", () => {
-    expect(WINDOWS_TERMINAL_REVIEWS_ENABLED).toBe(false);
+  it("is on on Windows, with line breaks flattened (R98)", () => {
+    expect(WINDOWS_TERMINAL_REVIEWS_ENABLED).toBe(true);
     for (const target of [claude, codex]) {
-      expect(review(target, { platformOs: "windows" })).toMatchObject({
-        command: null,
-        disabledReason:
-          "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.",
-      });
+      const action = review(target, { prompt: "a\nb\r\nc\rd", platformOs: "windows" });
+      expect(action?.disabledReason).toBeNull();
+      expect(action?.command?.args.at(-1)).toBe("a b c d");
       for (const platformOs of ["darwin", "linux", null]) {
         expect(review(target, { platformOs })?.disabledReason).toBeNull();
       }
     }
   });
 
-  it("flattens line breaks on Windows once enabled, and nowhere else", () => {
+  it("flattens line breaks on Windows only", () => {
     const prompt = "a\nb\r\nc\rd";
-    expect(
-      review(codex, { prompt, platformOs: "windows", windowsEnabled: true })?.command?.args.at(-1),
-    ).toBe("a b c d");
-    expect(
-      review(codex, { prompt, platformOs: "linux", windowsEnabled: true })?.command?.args.at(-1),
-    ).toBe(prompt);
+    expect(review(codex, { prompt, platformOs: "windows" })?.command?.args.at(-1)).toBe("a b c d");
+    expect(review(codex, { prompt, platformOs: "linux" })?.command?.args.at(-1)).toBe(prompt);
   });
 
   it("ends with one-off instructions, flattened only on Windows (R105)", () => {
@@ -883,9 +877,8 @@ describe("resolveProviderReviewTerminalAction", () => {
         /Rules\n\nFocus on the parser\.$/,
       );
     }
-    // Forced on: Windows terminal reviews stay off until Task 12.17.
-    expect(
-      review(claude, { prompt, platformOs: "windows", windowsEnabled: true })?.command?.args.at(-1),
-    ).toMatch(/Rules {2}Focus on the parser\.$/);
+    expect(review(claude, { prompt, platformOs: "windows" })?.command?.args.at(-1)).toMatch(
+      /Rules {2}Focus on the parser\.$/,
+    );
   });
 });

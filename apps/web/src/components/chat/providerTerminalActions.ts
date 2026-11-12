@@ -220,8 +220,8 @@ export function resolveProviderTerminalAction(
   };
 }
 
-// Only Task 12.17 turns this on, once the native Windows batch argument tests run green (D44).
-export const WINDOWS_TERMINAL_REVIEWS_ENABLED = false;
+// On since the native Windows batch argument tests ran green on real Windows (D44, Task 12.17).
+export const WINDOWS_TERMINAL_REVIEWS_ENABLED = true;
 
 /** Read-only flags replace `DEFINITIONS`' bypass flags; other CLIs' read-only flags are unverified. */
 const REVIEW_ARGUMENTS: Partial<Record<ProviderDriverKind, ReadonlyArray<string>>> = {
@@ -259,8 +259,6 @@ export function resolveProviderReviewTerminalAction(
     readonly prompt: string;
     readonly platformOs: string | null;
     readonly modelSelection: ModelSelection | null;
-    /** Test seam for Task 12.17; callers leave it unset. */
-    readonly windowsEnabled?: boolean;
   },
 ): ProviderTerminalActionItem | null {
   const reviewArguments = REVIEW_ARGUMENTS[entry.driverKind];
@@ -274,7 +272,7 @@ export function resolveProviderReviewTerminalAction(
     disabledReason,
   });
   const isWindows = input.platformOs === "windows";
-  if (isWindows && !(input.windowsEnabled ?? WINDOWS_TERMINAL_REVIEWS_ENABLED)) {
+  if (isWindows && !WINDOWS_TERMINAL_REVIEWS_ENABLED) {
     return disabled(WINDOWS_REVIEWS_OFF_REASON);
   }
   // cmd.exe cannot carry a line break inside an argument; the web cannot see whether the
