@@ -88,6 +88,25 @@ describe("CodeReviewInstructionsDialog (R105)", () => {
     expect(button("Start review").disabled).toBe(false);
   });
 
+  it("stays open with the text and shows the reason when the launch refuses them", async () => {
+    onStart.mockReturnValueOnce("These instructions hold a control character.");
+    await renderDialog();
+    await type("Focus on the parser.");
+    await act(async () => button("Start review").click());
+    expect(onStart).toHaveBeenCalledWith("Focus on the parser.");
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("Focus on the parser.");
+    expect(textarea().getAttribute("aria-invalid")).toBe("true");
+    expect(container!.querySelector('[role="alert"]')?.textContent).toBe(
+      "These instructions hold a control character.",
+    );
+    // Editing clears the reason, and the next start goes through.
+    await type("Focus on the parser");
+    expect(container!.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => button("Start review").click());
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("closes without starting on Cancel", async () => {
     await renderDialog();
     await type("Focus on the parser.");

@@ -241,6 +241,17 @@ const REVIEW_PROMPT_CONTROL_REASON =
 // oxlint-disable-next-line no-control-regex -- the point is to find control characters.
 const FORBIDDEN_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
 
+/** The refusal of a terminal review prompt, worded for the one-off instructions that caused it. */
+export function describeInstructionsRefusal(disabledReason: string | null): string | null {
+  if (disabledReason === REVIEW_PROMPT_TOO_LONG_REASON) {
+    return `These instructions make the review prompt longer than ${TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH.toLocaleString("en-US")} characters. Shorten them to start the review.`;
+  }
+  if (disabledReason === REVIEW_PROMPT_CONTROL_REASON) {
+    return "These instructions hold a control character other than tab or a line break. Remove it to start the review.";
+  }
+  return disabledReason;
+}
+
 export function resolveProviderReviewTerminalAction(
   entry: ProviderInstanceEntry,
   settings: ProviderTerminalSettings,

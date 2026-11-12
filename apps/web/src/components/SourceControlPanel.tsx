@@ -165,7 +165,7 @@ interface SourceControlPanelProps {
       scope: CodeReviewScope,
       reviewer?: DefaultAgentSelection,
       instructions?: string,
-    ) => void;
+    ) => string | null | undefined;
     /** The reviewers the review menu offers for one review (R103). */
     readonly reviewers?: ReadonlyArray<CodeReviewMenuReviewer>;
     /** The thread's project, whose review prompt the menu edits; `null` hides the menu. */
@@ -1735,9 +1735,8 @@ export default function SourceControlPanel({
           onOpenChange={setReviewInstructionsOpen}
           onStart={(instructions) => {
             // The scope at Start, as the button reads it at its click.
-            if (!codeReviewButton.disabled && codeReviewScope) {
-              codeReview.onStart(codeReviewScope, undefined, instructions);
-            }
+            if (codeReviewButton.disabled || !codeReviewScope) return null;
+            return codeReview.onStart(codeReviewScope, undefined, instructions);
           }}
         />
       ) : null}

@@ -6398,6 +6398,62 @@ describe("ChatView handlers (captured from mocked children)", () => {
           }
         },
       );
+
+      type StartWith = (scope: typeof SCOPE, reviewer: undefined, extra: string) => unknown;
+      it.each([
+        [
+          "too long",
+          "x".repeat(8_200),
+          "These instructions make the review prompt longer than 8,192 characters. Shorten them to start the review.",
+        ],
+        [
+          "holding a control character",
+          "Look at \u0007 this",
+          "These instructions hold a control character other than tab or a line break. Remove it to start the review.",
+        ],
+      ])(
+        "returns the reason for instructions that are %s, with no toast and no launch",
+        async (_name, instructions, reason) => {
+          seedReviewEnvironment({
+            reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+          });
+          seedServerThread(makeThread());
+          const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+          const view = await mountServerReview();
+          try {
+            let result: unknown;
+            await act(async () => {
+              result = (view.review().onStart as StartWith)(SCOPE, undefined, instructions);
+            });
+            expect(result).toBe(reason);
+            expect(add).not.toHaveBeenCalled();
+            expect(commandCallsFor("terminal.open")).toEqual([]);
+          } finally {
+            add.mockRestore();
+            await view.unmount();
+          }
+        },
+      );
+
+      it("still sends the Settings reason when the saved prompt itself is refused", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+          settings: { codeReviewPrompt: "y".repeat(8_200) },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          let result: unknown;
+          await act(async () => {
+            result = (view.review().onStart as StartWith)(SCOPE, undefined, EXTRA);
+          });
+          expect(result).toBe(
+            "Review prompt is longer than 8,192 characters. Shorten it in Settings → Agents.",
+          );
+        } finally {
+          await view.unmount();
+        }
+      });
     });
 
     describe("from Mod+Alt+Shift+R (R102)", () => {

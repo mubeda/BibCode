@@ -343,6 +343,7 @@ import { MessagesTimeline, type TimelineOlderHistory } from "./chat/MessagesTime
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import {
   type ProviderTerminalAction,
+  describeInstructionsRefusal,
   resolveProviderReviewTerminalAction,
 } from "./chat/providerTerminalActions";
 import { buildProviderAgentActions } from "./chat/providerAgentActions";
@@ -4960,15 +4961,19 @@ function ChatViewContent(props: ChatViewProps) {
   // `selection` is a one-off reviewer from the menu; the saved reviewer stays as saved (R103).
   // `instructions` are added to this review only, in both the chat and the terminal (R105).
   const handleStartCodeReview = useLatestHandler(
-    (scope: CodeReviewScope, selection?: DefaultAgentSelection, instructions?: string) => {
+    (
+      scope: CodeReviewScope,
+      selection?: DefaultAgentSelection,
+      instructions?: string,
+    ): string | null => {
       const resolved =
         selection === undefined
           ? savedCodeReviewer
           : resolveSavedCodeReviewer(codeReviewAgentActions, selection, providerInstanceEntries);
       const reviewer = resolved.action;
-      if (reviewer === null) return;
-      if ((codeReviewEnvironmentReason ?? codeReviewerReason(resolved)) !== null) return;
-      if (!activeThread || !centerPanelLaunchContext) return;
+      if (reviewer === null) return null;
+      if ((codeReviewEnvironmentReason ?? codeReviewerReason(resolved)) !== null) return null;
+      if (!activeThread || !centerPanelLaunchContext) return null;
       const { entry } = reviewer;
       const prompt = resolveCodeReviewPrompt({
         project: activeProject?.codeReviewPrompt ?? "",
@@ -4987,24 +4992,40 @@ function ChatViewContent(props: ChatViewProps) {
           modelSelection,
         });
         if (action === null || action.command === null) {
+          const reason = action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON;
+          if (instructions !== undefined) {
+            // Give the reason back to the instructions dialog, which stays open with the text,
+            // instead of closing it on a toast. When the prompt is refused even without the
+            // instructions, the reason is the saved prompt's and still points at Settings.
+            const withoutInstructions = resolveProviderReviewTerminalAction(entry, settings, {
+              prompt: resolveCodeReviewPrompt({
+                project: activeProject?.codeReviewPrompt ?? "",
+                user: settings.codeReviewPrompt,
+                scope,
+              }),
+              platformOs: codeReviewPlatformOs,
+              modelSelection,
+            });
+            return withoutInstructions?.command ? describeInstructionsRefusal(reason) : reason;
+          }
           toastManager.add(
             stackedThreadToast({
               type: "error",
               title: CODE_REVIEW_SEND_FAILED_TITLE,
-              description: action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON,
+              description: reason,
             }),
           );
-          return;
+          return null;
         }
         // Terminal ids are distinct per open, so only this guard stops a double click (as chat
         // reviews are guarded in centerPanelActions); it is released however the open settles.
         const hostKey = `${activeThread.environmentId}:${activeThread.hostThreadId ?? activeThread.id}`;
-        if (pendingTerminalReviewHosts.has(hostKey)) return;
+        if (pendingTerminalReviewHosts.has(hostKey)) return null;
         pendingTerminalReviewHosts.add(hostKey);
         void handleOpenProviderTerminalPanel(action).finally(() =>
           pendingTerminalReviewHosts.delete(hostKey),
         );
-        return;
+        return null;
       }
       const resolution = resolveProviderSessionDefault({
         driver: entry.driverKind,
@@ -5029,6 +5050,7 @@ function ChatViewContent(props: ChatViewProps) {
         ...resolveCodeReviewChatModes(entry.driverKind),
         codeReview: true,
       });
+      return null;
     },
   );
   // The shortcut does what the button would do now, from the status the header already reads

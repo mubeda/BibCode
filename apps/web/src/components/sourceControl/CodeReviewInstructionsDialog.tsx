@@ -19,7 +19,8 @@ const TOO_LONG = `Instructions are longer than ${MAX_LABEL} characters. Shorten 
 export interface CodeReviewInstructionsDialogProps {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
-  readonly onStart: (instructions: string) => void;
+  /** A reason the launch refused them: the dialog stays open, with the text, and shows it. */
+  readonly onStart: (instructions: string) => string | null | undefined;
 }
 
 /** Adds instructions to one review only (R105); nothing is saved. */
@@ -34,10 +35,12 @@ export function CodeReviewInstructionsDialog(props: CodeReviewInstructionsDialog
 
 function InstructionsForm({ onOpenChange, onStart }: CodeReviewInstructionsDialogProps) {
   const [text, setText] = useState("");
+  const [refusal, setRefusal] = useState<string | null>(null);
   const fieldId = useId();
   const errorId = useId();
   // Over-long text stays in the field so a paste is not cut silently.
   const tooLong = text.length > CODE_REVIEW_INSTRUCTIONS_MAX_LENGTH;
+  const problem = tooLong ? TOO_LONG : refusal;
 
   return (
     <DialogPopup className="max-w-xl">
@@ -54,15 +57,18 @@ function InstructionsForm({ onOpenChange, onStart }: CodeReviewInstructionsDialo
         <Textarea
           id={fieldId}
           value={text}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => {
+            setText(event.target.value);
+            setRefusal(null);
+          }}
           rows={6}
-          aria-invalid={tooLong}
-          aria-describedby={tooLong ? errorId : undefined}
+          aria-invalid={problem !== null}
+          aria-describedby={problem !== null ? errorId : undefined}
         />
         <div className="flex justify-between gap-2 text-xs text-muted-foreground">
-          {tooLong ? (
+          {problem !== null ? (
             <span id={errorId} className="text-destructive" role="alert">
-              {TOO_LONG}
+              {problem}
             </span>
           ) : (
             <span />
@@ -81,8 +87,9 @@ function InstructionsForm({ onOpenChange, onStart }: CodeReviewInstructionsDialo
           disabled={tooLong}
           onClick={() => {
             if (tooLong) return;
-            onStart(text);
-            onOpenChange(false);
+            const reason = onStart(text);
+            if (reason) setRefusal(reason);
+            else onOpenChange(false);
           }}
         >
           Start review
