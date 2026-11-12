@@ -29,10 +29,11 @@ function eventChangesMetadata(event: TerminalAttachStreamEvent): boolean {
 export function projectTerminalMetadataStream<E, R>(
   events: Stream.Stream<TerminalAttachStreamEvent, E, R>,
   runtime: TerminalTranscriptRuntime,
+  sizeClaim?: string,
 ): Stream.Stream<TerminalMetadataSnapshot, E, R> {
   return Stream.suspend(() => {
     // One identity per run of the stream: the runtime orders events across streams by it.
-    const source = {};
+    const source = sizeClaim === undefined ? {} : { sizeClaim };
     return events.pipe(
       Stream.filterMap((event) => {
         runtime.ingest(event, source);
@@ -90,12 +91,13 @@ export function acquireTerminalMetadataStream<E, R>(
   events: Stream.Stream<TerminalAttachStreamEvent, E, R>,
   registry: TerminalTranscriptRuntimeRegistry,
   key: string,
+  sizeClaim?: string,
 ): Stream.Stream<TerminalMetadataSnapshot, E, R> {
   return Stream.unwrap(
     Effect.acquireRelease(
       Effect.sync(() => registry.acquire(key)),
       () => Effect.sync(() => registry.release(key)),
-    ).pipe(Effect.map((runtime) => projectTerminalMetadataStream(events, runtime))),
+    ).pipe(Effect.map((runtime) => projectTerminalMetadataStream(events, runtime, sizeClaim))),
   );
 }
 

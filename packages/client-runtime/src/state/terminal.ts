@@ -179,6 +179,7 @@ export function createTerminalEnvironmentAtoms<R, E>(
             ),
             transcriptRuntimes,
             runtimeKey,
+            target.input.sizeClaim,
           ).pipe(
             Stream.tap((metadata) =>
               Effect.sync(() => {
