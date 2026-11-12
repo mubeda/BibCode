@@ -29,6 +29,7 @@ import type { TerminalThemeMode } from "./terminalTheme";
 
 interface FakeTerminalInstance {
   readonly options: Record<string, unknown>;
+  readonly element: HTMLElement | undefined;
   readonly modes: {
     mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any";
     bracketedPasteMode: boolean;
@@ -7773,6 +7774,17 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       owner: "this window",
       notice: false,
     });
+  });
+
+  it("leaves a released size alone while the mirror is hidden and claims it once shown", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    await setWindowVisible(client, false);
+    const requests = testState.resizeCommand.mock.calls.length;
+    await disconnect(host);
+    expect(server.size()).toEqual({ cols: 120, rows: 50, sizeClaim: null });
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    await setWindowVisible(client, true);
+    expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
   });
 
   it("converges on one owner when two windows race for a released size", async () => {

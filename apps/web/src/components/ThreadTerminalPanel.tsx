@@ -98,6 +98,7 @@ import {
   terminalSizesEqual,
   hasForeignTerminalSizeOwner,
   shouldShowTerminalSizeNotice,
+  terminalMirrorScale,
   type TerminalDimensions,
   type TerminalSizeTrigger,
 } from "./terminalSizePolicy";
@@ -896,7 +897,8 @@ export function TerminalViewport({
     rendererAttachmentInput.sizeOwnership === sizeOwnership
       ? rendererAttachmentInput
       : null;
-  const [mirroringSize, setMirroringSize] = useState(false);
+  // The size notice's scale (1 when the owner's grid fits unscaled), or null while hidden.
+  const [mirroringSize, setMirroringSize] = useState<number | null>(null);
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
@@ -1403,11 +1405,32 @@ export function TerminalViewport({
       sizeOwnership,
       dimensions: fittedDimensions,
     });
-    let mirroringSizeVisible = false;
-    const updateMirroringSize = (next: boolean) => {
+    let mirroringSizeVisible: number | null = null;
+    const updateMirroringSize = (next: number | null) => {
       if (mirroringSizeVisible === next) return;
       mirroringSizeVisible = next;
       setMirroringSize(next);
+    };
+    let mirrorScale = 1;
+    // A mirror never clips the owner's grid: it scales the whole xterm element down, which
+    // keeps the grid's cells and both renderers intact. Negative margins give the scaled
+    // element its scaled layout size, so below the floor the box scrolls to the bottom rows.
+    const applyMirrorScale = (fitted: TerminalDimensions | null) => {
+      const element = terminal.element;
+      if (!element) return;
+      const scale = sizeOwnership ? terminalMirrorScale(sizeClaim, appliedSize, fitted) : 1;
+      const overflows =
+        scale < 1 &&
+        appliedSize !== null &&
+        fitted !== null &&
+        (appliedSize.rows * scale > fitted.rows || appliedSize.cols * scale > fitted.cols);
+      mirrorScale = scale;
+      element.style.transformOrigin = scale < 1 ? "0 0" : "";
+      element.style.transform = scale < 1 ? `scale(${scale})` : "";
+      element.style.marginRight = scale < 1 ? `${(scale - 1) * element.offsetWidth}px` : "";
+      element.style.marginBottom = scale < 1 ? `${(scale - 1) * element.offsetHeight}px` : "";
+      mount.style.overflow = overflows ? "auto" : "";
+      if (overflows) mount.scrollTop = mount.scrollHeight;
     };
     let appliedSize: TerminalSize | null = null;
     let claimInFlight: TerminalSize | null = null;
@@ -1499,6 +1522,7 @@ export function TerminalViewport({
       () => oscColorResponderActive,
     );
     const updateSizeNotice = (fitted = updateFittedDimensions()) => {
+      applyMirrorScale(fitted);
       updateMirroringSize(
         !dismissedTerminalSizes.has(terminalTargetKey) &&
           !claimNoticeSuppressed &&
@@ -1508,7 +1532,9 @@ export function TerminalViewport({
             applied: appliedSize,
             fitted,
             claimInFlight: claimInFlight !== null,
-          }),
+          })
+          ? mirrorScale
+          : null,
       );
     };
     // The server answers a claim for the size and owner it already holds with success and no
@@ -1557,6 +1583,8 @@ export function TerminalViewport({
           fitted,
           trigger,
           documentFocused: document.hasFocus(),
+          // Engines without the API keep the earlier focus-only rule.
+          userActive: navigator.userActivation?.isActive ?? true,
           claimInFlight: claimInFlight !== null,
         });
       // Typing measures at most once per frame; other keydowns in that frame reuse the fit.
@@ -1987,6 +2015,12 @@ export function TerminalViewport({
     };
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
+      // xterm maps a click to a cell at full size, so a scaled mirror's first click only
+      // takes the size (its pointerdown did) and never lands on the wrong cell or TUI button.
+      if (mirrorScale < 1 && event.button === 0) {
+        event.stopPropagation();
+        return;
+      }
       const tracking = terminal.modes.mouseTrackingMode !== "none";
       if (tracking && event.button === 2 && terminal.hasSelection()) {
         Object.defineProperty(event, forceSelectionKey, { value: true });
@@ -2122,7 +2156,7 @@ export function TerminalViewport({
     return () => {
       if (disposed) return;
       disposed = true;
-      updateMirroringSize(false);
+      updateMirroringSize(null);
 
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
@@ -2568,9 +2602,12 @@ export function TerminalViewport({
         className="min-h-0 w-full flex-1 overflow-hidden"
         data-terminal-xterm-mount={terminalId}
       />
-      {shouldRender && sizeOwnership && mirroringSize ? (
-        <div className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
-          <span>Sized for another window.</span>
+      {shouldRender && sizeOwnership && mirroringSize !== null ? (
+        <div className="absolute top-2 right-2 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md">
+          <span>
+            Sized for another window.
+            {mirroringSize < 1 ? ` Shown at ${Math.round(mirroringSize * 100)}%.` : ""}
+          </span>
           <Button
             type="button"
             size="xs"
