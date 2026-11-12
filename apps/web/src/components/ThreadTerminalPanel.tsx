@@ -1867,7 +1867,7 @@ export function TerminalViewport({
           declinedRequest = null;
           layoutChangedWhileClaimPending = false;
           claimNoticeSuppressed = false;
-          // A restart's process has no owner: some window must size it.
+          // A restart ends a pending hand-over: the size the event carries says who owns it now.
           unownedUntilUsed = false;
         }
         oscColorResponderActive = signal.oscColorResponderActive ?? false;

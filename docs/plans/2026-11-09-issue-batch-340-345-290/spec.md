@@ -1940,7 +1940,7 @@ WHEN the window that sizes the terminal leaves, the server SHALL hand the size t
 
 #### Scenario: an un-owned size waits for use
 
-- GIVEN three windows, the owner and two idle ones
+- GIVEN four windows, the owner and three idle ones
 - WHEN the owner leaves and one idle window reloads
 - THEN the size is un-owned, the reloaded window shows the whole grid, and exactly one window answers a terminal query
 
