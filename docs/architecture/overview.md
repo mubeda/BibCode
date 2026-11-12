@@ -1512,8 +1512,10 @@ than the owner's grid scales the xterm element with a CSS transform by
 `min(fit cols / cols, fit rows / rows)`, its fit measured at full size, so the
 whole grid stays visible and the claimable fit is unaffected; it never scales
 up. The floor is 0.5: below it the mount scrolls and is pinned to the bottom
-rows. xterm maps clicks to cells at full size, so a scaled mirror's first
-primary mousedown only claims (its pointerdown) and does not reach xterm. Only a
+rows, with a negative bottom margin giving the element its scaled scroll
+height. xterm maps the mouse to cells at full size, so a scaled element has
+`pointer-events: none`: clicks, hover, wheel and mouse reports reach the mount,
+whose pointerdown claims, and never xterm's cells. Only a
 different-size mirror shows **Sized for another window** (with the scale when
 below 100%) and fit and dismiss actions. Manual
 dismissal is retained by terminal identity and applied dimensions/owner across

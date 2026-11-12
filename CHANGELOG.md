@@ -36,7 +36,7 @@
 - A terminal laid out with no width or height, such as a center terminal behind a maximized right panel, keeps its size instead of resizing its program to 2 columns or 1 row. (#348)
 - A terminal refits when the display scale changes, for example after moving the window to another display, so a bottom row clipped by the new scale's row height no longer stays cut off until a panel is resized. (#348)
 - When resizing a terminal's program fails, BiBCode retries it a few times, so the program no longer keeps its old size, with its bottom rows cut off, until the next panel resize or keypress. (#348)
-- When two windows, for example on two machines, show the same terminal, the window you last used sizes it and the other one shows the whole terminal scaled down to fit instead of cutting off its bottom rows; a window nobody is using, such as a locked server host, no longer takes the size back when it regains focus. (#348)
+- When two windows, for example on two machines, show the same terminal, the window you last used sizes it and the other one shows the whole terminal scaled down to fit instead of cutting off its bottom rows; a window nobody is clicking or typing in, such as an idle server host window, no longer takes the size back when it regains focus, where its web view reports recent input. (#348)
 
 ## [v0.15.3] - 2026-11-08
 

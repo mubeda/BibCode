@@ -610,8 +610,9 @@ half size it keeps the bottom rows in view and scrolls for the rest. If it has
 more room, it shows the terminal at normal size with empty space around it.
 The first click in a scaled window takes the size and returns it to normal
 size; it is not passed to the program. A window that regains focus without
-anyone using it, such as a server host window after its screen unlocks, does
-not take the size. When the window that sized the terminal closes or
+anyone clicking or typing in it, such as a server host window after its display
+wakes, does not take the size, where its web view reports recent input (Safari
+16.4 and later on macOS); elsewhere a focused window still takes it. When the window that sized the terminal closes or
 disconnects, the other window takes the size.
 
 Only the focused center pane may programmatically focus its terminal. Moving

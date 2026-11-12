@@ -1413,12 +1413,15 @@ export function TerminalViewport({
     };
     let mirrorScale = 1;
     // A mirror never clips the owner's grid: it scales the whole xterm element down, which
-    // keeps the grid's cells and both renderers intact. Negative margins give the scaled
-    // element its scaled layout size, so below the floor the box scrolls to the bottom rows.
+    // keeps the grid's cells and both renderers intact. A negative bottom margin gives the
+    // element its scaled height for scrolling, so below the floor the box scrolls from the
+    // bottom rows. xterm maps the mouse to cells at full size, so a scaled mirror takes no
+    // pointer input itself: a click reaches the mount, whose pointerdown takes the size.
     const applyMirrorScale = (fitted: TerminalDimensions | null) => {
       const element = terminal.element;
       if (!element) return;
       const scale = sizeOwnership ? terminalMirrorScale(sizeClaim, appliedSize, fitted) : 1;
+      if (scale === 1 && mirrorScale === 1) return;
       const overflows =
         scale < 1 &&
         appliedSize !== null &&
@@ -1427,8 +1430,8 @@ export function TerminalViewport({
       mirrorScale = scale;
       element.style.transformOrigin = scale < 1 ? "0 0" : "";
       element.style.transform = scale < 1 ? `scale(${scale})` : "";
-      element.style.marginRight = scale < 1 ? `${(scale - 1) * element.offsetWidth}px` : "";
       element.style.marginBottom = scale < 1 ? `${(scale - 1) * element.offsetHeight}px` : "";
+      element.style.pointerEvents = scale < 1 ? "none" : "";
       mount.style.overflow = overflows ? "auto" : "";
       if (overflows) mount.scrollTop = mount.scrollHeight;
     };
@@ -2015,12 +2018,6 @@ export function TerminalViewport({
     };
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
-      // xterm maps a click to a cell at full size, so a scaled mirror's first click only
-      // takes the size (its pointerdown did) and never lands on the wrong cell or TUI button.
-      if (mirrorScale < 1 && event.button === 0) {
-        event.stopPropagation();
-        return;
-      }
       const tracking = terminal.modes.mouseTrackingMode !== "none";
       if (tracking && event.button === 2 && terminal.hasSelection()) {
         Object.defineProperty(event, forceSelectionKey, { value: true });
@@ -2603,7 +2600,7 @@ export function TerminalViewport({
         data-terminal-xterm-mount={terminalId}
       />
       {shouldRender && sizeOwnership && mirroringSize !== null ? (
-        <div className="absolute top-2 right-2 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md">
+        <div className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
           <span>
             Sized for another window.
             {mirroringSize < 1 ? ` Shown at ${Math.round(mirroringSize * 100)}%.` : ""}
