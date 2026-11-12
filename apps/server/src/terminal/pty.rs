@@ -1429,8 +1429,7 @@ fn resume_reserved_unix_process_group(
     if *ownership == UnixProcessGroupOwnership::Released {
         return Ok(false);
     }
-    let _ = (signal, process_group); // stub: the fix commit sends the signal (#348)
-    Ok(false)
+    signal(process_group)
 }
 
 /// `SIGCONT` to the whole group. `Ok(false)` when no member is left to receive it.

@@ -4603,8 +4603,7 @@ fn resume_after_lossy_attach(
     process: &dyn PtyProcess,
     reason: LossyReplay,
 ) {
-    let _ = process; // stub: the fix commit sends the signal (#348)
-    match Ok::<bool, String>(false) {
+    match process.resume() {
         Ok(sent) => tracing::debug!(
             thread_id,
             terminal_id,

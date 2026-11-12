@@ -40,6 +40,7 @@
 
 ### Terminals
 
+- When you return to a Claude AI Terminal on a macOS or Linux server after it printed more than BiBCode keeps for a redraw (1 MiB or 5,000 lines, or 512 KiB in the client), BiBCode asks Claude to redraw its screen, the way it does when resumed, so characters missing from the replay come back. This is a best-effort repaint for Claude terminals BiBCode starts, not a rebuild of the terminal's state; other programs and Windows servers still need a panel resize, and a Claude session you suspended in that terminal resumes. (#348)
 - A terminal that kept an old row count, so an AI CLI lost its bottom lines or footer until you changed the panel's width, now corrects itself: the server confirms each size in order with the output, a size it did not apply never resizes the view, and a window whose connection dropped gets the terminal's size back when it reconnects, unless someone typed in the other window meanwhile. (#348)
 - A terminal laid out with no width or height, such as a center terminal behind a maximized right panel, keeps its size instead of resizing its program to 2 columns or 1 row. (#348)
 - A terminal refits when the display scale changes, for example after moving the window to another display, so a bottom row clipped by the new scale's row height no longer stays cut off until a panel is resized. (#348)

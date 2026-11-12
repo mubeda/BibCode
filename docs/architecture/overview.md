@@ -1466,6 +1466,33 @@ After a restart, or one that may have been among the lost events, it is a
 plain `snapshot`, handled as a new attachment. Clients that predate the flag
 handle every resync that way.
 
+An attach replays the raw history tail (1 MiB or 5,000 lines), and a released
+client keeps at most 512 KiB of it (`DEFAULT_MAX_TERMINAL_BUFFER_BYTES`, pinned
+against the server's copy by a test in `terminal/history.rs`). Once a
+program's last full paint has left that tail, the rebuilt screen lacks cells,
+the alternate buffer and the modes, and a program that repaints by cell diff
+shows missing characters until its size changes (#348). As best-effort repaint
+recovery for Claude terminals that BiBCode starts, after a lossy replay, and not
+terminal-state reconstruction: on Unix, when an attach builds its snapshot for
+a running session launched with activity driver `claudeAgent` and the history
+has a discarded prefix (eviction or `terminal.clear`, O(1) from its counters)
+or retains more than 512 KiB, the manager sends `SIGCONT` once to the
+session's own process group, right after the snapshot and its sequence are
+fixed. On Unix the provider executable is the PTY root, its own session and
+group leader. The Claude CLI handles `SIGCONT` by re-entering its alternate
+screen, re-asserting its modes and painting a full frame, which arrives as
+ordinary output after the replay, for every viewer. The signal goes only to the
+group the waiter keeps reserved until it reaps the root, never a foreground
+group; it does not consume that reservation, so close still kills the group,
+and a group being closed is skipped. A Claude session suspended in its own AI
+Terminal resumes when a window re-attaches after a lossy history. Each lossy
+attach sends one signal with no cooldown; the client re-attaches on a remount
+or a reconnect, not on a timer. History reads, MCP reads and lag resyncs send
+none, so a viewer that falls behind until the repaint leaves the history stays
+damaged until its next attach. Other programs and Windows servers are not
+helped; the lasting fix is a server-side screen state. Each signal is a
+`tracing` debug line with the session and reason, and a failed one a warning.
+
 Resize requests publish `resized { size }` after the PTY accepts the size,
 before subsequent output can publish. Claim-only changes publish; an exact
 no-op with a registered claim publishes `resized` to that claim's attachment

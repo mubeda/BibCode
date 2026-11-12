@@ -532,6 +532,12 @@ keystrokes. Check the prompt before typing again. With an updated client and
 server, normal typing no longer waits for each preceding write's reply;
 network latency still affects when remote output appears.
 
+A full-screen program you return to after long output can show missing
+characters, because a terminal is redrawn from its last 1 MiB or 5,000 lines;
+a Claude AI Terminal on a macOS or Linux server is then asked to redraw (and a
+Claude session suspended in it resumes). Other programs, and terminals on a
+Windows server, still need a panel resize.
+
 The active thread's main chat starts as the first center tab. It can be reordered,
 moved between split panes, or closed from the center layout without deleting the
 thread. While present, it remains mounted throughout layout and tab changes. The
