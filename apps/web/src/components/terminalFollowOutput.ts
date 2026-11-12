@@ -1,6 +1,6 @@
 import type { IDisposable, Terminal } from "@xterm/xterm";
 
-type FollowedTerminal = Pick<Terminal, "buffer" | "onRender" | "scrollToBottom">;
+type FollowedTerminal = Pick<Terminal, "buffer" | "onRender" | "scrollLines" | "scrollToBottom">;
 
 export interface TerminalFollowOutputOptions {
   /**
@@ -48,7 +48,15 @@ export function createTerminalFollowOutput(
     if (disposed || paused || followed === null) return;
     // The alternate screen has no scrollback; the normal buffer is repaired when it returns.
     if (terminal.buffer.active.type !== "normal") return;
-    if (followed && !normalAtBottom()) terminal.scrollToBottom();
+    if (followed && !normalAtBottom()) {
+      terminal.scrollToBottom();
+      // xterm's scroll area can keep the paused height until its next sync, which clamps the
+      // scroll short of the bottom; a one-row scroll syncs it, then the bottom is reachable.
+      if (!normalAtBottom()) {
+        terminal.scrollLines(-1);
+        terminal.scrollToBottom();
+      }
+    }
     followed = null;
   };
   // Outside xterm's own scroll handling, which ignores a scroll requested inside it.

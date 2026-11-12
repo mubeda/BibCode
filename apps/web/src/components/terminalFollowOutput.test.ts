@@ -18,11 +18,14 @@ function harness() {
   const terminal = new Terminal({ cols: 46, rows: 43, scrollback: 5000, allowProposedApi: true });
   let setDrawing: (drawing: boolean) => void = () => undefined;
   let frames: Array<() => void> = [];
+  /** Bottom scrolls that xterm's stale scroll area clamps short (they move nothing here). */
+  let stuckScrolls = 0;
   const renders = new Set<() => void>();
   const follow = createTerminalFollowOutput(
     {
       buffer: terminal.buffer,
-      scrollToBottom: () => terminal.scrollToBottom(),
+      scrollLines: (amount) => terminal.scrollLines(amount),
+      scrollToBottom: () => (stuckScrolls > 0 ? (stuckScrolls -= 1) : terminal.scrollToBottom()),
       onRender: (listener) => {
         const callback = () => listener({ start: 0, end: terminal.rows - 1 });
         renders.add(callback);
@@ -56,6 +59,9 @@ function harness() {
     runFrames,
     /** What xterm 6's paused viewport does after a row shrink: moves the view up by itself. */
     clamp: (rows: number) => terminal.scrollLines(-rows),
+    clampNextBottomScroll: () => {
+      stuckScrolls = 1;
+    },
     position: () => [terminal.buffer.normal.viewportY, terminal.buffer.normal.baseY],
   };
 }
@@ -92,6 +98,17 @@ describe("terminal follow output across a paused renderer (#348)", () => {
     const [viewportY, bottom] = test.position();
     expect(viewportY).toBe(bottom);
     expect(test.follow.atBottom()).toBe(true);
+  });
+
+  it("syncs a scroll area still clamped to the paused height, then reaches the bottom", async () => {
+    const test = await setUp();
+    test.pause();
+    test.clamp(18);
+    test.resume();
+    test.clampNextBottomScroll();
+    test.render();
+    await tick();
+    expect(test.position()[0]).toBe(test.position()[1]);
   });
 
   it("repairs after two frames when the resumed renderer draws nothing", async () => {
