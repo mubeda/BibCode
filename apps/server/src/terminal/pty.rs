@@ -1419,9 +1419,26 @@ fn close_unix_process_group(
     kill_group: fn(i32) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     kill_reserved_unix_process_group(process_group, ownership, kill_group, || {
-        matches!(probe_unix_child_exit_without_reaping(root_pid), Ok(true))
+        // macOS refuses the kill of a dying group before its root is waitable (a probe saw
+        // it in nearly every one of 3,000 quick exits, waitable within 3 ms), so wait for it.
+        // shortcut: blocks the caller's thread up to the close timeout when the root really
+        // runs; move the kill to a blocking task if that case ever matters.
+        let deadline = std::time::Instant::now() + CLOSE_ROOT_EXIT_WAIT;
+        loop {
+            match probe_unix_child_exit_without_reaping(root_pid) {
+                Ok(true) => return true,
+                Ok(false) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => return false,
+            }
+        }
     })
 }
+
+/// How long a refused close waits for the root to become waitable: the manager's close wait.
+#[cfg(unix)]
+const CLOSE_ROOT_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 /// Waits for the child to exit without reaping it, and returns its exit status.
 #[cfg(unix)]
@@ -2050,6 +2067,25 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             UnixProcessGroupOwnership::Released
         );
+        assert_eq!(root.wait().expect("root still waitable").code(), Some(7));
+    }
+
+    /// macOS refuses the kill of a dying group a moment before its root becomes waitable: a
+    /// close that lands then waits for the root instead of failing (#348 flake).
+    #[cfg(unix)]
+    #[test]
+    fn close_waits_for_a_dying_root_whose_group_kill_is_refused() {
+        fn refused(_: i32) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+        let mut root = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn root");
+        let pid = root.id();
+        let ownership = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        close_unix_process_group(pid as i32, &ownership, pid, refused)
+            .expect("the root becomes waitable within the close's wait");
         assert_eq!(root.wait().expect("root still waitable").code(), Some(7));
     }
 
