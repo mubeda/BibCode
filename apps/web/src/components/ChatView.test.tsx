@@ -6197,6 +6197,136 @@ describe("ChatView handlers (captured from mocked children)", () => {
       },
     );
 
+    describe("with a one-off reviewer from the menu (R103)", () => {
+      type MenuReviewer = {
+        readonly label: string;
+        readonly selection: { kind: "chat" | "terminal"; instanceId: ProviderInstanceId };
+        readonly guardLine: string | null;
+        readonly disabledReason: string | null;
+      };
+      const reviewers = (view: { review: () => ReviewProp }) =>
+        (view.review() as ReviewProp & { reviewers: ReadonlyArray<MenuReviewer> }).reviewers;
+      const reviewerByLabel = (view: { review: () => ReviewProp }, label: string) =>
+        reviewers(view).find((reviewer) => reviewer.label === label)!;
+      const startWith = (
+        view: { review: () => ReviewProp },
+        selection: MenuReviewer["selection"],
+      ) =>
+        (view.review().onStart as (scope: typeof SCOPE, reviewer: typeof selection) => void)(
+          SCOPE,
+          selection,
+        );
+
+      it("opens a Claude review terminal and leaves the saved chat Codex reviewer alone", async () => {
+        const saved = { kind: "chat" as const, instanceId: codexInstanceId };
+        seedReviewEnvironment({ reviewer: saved });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          expect(reviewers(view).map((reviewer) => reviewer.label)).toEqual([
+            "Codex",
+            "Claude",
+            "Codex Terminal",
+            "Claude Terminal",
+          ]);
+          const claudeTerminal = reviewerByLabel(view, "Claude Terminal");
+          expect(claudeTerminal).toMatchObject({
+            selection: { kind: "terminal", instanceId: claudeInstanceId },
+            guardLine: "Starts in Claude's plan mode.",
+            disabledReason: null,
+          });
+          await act(async () => startWith(view, claudeTerminal.selection));
+          await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+          const opened = commandCallsFor("terminal.open")[0]!.input as {
+            input: { command: { executable: string; args: string[] } };
+          };
+          expect(opened.input.command.executable).toBe("claude");
+          expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(h.commandCalls.filter((call) => /settings/i.test(call.key))).toEqual([]);
+          expect(h.settings["codeReviewAgent"]).toEqual(saved);
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it("starts a one-off chat reviewer while the saved reviewer is unavailable", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: claudeInstanceId },
+          settings: {
+            providers: {
+              ...DEFAULT_SERVER_SETTINGS.providers,
+              claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
+            },
+          },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          expect(view.review().unavailableReason).toBe(
+            "Claude is not available. Change the code review agent in Settings → Agents.",
+          );
+          const codex = reviewerByLabel(view, "Codex");
+          expect(codex.disabledReason).toBeNull();
+          await act(async () => startWith(view, codex.selection));
+          await vi.waitFor(() => expect(commandCallsFor("worktree.createPanel")).toHaveLength(1));
+          expect(commandCallsFor("worktree.createPanel")[0]!.input).toMatchObject({
+            input: { title: "Panel: Code review · Codex", codeReview: true },
+          });
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it.each([
+        ["windows", WINDOWS_REASON],
+        ["darwin", null],
+        ["linux", null],
+      ])(
+        "offers the Claude and Codex Terminals on %s only when terminal reviews are on",
+        async (os, reason) => {
+          seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId }, os });
+          seedServerThread(makeThread());
+          const view = await mountServerReview();
+          try {
+            expect(reviewerByLabel(view, "Claude Terminal").disabledReason).toBe(reason);
+            expect(reviewerByLabel(view, "Codex Terminal").disabledReason).toBe(reason);
+            expect(reviewerByLabel(view, "Codex").disabledReason).toBeNull();
+            await act(async () =>
+              startWith(view, reviewerByLabel(view, "Claude Terminal").selection),
+            );
+            if (reason !== null) {
+              expect(commandCallsFor("terminal.open")).toEqual([]);
+            } else {
+              await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+            }
+          } finally {
+            await view.unmount();
+          }
+        },
+      );
+
+      it("gives every reviewer the environment's reason on a server without code reviews", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          codeReviews: false,
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          for (const reviewer of reviewers(view)) {
+            expect(reviewer.disabledReason).toBe(
+              "Update the BiBCode server on this environment to use Review.",
+            );
+          }
+          await act(async () => startWith(view, reviewerByLabel(view, "Codex").selection));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        } finally {
+          await view.unmount();
+        }
+      });
+    });
+
     describe("from Mod+Alt+Shift+R (R102)", () => {
       const isMac = () => navigator.platform.toLowerCase().includes("mac");
       const shortcut = () =>

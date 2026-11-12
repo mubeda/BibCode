@@ -488,6 +488,8 @@ vi.mock("~/components/ui/menu", () => ({
   ),
   MenuPopup: (props: { children?: unknown }) => <div>{props.children as never}</div>,
   MenuSeparator: () => <hr data-testid="menu-separator" />,
+  MenuGroup: (props: { children?: unknown }) => <div>{props.children as never}</div>,
+  MenuGroupLabel: (props: { children?: unknown }) => <div>{props.children as never}</div>,
   MenuItem: (props: CapturedMenuItemProps) => {
     captured.menuItems.push(props);
     return (
@@ -1218,6 +1220,76 @@ describe("SourceControlPanel", () => {
       const item = menuItemByText("Review prompt for this project…");
       expect(item?.disabled).toBe(true);
       expect(item?.title).toBe("Update the BiBCode server on this environment to use Review.");
+    });
+
+    describe("one-off reviewers in the review menu (R103)", () => {
+      const WINDOWS_REASON =
+        "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.";
+      const CLAUDE_TERMINAL = { kind: "terminal", instanceId: "claudeAgent" } as never;
+      const CODEX_TERMINAL = { kind: "terminal", instanceId: "codex" } as never;
+      const reviewerProps = (onStart = vi.fn()) =>
+        buildProps({
+          codeReview: {
+            unavailableReason: null,
+            guardLine: GUARD,
+            onStart,
+            projectId: "project-1" as never,
+            projectPrompt: "",
+            userPrompt: "",
+            reviewers: [
+              {
+                value: "terminal:claudeAgent",
+                label: "Claude Terminal",
+                selection: CLAUDE_TERMINAL,
+                guardLine: GUARD,
+                disabledReason: null,
+              },
+              {
+                value: "terminal:codex",
+                label: "Codex Terminal",
+                selection: CODEX_TERMINAL,
+                guardLine: "Runs in Codex's read-only sandbox.",
+                disabledReason: WINDOWS_REASON,
+              },
+            ],
+          },
+        });
+
+      it("lists each reviewer with its guard line and starts the picked one", () => {
+        testState.statusQuery.data = stagingStatus({ defaultRefName: "main" });
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Claude Terminal");
+        expect(item?.disabled).toBe(false);
+        expect(flattenText(item?.children)).toContain(GUARD);
+        item!.onClick!();
+        expect(onStart).toHaveBeenCalledWith(
+          { kind: "uncommitted", base: "origin/main" },
+          CLAUDE_TERMINAL,
+        );
+      });
+
+      it("shows a disabled reviewer's reason in place of its guard line and starts nothing", () => {
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Codex Terminal");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain(WINDOWS_REASON);
+        expect(flattenText(item?.children)).not.toContain("read-only sandbox");
+        item!.onClick?.();
+        expect(onStart).not.toHaveBeenCalled();
+      });
+
+      it("disables every reviewer with the reason while there is nothing to review", () => {
+        testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 0 });
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Claude Terminal");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain("No changes to review");
+        item!.onClick?.();
+        expect(onStart).not.toHaveBeenCalled();
+      });
     });
 
     it("shows the unavailable reason first", () => {
