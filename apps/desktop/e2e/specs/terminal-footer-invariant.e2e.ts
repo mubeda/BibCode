@@ -3,15 +3,18 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-import {
-  configureDesktopActivityCodexExecutable,
-  materializeDesktopActivitySession,
-} from "../support/activity-session.ts";
-import { desktopActivityFixture } from "../support/activity-events.ts";
 import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
+import {
+  fixtureTuiLogPath,
+  openFixtureCodexTerminal,
+  openFixtureTerminalThread,
+  readFixtureTuiSize,
+  settleFixtureTui,
+  type FixtureTuiSize,
+} from "../support/fixture-terminal.ts";
 import { installDesktopUiMotionGuard } from "../support/motion-guard.ts";
 import { clearDesktopActivityMarker } from "../support/test-project.ts";
-import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-state.ts";
+import { setDesktopUiWindowSize } from "../support/ui-state.ts";
 
 /**
  * #348: an agent CLI in a center-panel terminal suddenly loses its bottom lines
@@ -41,7 +44,7 @@ const preparedArtifactDirectory: string = artifactDirectory;
 const preparedProjectPath: string = projectPath;
 const isWindowsE2e = process.env.BIBCODE_E2E_PLATFORM === "win";
 const preparedCodexExecutable = NodePath.join(shimDirectory, isWindowsE2e ? "codex.cmd" : "codex");
-const tuiLogPath = NodePath.join(preparedProjectPath, ".git", "bibcode-fixture-tui-sizes.log");
+const tuiLogPath = fixtureTuiLogPath(preparedProjectPath);
 
 function readPositiveInteger(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
@@ -72,18 +75,10 @@ function createRandom(initial: number): () => number {
   };
 }
 
-interface TuiSize {
-  readonly cols: number;
-  readonly rows: number;
-  readonly bytes: number;
-}
+type TuiSize = FixtureTuiSize;
 
 function readTuiSize(): TuiSize | null {
-  if (!NodeFS.existsSync(tuiLogPath)) return null;
-  const log = NodeFS.readFileSync(tuiLogPath);
-  const last = log.toString("utf8").trim().split("\n").at(-1);
-  const match = last ? /^(\d+)x(\d+)$/.exec(last) : null;
-  return match ? { cols: Number(match[1]), rows: Number(match[2]), bytes: log.length } : null;
+  return readFixtureTuiSize(tuiLogPath);
 }
 
 interface TerminalGeometry {
@@ -264,15 +259,7 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
 }
 
 async function settle(): Promise<void> {
-  // The TUI redraws on every SIGWINCH; a size that holds for 400 ms is final.
-  const deadline = Date.now() + 5_000;
-  let previous = readTuiSize()?.bytes ?? 0;
-  while (Date.now() < deadline) {
-    await browser.pause(400);
-    const current = readTuiSize()?.bytes ?? 0;
-    if (current === previous) return;
-    previous = current;
-  }
+  await settleFixtureTui(tuiLogPath);
 }
 
 interface Session {
@@ -596,46 +583,13 @@ const actionList: ReadonlyArray<readonly [string, Action]> = chatActions
   : actions;
 
 async function openFixtureThread(): Promise<void> {
-  await ensureMainSidebarOpen();
-  await materializeDesktopActivitySession(preparedProjectPath);
-  await configureDesktopActivityCodexExecutable(
-    preparedCodexExecutable,
-    domRenderer ? { webglEnabled: false } : {},
-  );
-  await refreshDesktopUiDocument();
-  await installDesktopUiMotionGuard();
-  const threadRow = `//*[starts-with(@data-testid, "thread-row-") and .//*[normalize-space()="${desktopActivityFixture.thread.title}"]]`;
-  if (!(await browser.$(threadRow).isDisplayed())) {
-    const project = browser.$(
-      `//button[@data-sidebar="menu-button" and .//*[normalize-space()="${desktopActivityFixture.project.title}"]]`,
-    );
-    await project.waitForDisplayed({ timeoutMsg: "The fixture project did not appear." });
-    if ((await project.getAttribute("aria-expanded")) !== "true") await project.click();
-  }
-  for (const candidate of await browser.$$(threadRow)) {
-    if (await candidate.isDisplayed()) {
-      await candidate.click();
-      break;
-    }
-  }
-  await browser.$('[data-testid="composer-editor"]').waitForDisplayed({
-    timeoutMsg: "The fixture thread did not open.",
+  await openFixtureTerminalThread(preparedProjectPath, preparedCodexExecutable, {
+    webglEnabled: !domRenderer,
   });
 }
 
 async function openCodexTerminal(): Promise<string> {
-  const newPanel = browser.$('button[aria-label="New panel"]');
-  await newPanel.waitForDisplayed();
-  await newPanel.click();
-  const item = browser.$('//*[@role="menuitem"][.//span[normalize-space()="Codex Terminal"]]');
-  await item.waitForDisplayed();
-  await item.waitForEnabled();
-  await item.click();
-  const mount = browser.$("[data-terminal-xterm-mount]");
-  await mount.waitForExist({ timeoutMsg: "The Codex Terminal did not mount." });
-  const terminalId = await mount.getAttribute("data-terminal-xterm-mount");
-  if (!terminalId) throw new Error("The Codex Terminal mount has no terminal id.");
-  return terminalId;
+  return await openFixtureCodexTerminal();
 }
 
 describe("packaged AI terminal footer invariant (#348)", () => {
