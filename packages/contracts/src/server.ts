@@ -572,6 +572,8 @@ export const ServerHostMetricsSample = Schema.Struct({
   volumeListingNotResponding: Schema.optionalKey(Schema.Boolean),
   /** Rises by one per CPU and memory reading within one server run, whatever the wall clock does. */
   sequence: Schema.optionalKey(NonNegativeInt),
+  /** The reading's time on the server's chart clock, which never runs backwards; `recent` points use it. */
+  chartAt: Schema.optionalKey(IsoDateTime),
   /** How old the reading was, on the server's monotonic clock, when the item was encoded. */
   ageMs: Schema.optionalKey(NonNegativeInt),
 });

@@ -28,7 +28,8 @@ export interface HostMetricsView {
 
 function chartPoint(sample: ServerHostMetricsSample): ServerHostMetricsChartPoint {
   return {
-    sampledAt: sample.sampledAt,
+    // The wall time can step back; the chart clock the snapshot's points use cannot.
+    sampledAt: sample.chartAt ?? sample.sampledAt,
     cpuPercent: sample.cpuPercent,
     memoryPercent:
       sample.memoryTotalBytes > 0 ? (sample.memoryUsedBytes / sample.memoryTotalBytes) * 100 : 0,

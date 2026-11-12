@@ -210,3 +210,30 @@ describe("accumulateHostMetrics ordering", () => {
     expect(view.sample?.sampledAt).toBe(at(100));
   });
 });
+
+describe("accumulateHostMetrics chart clock", () => {
+  function withChartAt(sampledAt: string, chartAt: string | undefined): ServerHostMetricsEvent {
+    const event = sampleEvent(sampledAt);
+    if (event._tag !== "Sample") throw new Error("unreachable");
+    return {
+      ...event,
+      sample: { ...event.sample, sequence: 11, ...(chartAt === undefined ? {} : { chartAt }) },
+    } as ServerHostMetricsEvent;
+  }
+
+  it("places a live point at the server's chart time after the wall clock stepped back", () => {
+    const first = snapshot([at(99), at(100)]);
+    const sequenced = {
+      ...first,
+      sample: { ...(first as { sample: ServerHostMetricsSample }).sample, sequence: 10 },
+    } as ServerHostMetricsEvent;
+    const { view } = run([sequenced, withChartAt(at(40), at(101))]);
+    expect(view.recent.map((point) => point.sampledAt)).toEqual([at(99), at(100), at(101)]);
+    expect(view.sample?.sampledAt).toBe(at(40));
+  });
+
+  it("keeps the wall time for a point when the server sends no chart time", () => {
+    const { view } = run([snapshot([at(99), at(100)]), withChartAt(at(101), undefined)]);
+    expect(view.recent.at(-1)?.sampledAt).toBe(at(101));
+  });
+});
