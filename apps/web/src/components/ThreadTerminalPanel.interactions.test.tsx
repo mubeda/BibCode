@@ -8414,9 +8414,13 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       const mount = client.mounted.container.querySelector<HTMLElement>(
         "[data-terminal-xterm-mount]",
       )!;
+      // A scaled mirror takes no pointer input itself, so the browser hands a click to the
+      // mount; an unscaled one gets it on xterm's element, from which it bubbles.
       const clickClient = async () => {
+        const element = xtermOf(client).element!;
+        const target = element.style.pointerEvents === "none" ? mount : element;
         await act(async () =>
-          mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+          target.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
         );
         await server.deliver();
       };

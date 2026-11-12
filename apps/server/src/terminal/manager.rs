@@ -6279,6 +6279,56 @@ mod tests {
         manager.shutdown().await;
     }
 
+    /// An owner's equal claim is acknowledged on its own stream only for a caller that reads
+    /// the structured answer; an older client gets nothing, as before that answer (#348).
+    #[tokio::test]
+    async fn an_equal_claim_is_acknowledged_only_to_a_caller_that_reads_the_answer() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        let pty = backend.latest();
+        // Skip what attaching published.
+        pty.emit("attached");
+        for attachment in [&mut owner, &mut mirror] {
+            while !matches!(
+                next_attachment_event(attachment).await,
+                TerminalEvent::Output { .. }
+            ) {}
+        }
+        for acknowledge in [false, true] {
+            let result = manager
+                .resize_acknowledging(
+                    "sizing",
+                    "term",
+                    80,
+                    24,
+                    Some("owner".to_owned()),
+                    acknowledge,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, TerminalResizeOutcome::Unchanged);
+            pty.emit("next");
+            let first = next_attachment_event(&mut owner).await;
+            assert_eq!(
+                matches!(first, TerminalEvent::Resized { .. }),
+                acknowledge,
+                "acknowledge: {acknowledge}, got {first:?}"
+            );
+            if acknowledge {
+                assert!(matches!(
+                    next_attachment_event(&mut owner).await,
+                    TerminalEvent::Output { .. }
+                ));
+            }
+            assert!(matches!(
+                next_attachment_event(&mut mirror).await,
+                TerminalEvent::Output { .. }
+            ));
+        }
+        manager.shutdown().await;
+    }
+
     /// The PTY refused a size the session records: the next equal request sends it again
     /// instead of answering it as a no-op (#348).
     #[tokio::test]
