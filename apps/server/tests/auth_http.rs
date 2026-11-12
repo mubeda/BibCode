@@ -2906,6 +2906,14 @@ async fn start_desktop_server(temp: &TempDir) -> ServerHandle {
             .expect("activity fixture chunk");
         receiver
     });
+    // A reading ready at once, so a refusal that came after it would show (#292).
+    registry.register_stream("server.subscribeHostMetrics", |_request, _cancellation| {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(Ok(vec![json!({ "tag": "server.subscribeHostMetrics" })]))
+            .expect("host metrics fixture chunk");
+        receiver
+    });
     ServerRuntime::start_with_registry(config, registry)
         .await
         .expect("server starts")
