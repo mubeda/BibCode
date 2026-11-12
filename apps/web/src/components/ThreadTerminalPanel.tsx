@@ -599,6 +599,8 @@ const TERMINAL_USER_INPUT_EVENTS = [
 ] as const;
 /** How long after a user event the terminal's input still counts as that user's. */
 const TERMINAL_USER_INPUT_WINDOW_MS = 500;
+const TERMINAL_FOCUS_IN_REPORT = "\u001b[I";
+const TERMINAL_FOCUS_OUT_REPORT = "\u001b[O";
 
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
@@ -949,6 +951,10 @@ export function TerminalViewport({
   const userInputClaim =
     sizeOwnership && serverConfig?.environment.capabilities?.terminalUserInputClaim === true;
   const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
+  // One claim for this viewport's renderers: a renderer recreated when the window is hidden
+  // and shown is the same window to the server, which gives a returning owner its size back.
+  // Another viewport of the terminal in this window has its own claim (#348).
+  const [viewportSizeClaim] = useState(randomUUID);
   const [rendererAttachmentInput, setRendererAttachmentInput] = useState<{
     readonly target: string;
     readonly sizeClaim: string;
@@ -1461,7 +1467,7 @@ export function TerminalViewport({
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
     if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
-    const sizeClaim = randomUUID();
+    const sizeClaim = viewportSizeClaim;
     let fittedDimensions = proposeTerminalDimensions(fitAddon, mount);
     const updateFittedDimensions = () =>
       (fittedDimensions = proposeTerminalDimensions(fitAddon, mount));
@@ -1486,7 +1492,9 @@ export function TerminalViewport({
     const applyMirrorScale = (fitted: TerminalDimensions | null) => {
       const element = terminal.element;
       if (!element) return;
-      const scale = sizeOwnership ? terminalMirrorScale(sizeClaim, appliedSize, fitted) : 1;
+      const scale = sizeOwnership
+        ? terminalMirrorScale(sizeClaim, appliedSize, fitted, unownedUntilUsed)
+        : 1;
       if (scale === 1 && mirrorScale === 1) return;
       const overflows =
         scale < 1 &&
@@ -1502,6 +1510,8 @@ export function TerminalViewport({
       if (overflows) mount.scrollTop = mount.scrollHeight;
     };
     let appliedSize: TerminalSize | null = null;
+    // A server that hands the size over published it un-owned: it waits for use (#348).
+    let unownedUntilUsed = false;
     let claimInFlight: TerminalSize | null = null;
     let layoutChangedWhileClaimPending = false;
     // Hides the notice only while a claim is pending or waits for its acknowledgement.
@@ -1622,6 +1632,7 @@ export function TerminalViewport({
             applied: appliedSize,
             fitted,
             claimInFlight: claimInFlight !== null,
+            unownedUntilUsed,
           })
           ? mirrorScale
           : null,
@@ -1710,6 +1721,7 @@ export function TerminalViewport({
           sizeClaim,
           applied: appliedSize,
           fitted,
+          unownedUntilUsed,
           trigger,
           documentFocused: document.hasFocus(),
           // Engines without the API keep the earlier focus-only rule.
@@ -1795,12 +1807,13 @@ export function TerminalViewport({
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
       appliedSize = size ?? null;
+      if (size?.sizeClaim != null) unownedUntilUsed = false;
       if (size && !terminalDimensionsEqual(terminal, size)) {
         const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
         terminal.resize(size.cols, size.rows);
         if (wasAtBottom) terminal.scrollToBottom();
       }
-      if (size?.sizeClaim === null) handleSizeTrigger("attach");
+      if (size?.sizeClaim === null) handleSizeTrigger(unownedUntilUsed ? "layout" : "attach");
       else if (claimOnAttach)
         handleSizeTrigger(size?.sizeClaim === sizeClaim ? "layout" : "attach");
       else if (size?.sizeClaim === sizeClaim) handleSizeTrigger("layout");
@@ -1813,7 +1826,14 @@ export function TerminalViewport({
         return;
       }
       if (signal.type === "resized") {
-        if (sizeOwnership) outputSink.barrier(() => applySize(signal.size, false, signal));
+        if (sizeOwnership) {
+          outputSink.barrier(() => {
+            // An older server leaves every released size un-owned; one that hands it over does
+            // so only when no remaining window is known to be in use.
+            unownedUntilUsed = userInputClaim && signal.size.sizeClaim === null;
+            applySize(signal.size, false, signal);
+          });
+        }
         return;
       }
       if (signal.type === "attached") {
@@ -1843,6 +1863,8 @@ export function TerminalViewport({
           declinedRequest = null;
           layoutChangedWhileClaimPending = false;
           claimNoticeSuppressed = false;
+          // A restart's process has no owner: some window must size it.
+          unownedUntilUsed = false;
         }
         oscColorResponderActive = signal.oscColorResponderActive ?? false;
         if (sizeOwnership) applySize(signal.size, claimOnAttach, signal);
@@ -1986,8 +2008,10 @@ export function TerminalViewport({
     const noteUserInput = () => {
       lastUserInputAt = performance.now();
     };
-    const inputOrigin = (): TerminalInputSchedulerOrigin => {
+    const inputOrigin = (data?: string): TerminalInputSchedulerOrigin => {
       if (!userInputClaim) return undefined;
+      // xterm reports focus changes, and answers enabling the reports, through onData.
+      if (data === TERMINAL_FOCUS_IN_REPORT || data === TERMINAL_FOCUS_OUT_REPORT) return null;
       return !replying && performance.now() - lastUserInputAt <= TERMINAL_USER_INPUT_WINDOW_MS
         ? sizeClaim
         : null;
@@ -1996,7 +2020,7 @@ export function TerminalViewport({
       if (!replyGuard.acceptInput()) return;
       if (inputBlocked() || data.length === 0) return;
       inputBinding.pendingFallbacks.push({ remaining: data.length, message: fallbackError });
-      inputScheduler.enqueue(data, inputOrigin());
+      inputScheduler.enqueue(data, inputOrigin(data));
     };
 
     terminal.attachCustomKeyEventHandler((event) => {
@@ -2394,6 +2418,7 @@ export function TerminalViewport({
     sizeOwnership,
     orderedInput,
     userInputClaim,
+    viewportSizeClaim,
   ]);
 
   useEffect(() => {

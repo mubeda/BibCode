@@ -289,6 +289,8 @@ export function createTerminalTranscriptRuntime(
     // shortcut: what this stream drops while a claimed stream is live and that stream had not
     // delivered when it ended is lost until the next snapshot. The panel mixes them only when
     // the ownership capability arrives after a claimless attach, until the old stream ends.
+    // A client cannot ask the server for a resync (it sends one only to a lagging stream);
+    // upgrade with a bounded replay of the dropped events if streams mix more often.
     if (source.sizeClaim === undefined && claimedSources.size > 0) return false;
     if (event.type === "resized") {
       if (sizeSequence !== undefined && sequence <= sizeSequence) return false;

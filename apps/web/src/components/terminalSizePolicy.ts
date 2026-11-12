@@ -8,6 +8,11 @@ interface TerminalSizePolicy {
   readonly applied: TerminalSize | null;
   readonly fitted: TerminalDimensions | null;
   readonly claimInFlight: boolean;
+  /**
+   * A server that hands the size over left it un-owned: the owner left several windows and
+   * none was typed in, so it waits for a person to use one (#348).
+   */
+  readonly unownedUntilUsed?: boolean;
 }
 
 export function terminalDimensionsEqual(
@@ -31,12 +36,24 @@ export function hasForeignTerminalSizeOwner(
   return applied?.sizeClaim != null && applied.sizeClaim !== sizeClaim;
 }
 
+/** Another window sizes the terminal, or the one that left did and nobody has used one since. */
+function sizedElsewhere(
+  applied: TerminalSize | null,
+  sizeClaim: string,
+  unownedUntilUsed = false,
+): boolean {
+  return (
+    hasForeignTerminalSizeOwner(applied, sizeClaim) ||
+    (unownedUntilUsed && applied?.sizeClaim === null)
+  );
+}
+
 export function shouldShowTerminalSizeNotice(input: TerminalSizePolicy): boolean {
   return (
     !input.claimInFlight &&
     input.applied !== null &&
     input.fitted !== null &&
-    hasForeignTerminalSizeOwner(input.applied, input.sizeClaim) &&
+    sizedElsewhere(input.applied, input.sizeClaim, input.unownedUntilUsed) &&
     !terminalDimensionsEqual(input.applied, input.fitted)
   );
 }
@@ -52,8 +69,9 @@ export function terminalMirrorScale(
   sizeClaim: string,
   applied: TerminalSize | null,
   fitted: TerminalDimensions | null,
+  unownedUntilUsed = false,
 ): number {
-  if (applied === null || fitted === null || !hasForeignTerminalSizeOwner(applied, sizeClaim))
+  if (applied === null || fitted === null || !sizedElsewhere(applied, sizeClaim, unownedUntilUsed))
     return 1;
   const scale = Math.min(1, fitted.cols / applied.cols, fitted.rows / applied.rows);
   return Math.max(TERMINAL_MIRROR_MIN_SCALE, Math.floor(scale * 1000) / 1000);
@@ -68,17 +86,17 @@ export function shouldClaimTerminalSize(
   },
 ): boolean {
   if (input.claimInFlight || input.fitted === null || input.applied === null) return false;
-  if (input.applied.sizeClaim === null) return true;
+  // A restart, or a server that leaves every released size un-owned: some window must size it.
+  if (input.applied.sizeClaim === null && !input.unownedUntilUsed) return true;
   const ownsSize = input.applied.sizeClaim === input.sizeClaim;
   // Matching owner geometry needs no resize or claim request.
   if (ownsSize && terminalDimensionsEqual(input.applied, input.fitted)) return false;
   switch (input.trigger) {
     // An unattended window (a locked or idle server host) refocused or remounted by the
-    // system never takes a live owner's size.
+    // system never takes the size.
     case "attach":
-      return ownsSize || (input.documentFocused && input.userActive);
     case "focus":
-      return ownsSize || input.userActive;
+      return ownsSize || (input.documentFocused && input.userActive);
     case "layout":
       return ownsSize;
     case "fit":

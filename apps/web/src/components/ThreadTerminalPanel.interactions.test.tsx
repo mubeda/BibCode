@@ -502,6 +502,7 @@ const testState = vi.hoisted(() => ({
       capabilities?: {
         terminalOrderedInput?: boolean;
         terminalSizeOwnership?: boolean;
+        terminalUserInputClaim?: boolean;
         terminalImagePaste?: boolean;
       };
     };
@@ -2024,7 +2025,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     "claims an equal-size mirror on terminal %s and deduplicates while the resize RPC is pending",
     async (trigger) => {
       testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
-      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
       const view = await mountViewport();
       await act(async () =>
         view.runtime.ingest({
@@ -2035,6 +2036,8 @@ describe("TerminalViewport mounted lifecycle", () => {
           },
         }),
       );
+      // A person focusing the terminal focuses its page.
+      if (trigger === "focus") hasFocus.mockReturnValue(true);
       const mount = view.mounted.container.querySelector<HTMLElement>(
         "[data-terminal-xterm-mount]",
       )!;
@@ -2130,6 +2133,46 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("waits for use of a size a handing-over server released, but claims a restart's (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = {
+      terminalSizeOwnership: true,
+      terminalUserInputClaim: true,
+    };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot("prompt"), size: { cols: 151, rows: 50, sizeClaim: "o" } },
+      }),
+    );
+    view.resizeSpy.mockClear();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 151, rows: 50, sizeClaim: null },
+      }),
+    );
+    await view.flushFrame();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    expect(view.mounted.container.textContent).toContain("Fit to this window");
+    await act(async () =>
+      view.runtime.ingest({
+        type: "restarted",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        snapshot: {
+          ...terminalSnapshot(""),
+          pid: 2,
+          size: { cols: 151, rows: 50, sizeClaim: null },
+        },
+      }),
+    );
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("clears a failed claim slot and restores the different-size mirror action", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
@@ -2151,6 +2194,7 @@ describe("TerminalViewport mounted lifecycle", () => {
         }),
     );
     const mount = view.mounted.container.querySelector<HTMLElement>("[data-terminal-xterm-mount]")!;
+    vi.mocked(document.hasFocus).mockReturnValue(true);
     await act(async () => mount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
     expect(view.mounted.container.textContent).not.toContain("Fit to this window");
     await act(async () =>
@@ -5325,9 +5369,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     const terminal = view.fakeTerminal!;
     const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
       .terminal.sizeClaim;
-    const mount = view.mounted.container.querySelector<HTMLElement>(
-      "[data-terminal-xterm-mount]",
-    )!;
+    const mount = view.mounted.container.querySelector<HTMLElement>("[data-terminal-xterm-mount]")!;
     await view.flushFrame();
     testState.writeCommand.mockClear();
     // xterm answers `CSI ?1004h` and each focus change with a report through onData.
@@ -5341,10 +5383,10 @@ describe("TerminalViewport mounted lifecycle", () => {
     const writes = testState.writeCommand.mock.calls.map(
       ([request]) => request.input as { data: string; userInputClaim?: string | null },
     );
+    // Input of one origin shares a frame.
     expect(writes.map(({ data, userInputClaim }) => [data, userInputClaim])).toEqual([
       ["a", claim],
-      ["\x1b[I", null],
-      ["\x1b[O", null],
+      ["\x1b[I\x1b[O", null],
     ]);
   });
 
@@ -8211,7 +8253,8 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       if (this.claims.get(stream.claim) === id) this.claims.delete(stream.claim);
       if (this.owner?.attachment !== id) return;
       // A lone remaining viewer takes the size at once; among several, the one typed in last.
-      for (const claim of this.typedAt.keys()) if (!this.claims.has(claim)) this.typedAt.delete(claim);
+      for (const claim of this.typedAt.keys())
+        if (!this.claims.has(claim)) this.typedAt.delete(claim);
       const remaining = [...this.claims];
       const next = this.releasesToNobody
         ? undefined
@@ -8638,7 +8681,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
 
   it("leaves the size un-owned when the owner leaves two idle windows, until one is used", async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
-    const third = await openWindow(THIRD, { cols: 90, rows: 28 });
+    const third = await openWindow(THIRD, { cols: 90, rows: 25 });
     const requests = testState.resizeCommand.mock.calls.length;
     await disconnect(host);
     expect(server.size()).toEqual({ cols: 120, rows: 50, sizeClaim: null });
@@ -8657,8 +8700,8 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
     );
     await server.deliver();
-    expect(view(third)).toMatchObject({ grid: "90x28", scale: 1, owner: "this window" });
-    expect(view(client)).toMatchObject({ grid: "90x28", owner: "the other window" });
+    expect(view(third)).toMatchObject({ grid: "90x25", scale: 1, owner: "this window" });
+    expect(view(client)).toMatchObject({ grid: "90x25", owner: "the other window" });
   });
 
   it("gives the size to the remaining window typed in last when the owner leaves", async () => {
@@ -8710,9 +8753,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     )!;
     hasFocus.mockReturnValue(false);
     setUserActive(true);
-    await act(async () =>
-      clientMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })),
-    );
+    await act(async () => clientMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
     await server.deliver();
     expect(view(host).owner).toBe("this window");
   });

@@ -1517,16 +1517,24 @@ variant set and resize events are not operational-log records. Attach streams
 also filter it unless their request carried a claim. Older clients therefore
 never receive the new event; optional snapshot fields remain additive.
 
-The window in use owns size. It claims on attach while its document is focused
-and its page has transient user activation (`navigator.userActivation.isActive`);
-on terminal focus with that activation, or on click or keypress, whenever it is
+The window in use owns size. It claims on attach or on terminal focus while its
+document is focused and its page has transient user activation
+(`navigator.userActivation.isActive`); on click or keypress, whenever it is
 a mirror or its fitted size differs; on its own layout changes while already
 owner; and through **Fit to this window**. A window refocused or remounted with
 no recent input in its page, such as an unattended server host window after its
 display wakes, therefore does not take a live owner's size; engines without the
-API keep the focus-only rule. A null-claim snapshot or event prompts an
-immediate claim even without focus, so a visible mirror takes the size as soon
-as the owner's stream ends; a hidden or zero-area mirror does not.
+API keep the focus-only rule. A null claim after a restart, or from a server
+without `terminalUserInputClaim` (which releases every size to nobody), prompts
+an immediate claim even without focus, so a visible mirror takes the size as
+soon as the owner's stream ends; a hidden or zero-area mirror does not. A
+`resized` with a null claim from a server advertising `terminalUserInputClaim`
+is an intentional hand-over to nobody: windows treat it like another window's
+size (scaled whole, with the notice) and claim it only through the same use
+triggers. A viewport keeps one claim for every renderer it creates, so a window
+hidden and shown is the same claim and gets a departed owner's size back.
+Focus reports (`CSI I`, `CSI O`), which xterm sends through `onData`, carry a
+`null` input claim.
 While ownership is null, renderers permit live replies until a claim wins. Each
 renderer keeps at most one claim pending until its resize RPC completes, whether
 successfully or with failure; the echo updates the applied size. A layout change

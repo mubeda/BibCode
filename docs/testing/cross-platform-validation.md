@@ -314,9 +314,15 @@ terminal must end at the rows that fit, with its bottom line visible, without a
 width change. Try **Fit to this window** on an exited terminal,
 then reopen or restart it: the window must remain usable, with the notice and
 fit action available when another window owns a different size.
-Close or disconnect the owner: other windows receive a null claim, immediately
-attempt a claim, and may answer queries while unowned. Repeat through reconnect
-and process restart; a departed stream cannot clear the replacement's claim. An
+Close or disconnect the owner, or hide its tab: a lone other window takes the
+size at once; with several, the one typed in last does, and with none typed in
+the size stays un-owned, every window shows the whole grid with the notice, and
+none claims until a person clicks, types or focuses one (unowned windows may
+answer queries). The owner gets the size back when it reconnects or is shown
+again before anyone typed elsewhere. A server without `terminalUserInputClaim`
+leaves every released size un-owned, and its windows claim it at once. After a
+process restart every window claims at once. Repeat through reconnect; a
+departed stream cannot clear the replacement's claim. An
 older attach without `sizeClaim` and the general `subscribeTerminalEvents`
 stream must never receive `resized`.
 
