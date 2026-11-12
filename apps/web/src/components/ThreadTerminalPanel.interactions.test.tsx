@@ -18,6 +18,7 @@ import {
   type TerminalLaunchCommand,
   type TerminalResizeResult,
   type TerminalSessionSnapshot,
+  type TerminalSize,
 } from "@bibcode/contracts";
 import type { TerminalFontPreference, TerminalThemePreference } from "@bibcode/contracts/settings";
 import * as Cause from "effect/Cause";
@@ -8154,6 +8155,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   const SERVER_HOST = EnvironmentId.make("server-host-window");
   const CLIENT = EnvironmentId.make("remote-client-window");
   const THIRD = EnvironmentId.make("third-window");
+  const FOURTH = EnvironmentId.make("fourth-window");
 
   interface Stream {
     readonly claim: string;
@@ -8163,16 +8165,21 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
 
   /**
    * The ownership rules of `TerminalManager` in apps/server/src/terminal/manager.rs: attach,
-   * `resize_acknowledging`, `release_size_claim` and `note_input`, with the expectations of
-   * its tests `a_returning_owner_takes_the_size_back_from_an_unused_window` and
-   * `the_size_goes_to_the_remaining_viewer_typed_in_last` (#348).
+   * `resize_acknowledging`, `release_size_claim`, `note_input` and the restart carry-over in
+   * `create_session`, with the expectations of its tests
+   * `a_returning_owner_takes_the_size_back_from_an_unused_window`,
+   * `the_size_goes_to_the_remaining_viewer_typed_in_last`,
+   * `an_attach_does_not_take_a_size_left_unowned_until_used` and
+   * `one_viewer_answers_queries_while_the_size_is_unowned` (#348).
    */
   class FakeTerminalManager {
     cols = 80;
     rows = 24;
     owner: { claim: string; attachment: number } | null = null;
-    /** The released rule (v0.15.3): every release leaves the size un-owned. */
+    /** The released rule (v0.15.3): every release leaves the size un-owned, naming no replier. */
     releasesToNobody = false;
+    /** `Session::handover_replier`: set while a hand-over waits for a window to be used. */
+    replier: string | null = null;
     private departedOwner: string | null = null;
     private ownerUnusedSinceHandoff = false;
     private readonly typedAt = new Map<string, number>();
@@ -8182,18 +8189,39 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     private readonly outbox: Array<() => void> = [];
     private nextAttachment = 1;
     private sequence = 1;
+    private pid = 1;
 
-    size() {
-      return { cols: this.cols, rows: this.rows, sizeClaim: this.owner?.claim ?? null };
+    /** `Session::size`: `replyClaim` only while the size is un-owned by a pending hand-over. */
+    size(): TerminalSize {
+      return {
+        cols: this.cols,
+        rows: this.rows,
+        sizeClaim: this.owner?.claim ?? null,
+        ...(this.replier !== null && this.owner === null ? { replyClaim: this.replier } : {}),
+      };
+    }
+
+    /** `handover_replier`: the least remaining claim. */
+    private leastClaim(): string | null {
+      return [...this.claims.keys()].toSorted()[0] ?? null;
+    }
+
+    private snapshot() {
+      return { ...terminalSnapshot(""), pid: this.pid, sequence: this.sequence, size: this.size() };
     }
 
     attach(claim: string, runtime: TerminalTranscriptRuntime): number {
       const id = this.nextAttachment++;
       this.claims.set(claim, id);
-      if (this.owner === null) {
+      // `attach`: a size left un-owned until used is not taken by attaching, except by the
+      // owner that left it.
+      const handoverPending = this.replier !== null && this.departedOwner !== claim;
+      if (this.owner === null && !handoverPending) {
         this.owner = { claim, attachment: id };
+        this.replier = null;
+        this.departedOwner = null;
         this.publish();
-      } else if (this.owner.claim === claim) {
+      } else if (this.owner?.claim === claim) {
         this.owner.attachment = id;
       } else if (this.ownerUnusedSinceHandoff && this.departedOwner === claim) {
         // The window last used came back before anyone used the one the size went to.
@@ -8204,7 +8232,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       }
       const stream = { claim, runtime, source: { sizeClaim: claim } };
       this.streams.set(id, stream);
-      const snapshot = { ...terminalSnapshot(""), sequence: this.sequence, size: this.size() };
+      const snapshot = this.snapshot();
       this.outbox.push(() => runtime.ingest({ type: "snapshot", snapshot }, stream.source));
       return id;
     }
@@ -8232,6 +8260,8 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       }
       this.cols = cols;
       this.rows = rows;
+      // `resize_acknowledging`: an applied claim ends a pending hand-over.
+      this.replier = null;
       this.owner = { claim, attachment };
       this.publish();
       return "applied";
@@ -8251,10 +8281,26 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       this.streams.delete(id);
       stream.runtime.releaseSource(stream.source);
       if (this.claims.get(stream.claim) === id) this.claims.delete(stream.claim);
-      if (this.owner?.attachment !== id) return;
-      // A lone remaining viewer takes the size at once; among several, the one typed in last.
+      // `release_size_claim` prunes departed claims from the typing record on every release.
       for (const claim of this.typedAt.keys())
         if (!this.claims.has(claim)) this.typedAt.delete(claim);
+      if (this.owner?.attachment !== id) {
+        // `release_size_claim`, a non-owner leaving a pending hand-over: a lone viewer left
+        // takes the size, and a replier that left is replaced.
+        if (this.replier === null) return;
+        const left = this.claims.size;
+        if (left > 1 && this.claims.has(this.replier)) return;
+        this.replier = left > 1 ? this.leastClaim() : null;
+        if (left === 0) return;
+        const lone = left === 1 ? [...this.claims][0]! : null;
+        this.ownerUnusedSinceHandoff = lone !== null;
+        this.owner = lone ? { claim: lone[0], attachment: lone[1] } : null;
+        this.publish();
+        return;
+      }
+      // `release_size_claim`, the owner leaving: a lone remaining viewer takes the size at
+      // once; among several, the one typed in last; with none typed in, it stays un-owned and
+      // the least claim answers the terminal's queries.
       const remaining = [...this.claims];
       const next = this.releasesToNobody
         ? undefined
@@ -8263,10 +8309,50 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
           : remaining
               .filter(([claim]) => this.typedAt.has(claim))
               .sort(([a], [b]) => this.typedAt.get(b)! - this.typedAt.get(a)!)[0];
+      this.replier = next === undefined && !this.releasesToNobody ? this.leastClaim() : null;
       this.departedOwner = this.owner.claim;
       this.ownerUnusedSinceHandoff = next !== undefined;
       this.owner = next ? { claim: next[0], attachment: next[1] } : null;
       this.publish();
+    }
+
+    /**
+     * A restart: `create_session` starts a new session that keeps only the owner whose
+     * attachment survived (`SessionCarryOver::size_owner`), and sends `restarted`.
+     */
+    restart(): void {
+      const kept =
+        this.owner !== null && this.claims.get(this.owner.claim) === this.owner.attachment;
+      if (!kept) this.owner = null;
+      this.replier = null;
+      this.departedOwner = null;
+      this.ownerUnusedSinceHandoff = false;
+      this.typedAt.clear();
+      this.pid += 1;
+      this.sequence += 1;
+      const snapshot = this.snapshot();
+      for (const stream of this.streams.values()) {
+        this.outbox.push(() =>
+          stream.runtime.ingest(
+            {
+              type: "restarted",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              sequence: snapshot.sequence,
+              snapshot,
+            },
+            stream.source,
+          ),
+        );
+      }
+    }
+
+    /** The program writes `data`, such as a query, to every stream. */
+    output(data: string): void {
+      this.sequence += 1;
+      const event = { ...outputEvent(data), sequence: this.sequence };
+      for (const stream of this.streams.values())
+        this.outbox.push(() => stream.runtime.ingest(event, stream.source));
     }
 
     /** `resize` answered as a server that reads `structuredResult` does. */
@@ -8349,7 +8435,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   });
 
   afterEach(() => {
-    for (const environmentId of [SERVER_HOST, CLIENT, THIRD]) {
+    for (const environmentId of [SERVER_HOST, CLIENT, THIRD, FOURTH]) {
       releaseTerminalUiResources(environmentId, THREAD_ID, "term-1");
     }
   });
@@ -8679,29 +8765,152 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
   });
 
-  it("leaves the size un-owned when the owner leaves two idle windows, until one is used", async () => {
+  const mountOf = (machine: Machine) =>
+    machine.mounted.container.querySelector<HTMLElement>("[data-terminal-xterm-mount]")!;
+
+  /** A reload: the page's renderer goes away with its stream, and a new one attaches. */
+  const reload = async (machine: Machine) => {
+    await unmount(machine.mounted);
+    await disconnect(machine);
+    machine.mounted = await mount(<TerminalViewport {...machine.props} />);
+    await flushAnimationFrames();
+    await connect(machine);
+  };
+
+  /** The terminal's answers to a device-attributes query, by the window that sent each. */
+  const queryReplies = async () => {
+    testState.writeCommand.mockClear();
+    server.output("\x1b[c");
+    await server.deliver();
+    return testState.writeCommand.mock.calls
+      .filter(([request]) => request.input.data === "\x1b[?1;2c")
+      .map(([request]) => request.environmentId as EnvironmentId);
+  };
+
+  /** The owner leaves three idle windows: the size stays un-owned until one is used. */
+  const ownerLeavesThreeIdleWindows = async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
     const third = await openWindow(THIRD, { cols: 90, rows: 25 });
-    const requests = testState.resizeCommand.mock.calls.length;
+    const fourth = await openWindow(FOURTH, { cols: 110, rows: 40 });
+    await disconnect(host);
+    return { client, third, fourth };
+  };
+
+  it.each(["click", "typing", "Fit"] as const)(
+    "leaves a handed-over size un-owned through a reload and a hide and show, until a %s takes it",
+    async (use) => {
+      const { client, third, fourth } = await ownerLeavesThreeIdleWindows();
+      expect(server.size()).toMatchObject({ cols: 120, rows: 50, sizeClaim: null });
+      expect(server.size().replyClaim).toBeDefined();
+      const requests = testState.resizeCommand.mock.calls.length;
+      await relayout(client, { cols: 100, rows: 29 });
+      hasFocus.mockReturnValue(true);
+      await act(async () => window.dispatchEvent(new FocusEvent("focus")));
+      await server.deliver();
+      hasFocus.mockReturnValue(false);
+      await setWindowVisible(third, false);
+      await setWindowVisible(third, true);
+      await reload(fourth);
+      expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+      // No window is sized for the grid, so each shows all of it and says so.
+      for (const machine of [client, third, fourth])
+        expect(view(machine)).toMatchObject({
+          grid: "120x50",
+          owner: "nobody",
+          clipped: false,
+          notice: true,
+        });
+      if (use === "click")
+        await act(async () =>
+          mountOf(client).dispatchEvent(
+            new PointerEvent("pointerdown", { button: 0, bubbles: true }),
+          ),
+        );
+      else if (use === "typing")
+        await act(async () => {
+          xtermOf(client).keyHandler?.(new KeyboardEvent("keydown", { key: "k" }));
+          xtermOf(client).dataHandler?.("k");
+        });
+      else {
+        const fit = [...client.mounted.container.querySelectorAll("button")].find(
+          (button) => button.textContent?.trim() === "Fit to this window",
+        )!;
+        await click(fit);
+      }
+      await server.deliver();
+      expect(view(client)).toMatchObject({ grid: "100x29", scale: 1, owner: "this window" });
+      expect(view(third)).toMatchObject({ grid: "100x29", owner: "the other window" });
+      expect(view(fourth)).toMatchObject({ grid: "100x29", owner: "the other window" });
+    },
+  );
+
+  it("lets only the named window answer the terminal's queries while the size is un-owned", async () => {
+    xtermState.answerQueriesOnWrite = true;
+    const windows = Object.values(await ownerLeavesThreeIdleWindows());
+    const replierOf = () => windows.find((machine) => claimOf(machine) === server.replier)!;
+    const first = replierOf();
+    expect(server.replier).toBe(windows.map(claimOf).toSorted()[0]);
+    expect(await queryReplies()).toEqual([first.environmentId]);
+    // The named window leaves: the server names another, which answers the next query.
+    await setWindowVisible(first, false);
+    const next = replierOf();
+    expect(next).not.toBe(first);
+    expect(server.owner).toBeNull();
+    expect(await queryReplies()).toEqual([next.environmentId]);
+  });
+
+  it("keeps an older server's rule: every window claims a released size and answers meanwhile", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    server.releasesToNobody = true;
+    xtermState.answerQueriesOnWrite = true;
+    const { host, client } = await serverHostOwnsTallerGrid();
+    const third = await openWindow(THIRD, { cols: 90, rows: 25 });
+    // Claims are held unanswered, so the size stays un-owned while the query is parsed.
+    const held: Array<() => void> = [];
+    testState.resizeCommand.mockImplementation(
+      ({ input }: { input: { cols: number; rows: number; sizeClaim?: string } }) =>
+        new Promise((resolve) =>
+          held.push(() => {
+            server.resize(input.sizeClaim, input.cols, input.rows);
+            resolve(AsyncResult.success(undefined));
+          }),
+        ),
+    );
+    testState.resizeCommand.mockClear();
     await disconnect(host);
     expect(server.size()).toEqual({ cols: 120, rows: 50, sizeClaim: null });
-    await relayout(client, { cols: 100, rows: 29 });
-    hasFocus.mockReturnValue(true);
-    await act(async () => window.dispatchEvent(new FocusEvent("focus")));
-    await server.deliver();
-    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
-    // Neither window is sized for the grid, so each shows all of it.
-    expect(view(client)).toMatchObject({ grid: "120x50", owner: "nobody", clipped: false });
-    expect(view(third)).toMatchObject({ grid: "120x50", owner: "nobody", clipped: false });
-    const mount = third.mounted.container.querySelector<HTMLElement>(
-      "[data-terminal-xterm-mount]",
-    )!;
-    await act(async () =>
-      mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+    const claimants = testState.resizeCommand.mock.calls.map(
+      ([request]) => (request as { environmentId: EnvironmentId }).environmentId,
     );
+    expect(claimants.toSorted()).toEqual([CLIENT, THIRD].toSorted());
+    expect((await queryReplies()).toSorted()).toEqual([CLIENT, THIRD].toSorted());
+    await act(async () => {
+      for (const answer of held) answer();
+    });
     await server.deliver();
-    expect(view(third)).toMatchObject({ grid: "90x25", scale: 1, owner: "this window" });
-    expect(view(client)).toMatchObject({ grid: "90x25", owner: "the other window" });
+    expect(server.owner).not.toBeNull();
+    expect([view(client).owner, view(third).owner].toSorted()).toEqual([
+      "the other window",
+      "this window",
+    ]);
+  });
+
+  it("keeps the owner across a restart while its window stays attached; the mirror still mirrors", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    // An unfocused page: a focused, active one may take the size on any attach.
+    hasFocus.mockReturnValue(false);
+    const requests = testState.resizeCommand.mock.calls.length;
+    server.restart();
+    await server.deliver();
+    expect(server.size()).toEqual({ cols: 120, rows: 50, sizeClaim: claimOf(host) });
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    expect(view(host)).toMatchObject({ grid: "120x50", owner: "this window", notice: false });
+    expect(view(client)).toMatchObject({
+      grid: "120x50",
+      scale: 0.6,
+      owner: "the other window",
+      notice: true,
+    });
   });
 
   it("gives the size to the remaining window typed in last when the owner leaves", async () => {
