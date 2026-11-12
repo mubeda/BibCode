@@ -3401,7 +3401,6 @@ mod tests {
         assert!(requests.try_recv().is_err(), "backlog must be drained");
     }
 
-    #[cfg(unix)]
     struct RefusingResizeWorker {
         requests: mpsc::Sender<PtySize>,
         /// The size the child sees after each attempt.
@@ -3413,7 +3412,6 @@ mod tests {
 
     /// The resize worker on a real PTY at 80x30 whose resize is refused `refusals` times, an
     /// injected failure of `MasterPty::resize`, before it reaches the PTY.
-    #[cfg(unix)]
     fn refusing_resize_worker(
         refusals: usize,
         retry_delays: &'static [Duration],
@@ -3446,7 +3444,7 @@ mod tests {
                         } else {
                             pair.master.resize(size).map_err(|error| error.to_string())
                         };
-                        // TIOCGWINSZ on the master reads the size the child sees.
+                        // The master reads back the size the PTY holds.
                         let held = pair.master.get_size().unwrap();
                         attempted.send((held.cols, held.rows)).unwrap();
                         result
@@ -3465,12 +3463,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     const QUICK_RETRIES: [Duration; 3] = [Duration::from_millis(5); 3];
-    #[cfg(unix)]
     const NO_RETRY_YET: [Duration; 1] = [Duration::from_secs(30)];
 
-    #[cfg(unix)]
     fn pty_size(cols: u16, rows: u16) -> PtySize {
         PtySize {
             rows,
@@ -3482,7 +3477,6 @@ mod tests {
 
     /// The manager has already published a size the PTY refused, and a client holding it
     /// never asks again: the worker retries it by itself until the PTY takes it (#348).
-    #[cfg(unix)]
     #[test]
     fn a_refused_resize_is_retried_without_another_request() {
         let pty = refusing_resize_worker(2, &QUICK_RETRIES);
@@ -3497,7 +3491,6 @@ mod tests {
 
     /// A size refused on every retry is given up, reporting the size the PTY kept so the
     /// manager publishes it and every viewer converges on the real one (#348).
-    #[cfg(unix)]
     #[test]
     fn a_size_refused_on_every_retry_reports_the_size_the_pty_kept() {
         let pty = refusing_resize_worker(usize::MAX, &QUICK_RETRIES);
@@ -3527,7 +3520,6 @@ mod tests {
 
     /// A child can set its own size (`stty`): the size reported when a refused size runs out
     /// of retries is the one read back from the PTY, not the last one the worker sent (#348).
-    #[cfg(unix)]
     #[test]
     fn a_size_refused_on_every_retry_reports_the_size_read_back_from_the_pty() {
         let initial = pty_size(80, 30);
@@ -3568,7 +3560,6 @@ mod tests {
 
     /// A child can set a size the wire rejects (`stty cols 0 rows 0`, or past the maximum):
     /// such a readback is not reported, the last accepted size is (#348).
-    #[cfg(unix)]
     #[test]
     fn a_size_read_back_outside_the_wire_bounds_reports_the_last_accepted_size() {
         for (cols, rows) in [(0, 0), (1_001, 30), (80, 501)] {
@@ -3605,7 +3596,6 @@ mod tests {
     }
 
     /// A newer size replaces a refused one waiting for its retry.
-    #[cfg(unix)]
     #[test]
     fn a_newer_request_replaces_a_refused_size_waiting_for_its_retry() {
         let pty = refusing_resize_worker(1, &NO_RETRY_YET);
