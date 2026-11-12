@@ -15,16 +15,19 @@ import { TerminalError, TerminalResizeInput, TerminalSessionSnapshot } from "./t
  * Mixed versions of BiBCode share one terminal (#348). These pin what each side of an older
  * pair decodes from the other, through the same JSON exit codec `RpcClient` uses.
  */
-const decodeExit = (rpc: Rpc.Any) =>
-  Schema.decodeUnknownSync(Schema.toCodecJson(Rpc.exitSchema(rpc as never)) as never) as (
-    value: unknown,
-  ) => { readonly _tag: string; readonly value?: unknown };
+type DecodeExit = (value: unknown) => { readonly _tag: string; readonly value?: unknown };
+const exitCodec = (rpc: Rpc.Any) => Schema.toCodecJson(Rpc.exitSchema(rpc as never)) as never;
 
 /** `terminal.resize` as clients before the structured answer declared it: a void result. */
 const OlderClientResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput.mapFields(Struct.omit(["structuredResult"])),
   error: TerminalError,
 });
+
+const decodeOlderClientExit: DecodeExit = Schema.decodeUnknownSync(exitCodec(OlderClientResizeRpc));
+const decodeNewerClientExit: DecodeExit = Schema.decodeUnknownSync(exitCodec(WsTerminalResizeRpc));
+const decodeOlderClientRequest = Schema.decodeUnknownSync(OlderClientResizeRpc.payloadSchema);
+const decodeNewerClientRequest = Schema.decodeUnknownSync(TerminalResizeInput);
 
 const structuredAnswer = {
   outcome: "applied",
@@ -35,13 +38,13 @@ const structuredAnswer = {
 
 describe("terminal.resize across versions", () => {
   it("an older client accepts only null, so a server answers it null", () => {
-    const decode = decodeExit(OlderClientResizeRpc);
+    const decode = decodeOlderClientExit;
     expect(decode({ _tag: "Success", value: null })._tag).toBe("Success");
     expect(() => decode({ _tag: "Success", value: structuredAnswer })).toThrow(/null/);
   });
 
   it("a newer client decodes an older server's null and a newer server's outcome", () => {
-    const decode = decodeExit(WsTerminalResizeRpc);
+    const decode = decodeNewerClientExit;
     expect(decode({ _tag: "Success", value: null })).toMatchObject({ value: null });
     expect(decode({ _tag: "Success", value: structuredAnswer })).toMatchObject({
       value: structuredAnswer,
@@ -56,13 +59,13 @@ describe("terminal.resize across versions", () => {
       rows: 40,
       structuredResult: true,
     };
-    expect(Schema.decodeUnknownSync(OlderClientResizeRpc.payloadSchema)(request)).toEqual({
+    expect(decodeOlderClientRequest(request)).toEqual({
       threadId: "thread-a",
       terminalId: "term",
       cols: 120,
       rows: 40,
     });
-    expect(Schema.decodeUnknownSync(TerminalResizeInput)(request)).toEqual(request);
+    expect(decodeNewerClientRequest(request)).toEqual(request);
   });
 });
 
@@ -87,6 +90,9 @@ const OlderHostMetricsSample = ServerHostMetricsSample.mapFields(
   Struct.omit(["volumeListingNotResponding", "sequence", "ageMs"]),
 );
 
+const decodeOlderTerminalEvent = Schema.decodeUnknownSync(OlderTerminalEvent);
+const decodeOlderHostMetricsSample = Schema.decodeUnknownSync(OlderHostMetricsSample);
+
 const fixture = (name: string) =>
   JSON.parse(
     NodeFS.readFileSync(
@@ -99,7 +105,7 @@ describe("optional keys added for #348 and #292 reach older decoders", () => {
   const generation = { boot: "boot-a", process: 3 };
 
   it("an older client drops the generation of a snapshot, an exit and a close", () => {
-    const decode = Schema.decodeUnknownSync(OlderTerminalEvent);
+    const decode = decodeOlderTerminalEvent;
     const snapshot = {
       threadId: "thread-a",
       terminalId: "term",
@@ -131,7 +137,7 @@ describe("optional keys added for #348 and #292 reach older decoders", () => {
   });
 
   it("an older client decodes a host metrics sample with the new optional keys", () => {
-    const decode = Schema.decodeUnknownSync(OlderHostMetricsSample);
+    const decode = decodeOlderHostMetricsSample;
     for (const event of fixture("server__subscribeHostMetrics-01.json").values) {
       const sample = event["sample"] as Record<string, unknown> | undefined;
       if (sample === undefined) continue;
