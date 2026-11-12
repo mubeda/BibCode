@@ -187,7 +187,9 @@ export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInpu
 /**
  * What a resize request did. `applied` and `unchanged` are each answered by a `resized`
  * event at `sequence` on the requester's claimed attach stream, behind the output already
- * queued for it; the other outcomes changed nothing and publish nothing.
+ * queued for it; the other outcomes changed nothing and publish nothing. An `unchanged`
+ * answer carries another size than the request when the PTY refused that size on every
+ * retry: then nothing new is published, and `sequence` names the size already published.
  */
 export const TerminalResizeOutcome = Schema.Literals([
   "applied",

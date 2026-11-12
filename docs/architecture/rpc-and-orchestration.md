@@ -5114,7 +5114,12 @@ xterm geometry changes only through ordered size events and snapshots, behind
 the output parsed before them. An `applied` or `unchanged` answer names the
 sequence of its acknowledgement; the claim's outcome is the applied size at or
 after that sequence in the same generation, so an older publication parsed
-after the answer neither applies the claim nor ends notice suppression. Any
+after the answer neither applies the claim nor ends notice suppression. When
+the PTY refused the requested size on every retry, the server publishes the
+size the PTY kept, and an owner's later claim of the refused size is answered
+`unchanged` with the kept size and that publication's sequence, publishing
+nothing; the client does not send that geometry again until the server's state
+changes. Any
 other outcome changed nothing: xterm keeps its size and the same geometry is
 not sent again until the server's state changes. A claim the server did not
 know (a remount claiming before its stream attached, or a reconnecting stream)
