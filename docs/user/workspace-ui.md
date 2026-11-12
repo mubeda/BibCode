@@ -45,8 +45,10 @@ The dashboard opens as a panel on the right. Its sections are:
   its peak drawn lighter above it. The figures cover this server process only.
   They start again when the server restarts.
 
-Free space is the free space of the volume itself. A per-user quota is not
-applied. BiBCode does not read network volumes, so a disconnected share cannot
+On macOS and Linux, free space is the free space of the volume itself: a
+per-user quota is not applied. On Windows, total and free space are the
+figures for the user the server runs as, so a quota on that user applies to
+both. BiBCode does not read network volumes, so a disconnected share cannot
 stall the dashboard.
 
 The dashboard updates once a second while you can see it. It stops asking the

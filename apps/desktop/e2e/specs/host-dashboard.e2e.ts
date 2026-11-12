@@ -3,7 +3,7 @@ const sheetSelector = '[data-testid="host-dashboard"]';
 const cpuSelector = `${sheetSelector} [data-testid="host-dashboard-cpu"]`;
 const sinceSelector = `${sheetSelector} [data-testid="host-dashboard-since"]`;
 const hiddenReason =
-  /(Network volume|Container layer|File mount|Empty|Same storage as .+|Hidden by the volume filter)$/;
+  /(Network volume|Container layer|File mount|Empty|System mount|Same storage as .+|Hidden by the volume filter)$/;
 
 async function openFromResourceManager(): Promise<void> {
   // The status bar sits on every route; leave Settings so no full-page surface covers it.
