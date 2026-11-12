@@ -669,9 +669,10 @@ the driver answers with a dead-session error (the webview crashed in an earlier
 spec; WebKitGTK then answers every script with "Unsupported result type"), it
 ends the app if its process survived (found through `lsof`, which must be
 installed), relaunches it once, and opens a new session. The shared specs run
-in one worker, so a crash in one of them fails the rest of that worker (spec
-files' own `afterEach` hooks fail on the dead webview and Mocha skips what
-follows); the closing spec's worker relaunches the app before its cases.
+in one worker, so a crash in one of them fails the rest of that worker (the
+failure screenshot of the `afterTest` hook fails on the dead webview and Mocha
+skips what follows); only the closing spec's worker starts with the relaunch
+check.
 The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
 `BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
 using the native shell's environment syntax, then clear that selection before

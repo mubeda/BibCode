@@ -361,8 +361,8 @@ needs no approval.
 
 Linux lab (Ubuntu 22.04 arm64 container, 12 CPUs visible, run under `taskset -c 0,1`,
 2026-11-12), one run on the tree of commit 12edddac9 with the probe file of commit 436561914
-copied in (the probe file's sha256 matched on the Mac and in the container; nothing else
-differed from 12edddac9):
+copied in (the probe file's sha256 matched on the Mac and in the container; no other Rust
+source differed from 12edddac9, only end-to-end test files):
 
 | Run | Background ms per reading | % of one core at 60 s | Live ms per reading | % at 1 s | % at 2 s |
 | --- | ------------------------- | --------------------- | ------------------- | -------- | -------- |
@@ -560,7 +560,8 @@ reads the system's own tools over one 5 s window and reads the source again, the
 | `/` free                  | 26.7% of `df`'s total, equal to the important-usage capacity; `df` Available is 25.2% | 92.7% of `df`'s total, equal to `df` Available        |
 
 Both runs printed `running 1 test` and `1 passed`. In the container the totals are the kernel's
-(the container has no cgroup memory limit, and the probe does not read one), as `free` reports
+(the container's `memory.max` is `max`, so it has no cgroup memory limit, and the probe does not
+read one), as `free` reports
 them there. The Linux run used the same tree identity as the cost run above. The macOS CPU
 window was not idle (other lanes were building), which the 10 point tolerance absorbs; the
 Linux one was.
