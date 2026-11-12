@@ -184,6 +184,7 @@ mod tests {
     }
 
     /// A network mount the listing left out is added once, to be hidden as a network volume.
+    /// An automount map is not: every stock Mac has one, and nobody mounted it (#292).
     #[test]
     fn mounted_network_volumes_missing_from_the_listing_are_added() {
         let mut listed = vec![
@@ -211,7 +212,6 @@ mod tests {
                 (Path::new("/"), "apfs"),
                 (Path::new("/Volumes/listed-share"), "smbfs"),
                 (Path::new("/Volumes/share"), "nfs"),
-                (Path::new("/Volumes/map"), "autofs"),
             ]
         );
         assert!(listed[2].name.is_empty() && !listed[2].is_file);
