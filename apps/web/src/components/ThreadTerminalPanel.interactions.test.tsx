@@ -8480,6 +8480,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   const openWindow = async (
     environmentId: EnvironmentId,
     fit: { cols: number; rows: number },
+    beforeAttach: (machine: Machine) => Promise<void> = async () => undefined,
   ): Promise<Machine> => {
     const runtime = createTerminalTranscriptRuntime();
     testState.sessionsByEnvironment.set(environmentId, {
@@ -8499,6 +8500,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     machines.push(machine);
     machine.mounted = await mount(<TerminalViewport {...props} />);
     await flushAnimationFrames();
+    await beforeAttach(machine);
     await connect(machine);
     return machine;
   };
@@ -9066,5 +9068,124 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     await act(async () => clientMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
     await server.deliver();
     expect(view(host).owner).toBe("this window");
+  });
+
+  describe("automatic claims wait for a settled mount (#348)", () => {
+    // happy-dom lays nothing out: the mounts report the size a test gives them.
+    const mountSizes = new WeakMap<Element, { width: number; height: number }>();
+    /** The size a mount without its own reports, such as one not created yet. */
+    let nextMountSize: { width: number; height: number } | null = null;
+    let restoreSize: () => void = () => undefined;
+    beforeEach(() => {
+      const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+      const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+      const sized = (axis: "width" | "height") =>
+        function (this: HTMLElement) {
+          return mountSizes.get(this)?.[axis] ?? nextMountSize?.[axis] ?? 0;
+        };
+      Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+        configurable: true,
+        get: sized("width"),
+      });
+      Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+        configurable: true,
+        get: sized("height"),
+      });
+      restoreSize = () => {
+        for (const [name, descriptor] of [
+          ["clientWidth", width],
+          ["clientHeight", height],
+        ] as const) {
+          if (descriptor) Object.defineProperty(HTMLElement.prototype, name, descriptor);
+          else Reflect.deleteProperty(HTMLElement.prototype, name);
+        }
+      };
+    });
+    afterEach(() => {
+      restoreSize();
+      nextMountSize = null;
+    });
+    const mountOf = (machine: Machine) =>
+      machine.mounted.container.querySelector<HTMLElement>("[data-terminal-xterm-mount]")!;
+    const resizeMount = async (
+      machine: Machine,
+      size: { width: number; height: number },
+      fit: { cols: number; rows: number },
+    ) => {
+      mountSizes.set(mountOf(machine), size);
+      await relayout(machine, fit);
+    };
+    // The panel waits TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS (100 ms) for a mount to hold still.
+    const settle = async () => {
+      await act(
+        async () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 140);
+          }),
+      );
+      await server.deliver();
+    };
+    const claimsOf = (machine: Machine) =>
+      testState.resizeCommand.mock.calls
+        .map(
+          ([request]) =>
+            request as { environmentId: string; input: { cols: number; rows: number } },
+        )
+        .filter((request) => request.environmentId === machine.environmentId)
+        .map((request) => `${request.input.cols}x${request.input.rows}`);
+
+    it("sends one claim at the final size after a mount passes through a few pixels", async () => {
+      hasFocus.mockReturnValue(true);
+      const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
+      await settle();
+      expect(view(owner)).toMatchObject({ grid: "85x26", owner: "this window" });
+      const before = claimsOf(owner).length;
+
+      // A divider dragged open from nothing: 4 px, 52 px, then its final width.
+      await resizeMount(owner, { width: 4, height: 400 }, { cols: 2, rows: 26 });
+      await resizeMount(owner, { width: 52, height: 400 }, { cols: 5, rows: 26 });
+      await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
+      expect(claimsOf(owner).slice(before)).toEqual([]);
+      await settle();
+      expect(claimsOf(owner).slice(before)).toEqual(["121x26"]);
+      expect(view(owner)).toMatchObject({ grid: "121x26", owner: "this window" });
+    });
+
+    it("claims a small owner panel that holds still", async () => {
+      hasFocus.mockReturnValue(true);
+      const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
+      await settle();
+      const before = claimsOf(owner).length;
+      await resizeMount(owner, { width: 130, height: 60 }, { cols: 18, rows: 4 });
+      await settle();
+      expect(claimsOf(owner).slice(before)).toEqual(["18x4"]);
+      expect(view(owner)).toMatchObject({ grid: "18x4", owner: "this window", scale: 1 });
+      await settle();
+      expect(claimsOf(owner).slice(before)).toEqual(["18x4"]);
+    });
+
+    it("does not claim the size a mount had while 4 px wide when its stream attached", async () => {
+      hasFocus.mockReturnValue(true);
+      nextMountSize = { width: 4, height: 400 };
+      // The panel keeps opening while the attach answer is on its way.
+      const owner = await openWindow(CLIENT, { cols: 2, rows: 26 }, (machine) =>
+        resizeMount(machine, { width: 52, height: 400 }, { cols: 5, rows: 26 }),
+      );
+      await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
+      await settle();
+      expect(claimsOf(owner).filter((size) => size === "2x26" || size === "5x26")).toEqual([]);
+      expect(view(owner)).toMatchObject({ grid: "121x26", owner: "this window" });
+    });
+
+    it("still scales a small mirror at once while its own box changes", async () => {
+      const { host, client } = await serverHostOwnsTallerGrid();
+      await settle();
+      const requests = claimsOf(client).length;
+      await resizeMount(client, { width: 300, height: 200 }, { cols: 60, rows: 25 });
+      expect(view(client)).toMatchObject({ grid: "120x50", scale: 0.5, owner: "the other window" });
+      await settle();
+      expect(claimsOf(client).length).toBe(requests);
+      expect(view(host).owner).toBe("this window");
+    });
   });
 });
