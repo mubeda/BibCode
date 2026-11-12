@@ -1,8 +1,8 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
-Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution; amendments A10 and A11 added on the user's instruction of 2026-11-11 and reviewed by Codex and the advisor, with their agent's calls listed for the user before the push)
+Status: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A9 approved in chat during execution; amendments A10 and A11 added on the user's instruction of 2026-11-11 and reviewed by Codex and the advisor, with their agent's calls listed for the user before the push; amendments A12, A13 and A14 added on the user's instruction of 2026-11-11)
 Size: full Mode: gated Type: bug class (#341, #343, #344, #345) and feature (#340, #342, #290)
-Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09; issues #292 and #293 by amendments A10 and A11, and #346 by amendment A12. One pull request closes all ten.
+Source: GitHub issues #340, #341, #342, #343, #344, #345 and #290 of this repository, and the conversation of 2026-11-09; issues #292 and #293 by amendments A10 and A11, #346 by amendment A12, #347 by amendment A13 and #348 by amendment A14. One pull request covers all twelve.
 
 This spec is longer than the usual 25 requirements because the maintainer chose one pull request for seven issues. Each issue has its own section and its requirements can be planned and reviewed on their own. Built-in theme values are in [theme-palettes.md](theme-palettes.md).
 
@@ -1776,6 +1776,8 @@ Implement action.
 
 ### R102. A keyboard shortcut starts a review [Should] (amendment A11)
 
+Correction of 2026-11-12: the shortcut is a built-in fallback, like the find shortcut, not an entry of the shipped default keybindings, because a new command in the shipped defaults breaks an older client's decoding of the server's settings and a person with a saved keybindings file never receives new defaults.
+
 The keybinding service SHALL offer the command `sourceControl.review`, bound by default to
 `mod+alt+shift+r` outside a focused terminal, which starts a review exactly as the button does.
 
@@ -1879,6 +1881,110 @@ WHEN a creation succeeds with Create more on, the dialog SHALL stay open with Na
 - GIVEN Create more on with Branch mode, a base override and a picked agent
 - WHEN creation succeeds
 - THEN the dialog stays open with only the per-worktree fields cleared and no navigation happens; WHEN it is then closed and opened again, R106 and R107 apply
+
+#### Amendment A13: the composer's model picker stays on the chat's provider (#347)
+
+A13 (added on the user's instruction in chat on 2026-11-11 during execution, diagnosed with a reproduction first). Issue #347 joins this pull request: a chat created for one agent listed every ready provider's models before its first turn. Requirements R110 to R112, decision D51. Plan phase: Phase 14.
+
+### R110. A chat created for an agent lists only that agent's models [Must] (amendment A13)
+
+WHILE a chat that exists on the server has not started its first turn, the composer's model picker SHALL list only the models of the provider instance the chat was created for, and SHALL refuse a selection that belongs to another provider.
+
+#### Scenario: a new main chat with two ready providers
+
+- GIVEN two ready providers and a never-started main chat created for the first
+- WHEN the model picker opens
+- THEN it lists the first provider's models only, a second account of the same driver is not offered, and a stale selection from the other provider is not sent
+
+### R111. A blank draft still chooses its provider [Must] (amendment A13)
+
+WHILE a chat is a local draft that does not exist on the server, the model picker SHALL list every ready provider, and the provider picked in the draft SHALL be the one the chat binds to. Adopted worktrees and pull request threads take the project's Default Agent.
+
+#### Scenario: a drafted pick
+
+- GIVEN a blank draft with two ready providers
+- WHEN a model of the second provider is picked and the chat is created
+- THEN the chat is bound to the second provider
+
+### R112. An unavailable provider is explained and Send is refused [Must] (amendment A13)
+
+IF the provider a chat is bound to is disabled, removed or not supported by the server, THEN the composer SHALL name the provider and the way to recover, SHALL refuse Send with that reason, and SHALL NOT fall back to another provider. An instance that is configured but not reported yet SHALL NOT be called unavailable.
+
+#### Scenario: a disabled provider, before and after the first turn
+
+- GIVEN a chat bound to a provider that was then disabled
+- WHEN the composer shows, for a never-started and for a started chat
+- THEN a banner names the provider and points to Settings > Providers or a new chat with another agent, and Send submits nothing
+
+#### Amendment A14: one terminal in several windows keeps its last lines (#348)
+
+A14 (added on the user's instruction in chat on 2026-11-11 during execution, with the user's ruling of 2026-11-11 on how two windows share one terminal). Issue #348 joins this pull request: an AI terminal lost its bottom lines or its whole footer until a panel was resized. The owner uses the macOS app as a client of a Linux desktop app, so two windows of different size show one terminal. The symptom was reproduced only with two viewers; single-window runs on three environments did not show it, and the owner's observation that a panel resize repairs it is not explained. Requirements R113 to R118, decisions D52 to D54. Plan phase: Phase 15.
+
+### R113. The window last used sizes the terminal [Must] (amendment A14)
+
+WHEN a person focuses, types in or clicks a terminal in one window, that window SHALL become the one that sizes the terminal. A window nobody is using SHALL NOT take the size, including when its tab is shown again, when it reloads or when the terminal queries it.
+
+#### Scenario: an unattended window does not take the size back
+
+- GIVEN a client window that owns the size and a second window left idle
+- WHEN the idle window's tab is hidden and shown, or it reloads
+- THEN the client window still owns the size
+
+#### Scenario: a click claims
+
+- GIVEN a window showing a mirror
+- WHEN the person clicks the terminal in it
+- THEN that window owns the size and the program is told its fit
+
+### R114. A window that does not size the terminal shows all of it [Must] (amendment A14)
+
+WHILE another window sizes the terminal, a window SHALL show the whole grid: scaled down to fit when the grid is larger than its space, never below half size, after which it scrolls pinned to the bottom; at normal size with empty space when the grid is smaller. It SHALL say that another window sizes the terminal and at what scale.
+
+#### Scenario: a taller owner
+
+- GIVEN an owner of 120 by 50 and a mirror that fits 100 by 30
+- WHEN the program draws its footer on the last rows
+- THEN the mirror shows the footer, clipped by no pixel
+
+### R115. Every window converges on the size the server holds [Must] (amendment A14)
+
+WHEN a window asks for a size, the server SHALL answer with the outcome, the size it holds, the terminal generation and a sequence, and the client SHALL apply answers and events in generation and sequence order and ignore older ones. An equal claim SHALL be acknowledged to the requester in stream order.
+
+#### Scenario: a stale answer
+
+- GIVEN a resize answer that arrives after a newer size event
+- WHEN the client reads it
+- THEN the newer size stays
+
+### R116. Mixed versions keep working [Must] (amendment A14)
+
+The server SHALL answer `terminal.resize` in the released form unless the request says the caller reads the new answer, and the client SHALL send an input origin only to a server that advertises it. A client of either age SHALL type and resize against a server of either age.
+
+#### Scenario: the released client against the new server
+
+- GIVEN the resize codec of the released contract
+- WHEN the new server answers a request without the flag
+- THEN the answer decodes, and no extra acknowledgement is sent
+
+### R117. Only real typing counts as use [Must] (amendment A14)
+
+The server SHALL NOT treat the terminal's automatic replies as use of a window. WHEN the owner leaves several viewers, the size SHALL go to the one typed in last, and with no typing on record it SHALL stay un-owned until a person uses a window. Input from an older client, which carries no origin, SHALL count as use.
+
+#### Scenario: a reply to a query
+
+- GIVEN an owner that left and an idle mirror whose terminal answers a device query
+- WHEN the owner returns
+- THEN the owner takes the size back
+
+### R118. A refused low-level resize does not leave a wrong size [Must] (amendment A14)
+
+IF the operating system refuses a terminal resize, THEN the server SHALL retry the latest size after 100 ms, 500 ms and 2 s without another request, and if every retry is refused SHALL publish the size the terminal kept, so that every window shows the truth.
+
+#### Scenario: refused on every retry
+
+- GIVEN a terminal of 80 by 30 whose resize to 100 by 40 is refused four times
+- WHEN the retries are exhausted
+- THEN every window is told 80 by 30, a warning is logged without terminal content, and the owner asking again for 100 by 40 sends nothing to the terminal until the state changes
 
 ## Constraints and assumptions
 
@@ -1985,6 +2091,14 @@ D48. Every disabled state of the button names its reason, including loading ("Ch
 D49. Review settings belong to the environment that runs the review, and a review model whose provider instance differs from the reviewer's is ignored in favour of the provider's session default. Alternatives considered: one review model per provider (more settings than the issue asks for). Decided by: agent's call. Source: #293 "Settings".
 
 D50. Create worktree resets at its opening boundary: every opening is a new creation, including after Close or Escape, and no base override is remembered between openings; the Settings Default Agent and the caller's project are fresh defaults, not remembered form data; Create more keeps its batch options within one opening. Alternatives considered: resetting only after a successful creation (misses dismissal); remounting the dialog with a changing key (wider lifecycle change); keeping the documented same-project source retention (the reported defect). Decided by: the user, by adopting issue #346's proposal. Source: #346.
+
+D51. A chat that exists on the server is bound to the instance it was created for, with the lock started chats already use; a local draft stays unlocked. Alternatives considered: lock by driver only (lists a second account's models the chat cannot use); fall back to another provider when the chat's own is unavailable (sends a turn to an agent the person did not choose). Decided by: agent's call, confirmed by the user on 2026-11-11. Source: #347.
+
+D52. The window last used sizes the terminal; other windows scale the picture to fit and never clip; a larger window shows normal size with empty space. Alternatives considered: the smallest window sizes it; the active window sizes it and others scroll. Decided by: the user, 2026-11-11. Source: #348.
+
+D53. The server is the authority on the terminal size: the resize answer and an ordered acknowledgement replace the client's timed settle. Alternatives considered: a client-only fix with a 250 ms settle and process-id fencing (judged unsound in review, because the client cannot order its answer against the stream). Decided by: agent's call after review. Source: #348.
+
+D54. New wire shapes are negotiated, never sent blind: an optional request field for the resize answer, a server capability for the input origin. Alternatives considered: a new method name; a boolean for typing (cannot keep older clients' input counting while excluding new clients' replies). Decided by: agent's call. Source: #348.
 
 ## Risks
 

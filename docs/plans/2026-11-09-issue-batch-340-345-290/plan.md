@@ -1,7 +1,7 @@
 # Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Status: Approved 2026-11-09 (approved in chat by the user)
-Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 45d753cdb3f1)
+Spec: spec.md (Status line: Approved 2026-11-09 (approved in chat by the user, with amendments A1 and A2; amendments A3 to A6 approved in chat during execution), sha256 02332cf34056)
 Repository: this repository
 Base: main
 
@@ -42,6 +42,8 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 - A10 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #292 joins this pull request as Phase 11 (R66 to R85, D22 to D33): a Host dashboard per environment. Its design note is `docs/plans/2026-11-11-host-metrics-dashboard-design.md`. Reviewed by Codex in two rounds and triaged with the advisor; its agent's calls await the user's confirmation before the push.
 - A11 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #293 joins this pull request as Phase 12 (R90 to R105, D40 to D49; R86 to R89 and D34 to D39 are unused): a Review button in Source Control. Its design note is `docs/plans/2026-11-11-code-review-button-design.md`. Reviewed the same way. Phase 12's plan was final first, so it runs before Phase 11; the two never run at the same time, because both change the contracts and their generated fixtures and only one lane compiles Rust. Task 8.5 depends on both.
 - A12 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #346 joins this pull request as Phase 13 (R106 to R109, D50): every opening of Create worktree starts fresh. It is web-only and shares no source file with Phases 11 and 12, so it runs beside them.
+- A13 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #347 joins this pull request as Phase 14 (R110 to R112, D51): the composer's model picker stays on the chat's provider, and an unavailable provider is explained.
+- A14 (added on the user's instruction in chat on 2026-11-11 during execution). Issue #348 joins this pull request as Phase 15 (R113 to R118, D52 to D54): one terminal in several windows keeps its last lines. The pull request references #348 without closing it until the owner's setup is confirmed.
 - A2 (Verification of R1 and R2). The packaged-app screenshot of the pipeline detail view is dropped, because the end-to-end fixture has no pipeline host. R1 and R2 are proven by component tests.
 
 ## Review focus
@@ -82,21 +84,23 @@ Both were found by the plan review and approved by the user on 2026-11-09; `spec
 
 ## Phases
 
-| Phase | File                                          | Goal                                                                   | Round | Depends on                             | Tier         |
-| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | -------------------------------------- | ------------ |
-| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                                   | standard     |
-| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                                   | most capable |
-| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                                      | most capable |
-| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                                      | most capable |
-| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                                      | most capable |
-| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                                   | most capable |
-| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                                   | most capable |
-| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates                                     | 7     | 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13 | standard     |
-| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                                   | most capable |
-| 10    | phases/PHASE-10-sidebar-hierarchy.md          | Five readable sidebar levels that themes can style (A9)                | 3     | 7, 9                                   | most capable |
-| 11    | phases/PHASE-11-host-dashboard.md             | A Host dashboard for each environment (#292, A10)                      | 6     | 10, 12                                 | most capable |
-| 12    | phases/PHASE-12-review-button.md              | A Review button that starts a guarded review session (#293, A11)       | 5     | 5, 10                                  | most capable |
-| 13    | phases/PHASE-13-fresh-worktree-dialog.md      | Every opening of Create worktree starts fresh (#346, A12)              | 5     | 10                                     | most capable |
+| Phase | File                                          | Goal                                                                   | Round | Depends on                   | Tier         |
+| ----- | --------------------------------------------- | ---------------------------------------------------------------------- | ----- | ---------------------------- | ------------ |
+| 1     | phases/PHASE-01-pipeline-stage-headers.md     | Stage headers read as group labels (#340)                              | 1     | none                         | standard     |
+| 2     | phases/PHASE-02-background-git-index-locks.md | Background Git never blocks the person's Git and leaves no lock (#341) | 1     | none                         | most capable |
+| 3     | phases/PHASE-03-status-during-push.md         | Status is delivered while a push waits (#345)                          | 2     | 2                            | most capable |
+| 4     | phases/PHASE-04-remote-push-guidance.md       | A failed remote push says where to sign in (#343)                      | 3     | 3                            | most capable |
+| 5     | phases/PHASE-05-orphan-worktree-warnings.md   | Orphan warnings need worktree evidence (#344)                          | 4     | 4                            | most capable |
+| 6     | phases/PHASE-06-rich-markdown-editing.md      | Markdown is editable in rendered view (#342)                           | 1     | none                         | most capable |
+| 7     | phases/PHASE-07-custom-themes.md              | Built-in and custom color themes (#290)                                | 1     | none                         | most capable |
+| 8     | phases/PHASE-08-end-to-end-docs-gates.md      | End-to-end proof, documents, gates                                     | 7     | 1, 2, 3, 4, 5, 6, 7, 9 to 15 | standard     |
+| 9     | phases/PHASE-09-desktop-save-and-close.md     | Desktop theme export and asking before closing with unsaved edits (A5) | 2     | 6, 7                         | most capable |
+| 10    | phases/PHASE-10-sidebar-hierarchy.md          | Five readable sidebar levels that themes can style (A9)                | 3     | 7, 9                         | most capable |
+| 11    | phases/PHASE-11-host-dashboard.md             | A Host dashboard for each environment (#292, A10)                      | 6     | 10, 12                       | most capable |
+| 12    | phases/PHASE-12-review-button.md              | A Review button that starts a guarded review session (#293, A11)       | 5     | 5, 10                        | most capable |
+| 13    | phases/PHASE-13-fresh-worktree-dialog.md      | Every opening of Create worktree starts fresh (#346, A12)              | 5     | 10                           | most capable |
+| 14    | phases/PHASE-14-composer-provider-lock.md     | The model picker stays on the chat's provider (#347, A13)              | 5     | 10                           | most capable |
+| 15    | phases/PHASE-15-terminal-size-ownership.md    | One terminal in several windows keeps its last lines (#348, A14)       | 5     | 10                           | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds. Tasks inside a phase run one after another, in the order their Depends on lines give: one lane per phase, never one lane per task. The four server phases (2, 3, 4, 5) are a chain because they share `repository.rs`, `git_vcs.rs` and `manager/operations.rs`. Run at most one lane that compiles Rust at a time, and check `df -h .` for at least 60 GB free before a lane starts a build.
 
@@ -272,6 +276,15 @@ Parallel conflicts: round 1 runs Phases 1, 2, 6 and 7. They share no path: Phase
 | R107        | 13.1                     |
 | R108        | 13.1                     |
 | R109        | 13.1                     |
+| R110        | 14.1                     |
+| R111        | 14.1                     |
+| R112        | 14.2, 14.3               |
+| R113        | 15.2, 15.7               |
+| R114        | 15.2, 15.7               |
+| R115        | 15.3                     |
+| R116        | 15.4                     |
+| R117        | 15.5                     |
+| R118        | 15.6                     |
 
 ## End-to-end verification
 

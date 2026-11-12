@@ -1,96 +1,108 @@
 # Progress: Issue batch: pipeline headers, Git reliability, rich Markdown editing and custom themes
 
 Plan: plan.md
-Spec: spec.md (sha256 45d753cdb3f1)
+Spec: spec.md (sha256 02332cf34056)
 Plan status: Approved 2026-11-09
 Plan review: Codex gpt-6.1-sol (effort high), round 2 of 2, Needs rework; 14 findings handled in reviews/plan-review-2.md (round 1: 18 findings, reviews/plan-review-1.md)
 Executor: mstack-codex-review-workflow
 Branch: claude/next-pr-planning-13d367
 
-| Task  | Title                                                                     | Phase | State       | Owner           | Note                                |
-| ----- | ------------------------------------------------------------------------- | ----- | ----------- | --------------- | ----------------------------------- |
-| 1.1   | Restyle the stage header as a group label                                 | 1     | Closed      | A, sonnet       | 58 tests pass; Codex finding fixed  |
-| 2.1   | Prove the lock source and make background reads lock-free                 | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green    |
-| 2.2   | Ask Git to stop before killing it                                         | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green    |
-| 2.3   | Remove BiBCode's own leftover lock and leave none at shutdown             | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green    |
-| 3.1   | Let a mutation reopen status reads while it keeps the write lock          | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green    |
-| 3.2   | Stacked actions deliver status while the push waits                       | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green    |
-| 3.3   | Git Manager push-family operations deliver status; pull and fetch do not  | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green    |
-| 4.1   | Server guidance for a remote missing-credentials push                     | 4     | Closed      | H, opus         | Integrated with H2 and lane T       |
-| 4.2   | Show the guidance and keep Git's line readable in both surfaces           | 4     | Closed      | H, opus         | Integrated with H2 and lane T       |
-| 5.1   | Record the worktrees BiBCode creates                                      | 5     | Closed      | I, opus         | Integrated with I2                  |
-| 5.2   | Warn only for folders with worktree evidence                              | 5     | Closed      | I, opus         | Integrated with I2                  |
-| 6.1   | Write and review the design note                                          | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.2   | Let the session take rich edits without losing source history             | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.3   | Source-preserving reconcile                                               | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.4   | Editable rendered surface on the existing save path                       | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.5   | Formatting group and its commands                                         | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.6   | Link dialog                                                               | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.7   | Insert image                                                              | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.8   | Frontmatter split and the read-only rule                                  | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 6.9   | Editor packages, schema and a faithful round trip                         | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 7.1   | Write and review the design note                                          | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.2   | Theme file format and validation                                          | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.3   | New color tokens that default to today's look                             | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.4   | Built-in theme files and the contrast check                               | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.5   | Theme library and slots store                                             | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.6   | Apply a theme, and paint it before the app appears                        | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.7   | New terminal sessions follow the theme when asked to                      | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.8   | Appearance section, theme list and its actions                            | 7     | Closed      | D to D6, opus   | Merged; A8 row click, web 11093     |
-| 7.9   | Theme editor with live preview, terminal colors and contrast warnings     | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.10  | Export and import                                                         | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.11  | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.12  | Focus ring and control shadow tokens                                      | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.13  | One color parser and one token resolver                                   | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 7.14  | The pipeline job log follows the terminal palette                         | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921      |
-| 8.1   | Desktop end-to-end test for rich Markdown editing                         | 8     | In progress |                 | Lane E, opus                        |
-| 8.2   | Desktop end-to-end test for themes                                        | 8     | In progress |                 | Lane E, opus                        |
-| 8.3   | User guide, runbooks and notices                                          | 8     | In progress |                 | Built; e2e sentences to verify      |
-| 8.4   | Last token switch and changelog                                           | 8     | Closed      |                 | Lane P1, integrated                 |
-| 8.5   | Final gates, follow-up issue and report                                   | 8     | Open        |                 |                                     |
-| 9.1   | Export a theme through the native Save dialog                             | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079      |
-| 9.2   | Ask before closing with unsaved Files edits                               | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079      |
-| 9.3   | The native close protocol                                                 | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079      |
-| 8.6   | Desktop end-to-end test for export and the close dialog                   | 8     | In progress |                 | Lane E, opus                        |
-| 6.10  | A checkbox in a read-only file keeps source history                       | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028  |
-| 3.4   | A status refresh does not wait on a slow pull-request lookup              | 3     | Closed      | E to E4, opus   | Merged; A7 table, 26 lookup tests   |
-| 10.1  | Sidebar level tokens, their styles and the editor preview                 | 10    | Closed      | S1 to S1c, opus | Integrated, branch at 56f247697     |
-| 10.2  | The left panel draws the five levels                                      | 10    | Closed      | S2, opus        | Integrated with S3 and S4           |
-| 11.1  | Statistics, chart tiers and the volume filter                             | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4             |
-| 11.2  | The collector's two loops, the disk workers, the time limit and shutdown  | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4             |
-| 11.3  | The native source, and the volume probe on macOS and Linux                | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4             |
-| 11.4  | Measure the collector's cost, then apply the sampling policy              | 11    | In progress | J1, opus        | macOS measured; Linux probe due     |
-| 11.5  | The host stream protocol and the capability flag                          | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4             |
-| 11.6  | Start the collector with the server, stop it in quiesce, and test it on t | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4             |
-| 11.7  | The client subscription and the dashboard's state logic                   | 11    | In progress | J2, opus        |                                     |
-| 11.8  | The Host dashboard sheet and its charts                                   | 11    | In progress | J2, opus        |                                     |
-| 11.9  | Host dashboard entry points                                               | 11    | In progress | J2, opus        |                                     |
-| 11.10 | Readings match the operating system's tools (P1.3, can be cut)            | 11    | Open        |                 |                                     |
-| 11.11 | Hidden volumes disclosure (P1.2, can be cut)                              | 11    | Open        |                 |                                     |
-| 11.12 | MCP host snapshot tool (P2.1, can be cut)                                 | 11    | Open        |                 |                                     |
-| 11.13 | Per-volume statistics (P2.2, can be cut)                                  | 11    | Open        |                 |                                     |
-| 11.14 | Packaged desktop end-to-end test of the local Host dashboard              | 11    | Open        |                 |                                     |
-| 11.15 | Changelog, user guide, runbook review and final gates for this phase      | 11    | Open        |                 |                                     |
-| 12.1  | Review settings in the contract and on the server                         | 12    | Closed      | K1, opus        | Integrated at 3dce787b6             |
-| 12.2  | The project review prompt, migration 73 and replay                        | 12    | Closed      | K1, opus        | Integrated at 3dce787b6             |
-| 12.3  | The review thread flag, migration 74 and the capability                   | 12    | Closed      | K1, opus        | Integrated at 3dce787b6             |
-| 12.4  | Windows batch launch: length check beside the encoder, and native argumen | 12    | Closed      | K1, opus        | Integrated at 3dce787b6             |
-| 12.5  | Scope, prompt and reviewer resolution in the web                          | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.6  | The review terminal command                                               | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.7  | A review thread offers no Implement                                       | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.8  | The Review button starts a chat or terminal review                        | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.9  | The project prompt dialog                                                 | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.10 | The Code review group in Settings → Agents                                | 12    | In progress | K2, opus        | Built, merged; review fixes pending |
-| 12.11 | Packaged desktop end-to-end review                                        | 12    | Open        |                 |                                     |
-| 12.12 | Changelog, user guide, architecture and runbook review                    | 12    | Open        |                 |                                     |
-| 12.13 | Keyboard shortcut for a review (P1.1)                                     | 12    | Open        |                 |                                     |
-| 12.14 | One-off reviewer from the menu (P1.2)                                     | 12    | Open        |                 |                                     |
-| 12.15 | Scope in the tooltip (P1.3)                                               | 12    | Open        |                 |                                     |
-| 12.16 | Review with one-off instructions (P2.1)                                   | 12    | Open        |                 |                                     |
-| 12.17 | Turn on terminal reviews on Windows                                       | 12    | Open        |                 |                                     |
-| 12.18 | Fix the Windows batch `%` encoding (conditional)                          | 12    | Open        |                 |                                     |
-| 13.1  | Reproduce, find the cause, and reset at the opening boundary              | 13    | Closed      | W1, opus        | Integrated; Codex clean             |
-| 13.2  | User guide, runbook scenario and changelog                                | 13    | Closed      | W1, opus        | Integrated; Codex clean             |
+| Task  | Title                                                                     | Phase | State       | Owner           | Note                                  |
+| ----- | ------------------------------------------------------------------------- | ----- | ----------- | --------------- | ------------------------------------- |
+| 1.1   | Restyle the stage header as a group label                                 | 1     | Closed      | A, sonnet       | 58 tests pass; Codex finding fixed    |
+| 2.1   | Prove the lock source and make background reads lock-free                 | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green      |
+| 2.2   | Ask Git to stop before killing it                                         | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green      |
+| 2.3   | Remove BiBCode's own leftover lock and leave none at shutdown             | 2     | Closed      | B to B3, opus   | Merged; lib 5324, 4 suites green      |
+| 3.1   | Let a mutation reopen status reads while it keeps the write lock          | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green      |
+| 3.2   | Stacked actions deliver status while the push waits                       | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green      |
+| 3.3   | Git Manager push-family operations deliver status; pull and fetch do not  | 3     | Closed      | E to E4, opus   | Merged; lib 5324, 4 suites green      |
+| 4.1   | Server guidance for a remote missing-credentials push                     | 4     | Closed      | H, opus         | Integrated with H2 and lane T         |
+| 4.2   | Show the guidance and keep Git's line readable in both surfaces           | 4     | Closed      | H, opus         | Integrated with H2 and lane T         |
+| 5.1   | Record the worktrees BiBCode creates                                      | 5     | Closed      | I, opus         | Integrated with I2                    |
+| 5.2   | Warn only for folders with worktree evidence                              | 5     | Closed      | I, opus         | Integrated with I2                    |
+| 6.1   | Write and review the design note                                          | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.2   | Let the session take rich edits without losing source history             | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.3   | Source-preserving reconcile                                               | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.4   | Editable rendered surface on the existing save path                       | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.5   | Formatting group and its commands                                         | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.6   | Link dialog                                                               | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.7   | Insert image                                                              | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.8   | Frontmatter split and the read-only rule                                  | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 6.9   | Editor packages, schema and a faithful round trip                         | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 7.1   | Write and review the design note                                          | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.2   | Theme file format and validation                                          | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.3   | New color tokens that default to today's look                             | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.4   | Built-in theme files and the contrast check                               | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.5   | Theme library and slots store                                             | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.6   | Apply a theme, and paint it before the app appears                        | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.7   | New terminal sessions follow the theme when asked to                      | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.8   | Appearance section, theme list and its actions                            | 7     | Closed      | D to D6, opus   | Merged; A8 row click, web 11093       |
+| 7.9   | Theme editor with live preview, terminal colors and contrast warnings     | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.10  | Export and import                                                         | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.11  | Scrollbars, sidebar text, diagrams and annotation colors follow the theme | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.12  | Focus ring and control shadow tokens                                      | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.13  | One color parser and one token resolver                                   | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 7.14  | The pipeline job log follows the terminal palette                         | 7     | Closed      | D to D4, opus   | Merged; web 11028, scripts 921        |
+| 8.1   | Desktop end-to-end test for rich Markdown editing                         | 8     | In progress |                 | Lane E, opus                          |
+| 8.2   | Desktop end-to-end test for themes                                        | 8     | In progress |                 | Lane E, opus                          |
+| 8.3   | User guide, runbooks and notices                                          | 8     | In progress |                 | Built; e2e sentences to verify        |
+| 8.4   | Last token switch and changelog                                           | 8     | Closed      |                 | Lane P1, integrated                   |
+| 8.5   | Final gates, follow-up issue and report                                   | 8     | Open        |                 |                                       |
+| 9.1   | Export a theme through the native Save dialog                             | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079        |
+| 9.2   | Ask before closing with unsaved Files edits                               | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079        |
+| 9.3   | The native close protocol                                                 | 9     | Closed      | G to G5, opus   | Merged; desktop 517, web 11079        |
+| 8.6   | Desktop end-to-end test for export and the close dialog                   | 8     | In progress |                 | Lane E, opus                          |
+| 6.10  | A checkbox in a read-only file keeps source history                       | 6     | Closed      | C to C5, opus   | Merged; files 604 tests, web 11028    |
+| 3.4   | A status refresh does not wait on a slow pull-request lookup              | 3     | Closed      | E to E4, opus   | Merged; A7 table, 26 lookup tests     |
+| 10.1  | Sidebar level tokens, their styles and the editor preview                 | 10    | Closed      | S1 to S1c, opus | Integrated, branch at 56f247697       |
+| 10.2  | The left panel draws the five levels                                      | 10    | Closed      | S2, opus        | Integrated with S3 and S4             |
+| 11.1  | Statistics, chart tiers and the volume filter                             | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4               |
+| 11.2  | The collector's two loops, the disk workers, the time limit and shutdown  | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4               |
+| 11.3  | The native source, and the volume probe on macOS and Linux                | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4               |
+| 11.4  | Measure the collector's cost, then apply the sampling policy              | 11    | In progress | J1, opus        | macOS measured; Linux probe due       |
+| 11.5  | The host stream protocol and the capability flag                          | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4               |
+| 11.6  | Start the collector with the server, stop it in quiesce, and test it on t | 11    | Closed      | J1, opus        | Integrated at e77f6a7b4               |
+| 11.7  | The client subscription and the dashboard's state logic                   | 11    | In progress | J2, opus        |                                       |
+| 11.8  | The Host dashboard sheet and its charts                                   | 11    | In progress | J2, opus        |                                       |
+| 11.9  | Host dashboard entry points                                               | 11    | In progress | J2, opus        |                                       |
+| 11.10 | Readings match the operating system's tools (P1.3, can be cut)            | 11    | Open        |                 |                                       |
+| 11.11 | Hidden volumes disclosure (P1.2, can be cut)                              | 11    | Open        |                 |                                       |
+| 11.12 | MCP host snapshot tool (P2.1, can be cut)                                 | 11    | Open        |                 |                                       |
+| 11.13 | Per-volume statistics (P2.2, can be cut)                                  | 11    | Open        |                 |                                       |
+| 11.14 | Packaged desktop end-to-end test of the local Host dashboard              | 11    | Open        |                 |                                       |
+| 11.15 | Changelog, user guide, runbook review and final gates for this phase      | 11    | Open        |                 |                                       |
+| 12.1  | Review settings in the contract and on the server                         | 12    | Closed      | K1, opus        | Integrated at 3dce787b6               |
+| 12.2  | The project review prompt, migration 73 and replay                        | 12    | Closed      | K1, opus        | Integrated at 3dce787b6               |
+| 12.3  | The review thread flag, migration 74 and the capability                   | 12    | Closed      | K1, opus        | Integrated at 3dce787b6               |
+| 12.4  | Windows batch launch: length check beside the encoder, and native argumen | 12    | Closed      | K1, opus        | Integrated at 3dce787b6               |
+| 12.5  | Scope, prompt and reviewer resolution in the web                          | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.6  | The review terminal command                                               | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.7  | A review thread offers no Implement                                       | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.8  | The Review button starts a chat or terminal review                        | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.9  | The project prompt dialog                                                 | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.10 | The Code review group in Settings → Agents                                | 12    | In progress | K2, opus        | Built, merged; review fixes pending   |
+| 12.11 | Packaged desktop end-to-end review                                        | 12    | Open        |                 |                                       |
+| 12.12 | Changelog, user guide, architecture and runbook review                    | 12    | Open        |                 |                                       |
+| 12.13 | Keyboard shortcut for a review (P1.1)                                     | 12    | Open        |                 |                                       |
+| 12.14 | One-off reviewer from the menu (P1.2)                                     | 12    | Open        |                 |                                       |
+| 12.15 | Scope in the tooltip (P1.3)                                               | 12    | Open        |                 |                                       |
+| 12.16 | Review with one-off instructions (P2.1)                                   | 12    | Open        |                 |                                       |
+| 12.17 | Turn on terminal reviews on Windows                                       | 12    | Open        |                 |                                       |
+| 12.18 | Fix the Windows batch `%` encoding (conditional)                          | 12    | Open        |                 |                                       |
+| 13.1  | Reproduce, find the cause, and reset at the opening boundary              | 13    | Closed      | W1, opus        | Integrated; Codex clean               |
+| 13.2  | User guide, runbook scenario and changelog                                | 13    | Closed      | W1, opus        | Integrated; Codex clean               |
+| 14.1  | Reproduce, and bind a never-started server chat to its provider           | 14    | Closed      | W2, opus        | Integrated; Codex clean               |
+| 14.2  | Explain an unavailable provider and refuse Send                           | 14    | Closed      | W2b, opus       | Integrated; Codex clean               |
+| 14.3  | The server says when a configured agent is unsupported                    | 14    | In progress | S2, opus        |                                       |
+| 14.4  | User guide and changelog                                                  | 14    | Closed      | W2, opus        | Integrated                            |
+| 15.1  | A footer invariant spec and the reproduction record                       | 15    | Closed      | W4, opus        | Integrated; lab run 4,600 steps       |
+| 15.2  | A mirror scales the picture and never clips                               | 15    | In progress | W6, opus        | Review: unowned and focus claims      |
+| 15.3  | The resize answer states what the server holds                            | 15    | Closed      | T1, opus        | Integrated; findings fixed by T2w, T3 |
+| 15.4  | Mixed versions keep working in both directions                            | 15    | In progress | T3, opus        | Integrated; Codex review running      |
+| 15.5  | Typing is told apart from the terminal's own replies                      | 15    | In progress | T3, opus        | Integrated; Codex review running      |
+| 15.6  | A refused low-level resize is retried, then the truth is published        | 15    | In progress | T3, opus        | Integrated; Codex review running      |
+| 15.7  | The real pair, on the final build                                         | 15    | Open        |                 |                                       |
+| 15.8  | Documentation and changelog                                               | 15    | Closed      | T1, T3          | Integrated                            |
 
 ## Log
 
@@ -206,3 +218,4 @@ Branch: claude/next-pr-planning-13d367
 - 2026-11-12 03:30 Integrated since the last entry: lane W6 (two viewers: a mirror scales the picture to fit and never clips, floor 0.5 then scroll pinned to the bottom; attach and focus claims against a live owner need recent user input; the notice says the scale), lane T1 (the resize answer states what the server holds; a no-op is acknowledged to the requester in stream order; generations on snapshots, exits and closes; a refused PTY resize is remembered; the timed local settle and pid fencing removed), lane J2 and its follow-up (the Host dashboard sheet, seven states, three entries, keyboard-reachable charts, a real stream-cleanup test), lane K4 (review shortcut as a built-in fallback, one-off reviewer, scope tooltip, one-off instructions, the packaged review spec, docs), lane W7 (parked web follow-ups: theme Undo all-or-nothing, focus after a half-failed Delete, the Keybindings page's duplicate key and narrow layout, the footer spec's three faults, every Sheet takes the native-preview occlusion lease, the harness relaunches once on a dead webview; the 4 px gap is not a defect). Web gates on the combined tree at 5056c08b8: vp check, web and e2e tsc, web suite 11453 passed, client-runtime 1291, scripts 939, markdown links, all exit 0. Deviation recorded: the review shortcut is not a shipped default (a new command in the defaults breaks an older client's config decode); R102 and D46 to be reworded.
 - 2026-11-12 03:30 Reviews, each triaged: the Host dashboard (astra): eleven findings accepted (a panicking disk job disables discovery; a hung listing is silent; sleep weighted as observed time; wall-clock ordering; failed capacity reads reported as success; the merged APFS entry's read-only flag; stale readings shown as live; the statistics start; keyboard access; flaky timing tests; a cleanup test that could not fail); the web ones fixed by lane J2, the server ones with lane S1. The size protocol (astra): seven findings accepted, among them one that blocks the push (an older client's null-only result codec rejects the new resize answer, so mixed versions across a remote connection would see successful resizes as failures), a resync that discards the missing acknowledgement, a closed generation revived by a delayed snapshot, output rendered before its resize when streams are merged, an older server leaving the new client waiting, a refused PTY resize never retried, automatic terminal replies counted as typing; client ones with lane T2w, server ones queued.
 - 2026-11-12 03:30 #348 on the real pair (lane V1: the Linux desktop app in the owner's VM as server, a headless Chromium client, about 60 runs on builds from before the two fixes, Profiler on): the client is cut off at the bottom by 85 to 257 px whenever the Linux window owns the size and is taller, always with the notice; the Linux window takes the size back unattended after its tab is hidden and shown (2 of 6, 2 of 5) and after a short freeze (2 of 2); once, a client click did not take the size back; a right-panel toggle never repaired a clipped client (0 of 7), a click did. This reproduces the footer loss as mirror clipping but not the owner's "a panel resize fixes it" nor a missing notice. Profiler: one `client.stall` of 1.0 s on the older build, unclassified; no slow or hung RPC. Re-test on the final build is queued. Lane S1 (opus, the Rust slot) runs the combined contract regeneration, the review button's two server launch fixes and prompt validation, the dashboard's server findings and contract additions, and the first full server test pass.
+- 2026-11-12 05:00 Amendments A13 (#347, Phase 14, R110 to R112, D51) and A14 (#348, Phase 15, R113 to R118, D52 to D54) written from the work already integrated; R102 corrected (the review shortcut is a built-in fallback, not a shipped default). Integrated since the last entry: lane T2w (client fixes of the size protocol), lane S1 (Host dashboard and review launch fixes on the server), lane W8 (web follow-ups, batch two), lane T3 (9e91922d9..c7c37fac1: the resize answer is negotiated with an optional request field and older clients get the released answer; input says who produced it, behind a server capability; with several viewers left the size goes to the one typed in last; a refused low-level resize is retried after 100 ms, 500 ms and 2 s and then the kept size is published; a click reclaiming the size is pinned by a test that fails without the handler). The Linux lab ran 4,600 seeded footer steps with the Profiler on without a lasting violation; its Profiler leads (a client stall over 1 s around a resize, a stale bottom after a split, a fallback to the DOM renderer, memory growth across reloads) went to lane W9. Running: lane S2 (server queue, batch two) and the review of T2w and T3.
