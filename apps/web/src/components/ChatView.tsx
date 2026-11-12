@@ -2201,6 +2201,7 @@ function ChatViewContent(props: ChatViewProps) {
       : null;
   const unavailableProviderReason =
     unavailableProviderName === null ? null : `${unavailableProviderName} is not available`;
+  const unavailableProviderNeedsSetup = boundProviderEntry?.enabled === true;
   const unavailableProviderOnPrimary =
     activeThread !== undefined && activeThread.environmentId === primaryEnvironment?.environmentId;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
@@ -2300,10 +2301,10 @@ function ChatViewContent(props: ChatViewProps) {
         // An agent that is enabled but not usable (not installed, not signed in) needs its setup
         // checked, not enabling.
         description: unavailableProviderOnPrimary
-          ? boundProviderEntry?.enabled === true
+          ? unavailableProviderNeedsSetup
             ? "This chat stays on it. Check its install and sign-in in Settings → Providers, or add a chat with another agent from the + menu."
             : "This chat stays on it. Enable it in Settings → Providers, or add a chat with another agent from the + menu."
-          : boundProviderEntry?.enabled === true
+          : unavailableProviderNeedsSetup
             ? "This chat stays on it. Check its install and sign-in on this chat's server, or add a chat with another agent from the + menu."
             : "This chat stays on it. Enable it on this chat's server, or add a chat with another agent from the + menu.",
         ...(unavailableProviderOnPrimary
@@ -2346,6 +2347,7 @@ function ChatViewContent(props: ChatViewProps) {
     presentation,
     providerBinding.conflict,
     providerBinding.instanceId,
+    unavailableProviderNeedsSetup,
     unavailableProviderOnPrimary,
     unavailableProviderReason,
     setDismissedVersionMismatchKey,
