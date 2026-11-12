@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  answersTerminalQueries,
+  isUnownedUntilUsed,
   shouldClaimTerminalSize,
   shouldShowTerminalSizeNotice,
   hasForeignTerminalSizeOwner,
@@ -17,6 +19,24 @@ const base = {
   userActive: true,
   claimInFlight: false,
 };
+
+describe("one answer to the terminal's queries (#348)", () => {
+  it("lets only the named viewer answer while the size is un-owned", () => {
+    const unowned = { cols: 80, rows: 24, sizeClaim: null, replyClaim: "mine" };
+    expect(answersTerminalQueries(unowned, "mine")).toBe(true);
+    expect(answersTerminalQueries(unowned, "other")).toBe(false);
+    expect(isUnownedUntilUsed(unowned)).toBe(true);
+  });
+
+  it("keeps the owner's answers and an older server's rule", () => {
+    expect(answersTerminalQueries(applied, "other")).toBe(true);
+    expect(answersTerminalQueries(applied, "mine")).toBe(false);
+    const legacy = { cols: 80, rows: 24, sizeClaim: null };
+    expect(answersTerminalQueries(legacy, "mine")).toBe(true);
+    expect(answersTerminalQueries(null, "mine")).toBe(true);
+    expect(isUnownedUntilUsed(legacy)).toBe(false);
+  });
+});
 
 describe("unattended windows (#348)", () => {
   it.each(["attach", "focus"] as const)(

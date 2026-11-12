@@ -754,6 +754,7 @@ mod tests {
                     cols: 91,
                     rows: 42,
                     size_claim: Some("PRIVATE_CLAIM".to_owned()),
+                    reply_claim: None,
                 },
                 only_for: None,
             },

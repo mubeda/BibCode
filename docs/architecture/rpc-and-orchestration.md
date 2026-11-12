@@ -5074,7 +5074,7 @@ optional attachment owner; renderers mirror that applied state.
 | `terminal.resize` result                | `{ outcome, size, generation, sequence }`: `applied`, `unchanged`, `sessionMissing`, `claimNotRegistered`, `processAbsent` or `generationInvalidated`, with the size the server holds, only to a request with `structuredResult`. Otherwise `null`: older clients declare a void result, which the JSON RPC codec decodes as null only. Older servers answer `null`. |
 | `terminal.write`, `terminal.writeInput` | Optional `userInputClaim`: the size claim of the window a user produced the input in, or `null` for the terminal's own query replies, which never share a frame with typed input. Absent from older clients, whose input counts as use. Sent only when the server advertises `terminalUserInputClaim`.                                                               |
 | Snapshot, `exited`, `closed`            | Optional `generation { boot, process }`; see the terminal section of the architecture overview.                                                                                                                                                                                                                                                                      |
-| Attach snapshot                         | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                                                                                                                                                                                                                     |
+| Attach snapshot                         | Optional `size { cols, rows, sizeClaim, replyClaim? }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                                                                                                                                                                                                                     |
 | Attach snapshot                         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                                                                                                                                                                                                              |
 | Attach snapshot                         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it.                                                                                                                                                                                            |
 | Attach event                            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                                                                                                                                                                                                                    |
@@ -5101,7 +5101,11 @@ viewer takes it; among several, the one a user typed in last takes it, and with
 none typed in it stays un-owned; the departed claim gets it back if it attaches
 again before anyone types, where a terminal's own query replies are not
 typing), and stale resize requests cannot
-reclaim it. Manager shutdown cancels and drains attachment cleanup
+reclaim it. While a size is left un-owned that way, `size.replyClaim` names one
+remaining viewer (the least claim; another when it leaves) that alone answers
+the terminal's queries, a new attach does not take the size (only the departed
+claim does), and a lone viewer left takes it. The field is absent otherwise and
+from older servers, whose clients keep answering from every window. Manager shutdown cancels and drains attachment cleanup
 workers.
 
 Accepted resize/claim changes publish before subsequent PTY output under the

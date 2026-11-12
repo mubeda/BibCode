@@ -161,6 +161,10 @@ pub struct TerminalSize {
     pub cols: u16,
     pub rows: u16,
     pub size_claim: Option<String>,
+    /// While the size is un-owned because its owner left several viewers, none used since:
+    /// the one viewer that answers the terminal's queries (#348). Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_claim: Option<String>,
 }
 
 /// The process a terminal state belongs to: `boot` names this manager instance, `process`

@@ -96,6 +96,8 @@ import {
   terminalHostHasArea,
 } from "./terminalSizing";
 import {
+  answersTerminalQueries,
+  isUnownedUntilUsed,
   shouldClaimTerminalSize,
   terminalDimensionsEqual,
   terminalSizesEqual,
@@ -1611,7 +1613,7 @@ export function TerminalViewport({
     let replying = false;
     const replyGuard = installTerminalReplyGuard(
       terminal,
-      () => !sizeOwnership || !hasForeignTerminalSizeOwner(appliedSize, sizeClaim),
+      () => !sizeOwnership || answersTerminalQueries(appliedSize, sizeClaim),
       () => oscColorResponderActive,
       () => {
         if (replying) return;
@@ -1808,6 +1810,8 @@ export function TerminalViewport({
         dismissedTerminalSizes.delete(terminalTargetKey);
       appliedSize = size ?? null;
       if (size?.sizeClaim != null) unownedUntilUsed = false;
+      // A window attaching to a size the server left un-owned waits to be used as well.
+      else if (isUnownedUntilUsed(size)) unownedUntilUsed = true;
       if (size && !terminalDimensionsEqual(terminal, size)) {
         const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
         terminal.resize(size.cols, size.rows);

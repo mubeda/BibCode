@@ -32,6 +32,12 @@ export const TerminalSize = Schema.Struct({
   cols: TerminalColsSchema,
   rows: TerminalRowsSchema,
   sizeClaim: Schema.NullOr(TerminalSizeClaimSchema),
+  /**
+   * Set while `sizeClaim` is null because the owner left several viewers and none has been
+   * used since: the size stays un-owned until a window is used, and only this claim's viewer
+   * answers the terminal's queries meanwhile. Absent from older servers: every viewer answers.
+   */
+  replyClaim: Schema.optional(TerminalSizeClaimSchema),
 });
 export type TerminalSize = typeof TerminalSize.Type;
 

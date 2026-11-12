@@ -36,6 +36,21 @@ export function hasForeignTerminalSizeOwner(
   return applied?.sizeClaim != null && applied.sizeClaim !== sizeClaim;
 }
 
+/**
+ * Whether this window answers the terminal's queries: the owner does, and while the size is
+ * un-owned only the viewer the server names, so the program gets one answer. An older server
+ * names none, and every window without a foreign owner answers (#348).
+ */
+export function answersTerminalQueries(applied: TerminalSize | null, sizeClaim: string): boolean {
+  if (hasForeignTerminalSizeOwner(applied, sizeClaim)) return false;
+  return applied?.sizeClaim != null || applied?.replyClaim == null || applied.replyClaim === sizeClaim;
+}
+
+/** The server left the size un-owned until a window is used, and says so (#348). */
+export function isUnownedUntilUsed(applied: TerminalSize | null | undefined): boolean {
+  return applied?.sizeClaim === null && applied.replyClaim != null;
+}
+
 /** Another window sizes the terminal, or the one that left did and nobody has used one since. */
 function sizedElsewhere(
   applied: TerminalSize | null,

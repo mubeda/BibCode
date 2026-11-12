@@ -302,6 +302,10 @@ struct Session {
     /// goes to the one used last when its owner leaves several viewers (#348).
     user_input_order: HashMap<String, u64>,
     user_input_clock: u64,
+    /// Set while the size is un-owned because its owner left several viewers and none was used
+    /// since: the hand-over waits for use, so an attach does not take the size, and only this
+    /// viewer answers the terminal's queries meanwhile (#348).
+    handover_replier: Option<String>,
     /// A size the PTY refused on every retry; the session holds the size it kept instead.
     /// Asking for it again changes nothing until another size is asked for (#348).
     refused_size: Option<(u16, u16)>,
@@ -1807,6 +1811,10 @@ impl Session {
             cols: self.cols,
             rows: self.rows,
             size_claim: self.size_owner.as_ref().map(|owner| owner.claim.clone()),
+            reply_claim: self
+                .handover_replier
+                .clone()
+                .filter(|_| self.size_owner.is_none()),
         }
     }
 
@@ -2717,6 +2725,7 @@ impl TerminalManager {
             owner_unused_since_handoff: false,
             user_input_order: HashMap::new(),
             user_input_clock: 0,
+            handover_replier: None,
             refused_size: None,
             first_attachment_grant_used: false,
             osc_color_responder_active: process.osc_color_responder_active(),
@@ -3549,11 +3558,18 @@ impl TerminalManager {
                 let first_attachment_grant =
                     current.size_owner.is_none() && !current.first_attachment_grant_used;
                 current.first_attachment_grant_used = true;
-                if current.size_owner.is_none() {
+                // A size left un-owned until a window is used is not taken by attaching: an
+                // idle window reloaded or shown again would take it. The window it was taken
+                // from gets it back before anyone uses another (#348).
+                let handover_pending = current.handover_replier.is_some()
+                    && current.departed_owner.as_deref() != Some(claim.as_str());
+                if current.size_owner.is_none() && !handover_pending {
                     current.size_owner = Some(SizeOwner {
                         claim: claim.clone(),
                         attachment: id,
                     });
+                    current.handover_replier = None;
+                    current.departed_owner = None;
                     let _ = self.inner.events.send(current.resized());
                 } else if let Some(owner) = current
                     .size_owner
@@ -3893,6 +3909,9 @@ impl TerminalManager {
         }
         session.cols = cols;
         session.rows = rows;
+        if size_owner.is_some() {
+            session.handover_replier = None;
+        }
         session.size_owner = size_owner;
         let _ = self.inner.events.send(session.resized());
         Ok(session.resize_result(TerminalResizeOutcome::Applied))
@@ -3964,6 +3983,30 @@ impl TerminalManager {
             .user_input_order
             .retain(|claim, _| claims.is_some_and(|claims| claims.contains_key(claim)));
         if session.size_owner.as_ref().map(|owner| owner.attachment) != Some(attachment_id) {
+            // A pending hand-over: a lone viewer left takes the size, and a replier that left
+            // is replaced so one viewer keeps answering the terminal's queries.
+            let Some(replier) = session.handover_replier.as_deref() else {
+                return;
+            };
+            let remaining = claims.map_or(0, HashMap::len);
+            if remaining > 1 && claims.is_some_and(|claims| claims.contains_key(replier)) {
+                return;
+            }
+            let lone = claims
+                .filter(|claims| claims.len() == 1)
+                .and_then(|claims| claims.iter().next())
+                .map(|(claim, id)| SizeOwner {
+                    claim: claim.clone(),
+                    attachment: *id,
+                });
+            session.handover_replier = handover_replier(claims).filter(|_| remaining > 1);
+            drop(attachments);
+            if remaining == 0 {
+                return;
+            }
+            session.owner_unused_since_handoff = lone.is_some();
+            session.size_owner = lone;
+            let _ = inner.events.send(session.resized());
             return;
         }
         // The window last used sizes the terminal (#348). A lone remaining viewer takes the
@@ -3988,6 +4031,10 @@ impl TerminalManager {
                     attachment: *id,
                 })
         };
+        session.handover_replier = remaining
+            .is_none()
+            .then(|| handover_replier(claims))
+            .flatten();
         drop(attachments);
         session.departed_owner = session.size_owner.take().map(|owner| owner.claim);
         session.owner_unused_since_handoff = remaining.is_some();
@@ -6152,7 +6199,8 @@ mod tests {
             Some(TerminalSize {
                 cols: 151,
                 rows: 50,
-                size_claim: Some("owner".to_owned())
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
             })
         );
         *backend.latest().output_on_resize.lock().unwrap() = Some("after resize".to_owned());
@@ -6209,7 +6257,8 @@ mod tests {
             Some(TerminalSize {
                 cols: 80,
                 rows: 24,
-                size_claim: Some("owner".to_owned())
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
             })
         );
         assert_eq!(unregistered.generation.as_ref(), Some(&generation));
@@ -6573,7 +6622,8 @@ mod tests {
             TerminalSize {
                 cols: 91,
                 rows: 42,
-                size_claim: Some("new-owner".to_owned())
+                size_claim: Some("new-owner".to_owned()),
+                reply_claim: None,
             }
         );
         input.terminal_id = "term".to_owned();
@@ -6622,7 +6672,8 @@ mod tests {
                 TerminalSize {
                     cols: 80,
                     rows: 24,
-                    size_claim: claim.clone()
+                    size_claim: claim.clone(),
+                    reply_claim: None,
                 }
             );
             manager
@@ -6661,7 +6712,8 @@ mod tests {
             TerminalSize {
                 cols: 80,
                 rows: 24,
-                size_claim: Some("owner".to_owned())
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
             }
         );
         backend.latest().emit("unchanged");
@@ -7196,6 +7248,93 @@ mod tests {
         // The owner that left gets it back if it returns before anyone types in `left`.
         let back = manager.attach(size_attachment("owner")).await.unwrap();
         assert_eq!(owner_of(&back), Some("owner"));
+        manager.shutdown().await;
+    }
+
+    fn resized_size(event: TerminalEvent) -> TerminalSize {
+        match event {
+            TerminalEvent::Resized { size, .. } => size,
+            other => panic!("expected a resize, got {other:?}"),
+        }
+    }
+
+    /// The owner left several viewers, none used: an idle window that attaches (a reload, a
+    /// tab shown again) does not take the size left un-owned, the owner that left does, and a
+    /// lone viewer left takes it (#348).
+    #[tokio::test]
+    async fn an_attach_does_not_take_a_size_left_unowned_until_used() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut left = manager.attach(size_attachment("left")).await.unwrap();
+        let right = manager.attach(size_attachment("right")).await.unwrap();
+        drop(owner);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await).size_claim,
+            None
+        );
+        let reloaded = manager.attach(size_attachment("reloaded")).await.unwrap();
+        assert_eq!(owner_of(&reloaded), None, "an idle window does not take it");
+        drop(reloaded);
+        let back = manager.attach(size_attachment("owner")).await.unwrap();
+        assert_eq!(owner_of(&back), Some("owner"), "the window last used does");
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await)
+                .size_claim
+                .as_deref(),
+            Some("owner")
+        );
+        drop(back);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await).size_claim,
+            None
+        );
+        drop(right);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await)
+                .size_claim
+                .as_deref(),
+            Some("left"),
+            "the lone viewer left takes it"
+        );
+        // A fresh session's first attach and a lone viewer are still granted.
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let first = manager.attach(size_attachment("first")).await.unwrap();
+        assert_eq!(owner_of(&first), Some("first"));
+        manager.shutdown().await;
+    }
+
+    /// While the size is un-owned every viewer would answer the terminal's queries: the server
+    /// names one, and names another when it leaves (#348).
+    #[tokio::test]
+    async fn one_viewer_answers_queries_while_the_size_is_unowned() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let a = manager.attach(size_attachment("a")).await.unwrap();
+        let _b = manager.attach(size_attachment("b")).await.unwrap();
+        let mut c = manager.attach(size_attachment("c")).await.unwrap();
+        assert_eq!(c.initial.size.as_ref().unwrap().reply_claim, None);
+        drop(owner);
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim, size.reply_claim.as_deref()),
+            (None, Some("a"))
+        );
+        drop(a);
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim, size.reply_claim.as_deref()),
+            (None, Some("b"))
+        );
+        // A window that is used claims the size, and the owner answers again.
+        manager
+            .resize("sizing", "term", 90, 30, Some("c".to_owned()))
+            .await
+            .unwrap();
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim.as_deref(), size.reply_claim),
+            (Some("c"), None)
+        );
         manager.shutdown().await;
     }
 
