@@ -7710,6 +7710,8 @@ pub(crate) fn clone_destination_leaf(
 }
 
 /// What reserving a clone destination found.
+// Returned once per clone and matched at once; on Windows the file identity makes it large.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CloneReservation {
     /// The destination did not exist. This clone created it and owns its cleanup.
     Reserved(ReservedClone),
