@@ -4,6 +4,7 @@
   "values": [
     {
       "_tag": "Sample",
+      "statisticsSince": "2026-07-22T09:00:00.000Z",
       "sample": {
         "sampledAt": "2026-07-22T12:00:01.000Z",
         "cpuPercent": 23.5,
@@ -34,7 +35,10 @@
             "state": "notResponding"
           }
         ],
-        "volumesPaused": false
+        "volumesPaused": false,
+        "volumeListingNotResponding": false,
+        "sequence": 3601,
+        "ageMs": 120
       },
       "cpu": {
         "current": 23.5,

@@ -600,4 +600,35 @@ describe("ServerHostMetricsEvent", () => {
   it("rejects an unknown item", () => {
     expect(() => decode({ ...snapshot, _tag: "Delta" })).toThrow();
   });
+
+  it("round-trips the order, age, listing and statistics start fields, and accepts their absence", () => {
+    const ordered = {
+      ...sample,
+      volumeListingNotResponding: true,
+      sequence: 42,
+      ageMs: 120,
+    };
+    const live = {
+      _tag: "Sample",
+      statisticsSince: "2026-11-11T09:00:00.000Z",
+      sample: ordered,
+      cpu: statistic,
+      memory: statistic,
+      uptime: null,
+    };
+    expect(encode(decode(live))).toEqual(live);
+    expect(encode(decode({ ...live, statisticsSince: null }))).toEqual({
+      ...live,
+      statisticsSince: null,
+    });
+    expect(encode(decode({ ...snapshot, sample: ordered }))).toEqual({
+      ...snapshot,
+      sample: ordered,
+    });
+    const old = { _tag: "Sample", sample, cpu: statistic, memory: statistic, uptime: null };
+    expect(decode(old)).not.toHaveProperty("statisticsSince");
+    expect(decode(old)).not.toHaveProperty("sample.sequence");
+    expect(() => decode({ ...live, sample: { ...ordered, sequence: -1 } })).toThrow();
+    expect(() => decode({ ...live, sample: { ...ordered, ageMs: 1.5 } })).toThrow();
+  });
 });

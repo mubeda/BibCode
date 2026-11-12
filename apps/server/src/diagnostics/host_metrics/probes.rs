@@ -268,6 +268,7 @@ fn cost_probe() {
                     if let (Some(reading), Some((cpu, memory))) = (latest, summary) {
                         let update = HostMetricsUpdate {
                             reading,
+                            statistics_since_ms: lock(&live.shared.statistics).since_ms,
                             cpu,
                             memory,
                             chart: Arc::new(ChartState {

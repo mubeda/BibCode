@@ -480,7 +480,13 @@ const manualStreamSamples = new Map<string, unknown>([
     "server.subscribeHostMetrics:1",
     {
       _tag: "Sample",
-      sample: fixtureHostMetricsSample,
+      statisticsSince: "2026-07-22T09:00:00.000Z",
+      sample: {
+        ...fixtureHostMetricsSample,
+        volumeListingNotResponding: false,
+        sequence: 3_601,
+        ageMs: 120,
+      },
       cpu: fixtureHostMetricsStatistic,
       memory: fixtureHostMetricsStatistic,
       uptime: null,

@@ -261,19 +261,37 @@ fn collector(source: Arc<dyn HostMetricsSource>) -> HostMetricsCollector {
     HostMetricsCollector::new(source, HostMetricsRates::default(), identity())
 }
 
-/// Lets the disk threads, which run on the real clock, finish what the last tick gave them.
-/// Blocking the test thread also keeps the paused clock from moving meanwhile.
-pub(super) fn settle() {
-    std::thread::sleep(Duration::from_millis(20));
+/// Waits until nothing the last tick started is still running: no CPU read on the blocking pool,
+/// no disk job on a worker thread and no result the disk loop has not taken. The loops run only
+/// while this task yields, and the paused clock does not move while it blocks, so a pass that
+/// finds everything idle after yielding means the collector waits on its clock alone.
+pub(super) async fn quiesce(collector: &HostMetricsCollector) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let workers = lock(&collector.shared.workers).clone();
+    let cpu_busy = || collector.shared.cpu_in_flight.load(Ordering::Acquire) > 0;
+    loop {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        if !cpu_busy() && workers.as_ref().is_none_or(|workers| workers.idle()) {
+            return;
+        }
+        while cpu_busy() || workers.as_ref().is_some_and(|workers| workers.busy()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collector did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
-/// Runs the paused clock forward in steps, settling the disk threads after each.
-pub(super) async fn run_for(total: Duration, step: Duration) {
+/// Runs the paused clock forward in steps, waiting for the collector to settle after each.
+pub(super) async fn run_for(collector: &HostMetricsCollector, total: Duration, step: Duration) {
     let mut elapsed = Duration::ZERO;
     while elapsed < total {
         tokio::time::sleep(step).await;
-        settle();
-        tokio::task::yield_now().await;
+        quiesce(collector).await;
         elapsed += step;
     }
 }
@@ -317,11 +335,13 @@ fn volume<'a>(reading: &'a HostReading, mount_point: &str) -> Option<&'a VolumeR
         .find(|volume| volume.descriptor.mount_point == Path::new(mount_point))
 }
 
-fn assert_paced(readings: &[Arc<HostMetricsUpdate>], interval_ms: i128) {
+/// On the real clock only liveness is checked, with room for a loaded machine: readings keep
+/// coming in order and none is three intervals late. Exact cadence is tested on the paused clock.
+fn assert_live(readings: &[Arc<HostMetricsUpdate>], interval_ms: i128) {
     for pair in readings.windows(2) {
         let gap = pair[1].reading.sampled_at_ms - pair[0].reading.sampled_at_ms;
         assert!(
-            (gap - interval_ms).abs() <= 200,
+            pair[1].reading.sequence > pair[0].reading.sequence && gap <= 3 * interval_ms,
             "readings {gap} ms apart: {:?}",
             readings
                 .iter()
@@ -374,7 +394,7 @@ async fn cpu_is_clamped_to_0_and_100() {
     collector.start_background();
 
     let first = current(&collector).await;
-    run_for(Duration::from_secs(60), Duration::from_secs(60)).await;
+    run_for(&collector, Duration::from_secs(60), Duration::from_secs(60)).await;
     let second = current(&collector).await;
 
     assert_eq!(first.cpu_percent, 100.0);
@@ -387,7 +407,12 @@ async fn construction_reads_nothing_and_starts_no_thread() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![descriptor("/", "ext4")]));
     let collector = collector(source.clone());
 
-    run_for(Duration::from_secs(600), Duration::from_secs(60)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(600),
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert_eq!(source.cpu_reads(), 0);
     assert_eq!(source.list_calls(), 0);
@@ -400,9 +425,14 @@ async fn background_reads_every_60_s_and_volumes_every_fifth_reading() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![descriptor("/", "ext4")]));
     let collector = collector(source.clone());
     collector.start_background();
-    settle();
+    quiesce(&collector).await;
 
-    run_for(Duration::from_secs(600), Duration::from_secs(10)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(600),
+        Duration::from_secs(10),
+    )
+    .await;
 
     // Readings at 0, 60, ..., 600 s; volumes at the 1st, 6th and 11th.
     let readings = source.cpu_reads();
@@ -417,22 +447,32 @@ async fn streams_switch_to_the_live_rate_and_share_one_read() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![descriptor("/", "ext4")]));
     let collector = collector(source.clone());
     collector.start_background();
-    settle();
+    quiesce(&collector).await;
 
-    run_for(Duration::from_secs(120), Duration::from_secs(1)).await;
+    run_for(&collector, Duration::from_secs(120), Duration::from_secs(1)).await;
     let background = source.cpu_reads();
     let first = collector.subscribe();
-    run_for(Duration::from_secs(10), Duration::from_millis(100)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+    )
+    .await;
     let one_stream = source.cpu_reads() - background;
     let second = collector.subscribe();
     assert_eq!(collector.live_subscribers(), 2);
-    run_for(Duration::from_secs(10), Duration::from_millis(100)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+    )
+    .await;
     let two_streams = source.cpu_reads() - background - one_stream;
     drop(first);
     drop(second);
     assert_eq!(collector.live_subscribers(), 0);
     let before_idle = source.cpu_reads();
-    run_for(Duration::from_secs(120), Duration::from_secs(1)).await;
+    run_for(&collector, Duration::from_secs(120), Duration::from_secs(1)).await;
     let after = source.cpu_reads() - before_idle;
 
     assert!(
@@ -461,19 +501,29 @@ async fn the_first_live_reading_covers_one_second() {
         Arc::new(FakeHostMetricsSource::new(vec![]).script_cpu([cpu(10.0), cpu(50.0), cpu(90.0)]));
     let collector = collector(source.clone());
     collector.start_background();
-    run_for(Duration::from_secs(30), Duration::from_secs(1)).await;
+    run_for(&collector, Duration::from_secs(30), Duration::from_secs(1)).await;
     assert_eq!(source.cpu_reads(), 1);
     let background = current(&collector).await;
 
     let mut subscription = collector.subscribe();
-    run_for(Duration::from_millis(100), Duration::from_millis(100)).await;
+    run_for(
+        &collector,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .await;
     assert_eq!(
         source.cpu_reads(),
         2,
         "the live rate refreshes CPU once first"
     );
     let subscribed_at = collector.shared.now_ms();
-    run_for(Duration::from_millis(1_000), Duration::from_millis(100)).await;
+    run_for(
+        &collector,
+        Duration::from_millis(1_000),
+        Duration::from_millis(100),
+    )
+    .await;
     let update = subscription
         .receiver()
         .borrow_and_update()
@@ -508,7 +558,12 @@ async fn a_failed_cpu_read_keeps_the_last_reading_and_warns_once() {
     collector.start_background();
     let first = current(&collector).await;
 
-    run_for(Duration::from_secs(180), Duration::from_secs(60)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert_eq!(source.cpu_reads(), 4);
     assert_eq!(current(&collector).await, first);
@@ -564,11 +619,21 @@ async fn snapshot_waits_at_most_one_second_for_the_first_reading() {
 async fn the_first_subscriber_starts_an_idle_collector() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![]));
     let collector = collector(source.clone());
-    run_for(Duration::from_secs(120), Duration::from_secs(10)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(120),
+        Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(source.cpu_reads(), 0);
 
     let mut subscription = collector.subscribe();
-    run_for(Duration::from_secs(2), Duration::from_millis(100)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await;
 
     assert!(source.cpu_reads() >= 2);
     assert!(subscription.receiver().borrow_and_update().is_some());
@@ -584,7 +649,7 @@ async fn the_chart_revision_rises_when_a_minute_bucket_closes() {
     let first = collector.snapshot().await.chart;
     assert!(first.uptime.is_empty());
 
-    run_for(Duration::from_secs(60), Duration::from_secs(60)).await;
+    run_for(&collector, Duration::from_secs(60), Duration::from_secs(60)).await;
     let later = collector.snapshot().await.chart;
 
     assert!(later.revision > first.revision);
@@ -599,14 +664,24 @@ async fn a_wall_clock_moved_back_keeps_the_chart_moving() {
     let source = Arc::new(FakeHostMetricsSource::new(vec![]));
     let collector = collector(source);
     collector.start_background();
-    run_for(Duration::from_secs(180), Duration::from_secs(60)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    )
+    .await;
     let before = collector.snapshot().await;
 
     collector
         .shared
         .wall_offset_ms
         .store(-3_600_000, Ordering::Release);
-    run_for(Duration::from_secs(180), Duration::from_secs(60)).await;
+    run_for(
+        &collector,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    )
+    .await;
     let after = collector.snapshot().await;
 
     assert!(
@@ -621,6 +696,15 @@ async fn a_wall_clock_moved_back_keeps_the_chart_moving() {
         newest.sampled_at_ms > previous.sampled_at_ms,
         "{:?}",
         after.recent
+    );
+    let (before, after) = (
+        before.current.expect("a reading"),
+        after.current.expect("a reading"),
+    );
+    assert!(after.sequence > before.sequence);
+    assert!(
+        after.sampled_at_ms < before.sampled_at_ms,
+        "the label is the wall time"
     );
     collector.shutdown().await;
 }
@@ -638,18 +722,47 @@ async fn a_hung_listing_is_reported_and_recovers() {
     };
     let collector = HostMetricsCollector::new(source.clone(), rates, identity())
         .with_volume_cadence(Duration::from_millis(200));
-    collector.start_background();
+    let mut subscription = collector.subscribe();
 
     wait_until("the hung listing is logged", || {
         log.text().contains("host volume listing did not answer")
     })
     .await;
+    let mut last = i128::MIN;
+    let reading = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let update = next_update(&mut subscription, last).await;
+            last = update.reading.sampled_at_ms;
+            if update.reading.volume_listing_not_responding {
+                return update.reading.clone();
+            }
+        }
+    })
+    .await
+    .expect("a reading says the listing is not responding");
+    assert!(!reading.volumes_paused, "volume reads go on");
+    assert_eq!(
+        volume(&reading, "/").map(|volume| volume.state),
+        Some(VolumeState::Ok),
+        "a hung listing marks no volume"
+    );
     list.send(vec![descriptor("/", "ext4")])
         .expect("the listing is held");
     wait_until("the listing's recovery is logged", || {
         log.text().contains("host volume listing answered again")
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let update = next_update(&mut subscription, last).await;
+            last = update.reading.sampled_at_ms;
+            if !update.reading.volume_listing_not_responding {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("a reading says the listing answers again");
     collector.shutdown().await;
 }
 
@@ -663,7 +776,7 @@ async fn after_shutdown_a_subscription_gets_no_reading() {
     collector.shutdown().await;
     let reads = source.cpu_reads();
     let mut subscription = collector.subscribe();
-    run_for(Duration::from_secs(10), Duration::from_secs(1)).await;
+    run_for(&collector, Duration::from_secs(10), Duration::from_secs(1)).await;
 
     assert_eq!(source.cpu_reads(), reads);
     assert!(subscription.receiver().changed().await.is_err());
@@ -701,7 +814,7 @@ async fn cpu_and_memory_keep_their_pace_while_disks_hang() {
 
     let updates = collect_updates(&mut subscription, 8).await;
 
-    assert_paced(&updates, 1_000);
+    assert_live(&updates, 1_000);
     let last_four = &updates[4..];
     for update in last_four {
         assert_eq!(
@@ -782,7 +895,7 @@ async fn every_worker_held_pauses_disk_reads() {
 
     let updates = collect_updates(&mut subscription, 10).await;
 
-    assert_paced(&updates, 1_000);
+    assert_live(&updates, 1_000);
     // Held from about one second in; the limit passes two seconds later.
     for update in &updates[4..] {
         assert!(update.reading.volumes_paused, "{:?}", update.reading);
@@ -866,9 +979,9 @@ async fn mount_churn_keeps_state_bounded() {
             .map_or(i128::MIN, |update| update.reading.sampled_at_ms);
         updates.push(next_update(&mut subscription, after).await);
     }
-    settle();
+    quiesce(&collector).await;
 
-    assert_paced(&updates, 1_000);
+    assert_live(&updates, 1_000);
     let tracked = lock(&collector.shared.disk_view).tracked;
     assert!(tracked <= 2, "{tracked} volumes tracked");
     let workers = lock(&collector.shared.workers)

@@ -2785,8 +2785,11 @@ async fn host_metrics_stream_sends_a_snapshot_then_samples() {
             assert_eq!(sample["_tag"], "Sample");
             assert_eq!(sample["cpu"]["current"], 23.5);
         }
+        // Liveness only: the cadence is tested on a paused clock in the collector's own tests.
+        let sequence = |sample: &Value| sample["sample"]["sequence"].as_u64().expect("a sequence");
+        assert!(sequence(&samples[1]) > sequence(&samples[0]), "{samples:?}");
         let gap = sampled_at_ms(&samples[1]) - sampled_at_ms(&samples[0]);
-        assert!((800..=1_200).contains(&gap), "samples {gap} ms apart");
+        assert!((1..=10_000).contains(&gap), "samples {gap} ms apart");
     })
     .catch_unwind()
     .await;

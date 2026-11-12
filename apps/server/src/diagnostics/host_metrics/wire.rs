@@ -62,6 +62,12 @@ pub(crate) struct HostSampleWire {
     memory_available_bytes: u64,
     volumes: Vec<VolumeWire>,
     volumes_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume_listing_not_responding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,6 +116,9 @@ pub(crate) struct SnapshotWire {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SampleWire {
+    /// As on the snapshot; older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statistics_since: Option<String>,
     sample: HostSampleWire,
     cpu: StatisticWire,
     memory: StatisticWire,
@@ -159,6 +168,9 @@ fn sample(reading: &HostReading) -> HostSampleWire {
         memory_available_bytes: reading.memory_available_bytes,
         volumes: reading.volumes.iter().map(volume).collect(),
         volumes_paused: reading.volumes_paused,
+        volume_listing_not_responding: Some(reading.volume_listing_not_responding),
+        sequence: Some(reading.sequence),
+        age_ms: Some(u64::try_from(reading.taken_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
     }
 }
 
@@ -211,6 +223,7 @@ pub(crate) fn encode_snapshot(snapshot: &HostMetricsSnapshot) -> Value {
 
 pub(crate) fn encode_update(update: &HostMetricsUpdate, include_chart: bool) -> Value {
     to_value(&HostMetricsEventWire::Sample(SampleWire {
+        statistics_since: update.statistics_since_ms.map(format_ms),
         sample: sample(&update.reading),
         cpu: statistic(&update.cpu),
         memory: statistic(&update.memory),
@@ -238,10 +251,7 @@ pub(crate) async fn send_host_metrics(
     // Whatever the snapshot already shows is not sent again.
     subscription.receiver().borrow_and_update();
     let mut sent_revision = snapshot.chart.revision;
-    let mut sent_at_ms = snapshot
-        .current
-        .as_ref()
-        .map(|reading| reading.sampled_at_ms);
+    let mut sent_sequence = snapshot.current.as_ref().map(|reading| reading.sequence);
     permit.send(Ok(vec![encode_snapshot(&snapshot)]));
     loop {
         let Ok(permit) = reserve(&sender, &cancellation).await else {
@@ -250,7 +260,7 @@ pub(crate) async fn send_host_metrics(
         let update = loop {
             let latest = subscription.receiver().borrow_and_update().clone();
             if let Some(update) = latest
-                && Some(update.reading.sampled_at_ms) != sent_at_ms
+                && Some(update.reading.sequence) != sent_sequence
             {
                 break update;
             }
@@ -267,7 +277,7 @@ pub(crate) async fn send_host_metrics(
         let include_chart = update.chart.revision != sent_revision;
         permit.send(Ok(vec![encode_update(&update, include_chart)]));
         sent_revision = update.chart.revision;
-        sent_at_ms = Some(update.reading.sampled_at_ms);
+        sent_sequence = Some(update.reading.sequence);
     }
 }
 
@@ -329,6 +339,10 @@ mod tests {
     fn encoded_snapshot_stays_under_128_kib() {
         let reading = HostReading {
             sampled_at_ms: 1_700_000_000_123,
+            chart_ms: 1_700_000_000_123,
+            sequence: 3_601,
+            taken_at: tokio::time::Instant::now(),
+            volume_listing_not_responding: false,
             cpu_percent: 23.456_789,
             memory_total_bytes: 34_359_738_368,
             memory_used_bytes: 12_025_908_428,
@@ -400,6 +414,89 @@ mod tests {
         assert!(bytes.len() < 128 * 1_024, "{} bytes", bytes.len());
     }
 
+    /// #292 review: a Sample written by an older server, without the order, age, listing and
+    /// statistics start fields, still decodes.
+    #[test]
+    fn a_sample_without_the_newer_fields_decodes() {
+        let mut wire = fixture("server__subscribeHostMetrics-01.json");
+        let object = wire.as_object_mut().expect("a Sample");
+        object
+            .remove("statisticsSince")
+            .expect("the fixture is the new shape");
+        let sample = object["sample"].as_object_mut().expect("a sample");
+        for field in ["sequence", "ageMs", "volumeListingNotResponding"] {
+            sample.remove(field).expect("the fixture is the new shape");
+        }
+
+        let event: HostMetricsEventWire =
+            serde_json::from_value(wire.clone()).expect("the old shape decodes");
+
+        assert_eq!(serde_json::to_value(&event).expect("re-encodes"), wire);
+    }
+
+    /// #292 review: every reading says its order and age, and every Sample says when the
+    /// statistics started, so a stream that began before the first reading learns it.
+    #[tokio::test(start_paused = true)]
+    async fn items_carry_order_age_and_the_statistics_start() {
+        let collector = Arc::new(HostMetricsCollector::new(
+            Arc::new(FakeHostMetricsSource::new(vec![])),
+            HostMetricsRates::default(),
+            HostMetricsIdentity {
+                boot_id: None,
+                started_at_ms: 1_700_000_000_000,
+            },
+        ));
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(send_host_metrics(
+            collector.clone(),
+            sender,
+            cancellation.clone(),
+        ));
+
+        run_for(
+            &collector,
+            Duration::from_secs(4),
+            Duration::from_millis(500),
+        )
+        .await;
+        let mut items = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            items.extend(chunk.expect("a value"));
+        }
+        let since = collector
+            .snapshot()
+            .await
+            .statistics_since_ms
+            .map(format_ms)
+            .expect("statistics started");
+
+        assert_eq!(items[0]["_tag"], "Snapshot");
+        // A snapshot taken before the first live reading leaves the start to the Samples.
+        let mut sequence = match items[0]["sample"]["sequence"].as_u64() {
+            Some(sequence) => sequence,
+            None => {
+                assert!(items[0]["statisticsSince"].is_null(), "{}", items[0]);
+                0
+            }
+        };
+        let later = encode_snapshot(&collector.snapshot().await);
+        assert!(later["sample"]["sequence"].is_u64(), "{later}");
+        assert!(later["sample"]["ageMs"].is_u64(), "{later}");
+        assert!(items.len() >= 3, "{items:?}");
+        for item in &items[1..] {
+            assert_eq!(item["statisticsSince"], since.as_str());
+            assert_eq!(item["sample"]["ageMs"], 0, "encoded as soon as it was read");
+            assert_eq!(item["sample"]["volumeListingNotResponding"], false);
+            let next = item["sample"]["sequence"].as_u64().expect("a sequence");
+            assert!(next > sequence, "{next} after {sequence}");
+            sequence = next;
+        }
+        cancellation.cancel();
+        task.await.expect("the subscriber loop ends");
+        collector.shutdown().await;
+    }
+
     /// R85: a subscriber that stops reading while a minute bucket closes still holds that
     /// bucket once its queue drains, and no item is built while its queue is full.
     #[tokio::test(start_paused = true)]
@@ -422,7 +519,7 @@ mod tests {
 
         // The queue fills about 64 s in; the minute that closes at about 121 s closes while it
         // is full, and nothing is read until 130 s.
-        run_for(Duration::from_secs(130), Duration::from_secs(1)).await;
+        run_for(&collector, Duration::from_secs(130), Duration::from_secs(1)).await;
         let resumed_at = collector.shared.now_ms();
         let mut items = Vec::new();
         while let Ok(chunk) = receiver.try_recv() {
@@ -433,7 +530,7 @@ mod tests {
             .iter()
             .map(|item| parse_ms(&item["sample"]["sampledAt"]))
             .collect::<Vec<_>>();
-        run_for(Duration::from_secs(3), Duration::from_secs(1)).await;
+        run_for(&collector, Duration::from_secs(3), Duration::from_secs(1)).await;
         while let Ok(chunk) = receiver.try_recv() {
             items.extend(chunk.expect("a value"));
         }

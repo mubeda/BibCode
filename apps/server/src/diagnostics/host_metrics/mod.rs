@@ -114,13 +114,22 @@ pub trait HostMetricsSource: std::fmt::Debug + Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostReading {
+    /// Wall time, a label only.
     pub sampled_at_ms: i128,
+    /// The chart clock: wall time that never runs backwards (`ReadingClock`).
+    pub chart_ms: i128,
+    /// Rises by one per reading within this run.
+    pub sequence: u64,
+    /// When the reading was taken, on the monotonic clock, for its age on the wire.
+    pub taken_at: Instant,
     pub cpu_percent: f64,
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub memory_available_bytes: u64,
     pub volumes: Vec<VolumeReading>,
     pub volumes_paused: bool,
+    /// The volume listing has run past the limit without answering.
+    pub volume_listing_not_responding: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +185,7 @@ pub struct HostMetricsSnapshot {
 #[derive(Clone, Debug)]
 pub struct HostMetricsUpdate {
     pub reading: HostReading,
+    pub statistics_since_ms: Option<i128>,
     pub cpu: MeasureStatistics,
     pub memory: MeasureStatistics,
     pub chart: Arc<ChartState>,
@@ -198,6 +208,32 @@ const HELD_CHECK: Duration = Duration::from_millis(250);
 
 type UpdateSender = watch::Sender<Option<Arc<HostMetricsUpdate>>>;
 
+/// Orders readings and places them in the chart whatever the wall clock does: the chart clock
+/// follows the wall clock forward (a suspend shows as a gap) but advances at least as fast as the
+/// monotonic clock, so a wall clock moved back neither freezes nor folds the chart.
+#[derive(Debug, Default)]
+struct ReadingClock {
+    sequence: u64,
+    last: Option<(Instant, i128)>,
+}
+
+impl ReadingClock {
+    /// The next sequence and chart time for a reading taken at `now` with wall time `wall_ms`.
+    fn tick(&mut self, now: Instant, wall_ms: i128) -> (u64, i128) {
+        let chart_ms = match self.last {
+            Some((at, previous)) => {
+                let elapsed = i128::try_from(now.saturating_duration_since(at).as_millis())
+                    .unwrap_or(i128::MAX);
+                wall_ms.max(previous.saturating_add(elapsed))
+            }
+            None => wall_ms,
+        };
+        self.last = Some((now, chart_ms));
+        self.sequence += 1;
+        (self.sequence, chart_ms)
+    }
+}
+
 #[derive(Debug)]
 struct Statistics {
     cpu: RunningStatistic,
@@ -206,6 +242,7 @@ struct Statistics {
     since_ms: Option<i128>,
     current: Option<HostReading>,
     last_error: Option<String>,
+    clock: ReadingClock,
 }
 
 /// A volume the disk loop tracks: the listing that first showed it and its latest reading.
@@ -220,6 +257,7 @@ struct TrackedVolume {
 struct DiskView {
     shown: Vec<VolumeReading>,
     paused: bool,
+    listing_not_responding: bool,
     /// Volumes the disk loop tracks: the latest listing's.
     #[cfg(test)]
     tracked: usize,
@@ -248,6 +286,9 @@ struct Shared {
     /// Added to the test wall clock, so a test can move it as an administrator would.
     #[cfg(test)]
     wall_offset_ms: std::sync::atomic::AtomicI64,
+    /// CPU and memory reads still running on the blocking pool, so a test can wait them out.
+    #[cfg(test)]
+    cpu_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Reads the host's CPU, memory and volumes: in the background from `start_background`, and once
@@ -303,6 +344,7 @@ impl HostMetricsCollector {
                     since_ms: None,
                     current: None,
                     last_error: None,
+                    clock: ReadingClock::default(),
                 }),
                 chart: SyncMutex::new((
                     0,
@@ -324,6 +366,8 @@ impl HostMetricsCollector {
                 volume_cadence: None,
                 #[cfg(test)]
                 wall_offset_ms: std::sync::atomic::AtomicI64::new(0),
+                #[cfg(test)]
+                cpu_in_flight: Arc::default(),
             }),
         }
     }
@@ -517,9 +561,15 @@ impl Shared {
     /// `None` once shutdown began.
     async fn read_cpu_memory(&self) -> Option<Result<CpuMemoryReading, SamplingError>> {
         let source = self.source.clone();
+        #[cfg(test)]
+        let in_flight = InFlight::enter(&self.cpu_in_flight);
         tokio::select! {
             () = self.shutdown.cancelled() => None,
-            read = tokio::task::spawn_blocking(move || source.read_cpu_memory()) => Some(
+            read = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _in_flight = in_flight;
+                source.read_cpu_memory()
+            }) => Some(
                 read.unwrap_or_else(|error| {
                     Err(SamplingError::Failed(format!("host metrics read stopped: {error}")))
                 }),
@@ -540,20 +590,28 @@ impl Shared {
                 return;
             }
         };
-        let (volumes, volumes_paused) = {
+        let (volumes, volumes_paused, volume_listing_not_responding) = {
             let view = lock(&self.disk_view);
-            (view.shown.clone(), view.paused)
+            (view.shown.clone(), view.paused, view.listing_not_responding)
         };
         let memory_total_bytes = sampled.memory_total_bytes;
         let memory_used_bytes = sampled.memory_used_bytes.min(memory_total_bytes);
+        let taken_at = Instant::now();
+        let sampled_at_ms = self.now_ms();
+        let mut statistics = lock(&self.statistics);
+        let (sequence, chart_ms) = statistics.clock.tick(taken_at, sampled_at_ms);
         let reading = HostReading {
-            sampled_at_ms: self.now_ms(),
+            sampled_at_ms,
+            chart_ms,
+            sequence,
+            taken_at,
             cpu_percent: clamp_percent(sampled.cpu_percent),
             memory_total_bytes,
             memory_used_bytes,
             memory_available_bytes: memory_total_bytes - memory_used_bytes,
             volumes,
             volumes_paused,
+            volume_listing_not_responding,
         };
         let memory_percent = if memory_total_bytes == 0 {
             0.0
@@ -561,33 +619,36 @@ impl Shared {
             memory_used_bytes as f64 * 100.0 / memory_total_bytes as f64
         };
         let (update, chart_revision) = {
-            let mut statistics = lock(&self.statistics);
             statistics.last_error = None;
             statistics.cpu.record(reading.cpu_percent, weight);
             statistics.memory.record(memory_percent, weight);
             statistics.chart.record(
                 ChartPoint {
-                    sampled_at_ms: reading.sampled_at_ms,
+                    sampled_at_ms: reading.chart_ms,
                     cpu_percent: reading.cpu_percent,
                     memory_percent,
                 },
                 weight,
             );
-            statistics.since_ms.get_or_insert(reading.sampled_at_ms);
+            let since_ms = *statistics.since_ms.get_or_insert(reading.sampled_at_ms);
             statistics.current = Some(reading.clone());
             let cpu = statistics.cpu.summary();
             let memory = statistics.memory.summary();
+            let revision = statistics.chart.revision();
+            drop(statistics);
             (
-                cpu.zip(memory).map(|(cpu, memory)| (reading, cpu, memory)),
-                statistics.chart.revision(),
+                cpu.zip(memory)
+                    .map(|(cpu, memory)| (reading, since_ms, cpu, memory)),
+                revision,
             )
         };
         let chart = self.refresh_chart(Some(chart_revision), None);
-        if let Some((reading, cpu, memory)) = update
+        if let Some((reading, since_ms, cpu, memory)) = update
             && let Some(sender) = lock(&self.updates).as_ref()
         {
             sender.send_replace(Some(Arc::new(HostMetricsUpdate {
                 reading,
+                statistics_since_ms: Some(since_ms),
                 cpu,
                 memory,
                 chart,
@@ -660,6 +721,7 @@ impl Shared {
                 let mut view = lock(&self.disk_view);
                 view.shown = shown;
                 view.paused = workers.paused();
+                view.listing_not_responding = disks.listing_hung;
                 #[cfg(test)]
                 {
                     view.tracked = disks.volumes.len();
@@ -674,11 +736,18 @@ impl Shared {
 #[derive(Debug, Default)]
 struct DiskTracker {
     listings: u64,
+    /// The listing job has run past the limit and not answered yet.
+    listing_hung: bool,
     volumes: Vec<TrackedVolume>,
     pre_hidden: Vec<HiddenVolume>,
 }
 
 impl DiskTracker {
+    const LISTING: DiskJobKey = DiskJobKey {
+        mount_point: None,
+        generation: 0,
+    };
+
     fn key(volume: &TrackedVolume) -> DiskJobKey {
         DiskJobKey {
             mount_point: Some(volume.reading.descriptor.mount_point.clone()),
@@ -687,11 +756,7 @@ impl DiskTracker {
     }
 
     fn admit_all(&mut self, workers: &DiskWorkers) {
-        let list = DiskJobKey {
-            mount_point: None,
-            generation: 0,
-        };
-        if workers.admit(DiskJob { key: list }) == Admission::Paused {
+        if workers.admit(DiskJob { key: Self::LISTING }) == Admission::Paused {
             return;
         }
         for volume in &self.volumes {
@@ -705,6 +770,9 @@ impl DiskTracker {
     }
 
     fn apply(&mut self, result: DiskJobResult, workers: &DiskWorkers) {
+        if result.key == Self::LISTING && std::mem::take(&mut self.listing_hung) {
+            tracing::info!("host volume listing answered again");
+        }
         match result.outcome {
             DiskOutcome::Listed(Ok(listed)) => self.apply_listing(listed, workers),
             // The listing failed: the volumes of the last listing that answered stay.
@@ -771,6 +839,10 @@ impl DiskTracker {
 
     fn mark_hung(&mut self, workers: &DiskWorkers, limit: Duration) {
         let hung = workers.running_longer_than(limit);
+        if !self.listing_hung && hung.contains(&Self::LISTING) {
+            self.listing_hung = true;
+            tracing::warn!("host volume listing did not answer");
+        }
         for (position, volume) in self.volumes.iter_mut().enumerate() {
             if !hung.contains(&Self::key(volume)) {
                 continue;
@@ -798,6 +870,25 @@ impl DiskTracker {
             })
             .map(|volume| volume.reading.clone())
             .collect()
+    }
+}
+
+/// Counts one read in flight until it drops, on whatever thread finishes the read.
+#[cfg(test)]
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl InFlight {
+    fn enter(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count.clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

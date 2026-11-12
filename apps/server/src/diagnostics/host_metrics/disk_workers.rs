@@ -107,23 +107,26 @@ impl Inner {
             };
             // A panicking call fails its own job only: its key is freed below and this thread
             // keeps serving. The profiler's panic hook has already recorded the panic.
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match &job.key.mount_point {
-                None => DiskOutcome::Listed(Ok(self.source.list_volumes())),
-                Some(mount_point) => DiskOutcome::Space(self.source.read_volume_space(mount_point)),
-            }))
-            .unwrap_or_else(|_| {
-                // R74: the payload may name a path, so only the kind of call is logged.
-                let listing = job.key.mount_point.is_none();
-                tracing::warn!(
-                    call = if listing { "list" } else { "space" },
-                    "host disk call panicked"
-                );
-                if listing {
-                    DiskOutcome::Listed(Err("the volume listing failed".to_owned()))
-                } else {
-                    DiskOutcome::Space(Err("the volume read failed".to_owned()))
-                }
-            });
+            let outcome =
+                std::panic::catch_unwind(AssertUnwindSafe(|| match &job.key.mount_point {
+                    None => DiskOutcome::Listed(Ok(self.source.list_volumes())),
+                    Some(mount_point) => {
+                        DiskOutcome::Space(self.source.read_volume_space(mount_point))
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    // R74: the payload may name a path, so only the kind of call is logged.
+                    let listing = job.key.mount_point.is_none();
+                    tracing::warn!(
+                        call = if listing { "list" } else { "space" },
+                        "host disk call panicked"
+                    );
+                    if listing {
+                        DiskOutcome::Listed(Err("the volume listing failed".to_owned()))
+                    } else {
+                        DiskOutcome::Space(Err("the volume read failed".to_owned()))
+                    }
+                });
             {
                 let mut state = self.lock();
                 let Some(index) = state.running.iter().position(|running| running.id == id) else {
@@ -249,6 +252,20 @@ impl DiskWorkers {
     /// Wakes when a worker has stored a result.
     pub(crate) async fn results_ready(&self) {
         self.inner.results_ready.notified().await;
+    }
+
+    /// Whether no job is queued or running, retired ones included, and no result waits.
+    #[cfg(test)]
+    pub(crate) fn idle(&self) -> bool {
+        let state = self.inner.lock();
+        state.queue.is_empty() && state.running.is_empty() && state.results.is_empty()
+    }
+
+    /// Whether a job is queued or running on a thread, retired ones included.
+    #[cfg(test)]
+    pub(crate) fn busy(&self) -> bool {
+        let state = self.inner.lock();
+        !state.queue.is_empty() || !state.running.is_empty()
     }
 
     /// Queued jobs plus running ones, retired ones included.
