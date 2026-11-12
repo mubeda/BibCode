@@ -149,16 +149,53 @@ impl HostMetricsSource for NativeHostMetricsSource {
 }
 
 /// Total and available blocks from `statvfs` on Linux; total capacity and available capacity for
-/// important usage on macOS.
+/// important usage on macOS. `sysinfo` reports success even when its own query fails and keeps
+/// the old figures, so `statvfs` decides whether the volume answered.
 #[cfg(not(windows))]
 fn storage_space(disk: &Mutex<Disk>) -> Result<VolumeSpace, String> {
     let mut disk = lock(disk);
-    if !disk.refresh_specifics(DiskRefreshKind::nothing().with_storage()) {
-        return Err("the volume did not report its space".to_owned());
+    let space = statvfs_space(disk.mount_point())?;
+    if cfg!(target_os = "linux") {
+        return Ok(space);
     }
+    // macOS: the figures Finder shows, which `statvfs` does not give.
+    disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
     Ok(VolumeSpace {
         total_bytes: disk.total_space(),
         free_bytes: disk.available_space(),
+    })
+}
+
+/// Total and available-to-the-user bytes from `statvfs`, or why the call failed.
+#[cfg(unix)]
+fn statvfs_space(mount_point: &Path) -> Result<VolumeSpace, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes())
+        .map_err(|_| "the mount point holds a NUL byte".to_owned())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    loop {
+        // SAFETY: `path` is NUL-terminated and `stat` is writable for one `statvfs`.
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
+    }
+    // SAFETY: `statvfs` returned 0, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    // `fsblkcnt_t` is `u32` on macOS and `u64` on Linux.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, available, block_size) = (
+        u64::from(stat.f_blocks),
+        u64::from(stat.f_bavail),
+        u64::from(stat.f_frsize),
+    );
+    Ok(VolumeSpace {
+        total_bytes: blocks.saturating_mul(block_size),
+        free_bytes: available.saturating_mul(block_size),
     })
 }
 
@@ -278,6 +315,19 @@ mod tests {
         assert_eq!(read_only.get(Path::new("/mnt/ro-test")), Some(&true));
         assert_eq!(read_only.get(Path::new("/media/my disk")), Some(&false));
         assert_eq!(read_only.get(Path::new("/mnt/remounted")), Some(&true));
+    }
+
+    /// #292 review: a failed capacity read is an error, not the volume's old or zero sizes.
+    #[cfg(unix)]
+    #[test]
+    fn statvfs_space_fails_for_a_missing_mount_point() {
+        let error = statvfs_space(Path::new("/bibcode-missing-volume/inner"))
+            .expect_err("a missing mount point fails");
+        assert!(!error.is_empty());
+
+        let root = statvfs_space(Path::new("/")).expect("the root volume answers");
+        assert!(root.total_bytes > 0);
+        assert!(root.free_bytes <= root.total_bytes);
     }
 
     #[cfg(windows)]
