@@ -9151,6 +9151,42 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       expect(view(owner)).toMatchObject({ grid: "121x26", owner: "this window" });
     });
 
+    it("does not claim a 4 px mount whose stream attaches before its size first changes", async () => {
+      hasFocus.mockReturnValue(true);
+      nextMountSize = { width: 4, height: 400 };
+      // The attach answer arrives while the mount still has the size it was created with.
+      const owner = await openWindow(CLIENT, { cols: 2, rows: 26 });
+      expect(claimsOf(owner)).toEqual([]);
+      await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
+      await settle();
+      expect(claimsOf(owner).filter((size) => size === "2x26")).toEqual([]);
+      expect(view(owner)).toMatchObject({ grid: "121x26", owner: "this window" });
+    });
+
+    it("still claims at least twice a second while a mount keeps changing size", async () => {
+      hasFocus.mockReturnValue(true);
+      const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
+      await settle();
+      const before = claimsOf(owner).length;
+      // A slow continuous drag: a new height every 50 ms for 1.2 s, never holding still.
+      for (let step = 1; step <= 24; step += 1) {
+        await resizeMount(
+          owner,
+          { width: 600, height: 400 - step * 5 },
+          { cols: 85, rows: 26 - Math.floor(step / 2) },
+        );
+        await act(
+          async () =>
+            new Promise<void>((resolve) => {
+              setTimeout(resolve, 50);
+            }),
+        );
+      }
+      expect(claimsOf(owner).length - before).toBeGreaterThanOrEqual(2);
+      await settle();
+      expect(claimsOf(owner).at(-1)).toBe("85x14");
+    });
+
     it("claims a small owner panel that holds still", async () => {
       hasFocus.mockReturnValue(true);
       const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
