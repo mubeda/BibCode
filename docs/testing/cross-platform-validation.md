@@ -691,6 +691,24 @@ marker is part of the seed, so the side chat's turn is slow too; the scenario
 releases both turns one after the other through the release file. It saves
 `side-chat-reply.png` and `side-chat-host-untouched.png`.
 
+The default suite also includes `source-control-review.e2e.ts` (isolate it with
+`BIBCODE_E2E_SPEC=./specs/source-control-review.e2e.ts`). Run it with the
+Profiler on, as every packaged run should be, and read its findings afterwards.
+It modifies the fixture's `README.md`, clicks **Review changes** in Source
+Control and checks that a **Code review · Codex** tab opens, that Codex's first
+provider input starts with the review lead-in and names the uncommitted scope,
+and that the panel's runtime picker reads **Supervised**. It then picks
+**Claude** under **Review once with** in the review menu: the Claude fixture
+answers a prompt that starts with "Code review requested from BiBCode." with an
+`ExitPlanMode` plan, and the spec checks that the card reads **Review findings**
+with no Implement, Refine or **Implement in a new thread**, and that Enter in
+the empty composer sends nothing, before and after a reload. It saves
+`review-codex-panel.png`, `review-claude-findings.png` and
+`review-claude-findings-after-reload.png`. To prove the flag decides the Claude
+case, build once with `codeReview: false` in the review handler's panel request
+in `apps/web/src/components/ChatView.tsx` and run the spec alone: it must fail at
+the Implement check. Restore the line before the full suite.
+
 The native composer fixture must advertise each user-invocable Claude skill in
 both the `initialize.commands` catalog and `reload_skills.skills`. The server
 filters out reload-only model skills, so adding a fixture skill only to the
@@ -3684,6 +3702,16 @@ sizes. Cover relevant:
   `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts`. By hand, open a terminal
   before changing the theme and verify it keeps its colors while a new terminal
   uses the theme;
+- Source Control review: the packaged `source-control-review` spec covers a
+  Codex chat review and a Claude review whose findings offer no Implement after
+  a reload. With the Profiler on, also check by hand on macOS and Linux a
+  **Claude Terminal** and a **Codex Terminal** review: the terminal starts with
+  the read-only flags, the review prompt arrives whole as its first message, and
+  the agent's Activity shows as for any AI Terminal. On Windows the terminal
+  reviewers stay disabled with their reason. Check **Review with
+  instructions…**, **Mod+Alt+Shift+R** outside a terminal, and the button's
+  tooltip and disabled reasons in light and dark. Read the Profiler's findings
+  afterwards;
 - Desktop export and close: the packaged `desktop-save-and-close` spec proves that
   **Export** on a custom theme writes the theme JSON through the real Save
   command (an end-to-end build writes to the path in

@@ -2361,6 +2361,30 @@ The client opens a side chat with `createPanel` (`sideChat: true`,
 `thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
 draft stays until the question was handed over.
 
+A **code review panel** (#293) is a panel with `codeReview: true`, carried like
+`sideChat`. Only `worktree.createPanel` sets it, and only on a server that
+advertises `capabilities.codeReviews`; the client sends no review field,
+setting or project prompt to a server without it. The Rust input omits a
+`false` marker when it hashes the command, the engine refuses the flag on a
+thread that is not a `panel` with a host, `thread.created` carries it only when
+true, and the projector stores it in `projection_threads.code_review`
+(migration 74, `ProjectionThreadCodeReview`); replaying older events yields
+`false`. Thread shells and details carry `codeReview: true` only for a review
+panel, and the client offers no Implement, Refine or "Implement in a new thread"
+on such a thread. The client opens a review with `createPanel`
+(`approval-required`; `plan` for Claude, `default` for every other driver; the
+review model when it belongs to the reviewer's instance) and then sends the
+resolved review prompt with `thread.turn.start`. The project's review prompt is
+`codeReviewPrompt` on the project (default `""`), set through
+`project.meta.update` and stored in `projection_projects.code_review_prompt`
+(migration 73, `ProjectCodeReviewPrompt`); `project.meta-updated` writes it with
+`COALESCE`, so an explicit `""` (Reset) survives replay and an older event
+without the key leaves it alone. The user's review agent, model and prompt are
+server settings (`codeReviewAgent`, `codeReviewModelSelection`,
+`codeReviewPrompt`). A terminal review uses no new path: it is an AI Terminal
+opened through the terminal open RPC with the CLI's read-only flags, `--` and
+the prompt as the last argument.
+
 Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): a
 close hides the panel from adoption while this page's own request about it is
 in flight (its archive, or the creation it waits on), and an archive is sent

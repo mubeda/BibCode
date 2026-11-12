@@ -399,6 +399,19 @@ with hooks off. The repository pin beats both.
 `apps/server/tests/git_system_config.rs` covers the policy with a fixture
 `GIT_CONFIG_SYSTEM` file and a compiled fake `git-lfs`, never the host's.
 
+The code review terminal argument tests (#293) send one argument per class
+(quotes, `%` and `%PATH%`, `&`, `^`, `|`, `<` with `>`, `!`, trailing
+backslashes, a backslash before a quote, and all of them combined) through an
+npm-style `%*` `.cmd` shim to `node` and compare what arrives. CI's Windows rows
+run them, and a native Windows pass runs the same command:
+
+```powershell
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -j 2 -- review_prompt_shim_
+```
+
+Terminal reviews stay off on Windows environments until these pass on real
+Windows; record the result in the execution report.
+
 Two native checks need Git for Windows with its default system LFS filter and
 Git Credential Manager, and go in the execution report:
 

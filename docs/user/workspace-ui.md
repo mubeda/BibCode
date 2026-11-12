@@ -2234,6 +2234,86 @@ right-panel Source Control surface; this matches the Orca reference behavior for
 project-scoped Git Manager is a separate centre surface and does provide stash
 operations and amend.
 
+#### Review changes
+
+**Review changes**, the icon button in the Source Control header, starts a code
+review of the checkout the panel shows:
+
+- **Scope.** With commits on the branch that are not on `origin/<default
+  branch>`, the review covers those commits and every staged, unstaged and
+  untracked change. With no such commits, it covers the uncommitted changes
+  alone. The tooltip names the scope ("Review branch vs origin/main and
+  uncommitted changes" or "Review uncommitted changes") and the reviewer's guard
+  line. The scope is read when you start the review; later changes do not alter
+  it. When `origin/<default branch>` is missing, the built-in prompt tells the
+  agent to compare with the local default branch instead.
+- **When it is disabled**, its tooltip says why: "Checking for changes", "No
+  changes to review", a draft chat ("Send a first message in this chat, then
+  review from here."), a workspace that is not available, a server too old for
+  reviews ("Update the BiBCode server on this environment to use Review."), or a
+  code review agent that is not available, which it names along with Settings →
+  Agents. BiBCode never falls back to another agent.
+- **The reviewer** is the **Code review agent** in **Settings → Agents → Code
+  review**: a chat agent, or the Claude or Codex AI Terminal. Its guard line,
+  shown there and in the tooltip, names the mechanism the review starts with,
+  never an outcome:
+
+  | Reviewer                   | Guard line                                                         |
+  | -------------------------- | ------------------------------------------------------------------ |
+  | Claude chat or terminal    | "Starts in Claude's plan mode."                                    |
+  | Codex chat                 | "Runs in Codex's read-only sandbox. Writes ask for your approval." |
+  | Codex terminal             | "Runs in Codex's read-only sandbox."                               |
+  | OpenCode chat              | "Edits and commands ask for your approval."                        |
+  | Cursor, Grok or other chat | "Told not to edit. BiBCode cannot block edits for this agent."     |
+
+  These are the settings BiBCode starts the review with, not a guarantee that
+  nothing is edited. A Claude review loads your user Claude settings and the
+  repository's project and local Claude settings, as every Claude chat does, so
+  a hook that approves leaving plan mode, allow rules for edit tools, or a
+  default mode of `bypassPermissions` in any of them can weaken plan mode. A
+  prompt in the repository can also ask the agent to do more than review.
+
+- **A chat review** opens as a chat panel of the current thread, in a tab named
+  **Code review · \<agent\>**, on the same checkout. It starts with **Supervised**
+  runtime access, and in plan mode for Claude only. The composer's pickers can
+  change both, as in any chat. Its first message is the review prompt. If that
+  message cannot be sent, the panel stays open with the prompt in its composer.
+- **A review's findings offer no Implement.** When a Claude review ends with a
+  plan, its card reads **Review findings**, with copy and download but no
+  Implement, Refine or **Implement in a new thread**, and Enter in an empty
+  composer sends nothing. This holds after a reload and on other devices. To fix
+  something, ask for it in a normal chat.
+- **A terminal review** opens a Claude or Codex AI Terminal in the centre panel
+  with the CLI's read-only flags (`--permission-mode plan` or `--sandbox
+  read-only --ask-for-approval never`) and no bypass flag, and passes the review
+  prompt as its one argument. Like other AI Terminals, it shows the agent's
+  Activity. A double click opens one terminal. A prompt longer than 8,192
+  characters, or one with a control character other than tab and line breaks,
+  is refused with a reason. Terminal reviews are off on Windows for now: the
+  button and the menu say "Terminal reviews are off on Windows for now. Pick a
+  chat reviewer in Settings → Agents."
+- **The prompt** always starts with a fixed line from BiBCode: "Code review
+  requested from BiBCode. Do not edit files." followed by the scope and, for a
+  branch, the base. The text after it is the project's review prompt, or your
+  own **Review prompt** from Settings → Agents when the project has none, or the
+  built-in prompt when neither is set. `{scope}` and `{base}` in that text are
+  replaced. **Review prompt for this project…** in the button's menu edits the
+  project's prompt, which every review of the project uses, for anyone working on
+  it; **Reset** goes back to your own prompt.
+- **The button's menu** also starts a review once without changing your
+  settings: **Review with instructions…** adds up to 1,000 characters after the
+  prompt for this review only, and **Review once with** lists every reviewer with
+  its guard line, or the reason it cannot start.
+- **Mod+Alt+Shift+R** (Cmd+Option+Shift+R on macOS, Ctrl+Alt+Shift+R elsewhere)
+  starts the review the button would start, when focus is not in a terminal and
+  the button is enabled. Mod+Shift+R stays the browser's hard reload. To use
+  another key, bind the `sourceControl.review` command (see
+  [Keybindings](./keybindings.md)).
+
+Review model in Settings → Agents picks the model of a review; **Provider
+default** uses the agent's own default, and a model saved for another agent is
+ignored. Review settings belong to each environment, as the Default Agent does.
+
 ### Files
 
 The Files surface is a full file manager for the active workspace:
