@@ -26,9 +26,27 @@ describe("KeybindingsSettingsPanel with the shipped defaults", () => {
     document.body.append(container);
     const root = createRoot(container);
     await act(async () => root.render(<KeybindingsSettingsPanel />));
+    const keycaps = [...container.querySelectorAll("kbd")].map((element) => element.textContent);
     await act(async () => root.unmount());
     const keyWarnings = error.mock.calls.filter((call) => String(call[0]).includes("same key"));
     error.mockRestore();
     expect(keyWarnings).toEqual([]);
+    // The zoom-in rule is bound to the "+" key and shows it as one keycap, not two blanks.
+    expect(keycaps).toContain("+");
+    expect(keycaps).not.toContain("");
+  });
+
+  it("lays the table out in four columns only from the sm breakpoint, so a 320 px viewport stacks it", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<KeybindingsSettingsPanel />));
+    const classes = [...container.querySelectorAll<HTMLElement>("[class]")].flatMap((element) =>
+      element.className.split(/\s+/),
+    );
+    await act(async () => root.unmount());
+    const wide = classes.filter((name) => name.includes("680px") || name.includes("190px"));
+    expect(wide.length).toBeGreaterThan(0);
+    expect(wide.filter((name) => !name.startsWith("sm:"))).toEqual([]);
   });
 });
