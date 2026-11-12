@@ -498,13 +498,18 @@ that takes 500 ms or more writes `slow process diagnostics sample` to
 attribution durations; set `BIBCODE_LOG=info,bibcode_server::diagnostics=debug`
 to log them for every sample.
 
-The host collector behind the Host dashboard (#292) writes two `warn` lines to
+The host collector behind the Host dashboard (#292) writes four `warn` lines to
 `server.log`. `host metrics sample failed` carries the `error` of a failed CPU
 and memory read; it is written once per distinct error, and the last good
 reading stays. `host volume did not answer` is written once when a volume's
 space read has run past the 2 s limit, with the volume's `file_system` and its
-`position` in the volume list. No host metrics line names a mount point or a
-volume name, because mount points can contain user names. Volume lists and
+`position` in the volume list. `host volume listing did not answer` is written
+once when the volume listing has run past the same limit; `host volume listing
+answered again` follows at `info` when it returns. `host disk call panicked`
+carries only `call` (`list` or `space`): the disk thread fails that one job and
+keeps serving, and the panic itself is a `panic` profiler event. No host metrics
+line names a mount point or a volume name, because mount points can contain
+user names. Volume lists and
 space reads run on four dedicated threads named `host-disk-0` to `host-disk-3`;
 a thread held by a hung mount shows in a thread dump under that name, and
 shutdown never waits for it.

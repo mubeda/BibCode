@@ -169,11 +169,14 @@ On Windows `sysinfo` lists fixed and removable drives only (`src/windows/disk.rs
   the queue holds at most one job per mount point plus one list. Admission and results are
   keyed by the mount point plus a **generation**: the number of the listing that first showed
   that volume. A job running for more than 2 s marks its volume as not responding (or, for the
-  list, keeps the last list); its late result is applied when it arrives if its key is still
+  list, keeps the last list and sets `volumeListingNotResponding` until the list answers, apart
+  from `volumesPaused`, since a hung list does not stop size reads); its late result is applied when it arrives if its key is still
   listed, so the volume recovers. When a listing no longer shows a volume, its state and queued
   jobs are retired and a later result of that generation is discarded; a new volume at the same
   mount point gets a new generation, so a hung read of the old one never blocks or overwrites
-  it. Retained state is therefore bounded by the latest listing plus the reads still held. A hung call costs one thread
+  it. A disk call that panics fails only its own job: the thread catches the unwind, frees the
+  key, reports a fixed failure text and keeps serving; a failed list keeps the last list.
+  Retained state is therefore bounded by the latest listing plus the reads still held. A hung call costs one thread
   slot. When all 4 slots are hung, the disk loop stops admitting jobs and the reading says
   `volumesPaused: true` ("Disk readings paused: volumes are not responding"); CPU and memory
   keep publishing from the sampling loop. Shutdown sets a stop flag and never joins the
@@ -184,7 +187,9 @@ One sample holds `sampledAt`, `cpuPercent` (0 to 100, all logical cores), `memor
 `memoryUsedBytes`, `memoryAvailableBytes` and `volumes`. Each volume has `mountPoint`, `name`,
 `fileSystem`, `totalBytes` and `freeBytes`, both relative to the user the server runs as
 (Linux: `statvfs` total blocks and the blocks available to unprivileged users, the Available and
-1024-blocks columns of `df`; macOS: total capacity and available capacity for important usage;
+1024-blocks columns of `df`; macOS: total capacity and available capacity for important usage,
+read only after a `statvfs` call has succeeded, since `sysinfo` 0.39.6 reports success even when
+its own query fails;
 Windows: the caller's total and the caller's free bytes from one `GetDiskFreeSpaceExW`, D31),
 `usedBytes` (total minus free, with free clamped to total so it is never negative), `removable`, `readOnly` and `state` (`ok` or `notResponding`). A not-responding
 volume keeps its last known bytes, or `null` before its first answer. Host facts are OS, arch,
@@ -232,9 +237,11 @@ Kept in memory for the life of the server process (D23), reset on restart:
   24 hours, and 15-minute buckets beyond that. Each bucket keeps average and peak for CPU and
   memory, as `ProcessResourceHistory` buckets do. The oldest tier holds at most 20,000 buckets;
   when it is full, adjacent pairs merge and the bucket width doubles. Closed buckets are stored
-  compactly (start offset and width in seconds as `u32`, four `f32` values: 24 bytes), so 20,000
-  of them stay under 1 MiB; a test asserts the size. Only the open bucket of each tier keeps sums
-  and weights. The wire type is separate.
+  compactly (start offset and width in seconds as `u32`, the observed weight and four averages
+  and peaks as `f32`: 28 bytes), so 20,000
+  of them stay under 1 MiB; a test asserts the size. Only the open bucket of each tier keeps sums;
+  a closed bucket keeps its observed weight apart from its width, and merges average by that
+  weight, so a bucket that spans a suspend does not count the gap. The wire type is separate.
 - On the wire the uptime chart is at most 240 bars, aggregated from the tiers on the server, and
   the recent chart at most 900 points.
 
@@ -474,8 +481,15 @@ each time, which can hang and repeats the space reads the disk loop already make
 - **First live reading.** When the first subscription opens, the sampling loop makes one
   priming CPU read and takes the first live reading one second later; the priming read is not
   recorded, so the first live value covers one second.
-- **Timestamps.** Readings use the wall clock in the server; unit tests on a paused clock use
-  the collector's start time plus the Tokio clock, which the wall clock does not follow.
+- **Timestamps.** `sampledAt` is the wall clock, a label only. Readings are ordered by
+  `sequence`, which rises by one per reading in a server run, and placed in the chart by a chart
+  clock that follows the wall clock forward (a suspend shows as a gap, which the monotonic clock
+  would hide on macOS and Linux) but advances at least as fast as the monotonic clock, so a wall
+  clock moved back neither freezes the chart nor folds new readings into an older bucket. After
+  such a step, chart times stay ahead of the wall clock by the step. `ageMs` is the reading's age
+  on the monotonic clock when the item is encoded, and every `Sample` also carries
+  `statisticsSince`. Unit tests on a paused clock use the collector's start time plus the Tokio
+  clock and a test offset, which the wall clock does not follow.
 - **Test-only cadence.** Unit tests can tick the disk loop on its own short cadence
   (`with_volume_cadence`), so the churn and replacement scenarios run many listings in seconds.
 - **Third log line.** A volume whose space read returns an error (rather than hanging) is
@@ -497,10 +511,9 @@ each time, which can hang and repeats the space reads the disk loop already make
 
 ## Open points from the build
 
-- On macOS the entry kept for the APFS container is `/`, the sealed read-only system volume, so
-  the dashboard would badge the container Read-only although the Data volume it stands for is
-  writable. Keeping the writable flag when any merged member is writable, or keeping
-  `/System/Volumes/Data`'s flag, would fix it; this changes D25's rule and awaits a decision.
+- On macOS the entry kept for the APFS container is `/`, the sealed read-only system volume.
+  Decided after review: a merged entry is read-only only when every merged member is, so the
+  container shows writable like the Data volume it stands for.
 
 ## Lifecycle and failure behaviour
 
@@ -521,8 +534,9 @@ each time, which can hang and repeats the space reads the disk loop already make
   `send_discovered_local_servers`.
 - **Reconnect:** the client subscribes again and gets a new snapshot. A different `bootId` means
   the server restarted: the sheet resets and says when.
-- **Duplicate delivery and stale results:** every item carries `sampledAt`; the reducer ignores a
-  sample older than the last one it applied.
+- **Duplicate delivery and stale results:** every item carries `sequence` (and `sampledAt`); the
+  reducer ignores a sample whose sequence is not above the last one it applied, and falls back to
+  `sampledAt` with an older server.
 - **Shutdown:** `HostMetricsCollector::shutdown` cancels both loops, sets the disk threads' stop
   flag and does not join them; subscriber loops end when the watch sender is dropped. A test runs
   a child process shaped like `main.rs` (a multi-thread runtime dropped after `block_on`) with a
@@ -566,10 +580,12 @@ each time, which can hang and repeats the space reads the disk loop already make
 - **Worktree removal, binaries and re-exec modes:** not touched.
 - **Shutdown:** the collector stops in the quiesce sequence before the profiler's teardown
   (above).
-- **Events, findings and logs:** no new profiler event or finding. Two `tracing::warn!` lines,
+- **Events, findings and logs:** no new profiler event or finding. Four `tracing::warn!` lines,
   documented in `docs/operations/observability.md`: `host metrics sample failed` (with the error,
-  once per distinct error) and `host volume did not answer` (with `file_system` and `position`,
-  never the mount point). No record carries a mount point or volume name, so nothing reaches a
+  once per distinct error), `host volume did not answer` (with `file_system` and `position`,
+  never the mount point), `host volume listing did not answer` (no field; its recovery is an
+  `info` line) and `host disk call panicked` (only `call`, never the panic payload, which the
+  profiler's panic hook records as a `panic` event with its own redaction). No record carries a mount point or volume name, so nothing reaches a
   fingerprint.
 - **Documentation:** the Diagnostics paragraph of `docs/architecture/overview.md` (line 3361)
   gains the host collector and its always-on exception to "samples nothing"; the profiler
