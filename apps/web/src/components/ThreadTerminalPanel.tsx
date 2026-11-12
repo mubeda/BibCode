@@ -575,7 +575,7 @@ const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
 /** A claim the server applied or already held, waiting for its ordered `resized` (#348). */
 interface TerminalClaimAcknowledgement {
   readonly request: TerminalSize;
-  readonly sequence: number | null;
+  readonly sequence: number;
   readonly generation: TerminalResizeResult["generation"];
 }
 
@@ -588,7 +588,7 @@ function sizePositionReaches(
   position: TerminalSizePosition,
   acknowledgement: TerminalClaimAcknowledgement,
 ): boolean {
-  if (acknowledgement.sequence === null || position.sequence === undefined) return true;
+  if (position.sequence === undefined) return true;
   const { generation } = acknowledgement;
   if (
     generation !== null &&
@@ -999,6 +999,9 @@ export function TerminalViewport({
   });
   const runResetInput = useAtomCommand(terminalEnvironment.resetInput, { reportFailure: false });
   const runTerminalResize = useAtomCommand(terminalEnvironment.resize, {
+    reportFailure: false,
+  });
+  const runReadTerminalSize = useAtomCommand(terminalEnvironment.readSize, {
     reportFailure: false,
   });
   const runTerminalRestart = useAtomCommand(terminalEnvironment.restart, {
@@ -1473,8 +1476,12 @@ export function TerminalViewport({
     // Geometry changes only through ordered size events; the answer names the one to wait for.
     let awaitedAcknowledgement: TerminalClaimAcknowledgement | null = null;
     let appliedPosition: TerminalSizePosition = {};
-    // Geometry the server declined to apply is not sent again until its state changes.
+    // Geometry the server declined, or an older server answered without an acknowledgement,
+    // is not sent again until its state changes.
     let declinedRequest: TerminalSize | null = null;
+    // The geometry whose held size an older server was last asked for; a published size since
+    // makes the read stale and allows another.
+    let legacyRead: TerminalSize | null = null;
     let oscColorResponderActive = false;
     let disposed = false;
     let resizeRetryTimer: number | null = null;
@@ -1578,13 +1585,8 @@ export function TerminalViewport({
     // ordered size path applies it, so a stale applied size is repaired without a timer
     // (#348). Any other outcome changed nothing, so xterm keeps the size it has.
     const completeClaim = (request: TerminalSize, result: TerminalResizeResult | null) => {
-      // An older server answers nothing: the next published size is the claim's outcome.
-      if (result === null) {
-        awaitedAcknowledgement = { request, sequence: null, generation: null };
-        return;
-      }
-      const { outcome } = result;
-      if (outcome === "applied" || outcome === "unchanged") {
+      const accepted = result?.outcome === "applied" || result?.outcome === "unchanged";
+      if (accepted && result.sequence !== null) {
         const acknowledgement = {
           request,
           sequence: result.sequence,
@@ -1594,12 +1596,39 @@ export function TerminalViewport({
         else awaitedAcknowledgement = acknowledgement;
         return;
       }
-      claimNoticeSuppressed = false;
       // Not sent again until the server's state changes. An unregistered claim (a remount
       // claiming before its stream attached, or a stream reconnecting) is claimed again when
       // this renderer's stream attaches; a missing session or an ended process is shown by
       // its own events.
       declinedRequest = request;
+      if (result === null || accepted) {
+        // An older server answers null and acknowledges nothing: the size it publishes next
+        // settles the claim. A takeover always publishes its owner change, but an owner's
+        // claim for the size the server already holds publishes nothing, so one read of that
+        // size repairs a stale renderer.
+        if (appliedSize?.sizeClaim === sizeClaim && !terminalSizesEqual(appliedSize, request))
+          reconcileLegacyClaim(request);
+        return;
+      }
+      claimNoticeSuppressed = false;
+    };
+    const reconcileLegacyClaim = (request: TerminalSize) => {
+      if (terminalDimensionsEqual(legacyRead, request)) return;
+      const read = request;
+      legacyRead = read;
+      void runReadTerminalSize({ environmentId, input: { threadId, terminalId } }).then(
+        (result) => {
+          if (disposed || legacyRead !== read || result._tag !== "Success") return;
+          const held = result.value;
+          if (held === null) return;
+          outputSink.barrier(() => {
+            if (disposed || legacyRead !== read) return;
+            applySize(held);
+            // The read's own size does not allow another read of the same geometry.
+            legacyRead = read;
+          });
+        },
+      );
     };
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
@@ -1629,7 +1658,7 @@ export function TerminalViewport({
           claimInFlight:
             claimInFlight !== null ||
             terminalDimensionsEqual(declinedRequest, fitted) ||
-            (awaitedAcknowledgement?.sequence != null &&
+            (awaitedAcknowledgement !== null &&
               terminalDimensionsEqual(awaitedAcknowledgement.request, fitted)),
         });
       // Typing measures at most once per frame; other keydowns in that frame reuse the fit.
@@ -1697,6 +1726,7 @@ export function TerminalViewport({
       if (disposed) return;
       appliedPosition = position;
       declinedRequest = null;
+      legacyRead = null;
       if (awaitedAcknowledgement !== null && sizePositionReaches(position, awaitedAcknowledgement))
         awaitedAcknowledgement = null;
       // A claim's outcome is its acknowledgement: an older publication parsed after the answer
@@ -2273,6 +2303,7 @@ export function TerminalViewport({
   }, [
     terminalTargetKey,
     runTerminalResize,
+    runReadTerminalSize,
     runResetInput,
     runTerminalWrite,
     canAttachTerminal,

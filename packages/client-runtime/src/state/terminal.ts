@@ -7,6 +7,7 @@ import {
   WS_METHODS,
 } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { Atom } from "effect/reactivity";
 
@@ -291,6 +292,29 @@ export function createTerminalEnvironmentAtoms<R, E>(
         key: (target) =>
           JSON.stringify([terminalSessionKey(target), target.input.sizeClaim ?? null]),
       },
+    }),
+    /**
+     * The size an existing session holds, or null. An attach without a working directory, a
+     * claim or a restart never creates, restarts or claims a session, so this read changes
+     * nothing; only its first snapshot is taken. For servers that answer resizes with null
+     * (#348).
+     */
+    readSize: createEnvironmentCommand(runtime, {
+      label: "environment-data:terminal:read-size",
+      execute: Effect.fn("terminal.readSize")(function* (input: {
+        readonly threadId: EnvironmentRpcInput<typeof WS_METHODS.terminalAttach>["threadId"];
+        readonly terminalId: string;
+      }) {
+        const first = yield* Stream.runHead(
+          subscribe(WS_METHODS.terminalAttach, {
+            threadId: input.threadId,
+            terminalId: input.terminalId,
+          }),
+        );
+        return Option.isSome(first) && first.value.type === "snapshot"
+          ? (first.value.snapshot.size ?? null)
+          : null;
+      }),
     }),
     clear: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:clear",

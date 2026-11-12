@@ -2213,7 +2213,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     );
   });
 
-  it("releases a successful claim without waiting for an echo and keeps a pending RPC through an echo", async () => {
+  it("does not re-send an older server's answered claim and keeps a pending RPC through an echo", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const view = await mountViewport();
@@ -2239,9 +2239,10 @@ describe("TerminalViewport mounted lifecycle", () => {
     await act(async () => keypress());
     expect(view.resizeSpy).toHaveBeenCalledTimes(1);
     await act(async () => settle(AsyncResult.success(undefined)));
+    // An older server acknowledges nothing; the same geometry waits for its state to change.
     await act(async () => keypress());
-    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
-    const claim = view.resizeSpy.mock.calls[1]![0].input.sizeClaim as string;
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    const claim = view.resizeSpy.mock.calls[0]![0].input.sizeClaim as string;
     await act(async () =>
       view.runtime.ingest({
         type: "resized",
@@ -2254,11 +2255,24 @@ describe("TerminalViewport mounted lifecycle", () => {
     await view.resizeContainer();
     await view.flushFrame();
     expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    // Its echo arrives and the layout changes again while the RPC is pending.
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 91, rows: 42, sizeClaim: claim },
+      }),
+    );
+    xtermState.proposedDimensions = { cols: 92, rows: 43 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
     await act(async () => settle(AsyncResult.success(undefined)));
     expect(view.resizeSpy).toHaveBeenCalledTimes(3);
     expect(view.resizeSpy.mock.calls[2]![0].input).toMatchObject({
-      cols: 91,
-      rows: 42,
+      cols: 92,
+      rows: 43,
       sizeClaim: claim,
     });
   });
@@ -2953,6 +2967,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.fakeTerminal!.rows).toBe(20);
     expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
     // A size the server does publish still settles the terminal.
+    xtermState.proposedDimensions = { cols: 80, rows: 22 };
     await act(async () =>
       view.runtime.ingest({
         type: "resized",

@@ -65,6 +65,7 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
   const begins: number[] = [];
   const cancellations: string[] = [];
   const resizes: Array<{ readonly cols: number; readonly sizeClaim?: string }> = [];
+  const attaches: Array<unknown> = [];
   let resizeGate: Effect.Effect<void> = Effect.void;
   let failLifecycle = false;
   const lifecycle = () =>
@@ -87,6 +88,13 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
           return gate;
         }),
       [WS_METHODS.subscribeTerminalMetadata]: () => Stream.fromIterable(metadataBatch),
+      [WS_METHODS.terminalAttach]: (input: unknown) => {
+        attaches.push(input);
+        return Stream.make({
+          type: "snapshot",
+          snapshot: { ...snapshot, size: { cols: 91, rows: 42, sizeClaim: "owner" } },
+        });
+      },
       [WS_METHODS.terminalBeginInput]: (input: { attachmentSequence: number }) =>
         Effect.sync(() => {
           begins.push(input.attachmentSequence);
@@ -142,6 +150,7 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
     writes,
     begins,
     cancellations,
+    attaches,
     resizes,
     holdNextResize: (gate: Effect.Effect<void>) => {
       resizeGate = gate;
@@ -187,6 +196,20 @@ describe("terminal resize claims", () => {
         );
         h.registry.dispose();
       }),
+  );
+
+  it.effect("reads an existing session's size with an attach that cannot create or claim", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness(false);
+      const result = yield* h.invoke(h.atoms.readSize, target);
+      expect(AsyncResult.isSuccess(result) && result.value).toEqual({
+        cols: 91,
+        rows: 42,
+        sizeClaim: "owner",
+      });
+      expect(h.attaches).toEqual([target.input]);
+      h.registry.dispose();
+    }),
   );
 });
 
