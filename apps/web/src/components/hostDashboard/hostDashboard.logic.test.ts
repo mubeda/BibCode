@@ -1,4 +1,4 @@
-import type { HostMetricsView } from "@bibcode/client-runtime/state/hostMetrics";
+import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {

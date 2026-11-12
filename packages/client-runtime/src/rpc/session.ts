@@ -347,6 +347,7 @@ export const PRE_VERIFICATION_SUBSCRIPTIONS: ReadonlySet<string> = new Set([
   WS_METHODS.subscribePreviewEvents,
   WS_METHODS.projectsSubscribeEntries,
   WS_METHODS.subscribeServerLifecycle,
+  WS_METHODS.serverSubscribeHostMetrics,
   WS_METHODS.subscribeTerminalEvents,
   WS_METHODS.subscribeTerminalMetadata,
   WS_METHODS.subscribeVcsStatus,

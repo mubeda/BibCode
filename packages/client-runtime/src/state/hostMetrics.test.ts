@@ -4,6 +4,7 @@ import type {
   ServerHostMetricsSample,
   ServerHostMetricsStatistic,
 } from "@bibcode/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -86,7 +87,8 @@ function run(events: ReadonlyArray<ServerHostMetricsEvent>): {
   return { view: Option.getOrThrow(state), emitted };
 }
 
-const at = (seconds: number) => new Date(Date.UTC(2026, 10, 11, 19, 0, seconds)).toISOString();
+const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+const at = (seconds: number) => iso(Date.UTC(2026, 10, 11, 19, 0, seconds));
 
 describe("accumulateHostMetrics", () => {
   it("appends samples to the snapshot's recent points", () => {
@@ -126,9 +128,7 @@ describe("accumulateHostMetrics", () => {
 
   it("keeps only points within 15 minutes of the newest after skipped samples", () => {
     const start = Date.UTC(2026, 10, 11, 19, 40, 0);
-    const recent = Array.from({ length: 300 }, (_, index) =>
-      new Date(start + index * 1_000).toISOString(),
-    );
+    const recent = Array.from({ length: 300 }, (_, index) => iso(start + index * 1_000));
     const { view } = run([snapshot(recent), sampleEvent("2026-11-11T20:00:01.000Z")]);
     const oldest = Date.parse(view.recent[0]!.sampledAt);
     expect(oldest).toBeGreaterThanOrEqual(Date.parse("2026-11-11T19:45:01.000Z"));
@@ -138,12 +138,10 @@ describe("accumulateHostMetrics", () => {
   it("keeps at most 900 points", () => {
     const events: ServerHostMetricsEvent[] = [snapshot([at(0)])];
     for (let index = 1; index <= 1_000; index += 1) {
-      events.push(sampleEvent(new Date(Date.UTC(2026, 10, 11, 19, 0, 0) + index * 1_000).toISOString()));
+      events.push(sampleEvent(at(index)));
     }
     const { view } = run(events);
     expect(view.recent).toHaveLength(900);
-    expect(view.recent.at(-1)?.sampledAt).toBe(
-      new Date(Date.UTC(2026, 10, 11, 19, 0, 0) + 1_000_000).toISOString(),
-    );
+    expect(view.recent.at(-1)?.sampledAt).toBe(at(1_000));
   });
 });
