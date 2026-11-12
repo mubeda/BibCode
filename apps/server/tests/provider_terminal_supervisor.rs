@@ -11452,6 +11452,56 @@ async fn claude_unsafe_or_unproven_settings_composition_is_pass_through() {
     }
 }
 
+fn prepared_args(preparation: TerminalLaunchPreparation) -> Vec<String> {
+    match preparation {
+        TerminalLaunchPreparation::Prepared(prepared)
+        | TerminalLaunchPreparation::Admitted(prepared, _) => prepared.args,
+        TerminalLaunchPreparation::PassThrough => panic!("expected an observed launch"),
+    }
+}
+
+/// #293: server-added options go before the `--` that ends a review's options, so the prompt
+/// stays the last, positional argument; an ordinary command still gets them at the end.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_observer_settings_precede_the_end_of_options() {
+    let fixture = claude_hook_fixture();
+    let help = fixture["rootHelp"].as_str().expect("root help");
+    let review = [
+        "--permission-mode",
+        "plan",
+        "--model",
+        "sonnet",
+        "--",
+        "Review --settings and this",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let args = prepared_args(
+        claude_direct_preparation("2.1.220 (Claude Code)", help, review.clone()).await,
+    );
+    let end = args.iter().position(|arg| arg == "--").expect("end of options");
+    assert_eq!(&args[..4], &review[..4]);
+    assert_eq!(args[4], "--settings");
+    assert_eq!(end, 6, "{args:?}");
+    assert_eq!(&args[end..], &review[4..], "the prompt stays last");
+
+    // A prompt is data: one that reads like a settings switch does not unobserve the review.
+    let flag_like = ["--", "--bare"].map(str::to_owned).to_vec();
+    let args = prepared_args(
+        claude_direct_preparation("2.1.220 (Claude Code)", help, flag_like.clone()).await,
+    );
+    assert_eq!(&args[2..], &flag_like[..], "{args:?}");
+
+    let ordinary = ["--model", "sonnet"].map(str::to_owned).to_vec();
+    let args = prepared_args(
+        claude_direct_preparation("2.1.220 (Claude Code)", help, ordinary.clone()).await,
+    );
+    assert_eq!(&args[..2], &ordinary[..]);
+    assert_eq!(args[2], "--settings");
+    assert_eq!(args.len(), 4);
+}
+
 async fn claude_fixture_terminal(
     terminal_id: &str,
 ) -> (
@@ -17001,6 +17051,62 @@ fn codex_preparation_input(
             terminal_id.to_owned(),
         ),
     }
+}
+
+/// #293: a review ends its options with `--` and a prompt; the observed launch keeps that tail
+/// last and puts `--remote` before it, and an ordinary command still ends with `--remote`.
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_observer_keeps_a_review_prompt_after_the_end_of_options() {
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let helper = Arc::new(CodexFixtureHelperLauncher::default());
+    let (supervisor, _projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        helper.clone(),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: Arc::new(CodexFixtureRemoteState::default()),
+        }),
+    )
+    .await;
+    let review = [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "-m",
+        "gpt-5.4",
+        "--",
+        "Review --remote unix://x and -C elsewhere",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let mut input = codex_preparation_input(&fixture, &configured, &root, "terminal-review");
+    input.args = review.clone();
+    let args = prepared_args(supervisor.prepare(input).await);
+    let endpoint = helper.launches.lock().expect("helper launches")[0]
+        .endpoint
+        .clone();
+    let mut expected = review[..6].to_vec();
+    expected.extend(["--remote".to_owned(), endpoint, "--".to_owned()]);
+    expected.push(review[7].clone());
+    assert_eq!(args, expected);
+
+    let args = prepared_args(
+        supervisor
+            .prepare(codex_preparation_input(
+                &fixture,
+                &configured,
+                &root,
+                "terminal-ordinary",
+            ))
+            .await,
+    );
+    assert_eq!(args[args.len() - 2], "--remote");
+    assert!(!args.iter().any(|arg| arg == "--"));
 }
 
 #[cfg(unix)]
