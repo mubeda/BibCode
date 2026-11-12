@@ -40,6 +40,9 @@ describe("resolveRichMarkdownImageSource", () => {
       "/etc/pic.png",
       "//host.example.test/pic.png",
       "file:///pic.png",
+      // Without `//` the page would read these as paths on its own address.
+      "http:/pic.png",
+      "https:pic.png",
       "C:/pic.png",
       "images\\pic.png",
       "bad%E0%A4%A.png",

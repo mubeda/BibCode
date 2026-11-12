@@ -128,6 +128,34 @@ describe("RichMarkdownImage", () => {
     expect(text?.getAttribute("title")).toContain("Check that the file exists");
   });
 
+  it("says the file may be missing when the environment refuses its address", async () => {
+    assetState.result = { _tag: "Failure", cause: "not found" };
+    await render("images/missing.png");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const text = container.querySelector("[data-rich-markdown-image-text='failed']");
+    expect(text?.textContent).toBe("A pixel");
+    expect(text?.getAttribute("title")).toContain("Check that the file exists");
+  });
+
+  it("keeps the drawn image while its signed address is reissued", async () => {
+    await render("images/pic.png");
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:fixture-1");
+
+    const seen: (string | null)[] = [];
+    const observer = new MutationObserver(() =>
+      seen.push(container.querySelector("img")?.getAttribute("src") ?? null),
+    );
+    observer.observe(container, { subtree: true, childList: true, attributes: true });
+    assetState.result = { _tag: "Success", value: { relativeUrl: "/api/assets/tok2/pic.png" } };
+    await render("images/pic.png");
+    observer.disconnect();
+
+    expect(seen).not.toContain(null);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:fixture-2");
+    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:fixture-1");
+  });
+
   it("leaves a web or data URL to the page", async () => {
     await render("https://images.example.test/pic.png");
 
