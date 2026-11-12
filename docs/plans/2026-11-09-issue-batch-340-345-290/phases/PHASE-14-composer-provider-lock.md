@@ -57,7 +57,7 @@ Steps
 - Read first: `packages/contracts/src/server.ts` (provider snapshot availability)
 - Tier: standard
 - TDD: red-green
-- Done when: `cargo test -p bibcode-server -j 2 unsupported_configured_provider` exits 0
+- Done when: `cargo test -p bibcode-server -j 2 an_unsupported_driver_is_published_unavailable_before_the_settings_that_add_it` exits 0
 
 Steps
 
