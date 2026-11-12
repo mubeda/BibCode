@@ -6250,6 +6250,26 @@ describe("ChatView handlers (captured from mocked children)", () => {
         }
       });
 
+      it("names a disabled one-off reviewer's own reason, not the saved reviewer's", async () => {
+        // A listed provider that is not ready yet is a disabled menu item.
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          providers: [codexProvider, { ...claudeProvider, status: "error" }],
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          const claude = reviewerByLabel(view, "Claude");
+          expect(claude.disabledReason).not.toBeNull();
+          expect(claude.disabledReason).not.toContain("code review agent");
+          await act(async () => startWith(view, claude.selection));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(reviewerByLabel(view, "Codex").disabledReason).toBeNull();
+        } finally {
+          await view.unmount();
+        }
+      });
+
       it("starts a one-off chat reviewer while the saved reviewer is unavailable", async () => {
         seedReviewEnvironment({
           reviewer: { kind: "chat", instanceId: claudeInstanceId },
