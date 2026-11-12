@@ -8696,6 +8696,8 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     // The server declines the first claim, so the same geometry is not sent again.
     await browserClick(fitButton(client)!);
     expect(view(client)).toMatchObject({ scale: 0.6, notice: true });
+    // A sent claim hid the button that held focus, so the terminal kept it through the answer.
+    expect(document.activeElement).toBe(terminal.textarea);
     const requests = testState.resizeCommand.mock.calls.length;
     const fit = fitButton(client)!;
     await browserClick(fit);
