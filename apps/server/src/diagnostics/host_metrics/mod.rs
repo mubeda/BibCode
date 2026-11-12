@@ -673,7 +673,9 @@ impl Shared {
     fn volume_statistics(&self) -> Vec<(PathBuf, MeasureStatistics)> {
         lock(&self.volume_statistics)
             .iter()
-            .filter_map(|(mount_point, statistic)| Some((mount_point.clone(), statistic.summary()?)))
+            .filter_map(|(mount_point, statistic)| {
+                Some((mount_point.clone(), statistic.summary()?))
+            })
             .collect()
     }
 
@@ -694,7 +696,10 @@ impl Shared {
                 continue;
             }
             let percent = used as f64 * 100.0 / total as f64;
-            match statistics.iter().position(|(known, _)| known == mount_point) {
+            match statistics
+                .iter()
+                .position(|(known, _)| known == mount_point)
+            {
                 Some(index) => statistics[index].1.record(percent, weight),
                 None if statistics.len() < MOST_VOLUME_STATISTICS => {
                     let mut statistic = RunningStatistic::default();

@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ChartBucket, ChartPoint, HiddenReason, HiddenVolume, HostFacts, HostMetricsCollector, HostMetricsSnapshot,
-    HostMetricsUpdate, HostReading, MeasureStatistics, VolumeReading, VolumeState,
+    ChartBucket, ChartPoint, HiddenReason, HiddenVolume, HostFacts, HostMetricsCollector,
+    HostMetricsSnapshot, HostMetricsUpdate, HostReading, MeasureStatistics, VolumeReading,
+    VolumeState,
 };
 use crate::rpc::RpcStreamChunk;
 
@@ -158,7 +159,9 @@ pub(crate) struct SampleWire {
     volume_statistics: Vec<VolumeStatisticWire>,
 }
 
-fn volume_statistics(statistics: &[(std::path::PathBuf, MeasureStatistics)]) -> Vec<VolumeStatisticWire> {
+fn volume_statistics(
+    statistics: &[(std::path::PathBuf, MeasureStatistics)],
+) -> Vec<VolumeStatisticWire> {
     statistics
         .iter()
         .map(|(mount_point, value)| VolumeStatisticWire {
@@ -174,10 +177,9 @@ fn hidden_volume(hidden: &HiddenVolume) -> HiddenVolumeWire {
         HiddenReason::Overlay => ("overlay", None),
         HiddenReason::FileMount => ("fileMount", None),
         HiddenReason::Empty => ("empty", None),
-        HiddenReason::SameStorage { as_mount } => (
-            "sameStorage",
-            Some(as_mount.to_string_lossy().into_owned()),
-        ),
+        HiddenReason::SameStorage { as_mount } => {
+            ("sameStorage", Some(as_mount.to_string_lossy().into_owned()))
+        }
     };
     HiddenVolumeWire {
         mount_point: hidden.descriptor.mount_point.to_string_lossy().into_owned(),

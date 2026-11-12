@@ -126,23 +126,19 @@ it.effect("drops resolved rules whose command this client does not know", () =>
   }),
 );
 
+const decodeResolvedConfigExit = Schema.decodeUnknownExit(ResolvedKeybindingsConfig);
+const decodeConfigExit = Schema.decodeUnknownExit(KeybindingsConfig);
+
 it("still rejects a resolved rule whose known command has a malformed shortcut", () => {
   assert.isTrue(
-    Schema.decodeUnknownExit(ResolvedKeybindingsConfig)([
-      { command: "sidebar.toggle", shortcut: { key: "b" } },
-    ])._tag === "Failure",
-  );
-  assert.isTrue(
-    Schema.decodeUnknownExit(ResolvedKeybindingsConfig)([{ command: 7, shortcut: {} }])._tag ===
+    decodeResolvedConfigExit([{ command: "sidebar.toggle", shortcut: { key: "b" } }])._tag ===
       "Failure",
   );
+  assert.isTrue(decodeResolvedConfigExit([{ command: 7, shortcut: {} }])._tag === "Failure");
 });
 
 it("keeps user-written keybinding rules strict about the command", () => {
-  assert.isTrue(
-    Schema.decodeUnknownExit(KeybindingsConfig)([{ key: "mod+r", command: "future.command" }])
-      ._tag === "Failure",
-  );
+  assert.isTrue(decodeConfigExit([{ key: "mod+r", command: "future.command" }])._tag === "Failure");
 });
 
 it("accepts the center-terminal command", () => {

@@ -844,7 +844,8 @@ async fn host_metrics_tool_keeps_only_root_mount_points() {
             "removable": false, "readOnly": false, "state": "ok",
         })
     };
-    let statistic = json!({ "current": 60.0, "minimum": 40.0, "average": 50.0, "p95": 59.0, "maximum": 60.0 });
+    let statistic =
+        json!({ "current": 60.0, "minimum": 40.0, "average": 50.0, "p95": 59.0, "maximum": 60.0 });
     let harness = Harness::with_methods(|registry| {
         fake(
             registry,

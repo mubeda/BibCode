@@ -305,10 +305,7 @@ function HostDashboardValuesView({
         {values.hiddenVolumes.length === 0 ? null : (
           <Collapsible>
             <CollapsibleTrigger className="flex w-fit items-center gap-1 text-muted-foreground text-xs hover:text-foreground data-panel-open:[&_svg]:rotate-90">
-              <ChevronRightIcon
-                aria-hidden
-                className="size-3.5 transition-transform"
-              />
+              <ChevronRightIcon aria-hidden className="size-3.5 transition-transform" />
               Hidden volumes ({values.hiddenVolumes.length})
             </CollapsibleTrigger>
             <CollapsiblePanel>
