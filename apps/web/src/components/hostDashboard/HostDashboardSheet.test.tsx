@@ -337,7 +337,7 @@ describe("HostDashboardSheet", () => {
     expect(subscribed()).toBe(true);
   });
 
-  it("opens from the request atom and ends the stream when the sheet closes", async () => {
+  it("opens from the request atom and unmounts when it is cleared", async () => {
     h.data = view();
     const registry = AtomRegistry.make();
     const host = document.createElement("div");
