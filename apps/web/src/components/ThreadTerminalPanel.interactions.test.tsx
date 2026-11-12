@@ -523,6 +523,7 @@ const testState = vi.hoisted(() => ({
   resetInputCommand: vi.fn(),
   reattachCommand: vi.fn(),
   resizeCommand: vi.fn(),
+  readSizeCommand: vi.fn(),
   restartCommand: vi.fn(),
   stageImagePasteCommand: vi.fn(),
   previewCommand: vi.fn(),
@@ -582,6 +583,7 @@ vi.mock("../state/terminal", () => ({
     prepareInput: "terminal-prepare-input",
     resetInput: "terminal-reset-input",
     resize: "terminal-resize",
+    readSize: "terminal-read-size",
     restart: "terminal-restart",
     stageImagePaste: "terminal-stage-image-paste",
   },
@@ -592,6 +594,7 @@ vi.mock("../state/use-atom-command", () => ({
     if (command === "terminal-prepare-input") return testState.prepareInputCommand;
     if (command === "terminal-reset-input") return testState.resetInputCommand;
     if (command === "terminal-resize") return testState.resizeCommand;
+    if (command === "terminal-read-size") return testState.readSizeCommand;
     if (command === "terminal-restart") return testState.restartCommand;
     if (command === "terminal-stage-image-paste") return testState.stageImagePasteCommand;
     return testState.previewCommand;
@@ -1322,6 +1325,7 @@ beforeEach(() => {
   testState.resetInputCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.reattachCommand.mockReset();
   testState.resizeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  testState.readSizeCommand.mockReset().mockResolvedValue(AsyncResult.success(null));
   testState.restartCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.stageImagePasteCommand
     .mockReset()
@@ -2894,6 +2898,71 @@ describe("TerminalViewport mounted lifecycle", () => {
     await server.release();
     await view.flushFrame();
     expect(view.fakeTerminal!.rows).toBe(20);
+  });
+
+  it("does not wait for an acknowledgement an older server never sends (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 20, sizeClaim: claim };
+    // An older server answers every resize with null and publishes nothing for a no-op.
+    view.resizeSpy.mockResolvedValue(AsyncResult.success(null));
+    let answerRead: (size: typeof held) => void = () => undefined;
+    testState.readSizeCommand.mockReturnValue(
+      new Promise((resolve) => {
+        answerRead = (size) => resolve(AsyncResult.success(size));
+      }),
+    );
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+    );
+    await view.flushFrame();
+    // A stale size reaches this renderer; the server already holds the fit.
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { ...held, rows: 30 },
+      }),
+    );
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    for (let key = 0; key < 100; key += 1) {
+      await act(async () =>
+        view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+      );
+      await view.flushFrame();
+      await act(async () => vi.advanceTimersByTimeAsync(30));
+    }
+    vi.useRealTimers();
+    // The same geometry is not sent again while nothing changed on the server.
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    // One read of the existing session, without a working directory or a claim, repairs it.
+    expect(testState.readSizeCommand).toHaveBeenCalledOnce();
+    expect(testState.readSizeCommand).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-1" },
+    });
+    await act(async () => answerRead(held));
+    await view.flushFrame();
+    expect(view.fakeTerminal!.rows).toBe(20);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    // A size the server does publish still settles the terminal.
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 22, sizeClaim: claim },
+      }),
+    );
+    await view.flushFrame();
+    expect(view.fakeTerminal!.rows).toBe(22);
   });
 
   it("repairs rows from the requester's resync when its acknowledgement was lost (#348)", async () => {
