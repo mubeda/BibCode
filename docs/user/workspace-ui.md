@@ -15,6 +15,61 @@ the environment it was sent to, and its start time. The warning goes away when
 the requests finish. The hosted web app has no status bar, so there a bar holding
 only this warning appears at the bottom while requests are slow.
 
+## Host dashboard
+
+The Host dashboard shows the computer a BiBCode server runs on: its CPU, its
+memory and its disks. Each environment has one, so you can look at a remote
+server's host as well as this machine. Open it from any of three places:
+
+- the **Environment actions** menu on the environment card in the left panel;
+- **Settings → Remote Servers**, the **Host dashboard** button on a connected
+  server;
+- the **Resource Manager** popover in the status bar, its **Host dashboard**
+  button.
+
+The dashboard opens as a panel on the right. Its sections are:
+
+- **CPU** shows the current use and the number of cores, with a chart of the
+  last 15 minutes.
+- **Memory** shows used and total memory, with the same chart.
+- **Volumes** lists each disk with its used and total size and its free space.
+  A volume can carry a **Removable**, **Read-only** or **Not responding**
+  badge. **Hidden volumes** below the list names each volume that is not shown
+  and why: a network volume, a container layer, a file mount, an empty volume,
+  or the same storage as another volume. Hidden volumes are never sized.
+- **Since** shows the time the server started and how long it has been up, then
+  a table of the current, minimum, average, p95 and maximum use of CPU, memory
+  and each volume, and a chart of the whole run. Each bar is an average, with
+  its peak drawn lighter above it. The figures cover this server process only.
+  They start again when the server restarts.
+
+Free space is the free space of the volume itself. A per-user quota is not
+applied. BiBCode does not read network volumes, so a disconnected share cannot
+stall the dashboard.
+
+The dashboard updates once a second while you can see it. It stops asking the
+server when the window is hidden and starts again when you return. A reading
+that is more than a few seconds old dims the values and says how old it is.
+
+A notice at the top says when something is off:
+
+- **Disconnected**: the connection to the server dropped. The last values stay
+  on screen until it returns.
+- **This server's version doesn't report host metrics**: the server is too old.
+  Update it, or choose **Open Remote Servers** to find it.
+- **Server restarted at** a time: the server restarted while the dashboard was
+  open. The Since figures start again.
+- An error from the server, with **Retry**.
+
+If a disk stops answering, its volume shows **Not responding** and the
+dashboard says that volume sizes are paused until the earlier reads answer.
+If the list of volumes itself does not answer, the dashboard says so and shows
+the volumes from the last list that did. CPU and memory keep updating.
+
+An agent can read the same figures with the `host_metrics` MCP tool; it
+returns mount points only for a file system root such as `/` or `C:\`. See the
+[MCP reference](../reference/mcp.md).
+
 ## Left Panel
 
 The panel opens 422px wide by default (a 370px projects panel beside the 52px
