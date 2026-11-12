@@ -4500,7 +4500,7 @@ The host this server runs on, as the Host dashboard shows it: its system, archit
 - `cpu`, `memory` (null before the first reading): `{ current, minimum, average, p95, maximum }`, in percent.
 - `volumeStatistics[]`: `{ mountPoint, statistic }`, each volume's used percent since start, with `mountPoint` kept by the same rule.
 - `mountPointsWithheld` (integer): how many of `sample.volumes` had their mount point replaced by `null`.
-- `hiddenVolumeCount` (integer): how many volumes the dashboard's filter hid (network, container layer, file mount, system mount, empty, same storage); they are counted, never listed.
+- `hiddenVolumeCount` (integer): how many volumes the dashboard's filter hid (reasons `network`, `overlay` (container layer), `fileMount`, `system` (system mount), `empty`, `sameStorage`); they are counted, never listed.
 - Not included: volume names, non-root mount points, hidden volumes' paths, the recent and since-start charts, the boot ID.
 
 **Errors:**

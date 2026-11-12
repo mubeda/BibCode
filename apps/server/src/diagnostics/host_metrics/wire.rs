@@ -399,6 +399,64 @@ mod tests {
         fixture["values"][0].clone()
     }
 
+    /// #292 review: every hidden reason's wire string is pinned, and the web sheet's labels and
+    /// the MCP reference name the same strings, so a rename cannot pass silently.
+    #[test]
+    fn every_hidden_reason_has_a_pinned_wire_string() {
+        let reasons = [
+            HiddenReason::Network,
+            HiddenReason::Overlay,
+            HiddenReason::FileMount,
+            HiddenReason::System,
+            HiddenReason::Empty,
+            HiddenReason::SameStorage {
+                as_mount: PathBuf::from("/"),
+            },
+        ];
+        // No wildcard: a new variant fails to compile here until it is pinned too.
+        let expected = |reason: &HiddenReason| match reason {
+            HiddenReason::Network => "network",
+            HiddenReason::Overlay => "overlay",
+            HiddenReason::FileMount => "fileMount",
+            HiddenReason::System => "system",
+            HiddenReason::Empty => "empty",
+            HiddenReason::SameStorage { .. } => "sameStorage",
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
+        let web = read("apps/web/src/components/hostDashboard/hostDashboard.logic.ts");
+        let mcp = read("docs/reference/mcp.md");
+        let mcp_line = mcp
+            .lines()
+            .find(|line| line.contains("`hiddenVolumeCount`"))
+            .expect("the MCP reference documents hiddenVolumeCount");
+        for reason in reasons {
+            let wire = hidden_volume(&HiddenVolume {
+                descriptor: VolumeDescriptor {
+                    mount_point: PathBuf::from("/mnt/x"),
+                    name: String::new(),
+                    file_system: "ext4".to_owned(),
+                    removable: false,
+                    read_only: false,
+                    is_file: false,
+                },
+                reason: reason.clone(),
+            });
+            let string = expected(&reason);
+            assert_eq!(wire.reason, string, "{reason:?}");
+            let labelled = if string == "sameStorage" {
+                web.contains("volume.reason === \"sameStorage\"")
+            } else {
+                web.contains(&format!("  {string}: \""))
+            };
+            assert!(labelled, "the web sheet labels `{string}`");
+            assert!(
+                mcp_line.contains(&format!("`{string}`")),
+                "docs/reference/mcp.md names `{string}`"
+            );
+        }
+    }
+
     #[test]
     fn host_metrics_stream_fixtures_round_trip() {
         for name in [
