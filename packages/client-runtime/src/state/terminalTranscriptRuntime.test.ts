@@ -486,3 +486,159 @@ describe("createTerminalTranscriptRuntime", () => {
     expect(revisions).toEqual([]);
   });
 });
+
+describe("createTerminalTranscriptRuntime with several attach streams (#348)", () => {
+  const at = (sequence: number, history: string, pid = 7, rows = 30) =>
+    ({
+      type: "snapshot",
+      snapshot: {
+        ...snapshotData(history),
+        pid,
+        sequence,
+        size: { cols: 80, rows, sizeClaim: "a" },
+      },
+    }) satisfies TerminalAttachStreamEvent;
+  const resizedAt = (sequence: number, rows: number) =>
+    ({
+      type: "resized",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence,
+      size: { cols: 80, rows, sizeClaim: "a" },
+    }) satisfies TerminalAttachStreamEvent;
+  const outputAt = (sequence: number, data: string) =>
+    ({
+      type: "output",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence,
+      data,
+    }) satisfies TerminalAttachStreamEvent;
+  const restartedAt = (sequence: number, history: string, pid: number) =>
+    ({
+      type: "restarted",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence,
+      snapshot: { ...snapshotData(history), pid, sequence },
+    }) satisfies TerminalAttachStreamEvent;
+  const appliedRows = (runtime: ReturnType<typeof createTerminalTranscriptRuntime>) => {
+    const seen: Array<number> = [];
+    runtime.attachRenderer((signal) => {
+      if (signal.type === "resized") seen.push(signal.size.rows);
+      if (signal.type === "reset" && signal.size) seen.push(signal.size.rows);
+    });
+    return seen;
+  };
+
+  it("keeps a newer size when another stream delivers an older one late", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    runtime.ingest(at(10, "h"), a);
+    runtime.ingest(at(10, "h"), b);
+    const rows = appliedRows(runtime);
+    runtime.ingest(resizedAt(11, 30), a);
+    runtime.ingest(resizedAt(12, 20), a);
+    runtime.ingest(resizedAt(11, 30), b);
+    expect(rows).toEqual([30, 30, 20]);
+    const late: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => late.push(signal));
+    expect(late).toEqual([
+      { type: "reset", snapshot: "h", size: { cols: 80, rows: 20, sizeClaim: "a" } },
+    ]);
+  });
+
+  it("appends output delivered by two streams once, in order, without a gap", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    runtime.ingest(at(10, "h"), a);
+    runtime.ingest(outputAt(11, "1"), a);
+    runtime.ingest(outputAt(12, "2"), a);
+    // The second stream's snapshot is older than what the first already applied.
+    runtime.ingest(at(10, "h"), b);
+    runtime.ingest(outputAt(11, "1"), b);
+    runtime.ingest(outputAt(13, "3"), a);
+    runtime.ingest(outputAt(12, "2"), b);
+    runtime.ingest(outputAt(13, "3"), b);
+    runtime.ingest(outputAt(14, "4"), b);
+    expect(runtime.snapshot()).toBe("h1234");
+  });
+
+  it("applies a newer resync from another stream and ignores an equal or older one", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    runtime.ingest(at(10, "h"), a);
+    runtime.ingest(outputAt(11, "1"), a);
+    runtime.ingest({ ...at(11, "h1"), resync: true }, b);
+    runtime.ingest({ ...at(9, "old"), resync: true }, b);
+    expect(runtime.snapshot()).toBe("h1");
+    runtime.ingest({ ...at(15, "caught-up"), resync: true }, b);
+    expect(runtime.snapshot()).toBe("caught-up");
+    expect(runtime.metadata().generation).toBe(1);
+    runtime.ingest(outputAt(12, "stale"), a);
+    runtime.ingest(outputAt(16, "!"), a);
+    expect(runtime.snapshot()).toBe("caught-up!");
+  });
+
+  it("drops a lagging stream's old-process events after a restart and resumes it after its own restart", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    runtime.ingest(at(490, "old"), a);
+    runtime.ingest(at(490, "old"), b);
+    runtime.ingest(restartedAt(1, "new", 8), a);
+    runtime.ingest(outputAt(2, "a"), a);
+    runtime.ingest(outputAt(498, "stale"), b);
+    runtime.ingest(resizedAt(499, 50), b);
+    expect(runtime.snapshot()).toBe("newa");
+    expect(runtime.metadata().generation).toBe(3);
+    runtime.ingest(restartedAt(1, "new", 8), b);
+    expect(runtime.metadata().generation).toBe(3);
+    expect(runtime.snapshot()).toBe("newa");
+    runtime.ingest(outputAt(2, "a"), b);
+    runtime.ingest(outputAt(3, "b"), b);
+    expect(runtime.snapshot()).toBe("newab");
+  });
+
+  it("starts over for a snapshot of another process even at a lower sequence", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    runtime.ingest(at(40, "old"), a);
+    runtime.ingest(at(2, "reopened", 9), b);
+    expect(runtime.snapshot()).toBe("reopened");
+    expect(runtime.metadata().generation).toBe(2);
+  });
+
+  it("ignores a cleared and a closed event already applied from another stream", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    const statuses: Array<string> = [];
+    runtime.ingest(at(10, "h"), a);
+    runtime.ingest(at(10, "h"), b);
+    runtime.subscribeMetadata((next) => statuses.push(next.status));
+    const cleared = {
+      type: "cleared",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 11,
+    } satisfies TerminalAttachStreamEvent;
+    const closed = {
+      type: "closed",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 13,
+    } satisfies TerminalAttachStreamEvent;
+    runtime.ingest(cleared, a);
+    runtime.ingest(outputAt(12, "kept"), a);
+    runtime.ingest(cleared, b);
+    expect(runtime.snapshot()).toBe("kept");
+    runtime.ingest(closed, a);
+    runtime.ingest(closed, b);
+    expect(statuses).toEqual(["running", "closed"]);
+  });
+});

@@ -151,6 +151,60 @@ describe("projectTerminalMetadataStream", () => {
   );
 });
 
+describe("two attach producers sharing one transcript runtime (#348)", () => {
+  it.effect("a late stream cannot roll back the size or repeat the output of an earlier one", () =>
+    Effect.gen(function* () {
+      const registry = createTerminalTranscriptRuntimeRegistry();
+      const key = terminalTranscriptRuntimeKey("environment", { threadId: "thread-1" });
+      const runtime = registry.acquire(key);
+      const sized = (sequence: number, rows: number): TerminalAttachStreamEvent => ({
+        type: "resized",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence,
+        size: { cols: 80, rows, sizeClaim: "owner" },
+      });
+      const attachedAt = (sequence: number): TerminalAttachStreamEvent => ({
+        type: "snapshot",
+        snapshot: {
+          ...snapshotData("h"),
+          sequence,
+          size: { cols: 80, rows: 30, sizeClaim: "owner" },
+        },
+      });
+      const printed = (sequence: number): TerminalAttachStreamEvent => ({
+        type: "output",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence,
+        data: "x",
+      });
+      const rows: Array<number> = [];
+      runtime.attachRenderer((signal) => {
+        if (signal.type === "resized") rows.push(signal.size.rows);
+      });
+      // Producer A delivers its whole stream first; producer B, attached at the same
+      // point, delivers the same events late.
+      yield* Stream.runDrain(
+        acquireTerminalMetadataStream(
+          Stream.make(attachedAt(10), sized(11, 30), sized(12, 20), printed(13)),
+          registry,
+          key,
+        ),
+      );
+      yield* Stream.runDrain(
+        acquireTerminalMetadataStream(
+          Stream.make(attachedAt(10), sized(11, 30), printed(13)),
+          registry,
+          key,
+        ),
+      );
+      expect(rows).toEqual([30, 20]);
+      expect(runtime.snapshot()).toBe("hx");
+    }),
+  );
+});
+
 describe("createTerminalTranscriptRuntimeRegistry", () => {
   it("shares exact identity per key and cleans up only after the final balanced release", () => {
     const registry = createTerminalTranscriptRuntimeRegistry();
