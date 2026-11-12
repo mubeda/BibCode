@@ -32,7 +32,7 @@ async function texts(selector: string): Promise<string[]> {
 }
 
 describe("packaged Host dashboard", () => {
-  it("opens for the local computer from the Resource Manager and updates live", async () => {
+  it("opens for the local computer, updates live, discloses hidden volumes and closes", async () => {
     await openFromResourceManager();
 
     const title = await text(`${sheetSelector} [data-slot="sheet-title"]`);
@@ -63,30 +63,28 @@ describe("packaged Host dashboard", () => {
     expect(firstSampledAt).toBeTruthy();
     await browser.pause(3_000);
     expect(await browser.$(cpuSelector).getAttribute("data-sampled-at")).not.toBe(firstSampledAt);
-  });
 
-  it("lists hidden volumes with a reason and no size", async () => {
+    // One case only: every case starts from a reset connection and route, which closes the sheet.
     const disclosure = browser.$(
       '//*[@data-testid="host-dashboard"]//button[starts-with(normalize-space(), "Hidden volumes (")]',
     );
     // Whether a host hides a volume depends on its mounts (a container's file mounts, the macOS
     // data volume); a host that hides none shows no disclosure.
-    if (!(await disclosure.isExisting())) return;
-    expect(await disclosure.getAttribute("aria-expanded")).toBe("false");
-    await disclosure.click();
-    await browser.waitUntil(
-      async () => (await disclosure.getAttribute("aria-expanded")) === "true",
-      { timeoutMsg: "The hidden volumes disclosure never opened." },
-    );
-    const rows = await texts(`${sheetSelector} [data-testid="host-dashboard-hidden-volume"]`);
-    expect(rows.length).toBeGreaterThan(0);
-    for (const row of rows) {
-      expect(row).toMatch(hiddenReason);
-      expect(row).not.toMatch(/\d\s?(B|KB|MB|GB|TB)\b/);
+    if (await disclosure.isExisting()) {
+      expect(await disclosure.getAttribute("aria-expanded")).toBe("false");
+      await disclosure.click();
+      await browser.waitUntil(
+        async () => (await disclosure.getAttribute("aria-expanded")) === "true",
+        { timeoutMsg: "The hidden volumes disclosure never opened." },
+      );
+      const rows = await texts(`${sheetSelector} [data-testid="host-dashboard-hidden-volume"]`);
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row).toMatch(hiddenReason);
+        expect(row).not.toMatch(/\d\s?(B|KB|MB|GB|TB)\b/);
+      }
     }
-  });
 
-  it("closes", async () => {
     await browser.keys("Escape");
     await browser.$(sheetSelector).waitForExist({ reverse: true });
   });
