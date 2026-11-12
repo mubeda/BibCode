@@ -1,9 +1,6 @@
 import type { IDisposable, Terminal } from "@xterm/xterm";
 
-type FollowedTerminal = Pick<
-  Terminal,
-  "buffer" | "cols" | "rows" | "resize" | "onRender" | "scrollToBottom"
->;
+type FollowedTerminal = Pick<Terminal, "buffer" | "onRender" | "scrollToBottom">;
 
 /** Repair attempts after one resume; each waits for the next render. */
 const TERMINAL_FOLLOW_REPAIR_ATTEMPTS = 3;
@@ -15,6 +12,11 @@ export interface TerminalFollowOutputOptions {
    * pauses. Returns the unsubscribe.
    */
   readonly observeDrawing: (onChange: (drawing: boolean) => void) => () => void;
+  /**
+   * Makes xterm's scroll area take the terminal's current height, touching no buffer, cursor
+   * or margin (see `syncXtermScrollArea`).
+   */
+  readonly syncScrollArea: () => void;
   /**
    * Reports a scroll the user makes (a wheel over the terminal, a press on its scroll bar),
    * which ends a pending repair: the user chose a position. Returns the unsubscribe.
@@ -69,11 +71,11 @@ export function createTerminalFollowOutput(
     if (normalAtBottom() || attempts >= TERMINAL_FOLLOW_REPAIR_ATTEMPTS) return settle();
     attempts += 1;
     // xterm's scroll area can keep the paused height after drawing resumes and clamps every
-    // scroll to it, even at row 0 with no range at all; xterm syncs it on a resize, and a
-    // one-row round trip leaves the grid as it was. The next render tries again.
-    const { cols, rows } = terminal;
-    terminal.resize(cols, rows + 1);
-    terminal.resize(cols, rows);
+    // scroll to it, even at row 0 with no range at all. Sync it, then scroll; a render that
+    // follows tries again if that was not enough.
+    options.syncScrollArea();
+    terminal.scrollToBottom();
+    if (normalAtBottom()) return settle();
     waitForDraw();
   };
   // Outside xterm's own scroll handling, which ignores a scroll requested inside it.
@@ -149,6 +151,29 @@ export function createTerminalFollowOutput(
 function liveAtBottom(terminal: FollowedTerminal): boolean {
   const active = terminal.buffer.active;
   return active.viewportY >= active.baseY;
+}
+
+/**
+ * Syncs xterm's scroll area with the terminal's current height and position. xterm 6 syncs it
+ * only on a buffer resize, a buffer switch or a buffer scroll, so no public call does it
+ * without changing the program's terminal state (a resize resets its scrolling margins).
+ */
+export function syncXtermScrollArea(terminal: Terminal): void {
+  // shortcut: calls xterm 6.0.0's private `Viewport._sync` (or `queueSync`), feature-detected;
+  // remove when xterm syncs its scroll area when a paused renderer resumes, or exposes a sync.
+  try {
+    const viewport = (
+      terminal as unknown as {
+        readonly _core?: {
+          readonly _viewport?: { readonly _sync?: () => void; readonly queueSync?: () => void };
+        };
+      }
+    )._core?._viewport;
+    if (typeof viewport?._sync === "function") viewport._sync();
+    else if (typeof viewport?.queueSync === "function") viewport.queueSync();
+  } catch {
+    // An xterm without them keeps the bounded retry on later renders.
+  }
 }
 
 /**

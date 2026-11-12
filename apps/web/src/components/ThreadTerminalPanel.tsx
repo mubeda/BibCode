@@ -93,6 +93,7 @@ import {
   createTerminalFollowOutput,
   observeTerminalDrawing,
   observeTerminalUserScroll,
+  syncXtermScrollArea,
 } from "./terminalFollowOutput";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
 import {
@@ -1493,6 +1494,7 @@ export function TerminalViewport({
     const followOutput = followScreen
       ? createTerminalFollowOutput(terminal, {
           observeDrawing: observeTerminalDrawing(followScreen),
+          syncScrollArea: () => syncXtermScrollArea(terminal),
           observeUserScroll: observeTerminalUserScroll(mount),
         })
       : null;

@@ -35,13 +35,6 @@ function harness() {
   const follow = createTerminalFollowOutput(
     {
       buffer: terminal.buffer,
-      get cols() {
-        return terminal.cols;
-      },
-      get rows() {
-        return terminal.rows;
-      },
-      resize: (cols, rows) => terminal.resize(cols, rows),
       scrollToBottom: () => scrollTo(terminal.buffer.normal.baseY),
       onRender: (listener) => {
         const callback = () => listener({ start: 0, end: terminal.rows - 1 });
@@ -177,9 +170,12 @@ describe("terminal follow output across a paused renderer (#348)", () => {
       terminal.buffer.normal
         .getLine(terminal.buffer.normal.baseY + row - 1)
         ?.translateToString(true);
-    // A scrolling region on rows 2 to 4, a footer on row 5, a tab stop at column 11, a saved
+    // A scrolling region on rows 2 to 4, a footer on row 5, one tab stop at column 11, a saved
     // cursor at row 3 column 7, and the cursor on the region's bottom row.
-    await write(terminal, "\u001b[5;1H\u001b[2KFOOTER\u001b[1;11H\u001bH\u001b[3;7H\u001b7");
+    await write(
+      terminal,
+      "\u001b[5;1H\u001b[2KFOOTER\u001b[3g\u001b[1;11H\u001bH\u001b[3;7H\u001b7",
+    );
     await write(terminal, "\u001b[2;4r\u001b[4;1H");
     test.pause();
     test.clamp(18);
@@ -196,7 +192,7 @@ describe("terminal follow output across a paused renderer (#348)", () => {
     // The saved cursor comes back where the program saved it.
     await write(terminal, "\u001b8");
     expect([terminal.buffer.normal.cursorY, terminal.buffer.normal.cursorX]).toEqual([2, 6]);
-    expect(terminal.buffer.alternate.getLine(0)?.translateToString(true)).toBe("");
+    expect(terminal.buffer.alternate.getLine(0)?.translateToString(true) ?? "").toBe("");
   });
 
   it("keeps a scroll the user makes after the show while the repair is pending", async () => {
