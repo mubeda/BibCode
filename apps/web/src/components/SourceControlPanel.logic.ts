@@ -143,6 +143,13 @@ export function resolveCodeReviewScope(
   return null;
 }
 
+/** The enabled button's tooltip names what a review covers (R104). */
+export function codeReviewTooltip(scope: CodeReviewScope): string {
+  return scope.kind === "branch"
+    ? `Review branch vs ${scope.base} and uncommitted changes`
+    : "Review uncommitted changes";
+}
+
 export function resolveCodeReviewButtonState(input: {
   readonly status: VcsStatusResult | null;
   readonly scope: CodeReviewScope | null;

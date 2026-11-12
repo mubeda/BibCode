@@ -124,6 +124,7 @@ import {
   ignoreParentFolderPattern,
   isFileStaged,
   type CodeReviewScope,
+  codeReviewTooltip,
   type PendingDiscard,
   resolveCodeReviewButtonState,
   resolveCodeReviewScope,
@@ -1176,7 +1177,9 @@ export default function SourceControlPanel({
           <TooltipPopup side="bottom">
             {codeReviewButton.reason ?? (
               <>
-                <span className="block">Review changes</span>
+                <span className="block">
+                  {codeReviewScope ? codeReviewTooltip(codeReviewScope) : "Review changes"}
+                </span>
                 {codeReview.guardLine ? (
                   <span className="block text-muted-foreground">{codeReview.guardLine}</span>
                 ) : null}
