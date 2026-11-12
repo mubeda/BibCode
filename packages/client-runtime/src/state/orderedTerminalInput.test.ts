@@ -99,6 +99,42 @@ describe("ordered terminal input binding", () => {
       expect(h.frames.map((f) => f.data)).toEqual(["a"]);
     }),
   );
+  it.effect("marks each frame with who produced its input, and nothing when unsaid (#348)", () =>
+    Effect.gen(function* () {
+      for (const ordered of [true, false]) {
+        const h = harness(ordered);
+        const sent: Array<Record<string, unknown>> = [];
+        const client = h.session.client as unknown as Record<
+          string,
+          (frame: Record<string, unknown>) => Effect.Effect<unknown>
+        >;
+        for (const method of [WS_METHODS.terminalWriteInput, WS_METHODS.terminalWrite]) {
+          const send = client[method]!;
+          client[method] = (frame) => {
+            sent.push(frame);
+            return send(frame);
+          };
+        }
+        // A binding a write created keeps that write's input as its target.
+        const binding = createOrderedTerminalInputBinding(
+          h.session,
+          "env",
+          { ...target, data: "first", userInputClaim: "claim" } as typeof target,
+          yield* Effect.context(),
+        );
+        yield* binding.write("typed", "claim");
+        yield* binding.write("\u001b[0n", null);
+        yield* binding.write("unmarked");
+        expect(sent.map(({ data, userInputClaim }) => ({ data, userInputClaim }))).toEqual([
+          { data: "typed", userInputClaim: "claim" },
+          { data: "\u001b[0n", userInputClaim: null },
+          { data: "unmarked", userInputClaim: undefined },
+        ]);
+        expect(sent[2]).not.toHaveProperty("userInputClaim");
+        binding.dispose();
+      }
+    }),
+  );
   it.effect("does not begin a lease for an older server", () =>
     Effect.gen(function* () {
       const h = harness(false);

@@ -6735,6 +6735,130 @@ mod tests {
         manager.shutdown().await;
     }
 
+    fn owner_of(attachment: &TerminalAttachment) -> Option<&str> {
+        attachment
+            .initial
+            .size
+            .as_ref()
+            .and_then(|size| size.size_claim.as_deref())
+    }
+
+    async fn ordered_write_from(
+        manager: &TerminalManager,
+        connection: uuid::Uuid,
+        input_id: &str,
+        sequence: u64,
+        data: &str,
+        origin: TerminalInputOrigin<'_>,
+    ) {
+        manager
+            .prepare_input_write(connection, "sizing", "term", input_id, sequence, data)
+            .unwrap()
+            .with_origin(origin)
+            .write()
+            .await
+            .unwrap();
+    }
+
+    /// A terminal's own answer to a status query is input from the window that inherited the
+    /// size, but nobody used that window: the window last used still gets the size back when it
+    /// returns (#348). An older client cannot tell its replies from typing, so all its input
+    /// counts as use, as before.
+    #[tokio::test]
+    async fn an_automatic_reply_does_not_keep_the_size_from_the_returning_owner() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let connection = uuid::Uuid::new_v4();
+        let input = manager
+            .begin_input(
+                connection,
+                CancellationToken::new(),
+                "sizing",
+                "term",
+                0,
+                None,
+            )
+            .await
+            .unwrap()
+            .input_id;
+        let mut sequence = 0;
+        let mut client = manager.attach(size_attachment("client")).await.unwrap();
+        let mut host = manager.attach(size_attachment("host")).await.unwrap();
+        for (path, origin, client_returns) in [
+            ("unary", TerminalInputOrigin::Automatic, true),
+            ("ordered", TerminalInputOrigin::Automatic, true),
+            ("ordered", TerminalInputOrigin::Unmarked, false),
+        ] {
+            drop(client);
+            assert!(
+                matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("host")),
+                "the idle host inherits the size"
+            );
+            if path == "unary" {
+                manager
+                    .write_from("sizing", "term", "\x1b[0n", origin)
+                    .await
+                    .unwrap();
+            } else {
+                ordered_write_from(&manager, connection, &input, sequence, "\x1b[0n", origin).await;
+                sequence += 1;
+            }
+            client = manager.attach(size_attachment("client")).await.unwrap();
+            let expected = if client_returns { "client" } else { "host" };
+            assert_eq!(owner_of(&client), Some(expected), "{path} {origin:?}");
+            if client_returns {
+                assert!(matches!(
+                    next_attachment_event(&mut host).await,
+                    TerminalEvent::Resized { .. }
+                ));
+            } else {
+                // Give the size back to the client for the next round.
+                manager
+                    .resize("sizing", "term", 80, 24, Some("client".to_owned()))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next_attachment_event(&mut host).await,
+                    TerminalEvent::Resized { .. }
+                ));
+            }
+        }
+        manager.shutdown().await;
+    }
+
+    /// With several viewers left when the window last used goes away, the size goes to the one
+    /// a user typed in last; a terminal's own replies are not typing (#348).
+    #[tokio::test]
+    async fn the_size_goes_to_the_remaining_viewer_typed_in_last() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut left = manager.attach(size_attachment("left")).await.unwrap();
+        let mut right = manager.attach(size_attachment("right")).await.unwrap();
+        for (data, origin) in [
+            ("r", TerminalInputOrigin::User("right")),
+            ("l", TerminalInputOrigin::User("left")),
+            ("\x1b[0n", TerminalInputOrigin::Automatic),
+            ("o", TerminalInputOrigin::User("owner")),
+        ] {
+            manager
+                .write_from("sizing", "term", data, origin)
+                .await
+                .unwrap();
+        }
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut left).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("left")),
+            "the viewer typed in last takes the size"
+        );
+        assert!(matches!(
+            next_attachment_event(&mut right).await,
+            TerminalEvent::Resized { .. }
+        ));
+        // The owner that left gets it back if it returns before anyone types in `left`.
+        let back = manager.attach(size_attachment("owner")).await.unwrap();
+        assert_eq!(owner_of(&back), Some("owner"));
+        manager.shutdown().await;
+    }
+
     #[derive(Debug)]
     struct HistoryTestBackend {
         processes: std::sync::Mutex<Vec<Arc<HistoryTestPty>>>,

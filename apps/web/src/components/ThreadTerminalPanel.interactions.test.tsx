@@ -5219,6 +5219,63 @@ describe("TerminalViewport mounted lifecycle", () => {
     );
   });
 
+  it.each([true, false])(
+    "marks a user's input with its claim and the terminal's own replies with null (server marks: %s) (#348)",
+    async (serverMarks) => {
+      testState.serverConfig!.environment.capabilities = {
+        terminalOrderedInput: true,
+        terminalSizeOwnership: true,
+        ...(serverMarks ? { terminalUserInputClaim: true } : {}),
+      };
+      xtermState.answerQueriesOnWrite = true;
+      let now = 10_000;
+      vi.spyOn(performance, "now").mockImplementation(() => now);
+      const view = await mountViewport();
+      const terminal = view.fakeTerminal!;
+      const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+        .terminal.sizeClaim;
+      const mount = view.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      await view.flushFrame();
+      testState.writeCommand.mockClear();
+      // A program queries the terminal with nobody at this window.
+      await act(async () => view.emitOutput("\x1b[c"));
+      await view.flushFrame();
+      // A key, and the program querying the terminal as it echoes it: the reply is not typing.
+      await act(async () => {
+        mount.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+        terminal.dataHandler?.("a");
+      });
+      await act(async () => view.emitOutput("\x1b[6n"));
+      await view.flushFrame();
+      // A focus report from a window losing focus, long after any input here.
+      now += 5_000;
+      await act(async () => terminal.dataHandler?.("\x1b[O"));
+      // A mouse report on release, after the press.
+      await act(async () => {
+        mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true }));
+        now += 100;
+        terminal.dataHandler?.("\x1b[M !!");
+      });
+      const writes = testState.writeCommand.mock.calls.map(
+        ([request]) => request.input as { data: string; userInputClaim?: string | null },
+      );
+      expect(writes.map(({ data }) => data)).toEqual([
+        "\x1b[?1;2c",
+        "a",
+        "\x1b[1;1R",
+        "\x1b[O",
+        "\x1b[M !!",
+      ]);
+      expect(writes.map((write) => write.userInputClaim)).toEqual(
+        serverMarks ? [null, claim, null, null, claim] : Array(5).fill(undefined),
+      );
+      if (!serverMarks)
+        for (const write of writes) expect(write).not.toHaveProperty("userInputClaim");
+    },
+  );
+
   it("pipelines interactive and programmatic input on an ordered server before acknowledgement", async () => {
     testState.serverConfig!.environment.capabilities = { terminalOrderedInput: true };
     let completeFirst!: (result: unknown) => void;
