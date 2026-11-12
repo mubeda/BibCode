@@ -74,7 +74,14 @@ for remote servers and for the local environment.
 4. **macOS de-duplication is needed, as the issue guessed.** The crate itself says the writable
    Data volume counts as browsable (`src/unix/apple/disk.rs:310-313`), and `df -k` on the
    maintainer's host lists `/` and `/System/Volumes/Data` with the same total and available
-   blocks. What `Disks` returns there is unverified until the probe in Task 11.3 runs.
+   blocks. Task 11.3's `volume_probe` on the macOS development host (2026-11-11): `Disks` with
+   `DiskRefreshKind::nothing()` returned two volumes, `/` and `/System/Volumes/Data`, both
+   `apfs` with the same total and available capacity; the filter kept `/` and hid
+   `/System/Volumes/Data` as same storage as `/`. Recovery, VM, Preboot, simulator runtime images
+   and other system volumes did not appear (the crate drops non-browsable volumes), and no
+   external disk was attached during the run. `/` reports read-only (the sealed system volume),
+   so the merged entry carries the Read-only badge although the Data volume it stands for is
+   writable; see "Open points from the build".
 5. **macOS free space is not `df`'s.** `sysinfo` prefers "available capacity for important
    usage", which counts purgeable space such as the trash and system-managed caches
    (`src/unix/apple/disk.rs:380-391`). It can be larger than `df`'s Available and than
@@ -89,7 +96,10 @@ for remote servers and for the local environment.
    reads the flag from the mount options (`ro`) of `/proc/self/mounts` instead, on the disk
    worker while listing, which touches no file system (D33). macOS and Windows set the flag at
    listing from `getfsstat` flags and `FILE_READ_ONLY_VOLUME` (`src/unix/apple/disk.rs:512`,
-   `src/windows/disk.rs:340`).
+   `src/windows/disk.rs:340`). As built, the parser decodes the kernel's `\ooo` escapes and lets
+   the last line for a mount point win (a later mount covers an earlier one); it is compiled on
+   Linux and in every test build, so its unit test runs on macOS and Windows too. The Linux lab
+   run that proves it with a real read-only mount is pending (the lab was in use).
 7. **Windows total and free do not match under a quota.** `get_drive_size` passes `None` for
    the caller-available value of `GetDiskFreeSpaceExW` and pairs `lpTotalNumberOfBytes`, which is
    relative to the calling user when quotas apply, with `lpTotalNumberOfFreeBytes`, which is
@@ -321,6 +331,29 @@ in the Linux lab. The policy then picks exactly one outcome:
 If live is over 1% even at 2 s, the task stops and reports to the user: no outcome is accepted.
 (a) is not an outcome: it cannot answer "since server start" at all.
 
+**Measured (Task 11.4, 2026-11-11).** Method: the ignored `cost_probe` in
+`diagnostics/host_metrics/probes.rs`, run alone (`--test-threads=1 --exact`), drives the real
+collector over `NativeHostMetricsSource` in a multi-thread runtime at a 250 ms test rate (so
+every CPU refresh does its work): 300 background-shaped readings with no subscriber (volumes
+every fifth), then 300 live-shaped readings with one subscriber served by the real stream loop,
+every item encoded as on the wire, plus the uptime chart rebuilt and encoded every fifth reading
+to over-count chart cost. It takes this process's CPU time (`getrusage(RUSAGE_SELF)`, user plus
+system) over each run and subtracts an idle runtime of the same length.
+
+macOS development host (Apple silicon, 12 logical CPUs, macOS 27), three runs:
+
+| Run | Background ms per reading | % of one core at 60 s | Live ms per reading | % at 1 s | % at 2 s |
+| --- | ------------------------- | --------------------- | ------------------- | -------- | -------- |
+| 1   | 7.424                     | 0.0124                | 6.628               | 0.663    | 0.331    |
+| 2   | 7.239                     | 0.0121                | 6.140               | 0.614    | 0.307    |
+| 3   | 6.655                     | 0.0111                | 6.149               | 0.615    | 0.307    |
+
+The runs agree within 12 percent. Background costs about a tenth of the 0.1% limit and live
+about two thirds of the 1% limit, so the macOS figures select **(c) always on, live 1 s**, which
+needs no approval. The Linux lab run (`taskset -c 0,1`, Ubuntu 22.04 container) is pending: the
+lab was in use by another lane. The policy applies to the higher of the two hosts, so the
+outcome is provisional until that run is recorded here with its tree identity.
+
 What makes (c) cheap: no process table walk (#24, #232), one `System` with CPU and memory
 refreshes only, `/proc/stat` and `/proc/meminfo` on Linux, one host statistics call on macOS,
 and one space read per volume every 5 minutes.
@@ -425,6 +458,41 @@ system. Alternative: listing with `DiskRefreshKind::nothing().with_storage()`, t
 crate sets the flag (on a disk's first listing); that listing runs `statvfs` on every volume
 each time, which can hang and repeats the space reads the disk loop already makes. Agent's call, after review; the Linux lab proves it with a real read-only mount.
 
+## As built (Tasks 11.1 to 11.6)
+
+- **Disk loop.** The disk loop is a Tokio task that never blocks: it admits jobs to the four
+  `host-disk-<n>` threads and folds their results in. It wakes on the sampling loop's volume tick
+  (every fifth reading), on a worker's result, and every 250 ms while a job is queued or running,
+  to mark reads past the 2 s limit. The limit is timed on the real clock inside the workers. A
+  new volume is read as soon as a listing shows it, not at the next volume tick, so a first
+  snapshot has sizes soon after start. A volume that has not answered yet is not shown until it
+  answers or passes the limit (then as not responding with no sizes).
+- **Generation.** A volume's generation is the number of the listing that first showed it. A
+  listing that no longer shows a volume retires its key: queued jobs are dropped and a running
+  job's result is discarded by the worker, so a late result of a retired volume never reaches
+  the collector.
+- **First live reading.** When the first subscription opens, the sampling loop makes one
+  priming CPU read and takes the first live reading one second later; the priming read is not
+  recorded, so the first live value covers one second.
+- **Timestamps.** Readings use the wall clock in the server; unit tests on a paused clock use
+  the collector's start time plus the Tokio clock, which the wall clock does not follow.
+- **Test-only cadence.** Unit tests can tick the disk loop on its own short cadence
+  (`with_volume_cadence`), so the churn and replacement scenarios run many listings in seconds.
+- **Third log line.** A volume whose space read returns an error (rather than hanging) is
+  logged at `debug` as `host volume read failed` with its file system only, and shows as not
+  responding; the two `warn` lines are unchanged.
+- **Wire.** `server.subscribeHostMetrics` adds no typed failure fixture (stream methods export
+  none), so the fixture counts rose by one method, one stream method and two stream shapes.
+  Numbers use `Schema.Finite`. The stream's subscriber loop lives in
+  `diagnostics/host_metrics/wire.rs`; `production/server_terminal.rs` only registers it.
+
+## Open points from the build
+
+- On macOS the entry kept for the APFS container is `/`, the sealed read-only system volume, so
+  the dashboard would badge the container Read-only although the Data volume it stands for is
+  writable. Keeping the writable flag when any merged member is writable, or keeping
+  `/System/Volumes/Data`'s flag, would fix it; this changes D25's rule and awaits a decision.
+
 ## Lifecycle and failure behaviour
 
 - **Server start:** the production runtime creates the collector and starts the background loop
@@ -469,7 +537,9 @@ each time, which can hang and repeats the space reads the disk loop already make
   faster than 250 ms, because `sysinfo` skips a CPU refresh closer than 200 ms to the last one
   (`src/unix/apple/cpu.rs:33-35`, `src/unix/linux/cpu.rs:48`), and with one subscriber whose
   items are encoded as on the wire. The figure is this process's CPU time during the run minus
-  an idle runtime of the same length. The method and numbers go in the pull request.
+  an idle runtime of the same length. The method and numbers go in the pull request. On the
+  macOS development host a reading costs 6 to 7.5 ms of CPU (D22's table): 0.012% of one core
+  in the background and 0.66% at the live rate, and one live item is about 0.9 KB on the wire.
 
 ## Profiler, crash and trace coverage
 
