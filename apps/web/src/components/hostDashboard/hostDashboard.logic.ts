@@ -60,6 +60,7 @@ export interface HostDashboardValues {
   readonly memory: string;
   readonly volumes: ReadonlyArray<HostDashboardVolumeRow>;
   readonly volumesPaused: boolean;
+  readonly volumeListingNotResponding: boolean;
   /** "Since <time> (up <duration>)", or null before the first reading. */
   readonly since: string | null;
   readonly statistics: ReadonlyArray<HostDashboardStatisticRow>;
@@ -153,6 +154,7 @@ function presentValues(
           )}%`,
     volumes: sample?.volumes.map(volumeRow) ?? [],
     volumesPaused: sample?.volumesPaused ?? false,
+    volumeListingNotResponding: sample?.volumeListingNotResponding ?? false,
     since:
       view.statisticsSince === null
         ? null

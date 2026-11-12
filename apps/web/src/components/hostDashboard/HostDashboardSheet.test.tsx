@@ -231,6 +231,29 @@ describe("HostDashboardSheet", () => {
     expect(since?.querySelector('[aria-label="Memory since start"]')?.children.length).toBe(1);
   });
 
+  it("says the volume list is not answering only when the server reports it", async () => {
+    const withFlag = (flag: boolean | undefined) => {
+      const base = view() as HostMetricsView;
+      return {
+        ...base,
+        sample: {
+          ...base.sample!,
+          ...(flag === undefined ? {} : { volumeListingNotResponding: flag }),
+        },
+      } as HostMetricsView;
+    };
+    const notice =
+      "The volume list is not answering. Volumes shown are from the last list that did.";
+    h.data = withFlag(true);
+    await render();
+    expect(text()).toContain(notice);
+    for (const flag of [false, undefined]) {
+      h.data = withFlag(flag);
+      await render();
+      expect(text()).not.toContain(notice);
+    }
+  });
+
   it("dims the values after 3 seconds without an item", async () => {
     vi.useFakeTimers({
       now: Date.UTC(2026, 10, 11, 20, 0, 0),

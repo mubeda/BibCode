@@ -258,6 +258,11 @@ function HostDashboardValuesView({
             Volume sizes are paused: earlier reads have not answered yet.
           </p>
         ) : null}
+        {values.volumeListingNotResponding ? (
+          <p className="text-muted-foreground text-xs">
+            The volume list is not answering. Volumes shown are from the last list that did.
+          </p>
+        ) : null}
         {values.volumes.length === 0 ? (
           <p className="text-muted-foreground text-xs">No volumes reported yet.</p>
         ) : (
