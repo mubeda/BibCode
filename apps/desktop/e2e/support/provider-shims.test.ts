@@ -648,6 +648,44 @@ describe("generated provider shims", () => {
     ]);
   });
 
+  it("answers a code review prompt with an ExitPlanMode plan (#293)", () => {
+    const fixture = prepareProviderFixture();
+    const prompt = "Code review requested from BiBCode. Do not edit files. Scope: x.\n\nReview.";
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+      [
+        {
+          type: "user",
+          session_id: "claude-fixture",
+          message: { content: [{ type: "text", text: prompt }] },
+        },
+      ],
+    );
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        type: "assistant",
+        message: expect.objectContaining({
+          content: [
+            expect.objectContaining({
+              type: "tool_use",
+              name: "ExitPlanMode",
+              input: { plan: "## Review findings\n\n- Low: example finding" },
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(responses).not.toContainEqual(expect.objectContaining({ type: "stream_event" }));
+    expect(responses).toContainEqual(
+      expect.objectContaining({ type: "result", subtype: "success", is_error: false }),
+    );
+    expect(readProviderInputLog(fixture.context.providerInputLogPath)).toMatchObject([
+      { provider: "claudeAgent", prompt },
+    ]);
+  });
+
   it("streams a Claude thinking block, a tool call and an answer for a reasoning prompt", () => {
     const fixture = prepareProviderFixture();
     const responses = exchangeJsonLines(
