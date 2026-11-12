@@ -818,6 +818,24 @@ describe("createTerminalTranscriptRuntime ordered by server generation (#348)", 
     expect(runtime.metadata().status).toBe("closed");
   });
 
+  it("keeps a closed process closed when a delayed resync of it arrives", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = { sizeClaim: "a" };
+    const b = { sizeClaim: "b" };
+    runtime.ingest(snapshotAt(3, 10, "h"), a);
+    runtime.ingest(snapshotAt(3, 10, "h"), b);
+    runtime.ingest(closedAt(13, 3), a);
+    // Each stream's catch-up from before the close, delivered after it.
+    runtime.ingest({ ...snapshotAt(3, 12, "late b"), resync: true }, b);
+    runtime.ingest({ ...snapshotAt(3, 12, "late a"), resync: true }, a);
+    expect(runtime.metadata().status).toBe("closed");
+    expect(runtime.snapshot()).toBe("h");
+    // Only a newer process reopens it.
+    runtime.ingest(restartedAt(4, 1, "reopened"), a);
+    expect(runtime.metadata().status).toBe("running");
+    expect(runtime.snapshot()).toBe("reopened");
+  });
+
   it("follows a restarted server and never returns to the one it left", () => {
     const runtime = createTerminalTranscriptRuntime();
     const a = {};
