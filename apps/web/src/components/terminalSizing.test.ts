@@ -4,6 +4,7 @@ import type { Terminal } from "@xterm/xterm";
 import { describe, expect, it } from "vite-plus/test";
 import { terminalInputKey } from "@bibcode/client-runtime/state/terminal";
 import {
+  isTerminalSizingMinimum,
   proposeTerminalDimensions,
   readTerminalFittedSize,
   registerTerminalSizeReader,
@@ -82,5 +83,14 @@ describe("terminal fitting", () => {
     expect(readTerminalFittedSize("env", "thread", "term")).toEqual({ cols: 80, rows: 24 });
     replace();
     expect(readTerminalFittedSize("env", "thread", "term")).toBeNull();
+  });
+});
+
+describe("terminal sizing minimum (#348)", () => {
+  it("marks what the fit proposes for a mount a few pixels wide or tall", () => {
+    expect(isTerminalSizingMinimum({ cols: 2, rows: 26 })).toBe(true);
+    expect(isTerminalSizingMinimum({ cols: 85, rows: 1 })).toBe(true);
+    expect(isTerminalSizingMinimum({ cols: 5, rows: 26 })).toBe(false);
+    expect(isTerminalSizingMinimum({ cols: 18, rows: 4 })).toBe(false);
   });
 });

@@ -1536,7 +1536,9 @@ program to 2 columns; a small panel that holds still claims its size, and a
 mirror's scale follows every change at once. A mount that keeps changing still
 claims at least every 500 ms (`TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS`): an owner
 is not scaled, so during a long drag its box would otherwise cut off the rows
-it no longer fits.
+it no longer fits. At that deadline a proposal at the sizing minimum (the fit's
+2 columns or 1 row, from a mount a few pixels wide or tall) is not claimed; it
+waits for the quiet period like any other.
 Explicit triggers (click, typing, focus, **Fit to this window**) are not
 delayed. A null claim after a restart, or from a server
 without `terminalUserInputClaim` (which releases every size to nobody), prompts

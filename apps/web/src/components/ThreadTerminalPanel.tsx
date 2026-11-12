@@ -97,6 +97,7 @@ import {
 } from "./terminalFollowOutput";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
 import {
+  isTerminalSizingMinimum,
   proposeTerminalDimensions,
   registerTerminalSizeReader,
   terminalHostHasArea,
@@ -1568,13 +1569,17 @@ export function TerminalViewport({
         mountSizeChangedAt = now;
         mountUnsettledSince ??= now;
       }
-      const remaining =
-        mountUnsettledSince === null
-          ? 0
-          : Math.min(
-              mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
-              mountUnsettledSince + TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS,
-            ) - now;
+      if (mountUnsettledSince === null) return 0;
+      const quiet = mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS - now;
+      let remaining = Math.min(
+        quiet,
+        mountUnsettledSince + TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS - now,
+      );
+      // The maximum wait never claims the sizing minimum; only holding still does.
+      if (remaining <= 0 && quiet > 0) {
+        const fitted = proposeTerminalDimensions(fitAddon, mount);
+        if (fitted === null || isTerminalSizingMinimum(fitted)) remaining = quiet;
+      }
       if (remaining <= 0) mountUnsettledSince = null;
       return remaining;
     };

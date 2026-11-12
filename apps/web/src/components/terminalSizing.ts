@@ -37,6 +37,21 @@ export function proposeTerminalDimensions(
   }
 }
 
+/** The fit addon's own floor (`MINIMUM_COLS`, `MINIMUM_ROWS` in @xterm/addon-fit 0.11). */
+const FIT_MINIMUM_COLS = 2;
+const FIT_MINIMUM_ROWS = 1;
+
+/**
+ * Whether a proposal sits at the sizing minimum: what the fit proposes for a mount a few pixels
+ * wide or tall, which no program can draw in.
+ */
+export function isTerminalSizingMinimum(dimensions: TerminalDimensions): boolean {
+  return (
+    dimensions.cols <= Math.max(TERMINAL_COLS_MIN, FIT_MINIMUM_COLS) ||
+    dimensions.rows <= Math.max(TERMINAL_ROWS_MIN, FIT_MINIMUM_ROWS)
+  );
+}
+
 // Only mounted renderers register a reader. Launch callbacks can use their
 // current fit without subscribing to layout or manufacturing a measuring xterm.
 const sizeReaders = new Map<string, () => TerminalDimensions | null>();
