@@ -7639,10 +7639,12 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   /** What one window shows: its grid against its fit, the owner, and the notice. */
   const view = (machine: Machine) => {
     const terminal = xtermOf(machine);
+    const scale = Number(/scale\(([\d.]+)\)/.exec(terminal.element?.style.transform ?? "")?.[1] ?? 1);
     return {
       grid: `${terminal.cols}x${terminal.rows}`,
       fit: `${machine.fit.cols}x${machine.fit.rows}`,
-      clipped: terminal.rows > machine.fit.rows || terminal.cols > machine.fit.cols,
+      scale,
+      clipped: terminal.rows * scale > machine.fit.rows || terminal.cols * scale > machine.fit.cols,
       owner:
         server.owner === null
           ? "nobody"
@@ -7653,21 +7655,111 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     };
   };
 
-  /** The server host window owns a taller grid; the client mirrors it, clipped at the bottom. */
+  /** The server host window owns a taller grid; the client mirrors it. */
   const serverHostOwnsTallerGrid = async () => {
     hasFocus.mockReturnValue(true);
     const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
     hasFocus.mockReturnValue(false);
     const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+    return { host, client };
+  };
+
+  const setUserActive = (isActive: boolean) =>
+    Object.defineProperty(navigator, "userActivation", {
+      configurable: true,
+      value: { isActive, hasBeenActive: isActive },
+    });
+
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "userActivation");
+  });
+
+  it("shows a taller owner's whole grid on the mirror, scaled to fit, bottom row in view", async () => {
+    const { client } = await serverHostOwnsTallerGrid();
     expect(view(client)).toEqual({
       grid: "120x50",
       fit: "100x30",
-      clipped: true,
+      scale: 0.6,
+      clipped: false,
       owner: "the other window",
       notice: true,
     });
-    return { host, client };
-  };
+    expect(client.mounted.container.textContent).toContain("60%");
+  });
+
+  it("follows the owner's grid and the mirror's own box without sending a claim", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    await relayout(host, { cols: 120, rows: 40 });
+    expect(view(client)).toMatchObject({ grid: "120x40", scale: 0.75, clipped: false });
+    const requests = testState.resizeCommand.mock.calls.length;
+    await relayout(client, { cols: 100, rows: 20 });
+    expect(view(client)).toMatchObject({ scale: 0.5, clipped: false });
+    await relayout(client, { cols: 60, rows: 40 });
+    expect(view(client)).toMatchObject({ scale: 0.5, clipped: false });
+    await relayout(client, { cols: 150, rows: 60 });
+    expect(view(client)).toMatchObject({ grid: "120x40", scale: 1, clipped: false });
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+  });
+
+  it("stops at the readability floor and pins the bottom rows in a scrollable box", async () => {
+    const { client } = await serverHostOwnsTallerGrid();
+    await relayout(client, { cols: 40, rows: 20 });
+    expect(view(client)).toMatchObject({ scale: 0.5 });
+    const mount = client.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    expect(mount.style.overflow).toBe("auto");
+  });
+
+  it("returns to full size when the mirror takes the size by a click, without passing that click on", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    const mount = client.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    const reachedTerminal = vi.fn();
+    xtermOf(client).element!.addEventListener("mousedown", reachedTerminal);
+    await act(async () => {
+      xtermOf(client).element!.dispatchEvent(
+        new PointerEvent("pointerdown", { button: 0, bubbles: true }),
+      );
+      xtermOf(client).element!.dispatchEvent(
+        new MouseEvent("mousedown", { button: 0, bubbles: true }),
+      );
+    });
+    expect(reachedTerminal).not.toHaveBeenCalled();
+    expect(mount).toBeDefined();
+    await server.deliver();
+    expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+    expect(view(host)).toMatchObject({ grid: "100x30", scale: 1, clipped: false });
+    await act(async () =>
+      xtermOf(client).element!.dispatchEvent(
+        new MouseEvent("mousedown", { button: 0, bubbles: true }),
+      ),
+    );
+    expect(reachedTerminal).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an unattended window take the size when the page regains focus by itself", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    await act(async () =>
+      xtermOf(client).keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+    );
+    await server.deliver();
+    expect(view(client).owner).toBe("this window");
+    const hostMount = host.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    hasFocus.mockReturnValue(true);
+    setUserActive(false);
+    await act(async () => hostMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
+    await act(async () => window.dispatchEvent(new FocusEvent("focus")));
+    await server.deliver();
+    expect(view(client).owner).toBe("this window");
+    setUserActive(true);
+    await act(async () => hostMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
+    await server.deliver();
+    expect(view(host).owner).toBe("this window");
+  });
 
   it("lets the visible client claim its fit as soon as the server host window releases the size", async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
@@ -7676,6 +7768,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(view(client)).toEqual({
       grid: "100x30",
       fit: "100x30",
+      scale: 1,
       clipped: false,
       owner: "this window",
       notice: false,
