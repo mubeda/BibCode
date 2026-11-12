@@ -577,11 +577,19 @@ describe("ServerHostMetricsEvent", () => {
       { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
       { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
     ],
+    volumeStatistics: [{ mountPoint: "/", statistic }],
   };
 
   it("round-trips a snapshot and a sample", () => {
     expect(encode(decode(snapshot))).toEqual(snapshot);
-    const live = { _tag: "Sample", sample, cpu: statistic, memory: statistic, uptime: null };
+    const live = {
+      _tag: "Sample",
+      sample,
+      cpu: statistic,
+      memory: statistic,
+      uptime: null,
+      volumeStatistics: [{ mountPoint: "/", statistic }],
+    };
     expect(encode(decode(live))).toEqual(live);
     const withChart = { ...live, uptime: [bucket] };
     expect(encode(decode(withChart))).toEqual(withChart);
@@ -616,6 +624,7 @@ describe("ServerHostMetricsEvent", () => {
       memory: statistic,
       uptime: [bucket],
       hiddenVolumes: snapshot.hiddenVolumes,
+      volumeStatistics: [],
     };
     expect(encode(decode(withChart))).toEqual(withChart);
   });
@@ -638,6 +647,7 @@ describe("ServerHostMetricsEvent", () => {
       cpu: statistic,
       memory: statistic,
       uptime: null,
+      volumeStatistics: [],
     };
     expect(encode(decode(live))).toEqual(live);
     expect(encode(decode({ ...live, statisticsSince: null }))).toEqual({
@@ -651,6 +661,10 @@ describe("ServerHostMetricsEvent", () => {
     const old = { _tag: "Sample", sample, cpu: statistic, memory: statistic, uptime: null };
     expect(decode(old)).not.toHaveProperty("statisticsSince");
     expect(decode(old)).not.toHaveProperty("sample.sequence");
+    // R83: a server older than the volume statistics sends none.
+    expect(decode(old)).toMatchObject({ volumeStatistics: [] });
+    const { volumeStatistics: _, ...olderSnapshot } = snapshot;
+    expect(decode(olderSnapshot)).toMatchObject({ volumeStatistics: [] });
     expect(() => decode({ ...live, sample: { ...ordered, sequence: -1 } })).toThrow();
     expect(() => decode({ ...live, sample: { ...ordered, ageMs: 1.5 } })).toThrow();
   });

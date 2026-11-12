@@ -6,6 +6,7 @@ import type {
   ServerHostMetricsHiddenVolume,
   ServerHostMetricsSample,
   ServerHostMetricsStatistic,
+  ServerHostMetricsVolumeStatistic,
 } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 
@@ -27,6 +28,8 @@ export interface HostMetricsView {
   readonly uptime: ReadonlyArray<ServerHostMetricsChartBucket>;
   /** Volumes the filter hid (R81); part of the chart state, so it changes with `uptime`. */
   readonly hiddenVolumes: ReadonlyArray<ServerHostMetricsHiddenVolume>;
+  /** Each volume's used percent since start (R83). */
+  readonly volumeStatistics: ReadonlyArray<ServerHostMetricsVolumeStatistic>;
 }
 
 function chartPoint(sample: ServerHostMetricsSample): ServerHostMetricsChartPoint {
@@ -97,6 +100,7 @@ export function accumulateHostMetrics(
       recent: pruneRecent(event.recent),
       uptime: event.uptime,
       hiddenVolumes: event.hiddenVolumes,
+      volumeStatistics: event.volumeStatistics,
     };
     return [Option.some(view), [view]];
   }
@@ -127,6 +131,7 @@ export function accumulateHostMetrics(
     recent: pruneRecent([...current.recent, chartPoint(event.sample)]),
     uptime: event.uptime ?? current.uptime,
     hiddenVolumes: event.hiddenVolumes ?? current.hiddenVolumes,
+    volumeStatistics: event.volumeStatistics,
   };
   return [Option.some(view), [view]];
 }

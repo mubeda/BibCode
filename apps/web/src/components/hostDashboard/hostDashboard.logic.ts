@@ -53,7 +53,8 @@ export interface HostDashboardHiddenVolumeRow {
 }
 
 export interface HostDashboardStatisticRow {
-  readonly label: "CPU" | "Memory";
+  /** "CPU", "Memory", or "<mount point> used" for a volume (R83). */
+  readonly label: string;
   readonly figures: ReadonlyArray<{
     readonly label: "Current" | "Minimum" | "Average" | "p95" | "Maximum";
     readonly value: string;
@@ -170,6 +171,9 @@ function presentValues(
   const statistics: HostDashboardStatisticRow[] = [];
   if (view.cpu !== null) statistics.push(statisticRow("CPU", view.cpu));
   if (view.memory !== null) statistics.push(statisticRow("Memory", view.memory));
+  for (const volume of view.volumeStatistics) {
+    statistics.push(statisticRow(`${volume.mountPoint} used`, volume.statistic));
+  }
   return {
     sampledAt: sample?.sampledAt ?? null,
     cpu: sample === null ? "Unavailable" : formatCpuPercent(sample.cpuPercent),

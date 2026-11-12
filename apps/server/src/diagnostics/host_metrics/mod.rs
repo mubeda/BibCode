@@ -179,6 +179,8 @@ pub struct HostMetricsSnapshot {
     pub memory: Option<MeasureStatistics>,
     pub recent: Vec<ChartPoint>,
     pub chart: Arc<ChartState>,
+    /// Each volume's used percent since start, by mount point (R83).
+    pub volume_statistics: Vec<(PathBuf, MeasureStatistics)>,
 }
 
 /// One live reading; `chart` always points at the latest complete chart state.
@@ -189,6 +191,7 @@ pub struct HostMetricsUpdate {
     pub cpu: MeasureStatistics,
     pub memory: MeasureStatistics,
     pub chart: Arc<ChartState>,
+    pub volume_statistics: Vec<(PathBuf, MeasureStatistics)>,
 }
 
 /// Turns a volume's space into a reading; free is clamped to total, so used is never negative.
@@ -202,6 +205,8 @@ pub fn volume_reading(descriptor: VolumeDescriptor, space: VolumeSpace) -> Volum
 }
 
 const UPTIME_BARS: usize = 240;
+/// Mount points with statistics since start; later ones get none (R83).
+const MOST_VOLUME_STATISTICS: usize = 64;
 const FIRST_READING_WAIT: Duration = Duration::from_secs(1);
 /// How often the disk loop looks for reads past the limit while any is running.
 const HELD_CHECK: Duration = Duration::from_millis(250);
@@ -274,6 +279,10 @@ struct Shared {
     statistics: SyncMutex<Statistics>,
     chart: SyncMutex<(u64, Arc<ChartState>)>,
     disk_view: SyncMutex<DiskView>,
+    /// Each kept volume's used percent since start; a volume that goes keeps its entry.
+    volume_statistics: SyncMutex<Vec<(PathBuf, RunningStatistic)>>,
+    /// What a volume read weighs: the nominal time between volume ticks at the current rate.
+    volume_weight: SyncMutex<Duration>,
     updates: SyncMutex<Option<UpdateSender>>,
     subscribers: watch::Sender<usize>,
     volume_tick: Notify,
@@ -355,6 +364,8 @@ impl HostMetricsCollector {
                     }),
                 )),
                 disk_view: SyncMutex::new(DiskView::default()),
+                volume_statistics: SyncMutex::new(Vec::new()),
+                volume_weight: SyncMutex::new(rates.background * rates.volumes_every.max(1)),
                 updates: SyncMutex::new(Some(watch::Sender::new(None))),
                 subscribers: watch::Sender::new(0),
                 volume_tick: Notify::new(),
@@ -437,6 +448,7 @@ impl HostMetricsCollector {
             memory: statistics.memory.summary(),
             recent: statistics.chart.recent(),
             chart,
+            volume_statistics: self.shared.volume_statistics(),
         }
     }
 
@@ -510,6 +522,7 @@ impl Shared {
         }
         loop {
             if readings.is_multiple_of(u64::from(self.rates.volumes_every.max(1))) {
+                *lock(&self.volume_weight) = self.rate(live) * self.rates.volumes_every.max(1);
                 self.volume_tick.notify_one();
             }
             readings += 1;
@@ -652,7 +665,44 @@ impl Shared {
                 cpu,
                 memory,
                 chart,
+                volume_statistics: self.volume_statistics(),
             })));
+        }
+    }
+
+    fn volume_statistics(&self) -> Vec<(PathBuf, MeasureStatistics)> {
+        lock(&self.volume_statistics)
+            .iter()
+            .filter_map(|(mount_point, statistic)| Some((mount_point.clone(), statistic.summary()?)))
+            .collect()
+    }
+
+    /// Records the used percent of each shown volume that `fresh` names, weighted by the
+    /// nominal time between volume reads, so a watched minute does not outweigh an hour.
+    fn record_volume_statistics(&self, shown: &[VolumeReading], fresh: &[PathBuf]) {
+        if fresh.is_empty() {
+            return;
+        }
+        let weight = *lock(&self.volume_weight);
+        let mut statistics = lock(&self.volume_statistics);
+        for reading in shown {
+            let mount_point = &reading.descriptor.mount_point;
+            let (Some(total), Some(used)) = (reading.total_bytes, reading.used_bytes()) else {
+                continue;
+            };
+            if total == 0 || reading.state != VolumeState::Ok || !fresh.contains(mount_point) {
+                continue;
+            }
+            let percent = used as f64 * 100.0 / total as f64;
+            match statistics.iter().position(|(known, _)| known == mount_point) {
+                Some(index) => statistics[index].1.record(percent, weight),
+                None if statistics.len() < MOST_VOLUME_STATISTICS => {
+                    let mut statistic = RunningStatistic::default();
+                    statistic.record(percent, weight);
+                    statistics.push((mount_point.clone(), statistic));
+                }
+                None => {}
+            }
         }
     }
 
@@ -710,11 +760,23 @@ impl Shared {
                 () = workers.results_ready() => {}
                 () = tokio::time::sleep(HELD_CHECK), if held => {}
             }
+            let mut fresh = Vec::new();
             for result in workers.take_results() {
+                // Only a read of a volume still tracked counts; a retired one's is discarded.
+                if let (DiskOutcome::Space(Ok(_)), Some(mount_point)) =
+                    (&result.outcome, &result.key.mount_point)
+                    && disks
+                        .volumes
+                        .iter()
+                        .any(|volume| DiskTracker::key(volume) == result.key)
+                {
+                    fresh.push(mount_point.clone());
+                }
                 disks.apply(result, &workers);
             }
             disks.mark_hung(&workers, self.rates.volume_timeout);
             let (shown, merged) = merge_shared(disks.readings());
+            self.record_volume_statistics(&shown, &fresh);
             let mut hidden = disks.pre_hidden.clone();
             hidden.extend(merged);
             {

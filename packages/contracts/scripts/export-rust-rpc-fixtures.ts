@@ -478,6 +478,7 @@ const manualStreamSamples = new Map<string, unknown>([
         { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
         { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
       ],
+      volumeStatistics: [{ mountPoint: "/", statistic: fixtureHostMetricsStatistic }],
     },
   ],
   [
@@ -496,6 +497,7 @@ const manualStreamSamples = new Map<string, unknown>([
       cpu: fixtureHostMetricsStatistic,
       memory: fixtureHostMetricsStatistic,
       uptime: null,
+      volumeStatistics: [{ mountPoint: "/", statistic: fixtureHostMetricsStatistic }],
     },
   ],
   ["subscribeServerConfig:0", { version: 1, type: "snapshot", config: fixtureServerConfig }],

@@ -73,6 +73,7 @@ vi.mock("~/state/server", async () => {
     recent: [],
     uptime: [],
     hiddenVolumes: [],
+    volumeStatistics: [],
   });
   const fakeStream = (environmentId: string) =>
     Stream.unwrap(

@@ -589,6 +589,17 @@ export const ServerHostMetricsStatistic = Schema.Struct({
 });
 export type ServerHostMetricsStatistic = typeof ServerHostMetricsStatistic.Type;
 
+/** A volume's used percent since the server started (R83), by mount point. */
+export const ServerHostMetricsVolumeStatistic = Schema.Struct({
+  mountPoint: Schema.String,
+  statistic: ServerHostMetricsStatistic,
+});
+export type ServerHostMetricsVolumeStatistic = typeof ServerHostMetricsVolumeStatistic.Type;
+
+const VolumeStatistics = Schema.Array(ServerHostMetricsVolumeStatistic).pipe(
+  Schema.withDecodingDefault(Effect.succeed([])),
+);
+
 export const ServerHostMetricsChartPoint = Schema.Struct({
   sampledAt: IsoDateTime,
   cpuPercent: Schema.Finite,
@@ -637,6 +648,8 @@ export const ServerHostMetricsSnapshot = Schema.TaggedStruct("Snapshot", {
   hiddenVolumes: Schema.Array(ServerHostMetricsHiddenVolume).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Absent from older servers. */
+  volumeStatistics: VolumeStatistics,
 });
 export type ServerHostMetricsSnapshot = typeof ServerHostMetricsSnapshot.Type;
 
@@ -651,6 +664,8 @@ export const ServerHostMetricsEvent = Schema.Union([
     uptime: Schema.NullOr(Schema.Array(ServerHostMetricsChartBucket)),
     /** Sent with `uptime`, as part of the same chart state; absent means unchanged. */
     hiddenVolumes: Schema.optionalKey(Schema.Array(ServerHostMetricsHiddenVolume)),
+    /** Every Sample carries them; absent from older servers. */
+    volumeStatistics: VolumeStatistics,
   }),
 ]);
 export type ServerHostMetricsEvent = typeof ServerHostMetricsEvent.Type;

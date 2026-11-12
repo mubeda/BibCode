@@ -88,6 +88,18 @@
           "reason": "sameStorage",
           "sameStorageAs": "/"
         }
+      ],
+      "volumeStatistics": [
+        {
+          "mountPoint": "/",
+          "statistic": {
+            "current": 23.5,
+            "minimum": 1.5,
+            "average": 11.25,
+            "p95": 40.5,
+            "maximum": 97.5
+          }
+        }
       ]
     }
   ]

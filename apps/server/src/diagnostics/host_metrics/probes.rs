@@ -276,6 +276,7 @@ fn cost_probe() {
                                 uptime,
                                 hidden_volumes: Vec::new(),
                             }),
+                            volume_statistics: live.shared.volume_statistics(),
                         };
                         bytes += serde_json::to_vec(&wire::encode_update(&update, true))
                             .map_or(0, |encoded| encoded.len());

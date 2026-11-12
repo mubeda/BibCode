@@ -518,6 +518,16 @@ each time, which can hang and repeats the space reads the disk loop already make
   features `linux-netdevs` and `linux-tmpfs` add network and tmpfs mounts to the Linux listing,
   which makes no `statvfs` call, so the filter sees and discloses them.
 
+- **MCP snapshot (Task 11.12).** `server.getHostMetrics` answers one Snapshot from memory and
+  never switches the collector to the live rate. The `host_metrics` tool keeps a mount point only
+  for `/` or a drive root, reports how many it withheld (`mountPointsWithheld`) and counts the
+  hidden volumes without listing them.
+- **Per-volume statistics (Task 11.13).** A volume's used percent is recorded when a space read
+  of a volume still tracked answers and the volume is shown after the merge, weighted by the
+  nominal time between volume reads at the rate of that tick (five background or five live
+  readings), as D28 weighs CPU and memory. At most 64 mount points get statistics; one that
+  disappears keeps its entry until restart. Every Snapshot and Sample carries `volumeStatistics`.
+
 ## Open points from the build
 
 - On macOS the entry kept for the APFS container is `/`, the sealed read-only system volume.

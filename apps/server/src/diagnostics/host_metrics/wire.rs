@@ -117,6 +117,16 @@ pub(crate) struct SnapshotWire {
     /// Older servers leave it out.
     #[serde(default)]
     hidden_volumes: Vec<HiddenVolumeWire>,
+    /// Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volume_statistics: Vec<VolumeStatisticWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VolumeStatisticWire {
+    mount_point: String,
+    statistic: StatisticWire,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -143,6 +153,19 @@ pub(crate) struct SampleWire {
     /// Sent with `uptime`, as part of the same chart state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hidden_volumes: Option<Vec<HiddenVolumeWire>>,
+    /// Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volume_statistics: Vec<VolumeStatisticWire>,
+}
+
+fn volume_statistics(statistics: &[(std::path::PathBuf, MeasureStatistics)]) -> Vec<VolumeStatisticWire> {
+    statistics
+        .iter()
+        .map(|(mount_point, value)| VolumeStatisticWire {
+            mount_point: mount_point.to_string_lossy().into_owned(),
+            statistic: statistic(value),
+        })
+        .collect()
 }
 
 fn hidden_volume(hidden: &HiddenVolume) -> HiddenVolumeWire {
@@ -263,6 +286,7 @@ pub(crate) fn encode_snapshot(snapshot: &HostMetricsSnapshot) -> Value {
             .iter()
             .map(hidden_volume)
             .collect(),
+        volume_statistics: volume_statistics(&snapshot.volume_statistics),
     }))
 }
 
@@ -281,6 +305,7 @@ pub(crate) fn encode_update(update: &HostMetricsUpdate, include_chart: bool) -> 
                 .map(hidden_volume)
                 .collect()
         }),
+        volume_statistics: volume_statistics(&update.volume_statistics),
     }))
 }
 
@@ -460,6 +485,14 @@ mod tests {
                     .collect(),
                 hidden_volumes: Vec::new(),
             }),
+            volume_statistics: (0..20)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("/mnt/volume-with-a-long-name-{index}")),
+                        statistic,
+                    )
+                })
+                .collect(),
         };
 
         let bytes = serde_json::to_vec(&encode_snapshot(&snapshot)).expect("encodes");

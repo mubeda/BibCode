@@ -62,6 +62,7 @@ function snapshot(
     recent: recent.map((sampledAt) => ({ sampledAt, cpuPercent: 20, memoryPercent: 25 })),
     uptime,
     hiddenVolumes: [{ mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" }],
+    volumeStatistics: [],
   };
 }
 
@@ -75,6 +76,7 @@ function sampleEvent(
     cpu: STATISTIC,
     memory: STATISTIC,
     uptime,
+    volumeStatistics: [{ mountPoint: "/", statistic: STATISTIC }],
   };
 }
 
@@ -129,6 +131,11 @@ describe("accumulateHostMetrics", () => {
     expect(kept.view.uptime).toBe(first);
     const replaced = run([snapshot([at(0)], first), sampleEvent(at(1), second)]);
     expect(replaced.view.uptime).toBe(second);
+  });
+
+  it("takes each volume's statistics from the latest applied sample", () => {
+    const { view } = run([snapshot([at(0)]), sampleEvent(at(1))]);
+    expect(view.volumeStatistics).toEqual([{ mountPoint: "/", statistic: STATISTIC }]);
   });
 
   it("replaces the hidden volumes only when a sample carries the chart state", () => {
