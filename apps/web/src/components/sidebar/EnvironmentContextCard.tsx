@@ -9,6 +9,7 @@ import { environmentCatalog } from "../../connection/catalog";
 import { cn } from "../../lib/utils";
 import { useActiveEnvironmentId } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
+import { useOpenHostDashboard } from "../../state/hostDashboard";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -34,6 +35,7 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
   const activeEnvironmentId = useActiveEnvironmentId();
   const environment = useEnvironment(activeEnvironmentId);
   const navigate = useNavigate();
+  const openHostDashboard = useOpenHostDashboard();
   const disconnectEnvironment = useAtomCommand(environmentCatalog.disconnect, {
     reportFailure: false,
   });
@@ -146,6 +148,7 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
           <EllipsisIcon className="size-4" />
         </MenuTrigger>
         <MenuPopup align="end">
+          <MenuItem onClick={() => openHostDashboard(activeEnvironmentId)}>Host dashboard</MenuItem>
           <MenuItem onClick={() => void disconnectEnvironment(activeEnvironmentId)}>
             Disconnect
           </MenuItem>

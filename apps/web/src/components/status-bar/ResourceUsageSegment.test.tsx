@@ -39,13 +39,7 @@ vi.mock("../ui/popover", () => ({
     <button {...props}>{children}</button>
   ),
   PopoverContent: ({ children }: { children?: ReactNode }) => <section>{children}</section>,
-  PopoverClose: ({
-    children,
-    onClick,
-  }: {
-    children?: ReactNode;
-    onClick?: () => void;
-  }) => (
+  PopoverClose: ({ children, onClick }: { children?: ReactNode; onClick?: () => void }) => (
     <button type="button" data-popover-close="" onClick={onClick}>
       {children}
     </button>
