@@ -569,11 +569,11 @@ export const ServerHostMetricsSample = Schema.Struct({
   volumes: Schema.Array(ServerHostMetricsVolume),
   volumesPaused: Schema.Boolean,
   /** The volume listing has run past the limit without answering, apart from any volume. */
-  volumeListingNotResponding: Schema.optional(Schema.Boolean),
+  volumeListingNotResponding: Schema.optionalKey(Schema.Boolean),
   /** Rises by one per CPU and memory reading within one server run, whatever the wall clock does. */
-  sequence: Schema.optional(NonNegativeInt),
+  sequence: Schema.optionalKey(NonNegativeInt),
   /** How old the reading was, on the server's monotonic clock, when the item was encoded. */
-  ageMs: Schema.optional(NonNegativeInt),
+  ageMs: Schema.optionalKey(NonNegativeInt),
 });
 export type ServerHostMetricsSample = typeof ServerHostMetricsSample.Type;
 
@@ -622,7 +622,7 @@ export const ServerHostMetricsEvent = Schema.Union([
   }),
   Schema.TaggedStruct("Sample", {
     /** The snapshot's `statisticsSince`, so a stream that began before the first reading learns it. */
-    statisticsSince: Schema.optional(Schema.NullOr(IsoDateTime)),
+    statisticsSince: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     sample: ServerHostMetricsSample,
     cpu: ServerHostMetricsStatistic,
     memory: ServerHostMetricsStatistic,
