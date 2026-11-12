@@ -472,6 +472,44 @@ async fn write_input_does_not_wait_for_a_busy_database_once_input_begins() {
     fixture.shutdown().await;
 }
 
+/// An older client decodes `terminal.resize` as void, a null-only JSON codec: an object
+/// answer would turn every successful resize into a failure there (#348).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_answers_its_outcome_only_to_a_caller_that_reads_it() {
+    let mut fixture = Fixture::start().await;
+    let resize = |cols: u16, structured: Option<bool>| {
+        let mut payload =
+            json!({"threadId": THREAD, "terminalId": TERMINAL, "cols": cols, "rows": 30});
+        if let Some(structured) = structured {
+            payload["structuredResult"] = json!(structured);
+        }
+        payload
+    };
+
+    let older_client = success(fixture.request("terminal.resize", resize(100, None)).await);
+    assert_eq!(
+        older_client,
+        Value::Null,
+        "an older client gets the null it decodes"
+    );
+    let declined = success(
+        fixture
+            .request("terminal.resize", resize(101, Some(false)))
+            .await,
+    );
+    assert_eq!(declined, Value::Null);
+
+    let newer_client = success(
+        fixture
+            .request("terminal.resize", resize(102, Some(true)))
+            .await,
+    );
+    assert_eq!(newer_client["outcome"], "applied");
+    assert_eq!(newer_client["size"]["cols"], 102);
+    assert!(newer_client["sequence"].is_u64());
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspace_loss_cancels_pending_and_later_input_and_releases_the_admission() {
     let mut fixture = Fixture::start().await;

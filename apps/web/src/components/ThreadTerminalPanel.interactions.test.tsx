@@ -1789,7 +1789,13 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
       expect(testState.resizeCommand).toHaveBeenCalledWith({
         environmentId: ENVIRONMENT_ID,
-        input: { threadId: THREAD_ID, terminalId: "term-1", cols: 81, rows: 24 },
+        input: {
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          cols: 81,
+          rows: 24,
+          structuredResult: true,
+        },
       });
     },
   );
@@ -1803,7 +1809,13 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
     expect(view.resizeSpy).toHaveBeenLastCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24 },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 24,
+        structuredResult: true,
+      },
     });
 
     await view.resizeContainer();
@@ -1842,7 +1854,13 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
     expect(view.resizeSpy).toHaveBeenLastCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 35 },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 35,
+        structuredResult: true,
+      },
     });
   });
 
@@ -1942,6 +1960,7 @@ describe("TerminalViewport mounted lifecycle", () => {
         cols: 80,
         rows: 24,
         sizeClaim: expect.any(String),
+        structuredResult: true,
       },
     });
   });
@@ -1977,7 +1996,14 @@ describe("TerminalViewport mounted lifecycle", () => {
     await view.flushFrame();
     expect(view.resizeSpy).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 91, rows: 42, sizeClaim: claim },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 91,
+        rows: 42,
+        sizeClaim: claim,
+        structuredResult: true,
+      },
     });
     await act(async () =>
       view.runtime.ingest({
@@ -2558,7 +2584,14 @@ describe("TerminalViewport mounted lifecycle", () => {
     // The owner asks for its fit; the server already holds it and acknowledges it in order.
     expect(view.resizeSpy).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 20, sizeClaim: claim },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 20,
+        sizeClaim: claim,
+        structuredResult: true,
+      },
     });
     await act(async () => Promise.resolve());
     expect(view.fakeTerminal!.rows).toBe(20);
@@ -3114,7 +3147,14 @@ describe("TerminalViewport mounted lifecycle", () => {
       await view.flushFrame();
       expect(view.resizeSpy).toHaveBeenCalledWith({
         environmentId: ENVIRONMENT_ID,
-        input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 20, sizeClaim: claim },
+        input: {
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          cols: 80,
+          rows: 20,
+          sizeClaim: claim,
+          structuredResult: true,
+        },
       });
       expect(view.fakeTerminal!.rows).toBe(20);
     },
@@ -3232,6 +3272,7 @@ describe("TerminalViewport mounted lifecycle", () => {
           cols: 80,
           rows: 18,
           sizeClaim: claim(),
+          structuredResult: true,
         },
       });
       expect(view.fakeTerminal!.rows).toBe(18);
@@ -3328,7 +3369,13 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     expect(view.resizeSpy).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 40 },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 120,
+        rows: 40,
+        structuredResult: true,
+      },
     });
   });
 
@@ -3402,6 +3449,7 @@ describe("TerminalViewport mounted lifecycle", () => {
           cols: 80,
           rows: 30,
           ...(ownership ? { sizeClaim: claim } : {}),
+          structuredResult: true,
         },
       });
     },
@@ -3489,7 +3537,13 @@ describe("TerminalViewport mounted lifecycle", () => {
           expect(terminal.rows).toBe(23);
           expect(view.resizeSpy).toHaveBeenCalledWith({
             environmentId: ENVIRONMENT_ID,
-            input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 23 },
+            input: {
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              cols: 80,
+              rows: 23,
+              structuredResult: true,
+            },
           });
         } else if (mode === "owner") {
           expect(view.resizeSpy).toHaveBeenCalledWith({
@@ -3500,6 +3554,7 @@ describe("TerminalViewport mounted lifecycle", () => {
               cols: 80,
               rows: 23,
               sizeClaim: claim,
+              structuredResult: true,
             },
           });
           await act(async () =>
@@ -3557,7 +3612,14 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
     expect(view.resizeSpy).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 19, sizeClaim: claim },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 19,
+        sizeClaim: claim,
+        structuredResult: true,
+      },
     });
     await act(async () =>
       view.runtime.ingest({
@@ -3616,10 +3678,10 @@ describe("TerminalViewport mounted lifecycle", () => {
     await view.flushFrame();
 
     expect(view.resizeSpy.mock.calls.map(([request]) => request.input)).toEqual([
-      { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24 },
-      { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 24 },
-      { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 40 },
-      { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24 },
+      { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24, structuredResult: true },
+      { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 24, structuredResult: true },
+      { threadId: THREAD_ID, terminalId: "term-1", cols: 120, rows: 40, structuredResult: true },
+      { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24, structuredResult: true },
     ]);
   });
 
@@ -3674,6 +3736,7 @@ describe("TerminalViewport mounted lifecycle", () => {
           cols: 80,
           rows,
           ...(claim ? { sizeClaim: claim } : {}),
+          structuredResult: true,
         },
       });
 
@@ -6443,7 +6506,13 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(xtermState.fitAddons[0]?.fit).toHaveBeenCalled();
     expect(testState.resizeCommand).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 24 },
+      input: {
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        cols: 80,
+        rows: 24,
+        structuredResult: true,
+      },
     });
   });
 
