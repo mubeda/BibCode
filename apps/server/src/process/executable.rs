@@ -238,8 +238,9 @@ fn append_windows_batch_argument(command: &mut String, argument: &str) -> Result
                 command.push('"');
             } else if character == '%' {
                 // Prevent `%VAR%` expansion with the same zero-length `%cd%`
-                // substring used by Rust's hardened batch launcher.
-                command.push_str("%%cd:~,%");
+                // substring used by Rust's hardened batch launcher: `%%cd:~,` before
+                // the `%` itself reads back as one `%`.
+                command.push_str("%%cd:~,");
             }
             backslashes = 0;
         }
@@ -450,6 +451,17 @@ mod windows_batch_command_line_tests {
             encode(&arguments),
             Err(format!(
                 "The command is too long for a Windows terminal ({thousands},{units:03} of 8,191 characters). Shorten the review prompt or pick a chat reviewer."
+            ))
+        );
+    }
+
+    /// `%%cd:~,%` reads back as one `%` on the `cmd /c` line, so `%PATH%` is never expanded.
+    #[test]
+    fn windows_batch_percent_is_escaped_once() {
+        assert_eq!(
+            encode(&["100% %PATH%".to_owned()]),
+            Ok(format!(
+                r#"/e:ON /v:OFF /d /c ""{SCRIPT}" "100%%cd:~,% %%cd:~,%PATH%%cd:~,%"""#
             ))
         );
     }

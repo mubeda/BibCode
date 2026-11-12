@@ -2473,7 +2473,7 @@ mod tests {
 
             let command = build_pty_command_on(Platform::Windows, &input).unwrap();
             let raw_arguments = format!(
-                "/e:ON /v:OFF /d /c \"\"{}\" --flag \"value with spaces\" \"&literal\" \"%%cd:~,%%PATH%%cd:~,%%\" \"!literal!\" \"\"\"",
+                "/e:ON /v:OFF /d /c \"\"{}\" --flag \"value with spaces\" \"&literal\" \"%%cd:~,%PATH%%cd:~,%\" \"!literal!\" \"\"\"",
                 executable.display()
             );
             let expected = vec![
