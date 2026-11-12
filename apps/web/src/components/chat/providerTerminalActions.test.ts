@@ -14,6 +14,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ProviderInstanceEntry } from "~/providerInstances";
+import { resolveCodeReviewPrompt } from "~/codeReview";
 import { decodeTerminalLaunchCommand } from "~/lib/terminalLaunchCommand";
 import {
   CODE_REVIEW_DRIVERS_WITH_TERMINALS,
@@ -868,5 +869,23 @@ describe("resolveProviderReviewTerminalAction", () => {
     expect(
       review(codex, { prompt, platformOs: "linux", windowsEnabled: true })?.command?.args.at(-1),
     ).toBe(prompt);
+  });
+
+  it("ends with one-off instructions, flattened only on Windows (R105)", () => {
+    const prompt = resolveCodeReviewPrompt({
+      project: "Rules",
+      user: "",
+      scope: { kind: "uncommitted", base: "origin/main" },
+      extra: "Focus on the parser.",
+    });
+    for (const platformOs of ["darwin", "linux"]) {
+      expect(review(claude, { prompt, platformOs })?.command?.args.at(-1)).toMatch(
+        /Rules\n\nFocus on the parser\.$/,
+      );
+    }
+    // Forced on: Windows terminal reviews stay off until Task 12.17.
+    expect(
+      review(claude, { prompt, platformOs: "windows", windowsEnabled: true })?.command?.args.at(-1),
+    ).toMatch(/Rules {2}Focus on the parser\.$/);
   });
 });

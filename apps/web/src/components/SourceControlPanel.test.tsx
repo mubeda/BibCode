@@ -235,6 +235,16 @@ vi.mock("./sourceControl/CodeReviewProjectPromptDialog", () => ({
   },
 }));
 
+const reviewInstructionsDialog = vi.hoisted(() => ({
+  props: null as Record<string, unknown> | null,
+}));
+vi.mock("./sourceControl/CodeReviewInstructionsDialog", () => ({
+  CodeReviewInstructionsDialog: (props: Record<string, unknown>) => {
+    reviewInstructionsDialog.props = props;
+    return null;
+  },
+}));
+
 vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
   GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
     captured.createPullRequest = props;
@@ -1293,6 +1303,36 @@ describe("SourceControlPanel", () => {
         expect(flattenText(item?.children)).toContain("No changes to review");
         item!.onClick?.();
         expect(onStart).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("Review with instructions (R105)", () => {
+      it("opens the instructions dialog and starts the saved reviewer with them", () => {
+        testState.statusQuery.data = stagingStatus({ defaultRefName: "main" });
+        const onStart = vi.fn();
+        render(reviewProps(null, onStart));
+        expect(reviewInstructionsDialog.props?.["open"]).toBe(false);
+        const item = menuItemByText("Review with instructions…");
+        expect(item?.disabled).toBe(false);
+        item!.onClick!();
+        rerender();
+        expect(reviewInstructionsDialog.props?.["open"]).toBe(true);
+        (reviewInstructionsDialog.props!["onStart"] as (extra: string) => void)(
+          "Focus on the parser.",
+        );
+        expect(onStart).toHaveBeenCalledWith(
+          { kind: "uncommitted", base: "origin/main" },
+          undefined,
+          "Focus on the parser.",
+        );
+      });
+
+      it("is disabled with the button's reason", () => {
+        testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 0 });
+        render(reviewProps());
+        const item = menuItemByText("Review with instructions…");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain("No changes to review");
       });
     });
 

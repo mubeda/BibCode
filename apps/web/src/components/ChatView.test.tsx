@@ -6327,6 +6327,59 @@ describe("ChatView handlers (captured from mocked children)", () => {
       });
     });
 
+    describe("with one-off instructions (R105)", () => {
+      const EXTRA = "Focus on the parser.";
+      const startWithInstructions = (view: { review: () => ReviewProp }) =>
+        (
+          view.review().onStart as (scope: typeof SCOPE, reviewer: undefined, extra: string) => void
+        )(SCOPE, undefined, EXTRA);
+
+      it("ends the chat panel's first message with them and saves nothing", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          settings: { codeReviewPrompt: "User rules" },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          await act(async () => startWithInstructions(view));
+          await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+          const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+            input: { message: { text: string } };
+          };
+          expect(turn.input.message.text.endsWith(`\n\nUser rules\n\n${EXTRA}`)).toBe(true);
+          expect(h.settings["codeReviewPrompt"]).toBe("User rules");
+          expect(h.commandCalls.filter((call) => /settings|project\.meta/i.test(call.key))).toEqual(
+            [],
+          );
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it.each(["darwin", "linux"])(
+        "ends the review terminal's prompt argument with them on %s",
+        async (os) => {
+          seedReviewEnvironment({
+            reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+            os,
+          });
+          seedServerThread(makeThread());
+          const view = await mountServerReview();
+          try {
+            await act(async () => startWithInstructions(view));
+            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+            const opened = commandCallsFor("terminal.open")[0]!.input as {
+              input: { command: { args: string[] } };
+            };
+            expect(opened.input.command.args.at(-1)!.endsWith(`\n\n${EXTRA}`)).toBe(true);
+          } finally {
+            await view.unmount();
+          }
+        },
+      );
+    });
+
     describe("from Mod+Alt+Shift+R (R102)", () => {
       const isMac = () => navigator.platform.toLowerCase().includes("mac");
       const shortcut = () =>

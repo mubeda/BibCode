@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  CODE_REVIEW_INSTRUCTIONS_MAX_LENGTH,
   codeReviewGuardLine,
   codeReviewScopeText,
   resolveCodeReviewChatModes,
@@ -100,6 +101,21 @@ describe("resolveCodeReviewPrompt", () => {
     const resolved = resolveCodeReviewPrompt({ project: "purge", user: "", scope: BRANCH });
     expect(resolved.startsWith("Code review requested from BiBCode.")).toBe(true);
     expect(resolved).toBe(`${BRANCH_LEAD}\n\npurge`);
+  });
+
+  it("appends one-off instructions after a blank line, without expanding them (R105)", () => {
+    expect(
+      resolveCodeReviewPrompt({
+        project: "Rules for {base}.",
+        user: "",
+        scope: BRANCH,
+        extra: "Focus on the parser. Not {base}.",
+      }),
+    ).toBe(`${BRANCH_LEAD}\n\nRules for origin/main.\n\nFocus on the parser. Not {base}.`);
+    expect(
+      resolveCodeReviewPrompt({ project: "Rules", user: "", scope: BRANCH, extra: " \n " }),
+    ).toBe(`${BRANCH_LEAD}\n\nRules`);
+    expect(CODE_REVIEW_INSTRUCTIONS_MAX_LENGTH).toBe(1_000);
   });
 });
 
