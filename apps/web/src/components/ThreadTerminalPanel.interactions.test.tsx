@@ -7714,32 +7714,53 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(mount.style.overflow).toBe("auto");
   });
 
-  it("returns to full size when the mirror takes the size by a click, without passing that click on", async () => {
+  it("returns to full size when the mirror takes the size by a click, which xterm never maps while scaled", async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
     const mount = client.mounted.container.querySelector<HTMLElement>(
       "[data-terminal-xterm-mount]",
     )!;
-    const reachedTerminal = vi.fn();
-    xtermOf(client).element!.addEventListener("mousedown", reachedTerminal);
-    await act(async () => {
-      xtermOf(client).element!.dispatchEvent(
-        new PointerEvent("pointerdown", { button: 0, bubbles: true }),
-      );
-      xtermOf(client).element!.dispatchEvent(
-        new MouseEvent("mousedown", { button: 0, bubbles: true }),
-      );
-    });
-    expect(reachedTerminal).not.toHaveBeenCalled();
-    expect(mount).toBeDefined();
+    // The browser sends a scaled mirror's pointer input to the mount, not to xterm's cells.
+    expect(xtermOf(client).element!.style.pointerEvents).toBe("none");
+    await act(async () =>
+      mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+    );
     await server.deliver();
     expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+    expect(xtermOf(client).element!.style.pointerEvents).toBe("");
     expect(view(host)).toMatchObject({ grid: "100x30", scale: 1, clipped: false });
-    await act(async () =>
-      xtermOf(client).element!.dispatchEvent(
-        new MouseEvent("mousedown", { button: 0, bubbles: true }),
-      ),
-    );
-    expect(reachedTerminal).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["wait", null],
+    ["height-only layout", { cols: 100, rows: 29 }],
+    ["width layout", { cols: 99, rows: 30 }],
+  ] as const)(
+    "shows the whole grid after the client's own stream drops and the host takes the size (%s)",
+    async (_action, fit) => {
+      hasFocus.mockReturnValue(true);
+      const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+      hasFocus.mockReturnValue(false);
+      const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
+      await disconnect(client);
+      expect(view(host).owner).toBe("this window");
+      await connect(client);
+      const requests = testState.resizeCommand.mock.calls.length;
+      if (fit) await relayout(client, fit);
+      expect(view(client)).toMatchObject({
+        grid: "120x50",
+        clipped: false,
+        owner: "the other window",
+        notice: true,
+      });
+      expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    },
+  );
+
+  it.each([false, true])("scales the mirror the same with WebGL %s", async (webgl) => {
+    testState.webglEnabled = webgl;
+    const { client } = await serverHostOwnsTallerGrid();
+    await settleWebgl();
+    expect(view(client)).toMatchObject({ scale: 0.6, clipped: false });
   });
 
   it("does not let an unattended window take the size when the page regains focus by itself", async () => {
