@@ -2980,6 +2980,29 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.fakeTerminal!.rows).toBe(22);
   });
 
+  it("shows the notice again when an older server silently ignores a takeover (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const other = { cols: 151, rows: 50, sizeClaim: "other" };
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: other } }),
+    );
+    // An older server answers null for a claim it did not know and publishes nothing.
+    view.resizeSpy.mockResolvedValue(AsyncResult.success(null));
+    testState.readSizeCommand.mockResolvedValue(AsyncResult.success(other));
+    await act(async () => view.pointerDownOnSurface());
+    await view.flushFrame();
+    await act(async () => Promise.resolve());
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    expect(testState.readSizeCommand).toHaveBeenCalledOnce();
+    expect(view.fakeTerminal!.cols).toBe(151);
+    expect(view.mounted.container.textContent).toContain("Sized for another window.");
+    await act(async () => view.pointerDownOnSurface());
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+  });
+
   it("repairs rows from the requester's resync when its acknowledgement was lost (#348)", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
