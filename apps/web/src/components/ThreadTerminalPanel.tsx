@@ -615,6 +615,11 @@ const TERMINAL_FOCUS_OUT_REPORT = "\u001b[O";
  * which would size the program to 2 columns; a small panel that holds still is claimed (#348).
  */
 export const TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS = 100;
+/**
+ * The longest an automatic claim waits for a mount that keeps changing size. An owner is not
+ * scaled, so its box cuts off the rows it no longer fits until a claim lands (#348).
+ */
+export const TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS = 500;
 
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
@@ -1542,11 +1547,13 @@ export function TerminalViewport({
     let layoutChangedWhileClaimPending = false;
     // Hides the notice only while a claim is pending or waits for its acknowledgement.
     let claimNoticeSuppressed = false;
-    // Automatic claims wait for the mount to hold its size. A panel opening creates its
-    // terminal mid-transition; the mount has changed size again by the time the attach
-    // answer arrives, which stamps the change then.
+    // Automatic claims wait for the mount to hold its size, from its first measurement: a
+    // panel opening creates its terminal mid-transition, and its stream can attach before
+    // the size changes again.
     let settledMountSize = { width: mount.clientWidth, height: mount.clientHeight };
-    let mountSizeChangedAt = Number.NEGATIVE_INFINITY;
+    let mountSizeChangedAt = performance.now();
+    // When the mount started changing without a claim since; null while settled.
+    let mountUnsettledSince: number | null = mountSizeChangedAt;
     let deferredClaimTimer: number | null = null;
     // An attach claim may take another window's size; a later layout change keeps it pending.
     let deferredTrigger: "layout" | "attach" | null = null;
@@ -1557,8 +1564,17 @@ export function TerminalViewport({
       if (width !== settledMountSize.width || height !== settledMountSize.height) {
         settledMountSize = { width, height };
         mountSizeChangedAt = now;
+        mountUnsettledSince ??= now;
       }
-      return mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS - now;
+      const remaining =
+        mountUnsettledSince === null
+          ? 0
+          : Math.min(
+              mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
+              mountUnsettledSince + TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS,
+            ) - now;
+      if (remaining <= 0) mountUnsettledSince = null;
+      return remaining;
     };
     let keypressMeasureFrame: number | null = null;
     // Geometry changes only through ordered size events; the answer names the one to wait for.
@@ -1745,7 +1761,8 @@ export function TerminalViewport({
         },
       );
     };
-    const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
+    const handleSizeTrigger = (requestedTrigger: TerminalSizeTrigger) => {
+      let trigger = requestedTrigger;
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
       // An automatic claim of a mount still changing size waits until it holds still, then
@@ -1763,6 +1780,13 @@ export function TerminalViewport({
         }, settleRemaining);
         if (sizeOwnership) updateSizeNotice();
         return;
+      }
+      // A settled automatic trigger runs a deferred one now; an attach claim keeps its rule.
+      if ((trigger === "layout" || trigger === "attach") && deferredClaimTimer !== null) {
+        window.clearTimeout(deferredClaimTimer);
+        deferredClaimTimer = null;
+        if (deferredTrigger === "attach") trigger = "attach";
+        deferredTrigger = null;
       }
       if (!sizeOwnership) {
         if (trigger !== "layout" || !terminalHostHasArea(mount)) return;

@@ -1529,10 +1529,14 @@ no recent input in its page, such as an unattended server host window after its
 display wakes, therefore does not take a live owner's size; engines without the
 API keep the focus-only rule. The automatic claims (layout changes, the
 creation fit and the attach claim) wait until the mount has held its content
-size for 100 ms (`TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS`) and then send one claim at
-the final size, so a panel opening, collapsing or dragged open passes through a
-few pixels without sizing the program to 2 columns; a small panel that holds
-still claims its size, and a mirror's scale follows every change at once.
+size for 100 ms (`TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS`), counted from its first
+measurement, and then send one claim at the final size, so a panel opening,
+collapsing or dragged open passes through a few pixels without sizing the
+program to 2 columns; a small panel that holds still claims its size, and a
+mirror's scale follows every change at once. A mount that keeps changing still
+claims at least every 500 ms (`TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS`): an owner
+is not scaled, so during a long drag its box would otherwise cut off the rows
+it no longer fits.
 Explicit triggers (click, typing, focus, **Fit to this window**) are not
 delayed. A null claim after a restart, or from a server
 without `terminalUserInputClaim` (which releases every size to nobody), prompts

@@ -437,6 +437,8 @@ vi.mock("@xterm/xterm", () => ({
     constructor(options: Record<string, unknown>) {
       this.options = options;
       xtermState.terminals.push(this);
+      // After the renderer effect has stamped its mount's first measurement.
+      if (settleNewRenderers) queueMicrotask(elapseMountSettle);
     }
 
     attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
@@ -698,6 +700,7 @@ vi.mock("~/components/ui/popover", () => ({
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
   releaseTerminalUiResources,
+  TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS,
   TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
   TerminalViewport,
 } from "./ThreadTerminalPanel";
@@ -733,6 +736,17 @@ const resizeObserverInstances: Array<{
 }> = [];
 const componentTimers = new Set<unknown>();
 const componentTimerCallbacks = new Map<() => void, unknown>();
+/**
+ * Added to `performance.now()`. A fresh renderer's automatic claims wait until its mount has
+ * held still since its first measurement; tests that are not about that wait step the clock
+ * past it once the renderer exists (#348).
+ */
+let settleClockOffset = 0;
+/** False keeps fresh renderers unsettled, as real ones are for 100 ms after creation. */
+let settleNewRenderers = true;
+function elapseMountSettle(): void {
+  settleClockOffset += TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS + 1;
+}
 const animationFrames = new Map<number, FrameRequestCallback>();
 let nextAnimationFrame = 1;
 let beginComponentTimerCapture = () => 0;
@@ -1112,9 +1126,11 @@ async function mountViewport(
     transcriptRuntime: options.publishRuntime === false ? null : tracked.runtime,
   };
   const mounted = await mount(<TerminalViewport {...props} />);
+  elapseMountSettle();
 
   const rerender = async () => {
     await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+    elapseMountSettle();
   };
 
   return {
@@ -1366,6 +1382,10 @@ beforeEach(() => {
   componentTimerCallbacks.clear();
   animationFrames.clear();
   nextAnimationFrame = 1;
+  settleClockOffset = 0;
+  settleNewRenderers = true;
+  const realPerformanceNow = performance.now.bind(performance);
+  vi.spyOn(performance, "now").mockImplementation(() => realPerformanceNow() + settleClockOffset);
   Object.defineProperty(document, "visibilityState", {
     configurable: true,
     value: "visible",
@@ -8481,7 +8501,11 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   const openWindow = async (
     environmentId: EnvironmentId,
     fit: { cols: number; rows: number },
-    beforeAttach: (machine: Machine) => Promise<void> = async () => undefined,
+    options: {
+      readonly beforeAttach?: (machine: Machine) => Promise<void>;
+      /** False keeps the fresh mount unsettled, as a real one is for 100 ms. */
+      readonly settled?: boolean;
+    } = {},
   ): Promise<Machine> => {
     const runtime = createTerminalTranscriptRuntime();
     testState.sessionsByEnvironment.set(environmentId, {
@@ -8499,9 +8523,10 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       props,
     };
     machines.push(machine);
+    if (options.settled === false) settleNewRenderers = false;
     machine.mounted = await mount(<TerminalViewport {...props} />);
     await flushAnimationFrames();
-    await beforeAttach(machine);
+    await options.beforeAttach?.(machine);
     await connect(machine);
     return machine;
   };
@@ -8512,6 +8537,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     await act(async () => machine.mounted.root.render(<TerminalViewport {...machine.props} />));
     if (!visible) await disconnect(machine);
     else {
+      elapseMountSettle();
       await flushAnimationFrames();
       await connect(machine);
     }
@@ -9155,7 +9181,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       hasFocus.mockReturnValue(true);
       nextMountSize = { width: 4, height: 400 };
       // The attach answer arrives while the mount still has the size it was created with.
-      const owner = await openWindow(CLIENT, { cols: 2, rows: 26 });
+      const owner = await openWindow(CLIENT, { cols: 2, rows: 26 }, { settled: false });
       expect(claimsOf(owner)).toEqual([]);
       await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
       await settle();
@@ -9204,8 +9230,14 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       hasFocus.mockReturnValue(true);
       nextMountSize = { width: 4, height: 400 };
       // The panel keeps opening while the attach answer is on its way.
-      const owner = await openWindow(CLIENT, { cols: 2, rows: 26 }, (machine) =>
-        resizeMount(machine, { width: 52, height: 400 }, { cols: 5, rows: 26 }),
+      const owner = await openWindow(
+        CLIENT,
+        { cols: 2, rows: 26 },
+        {
+          settled: false,
+          beforeAttach: (machine) =>
+            resizeMount(machine, { width: 52, height: 400 }, { cols: 5, rows: 26 }),
+        },
       );
       await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
       await settle();
