@@ -1825,15 +1825,22 @@ impl Session {
         self.owner_unused_since_handoff = false;
         if let TerminalInputOrigin::User(claim) = origin {
             self.user_input_clock += 1;
-            let tracked = self.user_input_order.len();
-            match self.user_input_order.get_mut(claim) {
-                Some(order) => *order = self.user_input_clock,
-                // Bounded: a claim that is not attached is dropped at the next release.
-                None if tracked < MAX_USER_INPUT_CLAIMS => {
-                    self.user_input_order
-                        .insert(claim.to_owned(), self.user_input_clock);
-                }
-                None => {}
+            // Departed claims are pruned at each release; past the bound, the window typed in
+            // longest ago is forgotten rather than this one.
+            if let Some(order) = self.user_input_order.get_mut(claim) {
+                *order = self.user_input_clock;
+            } else if self
+                .user_input_order
+                .insert(claim.to_owned(), self.user_input_clock)
+                .is_none()
+                && self.user_input_order.len() > MAX_USER_INPUT_CLAIMS
+                && let Some(oldest) = self
+                    .user_input_order
+                    .iter()
+                    .min_by_key(|(_, typed)| **typed)
+                    .map(|(claim, _)| claim.clone())
+            {
+                self.user_input_order.remove(&oldest);
             }
         }
     }
@@ -3921,6 +3928,16 @@ impl TerminalManager {
             return;
         }
         let mut session = session.lock().await;
+        let attachments = inner
+            .size_claim_attachments
+            .lock()
+            .expect("terminal attachment claims");
+        let claims = attachments.get(key);
+        // Every release, not only the owner's: a window hidden and shown again returns under a
+        // new claim, and the ones it left must not fill the bounded typing record.
+        session
+            .user_input_order
+            .retain(|claim, _| claims.is_some_and(|claims| claims.contains_key(claim)));
         if session.size_owner.as_ref().map(|owner| owner.attachment) != Some(attachment_id) {
             return;
         }
@@ -3929,14 +3946,6 @@ impl TerminalManager {
         // in it stays un-owned until one claims it. The departed owner gets it back if it
         // returns before anyone types.
         let remaining = {
-            let attachments = inner
-                .size_claim_attachments
-                .lock()
-                .expect("terminal attachment claims");
-            let claims = attachments.get(key);
-            session
-                .user_input_order
-                .retain(|claim, _| claims.is_some_and(|claims| claims.contains_key(claim)));
             let order = &session.user_input_order;
             claims
                 .and_then(|claims| {
@@ -3954,6 +3963,7 @@ impl TerminalManager {
                     attachment: *id,
                 })
         };
+        drop(attachments);
         session.departed_owner = session.size_owner.take().map(|owner| owner.claim);
         session.owner_unused_since_handoff = remaining.is_some();
         session.size_owner = remaining;
@@ -7168,6 +7178,49 @@ mod tests {
         // The owner that left gets it back if it returns before anyone types in `left`.
         let back = manager.attach(size_attachment("owner")).await.unwrap();
         assert_eq!(owner_of(&back), Some("owner"));
+        manager.shutdown().await;
+    }
+
+    /// A window hidden and shown again comes back under a new claim. The claims it left behind
+    /// must not fill the bounded typing record, or the viewer typed in last is not recorded
+    /// and an older one takes the size when the owner leaves (#348).
+    #[tokio::test]
+    async fn departed_viewers_do_not_crowd_out_the_viewer_typed_in_last() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut early = manager.attach(size_attachment("early")).await.unwrap();
+        let type_in = |claim: String| {
+            let manager = &manager;
+            async move {
+                manager
+                    .write_from("sizing", "term", "x", TerminalInputOrigin::User(&claim))
+                    .await
+                    .unwrap();
+            }
+        };
+        type_in("early".to_owned()).await;
+        for round in 0..=MAX_USER_INPUT_CLAIMS + 5 {
+            let shown = manager
+                .attach(size_attachment(&format!("shown-{round}")))
+                .await
+                .unwrap();
+            type_in(format!("shown-{round}")).await;
+            type_in("owner".to_owned()).await;
+            drop(shown);
+            tokio::task::yield_now().await;
+        }
+        let last = format!("shown-{}", MAX_USER_INPUT_CLAIMS + 6);
+        let mut shown = manager.attach(size_attachment(&last)).await.unwrap();
+        type_in(last.clone()).await;
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut shown).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some(last.as_str())),
+            "the viewer typed in last takes the size"
+        );
+        assert!(matches!(
+            next_attachment_event(&mut early).await,
+            TerminalEvent::Resized { .. }
+        ));
         manager.shutdown().await;
     }
 
