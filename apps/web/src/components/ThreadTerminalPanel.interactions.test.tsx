@@ -16,6 +16,7 @@ import {
   type ResolvedKeybindingsConfig,
   type TerminalAttachStreamEvent,
   type TerminalLaunchCommand,
+  type TerminalResizeResult,
   type TerminalSessionSnapshot,
 } from "@bibcode/contracts";
 import type { TerminalFontPreference, TerminalThemePreference } from "@bibcode/contracts/settings";
@@ -2444,30 +2445,71 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(dismiss()).not.toBeNull();
   });
 
-  /** A manager-equivalent resize: an exact size and owner no-op succeeds without an echo. */
+  /**
+   * A manager-equivalent resize: it answers with the size it then holds, and publishes a
+   * `resized` at the answer's sequence, for an exact size and owner no-op too (#348). Held
+   * publications model a stream behind backpressure; output queued with them keeps its order.
+   */
   const serveResizes = (
     view: Awaited<ReturnType<typeof mountViewport>>,
     initial: { cols: number; rows: number; sizeClaim: string | null },
+    options: {
+      readonly hold?: boolean;
+      readonly outcome?: TerminalResizeResult["outcome"];
+      /** The requester's attach stream, which the acknowledgement arrives on. */
+      readonly source?: { readonly sizeClaim?: string };
+    } = {},
   ) => {
     let server = initial;
+    let sequence = 10;
+    const stream: Array<TerminalAttachStreamEvent> = [];
     view.resizeSpy.mockImplementation(
       async ({ input }: { input: { cols: number; rows: number; sizeClaim?: string } }) => {
+        if (options.outcome !== undefined) {
+          return AsyncResult.success({
+            outcome: options.outcome,
+            size: server,
+            generation: null,
+            sequence,
+          } satisfies TerminalResizeResult);
+        }
         const sizeClaim = input.sizeClaim ?? null;
-        if (
+        const unchanged =
           input.cols === server.cols &&
           input.rows === server.rows &&
-          sizeClaim === server.sizeClaim
-        ) {
-          return AsyncResult.success(undefined);
-        }
+          sizeClaim === server.sizeClaim;
         const size = { cols: input.cols, rows: input.rows, sizeClaim };
         server = size;
-        queueMicrotask(() =>
-          view.runtime.ingest({ type: "resized", threadId: THREAD_ID, terminalId: "term-1", size }),
-        );
-        return AsyncResult.success(undefined);
+        sequence += 1;
+        const event = {
+          type: "resized",
+          threadId: THREAD_ID,
+          terminalId: "term-1",
+          sequence,
+          size,
+        } satisfies TerminalAttachStreamEvent;
+        if (options.hold) stream.push(event);
+        else queueMicrotask(() => view.runtime.ingest(event, options.source));
+        return AsyncResult.success({
+          outcome: unchanged ? "unchanged" : "applied",
+          size,
+          generation: null,
+          sequence,
+        } satisfies TerminalResizeResult);
       },
     );
+    return {
+      /** Output the server printed before the next held publication. */
+      print(data: string) {
+        sequence += 1;
+        stream.push({ type: "output", threadId: THREAD_ID, terminalId: "term-1", sequence, data });
+      },
+      async release() {
+        await act(async () => {
+          for (const event of stream.splice(0)) view.runtime.ingest(event, options.source);
+        });
+      },
+    };
   };
 
   it("repairs rows kept above the fit when the server already holds the claimed size (#348)", async () => {
@@ -2483,7 +2525,6 @@ describe("TerminalViewport mounted lifecycle", () => {
       view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
     );
     expect(view.fakeTerminal!.rows).toBe(20);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     // A stale size reaches this renderer (a missed or misordered event): 30 rows where 20 fit.
     await act(async () =>
       view.runtime.ingest({
@@ -2494,17 +2535,14 @@ describe("TerminalViewport mounted lifecycle", () => {
       }),
     );
     await view.flushFrame();
-    // The owner asks for its fit; the server already holds it and stays silent.
+    // The owner asks for its fit; the server already holds it and acknowledges it in order.
     expect(view.resizeSpy).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
       input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 20, sizeClaim: claim },
     });
-    // A click measures and claims again, with the same silent answer.
-    await act(async () => view.pointerDownOnSurface());
-    await view.flushFrame();
-    await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    vi.useRealTimers();
+    await act(async () => Promise.resolve());
     expect(view.fakeTerminal!.rows).toBe(20);
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
     expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
     // A width change still produces an echo.
     xtermState.proposedDimensions = { cols: 81, rows: 20 };
@@ -2528,13 +2566,15 @@ describe("TerminalViewport mounted lifecycle", () => {
       }),
     );
     expect(view.mounted.container.textContent).toContain("Sized for another window.");
-    // The server answers success but publishes nothing (its claim was not registered).
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // The server applies nothing: this renderer's claim is not registered there.
+    serveResizes(
+      view,
+      { cols: 151, rows: 50, sizeClaim: "other" },
+      { outcome: "claimNotRegistered" },
+    );
     await act(async () => view.pointerDownOnSurface());
     expect(view.resizeSpy).toHaveBeenCalledTimes(1);
     await view.flushFrame();
-    await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    vi.useRealTimers();
     expect(view.fakeTerminal!.cols).toBe(151);
     expect(view.mounted.container.textContent).toContain("Sized for another window.");
   });
@@ -2593,6 +2633,290 @@ describe("TerminalViewport mounted lifecycle", () => {
         size: { cols: 80, rows: 24, sizeClaim: claim },
       }),
     );
+    expect(view.fakeTerminal!.cols).toBe(80);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+  });
+
+  it("keeps an exited terminal's size when its container shrinks (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 30 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 30, sizeClaim: claim };
+    serveResizes(view, held, { outcome: "generationInvalidated" });
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot("", "exited"), pid: null, size: held },
+      }),
+    );
+    await view.flushFrame();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    vi.useRealTimers();
+    // The server holds 30 rows for the exited process, so xterm keeps them; nothing retries.
+    expect(view.fakeTerminal!.rows).toBe(30);
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    expect(testState.reattachCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["sessionMissing", "processAbsent"] as const)(
+    "changes nothing and does not re-attach when the answer is %s (#348)",
+    async (outcome) => {
+      testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      xtermState.proposedDimensions = { cols: 80, rows: 30 };
+      const view = await mountViewport();
+      const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+        .terminal.sizeClaim;
+      const held = { cols: 80, rows: 30, sizeClaim: claim };
+      serveResizes(view, held, { outcome });
+      await act(async () =>
+        view.runtime.ingest({
+          type: "snapshot",
+          snapshot: { ...terminalSnapshot(""), size: held },
+        }),
+      );
+      await view.flushFrame();
+      xtermState.proposedDimensions = { cols: 80, rows: 20 };
+      await view.resizeContainer();
+      await view.flushFrame();
+      expect(view.resizeSpy).toHaveBeenCalledOnce();
+      expect(view.fakeTerminal!.rows).toBe(30);
+      expect(testState.reattachCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it("claims again once its stream attaches when the server did not know the claim (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 30 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 30, sizeClaim: claim };
+    serveResizes(view, held, { outcome: "claimNotRegistered" });
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+    );
+    await view.flushFrame();
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    // The same declined geometry is not sent again until the server's state changes.
+    await act(async () => view.pointerDownOnSurface());
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    // This renderer's stream attaches at the state already applied: it claims the fit again.
+    await act(async () =>
+      view.runtime.ingest(
+        { type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } },
+        { sizeClaim: claim },
+      ),
+    );
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    expect(view.fakeTerminal!.rows).toBe(30);
+    // Re-attaching could recreate a closed terminal; waiting for the stream is enough.
+    expect(testState.reattachCommand).not.toHaveBeenCalled();
+  });
+
+  it("takes the size on a focused remount whose claim reached the server before its stream (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const view = await mountViewport();
+    const first = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 151, rows: 50, sizeClaim: first };
+    await act(async () =>
+      view.runtime.ingest(
+        { type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } },
+        { sizeClaim: first },
+      ),
+    );
+    await unmount(view.mounted);
+    testState.resizeCommand.mockReset();
+    const remounted = await mountViewport({ publishRuntime: false });
+    serveResizes({ ...remounted, runtime: view.runtime }, held, { outcome: "claimNotRegistered" });
+    await remounted.setTranscriptRuntime(view.runtime);
+    await remounted.flushFrame();
+    // The cached transcript hydrates the new renderer, which claims before its stream exists.
+    expect(remounted.resizeSpy).toHaveBeenCalledOnce();
+    const second = remounted.resizeSpy.mock.calls[0]![0].input.sizeClaim as string;
+    expect(second).not.toBe(first);
+    const stream = { sizeClaim: second };
+    // The cached runtime is the first mount's, which the remount shares.
+    serveResizes({ ...remounted, runtime: view.runtime }, held, { source: stream });
+    // Its stream attaches with the same sequence the cache already holds.
+    await act(async () =>
+      view.runtime.ingest(
+        { type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } },
+        stream,
+      ),
+    );
+    await remounted.flushFrame();
+    await act(async () => Promise.resolve());
+    expect(remounted.resizeSpy).toHaveBeenCalledTimes(2);
+    expect(remounted.fakeTerminal!.cols).toBe(80);
+    expect(remounted.mounted.container.textContent).not.toContain("Sized for another window.");
+  });
+
+  it("parses output held behind backpressure at the old size before the claimed size (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 20, sizeClaim: claim };
+    const server = serveResizes(view, held, { hold: true });
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+    );
+    // Output printed at 20 rows is still in transit when a stale 30-row size reaches this
+    // renderer, which claims its fit at once.
+    server.print("printed before the claim");
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 30, sizeClaim: claim },
+      }),
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    vi.useRealTimers();
+    // The answer is in, but nothing ordered has arrived: xterm keeps the size it parses at.
+    expect(view.fakeTerminal!.rows).toBe(30);
+    const terminal = view.fakeTerminal!;
+    const order: Array<string> = [];
+    const write = terminal.write.bind(terminal);
+    terminal.write = ((data: string, callback?: () => void) => {
+      if (data.length > 0) order.push(`write ${terminal.rows}`);
+      return write(data, callback);
+    }) as typeof terminal.write;
+    await server.release();
+    await view.flushFrame();
+    expect(order).toEqual(["write 30"]);
+    expect(view.fakeTerminal!.rows).toBe(20);
+  });
+
+  it("applies only ordered sizes when a newer claim completes before an older one's acknowledgement (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.deferWrites = true;
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 20, sizeClaim: claim };
+    const server = serveResizes(view, held, { hold: true });
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+    );
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 30, sizeClaim: claim },
+      }),
+    );
+    await flushTerminalWrites();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    // Slow parsing holds anything queued for xterm; a newer fit is claimed and answered.
+    await act(async () => view.emitOutput("slow"));
+    xtermState.proposedDimensions = { cols: 80, rows: 22 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    vi.useRealTimers();
+    await flushTerminalWrites();
+    // Neither claim's size was applied before its ordered acknowledgement.
+    expect(view.fakeTerminal!.rows).toBe(30);
+    await server.release();
+    await flushTerminalWrites();
+    expect(view.fakeTerminal!.rows).toBe(22);
+  });
+
+  it("sends one claim for a hundred keys while its acknowledgement is in transit (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 20, sizeClaim: claim };
+    const server = serveResizes(view, held, { hold: true });
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+    );
+    await view.flushFrame();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 30, sizeClaim: claim },
+      }),
+    );
+    // The stale size's own layout claim is answered first; typing follows.
+    await view.flushFrame();
+    view.resizeSpy.mockClear();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    for (let key = 0; key < 100; key += 1) {
+      await act(async () =>
+        view.fakeTerminal!.keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+      );
+      await view.flushFrame();
+      await act(async () => vi.advanceTimersByTimeAsync(30));
+    }
+    vi.useRealTimers();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    await server.release();
+    await view.flushFrame();
+    expect(view.fakeTerminal!.rows).toBe(20);
+  });
+
+  it("does not flash the notice for an older publication parsed after a takeover's answer (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const other = { cols: 151, rows: 50, sizeClaim: "other" };
+    await act(async () =>
+      view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: other } }),
+    );
+    expect(view.mounted.container.textContent).toContain("Sized for another window.");
+    const server = serveResizes(view, other, { hold: true });
+    await act(async () => view.pointerDownOnSurface());
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    // The previous owner's unchanged size, published before the takeover, parses after it.
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        sequence: 5,
+        size: other,
+      }),
+    );
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await server.release();
     expect(view.fakeTerminal!.cols).toBe(80);
     expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
   });

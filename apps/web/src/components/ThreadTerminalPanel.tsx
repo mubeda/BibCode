@@ -12,6 +12,7 @@ import {
   type TerminalInputScheduler,
   type TerminalInputSendResult,
   type TerminalRenderSignal,
+  type TerminalSizePosition,
   terminalInputKey,
 } from "@bibcode/client-runtime/state/terminal";
 import {
@@ -28,6 +29,7 @@ import {
   type TerminalLaunchCommand,
   type TerminalSize,
   type TerminalResizeInput,
+  type TerminalResizeResult,
   type ThreadId,
 } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
@@ -569,8 +571,35 @@ function acquireTerminalInputBinding(inputKey: string): {
 
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
-/** How long a successful claim waits for its echo before settling without one (#348). */
-const TERMINAL_CLAIM_SETTLE_MS = 250;
+
+/** A claim the server applied or already held, waiting for its ordered `resized` (#348). */
+interface TerminalClaimAcknowledgement {
+  readonly request: TerminalSize;
+  readonly sequence: number | null;
+  readonly generation: TerminalResizeResult["generation"];
+}
+
+/**
+ * Whether an applied size is the acknowledgement, or later: the server publishes it at the
+ * answer's sequence, behind the output queued before it. A size of another process ends the
+ * wait, as does one without a position, which an older server sends.
+ */
+function sizePositionReaches(
+  position: TerminalSizePosition,
+  acknowledgement: TerminalClaimAcknowledgement,
+): boolean {
+  if (acknowledgement.sequence === null || position.sequence === undefined) return true;
+  const { generation } = acknowledgement;
+  if (
+    generation !== null &&
+    position.generation !== undefined &&
+    (generation.boot !== position.generation.boot ||
+      generation.process !== position.generation.process)
+  ) {
+    return true;
+  }
+  return position.sequence >= acknowledgement.sequence;
+}
 
 export function fitTerminalSafely(fitAddon: FitAddon): boolean {
   try {
@@ -1438,10 +1467,14 @@ export function TerminalViewport({
     let appliedSize: TerminalSize | null = null;
     let claimInFlight: TerminalSize | null = null;
     let layoutChangedWhileClaimPending = false;
-    // Hides the notice only while a claim is pending or its success has not settled.
+    // Hides the notice only while a claim is pending or waits for its acknowledgement.
     let claimNoticeSuppressed = false;
     let keypressMeasureFrame: number | null = null;
-    let claimSettleTimer: number | null = null;
+    // Geometry changes only through ordered size events; the answer names the one to wait for.
+    let awaitedAcknowledgement: TerminalClaimAcknowledgement | null = null;
+    let appliedPosition: TerminalSizePosition = {};
+    // Geometry the server declined to apply is not sent again until its state changes.
+    let declinedRequest: TerminalSize | null = null;
     let oscColorResponderActive = false;
     let disposed = false;
     let resizeRetryTimer: number | null = null;
@@ -1540,30 +1573,33 @@ export function TerminalViewport({
           : null,
       );
     };
-    // The server answers a claim for the size and owner it already holds with success and no
-    // echo, so a stale applied size survived its own repair (#348). The answer can also arrive
-    // before an echo and the output printed ahead of it, so the claim settles once, a bounded
-    // moment later, behind the output queued by then: if no size arrived since the claim and
-    // this renderer already owned the size, the claim is the applied state; a later echo or
-    // snapshot still wins. A takeover always echoes its owner change, so one without an echo
-    // was not applied.
-    const settleSuccessfulClaim = (request: TerminalSize, appliedAtClaim: TerminalSize | null) => {
-      if (claimSettleTimer !== null) window.clearTimeout(claimSettleTimer);
-      claimSettleTimer = window.setTimeout(() => {
-        claimSettleTimer = null;
-        outputSink.barrier(() => {
-          if (
-            disposed ||
-            resizeRendererGenerationRef.current !== resizeRendererGeneration ||
-            claimInFlight !== null
-          )
-            return;
-          claimNoticeSuppressed = false;
-          if (appliedSize === appliedAtClaim && appliedAtClaim?.sizeClaim === sizeClaim)
-            applySize(request);
-          else updateSizeNotice();
-        });
-      }, TERMINAL_CLAIM_SETTLE_MS);
+    // The answer says what the server holds. An applied or unchanged claim is acknowledged
+    // by a `resized` on this renderer's stream, behind the output printed before it, and the
+    // ordered size path applies it, so a stale applied size is repaired without a timer
+    // (#348). Any other outcome changed nothing, so xterm keeps the size it has.
+    const completeClaim = (request: TerminalSize, result: TerminalResizeResult | null) => {
+      // An older server answers nothing: the next published size is the claim's outcome.
+      if (result === null) {
+        awaitedAcknowledgement = { request, sequence: null, generation: null };
+        return;
+      }
+      const { outcome } = result;
+      if (outcome === "applied" || outcome === "unchanged") {
+        const acknowledgement = {
+          request,
+          sequence: result.sequence,
+          generation: result.generation,
+        };
+        if (sizePositionReaches(appliedPosition, acknowledgement)) claimNoticeSuppressed = false;
+        else awaitedAcknowledgement = acknowledgement;
+        return;
+      }
+      claimNoticeSuppressed = false;
+      // Not sent again until the server's state changes. An unregistered claim (a remount
+      // claiming before its stream attached, or a stream reconnecting) is claimed again when
+      // this renderer's stream attaches; a missing session or an ended process is shown by
+      // its own events.
+      declinedRequest = request;
     };
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
@@ -1579,6 +1615,8 @@ export function TerminalViewport({
         });
         return;
       }
+      // A claim already answered for this geometry waits for its acknowledgement; sending it
+      // again would only restart that wait.
       const shouldClaim = (fitted: TerminalDimensions | null) =>
         shouldClaimTerminalSize({
           sizeClaim,
@@ -1588,19 +1626,23 @@ export function TerminalViewport({
           documentFocused: document.hasFocus(),
           // Engines without the API keep the earlier focus-only rule.
           userActive: navigator.userActivation?.isActive ?? true,
-          claimInFlight: claimInFlight !== null,
+          claimInFlight:
+            claimInFlight !== null ||
+            terminalDimensionsEqual(declinedRequest, fitted) ||
+            (awaitedAcknowledgement?.sequence != null &&
+              terminalDimensionsEqual(awaitedAcknowledgement.request, fitted)),
         });
       // Typing measures at most once per frame; other keydowns in that frame reuse the fit.
-      if (trigger === "keypress") {
-        if (keypressMeasureFrame !== null) {
-          if (fittedDimensions === null || !shouldClaim(fittedDimensions)) return;
-        } else {
+      let fitted: TerminalDimensions | null;
+      if (trigger === "keypress" && keypressMeasureFrame !== null) fitted = fittedDimensions;
+      else {
+        if (trigger === "keypress") {
           keypressMeasureFrame = window.requestAnimationFrame(() => {
             keypressMeasureFrame = null;
           });
         }
+        fitted = updateFittedDimensions();
       }
-      const fitted = updateFittedDimensions();
       if (
         trigger === "layout" &&
         claimInFlight !== null &&
@@ -1611,10 +1653,10 @@ export function TerminalViewport({
       }
       if (fitted && shouldClaim(fitted)) {
         const request = { ...fitted, sizeClaim };
-        const appliedAtClaim = appliedSize;
         claimInFlight = request;
+        awaitedAcknowledgement = null;
         claimNoticeSuppressed = true;
-        const finishClaim = (succeeded: boolean) => {
+        const finishClaim = (succeeded: boolean, result: TerminalResizeResult | null = null) => {
           if (
             disposed ||
             resizeRendererGenerationRef.current !== resizeRendererGeneration ||
@@ -1624,7 +1666,7 @@ export function TerminalViewport({
           claimInFlight = null;
           if (succeeded) {
             resizeRetries = 0;
-            settleSuccessfulClaim(request, appliedAtClaim);
+            completeClaim(request, result);
           } else claimNoticeSuppressed = false;
           const refit = layoutChangedWhileClaimPending;
           layoutChangedWhileClaimPending = false;
@@ -1638,17 +1680,28 @@ export function TerminalViewport({
           }
         };
         void resizeTerminal(request).then(
-          (result) => finishClaim(result._tag === "Success"),
+          (result) =>
+            result._tag === "Success"
+              ? finishClaim(true, result.value ?? null)
+              : finishClaim(false),
           () => finishClaim(false),
         );
       }
       updateSizeNotice(fitted);
     };
-    const applySize = (size: TerminalSize | undefined, claimOnAttach = false) => {
+    const applySize = (
+      size: TerminalSize | undefined,
+      claimOnAttach = false,
+      position: TerminalSizePosition = {},
+    ) => {
       if (disposed) return;
-      // A size published after the claim was answered is the outcome of that claim.
-      if (claimInFlight === null || !terminalSizesEqual(appliedSize, size))
-        claimNoticeSuppressed = false;
+      appliedPosition = position;
+      declinedRequest = null;
+      if (awaitedAcknowledgement !== null && sizePositionReaches(position, awaitedAcknowledgement))
+        awaitedAcknowledgement = null;
+      // A claim's outcome is its acknowledgement: an older publication parsed after the answer
+      // keeps the notice suppressed (#348).
+      if (claimInFlight === null && awaitedAcknowledgement === null) claimNoticeSuppressed = false;
       const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
@@ -1671,7 +1724,20 @@ export function TerminalViewport({
         return;
       }
       if (signal.type === "resized") {
-        if (sizeOwnership) outputSink.barrier(() => applySize(signal.size));
+        if (sizeOwnership) outputSink.barrier(() => applySize(signal.size, false, signal));
+        return;
+      }
+      if (signal.type === "attached") {
+        // This renderer's own stream attached: its claim is registered, so it may claim now.
+        if (sizeOwnership) {
+          outputSink.barrier(() => {
+            claimInFlight = null;
+            awaitedAcknowledgement = null;
+            declinedRequest = null;
+            layoutChangedWhileClaimPending = false;
+            applySize(signal.size, true, signal);
+          });
+        }
         return;
       }
 
@@ -1684,13 +1750,13 @@ export function TerminalViewport({
         // Its late RPC completion is ignored by the request-identity guard.
         if (claimOnAttach) {
           claimInFlight = null;
+          awaitedAcknowledgement = null;
+          declinedRequest = null;
           layoutChangedWhileClaimPending = false;
           claimNoticeSuppressed = false;
         }
-        // A reset drops the old sink's pending claim settlement with it.
-        if (claimInFlight === null) claimNoticeSuppressed = false;
         oscColorResponderActive = signal.oscColorResponderActive ?? false;
-        if (sizeOwnership) applySize(signal.size, claimOnAttach);
+        if (sizeOwnership) applySize(signal.size, claimOnAttach, signal);
         else {
           lastRequestedSizeRef.current = null;
           handleSizeTrigger("layout");
@@ -2160,7 +2226,6 @@ export function TerminalViewport({
       window.clearTimeout(fitTimer);
       if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
       if (keypressMeasureFrame !== null) window.cancelAnimationFrame(keypressMeasureFrame);
-      if (claimSettleTimer !== null) window.clearTimeout(claimSettleTimer);
       outputSink.dispose();
       replyGuard.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;
