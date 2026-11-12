@@ -129,6 +129,7 @@ function view(overrides: Partial<HostMetricsView> = {}): HostMetricsView {
       },
     ],
     hiddenVolumes: [],
+    volumeStatistics: [],
     ...overrides,
   };
 }
@@ -268,6 +269,25 @@ describe("HostDashboardSheet", () => {
     ]);
     // Hidden volumes are listed, never sized.
     expect(rows.some((row) => /free|\bof\b|GB/u.test(row.textContent ?? ""))).toBe(false);
+  });
+
+  it("shows each volume's used percent since start in the Since section", async () => {
+    h.data = view({
+      volumeStatistics: [
+        {
+          mountPoint: "/",
+          statistic: { current: 60, minimum: 40, average: 50, p95: 59, maximum: 60 },
+        },
+      ],
+    });
+    await render();
+    const since = container!.querySelector('[data-testid="host-dashboard-since"]');
+    const rows = [...since!.querySelectorAll("tbody tr")].map((row) => row.textContent);
+    expect(rows).toEqual([
+      expect.stringContaining("CPU"),
+      expect.stringContaining("Memory"),
+      "/ used60.0%40.0%50.0%59.0%60.0%",
+    ]);
   });
 
   it("shows no hidden volumes disclosure when nothing is hidden", async () => {

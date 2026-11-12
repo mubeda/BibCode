@@ -1235,3 +1235,46 @@ async fn an_empty_or_shared_volume_is_hidden_after_its_read() {
     assert_eq!(wire["hiddenVolumes"][1]["sameStorageAs"], "/");
     collector.shutdown().await;
 }
+
+/// R83: each volume's used percent has the five statistics since start.
+#[tokio::test(start_paused = true)]
+async fn volume_statistics_follow_each_mount_point() {
+    let source = Arc::new(
+        FakeHostMetricsSource::new(vec![descriptor("/", "ext4")])
+            .script_cpu([cpu(10.0), cpu(10.0), cpu(10.0), cpu(10.0)])
+            .space("/", 100 * GB, 60 * GB),
+    );
+    let rates = HostMetricsRates {
+        volumes_every: 1,
+        ..HostMetricsRates::default()
+    };
+    let collector = HostMetricsCollector::new(source.clone(), rates, identity());
+    collector.start_background();
+    quiesce(&collector).await;
+    // Three background readings with volumes, at 0, 60 and 120 s: 40, 50 and 60 percent used.
+    for free in [50, 40] {
+        source
+            .space
+            .lock()
+            .unwrap()
+            .get_mut(Path::new("/"))
+            .expect("/")
+            .free_bytes = free * GB;
+        run_for(&collector, Duration::from_secs(60), Duration::from_secs(5)).await;
+    }
+
+    let snapshot = collector.snapshot().await;
+    assert_eq!(source.space_reads("/"), 3);
+    let [(mount_point, statistic)] = snapshot.volume_statistics.as_slice() else {
+        panic!("one volume: {:?}", snapshot.volume_statistics);
+    };
+    assert_eq!(mount_point, Path::new("/"));
+    assert_eq!(statistic.current, 60.0);
+    assert_eq!(statistic.minimum, 40.0);
+    assert_eq!(statistic.maximum, 60.0);
+    assert!((statistic.average - 50.0).abs() < 1e-9, "{statistic:?}");
+    let wire = wire::encode_snapshot(&snapshot);
+    assert_eq!(wire["volumeStatistics"][0]["mountPoint"], "/");
+    assert_eq!(wire["volumeStatistics"][0]["statistic"]["current"], 60.0);
+    collector.shutdown().await;
+}
