@@ -408,6 +408,26 @@ describe("AppearanceSettingsPanel", () => {
     expect(document.activeElement).toBe(select("matrix-dark"));
   });
 
+  it("a Delete whose slot write fails after the library write still moves focus to the row that takes its place", async () => {
+    saveCustomTheme({ version: 1, id: "mine", name: "Mine", base: "dark" });
+    saveCustomTheme({ version: 1, id: "mine-2", name: "Mine 2", base: "dark" });
+    await mount();
+    await menuAction("Mine", "Delete");
+    const realSetItem = Storage.prototype.setItem;
+    const setItem = vi.spyOn(window.localStorage, "setItem").mockImplementation((key, value) => {
+      if (key.includes("slots")) throw new Error("quota");
+      realSetItem.call(window.localStorage, key, value);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await click(button("Delete theme"));
+    setItem.mockRestore();
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      "Could not delete the theme.",
+    );
+    expect(rowNames()).not.toContain("mine");
+    expect(document.activeElement).toBe(select("mine-2"));
+  });
+
   it("New theme asks for a base and a name, rejects an empty name and a name over 48 characters with the rule that failed, and opens the editor", async () => {
     await mount();
     await click(button("New theme"));
