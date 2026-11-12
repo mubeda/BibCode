@@ -3553,6 +3553,44 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A child can set a size the wire rejects (`stty cols 0 rows 0`, or past the maximum):
+    /// such a readback is not reported, the last accepted size is (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_size_read_back_outside_the_wire_bounds_reports_the_last_accepted_size() {
+        for (cols, rows) in [(0, 0), (1_001, 30), (80, 501)] {
+            let (requests, worker_requests) = mpsc::channel();
+            let (reported, exhausted) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                run_resize_worker(
+                    7,
+                    pty_size(80, 30),
+                    &worker_requests,
+                    &AtomicBool::new(false),
+                    &QUICK_RETRIES,
+                    |_| Err("injected refusal"),
+                    || Some(pty_size(cols, rows)),
+                    |report| reported.send(report).unwrap(),
+                );
+            });
+            requests.send(pty_size(80, 20)).unwrap();
+            let report = exhausted
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the worker gives up");
+            assert_eq!(
+                report,
+                ExhaustedResize {
+                    requests: 1,
+                    cols: 80,
+                    rows: 30,
+                },
+                "readback {cols}x{rows}"
+            );
+            drop(requests);
+            worker.join().unwrap();
+        }
+    }
+
     /// A newer size replaces a refused one waiting for its retry.
     #[cfg(unix)]
     #[test]
