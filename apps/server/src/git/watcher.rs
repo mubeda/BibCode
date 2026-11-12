@@ -2618,6 +2618,20 @@ mod tests {
                 .registrations
                 .lock()
                 .expect("native readiness registrations lock");
+            // Windows also reports a sentinel write as `Modify(Any)` of its directory to
+            // the watch on that directory's parent (the common directory's watch sees
+            // `refs`). That directory event is the fence's own, not a fixture change.
+            if cfg!(windows)
+                && event.kind == EventKind::Modify(ModifyKind::Any)
+                && event.paths.len() == 1
+            {
+                let key = normalize_worktree_path_key(&event.paths[0], host_path_platform());
+                if registrations.iter().any(|registration| {
+                    normalize_worktree_path_key(&registration.root, host_path_platform()) == key
+                }) {
+                    return Some(Vec::new());
+                }
+            }
             event
                 .paths
                 .iter()
