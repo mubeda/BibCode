@@ -2187,7 +2187,7 @@ function ChatViewContent(props: ChatViewProps) {
   const boundInstanceSettings = settings.providerInstances?.[providerBinding.instanceId];
   // An instance the server has not reported but settings still configure is only not known yet.
   const boundProviderUnavailable = boundProviderEntry
-    ? !boundProviderEntry.enabled
+    ? !boundProviderEntry.enabled || !boundProviderEntry.isAvailable
     : boundInstanceSettings
       ? boundInstanceSettings.enabled === false
       : providerStatuses.length > 0;

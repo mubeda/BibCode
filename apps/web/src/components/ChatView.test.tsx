@@ -8742,6 +8742,34 @@ describe("ChatView composer model picker provider scope (#347)", () => {
     ).toBe(claudeInstanceId);
   });
 
+  it("explains an enabled provider the server reports unavailable and blocks Send (#347)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, { ...claudeProvider, availability: "unavailable" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection, session: claudeSession }));
+    useComposerDraftStore.getState().setPrompt(threadRef, "hello");
+    publishSeededStoreState(useComposerDraftStore);
+    h.realStatusBanners = true;
+
+    const container = await mount(serverRoute);
+
+    expect(container.textContent).toMatch(/is not available/);
+    const send = sendButton(container);
+    expect(send?.getAttribute("aria-label")).toMatch(/^Send unavailable\. .*is not available/);
+    const form = container.querySelector("form");
+    await act(async () => {
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
+  });
+
   it("still lists every ready provider in a blank new draft, where the picker chooses the provider", async () => {
     seedTwoReadyProviders();
     seedProject(makeProject());
