@@ -62,7 +62,9 @@ describe("@wdio/tauri-service compatibility", () => {
     const wdioConfig = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
 
     expect(wdioConfig).toContain("const desktopUiSpecFiles =");
-    expect(wdioConfig).toContain("[desktopUiSpecFiles]");
+    expect(wdioConfig).toContain(
+      "[desktopUiSpecFiles.filter((spec) => spec !== closingSpec), closingSpec]",
+    );
     expect(wdioConfig).toContain("connectionRetryCount: 0");
     expect(wdioConfig).toContain("commandTimeout: 60_000");
     expect(wdioConfig).toContain("beforeTest: async () =>");
