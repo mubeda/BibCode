@@ -588,6 +588,18 @@ impl NativeServerControl {
                 "settings patch must be an object",
             ));
         }
+        // Checked on the patch only, so a prompt stored before the rule still loads (#293).
+        if patch
+            .get("codeReviewPrompt")
+            .and_then(Value::as_str)
+            .is_some_and(crate::orchestration::engine::code_review_prompt_has_control_character)
+        {
+            return Err(settings_error(
+                &self.settings_path,
+                "normalize",
+                "codeReviewPrompt holds a control character other than tab or a line break",
+            ));
+        }
         if let Some(raw) = patch.get("worktreeBaseDirectory").and_then(Value::as_str) {
             let normalized = super::worktree_workspace::normalize_worktree_workspace(raw)
                 .await
@@ -6109,6 +6121,47 @@ mod tests {
             .update_settings(json!({"patch":{"codeReviewPrompt": "😀".repeat(3_840)}}))
             .await
             .expect("7,680 UTF-16 units fit");
+    }
+
+    /// #293: the review prompt holds no control character but tab, line feed and carriage
+    /// return (C0, DEL and C1, as the web checks); a stored one from before the rule loads.
+    #[tokio::test]
+    async fn code_review_prompt_rejects_control_characters_on_write_only() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"codeReviewPrompt": "Old\u{1b}text"}),
+        );
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        assert_eq!(
+            control.settings.read().await["codeReviewPrompt"],
+            "Old\u{1b}text",
+            "a stored prompt from before the rule still loads"
+        );
+        control
+            .update_settings(json!({"patch":{"enableProfiler": false}}))
+            .await
+            .expect("an old prompt does not block other updates");
+        for control_character in [
+            '\u{0}', '\u{8}', '\u{b}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}',
+        ] {
+            let error = control
+                .update_settings(json!({
+                    "patch":{"codeReviewPrompt": format!("a{control_character}b")}
+                }))
+                .await
+                .expect_err("a control character is rejected");
+            assert!(
+                error.to_string().contains("control character"),
+                "{control_character:?}: {error}"
+            );
+        }
+        let updated = control
+            .update_settings(json!({"patch":{"codeReviewPrompt": "Kept\tline\r\nnext\u{a0}"}}))
+            .await
+            .expect("tab, line breaks and U+00A0 are allowed");
+        assert_eq!(updated["codeReviewPrompt"], "Kept\tline\r\nnext\u{a0}");
     }
 
     #[tokio::test]

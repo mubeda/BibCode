@@ -1309,6 +1309,14 @@ struct CommandModel {
 /// Longest review prompt a project or a user may store, in UTF-16 units, as in the contract (#293).
 pub(crate) const CODE_REVIEW_PROMPT_MAX_LENGTH: usize = 7_680;
 
+/// Whether a review prompt holds a C0 control, DEL or a C1 control other than tab, line feed
+/// and carriage return: the web's rule for a prompt it launches in a terminal (#293).
+pub(crate) fn code_review_prompt_has_control_character(prompt: &str) -> bool {
+    prompt
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+}
+
 #[derive(Clone, Debug)]
 struct ProjectState {
     workspace_root: String,
@@ -4538,6 +4546,15 @@ async fn plan_command(
                     format!(
                         "The project review prompt is longer than {CODE_REVIEW_PROMPT_MAX_LENGTH} characters."
                     ),
+                );
+            }
+            if let Some(prompt) = code_review_prompt
+                && code_review_prompt_has_control_character(prompt)
+            {
+                return invariant(
+                    command,
+                    "The project review prompt holds a control character other than tab or a line break."
+                        .to_owned(),
                 );
             }
             if let Some(workspace_root) = workspace_root
