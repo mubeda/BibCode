@@ -7,6 +7,7 @@ import { BUILTIN_THEMES, isBuiltinThemeId } from "../../themes/builtinThemes";
 import {
   deleteCustomTheme,
   duplicateTheme,
+  getTheme,
   saveCustomTheme,
   setSlot,
   useThemeLibrary,
@@ -298,6 +299,10 @@ export function AppearanceSettingsPanel() {
     setConfirmingDelete(null);
     if (!result.ok) {
       setActionError("Could not delete the theme.");
+      // The library write can land before the slot write fails, which removes the row anyway.
+      if (getTheme(theme.id) === undefined && survivor !== undefined) {
+        return rowControl(survivor, "select")?.focus();
+      }
       return rowControl(theme.id, "more")?.focus();
     }
     setActionError(null);
