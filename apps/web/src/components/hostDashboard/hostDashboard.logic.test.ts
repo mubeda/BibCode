@@ -134,9 +134,7 @@ describe("presentHostDashboard", () => {
     const later = presentHostDashboard({ ...BASE, view: aged, lastItemAtMs: NOW_MS - 2_000 });
     expect(later.notice).toBe("Last updated 122 s ago");
     const fresh = view({ sample: { ...old.sample!, ageMs: 500 } as typeof old.sample });
-    expect(presentHostDashboard({ ...BASE, view: fresh, lastItemAtMs: NOW_MS }).state).toBe(
-      "live",
-    );
+    expect(presentHostDashboard({ ...BASE, view: fresh, lastItemAtMs: NOW_MS }).state).toBe("live");
   });
 
   it("keeps the last values dimmed while disconnected, even after a dropped request", () => {
@@ -243,6 +241,20 @@ describe("host metric bars", () => {
     ];
     const after = hostMetricsRecentBars(next, "cpu", "locale");
     expect(after.slice(0, -1).map((bar) => bar.key)).toEqual(bars.map((bar) => bar.key));
+  });
+
+  it("keeps bar keys unique when the server's clock moved backwards", () => {
+    const point = (ms: number) => ({
+      sampledAt: new Date(ms).toISOString(),
+      cpuPercent: 10,
+      memoryPercent: 40,
+    });
+    const bars = hostMetricsRecentBars(
+      [point(NOW_MS), point(NOW_MS + 20_000), point(NOW_MS + 1_000)],
+      "cpu",
+      "locale",
+    );
+    expect(new Set(bars.map((bar) => bar.key)).size).toBe(bars.length);
   });
 
   it("draws one uptime bar per bucket", () => {

@@ -1,4 +1,7 @@
-import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
+import type {
+  HostMetricsSampleExtension,
+  HostMetricsView,
+} from "@bibcode/client-runtime/state/server";
 import type {
   ServerHostMetricsChartBucket,
   ServerHostMetricsChartPoint,
@@ -195,7 +198,12 @@ export function presentHostDashboard(input: {
   if (input.supported === null || input.view === null) {
     return { state: "loading", dimmed: values !== null, notice: null, values };
   }
-  const silentMs = input.lastItemAtMs === null ? 0 : input.nowMs - input.lastItemAtMs;
+  // The reading's age as the server saw it when it sent it, plus the time since it arrived; a
+  // server that does not send the age leaves receipt time alone (both clocks stay unmixed).
+  const sampleAgeMs =
+    (input.view.sample as (HostMetricsSampleExtension & object) | null)?.ageMs ?? 0;
+  const silentMs =
+    (input.lastItemAtMs === null ? 0 : input.nowMs - input.lastItemAtMs) + sampleAgeMs;
   if (silentMs >= HOST_DASHBOARD_STALE_AFTER_MS) {
     return {
       state: "stale",
@@ -250,15 +258,20 @@ export function hostMetricsRecentBars(
     if (last !== undefined && last.startMs === startMs) last.values.push(value);
     else slots.push({ startMs, values: [value] });
   }
+  const seen = new Set<string>();
   return slots.map(({ startMs, values }) => {
-    const key = new Date(startMs).toISOString();
+    const label = new Date(startMs).toISOString();
+    // A clock moved backwards can revisit a slot; the repeat gets its own key.
+    let key = label;
+    for (let repeat = 1; seen.has(key); repeat += 1) key = `${label}#${repeat}`;
+    seen.add(key);
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
     const peak = Math.max(...values);
     return {
       key,
       average,
       peak,
-      tooltip: barTooltip(formatTimestamp(key, timestampFormat), average, peak),
+      tooltip: barTooltip(formatTimestamp(label, timestampFormat), average, peak),
     };
   });
 }

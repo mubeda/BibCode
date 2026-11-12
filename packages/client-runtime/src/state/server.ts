@@ -29,7 +29,7 @@ import { isToolId, toolsAsProviders } from "./serverTools.ts";
 import { accumulateHostMetrics, type HostMetricsView } from "./hostMetrics.ts";
 
 // The web reads the view type through this subpath; the package exports no `state/hostMetrics`.
-export type { HostMetricsView } from "./hostMetrics.ts";
+export type { HostMetricsSampleExtension, HostMetricsView } from "./hostMetrics.ts";
 
 export const PROVIDER_CAPABILITIES_STALE_TIME_MS = 30_000;
 

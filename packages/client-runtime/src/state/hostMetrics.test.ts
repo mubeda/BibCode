@@ -8,7 +8,11 @@ import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { describe, expect, it } from "vite-plus/test";
 
-import { accumulateHostMetrics, type HostMetricsView } from "./hostMetrics.ts";
+import {
+  accumulateHostMetrics,
+  type HostMetricsSampleExtension,
+  type HostMetricsView,
+} from "./hostMetrics.ts";
 
 const STATISTIC: ServerHostMetricsStatistic = {
   current: 20,
@@ -184,10 +188,11 @@ describe("accumulateHostMetrics after an empty snapshot", () => {
 describe("accumulateHostMetrics ordering", () => {
   it("orders by the server's sequence, so a clock moved backwards keeps values live", () => {
     const first = snapshot([at(100)]);
-    const withSequence = {
-      ...first,
-      sample: { ...(first as { sample: ServerHostMetricsSample }).sample, sequence: 10 },
-    } as ServerHostMetricsEvent;
+    const sequenced: ServerHostMetricsSample & HostMetricsSampleExtension = {
+      ...(first as { sample: ServerHostMetricsSample }).sample,
+      sequence: 10,
+    };
+    const withSequence = { ...first, sample: sequenced } as ServerHostMetricsEvent;
     const { view, emitted } = run([
       withSequence,
       orderedSampleEvent(at(40), { sequence: 11 }),

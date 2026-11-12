@@ -47,6 +47,32 @@ function pruneRecent(
 }
 
 /**
+ * Fields the server is asked to add to a sample (#292 review). The schema drops them until it
+ * declares them, so each is read when present and its absence keeps today's rule.
+ */
+export interface HostMetricsSampleExtension {
+  /** Rises by one per reading within a server run; orders samples whatever the wall clock does. */
+  readonly sequence?: number;
+  /** How old the reading was, on the server's own clock, when the item was encoded. */
+  readonly ageMs?: number;
+}
+
+/** A Sample item may carry the statistics start once the server sends it there too. */
+interface HostMetricsSampleEventExtension {
+  readonly statisticsSince?: string | null;
+}
+
+function isNewerSample(
+  previous: ServerHostMetricsSample & HostMetricsSampleExtension,
+  next: ServerHostMetricsSample & HostMetricsSampleExtension,
+): boolean {
+  if (previous.sequence !== undefined && next.sequence !== undefined) {
+    return next.sequence > previous.sequence;
+  }
+  return Date.parse(next.sampledAt) > Date.parse(previous.sampledAt);
+}
+
+/**
  * Folds stream items into the view, in the shape `Stream.mapAccum` takes: a Snapshot replaces
  * the view, a Sample newer than the last applied one updates it and appends a recent point, and
  * an uptime chart replaces the previous one whenever an item carries it.
@@ -71,8 +97,7 @@ export function accumulateHostMetrics(
   }
   const current = Option.getOrNull(previous);
   if (current === null) return [previous, []];
-  const lastSampledAt = current.sample === null ? null : Date.parse(current.sample.sampledAt);
-  if (lastSampledAt !== null && Date.parse(event.sample.sampledAt) <= lastSampledAt) {
+  if (current.sample !== null && !isNewerSample(current.sample, event.sample)) {
     // A stale or repeated sample changes nothing but may still carry a newer chart.
     if (event.uptime === null) return [previous, []];
     const view = { ...current, uptime: event.uptime };
@@ -80,6 +105,13 @@ export function accumulateHostMetrics(
   }
   const view: HostMetricsView = {
     ...current,
+    // After a Snapshot sent before the first reading, the first sample starts the statistics.
+    // shortcut: without the server's own start, a coalesced first reading makes this a few
+    // seconds late; exact once the server sends `statisticsSince` with samples.
+    statisticsSince:
+      current.statisticsSince ??
+      (event as HostMetricsSampleEventExtension).statisticsSince ??
+      event.sample.sampledAt,
     sample: event.sample,
     cpu: event.cpu,
     memory: event.memory,
