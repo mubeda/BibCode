@@ -12,6 +12,18 @@ pub(crate) fn is_network(file_system: &str) -> bool {
     NETWORK_FILE_SYSTEMS.contains(&file_system)
 }
 
+/// Whether the mount point is a file, as Docker's `/etc/hosts` bind mount is, from
+/// `symlink_metadata`. Never asks it of a network mount point: a hard mount can hang it (D25),
+/// and such a volume is hidden as a network one whatever its mount point is.
+pub(crate) fn is_file_mount(
+    file_system: &str,
+    mount_point: &Path,
+    symlink_metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> bool {
+    !is_network(file_system)
+        && symlink_metadata(mount_point).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Drops, before any space read, the volumes that must never be read.
 pub(crate) fn pre_filter(
     listed: Vec<VolumeDescriptor>,
@@ -123,13 +135,25 @@ mod tests {
     /// The listing skips its `lstat` for exactly the file systems the filter hides as network.
     #[test]
     fn network_file_systems_are_never_stat_by_the_listing() {
+        let file = tempfile::NamedTempFile::new().expect("a temporary file");
         for file_system in ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"] {
             assert!(is_network(file_system), "{file_system}");
+            let is_file = is_file_mount(file_system, Path::new("/mnt/share"), |_| {
+                panic!("{file_system}: a network mount point was stat")
+            });
+            assert!(!is_file, "{file_system}");
             let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)]);
             assert_eq!(hidden[0].reason, HiddenReason::Network, "{file_system}");
         }
         for file_system in ["ext4", "apfs", "tmpfs", "overlay", "ntfs"] {
             assert!(!is_network(file_system), "{file_system}");
+            let mut asked = None;
+            let is_file = is_file_mount(file_system, file.path(), |path| {
+                asked = Some(path.to_owned());
+                std::fs::symlink_metadata(path)
+            });
+            assert!(is_file, "{file_system}: the reader's answer is used");
+            assert_eq!(asked.as_deref(), Some(file.path()), "{file_system}");
         }
     }
 

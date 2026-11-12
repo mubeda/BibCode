@@ -113,10 +113,11 @@ impl HostMetricsSource for NativeHostMetricsSource {
         for disk in disks {
             let mount_point = disk.mount_point().to_owned();
             let file_system = disk.file_system().to_string_lossy().into_owned();
-            // Never `lstat` a network mount point: a hard mount can hang it (D25). Such a
-            // volume is hidden as a network one whatever its mount point is.
-            let is_file = !super::volumes::is_network(&file_system)
-                && std::fs::symlink_metadata(&mount_point).is_ok_and(|metadata| metadata.is_file());
+            let is_file = super::volumes::is_file_mount(
+                &file_system,
+                &mount_point,
+                |path| std::fs::symlink_metadata(path),
+            );
             #[cfg(target_os = "linux")]
             let disk_read_only = read_only.get(&mount_point).copied().unwrap_or(false);
             #[cfg(not(target_os = "linux"))]
