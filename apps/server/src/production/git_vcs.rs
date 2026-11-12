@@ -8236,10 +8236,11 @@ case "$1:$2" in
   pr:list)
     fail=''; if [ -f 'STATE/fail' ]; then fail=1; fi
     open=''; if [ -f 'STATE/open' ]; then open=1; fi
+    slow=''; if [ -f 'STATE/slow' ]; then slow="$(cat 'STATE/slow')"; fi
     printf '%s\n' "$4" >> 'CALLS'
     printf '%s\n' "$$" >> 'PIDS'
     if [ -n "$fail" ]; then echo 'forge unavailable' >&2; exit 1; fi
-    if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
+    if [ -n "$slow" ]; then sleep "$slow"; fi
     if [ -n "$open" ]; then
       printf '[{"number":42,"title":"PR for %s","url":"https://github.com/acme/repo/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
     else
