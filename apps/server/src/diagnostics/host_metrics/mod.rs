@@ -18,10 +18,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 mod disk_workers;
+mod native;
+#[cfg(test)]
+mod probes;
 mod stats;
 mod volumes;
 
 pub use crate::diagnostics::SamplingError;
+pub use native::NativeHostMetricsSource;
 pub use stats::{ChartBucket, ChartPoint, MeasureStatistics};
 
 use disk_workers::{Admission, DiskJob, DiskJobKey, DiskJobResult, DiskOutcome, DiskWorkers};
