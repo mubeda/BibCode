@@ -1,6 +1,12 @@
 import type { IDisposable, Terminal } from "@xterm/xterm";
 
-type FollowedTerminal = Pick<Terminal, "buffer" | "onRender" | "scrollLines" | "scrollToBottom">;
+type FollowedTerminal = Pick<
+  Terminal,
+  "buffer" | "cols" | "rows" | "resize" | "onRender" | "scrollToBottom"
+>;
+
+/** Repair attempts after one resume; each waits for the next render. */
+const TERMINAL_FOLLOW_REPAIR_ATTEMPTS = 3;
 
 export interface TerminalFollowOutputOptions {
   /**
@@ -9,6 +15,11 @@ export interface TerminalFollowOutputOptions {
    * pauses. Returns the unsubscribe.
    */
   readonly observeDrawing: (onChange: (drawing: boolean) => void) => () => void;
+  /**
+   * Reports a scroll the user makes (a wheel over the terminal, a press on its scroll bar),
+   * which ends a pending repair: the user chose a position. Returns the unsubscribe.
+   */
+  readonly observeUserScroll?: (onScroll: () => void) => () => void;
   readonly scheduleFrame?: (callback: () => void) => number;
   readonly cancelFrame?: (handle: number) => void;
 }
@@ -42,22 +53,28 @@ export function createTerminalFollowOutput(
   let awaitingRender = false;
   let fallbackFrame: number | null = null;
   let repairTimer: ReturnType<typeof setTimeout> | null = null;
+  let attempts = 0;
 
+  const settle = () => {
+    followed = null;
+    attempts = 0;
+  };
   const repair = () => {
     repairTimer = null;
     if (disposed || paused || followed === null) return;
     // The alternate screen has no scrollback; the normal buffer is repaired when it returns.
     if (terminal.buffer.active.type !== "normal") return;
-    if (followed && !normalAtBottom()) {
-      terminal.scrollToBottom();
-      // xterm's scroll area can keep the paused height until its next sync, which clamps the
-      // scroll short of the bottom; a one-row scroll syncs it, then the bottom is reachable.
-      if (!normalAtBottom()) {
-        terminal.scrollLines(-1);
-        terminal.scrollToBottom();
-      }
-    }
-    followed = null;
+    if (!followed || normalAtBottom()) return settle();
+    terminal.scrollToBottom();
+    if (normalAtBottom() || attempts >= TERMINAL_FOLLOW_REPAIR_ATTEMPTS) return settle();
+    attempts += 1;
+    // xterm's scroll area can keep the paused height after drawing resumes and clamps every
+    // scroll to it, even at row 0 with no range at all; xterm syncs it on a resize, and a
+    // one-row round trip leaves the grid as it was. The next render tries again.
+    const { cols, rows } = terminal;
+    terminal.resize(cols, rows + 1);
+    terminal.resize(cols, rows);
+    waitForDraw();
   };
   // Outside xterm's own scroll handling, which ignores a scroll requested inside it.
   const scheduleRepair = () => {
@@ -70,20 +87,15 @@ export function createTerminalFollowOutput(
     fallbackFrame = null;
     scheduleRepair();
   };
-  const stopObserving = options.observeDrawing((drawing) => {
-    if (disposed || drawing === !paused) return;
-    paused = !drawing;
-    if (paused) {
-      // A repair still pending keeps the earlier record: the view has not been drawn since.
-      followed ??= normalAtBottom();
-      awaitingRender = false;
-      if (fallbackFrame !== null) cancelFrame(fallbackFrame);
-      fallbackFrame = null;
-      return;
-    }
-    if (followed === null) return;
-    // xterm applies its deferred resize as it resumes and renders next; nothing may render
-    // when nothing changed, so two frames end the wait.
+  const stopWaiting = () => {
+    awaitingRender = false;
+    if (fallbackFrame !== null) cancelFrame(fallbackFrame);
+    fallbackFrame = null;
+  };
+  // xterm applies its deferred resize as it resumes and renders next; nothing may render
+  // when nothing changed, so two frames end the wait.
+  function waitForDraw() {
+    stopWaiting();
     awaitingRender = true;
     fallbackFrame = scheduleFrame(() => {
       fallbackFrame = scheduleFrame(() => {
@@ -91,7 +103,28 @@ export function createTerminalFollowOutput(
         resumed();
       });
     });
+  }
+  const stopObserving = options.observeDrawing((drawing) => {
+    if (disposed || drawing === !paused) return;
+    paused = !drawing;
+    if (paused) {
+      // A repair still pending keeps the earlier record: the view has not been drawn since.
+      followed ??= normalAtBottom();
+      attempts = 0;
+      stopWaiting();
+      return;
+    }
+    if (followed !== null) waitForDraw();
   });
+  const stopObservingUser =
+    options.observeUserScroll?.(() => {
+      // Only a pending repair is affected; while paused nothing can be scrolled by hand.
+      if (disposed || paused || followed === null) return;
+      stopWaiting();
+      if (repairTimer !== null) clearTimeout(repairTimer);
+      repairTimer = null;
+      settle();
+    }) ?? (() => undefined);
   const renderDisposable: IDisposable = terminal.onRender(resumed);
   const bufferDisposable: IDisposable = terminal.buffer.onBufferChange((buffer) => {
     if (buffer.type === "normal" && !paused && !awaitingRender && followed !== null)
@@ -104,6 +137,7 @@ export function createTerminalFollowOutput(
       if (disposed) return;
       disposed = true;
       stopObserving();
+      stopObservingUser();
       renderDisposable.dispose();
       bufferDisposable.dispose();
       if (fallbackFrame !== null) cancelFrame(fallbackFrame);
@@ -115,6 +149,25 @@ export function createTerminalFollowOutput(
 function liveAtBottom(terminal: FollowedTerminal): boolean {
   const active = terminal.buffer.active;
   return active.viewportY >= active.baseY;
+}
+
+/**
+ * Reports a wheel over the terminal's mount, or a press on xterm's scroll bar (its 6.0 and its
+ * renamed 6.1 class), never typing or a press on the grid.
+ */
+export function observeTerminalUserScroll(mount: Element): (onScroll: () => void) => () => void {
+  return (onScroll) => {
+    const onPointerDown = (event: Event) => {
+      if (event.target instanceof Element && event.target.closest(".scrollbar, .xterm-scrollbar"))
+        onScroll();
+    };
+    mount.addEventListener("wheel", onScroll, { capture: true, passive: true });
+    mount.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      mount.removeEventListener("wheel", onScroll, { capture: true });
+      mount.removeEventListener("pointerdown", onPointerDown, true);
+    };
+  };
 }
 
 /** Observes xterm's screen element the way xterm decides to pause its renderer. */

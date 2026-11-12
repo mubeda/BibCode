@@ -42,7 +42,6 @@ function harness() {
         return terminal.rows;
       },
       resize: (cols, rows) => terminal.resize(cols, rows),
-      scrollLines: (amount) => scrollTo(terminal.buffer.normal.viewportY + amount),
       scrollToBottom: () => scrollTo(terminal.buffer.normal.baseY),
       onRender: (listener) => {
         const callback = () => listener({ start: 0, end: terminal.rows - 1 });

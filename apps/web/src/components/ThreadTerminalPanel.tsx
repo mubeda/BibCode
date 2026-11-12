@@ -89,7 +89,11 @@ import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/brows
 import { openFileInPreview } from "~/browser/openFileInPreview";
 import { canPreviewAnyUrlInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
-import { createTerminalFollowOutput, observeTerminalDrawing } from "./terminalFollowOutput";
+import {
+  createTerminalFollowOutput,
+  observeTerminalDrawing,
+  observeTerminalUserScroll,
+} from "./terminalFollowOutput";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
 import {
   proposeTerminalDimensions,
@@ -1484,6 +1488,7 @@ export function TerminalViewport({
     const followOutput = followScreen
       ? createTerminalFollowOutput(terminal, {
           observeDrawing: observeTerminalDrawing(followScreen),
+          observeUserScroll: observeTerminalUserScroll(mount),
         })
       : null;
     const followsOutput = () =>
