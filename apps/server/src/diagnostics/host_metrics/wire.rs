@@ -66,6 +66,9 @@ pub(crate) struct HostSampleWire {
     volume_listing_not_responding: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
+    /// The chart clock's time for this reading; older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chart_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     age_ms: Option<u64>,
 }
@@ -170,6 +173,7 @@ fn sample(reading: &HostReading) -> HostSampleWire {
         volumes_paused: reading.volumes_paused,
         volume_listing_not_responding: Some(reading.volume_listing_not_responding),
         sequence: Some(reading.sequence),
+        chart_at: Some(format_ms(reading.chart_ms)),
         age_ms: Some(u64::try_from(reading.taken_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
     }
 }
@@ -424,7 +428,7 @@ mod tests {
             .remove("statisticsSince")
             .expect("the fixture is the new shape");
         let sample = object["sample"].as_object_mut().expect("a sample");
-        for field in ["sequence", "ageMs", "volumeListingNotResponding"] {
+        for field in ["sequence", "chartAt", "ageMs", "volumeListingNotResponding"] {
             sample.remove(field).expect("the fixture is the new shape");
         }
 
@@ -495,6 +499,30 @@ mod tests {
         cancellation.cancel();
         task.await.expect("the subscriber loop ends");
         collector.shutdown().await;
+    }
+
+    /// #292: a sample says its chart time, which the recent points use, apart from its wall time.
+    #[test]
+    fn a_sample_carries_its_chart_time() {
+        let mut reading = HostReading {
+            sampled_at_ms: 1_700_000_000_000,
+            chart_ms: 1_700_000_005_000,
+            sequence: 1,
+            taken_at: tokio::time::Instant::now(),
+            volume_listing_not_responding: false,
+            cpu_percent: 1.5,
+            memory_total_bytes: 2,
+            memory_used_bytes: 1,
+            memory_available_bytes: 1,
+            volumes: Vec::new(),
+            volumes_paused: false,
+        };
+        let encoded = serde_json::to_value(sample(&reading)).expect("encodes");
+        assert_eq!(parse_ms(&encoded["chartAt"]), 1_700_000_005_000);
+        assert_eq!(parse_ms(&encoded["sampledAt"]), 1_700_000_000_000);
+        reading.chart_ms = reading.sampled_at_ms;
+        let encoded = serde_json::to_value(sample(&reading)).expect("encodes");
+        assert_eq!(encoded["chartAt"], encoded["sampledAt"]);
     }
 
     /// R85: a subscriber that stops reading while a minute bucket closes still holds that
