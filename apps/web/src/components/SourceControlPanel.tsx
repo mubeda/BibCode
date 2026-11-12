@@ -1,5 +1,6 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
+  type DefaultAgentSelection,
   GitSignInRequiredError,
   type GitActionProgressEvent,
   type GitManagerOperationEvent,
@@ -45,7 +46,15 @@ import {
   DialogPopup,
   DialogTitle,
 } from "~/components/ui/dialog";
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
+import {
+  Menu,
+  MenuGroup,
+  MenuGroupLabel,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuTrigger,
+} from "~/components/ui/menu";
 import { Spinner } from "~/components/ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { Textarea } from "~/components/ui/textarea";
@@ -132,7 +141,7 @@ import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperat
 import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
 import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
-import { CODE_REVIEW_SERVER_UPDATE_REASON } from "~/codeReview";
+import { CODE_REVIEW_SERVER_UPDATE_REASON, type CodeReviewMenuReviewer } from "~/codeReview";
 import {
   GitManagerCreatePullRequestDialog,
   type GitManagerCreatePullRequestDialogProps,
@@ -149,7 +158,10 @@ interface SourceControlPanelProps {
   codeReview?: {
     readonly unavailableReason: string | null;
     readonly guardLine: string | null;
-    readonly onStart: (scope: CodeReviewScope) => void;
+    /** `reviewer` is a one-off pick from the review menu; absent means the saved reviewer. */
+    readonly onStart: (scope: CodeReviewScope, reviewer?: DefaultAgentSelection) => void;
+    /** The reviewers the review menu offers for one review (R103). */
+    readonly reviewers?: ReadonlyArray<CodeReviewMenuReviewer>;
     /** The thread's project, whose review prompt the menu edits; `null` hides the menu. */
     readonly projectId: ProjectId | null;
     readonly projectPrompt: string;
@@ -387,6 +399,19 @@ export default function SourceControlPanel({
         unavailableReason: codeReviewUnavailableReason,
       }),
     [codeReviewScope, codeReviewUnavailableReason, status],
+  );
+  const codeReviewMenuReviewers = codeReview?.reviewers;
+  const codeReviewMenuItems = useMemo(
+    () =>
+      (codeReviewMenuReviewers ?? []).map((reviewer) => ({
+        reviewer,
+        state: resolveCodeReviewButtonState({
+          status,
+          scope: codeReviewScope,
+          unavailableReason: reviewer.disabledReason,
+        }),
+      })),
+    [codeReviewMenuReviewers, codeReviewScope, status],
   );
 
   // Legacy servers (no staging areas) keep the chat-header cascade
@@ -1160,7 +1185,7 @@ export default function SourceControlPanel({
           </TooltipPopup>
         </Tooltip>
       ) : null}
-      {codeReview?.projectId ? (
+      {codeReview && (codeReview.projectId || codeReviewMenuItems.length > 0) ? (
         <Menu>
           <MenuTrigger
             render={<Button aria-label="Review options" size="icon-xs" variant="ghost" />}
@@ -1168,13 +1193,42 @@ export default function SourceControlPanel({
             <ChevronDownIcon aria-hidden="true" className="size-3.5" />
           </MenuTrigger>
           <MenuPopup align="end">
-            <MenuItem
-              disabled={!codeReviewsSupported}
-              {...(codeReviewsSupported ? {} : { title: CODE_REVIEW_SERVER_UPDATE_REASON })}
-              onClick={() => setReviewPromptDialogOpen(true)}
-            >
-              Review prompt for this project…
-            </MenuItem>
+            {codeReviewMenuItems.length > 0 ? (
+              <MenuGroup>
+                <MenuGroupLabel>Review once with</MenuGroupLabel>
+                {codeReviewMenuItems.map(({ reviewer, state }) => (
+                  <MenuItem
+                    key={reviewer.value}
+                    disabled={state.disabled}
+                    onClick={() => {
+                      if (!state.disabled && codeReviewScope) {
+                        codeReview.onStart(codeReviewScope, reviewer.selection);
+                      }
+                    }}
+                  >
+                    <span className="flex flex-col">
+                      <span>{reviewer.label}</span>
+                      {/* A disabled reviewer says why in place of its guard line. */}
+                      <span className="text-xs text-muted-foreground">
+                        {state.reason ?? reviewer.guardLine}
+                      </span>
+                    </span>
+                  </MenuItem>
+                ))}
+              </MenuGroup>
+            ) : null}
+            {codeReview.projectId ? (
+              <>
+                {codeReviewMenuItems.length > 0 ? <MenuSeparator /> : null}
+                <MenuItem
+                  disabled={!codeReviewsSupported}
+                  {...(codeReviewsSupported ? {} : { title: CODE_REVIEW_SERVER_UPDATE_REASON })}
+                  onClick={() => setReviewPromptDialogOpen(true)}
+                >
+                  Review prompt for this project…
+                </MenuItem>
+              </>
+            ) : null}
           </MenuPopup>
         </Menu>
       ) : null}

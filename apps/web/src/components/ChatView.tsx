@@ -4,6 +4,7 @@ import {
   type AgentSessionOpenMode,
   type ApprovalRequestId,
   type CheckpointRevertMode,
+  type DefaultAgentSelection,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -349,6 +350,7 @@ import {
   CODE_REVIEW_DRAFT_REASON,
   CODE_REVIEW_SERVER_UPDATE_REASON,
   CODE_REVIEW_UNLISTED_REASON,
+  buildCodeReviewMenuReviewers,
   codeReviewGuardLine,
   resolveCodeReviewChatModes,
   resolveCodeReviewModelSelection,
@@ -4910,98 +4912,131 @@ function ChatViewContent(props: ChatViewProps) {
   const codeReviewPlatformOs = serverConfig?.environment.platform.os ?? null;
   const codeReviewsSupported = serverConfig?.environment.capabilities?.codeReviews === true;
   const hasCodeReviewLaunchContext = isServerThread && centerPanelLaunchContext !== null;
-  const codeReviewUnavailableReason = useMemo(() => {
-    if (!codeReviewsSupported) return CODE_REVIEW_SERVER_UPDATE_REASON;
-    if (workspaceUnavailable) return workspaceUnavailable;
-    // A draft has no panel host and no terminal launch context (D40).
-    if (!hasCodeReviewLaunchContext) return CODE_REVIEW_DRAFT_REASON;
-    if (savedCodeReviewer.reason !== null) return savedCodeReviewer.reason;
-    const reviewer = savedCodeReviewer.action;
-    if (reviewer.kind !== "terminal") return null;
-    const terminal = resolveProviderReviewTerminalAction(reviewer.entry, settings, {
-      prompt: "",
-      platformOs: codeReviewPlatformOs,
-      modelSelection: null,
-    });
-    return terminal === null ? CODE_REVIEW_UNLISTED_REASON : terminal.disabledReason;
-  }, [
-    codeReviewPlatformOs,
-    codeReviewsSupported,
-    hasCodeReviewLaunchContext,
-    savedCodeReviewer,
-    settings,
-    workspaceUnavailable,
-  ]);
+  // Reasons that hold for every reviewer on this thread and environment.
+  const codeReviewEnvironmentReason = !codeReviewsSupported
+    ? CODE_REVIEW_SERVER_UPDATE_REASON
+    : (workspaceUnavailable ??
+      // A draft has no panel host and no terminal launch context (D40).
+      (hasCodeReviewLaunchContext ? null : CODE_REVIEW_DRAFT_REASON));
+  // A resolved reviewer's own reason; a terminal also takes this environment's terminal reason.
+  const codeReviewerReason = useCallback(
+    (resolved: ReturnType<typeof resolveSavedCodeReviewer>): string | null => {
+      if (resolved.reason !== null) return resolved.reason;
+      const reviewer = resolved.action;
+      if (reviewer.kind !== "terminal") return null;
+      const terminal = resolveProviderReviewTerminalAction(reviewer.entry, settings, {
+        prompt: "",
+        platformOs: codeReviewPlatformOs,
+        modelSelection: null,
+      });
+      return terminal === null ? CODE_REVIEW_UNLISTED_REASON : terminal.disabledReason;
+    },
+    [codeReviewPlatformOs, settings],
+  );
+  const codeReviewUnavailableReason = useMemo(
+    () => codeReviewEnvironmentReason ?? codeReviewerReason(savedCodeReviewer),
+    [codeReviewEnvironmentReason, codeReviewerReason, savedCodeReviewer],
+  );
+  // The one-off reviewers of the review menu (R103), each with its own reason.
+  const codeReviewMenuReviewers = useMemo(
+    () =>
+      buildCodeReviewMenuReviewers(
+        codeReviewAgentActions,
+        (action) =>
+          codeReviewEnvironmentReason ??
+          codeReviewerReason(
+            resolveSavedCodeReviewer(
+              codeReviewAgentActions,
+              action.selection,
+              providerInstanceEntries,
+            ),
+          ),
+      ),
+    [
+      codeReviewAgentActions,
+      codeReviewEnvironmentReason,
+      codeReviewerReason,
+      providerInstanceEntries,
+    ],
+  );
   const codeReviewGuard = savedCodeReviewer.action
     ? codeReviewGuardLine({
         kind: savedCodeReviewer.action.kind,
         driver: savedCodeReviewer.action.entry.driverKind,
       })
     : null;
-  const handleStartCodeReview = useLatestHandler((scope: CodeReviewScope) => {
-    const reviewer = savedCodeReviewer.action;
-    if (codeReviewUnavailableReason !== null || reviewer === null) return;
-    if (!activeThread || !centerPanelLaunchContext) return;
-    const { entry } = reviewer;
-    const prompt = resolveCodeReviewPrompt({
-      project: activeProject?.codeReviewPrompt ?? "",
-      user: settings.codeReviewPrompt,
-      scope,
-    });
-    const modelSelection = resolveCodeReviewModelSelection(
-      settings.codeReviewModelSelection,
-      entry.instanceId,
-    );
-    if (reviewer.kind === "terminal") {
-      const action = resolveProviderReviewTerminalAction(entry, settings, {
-        prompt,
-        platformOs: codeReviewPlatformOs,
-        modelSelection,
+  // `selection` is a one-off reviewer from the menu; the saved reviewer stays as saved (R103).
+  const handleStartCodeReview = useLatestHandler(
+    (scope: CodeReviewScope, selection?: DefaultAgentSelection) => {
+      const resolved =
+        selection === undefined
+          ? savedCodeReviewer
+          : resolveSavedCodeReviewer(codeReviewAgentActions, selection, providerInstanceEntries);
+      const reviewer = resolved.action;
+      if (reviewer === null) return;
+      if ((codeReviewEnvironmentReason ?? codeReviewerReason(resolved)) !== null) return;
+      if (!activeThread || !centerPanelLaunchContext) return;
+      const { entry } = reviewer;
+      const prompt = resolveCodeReviewPrompt({
+        project: activeProject?.codeReviewPrompt ?? "",
+        user: settings.codeReviewPrompt,
+        scope,
       });
-      if (action === null || action.command === null) {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: CODE_REVIEW_SEND_FAILED_TITLE,
-            description: action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON,
-          }),
+      const modelSelection = resolveCodeReviewModelSelection(
+        settings.codeReviewModelSelection,
+        entry.instanceId,
+      );
+      if (reviewer.kind === "terminal") {
+        const action = resolveProviderReviewTerminalAction(entry, settings, {
+          prompt,
+          platformOs: codeReviewPlatformOs,
+          modelSelection,
+        });
+        if (action === null || action.command === null) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: CODE_REVIEW_SEND_FAILED_TITLE,
+              description: action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON,
+            }),
+          );
+          return;
+        }
+        // Terminal ids are distinct per open, so only this guard stops a double click (as chat
+        // reviews are guarded in centerPanelActions); it is released however the open settles.
+        const hostKey = `${activeThread.environmentId}:${activeThread.hostThreadId ?? activeThread.id}`;
+        if (pendingTerminalReviewHosts.has(hostKey)) return;
+        pendingTerminalReviewHosts.add(hostKey);
+        void handleOpenProviderTerminalPanel(action).finally(() =>
+          pendingTerminalReviewHosts.delete(hostKey),
         );
         return;
       }
-      // Terminal ids are distinct per open, so only this guard stops a double click (as chat
-      // reviews are guarded in centerPanelActions); it is released however the open settles.
-      const hostKey = `${activeThread.environmentId}:${activeThread.hostThreadId ?? activeThread.id}`;
-      if (pendingTerminalReviewHosts.has(hostKey)) return;
-      pendingTerminalReviewHosts.add(hostKey);
-      void handleOpenProviderTerminalPanel(action).finally(() =>
-        pendingTerminalReviewHosts.delete(hostKey),
-      );
-      return;
-    }
-    const resolution = resolveProviderSessionDefault({
-      driver: entry.driverKind,
-      instanceId: entry.instanceId,
-      models: entry.models,
-      configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
-      explicitSelection: modelSelection,
-    });
-    void centerPanelActions.createPromptedChatPanel({
-      // A panel cannot host a panel: a review from one is hosted by its host.
-      hostRef: scopeThreadRef(
-        activeThread.environmentId,
-        activeThread.hostThreadId ?? activeThread.id,
-      ),
-      projectId: activeThread.projectId,
-      worktreePath: centerPanelLaunchContext.worktreePath,
-      branch: activeThread.branch ?? null,
-      modelSelection: resolution.modelSelection,
-      providerLabel: entry.displayName,
-      label: `Code review · ${entry.displayName}`,
-      prompt,
-      ...resolveCodeReviewChatModes(entry.driverKind),
-      codeReview: true,
-    });
-  });
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+        explicitSelection: modelSelection,
+      });
+      void centerPanelActions.createPromptedChatPanel({
+        // A panel cannot host a panel: a review from one is hosted by its host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+        label: `Code review · ${entry.displayName}`,
+        prompt,
+        ...resolveCodeReviewChatModes(entry.driverKind),
+        codeReview: true,
+      });
+    },
+  );
   // The shortcut does what the button would do now, from the status the header already reads
   // for the same checkout (R102).
   const handleCodeReviewShortcut = useLatestHandler(() => {
@@ -5019,6 +5054,7 @@ function ChatViewContent(props: ChatViewProps) {
       unavailableReason: codeReviewUnavailableReason,
       guardLine: codeReviewGuard,
       onStart: handleStartCodeReview,
+      reviewers: codeReviewMenuReviewers,
       projectId: activeProject?.id ?? null,
       projectPrompt: activeProject?.codeReviewPrompt ?? "",
       userPrompt: settings.codeReviewPrompt,
@@ -5027,6 +5063,7 @@ function ChatViewContent(props: ChatViewProps) {
       activeProject?.codeReviewPrompt,
       activeProject?.id,
       codeReviewGuard,
+      codeReviewMenuReviewers,
       codeReviewUnavailableReason,
       handleStartCodeReview,
       settings.codeReviewPrompt,

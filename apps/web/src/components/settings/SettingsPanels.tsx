@@ -51,10 +51,10 @@ import {
   type ProviderAgentAction,
   resolveEffectiveProviderAgentAction,
 } from "../chat/providerAgentActions";
-import { CODE_REVIEW_DRIVERS_WITH_TERMINALS } from "../chat/providerTerminalActions";
 import {
   CODE_REVIEW_SERVER_UPDATE_REASON,
   codeReviewGuardLine,
+  codeReviewerActions,
   resolveSavedCodeReviewer,
 } from "../../codeReview";
 import { isDesktopHost } from "../../env";
@@ -1219,11 +1219,7 @@ function CodeReviewSettingsSection({
   const updateReviewSettings = (patch: Parameters<typeof updateSettings>[0]) => {
     if (supported) updateSettings(patch);
   };
-  // Terminals only for the CLIs whose read-only flags are verified (design note).
-  const reviewerActions = actions.filter(
-    (action) =>
-      action.kind === "chat" || CODE_REVIEW_DRIVERS_WITH_TERMINALS.has(action.entry.driverKind),
-  );
+  const reviewerActions = codeReviewerActions(actions);
   const saved = settings.codeReviewAgent;
   const savedValue = `${saved.kind}:${saved.instanceId}`;
   const savedReviewer = resolveSavedCodeReviewer(reviewerActions, saved, instanceEntries);

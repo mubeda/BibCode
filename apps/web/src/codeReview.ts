@@ -7,6 +7,7 @@ import {
 } from "@bibcode/contracts";
 
 import type { ProviderAgentAction } from "./components/chat/providerAgentActions";
+import { CODE_REVIEW_DRIVERS_WITH_TERMINALS } from "./components/chat/providerTerminalActions";
 import type { ProviderInstanceEntry } from "./providerInstances";
 import type { CodeReviewScope } from "./components/SourceControlPanel.logic";
 
@@ -102,6 +103,38 @@ export function resolveSavedCodeReviewer(
     return { action: null, reason: unavailableReviewerReason(label) };
   }
   return { action: null, reason: CODE_REVIEW_UNLISTED_REASON };
+}
+
+/** The reviewers Settings and the review menu offer: chats, and terminals only for the CLIs whose read-only flags are verified (design note). */
+export function codeReviewerActions(
+  actions: ReadonlyArray<ProviderAgentAction>,
+): ReadonlyArray<ProviderAgentAction> {
+  return actions.filter(
+    (action) =>
+      action.kind === "chat" || CODE_REVIEW_DRIVERS_WITH_TERMINALS.has(action.entry.driverKind),
+  );
+}
+
+/** A reviewer the Source Control review menu offers for one review (R103). */
+export interface CodeReviewMenuReviewer {
+  readonly value: string;
+  readonly label: string;
+  readonly selection: DefaultAgentSelection;
+  readonly guardLine: string;
+  readonly disabledReason: string | null;
+}
+
+export function buildCodeReviewMenuReviewers(
+  actions: ReadonlyArray<ProviderAgentAction>,
+  reasonFor: (action: ProviderAgentAction) => string | null,
+): ReadonlyArray<CodeReviewMenuReviewer> {
+  return codeReviewerActions(actions).map((action) => ({
+    value: action.value,
+    label: action.label,
+    selection: action.selection,
+    guardLine: codeReviewGuardLine({ kind: action.kind, driver: action.entry.driverKind }),
+    disabledReason: reasonFor(action),
+  }));
 }
 
 /** The stored review model applies only to its own instance (D49). */
