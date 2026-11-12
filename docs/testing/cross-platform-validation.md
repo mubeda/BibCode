@@ -812,6 +812,18 @@ beside it. A passing run writes `terminal-footer-<seed>-passed.json` with its
 steps, the settling checks that disagreed and cleared, and the renderers seen.
 An edge drag that the driver cannot perform is logged as skipped.
 
+The spec `apps/desktop/e2e/specs/terminal-hidden-follow.e2e.ts` (not in the
+default list; run it with `BIBCODE_E2E_SPEC=./specs/terminal-hidden-follow.e2e.ts`
+and `BIBCODE_E2E_FOOTER_LAYOUT=cli`) shares the fixture thread helpers in
+`e2e/support/fixture-terminal.ts`. It first shrinks the window while the Codex
+Terminal is drawn and requires the view to stay at the bottom, then moves the
+terminal's center surface off-screen (xterm pauses its renderer and the mount
+keeps its size), shrinks the window so the PTY's rows shrink, lets the fixture
+CLI stream for 3 s, and brings the surface back with no size change: xterm's
+slider must end at its track's end and, with the DOM renderer (the default;
+`BIBCODE_E2E_FOOTER_RENDERER=webgl` keeps WebGL and checks only the slider),
+the footer must be on the last row.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original
