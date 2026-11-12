@@ -485,6 +485,15 @@ each time, which can hang and repeats the space reads the disk loop already make
   none), so the fixture counts rose by one method, one stream method and two stream shapes.
   Numbers use `Schema.Finite`. The stream's subscriber loop lives in
   `diagnostics/host_metrics/wire.rs`; `production/server_terminal.rs` only registers it.
+- **Runtime.** D22 selected option (c) on the macOS figures, so the production runtime creates
+  the collector with the config's boot ID and its own start time, starts it in the background,
+  passes it to the terminal services with `with_host_metrics`, and stops it in
+  `quiesce_for_update` right after `process-monitor`, as the `host-metrics` step. Services built
+  without the builder (tests, embedded hosts) keep an idle collector over the native source,
+  which reads nothing until a stream opens.
+- **CI.** The `native_desktop` job runs the collector's unit tests, the exit test and the runtime
+  test on Windows and macOS; each command fails its step when its filter matches no test. Linux
+  runs them in the `test` job with every other server test.
 
 ## Open points from the build
 
@@ -539,7 +548,7 @@ each time, which can hang and repeats the space reads the disk loop already make
   items are encoded as on the wire. The figure is this process's CPU time during the run minus
   an idle runtime of the same length. The method and numbers go in the pull request. On the
   macOS development host a reading costs 6 to 7.5 ms of CPU (D22's table): 0.012% of one core
-  in the background and 0.66% at the live rate, and one live item is about 0.9 KB on the wire.
+  in the background and 0.66% at the live rate, and a live item without a chart is under 1 KB.
 
 ## Profiler, crash and trace coverage
 

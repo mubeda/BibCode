@@ -432,6 +432,50 @@ jobs:
         if: matrix.platform == 'mac'
         run: cargo test -p bibcode-server --lib -j 2 -- background_status_ git_stop_ index_lock_cleanup_
 
+      # #292: the host collector, its exit with a disk read held, and its runtime start and
+      # quiesce. Each command fails the step when its filter matches no test.
+      - name: Run host metrics tests (Windows)
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          counted() {
+            local expected="$1"; shift
+            local log; log="$(mktemp)"
+            "$@" 2>&1 | tee "$log"
+            local passed
+            passed="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" | awk '{ total += $1 } END { print total + 0 }')"
+            if [ "$expected" = exactly-one ] && [ "$passed" -ne 1 ]; then
+              echo "::error::expected exactly 1 passed test, got $passed"; exit 1
+            fi
+            if [ "$passed" -lt 1 ]; then
+              echo "::error::the filter matched no test"; exit 1
+            fi
+          }
+          counted at-least-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- host_metrics::
+          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
+          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
+
+      - name: Run host metrics tests (macOS)
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          counted() {
+            local expected="$1"; shift
+            local log; log="$(mktemp)"
+            "$@" 2>&1 | tee "$log"
+            local passed
+            passed="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" | awk '{ total += $1 } END { print total + 0 }')"
+            if [ "$expected" = exactly-one ] && [ "$passed" -ne 1 ]; then
+              echo "::error::expected exactly 1 passed test, got $passed"; exit 1
+            fi
+            if [ "$passed" -lt 1 ]; then
+              echo "::error::the filter matched no test"; exit 1
+            fi
+          }
+          counted at-least-one cargo test -p bibcode-server --lib -j 2 -- host_metrics::
+          counted exactly-one cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
+          counted exactly-one cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
+
       # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
       # keeps ~/.cargo/bin, so a restored runner skips the compile.
       - name: Install dump_syms

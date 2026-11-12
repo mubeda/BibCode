@@ -3411,6 +3411,24 @@ durations at `debug`, and a sample that takes 500 ms or more logs them at `warn`
 (`slow process diagnostics sample`): process enumeration, which includes waiting
 for the blocking pool, the desktop UI observer, and attribution.
 
+The host collector (`diagnostics/host_metrics`, #292) is the one diagnostics
+reader that samples while nobody watches: the production runtime starts it with
+the server, and it reads the host's CPU and memory every 60 seconds, and volume
+space every fifth reading, so the Host dashboard can show statistics since the
+server started. It never walks the process table. While at least one
+`server.subscribeHostMetrics` stream is open it reads once a second, shared by
+every subscriber through one watch channel, and it drops back to 60 seconds
+when the last stream closes. Volume lists and space reads run on four dedicated
+`host-disk-<n>` threads, never on the Tokio blocking pool; a read that runs
+past 2 seconds shows its volume as not responding, and when all four threads
+are held, disk reads pause and CPU and memory keep their pace. Statistics and
+chart tiers live in memory, in a size that does not grow with uptime. The
+stream needs `orchestration:read`, sends a snapshot and then one sample per
+live reading, and builds each item only when its subscriber's queue has room.
+Runtime quiesce stops the collector right after the process monitor
+(`host-metrics`), before the Profiler's teardown; it never joins a disk thread,
+so a hung mount cannot delay exit.
+
 On Linux the server and the desktop host allocate through glibc malloc, which
 keeps freed memory in the per-thread arena that served it and returns only the
 free space at the top of a heap. A large transient allocation, such as a

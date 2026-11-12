@@ -24,8 +24,10 @@ use crate::{
     crypto::sha256_hex,
     diagnostic_bundle::{DiagnosticBundleIdentity, DiagnosticBundleService},
     diagnostics::{
-        DesktopUiProcessObserver, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionRegistry, TraceDiagnosticsStore, bound_diagnostic_string,
+        DesktopUiProcessObserver, DiagnosticsMonitor, HostMetricsCollector, HostMetricsIdentity,
+        HostMetricsRates, NativeProcessSampler, NativeResourceSampler, ProcessAttributionRegistry,
+        TraceDiagnosticsStore, bound_diagnostic_string,
+        host_metrics::NativeHostMetricsSource,
         profiler::{
             crash::MonitorDetector,
             latency::LatencyDetector,
@@ -150,6 +152,8 @@ pub struct ProductionRuntime {
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
+    /// The host collector behind the Host dashboard (#292): always on from the start (D22).
+    host_metrics: Arc<HostMetricsCollector>,
     profiler: Arc<ProfilerRuntime>,
     /// Whether an earlier quiesce stopped the services; later calls only settle the Git writes.
     services_stopped: tokio::sync::Mutex<bool>,
@@ -617,6 +621,15 @@ impl ProductionRuntime {
             resource_sampler.clone(),
             Duration::from_secs(2),
         ));
+        let host_metrics = Arc::new(HostMetricsCollector::new(
+            Arc::new(NativeHostMetricsSource::new()),
+            HostMetricsRates::default(),
+            HostMetricsIdentity {
+                boot_id: config.boot_id.map(|id| id.to_string()),
+                started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+            },
+        ));
+        host_metrics.start_background();
         let provider_usage =
             ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
         let relay = relay_client_service(config.state_dir());
@@ -643,7 +656,8 @@ impl ProductionRuntime {
         )
         .with_workspace_admission(workspace_availability.clone(), repositories.clone())
         .with_profiler(&profiler)
-        .with_environment_id(&config.environment_id);
+        .with_environment_id(&config.environment_id)
+        .with_host_metrics(host_metrics.clone());
         terminal_services.watch_workspace_changes(orchestration.subscribe_events());
         let worktree_runtime = WorktreeRuntime::start(
             orchestration.clone(),
@@ -837,6 +851,7 @@ impl ProductionRuntime {
             workspace,
             _resource_sampler: resource_sampler,
             process_monitor,
+            host_metrics,
             profiler,
             services_stopped: tokio::sync::Mutex::new(false),
         })
@@ -1000,6 +1015,9 @@ impl ProductionRuntime {
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
+        // Never waits for a disk read: the disk threads are not joined (D32).
+        self.host_metrics.shutdown().await;
+        steps.mark("host-metrics");
         // Waits for a running tool update, which must not be killed mid-replacement, and
         // before the profiler's teardown.
         self.server_control.shutdown_tool_updates().await;
@@ -2960,6 +2978,55 @@ mod tests {
             .expect("thread moved");
         readmission_after(&terminal, created).await;
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn host_metrics_start_with_the_runtime_and_stop_in_quiesce() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+
+        // Always on (D22, option c): a first background reading without any stream.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.host_metrics.snapshot().await.current.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collector took no reading within 2 s of the runtime start"
+            );
+        }
+        assert_eq!(runtime.host_metrics.live_subscribers(), 0);
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        let mut subscription = runtime.host_metrics.subscribe();
+        let changed = timeout(
+            std::time::Duration::from_secs(2),
+            subscription.receiver().changed(),
+        )
+        .await
+        .expect("a stopped collector answers at once");
+        assert!(
+            changed.is_err(),
+            "the collector still publishes after quiesce"
+        );
+        assert!(subscription.receiver().borrow().is_none());
     }
 
     #[tokio::test]
