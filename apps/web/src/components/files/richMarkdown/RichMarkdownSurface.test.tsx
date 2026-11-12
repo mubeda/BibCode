@@ -26,6 +26,19 @@ vi.mock("./markdownReconcile", async (importOriginal) => {
   };
 });
 
+// The image's loading is RichMarkdownImage's own test; here, where the surface draws it.
+vi.mock("./RichMarkdownImage", () => ({
+  RichMarkdownImage: (props: { src: string; alt: string; workspace: { markdownPath: string } }) => (
+    <span
+      data-image-stub={props.src}
+      data-image-alt={props.alt}
+      data-image-file={props.workspace.markdownPath}
+    />
+  ),
+}));
+
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
+
 import { FileEditingSession } from "../fileEditingSession";
 import { FileEditingSessionRegistry } from "../fileEditingSessionRegistry";
 import type { RichMarkdownEditor } from "./richMarkdownExtensions";
@@ -33,6 +46,13 @@ import RichMarkdownSurface from "./RichMarkdownSurface";
 
 let container: HTMLDivElement;
 let root: Root;
+
+const workspace = {
+  environmentId: EnvironmentId.make("environment-1"),
+  threadId: ThreadId.make("thread-1"),
+  cwd: "/repo",
+  markdownPath: "notes.md",
+};
 
 function createSession(contents: string, relativePath = "notes.md") {
   const persist = vi.fn(async (path: string, saved: string) =>
@@ -55,7 +75,12 @@ async function mount(session: FileEditingSession<never>, contents: string) {
   const onEditorChange = vi.fn<(editor: RichMarkdownEditor | null, opened: string) => void>();
   await act(async () => {
     root.render(
-      <RichMarkdownSurface session={session} contents={contents} onEditorChange={onEditorChange} />,
+      <RichMarkdownSurface
+        session={session}
+        contents={contents}
+        onEditorChange={onEditorChange}
+        workspace={workspace}
+      />,
     );
   });
   const element = container.querySelector(".ProseMirror") as
@@ -106,6 +131,21 @@ describe("RichMarkdownSurface", () => {
 
     expect(session.unsavedContents).toBe("Hello world again\n");
     expect(session.getSnapshot().save.phase).toBe("pending");
+  });
+
+  it("draws each image inside the editor for the file's workspace and keeps its source", async () => {
+    const original = "See ![A pixel](images/pic.png) here.\n";
+    const { session } = createSession(original);
+    await mount(session, original);
+    await act(async () => {});
+
+    const stub = container.querySelector(".ProseMirror [data-image-stub]");
+    expect(stub?.getAttribute("data-image-stub")).toBe("images/pic.png");
+    expect(stub?.getAttribute("data-image-alt")).toBe("A pixel");
+    expect(stub?.getAttribute("data-image-file")).toBe("notes.md");
+    expect(container.querySelector("img")).toBeNull();
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(session.changeFromRichEditor).not.toHaveBeenCalled();
   });
 
   it("opening a file does not mark it changed", async () => {
@@ -343,7 +383,12 @@ describe("RichMarkdownSurface", () => {
     await act(async () => {
       root.render(
         <Owner>
-          <RichMarkdownSurface session={session} contents={"Hello\n"} onEditorChange={vi.fn()} />
+          <RichMarkdownSurface
+            session={session}
+            contents={"Hello\n"}
+            onEditorChange={vi.fn()}
+            workspace={workspace}
+          />
         </Owner>,
       );
     });

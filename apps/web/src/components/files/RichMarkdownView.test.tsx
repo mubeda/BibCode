@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -51,6 +52,12 @@ describe("RichMarkdownView", () => {
           session={session}
           contents="# Title\n"
           onEditorChange={vi.fn()}
+          workspace={{
+            environmentId: EnvironmentId.make("environment-1"),
+            threadId: ThreadId.make("thread-1"),
+            cwd: "/repo",
+            markdownPath: "notes.md",
+          }}
           fallback={<div data-fallback />}
         />,
       );

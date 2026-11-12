@@ -13,15 +13,28 @@ import * as corpus from "./fixtures/corpus";
 import { canReconcile, reconcileMarkdown } from "./markdownReconcile";
 import { findUnsupportedConstruct, splitFrontmatter } from "./markdownSupport";
 import { fencedCode } from "./mermaidDiagramExtension";
-import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
+import {
+  createRichMarkdownEditor,
+  type RichMarkdownEditor,
+  type RichMarkdownImageView,
+} from "./richMarkdownExtensions";
 
 const editors: RichMarkdownEditor[] = [];
 const processor = unified().use(remarkParse).use(remarkGfm);
 
-function open(body: string, onUpdate = vi.fn()) {
+function open(
+  body: string,
+  onUpdate = vi.fn(),
+  onImageViewsChange?: (views: readonly RichMarkdownImageView[]) => void,
+) {
   const element = document.createElement("div");
   document.body.append(element);
-  const editor = createRichMarkdownEditor({ body, element, onUpdate });
+  const editor = createRichMarkdownEditor({
+    body,
+    element,
+    onUpdate,
+    ...(onImageViewsChange ? { onImageViewsChange } : {}),
+  });
   editors.push(editor);
   const tiptap = (element.querySelector(".ProseMirror") as HTMLElement & { editor: Editor }).editor;
   return { editor, element, tiptap, onUpdate };
@@ -259,6 +272,42 @@ describe("createRichMarkdownEditor", () => {
       expect(decodeURIComponent(resolved.pathname), name).toBe(`/docs/img/${name}`);
       expect(`${resolved.search}${resolved.hash}`, name).toBe("");
     }
+  });
+
+  it("never draws a file's relative image src against the page, and keeps it in the file", async () => {
+    const onImageViewsChange = vi.fn<(views: readonly RichMarkdownImageView[]) => void>();
+    const body = "See ![A pixel](images/pic.png) here.\n";
+    const { editor, element } = open(body, vi.fn(), onImageViewsChange);
+    await Promise.resolve();
+
+    // The page would resolve it against its own address (#345); the surface loads it instead.
+    expect(element.querySelector('img[src="images/pic.png"]')).toBeNull();
+    const views = onImageViewsChange.mock.lastCall?.[0] ?? [];
+    expect(views.map(({ src, alt }) => ({ src, alt }))).toEqual([
+      { src: "images/pic.png", alt: "A pixel" },
+    ]);
+    expect(element.contains(views[0]!.element)).toBe(true);
+    expect(editor.serialize()).toBe("See ![A pixel](images/pic.png) here.");
+    expect(canReconcile({ original: body, before: editor.serialize() })).toBe(true);
+  });
+
+  it("an inserted image gets a view at once and is still selected and deleted whole", async () => {
+    const onImageViewsChange = vi.fn<(views: readonly RichMarkdownImageView[]) => void>();
+    const { editor, tiptap } = open("Text\n", vi.fn(), onImageViewsChange);
+    editor.insertImage("my image.png");
+    await Promise.resolve();
+    expect(onImageViewsChange.mock.lastCall?.[0].map((view) => view.src)).toEqual([
+      "my%20image.png",
+    ]);
+
+    let position = -1;
+    tiptap.state.doc.descendants((node, pos) => {
+      if (node.type.name === "image") position = pos;
+    });
+    tiptap.chain().setNodeSelection(position).deleteSelection().run();
+    await Promise.resolve();
+    expect(editor.serialize()).toBe("Text");
+    expect(onImageViewsChange.mock.lastCall?.[0]).toEqual([]);
   });
 
   it("reports and performs undo and redo", () => {

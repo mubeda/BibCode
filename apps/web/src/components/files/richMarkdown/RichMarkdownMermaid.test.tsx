@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 // DOMPurify, which every drawn diagram goes through, does not run under happy-dom.
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import type { Editor } from "@tiptap/core";
 import { AsyncResult } from "effect/reactivity";
 import { act } from "react";
@@ -64,7 +65,17 @@ async function mount(session: FileEditingSession<never>, contents: string) {
   const onEditorChange = vi.fn<(editor: RichMarkdownEditor | null, opened: string) => void>();
   await act(async () => {
     root.render(
-      <RichMarkdownSurface session={session} contents={contents} onEditorChange={onEditorChange} />,
+      <RichMarkdownSurface
+        session={session}
+        contents={contents}
+        onEditorChange={onEditorChange}
+        workspace={{
+          environmentId: EnvironmentId.make("environment-1"),
+          threadId: ThreadId.make("thread-1"),
+          cwd: "/repo",
+          markdownPath: "notes.md",
+        }}
+      />,
     );
   });
   const element = container.querySelector(".ProseMirror") as HTMLElement & { editor: Editor };
