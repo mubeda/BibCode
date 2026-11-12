@@ -415,7 +415,8 @@ fn coalesce_pending_resizes(
 /// whether the PTY refused the last one: the manager has already recorded and published that
 /// size, so the next request for it must reach the PTY again instead of being a no-op. A
 /// refused size is retried after each of `retry_delays` unless a newer request replaces it;
-/// when they run out, `exhausted` gets the size the PTY still has (#348).
+/// when they run out, `exhausted` gets the size the PTY still has, from `read_size` (#348).
+#[allow(clippy::too_many_arguments)]
 fn run_resize_worker<E: fmt::Display>(
     pid: u32,
     initial: PtySize,
@@ -423,9 +424,11 @@ fn run_resize_worker<E: fmt::Display>(
     failed: &AtomicBool,
     retry_delays: &[Duration],
     mut resize: impl FnMut(PtySize) -> Result<(), E>,
+    mut read_size: impl FnMut() -> Option<PtySize>,
     mut exhausted: impl FnMut(ExhaustedResize),
 ) {
-    // Tracked rather than read back, so ConPTY and Unix agree on what the PTY holds.
+    // The last size the PTY accepted, for when its size cannot be read back. A Unix child can
+    // set its own size (`stty`), so the size read back is the one reported.
     let mut accepted = initial;
     let mut received = 0;
     let mut refused: Option<PtySize> = None;
@@ -472,13 +475,14 @@ fn run_resize_worker<E: fmt::Display>(
                     refused = Some(size);
                     continue;
                 }
+                let kept = read_size().unwrap_or(accepted);
                 tracing::warn!(
                     %error,
                     pid,
                     cols = size.cols,
                     rows = size.rows,
-                    kept_cols = accepted.cols,
-                    kept_rows = accepted.rows,
+                    kept_cols = kept.cols,
+                    kept_rows = kept.rows,
                     "PTY refused a size on every retry; publishing the size it kept"
                 );
                 refused = None;
@@ -487,8 +491,8 @@ fn run_resize_worker<E: fmt::Display>(
                 failed.store(false, Ordering::Release);
                 exhausted(ExhaustedResize {
                     requests: received,
-                    cols: accepted.cols,
-                    rows: accepted.rows,
+                    cols: kept.cols,
+                    rows: kept.rows,
                 });
             }
         }
@@ -624,6 +628,7 @@ impl PortablePtyBackend {
                     &worker_resize_failed,
                     &RESIZE_RETRY_DELAYS,
                     |size| pair.master.resize(size),
+                    || pair.master.get_size().ok(),
                     |report| {
                         worker_resize_exhausted.send_replace(Some(report));
                     },
@@ -3397,6 +3402,7 @@ mod tests {
                         attempted.send((held.cols, held.rows)).unwrap();
                         result
                     },
+                    || pair.master.get_size().ok(),
                     |report| reported.send(report).unwrap(),
                 );
             })
@@ -3468,6 +3474,47 @@ mod tests {
         assert!(!pty.failed.load(Ordering::Acquire));
         drop(pty.requests);
         pty.worker.join().unwrap();
+    }
+
+    /// A child can set its own size (`stty`): the size reported when a refused size runs out
+    /// of retries is the one read back from the PTY, not the last one the worker sent (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_size_refused_on_every_retry_reports_the_size_read_back_from_the_pty() {
+        let initial = pty_size(80, 30);
+        let pair = native_pty_system().openpty(initial).unwrap();
+        let (requests, worker_requests) = mpsc::channel();
+        let (reported, exhausted) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_resize_worker(
+                7,
+                initial,
+                &worker_requests,
+                &AtomicBool::new(false),
+                &QUICK_RETRIES,
+                |_| {
+                    // The child resizes its terminal itself; the master sees that size.
+                    pair.master.resize(pty_size(90, 25)).unwrap();
+                    Err("injected refusal")
+                },
+                || pair.master.get_size().ok(),
+                |report| reported.send(report).unwrap(),
+            );
+        });
+        requests.send(pty_size(80, 20)).unwrap();
+        let report = exhausted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker gives up");
+        assert_eq!(
+            report,
+            ExhaustedResize {
+                requests: 1,
+                cols: 90,
+                rows: 25,
+            }
+        );
+        drop(requests);
+        worker.join().unwrap();
     }
 
     /// A newer size replaces a refused one waiting for its retry.
