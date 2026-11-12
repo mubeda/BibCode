@@ -43,7 +43,10 @@ so any desktop that produces `hintfull` exercises it.
 Check WebKitGTK, Tauri/AppImage, FUSE, graphics, and display dependencies
 against current CI and release workflows. Use Xvfb for packaged E2E when the
 host has no suitable interactive display. Do not install system packages
-without permission.
+without permission. A bare container also needs the host libraries the
+AppImage does not carry, listed in
+[System libraries](../user/linux-desktop.md#system-libraries); a bare Ubuntu
+24.04 container lacks them with or without the bundled GStreamer plugins.
 
 Linux AppImages bundle WebKitGTK from their build host. Isolate XDG config,
 cache, and data roots when running locally built AppImages on a newer
@@ -143,8 +146,10 @@ changes (no owner, another path, several lines, several packages, a source
 package outside core, base and good), escaping of glob characters in the
 ownership lookup, a bundled plugin folder that differs from the allowlist,
 Wayland library removal after the upstream plugin re-runs linuxdeploy, the
-required plugin scanner, and discovery passthrough. It runs on Linux and macOS
-and is skipped on Windows.
+required plugin scanner, the AppRun hook rewrite (sourced with the AppImage's
+own, no, and another AppImage's `APPDIR`, every exported path stays in its own
+AppDir; a drifted upstream hook fails the build unrewritten), and discovery
+passthrough. It runs on Linux and macOS and is skipped on Windows.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
@@ -430,7 +435,8 @@ files that `bash scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins`
 prints and nothing else, beside the scanner at
 `usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner` and
 `apprun-hooks/linuxdeploy-plugin-gstreamer.sh`. The Desktop UI smoke workflow
-checks these files.
+checks these files. That hook must contain no `APPDIR`: its paths start with
+`${bibcode_gstreamer_appdir}`, which it sets from its own location.
 
 Record the backend actually used by the packaged BiBCode window, alongside the
 desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any
