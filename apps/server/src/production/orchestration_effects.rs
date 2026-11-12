@@ -1520,7 +1520,7 @@ pub(crate) async fn ensure_first_turn_baseline(
 }
 
 /// How long cancelled baseline steps may take to stop their Git children and clean up.
-const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
 /// How long a capture waits to remove its temporary index; past this, the removal is left to
 /// finish on its own (a stalled network filesystem) and logged, so no capture waits on it.
 const TEMPORARY_INDEX_REMOVAL_LIMIT: Duration = Duration::from_secs(5);

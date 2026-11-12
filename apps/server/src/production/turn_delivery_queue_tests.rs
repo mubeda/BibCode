@@ -1657,6 +1657,12 @@ impl HeldRefZeroUpdate {
 
 /// Long enough for the capture's Git steps before `update-ref` under load, then given up.
 const LIVE_WRITER_LIMIT: Duration = Duration::from_secs(15);
+/// How long a test waits for the turn once the update is held. The held pause ignores
+/// cancellation, as a stalled spawn does, so the baseline gives up only after the limit and then
+/// the whole grace for cancelled steps; the margin covers a loaded runner.
+const LIVE_WRITER_WAIT: Duration = LIVE_WRITER_LIMIT
+    .saturating_add(crate::production::orchestration_effects::CANCELLED_BASELINE_GRACE)
+    .saturating_add(Duration::from_secs(30));
 
 /// A ref 0 update still running at the limit is stopped before the turn is claimed: released
 /// afterwards, it never writes ref 0.
@@ -1679,7 +1685,7 @@ async fn a_live_ref_zero_writer_is_stopped_before_the_claim() {
     held.wait_entered().await;
     quiet(&mut routes).await;
     assert_eq!(
-        timeout(LIVE_WRITER_LIMIT + Duration::from_secs(10), routes.recv())
+        timeout(LIVE_WRITER_WAIT, routes.recv())
             .await
             .expect("the turn goes after the limit")
             .as_deref(),
@@ -1715,7 +1721,7 @@ async fn a_late_ref_zero_write_after_the_claim_publishes_the_pre_turn_checkout()
     held.wait_entered().await;
     let commit = held.commit();
     assert_eq!(
-        timeout(LIVE_WRITER_LIMIT + Duration::from_secs(10), routes.recv())
+        timeout(LIVE_WRITER_WAIT, routes.recv())
             .await
             .expect("the turn goes after the limit")
             .as_deref(),
