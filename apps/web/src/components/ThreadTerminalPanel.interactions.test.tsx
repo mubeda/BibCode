@@ -8611,6 +8611,99 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(view(host)).toMatchObject({ grid: "100x30", scale: 1, clipped: false });
   });
 
+  /** xterm's focus target, attached so `document.activeElement` shows where keys go. */
+  const focusableXterm = (machine: Machine) => {
+    const terminal = xtermOf(machine);
+    terminal.element!.append(terminal.textarea);
+    terminal.focus.mockImplementation(() => terminal.textarea.focus());
+    return terminal;
+  };
+
+  /**
+   * A browser click. jsdom skips mousedown's default action, which moves focus to the
+   * target's nearest focusable ancestor, or away from everything when it has none.
+   */
+  const browserClick = async (target: HTMLElement, init: MouseEventInit = {}) => {
+    await act(async () => {
+      const options = { ...init, button: 0, bubbles: true, cancelable: true };
+      target.dispatchEvent(new PointerEvent("pointerdown", options));
+      const mousedown = new MouseEvent("mousedown", options);
+      target.dispatchEvent(mousedown);
+      if (!mousedown.defaultPrevented) {
+        const focusable = target.closest<HTMLElement>("button, input, textarea, [tabindex]");
+        if (focusable) focusable.focus();
+        else (document.activeElement as HTMLElement | null)?.blur();
+      }
+      target.dispatchEvent(new MouseEvent("click", options));
+    });
+    await server.deliver();
+  };
+
+  const fitButton = (machine: Machine) =>
+    Array.from(machine.mounted.container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Fit to this window",
+    );
+
+  const typedReachesProgram = async (terminal: FakeTerminalInstance) => {
+    const before = testState.writeCommand.mock.calls.length;
+    await act(async () => terminal.dataHandler!("x"));
+    await flushAnimationFrames();
+    return testState.writeCommand.mock.calls
+      .slice(before)
+      .map(([request]) => (request as { input: { data: string } }).input.data)
+      .join("");
+  };
+
+  it.each([
+    ["a click", {}],
+    ["a Shift-click", { shiftKey: true }],
+  ] as const)(
+    "leaves the scaled mirror focused after %s takes the size, so the next key reaches the program",
+    async (_click, init) => {
+      const { client } = await serverHostOwnsTallerGrid();
+      const terminal = focusableXterm(client);
+      const mount = client.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      expect(terminal.element!.style.pointerEvents).toBe("none");
+      await browserClick(mount, init);
+      expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+      expect(document.activeElement).toBe(terminal.textarea);
+      expect(await typedReachesProgram(terminal)).toBe("x");
+    },
+  );
+
+  it("leaves the terminal focused after Fit to this window takes the size", async () => {
+    const { client } = await serverHostOwnsTallerGrid();
+    const terminal = focusableXterm(client);
+    await browserClick(fitButton(client)!);
+    expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+    expect(document.activeElement).toBe(terminal.textarea);
+    expect(await typedReachesProgram(terminal)).toBe("x");
+  });
+
+  it("keeps focus on Fit to this window when no claim is sent", async () => {
+    const { client } = await serverHostOwnsTallerGrid();
+    const terminal = focusableXterm(client);
+    testState.resizeCommand.mockImplementation(async () =>
+      AsyncResult.success({
+        outcome: "claimNotRegistered",
+        size: server.size(),
+        generation: null,
+        sequence: null,
+      } satisfies TerminalResizeResult),
+    );
+    // The server declines the first claim, so the same geometry is not sent again.
+    await browserClick(fitButton(client)!);
+    expect(view(client)).toMatchObject({ scale: 0.6, notice: true });
+    const requests = testState.resizeCommand.mock.calls.length;
+    const fit = fitButton(client)!;
+    await browserClick(fit);
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    expect(document.activeElement).toBe(fit);
+    expect(document.activeElement).not.toBe(terminal.textarea);
+  });
+
   // Real-pair case 5 on builds before the authoritative protocol: after the client took the
   // size and the host took it back by a keypress, a click on the client did not take it back.
   it.each([
