@@ -2297,9 +2297,15 @@ function ChatViewContent(props: ChatViewProps) {
         variant: "warning",
         icon: <TriangleAlertIcon />,
         title: unavailableProviderReason,
+        // An agent that is enabled but not usable (not installed, not signed in) needs its setup
+        // checked, not enabling.
         description: unavailableProviderOnPrimary
-          ? "This chat stays on it. Enable it in Settings → Providers, or add a chat with another agent from the + menu."
-          : "This chat stays on it. Enable it on this chat's server, or add a chat with another agent from the + menu.",
+          ? boundProviderEntry?.enabled === true
+            ? "This chat stays on it. Check its install and sign-in in Settings → Providers, or add a chat with another agent from the + menu."
+            : "This chat stays on it. Enable it in Settings → Providers, or add a chat with another agent from the + menu."
+          : boundProviderEntry?.enabled === true
+            ? "This chat stays on it. Check its install and sign-in on this chat's server, or add a chat with another agent from the + menu."
+            : "This chat stays on it. Enable it on this chat's server, or add a chat with another agent from the + menu.",
         ...(unavailableProviderOnPrimary
           ? {
               actions: (

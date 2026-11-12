@@ -8740,6 +8740,9 @@ describe("ChatView composer model picker provider scope (#347)", () => {
     const container = await mount(serverRoute);
 
     expect(container.textContent).toMatch(/is not available/);
+    // It is enabled, so the banner asks for its setup to be checked, not for enabling it.
+    expect(container.textContent).toContain("Check its install and sign-in");
+    expect(container.textContent).not.toContain("Enable it in Settings");
     const send = sendButton(container);
     expect(send?.getAttribute("aria-label")).toMatch(/^Send unavailable\. .*is not available/);
     const form = container.querySelector("form");

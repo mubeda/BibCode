@@ -2907,10 +2907,13 @@ export function TerminalViewport({
         data-terminal-xterm-mount={terminalId}
       />
       {shouldRender && sizeOwnership && mirroringSize !== null ? (
-        <div className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
+        <div
+          role="status"
+          className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
+        >
           <span>
             Sized for another window.
-            {mirroringSize < 1 ? ` Shown at ${Math.round(mirroringSize * 100)}%.` : ""}
+            {mirroringSize < 1 ? ` Shown at ${Math.floor(mirroringSize * 100)}%.` : ""}
           </span>
           <Button
             type="button"
