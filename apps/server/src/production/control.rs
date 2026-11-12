@@ -734,6 +734,28 @@ impl NativeServerControl {
                 *current = next_mcp_server;
                 true
             });
+            // An instance this build cannot run is known without a probe: publish it first, so
+            // no client sees it in settings with no snapshot, as if still being probed (#347).
+            let unsupported = {
+                let current = commit_control.providers.read().await;
+                provider_inventory::unsupported_instances(&next)
+                    .into_iter()
+                    .filter(|result| {
+                        !current.iter().any(|row| {
+                            row.get("instanceId") == result.snapshot.get("instanceId")
+                                && row.get("availability") == Some(&json!("unavailable"))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if !unsupported.is_empty() {
+                let (providers, changed) = commit_control
+                    .merge_provider_snapshots(unsupported, true)
+                    .await;
+                if changed {
+                    commit_control.publish_provider_snapshots(&providers);
+                }
+            }
             commit_control.publish(json!({
                 "version": 1,
                 "type": "settingsUpdated",
@@ -4461,6 +4483,65 @@ mod tests {
     #[tokio::test]
     async fn stale_manual_provider_refresh_is_replaced_after_settings_rpc_disconnect() {
         assert_stale_manual_refresh_is_replaced_by_settings(true).await;
+    }
+
+    /// #347: a chat on an instance whose driver this server does not ship must be explained as
+    /// unavailable, not left looking like an instance still being probed. Its snapshot is
+    /// published before the settings that add it, so no client ever sees it missing.
+    #[tokio::test]
+    async fn an_unsupported_driver_is_published_unavailable_before_the_settings_that_add_it() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let mut events = control.config_events.subscribe();
+        let quick_pause = control.install_next_quick_provider_probe_pause().await;
+        let update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({
+                        "patch": {
+                            "providerInstances": {
+                                "fork_agent": { "driver": "forkAgent", "enabled": true }
+                            }
+                        }
+                    }))
+                    .await
+            })
+        };
+        // The quick probe has not run yet.
+        quick_pause.wait_until_entered().await;
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        let settings_at = published
+            .iter()
+            .position(|event| event["type"] == "settingsUpdated")
+            .expect("settings published");
+        let unavailable = published[..settings_at]
+            .iter()
+            .filter(|event| event["type"] == "providerStatuses")
+            .filter_map(|event| event["payload"]["providers"].as_array())
+            .flatten()
+            .find(|provider| provider["instanceId"] == "fork_agent")
+            .unwrap_or_else(|| panic!("no snapshot before the settings: {published:?}"));
+        assert_eq!(unavailable["availability"], "unavailable", "{unavailable}");
+        assert_eq!(unavailable["enabled"], false, "{unavailable}");
+        assert_eq!(unavailable["installed"], false, "{unavailable}");
+        assert!(
+            unavailable["unavailableReason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{unavailable}"
+        );
+        quick_pause.release();
+        update
+            .await
+            .expect("settings update joins")
+            .expect("settings update");
+        let providers = control.providers.read().await.clone();
+        let after = providers
+            .iter()
+            .find(|provider| provider["instanceId"] == "fork_agent")
+            .expect("still listed after the probe");
+        assert_eq!(after["availability"], "unavailable");
     }
 
     async fn assert_explicit_provider_refresh_publishes_unchanged_inventory(payload: Value) {
