@@ -8226,17 +8226,19 @@ mod open_pull_request_lookup_tests {
     use crate::RequestId;
     use crate::test_support::TestSandbox;
 
-    /// Records the `--head` branch of every `pr list`, then answers from
-    /// marker files read when it starts: `fail` exits 1, `slow` sleeps its
-    /// contents in seconds, and `open` returns one open PR for the requested
-    /// branch.
+    /// Answers every `pr list` from marker files read when it starts, then
+    /// records its `--head` branch: `fail` exits 1, `slow` sleeps its contents
+    /// in seconds, and `open` returns one open PR for the requested branch.
+    /// The markers are read before the record, so a test that sees a lookup
+    /// recorded can change a marker without the change reaching that lookup.
     const FAKE_GH: &str = r#"#!/bin/sh
 case "$1:$2" in
   pr:list)
+    fail=''; if [ -f 'STATE/fail' ]; then fail=1; fi
+    open=''; if [ -f 'STATE/open' ]; then open=1; fi
     printf '%s\n' "$4" >> 'CALLS'
     printf '%s\n' "$$" >> 'PIDS'
-    if [ -f 'STATE/fail' ]; then echo 'forge unavailable' >&2; exit 1; fi
-    open=''; if [ -f 'STATE/open' ]; then open=1; fi
+    if [ -n "$fail" ]; then echo 'forge unavailable' >&2; exit 1; fi
     if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
     if [ -n "$open" ]; then
       printf '[{"number":42,"title":"PR for %s","url":"https://github.com/acme/repo/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
