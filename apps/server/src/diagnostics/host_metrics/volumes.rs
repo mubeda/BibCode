@@ -90,18 +90,29 @@ fn is_system_memory_mount(descriptor: &VolumeDescriptor) -> bool {
         .any(|root| descriptor.mount_point.starts_with(root))
 }
 
-/// The running AppImage's own image: a read-only FUSE mount holding this executable. `APPDIR`
-/// is not trusted, since it can be inherited from another AppImage. Never `/`, which holds every
-/// executable: a read-only FUSE root is still the root volume.
+/// The running AppImage's own image: a read-only FUSE mount holding this executable that is the
+/// AppImage's by identity, from the listing alone. The runtime names the file system
+/// `fuse.<image file name>` and mounts it at `.mount_*`; either marks it, so an ordinary FUSE
+/// volume holding the executable stays shown. `APPIMAGE` can be inherited from another image, but
+/// then it names a file system this mount does not have. `APPDIR` is not used for the same reason.
+/// Never `/`, which holds every executable: a read-only FUSE root is still the root volume.
 fn is_running_image(
     descriptor: &VolumeDescriptor,
     running_executable: Option<&Path>,
-    _appimage: Option<&Path>,
+    appimage: Option<&Path>,
 ) -> bool {
     let file_system = descriptor.file_system.as_str();
+    let named_after_image = appimage
+        .and_then(Path::file_name)
+        .is_some_and(|name| file_system.strip_prefix("fuse.") == Some(&name.to_string_lossy()));
+    let runtime_mount = descriptor
+        .mount_point
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(".mount_"));
     descriptor.mount_point != Path::new("/")
         && (file_system == "fuse" || file_system.starts_with("fuse."))
         && descriptor.read_only
+        && (named_after_image || runtime_mount)
         && running_executable
             .is_some_and(|executable| executable.starts_with(&descriptor.mount_point))
 }
