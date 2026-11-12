@@ -663,7 +663,9 @@ the window you last used sizes it: clicking in it, typing in it, or choosing
 **Fit to this window**. The other window shows the program at that size. If it
 has less room, it shows the whole terminal scaled down to fit, down to half
 size, with a note that it is **Sized for another window** and the scale; below
-half size it keeps the bottom rows in view and scrolls for the rest. If it has
+half size it keeps the bottom rows in view and scrolls for the rest. Scrolling
+it with the wheel or touchpad keeps it scaled, but pressing its scroll bar
+counts as a click and takes the size. If it has
 more room, it shows the terminal at normal size with empty space around it.
 The first click in a scaled window takes the size and returns it to normal
 size; it is not passed to the program. After that click, or after **Fit to this
