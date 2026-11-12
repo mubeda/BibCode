@@ -664,10 +664,14 @@ vp run test:ui:desktop
 Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`
 and, on Linux, for the headless `xvfb-run` invocation and its Wayland-socket
 guard.
-Before each spec file the harness sends one trivial script to the webview. If
+When a worker starts, the harness sends one trivial script to the webview. If
 the driver answers with a dead-session error (the webview crashed in an earlier
-spec), it ends the app if its process survived, relaunches it once, and opens a
-new session, so the crash fails only the spec that hit it.
+spec; WebKitGTK then answers every script with "Unsupported result type"), it
+ends the app if its process survived (found through `lsof`, which must be
+installed), relaunches it once, and opens a new session. The shared specs run
+in one worker, so a crash in one of them fails the rest of that worker (spec
+files' own `afterEach` hooks fail on the dead webview and Mocha skips what
+follows); the closing spec's worker relaunches the app before its cases.
 The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
 `BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
 using the native shell's environment syntax, then clear that selection before
