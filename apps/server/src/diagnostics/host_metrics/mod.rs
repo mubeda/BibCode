@@ -706,7 +706,9 @@ impl DiskTracker {
 
     fn apply(&mut self, result: DiskJobResult, workers: &DiskWorkers) {
         match result.outcome {
-            DiskOutcome::Listed(listed) => self.apply_listing(listed, workers),
+            DiskOutcome::Listed(Ok(listed)) => self.apply_listing(listed, workers),
+            // The listing failed: the volumes of the last listing that answered stay.
+            DiskOutcome::Listed(Err(_)) => {}
             DiskOutcome::Space(space) => {
                 let Some(volume) = self
                     .volumes

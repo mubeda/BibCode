@@ -3,6 +3,7 @@
 
 use std::{
     collections::VecDeque,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -36,7 +37,8 @@ pub(crate) enum Admission {
 
 #[derive(Debug)]
 pub(crate) enum DiskOutcome {
-    Listed(Vec<VolumeDescriptor>),
+    /// `Err` only when the listing call panicked.
+    Listed(Result<Vec<VolumeDescriptor>, String>),
     Space(Result<VolumeSpace, String>),
 }
 
@@ -103,10 +105,25 @@ impl Inner {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
-            let outcome = match &job.key.mount_point {
-                None => DiskOutcome::Listed(self.source.list_volumes()),
+            // A panicking call fails its own job only: its key is freed below and this thread
+            // keeps serving. The profiler's panic hook has already recorded the panic.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match &job.key.mount_point {
+                None => DiskOutcome::Listed(Ok(self.source.list_volumes())),
                 Some(mount_point) => DiskOutcome::Space(self.source.read_volume_space(mount_point)),
-            };
+            }))
+            .unwrap_or_else(|_| {
+                // R74: the payload may name a path, so only the kind of call is logged.
+                let listing = job.key.mount_point.is_none();
+                tracing::warn!(
+                    call = if listing { "list" } else { "space" },
+                    "host disk call panicked"
+                );
+                if listing {
+                    DiskOutcome::Listed(Err("the volume listing failed".to_owned()))
+                } else {
+                    DiskOutcome::Space(Err("the volume read failed".to_owned()))
+                }
+            });
             {
                 let mut state = self.lock();
                 let Some(index) = state.running.iter().position(|running| running.id == id) else {
