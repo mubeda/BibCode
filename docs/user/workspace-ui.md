@@ -35,8 +35,10 @@ The dashboard opens as a panel on the right. Its sections are:
 - **Volumes** lists each disk with its used and total size and its free space.
   A volume can carry a **Removable**, **Read-only** or **Not responding**
   badge. **Hidden volumes** below the list names each volume that is not shown
-  and why: a network volume, a container layer, a file mount, an empty volume,
-  or the same storage as another volume. Hidden volumes are never sized.
+  and why: a network volume, a container layer, a file mount, a system mount
+  (memory-backed system storage such as `/dev/shm` on Linux, or the running
+  AppImage's own image), an empty volume, or the same storage as another
+  volume. Hidden volumes are never sized.
 - **Since** shows the time the server started and how long it has been up, then
   a table of the current, minimum, average, p95 and maximum use of CPU, memory
   and each volume, and a chart of the whole run. Each bar is an average, with

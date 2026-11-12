@@ -239,6 +239,7 @@ describe("HostDashboardSheet", () => {
         { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
         { mountPoint: "/run/overlay", fileSystem: "overlay", reason: "overlay" },
         { mountPoint: "/etc/hostname", fileSystem: "ext4", reason: "fileMount" },
+        { mountPoint: "/dev/shm", fileSystem: "tmpfs", reason: "system" },
         { mountPoint: "/mnt/empty", fileSystem: "tmpfs", reason: "empty" },
         {
           mountPoint: "/System/Volumes/Data",
@@ -251,7 +252,7 @@ describe("HostDashboardSheet", () => {
     });
     await render();
     const toggle = [...container!.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Hidden volumes (6)"),
+      button.textContent?.includes("Hidden volumes (7)"),
     );
     expect(toggle).toBeDefined();
     expect(toggle?.getAttribute("aria-expanded")).toBe("false");
@@ -263,6 +264,7 @@ describe("HostDashboardSheet", () => {
       "/mnt/shareNetwork volume",
       "/run/overlayContainer layer",
       "/etc/hostnameFile mount",
+      "/dev/shmSystem mount",
       "/mnt/emptyEmpty",
       "/System/Volumes/DataSame storage as /",
       "/mnt/futureHidden by the volume filter",

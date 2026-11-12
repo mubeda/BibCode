@@ -204,6 +204,13 @@ logical CPU count and total memory.
 4. Skip a mount point that is a file, not a folder (Docker's `/etc/hosts`, `/etc/hostname` and
    `/etc/resolv.conf` bind mounts). The check is one `symlink_metadata` call per mount point, made
    only when the volume list is refreshed.
+   Also skip, as a system mount, two kinds of volume the `linux-tmpfs` listing adds (#292,
+   Linux lab): a memory-backed file system (`tmpfs`, `devtmpfs`, `ramfs`) mounted at or under
+   `/dev`, `/run` or `/sys` (`/dev`, `/dev/shm`, `/run/user/<id>`), and a read-only FUSE mount
+   that holds the running executable (the AppImage's own image, which reports 0 B free).
+   `APPDIR` is not used: it can be inherited from another AppImage. Both are decided from the
+   listing and the executable's path, without reading the volume. A `tmpfs` mounted elsewhere
+   (`/tmp`, `/mnt/...`) stays shown.
 5. Merge volumes that share storage: same file system type, same total and same free bytes. Keep
    the entry mounted at `/` if there is one, otherwise the shortest mount point. On macOS this
    folds an APFS container's volumes (`/` and `/System/Volumes/Data`) into one entry. Two separate
@@ -391,7 +398,8 @@ figure. Agent's call, from the crate source and the host reading above.
 
 Local fixed and removable volumes. Network mounts stay skipped by default on every platform,
 because a hung mount can block a read. Overlay is kept only at `/`; file mount points are
-skipped; shared storage is merged by file system, total and free bytes. Alternative: merge by
+skipped; system mounts (memory-backed storage under `/dev`, `/run` or `/sys`, and the running
+AppImage's own image) are skipped; shared storage is merged by file system, total and free bytes. Alternative: merge by
 device name, which folds Docker's bind mounts but not APFS volumes (each has its own name).
 Agent's call, the issue's recommendation plus the container finding; Task 11.3's probe confirms
 the rule on macOS and in Docker.
@@ -435,8 +443,8 @@ one watched minute (60 samples) outweigh an unwatched hour (60 samples). The wir
 The issue's P1.2 asks for a setting to show filtered volumes and one to hide removable ones.
 `UI.md` warns against preferences that stand in for a decision. Instead the sheet lists the
 volumes the filter hid under a closed **Hidden volumes (N)** disclosure, each with its reason
-("Network volume", "Same storage as /", "Empty"). A volume rejected before sampling (network,
-overlay not at `/`, file mount) is never read; an empty or shared one is read once, which is how
+("Network volume", "System mount", "Same storage as /", "Empty"). A volume rejected before
+sampling (network, overlay not at `/`, file mount, system mount) is never read; an empty or shared one is read once, which is how
 the filter knows. No option hides
 removable volumes; they carry a badge. Agent's call, for the user to confirm.
 

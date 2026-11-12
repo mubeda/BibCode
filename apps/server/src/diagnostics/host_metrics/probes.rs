@@ -25,7 +25,7 @@ use super::{
 fn volume_probe() {
     let source = Arc::new(NativeHostMetricsSource::new());
     let listed = source.list_volumes();
-    let (kept, mut hidden) = pre_filter(listed.clone());
+    let (kept, mut hidden) = pre_filter(listed.clone(), std::env::current_exe().ok().as_deref());
     let read = kept
         .into_iter()
         .map(

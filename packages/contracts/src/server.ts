@@ -632,8 +632,8 @@ export const ServerHostMetricsChartBucket = Schema.Struct({
 export type ServerHostMetricsChartBucket = typeof ServerHostMetricsChartBucket.Type;
 
 /**
- * A volume the filter hid (R81). `reason` is `network`, `overlay`, `fileMount`, `empty` or
- * `sameStorage`; it is an open string so a reason a newer server adds cannot fail an older
+ * A volume the filter hid (R81). `reason` is `network`, `overlay`, `fileMount`, `system`, `empty`
+ * or `sameStorage`; it is an open string so a reason a newer server adds cannot fail an older
  * client's whole snapshot. `sameStorageAs` names the shown volume a `sameStorage` one shares.
  */
 export const ServerHostMetricsHiddenVolume = Schema.Struct({

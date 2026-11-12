@@ -52,9 +52,32 @@ pub(crate) fn add_unlisted_network(
     }
 }
 
+/// Memory-backed storage the OS mounts for itself (`/dev`, `/dev/shm`, `/run/user/<id>`). A
+/// `tmpfs` someone mounted elsewhere is a real volume.
+fn is_system_memory_mount(descriptor: &VolumeDescriptor) -> bool {
+    matches!(
+        descriptor.file_system.as_str(),
+        "tmpfs" | "devtmpfs" | "ramfs"
+    ) && ["/dev", "/run", "/sys"]
+        .iter()
+        .any(|root| descriptor.mount_point.starts_with(root))
+}
+
+/// The running AppImage's own image: a read-only FUSE mount holding this executable. `APPDIR`
+/// is not trusted, since it can be inherited from another AppImage.
+fn is_running_image(descriptor: &VolumeDescriptor, running_executable: Option<&Path>) -> bool {
+    let file_system = descriptor.file_system.as_str();
+    (file_system == "fuse" || file_system.starts_with("fuse."))
+        && descriptor.read_only
+        && running_executable
+            .is_some_and(|executable| executable.starts_with(&descriptor.mount_point))
+}
+
 /// Drops, before any space read, the volumes that must never be read.
+/// `running_executable` is this process's own executable, which an AppImage runs from its mount.
 pub(crate) fn pre_filter(
     listed: Vec<VolumeDescriptor>,
+    running_executable: Option<&Path>,
 ) -> (Vec<VolumeDescriptor>, Vec<HiddenVolume>) {
     let mut kept = Vec::with_capacity(listed.len());
     let mut hidden = Vec::new();
@@ -65,6 +88,10 @@ pub(crate) fn pre_filter(
             Some(HiddenReason::Overlay)
         } else if descriptor.is_file {
             Some(HiddenReason::FileMount)
+        } else if is_system_memory_mount(&descriptor)
+            || is_running_image(&descriptor, running_executable)
+        {
+            Some(HiddenReason::System)
         } else {
             None
         };
@@ -170,7 +197,7 @@ mod tests {
                 panic!("{file_system}: a network mount point was stat")
             });
             assert!(!is_file, "{file_system}");
-            let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)]);
+            let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)], None);
             assert_eq!(hidden[0].reason, HiddenReason::Network, "{file_system}");
         }
         for file_system in ["ext4", "apfs", "tmpfs", "overlay", "ntfs"] {
@@ -237,7 +264,7 @@ mod tests {
             .iter()
             .map(|(descriptor, total, free)| (descriptor.mount_point.clone(), (*total, *free)))
             .collect::<Vec<_>>();
-        let (kept, mut hidden) = pre_filter(listed.into_iter().map(|(d, _, _)| d).collect());
+        let (kept, mut hidden) = pre_filter(listed.into_iter().map(|(d, _, _)| d).collect(), None);
         let read = kept
             .into_iter()
             .map(|descriptor| {
@@ -329,10 +356,13 @@ mod tests {
     #[test]
     fn a_network_volume_is_hidden_before_it_is_read() {
         for file_system in ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"] {
-            let (kept, hidden) = pre_filter(vec![
-                descriptor("/", "ext4"),
-                descriptor("/mnt/share", file_system),
-            ]);
+            let (kept, hidden) = pre_filter(
+                vec![
+                    descriptor("/", "ext4"),
+                    descriptor("/mnt/share", file_system),
+                ],
+                None,
+            );
 
             assert_eq!(kept.len(), 1, "{file_system}");
             assert_eq!(kept[0].mount_point, Path::new("/"));
@@ -417,6 +447,91 @@ mod tests {
             hidden[0].descriptor.read_only,
             "a hidden member keeps its own flag"
         );
+    }
+
+    /// #292: with `linux-tmpfs` the listing has the OS's own memory-backed mounts; they are
+    /// hidden as system mounts by type and place alone. A tmpfs mounted elsewhere stays shown.
+    #[test]
+    fn memory_backed_system_mounts_are_hidden_before_they_are_read() {
+        let (kept, hidden) = pre_filter(
+            vec![
+                descriptor("/", "ext4"),
+                descriptor("/dev", "tmpfs"),
+                descriptor("/dev/shm", "tmpfs"),
+                descriptor("/run/user/1000", "tmpfs"),
+                descriptor("/sys/firmware", "tmpfs"),
+                descriptor("/dev/hugepages", "ramfs"),
+                descriptor("/dev", "devtmpfs"),
+                descriptor("/tmp", "tmpfs"),
+                descriptor("/mnt/scratch", "tmpfs"),
+                descriptor("/devices", "tmpfs"),
+                descriptor("/dev/sdb1-mount", "ext4"),
+            ],
+            None,
+        );
+
+        let kept = kept
+            .iter()
+            .map(|volume| volume.mount_point.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                Path::new("/"),
+                Path::new("/tmp"),
+                Path::new("/mnt/scratch"),
+                Path::new("/devices"),
+                Path::new("/dev/sdb1-mount"),
+            ]
+        );
+        assert_eq!(hidden.len(), 6, "{hidden:?}");
+        assert!(
+            hidden
+                .iter()
+                .all(|volume| volume.reason == HiddenReason::System),
+            "{hidden:?}"
+        );
+    }
+
+    /// #292: the AppImage's own mount (read-only FUSE, 0 B free) holds the running executable,
+    /// which decides it without reading the volume. Another app's FUSE mount, a writable FUSE
+    /// mount holding the executable, and the mounts above the image stay shown.
+    #[test]
+    fn the_running_app_image_mount_is_hidden_before_it_is_read() {
+        let read_only = |mount_point: &str, file_system: &str| {
+            let mut volume = descriptor(mount_point, file_system);
+            volume.read_only = true;
+            volume
+        };
+        let (kept, hidden) = pre_filter(
+            vec![
+                read_only("/", "ext4"),
+                descriptor("/tmp", "ext4"),
+                read_only("/tmp/.mount_BiBCodX", "fuse.BiBCode-1.0.AppImage"),
+                read_only("/tmp/.mount_OtherY", "fuse.Other.AppImage"),
+            ],
+            Some(Path::new("/tmp/.mount_BiBCodX/usr/bin/bibcode-desktop")),
+        );
+        assert_eq!(
+            reason_of(&hidden, "/tmp/.mount_BiBCodX"),
+            &HiddenReason::System
+        );
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert_eq!(kept.len(), 3);
+
+        let (_, hidden) = pre_filter(
+            vec![descriptor("/home", "fuse.mergerfs")],
+            Some(Path::new("/home/test-user/bin/bibcode")),
+        );
+        assert!(hidden.is_empty(), "a writable FUSE home is a real volume");
+        let (_, hidden) = pre_filter(
+            vec![read_only(
+                "/tmp/.mount_BiBCodX",
+                "fuse.BiBCode-1.0.AppImage",
+            )],
+            None,
+        );
+        assert!(hidden.is_empty(), "without the executable nothing matches");
     }
 
     #[test]

@@ -176,6 +176,7 @@ fn hidden_volume(hidden: &HiddenVolume) -> HiddenVolumeWire {
         HiddenReason::Network => ("network", None),
         HiddenReason::Overlay => ("overlay", None),
         HiddenReason::FileMount => ("fileMount", None),
+        HiddenReason::System => ("system", None),
         HiddenReason::Empty => ("empty", None),
         HiddenReason::SameStorage { as_mount } => {
             ("sameStorage", Some(as_mount.to_string_lossy().into_owned()))

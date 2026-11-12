@@ -127,6 +127,7 @@ const HIDDEN_REASON_LABELS: Readonly<Record<string, string>> = {
   network: "Network volume",
   overlay: "Container layer",
   fileMount: "File mount",
+  system: "System mount",
   empty: "Empty",
 };
 

@@ -71,8 +71,12 @@ pub enum HiddenReason {
     Network,
     Overlay,
     FileMount,
+    /// A memory-backed system file system (`/dev`, `/dev/shm`) or the running app's own image.
+    System,
     Empty,
-    SameStorage { as_mount: PathBuf },
+    SameStorage {
+        as_mount: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -889,7 +893,7 @@ impl DiskTracker {
         weight: Duration,
     ) {
         self.listings += 1;
-        let (kept, hidden) = pre_filter(listed);
+        let (kept, hidden) = pre_filter(listed, std::env::current_exe().ok().as_deref());
         self.pre_hidden = hidden;
         let mut previous = std::mem::take(&mut self.volumes);
         for descriptor in kept {
