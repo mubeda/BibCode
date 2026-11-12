@@ -1325,7 +1325,8 @@ beforeEach(() => {
   testState.resetInputCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.reattachCommand.mockReset();
   testState.resizeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
-  testState.readSizeCommand.mockReset().mockResolvedValue(AsyncResult.success(null));
+  // A read in flight: a size the server publishes settles the claim first.
+  testState.readSizeCommand.mockReset().mockReturnValue(new Promise(() => undefined));
   testState.restartCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.stageImagePasteCommand
     .mockReset()

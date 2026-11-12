@@ -5123,10 +5123,11 @@ re-sent, so typing sends no repeated requests. With an older server (a `null`
 answer, or one without a sequence) the client waits for no acknowledgement: the
 same geometry is not sent again until the server publishes a size, and the next
 published size is the claim's outcome. Such a server publishes nothing for an
-owner's claim of the size it already holds, so when the renderer owned a
-different size, one read repairs it: an attach without `cwd`, claim or restart,
-whose first snapshot alone is taken, which cannot create, restart or claim a
-session. Notice suppression
+owner's claim of the size it already holds, nor for a claim it ignored, so one
+read settles those: an attach without `cwd`, claim or restart, whose first
+snapshot alone is taken, which cannot create, restart or claim a session. An
+owner applies the size it reads; a takeover the read shows as applied waits for
+its owner change, and any other result ends notice suppression. Notice suppression
 covers the pending claim and its acknowledgement; after it the notice shows
 whenever another owner's size differs from this renderer's fit.
 A mirror scales its xterm element down to show the owner's whole grid, never
@@ -5158,8 +5159,9 @@ catch-up snapshot. While a claimed stream on the current process is live, the
 sequenced events of a stream without a claim are not applied; the claimed
 stream delivers them behind the sizes published before them, so no output is
 parsed at a size the server had already replaced. A stream is released when it
-ends, so an ended one holds nothing back. Such a mix lasts one scheduler task in
-practice (the ownership capability arriving after a claimless attach). A
+ends, so an ended one holds nothing back. The panel can mix them only when the
+ownership capability arrives after a claimless attach (a plain terminal may
+attach before the server configuration loads), until the old stream ends. A
 `closed` with a generation is applied by generation (once), not against
 another stream's sequence, and fences that process: a delayed snapshot or
 restart of it is dropped, and only a newer process, which the server issues to

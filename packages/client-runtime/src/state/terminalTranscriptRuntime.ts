@@ -287,8 +287,8 @@ export function createTerminalTranscriptRuntime(
     if (sequence === undefined) return true;
     // A live claimed stream delivers this event too, behind the sizes published before it.
     // shortcut: what this stream drops while a claimed stream is live and that stream had not
-    // delivered when it ended is lost until the next snapshot; mixing only occurs for one
-    // scheduler task, when the ownership capability arrives after a claimless attach.
+    // delivered when it ended is lost until the next snapshot. The panel mixes them only when
+    // the ownership capability arrives after a claimless attach, until the old stream ends.
     if (source.sizeClaim === undefined && claimedSources.size > 0) return false;
     if (event.type === "resized") {
       if (sizeSequence !== undefined && sequence <= sizeSequence) return false;

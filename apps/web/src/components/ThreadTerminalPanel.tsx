@@ -1601,31 +1601,39 @@ export function TerminalViewport({
       // this renderer's stream attaches; a missing session or an ended process is shown by
       // its own events.
       declinedRequest = request;
-      if (result === null || accepted) {
-        // An older server answers null and acknowledges nothing: the size it publishes next
-        // settles the claim. A takeover always publishes its owner change, but an owner's
-        // claim for the size the server already holds publishes nothing, so one read of that
-        // size repairs a stale renderer.
-        if (appliedSize?.sizeClaim === sizeClaim && !terminalSizesEqual(appliedSize, request))
-          reconcileLegacyClaim(request);
+      // An older server answers null and acknowledges nothing: the size it publishes next
+      // settles the claim. It publishes nothing for an owner's claim of the size it already
+      // holds, nor for a claim it ignored, so one read of the size it holds settles those.
+      if ((result === null || accepted) && !terminalSizesEqual(appliedSize, request)) {
+        reconcileLegacyClaim(request, appliedSize?.sizeClaim === sizeClaim);
         return;
       }
       claimNoticeSuppressed = false;
     };
-    const reconcileLegacyClaim = (request: TerminalSize) => {
-      if (terminalDimensionsEqual(legacyRead, request)) return;
+    const endLegacyClaim = () => {
+      claimNoticeSuppressed = false;
+      updateSizeNotice();
+    };
+    const reconcileLegacyClaim = (request: TerminalSize, owned: boolean) => {
+      if (terminalDimensionsEqual(legacyRead, request)) {
+        endLegacyClaim();
+        return;
+      }
       const read = request;
       legacyRead = read;
       void runReadTerminalSize({ environmentId, input: { threadId, terminalId } }).then(
         (result) => {
-          if (disposed || legacyRead !== read || result._tag !== "Success") return;
-          const held = result.value;
-          if (held === null) return;
+          if (disposed || legacyRead !== read) return;
+          const held = result._tag === "Success" ? result.value : null;
           outputSink.barrier(() => {
             if (disposed || legacyRead !== read) return;
-            applySize(held);
-            // The read's own size does not allow another read of the same geometry.
-            legacyRead = read;
+            // A takeover the server applied publishes its owner change, which settles it.
+            if (held?.sizeClaim === sizeClaim && !owned) return;
+            if (held !== null && owned) {
+              applySize(held);
+              // The read's own size does not allow another read of the same geometry.
+              legacyRead = read;
+            } else endLegacyClaim();
           });
         },
       );
