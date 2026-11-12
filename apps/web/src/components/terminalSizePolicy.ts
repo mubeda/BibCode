@@ -43,7 +43,9 @@ export function hasForeignTerminalSizeOwner(
  */
 export function answersTerminalQueries(applied: TerminalSize | null, sizeClaim: string): boolean {
   if (hasForeignTerminalSizeOwner(applied, sizeClaim)) return false;
-  return applied?.sizeClaim != null || applied?.replyClaim == null || applied.replyClaim === sizeClaim;
+  return (
+    applied?.sizeClaim != null || applied?.replyClaim == null || applied.replyClaim === sizeClaim
+  );
 }
 
 /** The server left the size un-owned until a window is used, and says so (#348). */
