@@ -5066,16 +5066,16 @@ unattended window never takes the size by itself; when the sizing window goes
 away, a visible window takes it. The terminal manager owns PTY dimensions and one
 optional attachment owner; renderers mirror that applied state.
 
-| Protocol surface        | Additions and behavior                                                                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `terminal.attach` input | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.              |
-| `terminal.resize` input | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers.                             |
-| `terminal.resize` result | `{ outcome, size, generation, sequence }`: `applied`, `unchanged`, `sessionMissing`, `claimNotRegistered`, `processAbsent` or `generationInvalidated`, with the size the server holds. Older servers answer `null`; older clients ignore it. |
-| Snapshot, `exited`, `closed` | Optional `generation { boot, process }`; see the terminal section of the architecture overview.                                                                  |
-| Attach snapshot         | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                          |
-| Attach snapshot         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                   |
-| Attach snapshot         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it. |
-| Attach event            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                         |
+| Protocol surface             | Additions and behavior                                                                                                                                                                                                                       |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `terminal.attach` input      | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.                                                                                 |
+| `terminal.resize` input      | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers.                                                                                                |
+| `terminal.resize` result     | `{ outcome, size, generation, sequence }`: `applied`, `unchanged`, `sessionMissing`, `claimNotRegistered`, `processAbsent` or `generationInvalidated`, with the size the server holds. Older servers answer `null`; older clients ignore it. |
+| Snapshot, `exited`, `closed` | Optional `generation { boot, process }`; see the terminal section of the architecture overview.                                                                                                                                              |
+| Attach snapshot              | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                                                                                             |
+| Attach snapshot              | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                                                                                      |
+| Attach snapshot              | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it.                                                                    |
+| Attach event                 | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                                                                                            |
 
 First-attachment grant selection and ownership assignment are atomic under the
 PTY generation publication lock. Attach assigns an owner only when unowned; it

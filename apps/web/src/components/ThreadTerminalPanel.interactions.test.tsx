@@ -2798,13 +2798,16 @@ describe("TerminalViewport mounted lifecycle", () => {
     vi.useRealTimers();
     // The answer is in, but nothing ordered has arrived: xterm keeps the size it parses at.
     expect(view.fakeTerminal!.rows).toBe(30);
-    const terminal = view.fakeTerminal!;
+    // The fake terminal's interface declares only what tests read; its write is a method.
+    const terminal = view.fakeTerminal! as FakeTerminalInstance & {
+      write(data: string, callback?: () => void): void;
+    };
     const order: Array<string> = [];
     const write = terminal.write.bind(terminal);
-    terminal.write = ((data: string, callback?: () => void) => {
+    terminal.write = (data: string, callback?: () => void) => {
       if (data.length > 0) order.push(`write ${terminal.rows}`);
-      return write(data, callback);
-    }) as typeof terminal.write;
+      write(data, callback);
+    };
     await server.release();
     await view.flushFrame();
     expect(order).toEqual(["write 30"]);
