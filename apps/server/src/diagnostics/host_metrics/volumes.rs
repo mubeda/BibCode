@@ -24,6 +24,32 @@ pub(crate) fn is_file_mount(
         && symlink_metadata(mount_point).is_ok_and(|metadata| metadata.is_file())
 }
 
+/// Adds the mounted network file systems the listing left out (on macOS `sysinfo` skips every
+/// volume that is not local), so the filter hides and discloses them too. Only the file system
+/// type decides; nothing here touches a mount point.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn add_unlisted_network(
+    listed: &mut Vec<VolumeDescriptor>,
+    mounted: Vec<(PathBuf, String)>,
+) {
+    for (mount_point, file_system) in mounted {
+        if is_network(&file_system)
+            && !listed
+                .iter()
+                .any(|volume| volume.mount_point == mount_point)
+        {
+            listed.push(VolumeDescriptor {
+                mount_point,
+                name: String::new(),
+                file_system,
+                removable: false,
+                read_only: false,
+                is_file: false,
+            });
+        }
+    }
+}
+
 /// Drops, before any space read, the volumes that must never be read.
 pub(crate) fn pre_filter(
     listed: Vec<VolumeDescriptor>,
@@ -155,6 +181,40 @@ mod tests {
             assert!(is_file, "{file_system}: the reader's answer is used");
             assert_eq!(asked.as_deref(), Some(file.path()), "{file_system}");
         }
+    }
+
+    /// A network mount the listing left out is added once, to be hidden as a network volume.
+    #[test]
+    fn mounted_network_volumes_missing_from_the_listing_are_added() {
+        let mut listed = vec![
+            descriptor("/", "apfs"),
+            descriptor("/Volumes/listed-share", "smbfs"),
+        ];
+        let mounted = [
+            ("/", "apfs"),
+            ("/Volumes/listed-share", "smbfs"),
+            ("/Volumes/share", "nfs"),
+            ("/Volumes/map", "autofs"),
+            ("/Volumes/usb", "msdos"),
+        ]
+        .map(|(mount_point, file_system)| (PathBuf::from(mount_point), file_system.to_owned()));
+
+        add_unlisted_network(&mut listed, mounted.to_vec());
+
+        let added = listed
+            .iter()
+            .map(|volume| (volume.mount_point.as_path(), volume.file_system.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            [
+                (Path::new("/"), "apfs"),
+                (Path::new("/Volumes/listed-share"), "smbfs"),
+                (Path::new("/Volumes/share"), "nfs"),
+                (Path::new("/Volumes/map"), "autofs"),
+            ]
+        );
+        assert!(listed[2].name.is_empty() && !listed[2].is_file);
     }
 
     fn reading(descriptor: VolumeDescriptor, total: u64, free: u64) -> VolumeReading {

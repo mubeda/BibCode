@@ -113,11 +113,9 @@ impl HostMetricsSource for NativeHostMetricsSource {
         for disk in disks {
             let mount_point = disk.mount_point().to_owned();
             let file_system = disk.file_system().to_string_lossy().into_owned();
-            let is_file = super::volumes::is_file_mount(
-                &file_system,
-                &mount_point,
-                |path| std::fs::symlink_metadata(path),
-            );
+            let is_file = super::volumes::is_file_mount(&file_system, &mount_point, |path| {
+                std::fs::symlink_metadata(path)
+            });
             #[cfg(target_os = "linux")]
             let disk_read_only = read_only.get(&mount_point).copied().unwrap_or(false);
             #[cfg(not(target_os = "linux"))]
@@ -133,6 +131,8 @@ impl HostMetricsSource for NativeHostMetricsSource {
             by_mount.insert(mount_point, Arc::new(Mutex::new(disk)));
         }
         *lock(&self.disks) = by_mount;
+        #[cfg(target_os = "macos")]
+        super::volumes::add_unlisted_network(&mut listed, mounted_file_systems());
         listed
     }
 
@@ -151,6 +151,49 @@ impl HostMetricsSource for NativeHostMetricsSource {
         let space = storage_space(&disk);
         space
     }
+}
+
+/// Each mounted file system's mount point and type, from the kernel's mount table. `MNT_NOWAIT`
+/// returns the figures the kernel already holds, so no mount point is called and a hung network
+/// mount cannot hold the listing (D25). Empty when the table cannot be read.
+#[cfg(target_os = "macos")]
+fn mounted_file_systems() -> Vec<(PathBuf, String)> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+
+    // SAFETY: a null buffer asks for the count only.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    // Room for mounts added between the two calls; `getfsstat` never writes past `size`.
+    // SAFETY: `statfs` is plain data, valid when zeroed.
+    let mut entries = vec![unsafe { std::mem::zeroed::<libc::statfs>() }; count + 8];
+    let Ok(size) = libc::c_int::try_from(entries.len() * std::mem::size_of::<libc::statfs>())
+    else {
+        return Vec::new();
+    };
+    // SAFETY: `entries` is writable for `size` bytes.
+    let filled = unsafe { libc::getfsstat(entries.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    let Ok(filled) = usize::try_from(filled) else {
+        return Vec::new();
+    };
+    entries.truncate(filled);
+    entries
+        .iter()
+        .map(|entry| {
+            // SAFETY: the kernel NUL-terminates both fields within their arrays.
+            let (mount_point, file_system) = unsafe {
+                (
+                    CStr::from_ptr(entry.f_mntonname.as_ptr()),
+                    CStr::from_ptr(entry.f_fstypename.as_ptr()),
+                )
+            };
+            (
+                PathBuf::from(std::ffi::OsStr::from_bytes(mount_point.to_bytes())),
+                file_system.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Total and available blocks from `statvfs` on Linux; total capacity and available capacity for
