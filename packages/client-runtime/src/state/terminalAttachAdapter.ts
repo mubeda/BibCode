@@ -39,6 +39,8 @@ export function projectTerminalMetadataStream<E, R>(
         runtime.ingest(event, source);
         return eventChangesMetadata(event) ? Result.succeed(runtime.metadata()) : Result.failVoid;
       }),
+      // An ended stream must not keep ordering the streams still running.
+      Stream.ensuring(Effect.sync(() => runtime.releaseSource(source))),
     );
   });
 }

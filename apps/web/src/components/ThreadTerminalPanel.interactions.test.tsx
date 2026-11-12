@@ -979,6 +979,7 @@ function trackedTranscriptRuntime(initialSnapshot: string): {
   return {
     runtime: {
       ingest: (event, stream) => source.ingest(event, stream),
+      releaseSource: (stream) => source.releaseSource(stream),
       attachRenderer: (sink, sizeClaim) => {
         const attachment = source.attachRenderer(sink, sizeClaim);
         let detached = false;

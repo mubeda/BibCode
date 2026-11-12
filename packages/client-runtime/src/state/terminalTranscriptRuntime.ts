@@ -62,6 +62,8 @@ export interface TerminalTranscriptRuntime {
    * another stream already delivered is skipped.
    */
   ingest(event: TerminalAttachStreamEvent, source?: TerminalStreamSource): void;
+  /** `source`'s stream ended: it no longer orders the others. */
+  releaseSource(source: TerminalStreamSource): void;
   attachRenderer(
     sink: (signal: TerminalRenderSignal) => void,
     sizeClaim?: string,
@@ -101,6 +103,10 @@ export function createTerminalTranscriptRuntime(
   let appliedSequence: number | undefined;
   let sizeSequence: number | undefined;
   let sequenceSource: object | undefined;
+  // Live claimed streams on the current process. Each carries every size in order, so while
+  // one is live it orders rendering; a stream without sizes merging ahead would lay output
+  // out at a size the server had already replaced (#348).
+  const claimedSources = new Set<object>();
   let processingEvents = false;
   let metadata = EMPTY_TERMINAL_METADATA_SNAPSHOT;
   let size: TerminalSize | undefined;
@@ -196,6 +202,7 @@ export function createTerminalTranscriptRuntime(
   /** Moves to `next`, never back to a server instance this runtime has left. */
   const enterProcess = (next: ProcessKey) => {
     if (processKey?.generation && processKey.boot !== next.boot) leftBoots.add(processKey.boot);
+    if (!sameProcess(processKey, next)) claimedSources.clear();
     processKey = next;
   };
 
@@ -243,6 +250,7 @@ export function createTerminalTranscriptRuntime(
             size: snapshotSize,
           });
         }
+        if (source.sizeClaim !== undefined) claimedSources.add(source);
         // Another stream already applied this state of the same process.
         if (event.snapshot.firstAttachmentGrant) {
           firstAttachmentGrantClaim = event.snapshot.size?.sizeClaim ?? null;
@@ -254,6 +262,7 @@ export function createTerminalTranscriptRuntime(
         return false;
       }
       enterProcess(key);
+      if (source.sizeClaim !== undefined) claimedSources.add(source);
       processClosed = false;
       appliedSequence = sequence;
       sizeSequence = sequence;
@@ -276,6 +285,11 @@ export function createTerminalTranscriptRuntime(
     if (!sameProcess(sourceProcesses.get(source), processKey)) return false;
     const sequence = event.sequence;
     if (sequence === undefined) return true;
+    // A live claimed stream delivers this event too, behind the sizes published before it.
+    // shortcut: what this stream drops while a claimed stream is live and that stream had not
+    // delivered when it ended is lost until the next snapshot; mixing only occurs for one
+    // scheduler task, when the ownership capability arrives after a claimless attach.
+    if (source.sizeClaim === undefined && claimedSources.size > 0) return false;
     if (event.type === "resized") {
       if (sizeSequence !== undefined && sequence <= sizeSequence) return false;
       sizeSequence = sequence;
@@ -353,6 +367,9 @@ export function createTerminalTranscriptRuntime(
         pendingHead = 0;
         processingEvents = false;
       }
+    },
+    releaseSource(source) {
+      claimedSources.delete(source);
     },
     attachRenderer(sink, rendererClaim) {
       let attached = true;
