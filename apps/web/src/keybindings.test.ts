@@ -17,6 +17,7 @@ import {
   formatShortcutLabel,
   isChatFindFallbackShortcut,
   shouldOpenChatFind,
+  shouldStartCodeReview,
   isChatNewShortcut,
   isSteerQueuedMessageShortcut,
   isChatNewLocalShortcut,
@@ -1085,6 +1086,85 @@ describe("Find in thread shortcut", () => {
   it("labels the effective key", () => {
     assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, mac), "⌘F");
     assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, linux), "Ctrl+F");
+  });
+});
+
+describe("Review changes shortcut (R102)", () => {
+  const mac = "MacIntel";
+  const linux = "Linux";
+  // macOS Option turns the letter into a symbol; the matcher reads the code.
+  const modAltShiftR = (platform: string, overrides: Partial<ShortcutEventLike> = {}) =>
+    event({
+      key: platform === mac ? "‰" : "R",
+      code: "KeyR",
+      metaKey: platform === mac,
+      ctrlKey: platform !== mac,
+      altKey: true,
+      shiftKey: true,
+      ...overrides,
+    });
+  const noTerminal = { terminalFocus: false };
+
+  it("starts a review with the built-in Mod+Alt+Shift+R outside a terminal", () => {
+    for (const platform of [mac, linux]) {
+      const keydown = modAltShiftR(platform);
+      const command = resolveShortcutCommand(keydown, DEFAULT_RESOLVED_KEYBINDINGS, { platform });
+      assert.strictEqual(command, null);
+      assert.strictEqual(
+        shouldStartCodeReview(command, keydown, DEFAULT_RESOLVED_KEYBINDINGS, noTerminal, platform),
+        true,
+      );
+    }
+    assert.strictEqual(
+      shouldStartCodeReview(
+        null,
+        modAltShiftR(linux),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { terminalFocus: true },
+        linux,
+      ),
+      false,
+    );
+  });
+
+  it("leaves Mod+Shift+R, the browser's hard reload, alone", () => {
+    const reload = modAltShiftR(linux, { altKey: false });
+    assert.strictEqual(
+      resolveShortcutCommand(reload, DEFAULT_RESOLVED_KEYBINDINGS, { platform: linux }),
+      null,
+    );
+    assert.strictEqual(
+      shouldStartCodeReview(null, reload, DEFAULT_RESOLVED_KEYBINDINGS, noTerminal, linux),
+      false,
+    );
+  });
+
+  it("replaces the built-in key with a rule that binds sourceControl.review elsewhere", () => {
+    const keybindings: ResolvedKeybindingsConfig = [
+      ...DEFAULT_RESOLVED_KEYBINDINGS,
+      { shortcut: modShortcut("e", { shiftKey: true }), command: "sourceControl.review" },
+    ];
+    const bound = event({ key: "e", code: "KeyE", ctrlKey: true, shiftKey: true });
+    const command = resolveShortcutCommand(bound, keybindings, { platform: linux });
+    assert.strictEqual(command, "sourceControl.review");
+    assert.strictEqual(shouldStartCodeReview(command, bound, keybindings, noTerminal, linux), true);
+    assert.strictEqual(
+      shouldStartCodeReview(null, modAltShiftR(linux), keybindings, noTerminal, linux),
+      false,
+    );
+  });
+
+  it("lets a user rule on Mod+Alt+Shift+R for another command win", () => {
+    const keybindings: ResolvedKeybindingsConfig = [
+      ...DEFAULT_RESOLVED_KEYBINDINGS,
+      { shortcut: modShortcut("r", { altKey: true, shiftKey: true }), command: "sidebar.toggle" },
+    ];
+    const command = resolveShortcutCommand(modAltShiftR(linux), keybindings, { platform: linux });
+    assert.strictEqual(command, "sidebar.toggle");
+    assert.strictEqual(
+      shouldStartCodeReview(command, modAltShiftR(linux), keybindings, noTerminal, linux),
+      false,
+    );
   });
 });
 

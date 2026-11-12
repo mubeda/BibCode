@@ -6196,6 +6196,99 @@ describe("ChatView handlers (captured from mocked children)", () => {
         }
       },
     );
+
+    describe("from Mod+Alt+Shift+R (R102)", () => {
+      const isMac = () => navigator.platform.toLowerCase().includes("mac");
+      const shortcut = () =>
+        new KeyboardEvent("keydown", {
+          key: "R",
+          code: "KeyR",
+          metaKey: isMac(),
+          ctrlKey: !isMac(),
+          altKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+      const DIRTY_STATUS = {
+        isRepo: true,
+        refName: "feature",
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [] },
+      };
+
+      async function mountWithKeydown(): Promise<{
+        readonly keydown: EventListener;
+        readonly cleanup: () => Promise<void>;
+      }> {
+        // Spy after the globals are restored, as mountReview restores them too.
+        vi.unstubAllGlobals();
+        const addWindowListener = vi.spyOn(window, "addEventListener");
+        const view = await mountServerReview();
+        const keydown = addWindowListener.mock.calls.findLast(
+          ([eventName]) => eventName === "keydown",
+        )?.[1] as EventListener;
+        return {
+          keydown,
+          cleanup: async () => {
+            addWindowListener.mockRestore();
+            await view.unmount();
+          },
+        };
+      }
+
+      it("starts the review the button would start, and nothing from a focused terminal", async () => {
+        seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId } });
+        seedServerThread(makeThread());
+        h.queryDataByKey.set("vcs.status", DIRTY_STATUS);
+        const terminalHost = document.createElement("div");
+        terminalHost.dataset["terminalOwner"] = "center-panel";
+        const terminalInput = document.createElement("textarea");
+        terminalHost.append(terminalInput);
+        document.body.append(terminalHost);
+        const { keydown, cleanup } = await mountWithKeydown();
+        try {
+          terminalInput.focus();
+          await act(async () => keydown(shortcut()));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+
+          terminalInput.blur();
+          const event = shortcut();
+          await act(async () => keydown(event));
+          expect(event.defaultPrevented).toBe(true);
+          await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+          expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+          const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+            input: { message: { text: string } };
+          };
+          expect(turn.input.message.text).toMatch(
+            /^Code review requested from BiBCode\. Do not edit files\. Scope: the staged, unstaged and untracked changes in the working tree\.\n\n/,
+          );
+        } finally {
+          terminalHost.remove();
+          await cleanup();
+        }
+      });
+
+      it.each([
+        ["the server lacks code reviews", { codeReviews: false }, DIRTY_STATUS],
+        ["nothing changed", {}, { ...DIRTY_STATUS, hasWorkingTreeChanges: false }],
+      ])("does nothing when the button is disabled because %s", async (_name, env, status) => {
+        seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId }, ...env });
+        seedServerThread(makeThread());
+        h.queryDataByKey.set("vcs.status", status);
+        const { keydown, cleanup } = await mountWithKeydown();
+        try {
+          await act(async () => keydown(shortcut()));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(commandCallsFor("terminal.open")).toEqual([]);
+        } finally {
+          await cleanup();
+        }
+      });
+    });
   });
 
   it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {

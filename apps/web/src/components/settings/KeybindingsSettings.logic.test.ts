@@ -147,6 +147,11 @@ describe("KeybindingsSettings.logic", () => {
     expect(commandLabel("chat.find")).toBe("Chat: Find");
   });
 
+  it("offers sourceControl.review, whose key is built in, as a bindable command", () => {
+    expect(buildKeybindingCommandOptions([])).toContain("sourceControl.review");
+    expect(commandLabel("sourceControl.review")).toBe("Source Control: Review");
+  });
+
   it("builds command options from defaults and resolved project bindings", () => {
     const options = buildKeybindingCommandOptions([
       {
