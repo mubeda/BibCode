@@ -6379,6 +6379,37 @@ mod tests {
         manager.shutdown().await;
     }
 
+    /// Real-pair case 5 (#348): the client takes the size by a click, the host takes it back
+    /// by a keypress, and the client's next click takes it again, at equal and different sizes.
+    #[tokio::test]
+    async fn each_claim_by_another_window_takes_the_size_back() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        // The host attached first and owns the size.
+        let _host = manager.attach(size_attachment("host")).await.unwrap();
+        let mut client = manager.attach(size_attachment("client")).await.unwrap();
+        for (claim, cols, rows) in [
+            ("client", 80, 24),
+            ("host", 80, 24),
+            ("client", 80, 24),
+            ("host", 120, 50),
+            ("client", 100, 30),
+        ] {
+            let result = manager
+                .resize("sizing", "term", cols, rows, Some(claim.to_owned()))
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, TerminalResizeOutcome::Applied, "{claim}");
+            match next_attachment_event(&mut client).await {
+                TerminalEvent::Resized { size, .. } => {
+                    assert_eq!(size.size_claim.as_deref(), Some(claim));
+                    assert_eq!((size.cols, size.rows), (cols, rows));
+                }
+                other => panic!("expected {claim}'s claim to publish, got {other:?}"),
+            }
+        }
+        manager.shutdown().await;
+    }
+
     /// Snapshots, restarts, exits and closes name the process they belong to: a counter that
     /// only grows and survives the process's exit, so a client can order states without pids.
     #[tokio::test]

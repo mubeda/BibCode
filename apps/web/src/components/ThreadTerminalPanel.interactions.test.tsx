@@ -8140,6 +8140,18 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       }
     }
 
+    /** `resize` answered as a server that reads `structuredResult` does. */
+    answer(claim: string | undefined, cols: number, rows: number): TerminalResizeResult {
+      const before = this.sequence;
+      this.resize(claim, cols, rows);
+      return {
+        outcome: this.sequence === before ? "unchanged" : "applied",
+        size: this.size(),
+        generation: null,
+        sequence: this.sequence,
+      };
+    }
+
     private publish(): void {
       this.sequence += 1;
       const event: TerminalAttachStreamEvent = {
@@ -8378,6 +8390,59 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(xtermOf(client).element!.style.pointerEvents).toBe("");
     expect(view(host)).toMatchObject({ grid: "100x30", scale: 1, clipped: false });
   });
+
+  // Real-pair case 5 on builds before the authoritative protocol: after the client took the
+  // size and the host took it back by a keypress, a click on the client did not take it back.
+  it.each([
+    ["a taller host, scaled mirror", { cols: 120, rows: 50 }, "null answers"],
+    ["a taller host, scaled mirror", { cols: 120, rows: 50 }, "structured answers"],
+    ["an equal host fit", { cols: 100, rows: 30 }, "null answers"],
+    ["an equal host fit", { cols: 100, rows: 30 }, "structured answers"],
+  ] as const)(
+    "takes the size back with a click after the host took it by typing (%s, %s)",
+    async (_shape, hostFit, answers) => {
+      if (answers === "structured answers") {
+        testState.resizeCommand.mockImplementation(
+          async ({ input }: { input: { cols: number; rows: number; sizeClaim?: string } }) =>
+            AsyncResult.success(server.answer(input.sizeClaim, input.cols, input.rows)),
+        );
+      }
+      hasFocus.mockReturnValue(true);
+      const host = await openWindow(SERVER_HOST, hostFit);
+      hasFocus.mockReturnValue(false);
+      const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+      const mount = client.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      const clickClient = async () => {
+        await act(async () =>
+          mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+        );
+        await server.deliver();
+      };
+      const typeInHost = async () => {
+        await act(async () =>
+          xtermOf(host).keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
+        );
+        await server.deliver();
+      };
+      for (let round = 0; round < 2; round += 1) {
+        await clickClient();
+        expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+        await typeInHost();
+        expect(view(host)).toMatchObject({ owner: "this window", scale: 1 });
+        if (hostFit.rows > 30) {
+          expect(view(client)).toMatchObject({ grid: "120x50", scale: 0.6, clipped: false });
+          // The browser sends a scaled mirror's pointer input to the mount, not to xterm.
+          expect(xtermOf(client).element!.style.pointerEvents).toBe("none");
+        } else expect(view(client)).toMatchObject({ grid: "100x30", owner: "the other window" });
+      }
+      const requests = testState.resizeCommand.mock.calls.length;
+      await clickClient();
+      expect(testState.resizeCommand.mock.calls.length).toBeGreaterThan(requests);
+      expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
+    },
+  );
 
   it.each([
     ["wait", null],
