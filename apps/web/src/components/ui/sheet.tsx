@@ -2,11 +2,36 @@
 
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
-import { cn } from "~/lib/utils";
+import { useEffect, useState } from "react";
+import { acquireBrowserSurfaceOcclusion } from "~/browser/browserSurfaceStore";
+import { isDesktopHost } from "~/env";
+import { cn, isMacPlatform } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
-const Sheet = SheetPrimitive.Root;
+/**
+ * A macOS native preview is a view above the webview, so any sheet drawn over it would sit
+ * under it. While the sheet is open it holds an occlusion lease, which hides the preview.
+ */
+function Sheet({ open, defaultOpen, onOpenChange, ...props }: SheetPrimitive.Root.Props) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen ?? false);
+  const isOpen = open ?? uncontrolledOpen;
+  useEffect(() => {
+    if (!isOpen || !isDesktopHost || !isMacPlatform(navigator.platform)) return;
+    const lease = acquireBrowserSurfaceOcclusion();
+    return lease.release;
+  }, [isOpen]);
+  return (
+    <SheetPrimitive.Root
+      {...props}
+      {...(open === undefined ? { defaultOpen } : { open })}
+      onOpenChange={(next, details) => {
+        setUncontrolledOpen(next);
+        onOpenChange?.(next, details);
+      }}
+    />
+  );
+}
 
 const SheetPortal = SheetPrimitive.Portal;
 
