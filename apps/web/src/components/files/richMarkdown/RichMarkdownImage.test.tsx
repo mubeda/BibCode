@@ -71,9 +71,9 @@ describe("RichMarkdownImage", () => {
     vi.unstubAllGlobals();
   });
 
-  async function render(src: string, alt = "A pixel") {
+  async function render(src: string, alt = "A pixel", props = workspace) {
     await act(async () => {
-      root.render(<RichMarkdownImage workspace={workspace} src={src} alt={alt} />);
+      root.render(<RichMarkdownImage workspace={props} src={src} alt={alt} />);
     });
     await act(async () => {});
   }
@@ -148,7 +148,13 @@ describe("RichMarkdownImage", () => {
     );
     observer.observe(container, { subtree: true, childList: true, attributes: true });
     assetState.result = { _tag: "Success", value: { relativeUrl: "/api/assets/tok2/pic.png" } };
-    await render("images/pic.png");
+    // A copy re-renders past the compiler's memo, as the atom's own update would.
+    await render("images/pic.png", "A pixel", { ...workspace });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://server.example.test/api/assets/tok/pic.png",
+      "https://server.example.test/api/assets/tok2/pic.png",
+    ]);
+    await act(async () => {});
     observer.disconnect();
 
     expect(seen).not.toContain(null);

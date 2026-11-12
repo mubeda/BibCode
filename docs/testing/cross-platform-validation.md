@@ -3722,8 +3722,9 @@ sizes. Cover relevant:
   rendered view. It proves that an edit and a heading made there save with the
   frontmatter and the fence unchanged on disk, that Undo in rendered view removes
   the heading and that one Undo in source view removes a whole rendered visit,
-  and that opening and saving a file without editing leaves it byte-identical.
-  Rerun it alone with `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts`. By
+  that opening and saving a file without editing leaves it byte-identical, and
+  that an image the file links by a relative path (a placeholder PNG the spec
+  writes) loads in the rendered view. Rerun it alone with `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts`. By
   hand, also check **Link**, **Image** (the copy lands beside the Markdown file
   and a second copy with the same name gets a new name), the **More formatting**
   menu, and that a file with a footnote or an `.mdx` file shows the read-only

@@ -25,6 +25,8 @@ interface ImageProps {
   readonly alt: string;
 }
 
+const unreadable = (src: string) => `Couldn't read ${src}. Check that the file exists.`;
+
 /** The image's own text, shown while it loads and when it can't be shown. */
 function ImageText({ src, alt, problem }: ImageProps & { problem: string | null }) {
   const label = alt || src.slice(src.lastIndexOf("/") + 1) || src;
@@ -44,10 +46,11 @@ function ImageText({ src, alt, problem }: ImageProps & { problem: string | null 
 }
 
 function DrawnImage({ url, src, alt }: ImageProps & { url: string }) {
-  const [failed, setFailed] = useState(false);
-  if (failed) return <ImageText src={src} alt={alt} problem={`Couldn't show ${src}.`} />;
+  // Tied to the URL, so a reissued one gets another try.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  if (failedUrl === url) return <ImageText src={src} alt={alt} problem={`Couldn't show ${src}.`} />;
   return (
-    <img src={url} alt={alt} decoding="async" draggable={false} onError={() => setFailed(true)} />
+    <img src={url} alt={alt} decoding="async" draggable={false} onError={() => setFailedUrl(url)} />
   );
 }
 
@@ -59,11 +62,7 @@ function BlobImage({ assetUrl, src, alt }: ImageProps & { assetUrl: string }) {
       <ImageText
         src={src}
         alt={alt}
-        problem={
-          blob.failure === "too-large"
-            ? `${src} is larger than 10 MiB.`
-            : `Couldn't read ${src}. Check that the file exists.`
-        }
+        problem={blob.failure === "too-large" ? `${src} is larger than 10 MiB.` : unreadable(src)}
       />
     );
   }
@@ -90,7 +89,7 @@ function WorkspaceImage({
     }),
   );
   if (asset._tag === "Failure") {
-    return <ImageText src={src} alt={alt} problem={`Couldn't read ${src}.`} />;
+    return <ImageText src={src} alt={alt} problem={unreadable(src)} />;
   }
   const assetUrl =
     asset._tag === "Success" && httpBaseUrl !== null

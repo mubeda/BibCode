@@ -9,7 +9,8 @@ export type RichMarkdownImageSource =
   /** Not loaded: another scheme, an absolute path, or a path that leaves the workspace. */
   | { readonly kind: "refused" };
 
-const PASS_THROUGH_SCHEME = /^(?:https?|data|blob):/i;
+// `http:/x.png` without `//` would resolve against the page's own address.
+const PASS_THROUGH_SCHEME = /^(?:https?:\/\/|data:|blob:)/i;
 const ANY_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
 /**

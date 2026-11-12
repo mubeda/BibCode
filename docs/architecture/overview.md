@@ -3668,7 +3668,15 @@ sees partial source:
   so a diagram or code block pasted back keeps its fence's info string, and a
   diagram comes back as a diagram. A fence title is not shown. Other
   fenced code in the editable view has no syntax colors, and a click on a link
-  places the caret instead of opening it.
+  places the caret instead of opening it. Images use the same node-view and
+  portal pattern (`richMarkdownExtensions.ts`, `RichMarkdownImage.tsx`): the
+  editor never renders an `<img>` with the file's `src`, which would resolve
+  against the page. `richMarkdownImageSource.ts` resolves a relative `src`
+  against the Markdown file's folder and refuses other schemes, absolute paths
+  and any path that leaves the workspace before a request; the image is then
+  read through a `workspace-file` asset URL (which the server confines to the
+  project root again) and shown from a `blob:` URL by `FileMediaPreview`'s
+  loader, as the CSP allows. The document keeps the `src` as written.
 - **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)
   and `data-markdown-atomic`, so `markdown-clipboard.ts` copies a selection
   inside or across a diagram as its source, and the HTML flavor as an escaped
