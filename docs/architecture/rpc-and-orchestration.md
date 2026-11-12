@@ -4328,6 +4328,7 @@ projection built from named fields, never the RPC's own reply.
 | `refresh_providers`    | `server.refreshProviders` with no `instanceId`                                                                        | operate |
 | `process_diagnostics`  | `server.getProcessDiagnostics` and `server.getProcessResourceHistory`, without commands, labels or messages           | read    |
 | `trace_diagnostics`    | `server.getTraceDiagnostics`, without paths, causes or log entries                                                    | read    |
+| `host_metrics`         | `server.getHostMetrics` (one host Snapshot), without volume names, non-root mount points or hidden volumes' paths  | read    |
 
 The profiler tools take no RPC admission: they read files in process, as the stdio
 server does. A section of `diagnose_environment` that fails carries its error's tag

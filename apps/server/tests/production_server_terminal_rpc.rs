@@ -2217,6 +2217,7 @@ fn registrar_source_contains_every_owned_rpc_name() {
         "server.getProcessDiagnostics",
         "server.getProcessResourceHistory",
         "server.subscribeHostMetrics",
+        "server.getHostMetrics",
         "server.getProfilerStatus",
         "server.reportProfilerClientBatch",
         "server.getProviderUsage",
@@ -2793,6 +2794,44 @@ async fn host_metrics_stream_sends_a_snapshot_then_samples() {
         assert!(sequence(&samples[1]) > sequence(&samples[0]), "{samples:?}");
         let gap = sampled_at_ms(&samples[1]) - sampled_at_ms(&samples[0]);
         assert!((1..=10_000).contains(&gap), "samples {gap} ms apart");
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    collector.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// R82: the MCP `host_metrics` tool reads one Snapshot through `server.getHostMetrics`.
+#[tokio::test]
+async fn host_metrics_unary_answers_one_snapshot() {
+    let temp = TempDir::new().expect("temporary directory");
+    let collector = fixture_host_metrics();
+    collector.start_background();
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(
+        &mut registry,
+        fixture_services().with_host_metrics(collector.clone()),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let result = AssertUnwindSafe(async {
+        let socket = socket.as_mut().expect("socket");
+        let snapshot =
+            success_value(request(socket, "1", "server.getHostMetrics", json!({})).await);
+        assert_eq!(snapshot["_tag"], "Snapshot");
+        assert_eq!(snapshot["host"]["cpuCount"], 12);
+        assert_eq!(snapshot["sample"]["cpuPercent"], 23.5);
+        assert_eq!(snapshot["hiddenVolumes"], json!([]));
+        // A unary read never holds the collector at the live rate.
+        assert_eq!(collector.live_subscribers(), 0);
     })
     .catch_unwind()
     .await;

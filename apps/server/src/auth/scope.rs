@@ -69,6 +69,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getProcessDiagnostics"
         | "server.getProcessResourceHistory"
         | "server.subscribeHostMetrics"
+        | "server.getHostMetrics"
         | "server.getProfilerStatus"
         | "server.getProviderCapabilities"
         | "server.getProviderUsage"

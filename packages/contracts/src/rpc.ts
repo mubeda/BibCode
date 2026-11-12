@@ -373,6 +373,7 @@ import {
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
   ServerHostMetricsEvent,
+  ServerHostMetricsSnapshot,
   ServerSignalProcessInput,
   ServerSignalProcessResult,
   ServerUpsertKeybindingInput,
@@ -709,6 +710,7 @@ export const WS_METHODS = {
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverSubscribeHostMetrics: "server.subscribeHostMetrics",
+  serverGetHostMetrics: "server.getHostMetrics",
   serverGetProfilerStatus: "server.getProfilerStatus",
   serverReportProfilerClientBatch: "server.reportProfilerClientBatch",
   serverSignalProcess: "server.signalProcess",
@@ -941,6 +943,13 @@ export const WsServerSubscribeHostMetricsRpc = Rpc.make(WS_METHODS.serverSubscri
   success: ServerHostMetricsEvent,
   error: EnvironmentRpcError,
   stream: true,
+});
+
+/** One host Snapshot, for the MCP `host_metrics` tool (R82). */
+export const WsServerGetHostMetricsRpc = Rpc.make(WS_METHODS.serverGetHostMetrics, {
+  payload: Schema.Struct({}),
+  success: ServerHostMetricsSnapshot,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerGetProfilerStatusRpc = Rpc.make(WS_METHODS.serverGetProfilerStatus, {
@@ -2373,6 +2382,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerSubscribeHostMetricsRpc,
+  WsServerGetHostMetricsRpc,
   WsServerGetProfilerStatusRpc,
   WsServerReportProfilerClientBatchRpc,
   WsServerSignalProcessRpc,

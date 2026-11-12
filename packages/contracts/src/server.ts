@@ -623,21 +623,25 @@ export type ServerHostMetricsHiddenVolume = typeof ServerHostMetricsHiddenVolume
  * An item of `server.subscribeHostMetrics`: a `Snapshot` first, then one `Sample` per live
  * reading. A Sample carries `uptime` only when the subscriber has not been sent that chart yet.
  */
+/** The host's state at once: the stream's first item, and `server.getHostMetrics` (R82). */
+export const ServerHostMetricsSnapshot = Schema.TaggedStruct("Snapshot", {
+  host: ServerHostFacts,
+  bootId: Schema.NullOr(Schema.String),
+  startedAt: IsoDateTime,
+  statisticsSince: Schema.NullOr(IsoDateTime),
+  sample: Schema.NullOr(ServerHostMetricsSample),
+  cpu: Schema.NullOr(ServerHostMetricsStatistic),
+  memory: Schema.NullOr(ServerHostMetricsStatistic),
+  recent: Schema.Array(ServerHostMetricsChartPoint),
+  uptime: Schema.Array(ServerHostMetricsChartBucket),
+  hiddenVolumes: Schema.Array(ServerHostMetricsHiddenVolume).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+});
+export type ServerHostMetricsSnapshot = typeof ServerHostMetricsSnapshot.Type;
+
 export const ServerHostMetricsEvent = Schema.Union([
-  Schema.TaggedStruct("Snapshot", {
-    host: ServerHostFacts,
-    bootId: Schema.NullOr(Schema.String),
-    startedAt: IsoDateTime,
-    statisticsSince: Schema.NullOr(IsoDateTime),
-    sample: Schema.NullOr(ServerHostMetricsSample),
-    cpu: Schema.NullOr(ServerHostMetricsStatistic),
-    memory: Schema.NullOr(ServerHostMetricsStatistic),
-    recent: Schema.Array(ServerHostMetricsChartPoint),
-    uptime: Schema.Array(ServerHostMetricsChartBucket),
-    hiddenVolumes: Schema.Array(ServerHostMetricsHiddenVolume).pipe(
-      Schema.withDecodingDefault(Effect.succeed([])),
-    ),
-  }),
+  ServerHostMetricsSnapshot,
   Schema.TaggedStruct("Sample", {
     /** The snapshot's `statisticsSince`, so a stream that began before the first reading learns it. */
     statisticsSince: Schema.optionalKey(Schema.NullOr(IsoDateTime)),

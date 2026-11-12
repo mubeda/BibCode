@@ -442,6 +442,10 @@
       "mode": "unary"
     },
     {
+      "name": "server.getHostMetrics",
+      "mode": "unary"
+    },
+    {
       "name": "server.getProcessDiagnostics",
       "mode": "unary"
     },
@@ -1106,6 +1110,8 @@
     "typed-failures/server__getConfig-00.json",
     "typed-failures/server__getConfig-01.json",
     "typed-failures/server__getConfig-02.json",
+    "typed-failures/server__getHostMetrics-00.json",
+    "typed-failures/server__getHostMetrics-01.json",
     "typed-failures/server__getProcessDiagnostics-00.json",
     "typed-failures/server__getProcessDiagnostics-01.json",
     "typed-failures/server__getProcessResourceHistory-00.json",
@@ -1554,6 +1560,8 @@
     "typed-failures/server__getConfig-00.json": "c298bc2037cf8f13bb324ee4577dde33c4aac1d29bcc147d06286b00b5c83ea8",
     "typed-failures/server__getConfig-01.json": "b141caed2961004d11a558adc37cfee4944f1ee49667137d1a553b3d1ad9d623",
     "typed-failures/server__getConfig-02.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/server__getHostMetrics-00.json": "dc314faff42f01158f72c6b6ac11308814faeee7a4f37bbc0612cbf1652c1eda",
+    "typed-failures/server__getHostMetrics-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
     "typed-failures/server__getProcessDiagnostics-00.json": "dc314faff42f01158f72c6b6ac11308814faeee7a4f37bbc0612cbf1652c1eda",
     "typed-failures/server__getProcessDiagnostics-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
     "typed-failures/server__getProcessResourceHistory-00.json": "dc314faff42f01158f72c6b6ac11308814faeee7a4f37bbc0612cbf1652c1eda",
@@ -2170,6 +2178,8 @@
     "typed-failures/server__getConfig-00.json",
     "typed-failures/server__getConfig-01.json",
     "typed-failures/server__getConfig-02.json",
+    "typed-failures/server__getHostMetrics-00.json",
+    "typed-failures/server__getHostMetrics-01.json",
     "typed-failures/server__getProcessDiagnostics-00.json",
     "typed-failures/server__getProcessDiagnostics-01.json",
     "typed-failures/server__getProcessResourceHistory-00.json",

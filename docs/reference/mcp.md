@@ -704,7 +704,7 @@ refuses the next call.
 | `workspace`     | Threads and worktrees            | on      | threads (except `git_status`), worktrees, chat panels and UI suggestions, browser and device previews, clone |
 | `sourceControl` | Source Control and pull requests | on      | `git_status`, every `git_*` tool, pull requests                                                              |
 | `files`         | Files                            | on      | `files_*`                                                                                                    |
-| `diagnostics`   | Diagnostics                      | on      | profiler, environment, process and trace tools                                                               |
+| `diagnostics`   | Diagnostics                      | on      | profiler, environment, process, trace and host tools                                                         |
 | `terminals`     | Terminals                        | off     | `terminal_*`                                                                                                 |
 | (none)          | always on                        | —       | `server_capabilities`, `changes_since`                                                                       |
 
@@ -1144,6 +1144,7 @@ destructive, I idempotent, O open-world. **Keyed** is how a repeat behaves (see
 | `refresh_providers`           | Diagnostics                  | `diagnostics`   | operate              | I     | no             |
 | `process_diagnostics`         | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
 | `trace_diagnostics`           | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
+| `host_metrics`                | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
 | `server_capabilities`         | Change feed and capabilities | `(none)`        | read                 | RI    | no             |
 | `changes_since`               | Change feed and capabilities | `(none)`        | read                 | RI    | no             |
 | `create_chat_panel`           | Chat panels                  | `workspace`     | operate              | —     | receipt-backed |
@@ -4477,6 +4478,35 @@ A summary of the server's local trace: record and failure counts, log counts per
 
 - `McpInvalidArgumentError` - `limit` outside 1 to 20, not an integer, or an unknown argument.
 - Errors of `server.getTraceDiagnostics` are passed through under their own `_tag`.
+
+#### `host_metrics`
+
+The host this server runs on, as the Host dashboard shows it: its system, architecture, core count and memory; the current CPU, memory and volume sizes; and CPU, memory and each volume's used percent since the server started. A mount point is returned only when it is `/` or a drive root such as `C:\`, because any other one can name a user (`/media/<user>/<label>`). Use it to see whether the host is short of CPU, memory or disk space.
+
+- **Set / scope:** Diagnostics · `orchestration:read`
+- **Access:** any level
+- **Annotations:** `readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false`
+- **Retries:** no `clientRequestId` (read-only)
+
+| Argument | Type | Required | Limits and default       | Meaning |
+| -------- | ---- | -------- | ------------------------ | ------- |
+| (none)   |      |          | Any argument is refused. |         |
+
+**Result** (`structuredContent`):
+
+- `host`: `{ os, arch, cpuCount, memoryTotalBytes }`.
+- `startedAt`, `statisticsSince` (string or null).
+- `sample` (null before the first reading): `{ sampledAt, cpuPercent, memoryTotalBytes, memoryUsedBytes, memoryAvailableBytes, volumesPaused, volumes }`; each volume is `{ mountPoint, fileSystem, totalBytes, freeBytes, usedBytes, removable, readOnly, state ("ok"|"notResponding") }`, with `mountPoint` `null` unless it is a file system root.
+- `cpu`, `memory` (null before the first reading): `{ current, minimum, average, p95, maximum }`, in percent.
+- `volumeStatistics[]`: `{ mountPoint, statistic }`, each volume's used percent since start, with `mountPoint` kept by the same rule.
+- `mountPointsWithheld` (integer): how many of `sample.volumes` had their mount point replaced by `null`.
+- `hiddenVolumeCount` (integer): how many volumes the dashboard's filter hid (network, container layer, file mount, empty, same storage); they are counted, never listed.
+- Not included: volume names, non-root mount points, hidden volumes' paths, the recent and since-start charts, the boot ID.
+
+**Errors:**
+
+- `McpInvalidArgumentError` - any argument.
+- Errors of `server.getHostMetrics` are passed through under their own `_tag`.
 
 #### Example: diagnostics
 

@@ -22,7 +22,7 @@ use crate::{
         ProcessAttributionTotals, ProcessIdentity, ProcessResourceHistory, ProcessResourceTotals,
         ProcessRow, ProcessSignal, RuntimeProcessOwnership, SplitMetric, UiCoverage,
         UiCoverageStatus, bound_diagnostic_string,
-        host_metrics::{NativeHostMetricsSource, send_host_metrics},
+        host_metrics::{NativeHostMetricsSource, encode_snapshot, send_host_metrics},
         process_tree_metadata,
         profiler::{client::ingest_client_batch, runtime::ProfilerRuntime},
     },
@@ -646,6 +646,14 @@ fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTermin
             })
         },
     );
+
+    // One Snapshot for the MCP `host_metrics` tool; it answers from memory and never switches
+    // the collector to the live rate.
+    let collector = services.host_metrics.clone();
+    registry.register_unary("server.getHostMetrics", move |_request, _cancellation| {
+        let collector = collector.clone();
+        async move { Ok(encode_snapshot(&collector.snapshot().await)) }
+    });
 
     let monitor = services.process_monitor.clone();
     registry.register_unary(

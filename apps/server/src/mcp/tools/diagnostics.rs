@@ -82,6 +82,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec::client("trace_diagnostics", READ, &["server.getTraceDiagnostics"])
         .reads()
         .in_set(DIAGNOSTICS),
+    ToolSpec::client("host_metrics", READ, &["server.getHostMetrics"])
+        .reads()
+        .in_set(DIAGNOSTICS),
 ];
 
 pub(crate) const FAMILY: Family = Family {
@@ -111,6 +114,7 @@ fn call<'a>(
             "refresh_providers" => call.refresh_providers().await,
             "process_diagnostics" => call.process_diagnostics().await,
             "trace_diagnostics" => call.trace_diagnostics().await,
+            "host_metrics" => call.host_metrics().await,
             _ => Err(typed_tool_failure("McpUnknownToolError", "Unknown tool.")),
         }
     })
@@ -153,11 +157,85 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
                 &[],
             ),
         ),
+        "host_metrics" => (
+            "The host this server runs on: its system, architecture, core count and memory; the current CPU, memory and volume sizes; and CPU, memory and per-volume used percent since the server started (current, minimum, average, p95, maximum). A volume's mount point is given only when it is / or a drive root such as C:\\, and null otherwise; volume names and the volumes the dashboard hides are never listed, only counted.",
+            none(),
+        ),
         _ => return None,
     })
 }
 
 impl ToolCall<'_> {
+    async fn host_metrics(&self) -> ToolResult {
+        self.only(&[])?;
+        let snapshot = self.invoke("server.getHostMetrics", json!({})).await?;
+        let mut withheld = 0_u64;
+        let mut root_or_null = |mount_point: &Value| {
+            if mount_point.as_str().is_some_and(is_file_system_root) {
+                mount_point.clone()
+            } else {
+                withheld += 1;
+                Value::Null
+            }
+        };
+        let sample = &snapshot["sample"];
+        let sample = if sample.is_object() {
+            let mut picked = pick(sample, HOST_SAMPLE_FIELDS);
+            let volumes = sample["volumes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|volume| {
+                    let mut picked = pick(volume, HOST_VOLUME_FIELDS);
+                    picked["mountPoint"] = root_or_null(&volume["mountPoint"]);
+                    picked
+                })
+                .collect::<Vec<_>>();
+            picked["volumes"] = Value::Array(volumes);
+            picked
+        } else {
+            Value::Null
+        };
+        // Statistics name the same volumes; a withheld mount point is counted once, above.
+        let volume_statistics = snapshot["volumeStatistics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let mount_point = &entry["mountPoint"];
+                json!({
+                    "mountPoint": if mount_point.as_str().is_some_and(is_file_system_root) {
+                        mount_point.clone()
+                    } else {
+                        Value::Null
+                    },
+                    "statistic": pick(&entry["statistic"], STATISTIC_FIELDS),
+                })
+            })
+            .collect::<Vec<_>>();
+        let statistic = |value: &Value| {
+            if value.is_object() {
+                pick(value, STATISTIC_FIELDS)
+            } else {
+                Value::Null
+            }
+        };
+        Ok(tool_result(
+            json!({
+                "host": pick(&snapshot["host"], &["os", "arch", "cpuCount", "memoryTotalBytes"]),
+                "startedAt": snapshot["startedAt"],
+                "statisticsSince": snapshot["statisticsSince"],
+                "sample": sample,
+                "cpu": statistic(&snapshot["cpu"]),
+                "memory": statistic(&snapshot["memory"]),
+                "volumeStatistics": volume_statistics,
+                "mountPointsWithheld": withheld,
+                "hiddenVolumeCount": snapshot["hiddenVolumes"].as_array().map_or(0, Vec::len),
+            }),
+            &[],
+        ))
+    }
+
     /// Runs a stdio profiler handler over the server's own profiler directory, off the async
     /// workers, then projects its content.
     async fn profiler(&self, produce: Producer, project: fn(&mut Value)) -> ToolResult {
@@ -747,6 +825,33 @@ fn project_crash(content: &mut Value) {
 }
 
 /// The `fields` of `value` that it has; nothing else.
+const HOST_SAMPLE_FIELDS: &[&str] = &[
+    "sampledAt",
+    "cpuPercent",
+    "memoryTotalBytes",
+    "memoryUsedBytes",
+    "memoryAvailableBytes",
+    "volumesPaused",
+];
+/// Never `name`, and `mountPoint` only through [`is_file_system_root`] (D26).
+const HOST_VOLUME_FIELDS: &[&str] = &[
+    "fileSystem",
+    "totalBytes",
+    "freeBytes",
+    "usedBytes",
+    "removable",
+    "readOnly",
+    "state",
+];
+const STATISTIC_FIELDS: &[&str] = &["current", "minimum", "average", "p95", "maximum"];
+
+/// `/` or a drive root such as `C:\`: the only mount points that cannot name a user (D26).
+fn is_file_system_root(mount_point: &str) -> bool {
+    let bytes = mount_point.as_bytes();
+    mount_point == "/"
+        || (bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..] == b":\\")
+}
+
 fn pick(value: &Value, fields: &[&str]) -> Value {
     let mut picked = Map::new();
     for field in fields {
