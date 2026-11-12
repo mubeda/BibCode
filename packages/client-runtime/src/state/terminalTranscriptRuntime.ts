@@ -95,6 +95,9 @@ export function createTerminalTranscriptRuntime(
   const sourceProcesses = new WeakMap<object, ProcessKey>();
   const leftBoots = new Set<string>();
   let processKey: ProcessKey | undefined;
+  // `processKey` was closed by a close naming its generation; an older server's close is not
+  // fenced, since its processes are told apart only by a pid that can be reused.
+  let processClosed = false;
   let appliedSequence: number | undefined;
   let sizeSequence: number | undefined;
   let sequenceSource: object | undefined;
@@ -216,8 +219,9 @@ export function createTerminalTranscriptRuntime(
       const firstFromSource = !sourceProcesses.has(source);
       sourceProcesses.set(source, key);
       const order = compareProcesses(key, processKey, leftBoots);
-      // A delayed state of an earlier process, from a stream that has not caught up.
-      if (order < 0) return false;
+      // A delayed state of an earlier process, from a stream that has not caught up, or of
+      // the closed one: only a newer process reopens a closed terminal.
+      if (order < 0 || (order === 0 && processClosed)) return false;
       if (
         order === 0 &&
         source !== sequenceSource &&
@@ -236,6 +240,7 @@ export function createTerminalTranscriptRuntime(
         return false;
       }
       enterProcess(key);
+      processClosed = false;
       appliedSequence = sequence;
       sizeSequence = sequence;
       sequenceSource = source;
@@ -247,8 +252,10 @@ export function createTerminalTranscriptRuntime(
       const key = generationKey(event.generation);
       const order = compareProcesses(key, processKey, leftBoots);
       if (order < 0 || (order === 0 && metadata.status === "closed")) return false;
-      // The close outranks every process before it, so their delayed states stay out.
+      // The close outranks every process before it, and its own, so their delayed states stay
+      // out. The server issues a re-created terminal a newer process.
       enterProcess(key);
+      processClosed = true;
       return true;
     }
     // A stream still on an earlier process (it has not seen the restart yet).
