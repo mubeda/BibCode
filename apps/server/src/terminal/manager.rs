@@ -2795,31 +2795,6 @@ impl TerminalManager {
             }
             return Ok(snapshot);
         }
-        // Only Restarted resets surviving attachments' sequence cursors.
-        // A non-restart reopen leaves the first-attachment grant available.
-        let (first_attachment_grant_used, kept_owner) = {
-            let attachments = self
-                .inner
-                .size_claim_attachments
-                .lock()
-                .expect("terminal attachment claims");
-            let claims = attachments.get(&key);
-            // The window that sized the replaced process sizes the restarted one while it is
-            // still attached; left un-owned, every surviving window would race to claim it.
-            let kept_owner = carry_over.size_owner.take().filter(|owner| {
-                is_restart
-                    && claims.and_then(|claims| claims.get(&owner.claim)) == Some(&owner.attachment)
-            });
-            (
-                is_restart && claims.is_some_and(|claims| !claims.is_empty()),
-                kept_owner,
-            )
-        };
-        {
-            let mut session = session.lock().await;
-            session.first_attachment_grant_used = first_attachment_grant_used;
-            session.size_owner = kept_owner;
-        }
         #[cfg(test)]
         if is_restart {
             let barrier = self
@@ -2833,11 +2808,32 @@ impl TerminalManager {
                 barrier.release.notified().await;
             }
         }
+        // Registered before the owner check: an owner whose stream drops after the check finds
+        // this session, and its release waits for this publication lock (#348).
         self.inner
             .sessions
             .write()
             .await
-            .insert(key, session.clone());
+            .insert(key.clone(), session.clone());
+        {
+            let mut session = session.lock().await;
+            let attachments = self
+                .inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims");
+            let claims = attachments.get(&key);
+            // Only Restarted resets surviving attachments' sequence cursors.
+            // A non-restart reopen leaves the first-attachment grant available.
+            session.first_attachment_grant_used =
+                is_restart && claims.is_some_and(|claims| !claims.is_empty());
+            // The window that sized the replaced process sizes the restarted one while it is
+            // still attached; left un-owned, every surviving window would race to claim it.
+            session.size_owner = carry_over.size_owner.take().filter(|owner| {
+                is_restart
+                    && claims.and_then(|claims| claims.get(&owner.claim)) == Some(&owner.attachment)
+            });
+        }
         self.supervise(session.clone(), process, exit, generation.clone());
         uncommitted_process.commit();
         // The installed observer is now visible to the lifecycle snapshot used by disable.
