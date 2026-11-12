@@ -99,3 +99,16 @@
   outline-offset: 2px;
   border-radius: 0.375rem;
 }
+
+/* An image drawn from the workspace; while it loads or when it can't, its text stands in. */
+.rich-markdown-editor .rich-markdown-image img {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: bottom;
+}
+
+.rich-markdown-editor .rich-markdown-image.ProseMirror-selectednode {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}

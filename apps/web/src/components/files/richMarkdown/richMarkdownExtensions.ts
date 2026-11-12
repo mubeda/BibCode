@@ -19,6 +19,7 @@ import {
   fencedCode,
   type MermaidDiagramView,
 } from "./mermaidDiagramExtension";
+import { createNodeViewSet } from "./nodeViewSet";
 
 export type FormatName =
   | "paragraph"
@@ -115,8 +116,59 @@ const FencedCodeBlock = CodeBlock.extend({
   },
 });
 
+/** An image's place in the editor, where the surface loads it from the workspace. */
+export interface RichMarkdownImageView {
+  readonly id: number;
+  readonly element: HTMLElement;
+  /** The `src` as the file holds it. */
+  readonly src: string;
+  readonly alt: string;
+}
+
+let nextImageViewId = 0;
+
+/**
+ * Markdown puts images inside paragraphs. The editor never renders an `<img>` with the file's
+ * `src`: a relative path would resolve against the page's address, not the Markdown file's
+ * folder. The surface draws each image into its view; the document keeps the `src` unchanged.
+ */
+function createImageExtension(onViewsChange?: (views: readonly RichMarkdownImageView[]) => void) {
+  const views = createNodeViewSet(onViewsChange);
+  return Image.extend({
+    onDestroy() {
+      views.destroy();
+    },
+    addNodeView() {
+      return ({ node }) => {
+        const element = document.createElement("span");
+        element.className = "rich-markdown-image";
+        element.setAttribute("contenteditable", "false");
+        const view: RichMarkdownImageView = {
+          id: (nextImageViewId += 1),
+          element,
+          src: String(node.attrs["src"] ?? ""),
+          alt: String(node.attrs["alt"] ?? ""),
+        };
+        views.add(view);
+        return {
+          dom: element,
+          // An image with another source or text gets a new view.
+          update: (next) =>
+            next.type === node.type &&
+            String(next.attrs["src"] ?? "") === view.src &&
+            String(next.attrs["alt"] ?? "") === view.alt,
+          // React owns everything inside.
+          ignoreMutation: () => true,
+          destroy: () => views.delete(view),
+        };
+      };
+    },
+  }).configure({ inline: true });
+}
+
 function extensions(
   onDiagramViewsChange?: (views: readonly MermaidDiagramView[]) => void,
+  onImageViewsChange?: (views: readonly RichMarkdownImageView[]) => void,
 ): AnyExtension[] {
   return [
     StarterKit.configure({
@@ -134,8 +186,7 @@ function extensions(
     TaskList,
     TaskItem.configure({ nested: true }),
     TableKit.configure({ table: { resizable: false } }),
-    // Markdown puts images inside paragraphs.
-    Image.configure({ inline: true }),
+    createImageExtension(onImageViewsChange),
     ...createDetailsExtensions(),
     Markdown.configure({ markedOptions: { gfm: true } }),
   ];
@@ -208,10 +259,12 @@ export function createRichMarkdownEditor(input: {
   onUpdate(): void;
   /** Where each Mermaid diagram block sits, whenever one is added or removed. */
   onDiagramViewsChange?: (views: readonly MermaidDiagramView[]) => void;
+  /** Where each image sits, whenever one is added, removed or given another source. */
+  onImageViewsChange?: (views: readonly RichMarkdownImageView[]) => void;
 }): RichMarkdownEditor {
   const editor = new Editor({
     element: input.element,
-    extensions: extensions(input.onDiagramViewsChange),
+    extensions: extensions(input.onDiagramViewsChange, input.onImageViewsChange),
     content: input.body,
     contentType: "markdown",
     onUpdate: () => input.onUpdate(),

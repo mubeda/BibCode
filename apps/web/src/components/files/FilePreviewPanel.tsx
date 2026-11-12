@@ -891,6 +891,15 @@ export default function FilePreviewPanel({
   const richEditable = richMode?.editable === true && richEditor !== null;
   const activeRichEditor = renderMarkdown && richEditable ? (richEditor ?? null) : null;
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  const richMarkdownWorkspace = useMemo(
+    () => ({
+      environmentId,
+      threadId: threadRef.threadId,
+      cwd,
+      markdownPath: relativePath ?? "",
+    }),
+    [cwd, environmentId, relativePath, threadRef.threadId],
+  );
 
   useSyncExternalStore(
     activeRichEditor?.subscribe ?? subscribeUnavailable,
@@ -1193,6 +1202,7 @@ export default function FilePreviewPanel({
                   session={session}
                   contents={session.unsavedContents ?? file.data.contents}
                   onEditorChange={onRichEditorChange}
+                  workspace={richMarkdownWorkspace}
                   fallback={
                     <RenderedMarkdownSurface
                       session={session}

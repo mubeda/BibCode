@@ -43,7 +43,7 @@ type AssetBlobState =
  * way. The fetch also tells a 413 from a broken file, which an element cannot. The URL is
  * revoked when the asset URL changes or the preview goes away.
  */
-function useAssetBlobUrl(assetUrl: string): AssetBlobState {
+export function useAssetBlobUrl(assetUrl: string): AssetBlobState {
   const [state, setState] = useState<AssetBlobState>({ status: "loading" });
   useEffect(() => {
     const controller = new AbortController();

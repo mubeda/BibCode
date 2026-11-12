@@ -2555,6 +2555,13 @@ blocks show without syntax colors while
 you edit, and clicking a link places the caret in it instead of opening it; the
 read-only rendered view opens a link on a click.
 
+An image the file links by a relative path, such as `images/diagram.png`, is
+read from the project relative to the Markdown file, and the file keeps the path
+as written. An inserted image shows as soon as it is copied. While an image loads,
+or when it is missing, larger than 10 MiB, or outside the project, its text (or
+its file name) shows in its place, and hovering it says why. Web addresses load
+only if the app's security policy allows them.
+
 Undo and Redo work inside the view you are in. Rendered view starts a fresh
 history each time you enter it. When you switch to source view, everything you
 did in that visit is one Undo step there.

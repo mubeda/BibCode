@@ -1,6 +1,7 @@
 import { Node } from "@tiptap/core";
 
 import { isClosedMermaidFence } from "../../markdown/mermaidFence";
+import { createNodeViewSet } from "./nodeViewSet";
 
 /** A diagram's place in the editor, where the surface draws it with chat's Mermaid block. */
 export interface MermaidDiagramView {
@@ -32,22 +33,10 @@ let nextViewId = 0;
 export function createMermaidDiagramExtension(
   onViewsChange?: (views: readonly MermaidDiagramView[]) => void,
 ) {
-  const views = new Set<MermaidDiagramView>();
-  // One snapshot for every view a load or a transaction adds or removes, not one per view, and
-  // none once the editor is destroyed.
-  let scheduled = false;
-  let destroyed = false;
-  const publish = () => {
-    if (!onViewsChange || scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      if (!destroyed) onViewsChange([...views]);
-    });
-  };
+  const views = createNodeViewSet(onViewsChange);
   return Node.create({
     onDestroy() {
-      destroyed = true;
+      views.destroy();
     },
     name: "mermaidDiagram",
     group: "block",
@@ -109,7 +98,6 @@ export function createMermaidDiagramExtension(
           source: node.attrs["source"] as string,
         };
         views.add(view);
-        publish();
         return {
           dom: element,
           // A node with another source gets a new view, drawn for that source.
@@ -120,7 +108,6 @@ export function createMermaidDiagramExtension(
             event.target instanceof Element && event.target.closest("button") !== null,
           destroy: () => {
             views.delete(view);
-            publish();
           },
         };
       };

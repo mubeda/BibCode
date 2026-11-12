@@ -5,8 +5,13 @@ import type { FileEditingSession } from "../fileEditingSession";
 import { canReconcile, detectDominantEol, reconcileMarkdown } from "./markdownReconcile";
 import { splitFrontmatter } from "./markdownSupport";
 import type { MermaidDiagramView } from "./mermaidDiagramExtension";
+import { RichMarkdownImage, type RichMarkdownWorkspace } from "./RichMarkdownImage";
 import { RichMarkdownMermaid } from "./RichMarkdownMermaid";
-import { createRichMarkdownEditor, type RichMarkdownEditor } from "./richMarkdownExtensions";
+import {
+  createRichMarkdownEditor,
+  type RichMarkdownEditor,
+  type RichMarkdownImageView,
+} from "./richMarkdownExtensions";
 import "./richMarkdown.css";
 
 const SERIALIZE_DELAY_MS = 300;
@@ -25,6 +30,8 @@ export interface RichMarkdownSurfaceProps {
    * the text it opened.
    */
   readonly onEditorChange: (editor: RichMarkdownEditor | null, opened: string) => void;
+  /** Where the file's relative images are read from. */
+  readonly workspace: RichMarkdownWorkspace;
 }
 
 /**
@@ -36,11 +43,14 @@ export default function RichMarkdownSurface({
   session,
   contents,
   onEditorChange,
+  workspace,
 }: RichMarkdownSurfaceProps) {
   const [opened] = useState(() => ({ source: contents, ...splitFrontmatter(contents) }));
   const editorRef = useRef<HTMLDivElement>(null);
   // Changes only when a diagram block is added or removed, never on typing.
   const [diagrams, setDiagrams] = useState<readonly MermaidDiagramView[]>([]);
+  // Changes only when an image is added, removed or given another source.
+  const [images, setImages] = useState<readonly RichMarkdownImageView[]>([]);
 
   useEffect(() => {
     const element = editorRef.current;
@@ -81,6 +91,7 @@ export default function RichMarkdownSurface({
         timer = setTimeout(() => deliver(), SERIALIZE_DELAY_MS);
       },
       onDiagramViewsChange: setDiagrams,
+      onImageViewsChange: setImages,
     });
     before = editor.serialize();
     if (!canReconcile({ original: opened.body, before })) {
@@ -126,6 +137,13 @@ export default function RichMarkdownSurface({
       />
       {diagrams.map((view) =>
         createPortal(<RichMarkdownMermaid source={view.source} />, view.element, String(view.id)),
+      )}
+      {images.map((view) =>
+        createPortal(
+          <RichMarkdownImage workspace={workspace} src={view.src} alt={view.alt} />,
+          view.element,
+          String(view.id),
+        ),
       )}
     </div>
   );

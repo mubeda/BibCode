@@ -26,6 +26,7 @@
 ### Files
 
 - Markdown opens editable in rendered view, with a formatting group in the Files toolbar (paragraph, headings 1 to 5, bold, italic, strikethrough, bullet, numbered and task lists, block quote, a link dialog, Insert image next to the file, collapsible section). Undo and Redo work in both views and a save changes only what you edited; frontmatter and constructs the editor cannot represent stay as written or read-only. (#342)
+- Images a Markdown file links by a relative path show in the editable rendered view, read from the project relative to the file, in the desktop app, the browser and remote environments; an inserted image shows at once, and a path outside the project is not read. (#345)
 - Ticking a task checkbox in a read-only Markdown or `.mdx` file keeps the file's source Undo history. (#342)
 - Mermaid diagrams in an editable rendered Markdown file are drawn again, as one block that is not edited in place; the file's source is kept as written. (#342)
 - The Linux AppImage now carries its own GStreamer plugins for the audio Files previews in WAV, MP3, Ogg, WebM and FLAC files, instead of relying on the system's plugins, which its bundled GStreamer cannot load on newer distributions. M4A is not covered: its AAC decoder is not bundled.

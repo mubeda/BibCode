@@ -336,6 +336,33 @@ describe("packaged rich Markdown editing", () => {
     );
   });
 
+  it("shows an image the file links by a relative path (#345)", async () => {
+    // A 1x1 placeholder PNG next to the Markdown file's own folder.
+    const imagesPath = NodePath.join(preparedProjectPath, "images");
+    NodeFS.mkdirSync(imagesPath, { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(imagesPath, "pixel.png"),
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        "base64",
+      ),
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(preparedProjectPath, "notes-image.md"),
+      "Hello world\n\n![Placeholder pixel](images/pixel.png)\n",
+    );
+    await openNotes("notes-image.md");
+
+    await browser.waitUntil(
+      () =>
+        browser.execute((editorQuery: string) => {
+          const image = document.querySelector<HTMLImageElement>(`${editorQuery} img`);
+          return image !== null && image.complete && image.naturalWidth > 0;
+        }, richEditorSelector),
+      { timeoutMsg: "The relative image in notes-image.md never loaded." },
+    );
+  });
+
   it("opening and saving without editing leaves the file byte-identical", async () => {
     // R31: frontmatter, a table, a fenced code block, mixed list markers, no final newline.
     const path = NodePath.join(preparedProjectPath, "notes-untouched.md");
