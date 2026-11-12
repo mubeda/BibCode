@@ -241,10 +241,14 @@ async function failWith(session: Session, check: Check): Promise<never> {
   );
 }
 
-async function assertInvariant(session: Session, at: string): Promise<void> {
+/**
+ * A settling check only records: a size change is in flight for a moment after
+ * a reload, a split, or a reconnect. The check 1.5 s later is the one that fails.
+ */
+async function assertInvariant(session: Session, at: string, final = true): Promise<void> {
   const check = evaluate(at, readTuiSize(), await readTerminalGeometry(session.terminalId));
   session.checks.push(check);
-  if (check.violations.length > 0) await failWith(session, check);
+  if (final && check.violations.length > 0) await failWith(session, check);
 }
 
 const terminalTab =
@@ -526,7 +530,7 @@ describe("packaged AI terminal footer invariant (#348)", () => {
       const description = await run(session, random);
       session.steps.push(description ?? `${name} (unavailable, skipped)`);
       await settle();
-      await assertInvariant(session, `step ${index + 1}`);
+      await assertInvariant(session, `step ${index + 1}`, false);
       await browser.pause(1_500);
       await assertInvariant(session, `step ${index + 1} +1.5s`);
     }

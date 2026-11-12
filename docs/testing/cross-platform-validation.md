@@ -741,7 +741,8 @@ Terminal on the fixture TUI, which draws a footer on its last three rows and
 logs each PTY size, and drives random layout actions around it: the right
 panel's toggle, maximize and edge drag, the terminal's Activity panel, a center
 split or unsplit, tab and route switches, the sidebar, window resizes, and
-reloads. After each step, and again 1.5 s later, the PTY's rows must equal the
+reloads. Each step is measured once it settles and again 1.5 s later; only the
+later measurement fails the run. Then the PTY's rows must equal the
 rows xterm draws and the rows that fit the mount, the last row must sit inside
 every clipping ancestor, and with the DOM renderer the footer must be on the
 last row. `BIBCODE_E2E_FOOTER_SEED` (default 348) replays a run and
