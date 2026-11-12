@@ -9,6 +9,7 @@ import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
 import {
+  ensureLiveDesktopUiWebview,
   isDesktopUiApplicationRunning,
   isFinalDesktopUiSpec,
   requestDesktopUiApplicationExit,
@@ -169,6 +170,8 @@ export const config = {
     timeout: 120_000,
   },
   before: async () => {
+    // A webview that crashed in an earlier spec would fail this one with the same dead session.
+    await ensureLiveDesktopUiWebview();
     const pluginReady = await browser.execute(() => {
       const host = window as Window & {
         readonly wdioTauri?: {

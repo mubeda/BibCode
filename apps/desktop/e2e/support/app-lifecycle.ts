@@ -297,3 +297,53 @@ export async function stopRelaunchedDesktopUiApplication(): Promise<void> {
   child.kill("SIGTERM");
   await waitForDesktopUiApplicationExit(child.pid, 10_000).catch(() => child.kill("SIGKILL"));
 }
+
+/** Driver errors that mean the webview or its session is gone, not that a script misbehaved. */
+export function isDeadDesktopUiWebviewError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /invalid session id|no such (window|session)|session (deleted|not created)|window (was )?already closed|web ?view (not found|crashed|terminated)|ECONNREFUSED|ECONNRESET|socket hang up/i.test(
+      error.message,
+    )
+  );
+}
+
+export interface DeadWebviewRecovery {
+  readonly probe: () => Promise<unknown>;
+  readonly isRunning: () => Promise<boolean>;
+  readonly stopApplication: () => Promise<void>;
+  readonly relaunch: () => Promise<void>;
+}
+
+/**
+ * One trivial script before a spec file. When it fails with a dead-session error, the app is
+ * relaunched once (after ending a process that survived its webview), so a webview crash fails
+ * only the spec that hit it. Returns whether it relaunched.
+ */
+export async function recoverDeadDesktopUiWebview(deps: DeadWebviewRecovery): Promise<boolean> {
+  try {
+    await deps.probe();
+    return false;
+  } catch (error) {
+    if (!isDeadDesktopUiWebviewError(error)) throw error;
+  }
+  if (await deps.isRunning()) await deps.stopApplication();
+  await deps.relaunch();
+  return true;
+}
+
+async function stopRunningDesktopUiApplication(): Promise<void> {
+  const pid = desktopUiApplicationPid();
+  process.kill(pid, "SIGTERM");
+  await waitForDesktopUiApplicationExit(pid, 10_000).catch(() => process.kill(pid, "SIGKILL"));
+}
+
+/** The per-spec-file probe of the shared app; see {@link recoverDeadDesktopUiWebview}. */
+export function ensureLiveDesktopUiWebview(): Promise<boolean> {
+  return recoverDeadDesktopUiWebview({
+    probe: () => browser.execute(() => true),
+    isRunning: () => isDesktopUiApplicationRunning(),
+    stopApplication: stopRunningDesktopUiApplication,
+    relaunch: relaunchDesktopUiApplication,
+  });
+}
