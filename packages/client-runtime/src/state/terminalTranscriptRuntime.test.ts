@@ -818,6 +818,34 @@ describe("createTerminalTranscriptRuntime ordered by server generation (#348)", 
     expect(runtime.metadata().status).toBe("closed");
   });
 
+  it("delivers the size of a resync whose transcript another stream already applied", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const requester = { sizeClaim: "a" };
+    const other = { sizeClaim: "b" };
+    runtime.ingest(snapshotAt(1, 10, "h"), requester);
+    runtime.ingest(snapshotAt(1, 10, "h"), other);
+    const signals: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => signals.push(signal), "a");
+    // The requester's no-op acknowledgement at 11 reaches only its stream, which falls behind
+    // and loses it; the other stream delivers the next output.
+    runtime.ingest(outputAt(12, "!"), other);
+    // The server's catch-up for the requester carries the size as of 12.
+    runtime.ingest({ ...snapshotAt(1, 12, "h!"), resync: true }, requester);
+    expect(signals.slice(1)).toEqual([
+      { type: "delta", data: "!" },
+      {
+        type: "resized",
+        size: { cols: 80, rows: 30, sizeClaim: "a" },
+        sequence: 12,
+        generation: generation(1),
+      },
+    ]);
+    expect(runtime.snapshot()).toBe("h!");
+    // Once delivered, the same size position is not delivered again.
+    runtime.ingest({ ...snapshotAt(1, 12, "h!"), resync: true }, other);
+    expect(signals).toHaveLength(3);
+  });
+
   it("keeps a closed process closed when a delayed resync of it arrives", () => {
     const runtime = createTerminalTranscriptRuntime();
     const a = { sizeClaim: "a" };

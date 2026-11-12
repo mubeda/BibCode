@@ -978,7 +978,7 @@ function trackedTranscriptRuntime(initialSnapshot: string): {
   const detachRendererSpy = vi.fn();
   return {
     runtime: {
-      ingest: (event) => source.ingest(event),
+      ingest: (event, stream) => source.ingest(event, stream),
       attachRenderer: (sink, sizeClaim) => {
         const attachment = source.attachRenderer(sink, sizeClaim);
         let detached = false;
@@ -2737,7 +2737,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     const held = { cols: 151, rows: 50, sizeClaim: first };
     await act(async () =>
       view.runtime.ingest(
-        { type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } },
+        { type: "snapshot", snapshot: { ...terminalSnapshot(""), sequence: 2, size: held } },
         { sizeClaim: first },
       ),
     );
@@ -2757,7 +2757,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     // Its stream attaches with the same sequence the cache already holds.
     await act(async () =>
       view.runtime.ingest(
-        { type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } },
+        { type: "snapshot", snapshot: { ...terminalSnapshot(""), sequence: 2, size: held } },
         stream,
       ),
     );
@@ -2891,6 +2891,54 @@ describe("TerminalViewport mounted lifecycle", () => {
     vi.useRealTimers();
     expect(view.resizeSpy).not.toHaveBeenCalled();
     await server.release();
+    await view.flushFrame();
+    expect(view.fakeTerminal!.rows).toBe(20);
+  });
+
+  it("repairs rows from the requester's resync when its acknowledgement was lost (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const held = { cols: 80, rows: 20, sizeClaim: claim };
+    const requester = { sizeClaim: claim };
+    const other = { sizeClaim: "other-viewport" };
+    // The acknowledgement is held and never released: the requester's stream loses it.
+    serveResizes(view, held, { hold: true, source: requester });
+    const attached = {
+      type: "snapshot",
+      snapshot: { ...terminalSnapshot(""), sequence: 10, size: held },
+    } satisfies TerminalAttachStreamEvent;
+    await act(async () => {
+      view.runtime.ingest(attached, requester);
+      view.runtime.ingest(attached, other);
+    });
+    await act(async () =>
+      view.runtime.ingest(
+        { type: "resized", threadId: THREAD_ID, terminalId: "term-1", size: { ...held, rows: 30 } },
+        requester,
+      ),
+    );
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    expect(view.fakeTerminal!.rows).toBe(30);
+    // Another viewport's stream delivers the next output; the requester's catch-up follows.
+    await act(async () => {
+      view.runtime.ingest(
+        { type: "output", threadId: THREAD_ID, terminalId: "term-1", sequence: 12, data: "!" },
+        other,
+      );
+      view.runtime.ingest(
+        {
+          type: "snapshot",
+          resync: true,
+          snapshot: { ...terminalSnapshot("!"), sequence: 12, size: held },
+        },
+        requester,
+      );
+    });
     await view.flushFrame();
     expect(view.fakeTerminal!.rows).toBe(20);
   });
