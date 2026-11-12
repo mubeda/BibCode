@@ -4942,22 +4942,14 @@ function ChatViewContent(props: ChatViewProps) {
     () =>
       buildCodeReviewMenuReviewers(
         codeReviewAgentActions,
+        // A menu item names its own reason, not the saved reviewer's "change it in Settings".
         (action) =>
           codeReviewEnvironmentReason ??
-          codeReviewerReason(
-            resolveSavedCodeReviewer(
-              codeReviewAgentActions,
-              action.selection,
-              providerInstanceEntries,
-            ),
-          ),
+          (action.disabled
+            ? (action.disabledReason ?? `${action.label} is not available.`)
+            : codeReviewerReason({ action, reason: null })),
       ),
-    [
-      codeReviewAgentActions,
-      codeReviewEnvironmentReason,
-      codeReviewerReason,
-      providerInstanceEntries,
-    ],
+    [codeReviewAgentActions, codeReviewEnvironmentReason, codeReviewerReason],
   );
   const codeReviewGuard = savedCodeReviewer.action
     ? codeReviewGuardLine({
