@@ -5315,6 +5315,39 @@ describe("TerminalViewport mounted lifecycle", () => {
     },
   );
 
+  it("marks focus reports as the terminal's own even right after a key (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = {
+      terminalOrderedInput: true,
+      terminalSizeOwnership: true,
+      terminalUserInputClaim: true,
+    };
+    const view = await mountViewport();
+    const terminal = view.fakeTerminal!;
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    const mount = view.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    await view.flushFrame();
+    testState.writeCommand.mockClear();
+    // xterm answers `CSI ?1004h` and each focus change with a report through onData.
+    await act(async () => {
+      mount.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+      terminal.dataHandler?.("a");
+      terminal.dataHandler?.("\x1b[I");
+      terminal.dataHandler?.("\x1b[O");
+    });
+    await view.flushFrame();
+    const writes = testState.writeCommand.mock.calls.map(
+      ([request]) => request.input as { data: string; userInputClaim?: string | null },
+    );
+    expect(writes.map(({ data, userInputClaim }) => [data, userInputClaim])).toEqual([
+      ["a", claim],
+      ["\x1b[I", null],
+      ["\x1b[O", null],
+    ]);
+  });
+
   it("pipelines interactive and programmatic input on an ordered server before acknowledgement", async () => {
     testState.serverConfig!.environment.capabilities = { terminalOrderedInput: true };
     let completeFirst!: (result: unknown) => void;
@@ -8083,13 +8116,25 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   interface Stream {
     readonly claim: string;
     readonly runtime: TerminalTranscriptRuntime;
-    readonly source: object;
+    readonly source: { readonly sizeClaim: string };
   }
 
+  /**
+   * The ownership rules of `TerminalManager` in apps/server/src/terminal/manager.rs: attach,
+   * `resize_acknowledging`, `release_size_claim` and `note_input`, with the expectations of
+   * its tests `a_returning_owner_takes_the_size_back_from_an_unused_window` and
+   * `the_size_goes_to_the_remaining_viewer_typed_in_last` (#348).
+   */
   class FakeTerminalManager {
     cols = 80;
     rows = 24;
     owner: { claim: string; attachment: number } | null = null;
+    /** The released rule (v0.15.3): every release leaves the size un-owned. */
+    releasesToNobody = false;
+    private departedOwner: string | null = null;
+    private ownerUnusedSinceHandoff = false;
+    private readonly typedAt = new Map<string, number>();
+    private inputClock = 0;
     private readonly claims = new Map<string, number>();
     private readonly streams = new Map<number, Stream>();
     private readonly outbox: Array<() => void> = [];
@@ -8108,51 +8153,87 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
         this.publish();
       } else if (this.owner.claim === claim) {
         this.owner.attachment = id;
+      } else if (this.ownerUnusedSinceHandoff && this.departedOwner === claim) {
+        // The window last used came back before anyone used the one the size went to.
+        this.owner = { claim, attachment: id };
+        this.departedOwner = null;
+        this.ownerUnusedSinceHandoff = false;
+        this.publish();
       }
-      const stream = { claim, runtime, source: {} };
+      const stream = { claim, runtime, source: { sizeClaim: claim } };
       this.streams.set(id, stream);
       const snapshot = { ...terminalSnapshot(""), sequence: this.sequence, size: this.size() };
       this.outbox.push(() => runtime.ingest({ type: "snapshot", snapshot }, stream.source));
       return id;
     }
 
-    resize(claim: string | undefined, cols: number, rows: number): void {
+    /** `resize_acknowledging`: `acknowledge` is a caller that reads `structuredResult`. */
+    resize(
+      claim: string | undefined,
+      cols: number,
+      rows: number,
+      acknowledge = false,
+    ): TerminalResizeResult["outcome"] {
       if (claim === undefined) throw new Error("every renderer here negotiates ownership");
       const attachment = this.claims.get(claim);
-      if (attachment === undefined) return;
+      if (attachment === undefined) return "claimNotRegistered";
       const sizeChanged = this.cols !== cols || this.rows !== rows;
       const ownerChanged = this.owner?.claim !== claim;
-      if (!sizeChanged && !ownerChanged) return;
+      if (!sizeChanged && !ownerChanged) {
+        // Acknowledged on the requester's stream alone, in order with its output.
+        if (acknowledge) this.publish(attachment);
+        return "unchanged";
+      }
+      if (ownerChanged) {
+        this.departedOwner = null;
+        this.ownerUnusedSinceHandoff = false;
+      }
       this.cols = cols;
       this.rows = rows;
       this.owner = { claim, attachment };
       this.publish();
+      return "applied";
+    }
+
+    /** `note_input`: `null` is the terminal's own reply, `undefined` an older client's input. */
+    input(userInputClaim: string | null | undefined): void {
+      if (userInputClaim === null) return;
+      this.departedOwner = null;
+      this.ownerUnusedSinceHandoff = false;
+      if (userInputClaim !== undefined) this.typedAt.set(userInputClaim, ++this.inputClock);
     }
 
     drop(id: number): void {
       const stream = this.streams.get(id);
       if (!stream) return;
       this.streams.delete(id);
+      stream.runtime.releaseSource(stream.source);
       if (this.claims.get(stream.claim) === id) this.claims.delete(stream.claim);
-      if (this.owner?.attachment === id) {
-        this.owner = null;
-        this.publish();
-      }
+      if (this.owner?.attachment !== id) return;
+      // A lone remaining viewer takes the size at once; among several, the one typed in last.
+      for (const claim of this.typedAt.keys()) if (!this.claims.has(claim)) this.typedAt.delete(claim);
+      const remaining = [...this.claims];
+      const next = this.releasesToNobody
+        ? undefined
+        : remaining.length === 1
+          ? remaining[0]
+          : remaining
+              .filter(([claim]) => this.typedAt.has(claim))
+              .sort(([a], [b]) => this.typedAt.get(b)! - this.typedAt.get(a)!)[0];
+      this.departedOwner = this.owner.claim;
+      this.ownerUnusedSinceHandoff = next !== undefined;
+      this.owner = next ? { claim: next[0], attachment: next[1] } : null;
+      this.publish();
     }
 
     /** `resize` answered as a server that reads `structuredResult` does. */
     answer(claim: string | undefined, cols: number, rows: number): TerminalResizeResult {
-      const before = this.sequence;
-      this.resize(claim, cols, rows);
-      return {
-        outcome: this.sequence === before ? "unchanged" : "applied",
-        size: this.size(),
-        generation: null,
-        sequence: this.sequence,
-      };
+      const outcome = this.resize(claim, cols, rows, true);
+      return { outcome, size: this.size(), generation: null, sequence: this.sequence };
     }
 
-    private publish(): void {
+    /** Publishes the held size to every stream, or as an acknowledgement to one attachment. */
+    private publish(onlyFor?: number): void {
       this.sequence += 1;
       const event: TerminalAttachStreamEvent = {
         type: "resized",
@@ -8161,7 +8242,8 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
         sequence: this.sequence,
         size: this.size(),
       };
-      for (const stream of this.streams.values()) {
+      for (const [id, stream] of this.streams) {
+        if (onlyFor !== undefined && id !== onlyFor) continue;
         this.outbox.push(() => stream.runtime.ingest(event, stream.source));
       }
     }
@@ -8194,7 +8276,10 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   let hasFocus: { mockReturnValue(value: boolean): unknown };
 
   beforeEach(() => {
-    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    testState.serverConfig!.environment.capabilities = {
+      terminalSizeOwnership: true,
+      terminalUserInputClaim: true,
+    };
     server = new FakeTerminalManager();
     machines = [];
     hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
@@ -8209,6 +8294,12 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     testState.resizeCommand.mockImplementation(
       async ({ input }: { input: { cols: number; rows: number; sizeClaim?: string } }) => {
         server.resize(input.sizeClaim, input.cols, input.rows);
+        return AsyncResult.success(undefined);
+      },
+    );
+    testState.writeCommand.mockImplementation(
+      async ({ input }: { input: { userInputClaim?: string | null } }) => {
+        server.input(input.userInputClaim);
         return AsyncResult.success(undefined);
       },
     );
@@ -8453,26 +8544,45 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     ["height-only layout", { cols: 100, rows: 29 }],
     ["width layout", { cols: 99, rows: 30 }],
   ] as const)(
-    "shows the whole grid after the client's own stream drops and the host takes the size (%s)",
+    "gives the size back to the client when its own stream returns before anyone typed (%s)",
     async (_action, fit) => {
       hasFocus.mockReturnValue(true);
       const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
       hasFocus.mockReturnValue(false);
       const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
       await disconnect(client);
-      expect(view(host).owner).toBe("this window");
+      // The lone idle host inherits the size and fits it to its own box, which is not use.
+      expect(view(host)).toMatchObject({ grid: "120x50", owner: "this window" });
       await connect(client);
-      const requests = testState.resizeCommand.mock.calls.length;
       if (fit) await relayout(client, fit);
+      const clientFit = fit ?? { cols: 100, rows: 30 };
       expect(view(client)).toMatchObject({
-        grid: "120x50",
+        grid: `${clientFit.cols}x${clientFit.rows}`,
         clipped: false,
-        owner: "the other window",
-        notice: true,
+        owner: "this window",
+        notice: false,
       });
-      expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+      expect(view(host)).toMatchObject({ owner: "the other window", clipped: false });
     },
   );
+
+  it("keeps the size with the host the client's absence left it to once someone typed there", async () => {
+    hasFocus.mockReturnValue(true);
+    const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+    hasFocus.mockReturnValue(false);
+    const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
+    await disconnect(client);
+    const hostMount = host.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    await act(async () => {
+      hostMount.dispatchEvent(new KeyboardEvent("keydown", { key: "x", bubbles: true }));
+      xtermOf(host).dataHandler?.("x");
+    });
+    await server.deliver();
+    await connect(client);
+    expect(view(client)).toMatchObject({ grid: "120x50", owner: "the other window" });
+  });
 
   it.each([false, true])("scales the mirror the same with WebGL %s", async (webgl) => {
     testState.webglEnabled = webgl;
@@ -8526,18 +8636,84 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(view(client)).toMatchObject({ grid: "100x30", scale: 1, owner: "this window" });
   });
 
-  it("converges on one owner when two windows race for a released size", async () => {
+  it("leaves the size un-owned when the owner leaves two idle windows, until one is used", async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
     const third = await openWindow(THIRD, { cols: 90, rows: 28 });
-    await disconnect(host);
-    const owner = server.owner?.claim;
-    expect([claimOf(client), claimOf(third)]).toContain(owner);
-    const winner = owner === claimOf(client) ? client : third;
-    const loser = winner === client ? third : client;
-    expect(view(winner).clipped).toBe(false);
-    expect(view(loser).owner).toBe("the other window");
     const requests = testState.resizeCommand.mock.calls.length;
-    await relayout(loser, { cols: loser.fit.cols, rows: loser.fit.rows - 1 });
+    await disconnect(host);
+    expect(server.size()).toEqual({ cols: 120, rows: 50, sizeClaim: null });
+    await relayout(client, { cols: 100, rows: 29 });
+    hasFocus.mockReturnValue(true);
+    await act(async () => window.dispatchEvent(new FocusEvent("focus")));
+    await server.deliver();
     expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    // Neither window is sized for the grid, so each shows all of it.
+    expect(view(client)).toMatchObject({ grid: "120x50", owner: "nobody", clipped: false });
+    expect(view(third)).toMatchObject({ grid: "120x50", owner: "nobody", clipped: false });
+    const mount = third.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    await act(async () =>
+      mount.dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true })),
+    );
+    await server.deliver();
+    expect(view(third)).toMatchObject({ grid: "90x28", scale: 1, owner: "this window" });
+    expect(view(client)).toMatchObject({ grid: "90x28", owner: "the other window" });
+  });
+
+  it("gives the size to the remaining window typed in last when the owner leaves", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    const third = await openWindow(THIRD, { cols: 90, rows: 28 });
+    const typeIn = async (machine: Machine) => {
+      const mount = machine.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      await act(async () => {
+        mount.dispatchEvent(new KeyboardEvent("keydown", { key: "k", bubbles: true }));
+        xtermOf(machine).dataHandler?.("k");
+      });
+      await server.deliver();
+    };
+    await typeIn(third);
+    await typeIn(client);
+    await typeIn(host);
+    await disconnect(host);
+    expect(view(client)).toMatchObject({ grid: "100x30", owner: "this window", scale: 1 });
+    expect(view(third)).toMatchObject({ owner: "the other window", clipped: false });
+  });
+
+  it("lets the lone window claim at once on a server that releases every size to nobody", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    server.releasesToNobody = true;
+    const { host, client } = await serverHostOwnsTallerGrid();
+    await disconnect(host);
+    expect(view(client)).toMatchObject({ grid: "100x30", owner: "this window", scale: 1 });
+  });
+
+  it("gives the size back to the owner window when it is hidden and shown before anyone typed", async () => {
+    hasFocus.mockReturnValue(true);
+    const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+    hasFocus.mockReturnValue(false);
+    setUserActive(false);
+    const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
+    await setWindowVisible(client, false);
+    expect(view(host)).toMatchObject({ grid: "120x50", owner: "this window" });
+    await setWindowVisible(client, true);
+    expect(view(client)).toMatchObject({ grid: "100x30", owner: "this window", notice: false });
+    expect(view(host)).toMatchObject({ owner: "the other window", clipped: false });
+  });
+
+  it("does not take the size by focus while the page itself is not focused", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    const clientMount = client.mounted.container.querySelector<HTMLElement>(
+      "[data-terminal-xterm-mount]",
+    )!;
+    hasFocus.mockReturnValue(false);
+    setUserActive(true);
+    await act(async () =>
+      clientMount.dispatchEvent(new FocusEvent("focusin", { bubbles: true })),
+    );
+    await server.deliver();
+    expect(view(host).owner).toBe("this window");
   });
 });

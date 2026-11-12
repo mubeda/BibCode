@@ -27,6 +27,32 @@ describe("unattended windows (#348)", () => {
     },
   );
 
+  it.each(["attach", "focus"] as const)(
+    "does not take a live owner's size on %s while this page is not focused",
+    (trigger) => {
+      expect(shouldClaimTerminalSize({ ...base, trigger, documentFocused: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...base, trigger, documentFocused: true })).toBe(true);
+    },
+  );
+
+  it("waits for use of a size a newer server left un-owned, as for another window's", () => {
+    const unowned = { ...base, applied: { ...applied, sizeClaim: null }, unownedUntilUsed: true };
+    for (const trigger of ["attach", "focus"] as const) {
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, userActive: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, documentFocused: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...unowned, trigger })).toBe(true);
+    }
+    expect(shouldClaimTerminalSize({ ...unowned, trigger: "layout" })).toBe(false);
+    for (const trigger of ["pointer", "keypress", "fit"] as const) {
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, userActive: false })).toBe(true);
+    }
+    // Shown whole and with the notice, as a mirror of the window that left.
+    expect(terminalMirrorScale("mine", unowned.applied, { cols: 91, rows: 25 }, true)).toBe(0.5);
+    expect(terminalMirrorScale("mine", unowned.applied, { cols: 91, rows: 25 })).toBe(1);
+    expect(shouldShowTerminalSizeNotice(unowned)).toBe(true);
+    expect(shouldShowTerminalSizeNotice({ ...unowned, unownedUntilUsed: false })).toBe(false);
+  });
+
   it("still claims a released size and still claims on pointer, keypress and fit", () => {
     const released = { ...applied, sizeClaim: null };
     expect(
