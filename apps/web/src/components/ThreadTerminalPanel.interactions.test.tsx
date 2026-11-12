@@ -1056,6 +1056,7 @@ async function mountViewport(
     readonly focusRequestId?: number;
     readonly terminalId?: string;
     readonly terminalFontPreference?: TerminalFontPreference;
+    readonly command?: TerminalLaunchCommand;
   } = {},
 ) {
   testState.webglEnabled = options.webglEnabled ?? false;
@@ -1072,6 +1073,7 @@ async function mountViewport(
     onSessionExited,
     autoFocus: options.autoFocus ?? false,
     focusRequestId: options.focusRequestId ?? 0,
+    ...(options.command ? { command: options.command } : {}),
   } as Partial<ViewportProps>);
   testState.session = {
     buffer: options.initialSnapshot ?? "",
@@ -2549,6 +2551,118 @@ describe("TerminalViewport mounted lifecycle", () => {
         input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 20, sizeClaim: claim },
       });
       expect(view.fakeTerminal!.rows).toBe(20);
+    },
+  );
+
+  it.each(["idle", "pending claim", "replay", "remount"] as const)(
+    "shrinks an owned AI terminal to the rows left when its Activity panel appears (%s) (#348)",
+    async (scenario) => {
+      testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+      useCenterPanelStore.getState().openTerminalPanel(THREAD_REF, "terminal-codex");
+      useCenterPanelStore
+        .getState()
+        .setActivityPaneExpanded(THREAD_REF, "terminal:terminal-codex", true, "subagents");
+      await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
+      testState.activityState = {
+        snapshot: Option.none(),
+        status: "synchronizing",
+        error: Option.none(),
+        recentEntries: new Map(),
+      };
+      const view = await mountViewport({ terminalId: "terminal-codex", command: observedCommand() });
+      const claim = () =>
+        (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } }).terminal
+          .sizeClaim;
+      const held = { cols: 80, rows: 24, sizeClaim: claim() };
+      serveResizes(view, held);
+      await act(async () =>
+        view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
+      );
+      await view.flushFrame();
+      await view.flushMountFit();
+      expect(view.resizeSpy).not.toHaveBeenCalled();
+      const host = () =>
+        view.mounted.container.querySelector(
+          '[data-provider-terminal-activity-host="terminal-codex"]',
+        );
+      expect(host()?.querySelector("[data-activity-pane]")).toBeNull();
+
+      let releasePending: (() => void) | null = null;
+      if (scenario === "pending claim") {
+        // A claim for a slightly smaller box is still in flight.
+        const serve = view.resizeSpy.getMockImplementation()!;
+        view.resizeSpy.mockImplementationOnce(
+          (request) =>
+            new Promise((resolve) => {
+              releasePending = () => resolve(serve(request));
+            }),
+        );
+        xtermState.proposedDimensions = { cols: 80, rows: 22 };
+        await view.resizeContainer();
+        await view.flushFrame();
+        expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+      }
+      // The panel appears once observation is confirmed, and the browser reports the
+      // smaller terminal box.
+      await publishActivitySnapshot(activitySnapshot("terminal-codex"));
+      expect(host()?.querySelector('[data-activity-pane-expanded="true"]')).not.toBeNull();
+      xtermState.proposedDimensions = { cols: 80, rows: 18 };
+      if (scenario === "remount") {
+        await act(async () => {
+          view.mounted.root.render(<></>);
+        });
+        await view.setVisible(true);
+        await view.flushFrame();
+        await view.flushMountFit();
+        // The new renderer attaches with a new claim and the old owner's snapshot; dropping
+        // the old attachment then publishes a null owner.
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: { ...terminalSnapshot(""), size: held },
+          }),
+        );
+        await act(async () =>
+          view.runtime.ingest({
+            type: "resized",
+            threadId: THREAD_ID,
+            terminalId: "terminal-codex",
+            size: { ...held, sizeClaim: null },
+          }),
+        );
+      } else {
+        await view.resizeContainer();
+        if (scenario === "replay") {
+          // A catch-up snapshot taken before the claim replays the old size.
+          await act(async () =>
+            view.runtime.ingest({
+              type: "snapshot",
+              snapshot: { ...terminalSnapshot("replayed"), size: held },
+              resync: true,
+            }),
+          );
+        }
+        await view.flushFrame();
+      }
+      if (releasePending) {
+        await act(async () => releasePending!());
+      }
+      await view.flushFrame();
+      await view.flushMountFit();
+      await view.flushFrame();
+      expect(view.resizeSpy).toHaveBeenLastCalledWith({
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          threadId: THREAD_ID,
+          terminalId: "terminal-codex",
+          cols: 80,
+          rows: 18,
+          sizeClaim: claim(),
+        },
+      });
+      expect(view.fakeTerminal!.rows).toBe(18);
     },
   );
 
