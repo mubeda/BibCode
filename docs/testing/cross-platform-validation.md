@@ -3733,6 +3733,18 @@ sizes. Cover relevant:
   instructions…**, **Mod+Alt+Shift+R** outside a terminal, and the button's
   tooltip and disabled reasons in light and dark. Read the Profiler's findings
   afterwards;
+- Host dashboard: the packaged `host-dashboard` spec opens the status bar's
+  Resource Manager, chooses **Host dashboard**, and checks shapes only: the
+  sheet is titled with the local environment's name, the CPU figure is a
+  percentage, memory reads "… of …, N%", at least one volume is listed, the
+  statistics section starts with "Since" and has a row for a volume, and the
+  CPU reading's sample time changes within 3 s. When the host hides a volume
+  (a container's file mounts, the macOS data volume), it opens **Hidden
+  volumes (N)** and checks each row shows a reason and no size. It then closes
+  the sheet. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/host-dashboard.e2e.ts`. By hand, open the dashboard
+  from the environment menu and from Settings > Remote Servers too, and against
+  an older remote server check it asks to update the server;
 - Desktop export and close: the packaged `desktop-save-and-close` spec proves that
   **Export** on a custom theme writes the theme JSON through the real Save
   command (an end-to-end build writes to the path in
