@@ -63,6 +63,8 @@ describe("isDeadDesktopUiWebviewError", () => {
     "no such window: target window already closed",
     "Error: connect ECONNREFUSED 127.0.0.1:4445",
     "socket hang up",
+    // WebKitGTK after its web process was killed (Linux lab, 2026-11-12).
+    'javascript error: WebDriverError: Unsupported result type when running "execute/sync" with method "POST"',
   ])("recognises %s as a dead webview", (message) => {
     expect(isDeadDesktopUiWebviewError(new Error(message))).toBe(true);
   });

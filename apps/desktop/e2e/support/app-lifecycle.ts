@@ -298,11 +298,15 @@ export async function stopRelaunchedDesktopUiApplication(): Promise<void> {
   await waitForDesktopUiApplicationExit(child.pid, 10_000).catch(() => child.kill("SIGKILL"));
 }
 
-/** Driver errors that mean the webview or its session is gone, not that a script misbehaved. */
+/**
+ * Driver errors that mean the webview or its session is gone, not that a script misbehaved.
+ * WebKitGTK answers every script with "Unsupported result type" once its web process has died;
+ * the probe's `() => true` cannot produce that from a live page.
+ */
 export function isDeadDesktopUiWebviewError(error: unknown): boolean {
   return (
     error instanceof Error &&
-    /invalid session id|no such (window|session)|session (deleted|not created)|window (was )?already closed|web ?view (not found|crashed|terminated)|ECONNREFUSED|ECONNRESET|socket hang up/i.test(
+    /invalid session id|no such (window|session)|session (deleted|not created)|window (was )?already closed|web ?view (not found|crashed|terminated)|unsupported result type|ECONNREFUSED|ECONNRESET|socket hang up/i.test(
       error.message,
     )
   );
