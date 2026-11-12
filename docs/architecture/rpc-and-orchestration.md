@@ -5119,8 +5119,14 @@ is claimed again when the renderer's own stream attaches, even when that
 stream's snapshot is a state the shared runtime already applied; the client
 does not re-attach for it, since an attach can recreate a closed terminal. An
 `unchanged` claim for the geometry still awaiting its acknowledgement is not
-re-sent, so typing sends no repeated requests. With an older server (`null`
-answer) the next published size is the claim's outcome. Notice suppression
+re-sent, so typing sends no repeated requests. With an older server (a `null`
+answer, or one without a sequence) the client waits for no acknowledgement: the
+same geometry is not sent again until the server publishes a size, and the next
+published size is the claim's outcome. Such a server publishes nothing for an
+owner's claim of the size it already holds, so when the renderer owned a
+different size, one read repairs it: an attach without `cwd`, claim or restart,
+whose first snapshot alone is taken, which cannot create, restart or claim a
+session. Notice suppression
 covers the pending claim and its acknowledgement; after it the notice shows
 whenever another owner's size differs from this renderer's fit.
 A mirror scales its xterm element down to show the owner's whole grid, never
@@ -5145,8 +5151,19 @@ count only once it has delivered the snapshot or restart of the current
 process. Within a process each sequence is applied once: an event at or below
 the highest sequence another stream already applied is skipped, and size
 events keep their own watermark because only claimed streams receive them. A
+snapshot whose transcript another stream already applied still delivers its size
+when it is newer than the last size applied: a no-op acknowledgement reaches
+only its requester, and a requester that fell behind receives it only in its
+catch-up snapshot. While a claimed stream on the current process is live, the
+sequenced events of a stream without a claim are not applied; the claimed
+stream delivers them behind the sizes published before them, so no output is
+parsed at a size the server had already replaced. A stream is released when it
+ends, so an ended one holds nothing back. Such a mix lasts one scheduler task in
+practice (the ownership capability arriving after a claimless attach). A
 `closed` with a generation is applied by generation (once), not against
-another stream's sequence. With an older server (no generation) the `pid`
+another stream's sequence, and fences that process: a delayed snapshot or
+restart of it is dropped, and only a newer process, which the server issues to
+a re-created terminal, reopens it. With an older server (no generation) the `pid`
 tells processes apart as before, and a snapshot without one belongs to the
 last process. Pointer-down, focus and the first keydown of each frame
 re-measure the mount before deciding a claim.
