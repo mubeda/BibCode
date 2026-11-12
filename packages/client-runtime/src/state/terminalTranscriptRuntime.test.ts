@@ -603,6 +603,40 @@ describe("createTerminalTranscriptRuntime with several attach streams (#348)", (
     expect(runtime.snapshot()).toBe("newab");
   });
 
+  it("treats an exited snapshot (no pid) as the last process and keeps the first stream live", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const a = {};
+    const b = {};
+    const statuses: Array<string> = [];
+    runtime.ingest(at(10, "h"), a);
+    runtime.ingest(
+      {
+        type: "exited",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence: 11,
+        exitCode: 0,
+        exitSignal: null,
+      },
+      a,
+    );
+    runtime.subscribeMetadata((next) => statuses.push(next.status));
+    // A stream attached after the exit sees the same session without a pid.
+    runtime.ingest(
+      {
+        type: "snapshot",
+        snapshot: { ...snapshotData("h", "exited"), pid: null, sequence: 11 },
+      },
+      b,
+    );
+    runtime.ingest(
+      { type: "closed", threadId: "thread-1", terminalId: "terminal-1", sequence: 12 },
+      a,
+    );
+    expect(statuses).toEqual(["closed"]);
+    expect(runtime.metadata().generation).toBe(1);
+  });
+
   it("starts over for a snapshot of another process even at a lower sequence", () => {
     const runtime = createTerminalTranscriptRuntime();
     const a = {};

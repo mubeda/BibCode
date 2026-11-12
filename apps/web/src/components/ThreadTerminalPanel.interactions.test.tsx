@@ -2468,6 +2468,7 @@ describe("TerminalViewport mounted lifecycle", () => {
       view.runtime.ingest({ type: "snapshot", snapshot: { ...terminalSnapshot(""), size: held } }),
     );
     expect(view.fakeTerminal!.rows).toBe(20);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     // A stale size reaches this renderer (a missed or misordered event): 30 rows where 20 fit.
     await act(async () =>
       view.runtime.ingest({
@@ -2486,6 +2487,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     // A click measures and claims again, with the same silent answer.
     await act(async () => view.pointerDownOnSurface());
     await view.flushFrame();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
     expect(view.fakeTerminal!.rows).toBe(20);
     expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
     // A width change still produces an echo.
@@ -2511,11 +2513,71 @@ describe("TerminalViewport mounted lifecycle", () => {
     );
     expect(view.mounted.container.textContent).toContain("Sized for another window.");
     // The server answers success but publishes nothing (its claim was not registered).
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     await act(async () => view.pointerDownOnSurface());
     expect(view.resizeSpy).toHaveBeenCalledTimes(1);
     await view.flushFrame();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
     expect(view.fakeTerminal!.cols).toBe(151);
     expect(view.mounted.container.textContent).toContain("Sized for another window.");
+  });
+
+  it("keeps the old size until its echo when an owner's claim answer arrives first (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot(""), size: { cols: 80, rows: 24, sizeClaim: claim } },
+      }),
+    );
+    await view.flushFrame();
+    xtermState.proposedDimensions = { cols: 80, rows: 20 };
+    await view.resizeContainer();
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledTimes(1);
+    // The answer is in; output printed before the resize and the echo are still on the stream.
+    expect(view.fakeTerminal!.rows).toBe(24);
+    await act(async () => view.emitOutput("printed at 24 rows"));
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 20, sizeClaim: claim },
+      }),
+    );
+    await view.flushFrame();
+    expect(view.fakeTerminal!.rows).toBe(20);
+  });
+
+  it("does not flash the notice when a takeover answer arrives before its echo (#348)", async () => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    await act(async () =>
+      view.runtime.ingest({
+        type: "snapshot",
+        snapshot: { ...terminalSnapshot(""), size: { cols: 151, rows: 50, sizeClaim: "other" } },
+      }),
+    );
+    await act(async () => view.pointerDownOnSurface());
+    const claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+    await view.flushFrame();
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
+    await act(async () =>
+      view.runtime.ingest({
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        size: { cols: 80, rows: 24, sizeClaim: claim },
+      }),
+    );
+    expect(view.fakeTerminal!.cols).toBe(80);
+    expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
   });
 
   it.each(["keypress", "pointer", "focus"] as const)(
