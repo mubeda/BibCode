@@ -281,7 +281,8 @@ struct Shared {
     disk_view: SyncMutex<DiskView>,
     /// Each kept volume's used percent since start; a volume that goes keeps its entry.
     volume_statistics: SyncMutex<Vec<(PathBuf, RunningStatistic)>>,
-    /// What a volume read weighs: the nominal time between volume ticks at the current rate.
+    /// What a volume read admitted now weighs: the nominal time between volume ticks at the
+    /// current rate. Each job carries the weight it was admitted with.
     volume_weight: SyncMutex<Duration>,
     updates: SyncMutex<Option<UpdateSender>>,
     subscribers: watch::Sender<usize>,
@@ -680,19 +681,22 @@ impl Shared {
     }
 
     /// Records the used percent of each shown volume that `fresh` names, weighted by the
-    /// nominal time between volume reads, so a watched minute does not outweigh an hour.
-    fn record_volume_statistics(&self, shown: &[VolumeReading], fresh: &[PathBuf]) {
+    /// nominal time between volume reads when its read was admitted, so a watched minute does
+    /// not outweigh an hour.
+    fn record_volume_statistics(&self, shown: &[VolumeReading], fresh: &[(PathBuf, Duration)]) {
         if fresh.is_empty() {
             return;
         }
-        let weight = *lock(&self.volume_weight);
         let mut statistics = lock(&self.volume_statistics);
         for reading in shown {
             let mount_point = &reading.descriptor.mount_point;
             let (Some(total), Some(used)) = (reading.total_bytes, reading.used_bytes()) else {
                 continue;
             };
-            if total == 0 || reading.state != VolumeState::Ok || !fresh.contains(mount_point) {
+            let Some(&(_, weight)) = fresh.iter().find(|(fresh, _)| fresh == mount_point) else {
+                continue;
+            };
+            if total == 0 || reading.state != VolumeState::Ok {
                 continue;
             }
             let percent = used as f64 * 100.0 / total as f64;
@@ -755,13 +759,15 @@ impl Shared {
             let held = workers.has_work();
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
-                () = self.volume_tick.notified() => disks.admit_all(&workers),
+                () = self.volume_tick.notified() => {
+                    disks.admit_all(&workers, *lock(&self.volume_weight));
+                }
                 () = async {
                     match cadence.as_mut() {
                         Some(cadence) => { cadence.tick().await; }
                         None => std::future::pending().await,
                     }
-                } => disks.admit_all(&workers),
+                } => disks.admit_all(&workers, *lock(&self.volume_weight)),
                 () = workers.results_ready() => {}
                 () = tokio::time::sleep(HELD_CHECK), if held => {}
             }
@@ -775,9 +781,9 @@ impl Shared {
                         .iter()
                         .any(|volume| DiskTracker::key(volume) == result.key)
                 {
-                    fresh.push(mount_point.clone());
+                    fresh.push((mount_point.clone(), result.weight));
                 }
-                disks.apply(result, &workers);
+                disks.apply(result, &workers, *lock(&self.volume_weight));
             }
             disks.mark_hung(&workers, self.rates.volume_timeout);
             let (shown, merged) = merge_shared(disks.readings());
@@ -822,13 +828,18 @@ impl DiskTracker {
         }
     }
 
-    fn admit_all(&mut self, workers: &DiskWorkers) {
-        if workers.admit(DiskJob { key: Self::LISTING }) == Admission::Paused {
+    fn admit_all(&mut self, workers: &DiskWorkers, weight: Duration) {
+        if workers.admit(DiskJob {
+            key: Self::LISTING,
+            weight,
+        }) == Admission::Paused
+        {
             return;
         }
         for volume in &self.volumes {
             if workers.admit(DiskJob {
                 key: Self::key(volume),
+                weight,
             }) == Admission::Paused
             {
                 return;
@@ -836,12 +847,13 @@ impl DiskTracker {
         }
     }
 
-    fn apply(&mut self, result: DiskJobResult, workers: &DiskWorkers) {
+    /// `weight` is what a read this result admits weighs.
+    fn apply(&mut self, result: DiskJobResult, workers: &DiskWorkers, weight: Duration) {
         if result.key == Self::LISTING && std::mem::take(&mut self.listing_hung) {
             tracing::info!("host volume listing answered again");
         }
         match result.outcome {
-            DiskOutcome::Listed(Ok(listed)) => self.apply_listing(listed, workers),
+            DiskOutcome::Listed(Ok(listed)) => self.apply_listing(listed, workers, weight),
             // The listing failed: the volumes of the last listing that answered stay.
             DiskOutcome::Listed(Err(_)) => {}
             DiskOutcome::Space(space) => {
@@ -870,7 +882,12 @@ impl DiskTracker {
         }
     }
 
-    fn apply_listing(&mut self, listed: Vec<VolumeDescriptor>, workers: &DiskWorkers) {
+    fn apply_listing(
+        &mut self,
+        listed: Vec<VolumeDescriptor>,
+        workers: &DiskWorkers,
+        weight: Duration,
+    ) {
         self.listings += 1;
         let (kept, hidden) = pre_filter(listed);
         self.pre_hidden = hidden;
@@ -895,6 +912,7 @@ impl DiskTracker {
                     // A new volume is read at once, not at the next volume tick.
                     workers.admit(DiskJob {
                         key: Self::key(&volume),
+                        weight,
                     });
                     self.volumes.push(volume);
                 }

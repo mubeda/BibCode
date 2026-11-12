@@ -24,6 +24,8 @@ pub(crate) struct DiskJobKey {
 #[derive(Clone, Debug)]
 pub(crate) struct DiskJob {
     pub key: DiskJobKey,
+    /// What the read weighs in the statistics: the volume interval when it was admitted.
+    pub weight: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub(crate) enum DiskOutcome {
 #[derive(Debug)]
 pub(crate) struct DiskJobResult {
     pub key: DiskJobKey,
+    pub weight: Duration,
     pub outcome: DiskOutcome,
 }
 
@@ -139,6 +142,7 @@ impl Inner {
                 if !running.retired {
                     state.results.push(DiskJobResult {
                         key: job.key,
+                        weight: job.weight,
                         outcome,
                     });
                 }

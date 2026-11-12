@@ -1137,6 +1137,7 @@ async fn a_panicking_disk_call_fails_its_job_and_keeps_the_worker() {
                 mount_point: mount_point.map(PathBuf::from),
                 generation: 0,
             },
+            weight: Duration::from_secs(1),
         })
     };
 
@@ -1276,5 +1277,104 @@ async fn volume_statistics_follow_each_mount_point() {
     let wire = wire::encode_snapshot(&snapshot);
     assert_eq!(wire["volumeStatistics"][0]["mountPoint"], "/");
     assert_eq!(wire["volumeStatistics"][0]["statistic"]["current"], 60.0);
+    collector.shutdown().await;
+}
+
+/// Real clock with short rates: background 400 ms, live 100 ms, volumes every reading.
+fn quick_rates() -> HostMetricsRates {
+    HostMetricsRates {
+        background: Duration::from_millis(400),
+        live: Duration::from_millis(100),
+        volumes_every: 1,
+        ..HostMetricsRates::default()
+    }
+}
+
+fn volume_weight(collector: &HostMetricsCollector) -> Duration {
+    *lock(&collector.shared.volume_weight)
+}
+
+/// Releases `/`'s held second read at 80 percent used, after a first read at 40 percent, and
+/// returns the average once that read is recorded.
+async fn release_second_read_at_80_percent(
+    collector: &HostMetricsCollector,
+    second: &mpsc::Sender<VolumeSpace>,
+) -> f64 {
+    second
+        .send(VolumeSpace {
+            total_bytes: 100 * GB,
+            free_bytes: 20 * GB,
+        })
+        .expect("the second read is held");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some((_, statistic)) = collector.snapshot().await.volume_statistics.first()
+            && statistic.current == 80.0
+        {
+            return statistic.average;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second read was not recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// R83: a read admitted at the background rate keeps the background weight when it answers after
+/// the live rate starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_read_answering_while_live_keeps_the_background_weight() {
+    let source = Arc::new(BlockingHostMetricsSource::new(
+        FakeHostMetricsSource::new(vec![descriptor("/", "ext4")]).space("/", 100 * GB, 60 * GB),
+    ));
+    let second = source.hold_space("/", 1);
+    let third = source.hold_space("/", 2);
+    let collector = HostMetricsCollector::new(source.clone(), quick_rates(), identity());
+    collector.start_background();
+    wait_until("the second read of / is held", || {
+        source.inner.space_reads("/") == 2
+    })
+    .await;
+    let subscription = collector.subscribe();
+    wait_until("the live weight applies", || {
+        volume_weight(&collector) == Duration::from_millis(100)
+    })
+    .await;
+
+    let average = release_second_read_at_80_percent(&collector, &second).await;
+
+    // Both reads weigh one background interval.
+    assert!((average - 60.0).abs() < 1e-9, "average {average}");
+    drop((subscription, second, third));
+    collector.shutdown().await;
+}
+
+/// R83: a read admitted at the live rate keeps the live weight when it answers after the
+/// dashboard closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_read_answering_after_the_dashboard_closes_keeps_the_live_weight() {
+    let source = Arc::new(BlockingHostMetricsSource::new(
+        FakeHostMetricsSource::new(vec![descriptor("/", "ext4")]).space("/", 100 * GB, 60 * GB),
+    ));
+    let second = source.hold_space("/", 1);
+    let third = source.hold_space("/", 2);
+    let collector = HostMetricsCollector::new(source.clone(), quick_rates(), identity());
+    let subscription = collector.subscribe();
+    wait_until("the second read of / is held", || {
+        source.inner.space_reads("/") == 2
+    })
+    .await;
+    drop(subscription);
+    wait_until("the background weight applies", || {
+        volume_weight(&collector) == Duration::from_millis(400)
+    })
+    .await;
+
+    let average = release_second_read_at_80_percent(&collector, &second).await;
+
+    // Both reads weigh one live interval.
+    assert!((average - 60.0).abs() < 1e-9, "average {average}");
+    drop((second, third));
     collector.shutdown().await;
 }
