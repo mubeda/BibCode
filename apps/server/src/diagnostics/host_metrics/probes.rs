@@ -16,7 +16,7 @@ use super::{
     ChartState, CpuMemoryReading, HostFacts, HostMetricsCollector, HostMetricsIdentity,
     HostMetricsRates, HostMetricsSource, HostMetricsUpdate, SamplingError, VolumeDescriptor,
     VolumeReading, VolumeSpace, VolumeState, lock, merge_shared, native::NativeHostMetricsSource,
-    pre_filter, volume_reading, wire,
+    pre_filter, volume_reading, volumes::current_appimage, wire,
 };
 
 /// Lists every volume the native source returns and says whether the filter keeps or hides it.
@@ -25,7 +25,11 @@ use super::{
 fn volume_probe() {
     let source = Arc::new(NativeHostMetricsSource::new());
     let listed = source.list_volumes();
-    let (kept, mut hidden) = pre_filter(listed.clone(), std::env::current_exe().ok().as_deref());
+    let (kept, mut hidden) = pre_filter(
+        listed.clone(),
+        std::env::current_exe().ok().as_deref(),
+        current_appimage().as_deref(),
+    );
     let read = kept
         .into_iter()
         .map(

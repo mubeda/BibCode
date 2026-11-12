@@ -31,7 +31,7 @@ pub(crate) use wire::{encode_snapshot, send_host_metrics};
 
 use disk_workers::{Admission, DiskJob, DiskJobKey, DiskJobResult, DiskOutcome, DiskWorkers};
 use stats::{ChartHistory, RunningStatistic, clamp_percent};
-use volumes::{merge_shared, pre_filter};
+use volumes::{current_appimage, merge_shared, pre_filter};
 
 /// One volume as the source lists it, before any space read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -893,7 +893,11 @@ impl DiskTracker {
         weight: Duration,
     ) {
         self.listings += 1;
-        let (kept, hidden) = pre_filter(listed, std::env::current_exe().ok().as_deref());
+        let (kept, hidden) = pre_filter(
+            listed,
+            std::env::current_exe().ok().as_deref(),
+            current_appimage().as_deref(),
+        );
         self.pre_hidden = hidden;
         let mut previous = std::mem::take(&mut self.volumes);
         for descriptor in kept {

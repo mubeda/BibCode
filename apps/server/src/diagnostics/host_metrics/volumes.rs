@@ -93,7 +93,11 @@ fn is_system_memory_mount(descriptor: &VolumeDescriptor) -> bool {
 /// The running AppImage's own image: a read-only FUSE mount holding this executable. `APPDIR`
 /// is not trusted, since it can be inherited from another AppImage. Never `/`, which holds every
 /// executable: a read-only FUSE root is still the root volume.
-fn is_running_image(descriptor: &VolumeDescriptor, running_executable: Option<&Path>) -> bool {
+fn is_running_image(
+    descriptor: &VolumeDescriptor,
+    running_executable: Option<&Path>,
+    _appimage: Option<&Path>,
+) -> bool {
     let file_system = descriptor.file_system.as_str();
     descriptor.mount_point != Path::new("/")
         && (file_system == "fuse" || file_system.starts_with("fuse."))
@@ -102,11 +106,17 @@ fn is_running_image(descriptor: &VolumeDescriptor, running_executable: Option<&P
             .is_some_and(|executable| executable.starts_with(&descriptor.mount_point))
 }
 
+/// The AppImage file the runtime started this process from (`APPIMAGE`).
+pub(crate) fn current_appimage() -> Option<PathBuf> {
+    std::env::var_os("APPIMAGE").map(PathBuf::from)
+}
+
 /// Drops, before any space read, the volumes that must never be read.
 /// `running_executable` is this process's own executable, which an AppImage runs from its mount.
 pub(crate) fn pre_filter(
     listed: Vec<VolumeDescriptor>,
     running_executable: Option<&Path>,
+    appimage: Option<&Path>,
 ) -> (Vec<VolumeDescriptor>, Vec<HiddenVolume>) {
     let mut kept = Vec::with_capacity(listed.len());
     let mut hidden = Vec::new();
@@ -118,7 +128,7 @@ pub(crate) fn pre_filter(
         } else if descriptor.is_file {
             Some(HiddenReason::FileMount)
         } else if is_system_memory_mount(&descriptor)
-            || is_running_image(&descriptor, running_executable)
+            || is_running_image(&descriptor, running_executable, appimage)
         {
             Some(HiddenReason::System)
         } else {
@@ -234,7 +244,7 @@ mod tests {
                 panic!("{file_system}: a network mount point was stat")
             });
             assert!(!is_file, "{file_system}");
-            let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)], None);
+            let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)], None, None);
             assert_eq!(hidden[0].reason, HiddenReason::Network, "{file_system}");
         }
         for file_system in ["ext4", "apfs", "tmpfs", "overlay", "ntfs"] {
@@ -305,7 +315,7 @@ mod tests {
 
         let mut listed = vec![descriptor("C:\\", "NTFS"), descriptor("Z:\\", "NTFS")];
         add_unlisted_network(&mut listed, drives);
-        let (kept, hidden) = pre_filter(listed, None);
+        let (kept, hidden) = pre_filter(listed, None, None);
         let kept = kept
             .iter()
             .map(|volume| volume.mount_point.as_path())
@@ -333,7 +343,8 @@ mod tests {
             .iter()
             .map(|(descriptor, total, free)| (descriptor.mount_point.clone(), (*total, *free)))
             .collect::<Vec<_>>();
-        let (kept, mut hidden) = pre_filter(listed.into_iter().map(|(d, _, _)| d).collect(), None);
+        let (kept, mut hidden) =
+            pre_filter(listed.into_iter().map(|(d, _, _)| d).collect(), None, None);
         let read = kept
             .into_iter()
             .map(|descriptor| {
@@ -438,6 +449,7 @@ mod tests {
                     descriptor("/", "ext4"),
                     descriptor("/mnt/share", file_system),
                 ],
+                None,
                 None,
             );
 
@@ -545,6 +557,7 @@ mod tests {
                 descriptor("/dev/sdb1-mount", "ext4"),
             ],
             None,
+            None,
         );
 
         let kept = kept
@@ -588,6 +601,7 @@ mod tests {
                 read_only("/tmp/.mount_OtherY", "fuse.Other.AppImage"),
             ],
             Some(Path::new("/tmp/.mount_BiBCodX/usr/bin/bibcode-desktop")),
+            None,
         );
         assert_eq!(
             reason_of(&hidden, "/tmp/.mount_BiBCodX"),
@@ -599,6 +613,7 @@ mod tests {
         let (_, hidden) = pre_filter(
             vec![descriptor("/home", "fuse.mergerfs")],
             Some(Path::new("/home/test-user/bin/bibcode")),
+            None,
         );
         assert!(hidden.is_empty(), "a writable FUSE home is a real volume");
         let (_, hidden) = pre_filter(
@@ -606,6 +621,7 @@ mod tests {
                 "/tmp/.mount_BiBCodX",
                 "fuse.BiBCode-1.0.AppImage",
             )],
+            None,
             None,
         );
         assert!(hidden.is_empty(), "without the executable nothing matches");
@@ -617,11 +633,91 @@ mod tests {
         for file_system in ["fuse", "fuse.rootfs"] {
             let mut root = descriptor("/", file_system);
             root.read_only = true;
-            let (kept, hidden) =
-                pre_filter(vec![root], Some(Path::new("/usr/bin/bibcode-desktop")));
+            let (kept, hidden) = pre_filter(
+                vec![root],
+                Some(Path::new("/usr/bin/bibcode-desktop")),
+                None,
+            );
             assert!(hidden.is_empty(), "{file_system}: {hidden:?}");
             assert_eq!(kept.len(), 1, "{file_system}");
         }
+    }
+
+    /// #292 review: only the AppImage's own mount is the running image. An ordinary read-only FUSE
+    /// volume holding the executable stays shown, and an `APPIMAGE` inherited from another image
+    /// does not hide a mount that is not that image's.
+    #[test]
+    fn only_the_app_image_identity_hides_a_fuse_mount() {
+        let read_only = |mount_point: &str, file_system: &str| {
+            let mut volume = descriptor(mount_point, file_system);
+            volume.read_only = true;
+            volume
+        };
+        let hidden_mounts = |volume: VolumeDescriptor, executable: &str, appimage: Option<&str>| {
+            pre_filter(
+                vec![volume],
+                Some(Path::new(executable)),
+                appimage.map(Path::new),
+            )
+            .1
+            .len()
+        };
+
+        // An ordinary read-only FUSE volume holding the executable.
+        for appimage in [None, Some("/home/test-user/Apps/BiBCode-1.0.AppImage")] {
+            assert_eq!(
+                hidden_mounts(
+                    read_only("/mnt/tools", "fuse.gocryptfs"),
+                    "/mnt/tools/bin/bibcode",
+                    appimage
+                ),
+                0,
+                "{appimage:?}"
+            );
+        }
+        // The real descriptor: named after the image file, mounted under `.mount_`.
+        let image = Some("/home/test-user/Apps/BiBCode-1.0.AppImage");
+        let executable = "/tmp/.mount_BiBCodX/usr/bin/bibcode-desktop";
+        assert_eq!(
+            hidden_mounts(
+                read_only("/tmp/.mount_BiBCodX", "fuse.BiBCode-1.0.AppImage"),
+                executable,
+                image
+            ),
+            1
+        );
+        // The runtime's mount point alone identifies it, with no `APPIMAGE` at all.
+        assert_eq!(
+            hidden_mounts(read_only("/tmp/.mount_BiBCodX", "fuse"), executable, None),
+            1
+        );
+        // The image's file name alone identifies it, wherever it is mounted.
+        assert_eq!(
+            hidden_mounts(
+                read_only("/opt/image", "fuse.BiBCode-1.0.AppImage"),
+                "/opt/image/bin/bibcode",
+                image
+            ),
+            1
+        );
+        // An environment inherited from a foreign image names another file system and mount.
+        assert_eq!(
+            hidden_mounts(
+                read_only("/mnt/tools", "fuse.gocryptfs"),
+                "/mnt/tools/bin/bibcode",
+                Some("/home/test-user/Apps/Other.AppImage")
+            ),
+            0
+        );
+        // The root is never the image.
+        assert_eq!(
+            hidden_mounts(
+                read_only("/", "fuse.BiBCode-1.0.AppImage"),
+                "/usr/bin/bibcode",
+                image
+            ),
+            0
+        );
     }
 
     #[test]
