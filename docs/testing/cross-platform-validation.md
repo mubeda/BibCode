@@ -812,22 +812,15 @@ beside it. A passing run writes `terminal-footer-<seed>-passed.json` with its
 steps, the settling checks that disagreed and cleared, and the renderers seen.
 An edge drag that the driver cannot perform is logged as skipped.
 
-The spec `apps/desktop/e2e/specs/terminal-hidden-follow.e2e.ts` (not in the
-default list; run it with `BIBCODE_E2E_SPEC=./specs/terminal-hidden-follow.e2e.ts`
-and `BIBCODE_E2E_FOOTER_LAYOUT=cli`) shares the fixture thread helpers in
-`e2e/support/fixture-terminal.ts`. It first shrinks the window while the Codex
-Terminal is drawn and requires the view to stay at the bottom, then moves the
-terminal's center surface off-screen (xterm pauses its renderer and the mount
-keeps its size), shrinks the window so the PTY's rows shrink, lets the fixture
-CLI stream for 3 s, and brings the surface back with no size change: xterm's
-slider must end at its track's end and, with the DOM renderer (the default;
-`BIBCODE_E2E_FOOTER_RENDERER=webgl` keeps WebGL and checks only the slider),
-the footer must be on the last row. A missing slider or a track without height
-fails the check instead of passing as at the bottom. Green proves the repair for
-the off-screen route only: the release route (a 1000 px window whose right
-panel collapses the center column to a 0 px mount, which pauses xterm, while a
-second viewer shrinks the rows) needs a second viewer and is checked on the
-two-machine pair.
+A terminal whose view followed its output is returned to the bottom after its
+renderer was paused (#348). The packaged harness has no test for it: the field
+route needs a row shrink from another viewer while the terminal's mount is 0 px
+wide behind the right panel, and the harness has one window. A spec that moved
+the terminal off-screen and shrank the rows from its own window passed on the
+build that had the bug. The unit tests in
+`apps/web/src/components/terminalFollowOutput.test.ts` and the two-machine pair's
+replay (right panel dragged wide so the mount goes to 0 px, a row shrink from
+the other viewer, output, the panel closed) cover it.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
