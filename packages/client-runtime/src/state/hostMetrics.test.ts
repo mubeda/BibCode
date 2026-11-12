@@ -145,3 +145,63 @@ describe("accumulateHostMetrics", () => {
     expect(view.recent.at(-1)?.sampledAt).toBe(at(1_000));
   });
 });
+
+/** A sample carrying the ordering fields the server is asked to add (#292 review). */
+function orderedSampleEvent(
+  sampledAt: string,
+  extra: { readonly sequence?: number; readonly statisticsSince?: string },
+): ServerHostMetricsEvent {
+  const event = sampleEvent(sampledAt);
+  if (event._tag !== "Sample") throw new Error("unreachable");
+  return {
+    ...event,
+    ...(extra.statisticsSince === undefined ? {} : { statisticsSince: extra.statisticsSince }),
+    sample: {
+      ...event.sample,
+      ...(extra.sequence === undefined ? {} : { sequence: extra.sequence }),
+    },
+  } as ServerHostMetricsEvent;
+}
+
+function emptySnapshot(): ServerHostMetricsEvent {
+  const event = snapshot([]);
+  return { ...event, statisticsSince: null, cpu: null, memory: null } as ServerHostMetricsEvent;
+}
+
+describe("accumulateHostMetrics after an empty snapshot", () => {
+  it("takes the statistics start from the first sample", () => {
+    const { view } = run([emptySnapshot(), sampleEvent(at(5)), sampleEvent(at(6))]);
+    expect(view.statisticsSince).toBe(at(5));
+    expect(view.cpu).toEqual(STATISTIC);
+  });
+
+  it("prefers the start the server sends with a sample", () => {
+    const { view } = run([emptySnapshot(), orderedSampleEvent(at(5), { statisticsSince: at(2) })]);
+    expect(view.statisticsSince).toBe(at(2));
+  });
+});
+
+describe("accumulateHostMetrics ordering", () => {
+  it("orders by the server's sequence, so a clock moved backwards keeps values live", () => {
+    const first = snapshot([at(100)]);
+    const withSequence = {
+      ...first,
+      sample: { ...(first as { sample: ServerHostMetricsSample }).sample, sequence: 10 },
+    } as ServerHostMetricsEvent;
+    const { view, emitted } = run([
+      withSequence,
+      orderedSampleEvent(at(40), { sequence: 11 }),
+      orderedSampleEvent(at(41), { sequence: 11 }),
+      orderedSampleEvent(at(42), { sequence: 9 }),
+      orderedSampleEvent(at(43), { sequence: 12 }),
+    ]);
+    expect(emitted).toBe(3);
+    expect(view.sample?.sampledAt).toBe(at(43));
+  });
+
+  it("falls back to the timestamp when a sample has no sequence", () => {
+    const { view, emitted } = run([snapshot([at(100)]), sampleEvent(at(40))]);
+    expect(emitted).toBe(1);
+    expect(view.sample?.sampledAt).toBe(at(100));
+  });
+});

@@ -125,6 +125,20 @@ describe("presentHostDashboard", () => {
     expect(presentation.notice).toBe("Last updated 3 s ago");
   });
 
+  it("dims a snapshot whose sample the server says is old, even when it just arrived", () => {
+    const old = view();
+    const aged = view({ sample: { ...old.sample!, ageMs: 120_000 } as typeof old.sample });
+    const presentation = presentHostDashboard({ ...BASE, view: aged, lastItemAtMs: NOW_MS });
+    expect(presentation.state).toBe("stale");
+    expect(presentation.notice).toBe("Last updated 120 s ago");
+    const later = presentHostDashboard({ ...BASE, view: aged, lastItemAtMs: NOW_MS - 2_000 });
+    expect(later.notice).toBe("Last updated 122 s ago");
+    const fresh = view({ sample: { ...old.sample!, ageMs: 500 } as typeof old.sample });
+    expect(presentHostDashboard({ ...BASE, view: fresh, lastItemAtMs: NOW_MS }).state).toBe(
+      "live",
+    );
+  });
+
   it("keeps the last values dimmed while disconnected, even after a dropped request", () => {
     const presentation = presentHostDashboard({
       ...BASE,
