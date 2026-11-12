@@ -605,6 +605,13 @@ const TERMINAL_USER_INPUT_WINDOW_MS = 500;
 const TERMINAL_FOCUS_IN_REPORT = "\u001b[I";
 const TERMINAL_FOCUS_OUT_REPORT = "\u001b[O";
 
+/**
+ * How long a mount must hold its size before an automatic size claim (layout, attach) is
+ * sent. A panel opening, collapsing or being dragged passes through a few pixels on the way,
+ * which would size the program to 2 columns; a small panel that holds still is claimed (#348).
+ */
+export const TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS = 100;
+
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
 
@@ -1530,6 +1537,24 @@ export function TerminalViewport({
     let layoutChangedWhileClaimPending = false;
     // Hides the notice only while a claim is pending or waits for its acknowledgement.
     let claimNoticeSuppressed = false;
+    // Automatic claims wait for the mount to hold its size. A panel opening creates its
+    // terminal mid-transition; the mount has changed size again by the time the attach
+    // answer arrives, which stamps the change then.
+    let settledMountSize = { width: mount.clientWidth, height: mount.clientHeight };
+    let mountSizeChangedAt = Number.NEGATIVE_INFINITY;
+    let deferredClaimTimer: number | null = null;
+    // An attach claim may take another window's size; a later layout change keeps it pending.
+    let deferredTrigger: "layout" | "attach" | null = null;
+    const mountSettleRemaining = () => {
+      const width = mount.clientWidth;
+      const height = mount.clientHeight;
+      const now = performance.now();
+      if (width !== settledMountSize.width || height !== settledMountSize.height) {
+        settledMountSize = { width, height };
+        mountSizeChangedAt = now;
+      }
+      return mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS - now;
+    };
     let keypressMeasureFrame: number | null = null;
     // Geometry changes only through ordered size events; the answer names the one to wait for.
     let awaitedAcknowledgement: TerminalClaimAcknowledgement | null = null;
@@ -1640,6 +1665,7 @@ export function TerminalViewport({
       updateMirroringSize(
         !dismissedTerminalSizes.has(terminalTargetKey) &&
           !claimNoticeSuppressed &&
+          deferredTrigger !== "attach" &&
           sizeOwnership &&
           shouldShowTerminalSizeNotice({
             sizeClaim,
@@ -1717,6 +1743,22 @@ export function TerminalViewport({
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
+      // An automatic claim of a mount still changing size waits until it holds still, then
+      // runs once; the mirror scale still follows every change.
+      const settleRemaining =
+        trigger === "layout" || trigger === "attach" ? mountSettleRemaining() : 0;
+      if ((trigger === "layout" || trigger === "attach") && settleRemaining > 0) {
+        deferredTrigger = deferredTrigger === "attach" ? "attach" : trigger;
+        if (deferredClaimTimer !== null) window.clearTimeout(deferredClaimTimer);
+        deferredClaimTimer = window.setTimeout(() => {
+          const pending = deferredTrigger ?? "layout";
+          deferredClaimTimer = null;
+          deferredTrigger = null;
+          handleSizeTrigger(pending);
+        }, settleRemaining);
+        if (sizeOwnership) updateSizeNotice();
+        return;
+      }
       if (!sizeOwnership) {
         if (trigger !== "layout" || !terminalHostHasArea(mount)) return;
         const wasAtBottom = followsOutput();
@@ -2382,6 +2424,7 @@ export function TerminalViewport({
       lastRequestedSizeRef.current = null;
       window.clearTimeout(fitTimer);
       if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
+      if (deferredClaimTimer !== null) window.clearTimeout(deferredClaimTimer);
       if (keypressMeasureFrame !== null) window.cancelAnimationFrame(keypressMeasureFrame);
       outputSink.dispose();
       replyGuard.dispose();

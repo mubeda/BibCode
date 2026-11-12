@@ -698,6 +698,7 @@ vi.mock("~/components/ui/popover", () => ({
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
   releaseTerminalUiResources,
+  TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
   TerminalViewport,
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
@@ -9115,12 +9116,11 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       mountSizes.set(mountOf(machine), size);
       await relayout(machine, fit);
     };
-    // The panel waits TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS (100 ms) for a mount to hold still.
     const settle = async () => {
       await act(
         async () =>
           new Promise<void>((resolve) => {
-            setTimeout(resolve, 140);
+            setTimeout(resolve, TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS + 40);
           }),
       );
       await server.deliver();
