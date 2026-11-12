@@ -23,7 +23,9 @@ import {
   TerminalOpenInput,
   TerminalResizeError,
   TerminalResizeInput,
+  TerminalResizeResult,
   TerminalRestartInput,
+  TerminalSize,
   TerminalSessionSnapshot,
   TerminalSessionLookupError,
   TerminalSpawnError,
@@ -551,6 +553,27 @@ describe("TerminalResizeInput", () => {
       { threadId: "thread-1", cols: 80, rows: 24 },
       { rootTag: "Composite", paths: [["terminalId"]], containsTag: "MissingKey" },
     );
+  });
+});
+
+describe("TerminalResizeResult", () => {
+  const result = { size: null, generation: null, sequence: null };
+
+  it("decodes an outcome it does not know as one that changed nothing", () => {
+    expect(decodeSync(TerminalResizeResult, { ...result, outcome: "applied" }).outcome).toBe(
+      "applied",
+    );
+    expect(decodeSync(TerminalResizeResult, { ...result, outcome: "later" }).outcome).toBe(
+      "claimNotRegistered",
+    );
+  });
+
+  it("decodes the viewer named to answer queries, and its absence", () => {
+    const size = { cols: 80, rows: 24, sizeClaim: null };
+    expect(decodeSync(TerminalSize, { ...size, replyClaim: "renderer-a" }).replyClaim).toBe(
+      "renderer-a",
+    );
+    expect(decodeSync(TerminalSize, size).replyClaim).toBeUndefined();
   });
 });
 

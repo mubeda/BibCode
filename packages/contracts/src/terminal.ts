@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
@@ -197,7 +198,7 @@ export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInpu
  * answer carries another size than the request when the PTY refused that size on every
  * retry: then nothing new is published, and `sequence` names the size already published.
  */
-export const TerminalResizeOutcome = Schema.Literals([
+const CanonicalTerminalResizeOutcome = Schema.Literals([
   "applied",
   "unchanged",
   "sessionMissing",
@@ -205,6 +206,24 @@ export const TerminalResizeOutcome = Schema.Literals([
   "processAbsent",
   "generationInvalidated",
 ]);
+const isCanonicalTerminalResizeOutcome = Schema.is(CanonicalTerminalResizeOutcome);
+/**
+ * A newer server's outcome decodes as `claimNotRegistered`: the request changed nothing, so
+ * the client neither waits for an acknowledgement nor sends the same size again until the
+ * server's state changes. Encoding stays strict.
+ */
+export const TerminalResizeOutcome = Schema.String.pipe(
+  Schema.decodeTo(
+    CanonicalTerminalResizeOutcome,
+    SchemaTransformation.transformEffect({
+      decode: (value) =>
+        Effect.succeed(
+          isCanonicalTerminalResizeOutcome(value) ? value : ("claimNotRegistered" as const),
+        ),
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
 export type TerminalResizeOutcome = typeof TerminalResizeOutcome.Type;
 
 /**

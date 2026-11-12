@@ -633,6 +633,12 @@ describe("ServerHostMetricsEvent", () => {
     expect(() => decode({ ...snapshot, _tag: "Delta" })).toThrow();
   });
 
+  it("decodes a volume state it does not know as ok", () => {
+    const [volume] = sample.volumes;
+    const later = { ...snapshot, sample: { ...sample, volumes: [{ ...volume, state: "later" }] } };
+    expect(decode(later)).toMatchObject({ sample: { volumes: [{ state: "ok" }] } });
+  });
+
   it("round-trips the order, age, listing and statistics start fields, and accepts their absence", () => {
     const ordered = {
       ...sample,

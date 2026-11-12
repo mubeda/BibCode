@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import { ServerAuthDescriptor } from "./auth.ts";
 import {
@@ -546,6 +547,9 @@ export const ServerHostFacts = Schema.Struct({
 });
 export type ServerHostFacts = typeof ServerHostFacts.Type;
 
+const ServerHostMetricsVolumeState = Schema.Literals(["ok", "notResponding"]);
+const isServerHostMetricsVolumeState = Schema.is(ServerHostMetricsVolumeState);
+
 /** A volume's total and free bytes are relative to the user the server runs as. */
 export const ServerHostMetricsVolume = Schema.Struct({
   mountPoint: Schema.String,
@@ -556,7 +560,17 @@ export const ServerHostMetricsVolume = Schema.Struct({
   usedBytes: Schema.NullOr(NonNegativeInt),
   removable: Schema.Boolean,
   readOnly: Schema.Boolean,
-  state: Schema.Literals(["ok", "notResponding"]),
+  /** A newer server's state decodes as `ok`: the values shown are the ones it sent. */
+  state: Schema.String.pipe(
+    Schema.decodeTo(
+      ServerHostMetricsVolumeState,
+      SchemaTransformation.transformEffect({
+        decode: (value) =>
+          Effect.succeed(isServerHostMetricsVolumeState(value) ? value : ("ok" as const)),
+        encode: (value) => Effect.succeed(value),
+      }),
+    ),
+  ),
 });
 export type ServerHostMetricsVolume = typeof ServerHostMetricsVolume.Type;
 
