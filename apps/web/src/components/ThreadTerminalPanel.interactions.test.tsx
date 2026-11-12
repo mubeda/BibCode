@@ -9213,6 +9213,27 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       expect(claimsOf(owner).at(-1)).toBe("85x14");
     });
 
+    it("does not claim the sizing minimum at the maximum wait while a mount keeps moving", async () => {
+      hasFocus.mockReturnValue(true);
+      const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
+      await settle();
+      const before = claimsOf(owner).length;
+      // A drag that stays a few pixels wide past the 500 ms mark: the fit is 2 columns.
+      for (let step = 1; step <= 14; step += 1) {
+        await resizeMount(owner, { width: 3 + (step % 3), height: 400 }, { cols: 2, rows: 26 });
+        await act(
+          async () =>
+            new Promise<void>((resolve) => {
+              setTimeout(resolve, 50);
+            }),
+        );
+      }
+      expect(claimsOf(owner).slice(before)).toEqual([]);
+      await resizeMount(owner, { width: 860, height: 400 }, { cols: 121, rows: 26 });
+      await settle();
+      expect(claimsOf(owner).slice(before)).toEqual(["121x26"]);
+    });
+
     it("claims a small owner panel that holds still", async () => {
       hasFocus.mockReturnValue(true);
       const owner = await openWindow(CLIENT, { cols: 85, rows: 26 });
