@@ -609,7 +609,9 @@ size, with a note that it is **Sized for another window** and the scale; below
 half size it keeps the bottom rows in view and scrolls for the rest. If it has
 more room, it shows the terminal at normal size with empty space around it.
 The first click in a scaled window takes the size and returns it to normal
-size; it is not passed to the program. A window that regains focus without
+size; it is not passed to the program. After that click, or after **Fit to this
+window**, the terminal has keyboard focus, so what you type next reaches the
+program. A window that regains focus without
 anyone clicking or typing in it, such as a server host window after its display
 wakes, does not take the size, where its web view reports recent input (Safari
 16.4 and later on macOS); elsewhere a focused window still takes it. When the window that sized the terminal closes or

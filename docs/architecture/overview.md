@@ -1558,7 +1558,10 @@ up. The floor is 0.5: below it the mount scrolls and is pinned to the bottom
 rows, with a negative bottom margin giving the element its scaled scroll
 height. xterm maps the mouse to cells at full size, so a scaled element has
 `pointer-events: none`: clicks, hover, wheel and mouse reports reach the mount,
-whose pointerdown claims, and never xterm's cells. Only a
+whose pointerdown claims and focuses xterm, and never xterm's cells. The mount
+cancels a mousedown outside xterm's element, whose default would move focus off
+xterm, and **Fit to this window** focuses the terminal when it sends a claim,
+since that hides its button. Only a
 different-size mirror shows **Sized for another window** (with the scale when
 below 100%) and fit and dismiss actions. Manual
 dismissal is retained by terminal identity and applied dimensions/owner across

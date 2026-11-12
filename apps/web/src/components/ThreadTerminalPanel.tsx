@@ -973,6 +973,7 @@ export function TerminalViewport({
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
+    fit(): void;
     render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
@@ -1890,6 +1891,12 @@ export function TerminalViewport({
       sizeClaim,
       render,
       size: handleSizeTrigger,
+      fit() {
+        const pending = claimInFlight;
+        handleSizeTrigger("fit");
+        // The sent claim hides the notice and its button, so focus moves where the keys go.
+        if (claimInFlight !== null && claimInFlight !== pending) terminal.focus();
+      },
       dismissSizeNotice() {
         if (appliedSize) dismissedTerminalSizes.set(terminalTargetKey, appliedSize);
         updateSizeNotice();
@@ -2217,6 +2224,10 @@ export function TerminalViewport({
     };
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
+      // A click outside xterm's element (a scaled mirror takes no pointer input) lands on the
+      // unfocusable mount, whose default would take back the focus pointerdown gave xterm.
+      if (!(event.target instanceof Node && terminal.element?.contains(event.target)))
+        event.preventDefault();
       const tracking = terminal.modes.mouseTrackingMode !== "none";
       if (tracking && event.button === 2 && terminal.hasSelection()) {
         Object.defineProperty(event, forceSelectionKey, { value: true });
@@ -2814,7 +2825,7 @@ export function TerminalViewport({
             type="button"
             size="xs"
             variant="outline"
-            onClick={() => rendererRef.current?.size("fit")}
+            onClick={() => rendererRef.current?.fit()}
           >
             Fit to this window
           </Button>
