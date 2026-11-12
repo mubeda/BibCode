@@ -1987,6 +1987,8 @@ struct Inner {
     cancellation: CancellationToken,
     #[cfg(test)]
     restart_after_exact_cleanup_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
+    #[cfg(test)]
+    restart_before_register_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
 }
 
 #[derive(Clone)]
@@ -2052,6 +2054,8 @@ impl TerminalManager {
                 cancellation: CancellationToken::new(),
                 #[cfg(test)]
                 restart_after_exact_cleanup_barrier: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                restart_before_register_barrier: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -2815,6 +2819,19 @@ impl TerminalManager {
             let mut session = session.lock().await;
             session.first_attachment_grant_used = first_attachment_grant_used;
             session.size_owner = kept_owner;
+        }
+        #[cfg(test)]
+        if is_restart {
+            let barrier = self
+                .inner
+                .restart_before_register_barrier
+                .lock()
+                .expect("restart barrier lock")
+                .take();
+            if let Some(barrier) = barrier {
+                barrier.started.notify_one();
+                barrier.release.notified().await;
+            }
         }
         self.inner
             .sessions
@@ -7062,6 +7079,49 @@ mod tests {
         drop(owner);
         assert!(
             matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))
+        );
+        manager.shutdown().await;
+    }
+
+    /// The owner leaves while a restart is about to register the new session: its release finds
+    /// no session to update, so the restart must not hand the size to the departed owner (#348).
+    #[tokio::test]
+    async fn an_owner_leaving_before_the_restarted_session_registers_does_not_keep_the_size() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
+        let barrier = Arc::new(PublisherBarrier {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *manager
+            .inner
+            .restart_before_register_barrier
+            .lock()
+            .expect("restart barrier lock") = Some(barrier.clone());
+        let restarting = manager.clone();
+        let cwd = root.path().to_path_buf();
+        let restart = tokio::spawn(async move {
+            restarting
+                .restart(TerminalOpenInput::new("sizing", "term", cwd, 91, 42))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), barrier.started.notified())
+            .await
+            .expect("restart reaches the registration barrier");
+        let tasks = manager.inner.attachment_tasks.len();
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.inner.attachment_tasks.len() >= tasks {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the owner's release finishes");
+        barrier.release.notify_one();
+        restart.await.expect("restart task").expect("restart");
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.as_deref() != Some("owner"))
         );
         manager.shutdown().await;
     }
