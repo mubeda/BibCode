@@ -207,7 +207,8 @@ logical CPU count and total memory.
    Also skip, as a system mount, two kinds of volume the `linux-tmpfs` listing adds (#292,
    Linux lab): a memory-backed file system (`tmpfs`, `devtmpfs`, `ramfs`) mounted at or under
    `/dev`, `/run` or `/sys` (`/dev`, `/dev/shm`, `/run/user/<id>`), and a read-only FUSE mount
-   that holds the running executable (the AppImage's own image, which reports 0 B free).
+   that holds the running executable (the AppImage's own image, which reports 0 B free), never
+   `/`, which holds every executable.
    `APPDIR` is not used: it can be inherited from another AppImage. Both are decided from the
    listing and the executable's path, without reading the volume. A `tmpfs` mounted elsewhere
    (`/tmp`, `/mnt/...`) stays shown.

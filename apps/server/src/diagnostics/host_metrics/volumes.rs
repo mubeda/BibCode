@@ -64,10 +64,12 @@ fn is_system_memory_mount(descriptor: &VolumeDescriptor) -> bool {
 }
 
 /// The running AppImage's own image: a read-only FUSE mount holding this executable. `APPDIR`
-/// is not trusted, since it can be inherited from another AppImage.
+/// is not trusted, since it can be inherited from another AppImage. Never `/`, which holds every
+/// executable: a read-only FUSE root is still the root volume.
 fn is_running_image(descriptor: &VolumeDescriptor, running_executable: Option<&Path>) -> bool {
     let file_system = descriptor.file_system.as_str();
-    (file_system == "fuse" || file_system.starts_with("fuse."))
+    descriptor.mount_point != Path::new("/")
+        && (file_system == "fuse" || file_system.starts_with("fuse."))
         && descriptor.read_only
         && running_executable
             .is_some_and(|executable| executable.starts_with(&descriptor.mount_point))
@@ -532,6 +534,19 @@ mod tests {
             None,
         );
         assert!(hidden.is_empty(), "without the executable nothing matches");
+    }
+
+    /// #292 review: a read-only FUSE root holds the executable too, and is still the root volume.
+    #[test]
+    fn a_read_only_fuse_root_holding_the_executable_stays_shown() {
+        for file_system in ["fuse", "fuse.rootfs"] {
+            let mut root = descriptor("/", file_system);
+            root.read_only = true;
+            let (kept, hidden) =
+                pre_filter(vec![root], Some(Path::new("/usr/bin/bibcode-desktop")));
+            assert!(hidden.is_empty(), "{file_system}: {hidden:?}");
+            assert_eq!(kept.len(), 1, "{file_system}");
+        }
     }
 
     #[test]
