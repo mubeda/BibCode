@@ -60,6 +60,10 @@ vi.mock("../ui/tooltip", () => ({
     render ? cloneElement(render, undefined, children) : <>{children}</>,
 }));
 
+import { RegistryContext } from "@effect/atom-react";
+import { AtomRegistry } from "effect/reactivity";
+
+import { hostDashboardRequest } from "../../state/hostDashboard";
 import { EnvironmentContextCard } from "./EnvironmentContextCard";
 
 const ENV_REMOTE = EnvironmentId.make("env-remote");
@@ -192,6 +196,23 @@ describe("EnvironmentContextCard", () => {
     expect(card).toContain('data-sidebar-level="environment"');
     // The level rule paints the band, its radius and its leading accent rule.
     expect(card).not.toMatch(/\bbg-background\b|\bborder-border\b|\brounded-\[/);
+  });
+
+  it("opens the Host dashboard for this environment, before Disconnect", () => {
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment(SERVER_CONFIG);
+    const registry = AtomRegistry.make();
+    renderToStaticMarkup(
+      <RegistryContext.Provider value={registry}>
+        <EnvironmentContextCard />
+      </RegistryContext.Provider>,
+    );
+    const labels = h.menuItems.map((item) => item.children);
+    expect(labels.indexOf("Host dashboard")).toBe(labels.indexOf("Disconnect") - 1);
+    const item = h.menuItems.find((entry) => entry.children === "Host dashboard");
+    (item!.onClick as () => void)();
+    expect(registry.get(hostDashboardRequest)).toEqual({ environmentId: ENV_REMOTE });
   });
 
   it("disconnects through the latch and deep-links Manage", () => {

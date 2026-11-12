@@ -11,6 +11,11 @@ import { acquireBrowserSurface, useBrowserSurfaceStore } from "~/browser/browser
 const h = vi.hoisted(() => ({
   desktopHost: true,
   onOpenChange: undefined as ((open: boolean) => void) | undefined,
+  activeEnvironmentId: null as string | null,
+}));
+
+vi.mock("~/state/entities", () => ({
+  useActiveEnvironmentId: () => h.activeEnvironmentId,
 }));
 
 vi.mock("~/env", () => ({
@@ -34,9 +39,27 @@ vi.mock("../ui/popover", () => ({
     <button {...props}>{children}</button>
   ),
   PopoverContent: ({ children }: { children?: ReactNode }) => <section>{children}</section>,
+  PopoverClose: ({
+    children,
+    onClick,
+  }: {
+    children?: ReactNode;
+    onClick?: () => void;
+  }) => (
+    <button type="button" data-popover-close="" onClick={onClick}>
+      {children}
+    </button>
+  ),
 }));
 
+import { RegistryContext } from "@effect/atom-react";
+import { EnvironmentId } from "@bibcode/contracts";
+import { AtomRegistry } from "effect/reactivity";
+
+import { hostDashboardRequest } from "~/state/hostDashboard";
 import { ResourceUsageSegment } from "./ResourceUsageSegment";
+
+let registry = AtomRegistry.make();
 
 const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }> = [];
 const diagnostics = { diagnostics: null, queryError: null } as const;
@@ -52,12 +75,14 @@ async function mountResourceUsage(): Promise<{
   mounted.push(entry);
   await act(async () => {
     root.render(
-      <ResourceUsageSegment
-        diagnostics={diagnostics}
-        localDiagnostics={null}
-        terminalCount={0}
-        iconOnly={false}
-      />,
+      <RegistryContext.Provider value={registry}>
+        <ResourceUsageSegment
+          diagnostics={diagnostics}
+          localDiagnostics={null}
+          terminalCount={0}
+          iconOnly={false}
+        />
+      </RegistryContext.Provider>,
     );
   });
   return entry;
@@ -85,6 +110,8 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.desktopHost = true;
   h.onOpenChange = undefined;
+  h.activeEnvironmentId = null;
+  registry = AtomRegistry.make();
   vi.stubGlobal("navigator", { platform: "MacIntel" });
   useBrowserSurfaceStore.setState({ byTabId: {}, occlusionOwners: new Set() } as never);
 });
@@ -167,5 +194,25 @@ describe("ResourceUsageSegment memory metric", () => {
     const text = entry.container.textContent ?? "";
     expect(text).toContain("physical footprint on macOS, as in Activity Monitor");
     expect(text).toContain("resident memory on Linux and Windows");
+  });
+});
+
+describe("ResourceUsageSegment Host dashboard", () => {
+  it("opens the Host dashboard of the selected local environment and closes the popover", async () => {
+    h.activeEnvironmentId = "local";
+    const entry = await mountResourceUsage();
+    const button = [...entry.container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent === "Host dashboard",
+    );
+    expect(button?.hasAttribute("data-popover-close")).toBe(true);
+    await act(async () => button!.click());
+    expect(registry.get(hostDashboardRequest)).toEqual({
+      environmentId: EnvironmentId.make("local"),
+    });
+  });
+
+  it("offers no Host dashboard without a selected environment", async () => {
+    const entry = await mountResourceUsage();
+    expect(entry.container.textContent).not.toContain("Host dashboard");
   });
 });
