@@ -3,6 +3,7 @@
 import { AlertDialog as AlertDialogPrimitive } from "@base-ui/react/alert-dialog";
 
 import { cn } from "~/lib/utils";
+import { NativePreviewOcclusion } from "~/components/ui/useNativePreviewOcclusion";
 
 const AlertDialogCreateHandle = AlertDialogPrimitive.createHandle;
 
@@ -50,6 +51,7 @@ function AlertDialogPopup({
 }) {
   return (
     <AlertDialogPortal>
+      <NativePreviewOcclusion />
       <AlertDialogBackdrop />
       <AlertDialogViewport
         className={cn(bottomStickOnMobile && "max-sm:grid-rows-[1fr_auto] max-sm:p-0 max-sm:pt-12")}
