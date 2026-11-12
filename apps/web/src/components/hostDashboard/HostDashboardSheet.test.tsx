@@ -34,7 +34,6 @@ vi.mock("../ui/tooltip", () => ({
   TooltipTrigger: ({ render }: { render: ReactElement }) => render,
   TooltipPopup: () => null,
 }));
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => h.navigate }));
 vi.mock("~/hooks/useSettings", () => ({ useClientSettings: () => "locale" }));
 vi.mock("~/state/environments", () => ({ useEnvironment: () => h.environment }));
 vi.mock("~/state/server", () => ({
@@ -46,7 +45,7 @@ vi.mock("~/state/query", () => ({
     return {
       data: atom === null ? null : h.data,
       error: atom === null ? null : h.error,
-      isPending: atom !== null && h.data === null,
+      isPending: atom !== null && h.data === null && h.error === null,
       refresh: h.refresh,
     };
   },
@@ -113,7 +112,11 @@ function view(overrides: Partial<HostMetricsView> = {}): HostMetricsView {
     memory: { current: 35, minimum: 30, average: 33, p95: 36, maximum: 40 },
     recent: [
       { sampledAt: new Date(Date.now() - 2_000).toISOString(), cpuPercent: 20, memoryPercent: 34 },
-      { sampledAt: new Date(Date.now() - 1_000).toISOString(), cpuPercent: 23.5, memoryPercent: 35 },
+      {
+        sampledAt: new Date(Date.now() - 1_000).toISOString(),
+        cpuPercent: 23.5,
+        memoryPercent: 35,
+      },
     ],
     uptime: [
       {
@@ -165,7 +168,13 @@ async function render(onClose = vi.fn()) {
   }
   const target = root;
   await act(async () =>
-    target.render(<HostDashboardSheet environmentId={ENVIRONMENT_ID} onClose={onClose} />),
+    target.render(
+      <HostDashboardSheet
+        environmentId={ENVIRONMENT_ID}
+        onClose={onClose}
+        onOpenRemoteServers={h.navigate}
+      />,
+    ),
   );
   return { container: container!, onClose };
 }
@@ -197,11 +206,13 @@ describe("HostDashboardSheet", () => {
     expect(text()).not.toContain("—");
     const cpu = container!.querySelector('[data-testid="host-dashboard-cpu"]');
     expect(cpu?.textContent).toContain("23.5%");
-    expect(cpu?.getAttribute("data-sampled-at")).toBe((h.data as HostMetricsView).sample?.sampledAt);
-    expect(text()).toContain("12 cores");
-    expect(container!.querySelector('[data-testid="host-dashboard-memory"]')?.textContent).toContain(
-      "11.2 GB of 32.0 GB, 35%",
+    expect(cpu?.getAttribute("data-sampled-at")).toBe(
+      (h.data as HostMetricsView).sample?.sampledAt,
     );
+    expect(text()).toContain("12 cores");
+    expect(
+      container!.querySelector('[data-testid="host-dashboard-memory"]')?.textContent,
+    ).toContain("11.2 GB of 32.0 GB, 35%");
     const volumes = [...container!.querySelectorAll('[data-testid="host-dashboard-volume"]')];
     expect(volumes).toHaveLength(2);
     expect(volumes[0]?.textContent).toContain("/");
@@ -221,7 +232,10 @@ describe("HostDashboardSheet", () => {
   });
 
   it("dims the values after 3 seconds without an item", async () => {
-    vi.useFakeTimers({ now: Date.UTC(2026, 10, 11, 20, 0, 0), toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.useFakeTimers({
+      now: Date.UTC(2026, 10, 11, 20, 0, 0),
+      toFake: ["Date", "setInterval", "clearInterval"],
+    });
     h.data = view();
     await render();
     expect(text()).not.toContain("Last updated");
@@ -256,9 +270,9 @@ describe("HostDashboardSheet", () => {
     });
     await render();
     expect(text()).toContain("Server restarted at");
-    expect(container!.querySelector('[data-testid="host-dashboard-since"]')?.textContent).not.toContain(
-      "97.5%",
-    );
+    expect(
+      container!.querySelector('[data-testid="host-dashboard-since"]')?.textContent,
+    ).not.toContain("97.5%");
   });
 
   it("shows the failure with Retry, which subscribes again", async () => {
@@ -275,7 +289,7 @@ describe("HostDashboardSheet", () => {
 
   it("never asks an older server and points to Remote Servers", async () => {
     h.environment = environment({ hostMetrics: false });
-    const { onClose } = await render();
+    await render();
     expect(h.queries.length).toBeGreaterThan(0);
     expect(h.queries.every((query) => query === null)).toBe(true);
     expect(text()).toContain(
@@ -285,8 +299,7 @@ describe("HostDashboardSheet", () => {
       (button) => button.textContent === "Open Remote Servers",
     );
     await act(async () => open!.click());
-    expect(h.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
-    expect(onClose).toHaveBeenCalled();
+    expect(h.navigate).toHaveBeenCalledTimes(1);
   });
 
   it("closes the stream while the document is hidden, not when the window loses focus", async () => {
@@ -313,7 +326,7 @@ describe("HostDashboardSheet", () => {
     await act(async () =>
       mounted.render(
         <RegistryContext.Provider value={registry}>
-          <HostDashboardCoordinator />
+          <HostDashboardCoordinator onOpenRemoteServers={h.navigate} />
         </RegistryContext.Provider>,
       ),
     );

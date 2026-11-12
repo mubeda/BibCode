@@ -1,11 +1,17 @@
 import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
-import type { ServerHostMetricsStatistic, ServerHostMetricsVolume } from "@bibcode/contracts";
+import type {
+  ServerHostMetricsChartBucket,
+  ServerHostMetricsChartPoint,
+  ServerHostMetricsStatistic,
+  ServerHostMetricsVolume,
+} from "@bibcode/contracts";
 import type { TimestampFormat } from "@bibcode/contracts/settings";
 
 import {
   formatElapsedDurationLabel,
   formatChatTimestampTooltip,
   formatShortTimestamp,
+  formatTimestamp,
 } from "../../timestampFormat";
 import { formatCpuPercent, formatMemoryBytes } from "../status-bar/statusBarFormat";
 
@@ -207,4 +213,67 @@ export function presentHostDashboard(input: {
     };
   }
   return { state: "live", dimmed: false, notice: null, values };
+}
+
+export type HostMetricMeasure = "cpu" | "memory";
+
+export interface HostMetricBar {
+  readonly key: string;
+  readonly average: number;
+  readonly peak: number;
+  readonly tooltip: string;
+}
+
+/** The recent chart draws at most this many bars; each groups consecutive readings. */
+export const HOST_DASHBOARD_RECENT_BARS = 60;
+
+function barTooltip(time: string, average: number, peak: number): string {
+  return `${time}: average ${formatCpuPercent(average)}, peak ${formatCpuPercent(peak)}`;
+}
+
+/** Groups the last 15 minutes of readings into at most 60 bars of average and peak. */
+export function hostMetricsRecentBars(
+  recent: ReadonlyArray<ServerHostMetricsChartPoint>,
+  measure: HostMetricMeasure,
+  timestampFormat: TimestampFormat,
+): ReadonlyArray<HostMetricBar> {
+  const size = Math.max(1, Math.ceil(recent.length / HOST_DASHBOARD_RECENT_BARS));
+  const bars: HostMetricBar[] = [];
+  for (let start = 0; start < recent.length; start += size) {
+    const group = recent.slice(start, start + size);
+    const values = group.map((point) =>
+      measure === "cpu" ? point.cpuPercent : point.memoryPercent,
+    );
+    const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const peak = Math.max(...values);
+    bars.push({
+      key: group[0]!.sampledAt,
+      average,
+      peak,
+      tooltip: barTooltip(formatTimestamp(group[0]!.sampledAt, timestampFormat), average, peak),
+    });
+  }
+  return bars;
+}
+
+/** One bar per uptime bucket; the server sends at most 240 (D28). */
+export function hostMetricsUptimeBars(
+  uptime: ReadonlyArray<ServerHostMetricsChartBucket>,
+  measure: HostMetricMeasure,
+  timestampFormat: TimestampFormat,
+): ReadonlyArray<HostMetricBar> {
+  return uptime.map((bucket) => {
+    const average = measure === "cpu" ? bucket.cpuAverage : bucket.memoryAverage;
+    const peak = measure === "cpu" ? bucket.cpuPeak : bucket.memoryPeak;
+    return {
+      key: bucket.startedAt,
+      average,
+      peak,
+      tooltip: barTooltip(
+        formatChatTimestampTooltip(bucket.startedAt, timestampFormat),
+        average,
+        peak,
+      ),
+    };
+  });
 }

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   HOST_METRICS_UNSUPPORTED_MESSAGE,
+  hostMetricsRecentBars,
+  hostMetricsUptimeBars,
   isServerRestart,
   presentHostDashboard,
   shouldSubscribeToHostMetrics,
@@ -204,5 +206,39 @@ describe("presentHostDashboard", () => {
     ]) {
       expect(allText(presented)).not.toContain("—");
     }
+  });
+});
+
+describe("host metric bars", () => {
+  it("groups 900 recent readings into 60 bars of average and peak", () => {
+    const recent = Array.from({ length: 900 }, (_, index) => ({
+      sampledAt: new Date(NOW_MS - (900 - index) * 1_000).toISOString(),
+      cpuPercent: index % 15 === 0 ? 90 : 10,
+      memoryPercent: 40,
+    }));
+    const bars = hostMetricsRecentBars(recent, "cpu", "locale");
+    expect(bars).toHaveLength(60);
+    expect(bars[0]?.peak).toBe(90);
+    expect(bars[0]?.average).toBeCloseTo((90 + 14 * 10) / 15);
+    expect(bars[0]?.tooltip).toMatch(/: average 15\.3%, peak 90\.0%$/);
+    expect(hostMetricsRecentBars(recent.slice(0, 3), "memory", "locale")).toHaveLength(3);
+  });
+
+  it("draws one uptime bar per bucket", () => {
+    const bars = hostMetricsUptimeBars(
+      [
+        {
+          startedAt: STARTED_AT,
+          durationMs: 60_000,
+          cpuAverage: 10,
+          cpuPeak: 40,
+          memoryAverage: 30,
+          memoryPeak: 35,
+        },
+      ],
+      "memory",
+      "locale",
+    );
+    expect(bars).toEqual([expect.objectContaining({ key: STARTED_AT, average: 30, peak: 35 })]);
   });
 });

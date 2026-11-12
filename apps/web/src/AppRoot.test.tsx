@@ -22,6 +22,7 @@ import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
 import { registerPreviewRuntimeCapabilities } from "./previewRuntimeCapabilities";
 import { AppRoot, ProjectDataRecoveryCoordinator, ShareExposureReconciler } from "./AppRoot";
 import { RemoteUpdateConfirmationCoordinator } from "./components/settings/UpdateServerDialog";
+import { HostDashboardCoordinator } from "./components/hostDashboard/HostDashboardSheet";
 import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
 import { McpAuthorizationNotifier } from "./components/McpAuthorizationNotifier";
 import { UiIntentNotifier } from "./components/UiIntentNotifier";
@@ -56,7 +57,7 @@ describe("AppRoot", () => {
     const children = Children.toArray(
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
-    expect(children).toHaveLength(12);
+    expect(children).toHaveLength(13);
     expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
     expect(isValidElement(children[1]) && children[1].type).toBe(ShareExposureReconciler);
     expect(isValidElement(children[2]) && children[2].type).toBe(ThreadLifecycleReconciler);
@@ -65,16 +66,18 @@ describe("AppRoot", () => {
     expect(isValidElement(children[5]) && children[5].type).toBe(
       RemoteUpdateConfirmationCoordinator,
     );
-    expectTopBannerStack(children[6], router);
-    expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
-    expect(isValidElement(children[8]) && children[8].type).toBe(PreviewNewWindowRouter);
-    expect(isValidElement(children[9]) && children[9].type).toBe(OpenRequestRouter);
+    // The one Host dashboard sheet sits outside the router and navigates through it (#292).
+    expect(isValidElement(children[6]) && children[6].type).toBe(HostDashboardCoordinator);
+    expectTopBannerStack(children[7], router);
+    expect(isValidElement(children[8]) && children[8].type).toBe(PreviewAutomationHosts);
+    expect(isValidElement(children[9]) && children[9].type).toBe(PreviewNewWindowRouter);
+    expect(isValidElement(children[10]) && children[10].type).toBe(OpenRequestRouter);
     // An outside agent's UI suggestions raise notices outside the router, too.
-    expect(isValidElement(children[10]) && children[10].type).toBe(UiIntentNotifier);
-    expect((children[10] as ReactElement<{ router: AppRouter }>).props.router).toBe(router);
-    // So do a remote AI tool's requests to connect (#139, slice R).
-    expect(isValidElement(children[11]) && children[11].type).toBe(McpAuthorizationNotifier);
+    expect(isValidElement(children[11]) && children[11].type).toBe(UiIntentNotifier);
     expect((children[11] as ReactElement<{ router: AppRouter }>).props.router).toBe(router);
+    // So do a remote AI tool's requests to connect (#139, slice R).
+    expect(isValidElement(children[12]) && children[12].type).toBe(McpAuthorizationNotifier);
+    expect((children[12] as ReactElement<{ router: AppRouter }>).props.router).toBe(router);
   });
 
   it("mounts preview automation hosts for a preview bridge without full automation", () => {
@@ -94,8 +97,8 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
-    expect(children).toHaveLength(12);
-    expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
+    expect(children).toHaveLength(13);
+    expect(isValidElement(children[8]) && children[8].type).toBe(PreviewAutomationHosts);
   });
 
   it("mounts browser-mode automation hosts and open routing without a preview bridge", () => {
@@ -106,10 +109,10 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
-    expect(children).toHaveLength(12);
+    expect(children).toHaveLength(13);
     expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
     expect(isValidElement(children[4]) && children[4].type).toBe(RouterProvider);
-    expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
-    expect(isValidElement(children[9]) && children[9].type).toBe(OpenRequestRouter);
+    expect(isValidElement(children[8]) && children[8].type).toBe(PreviewAutomationHosts);
+    expect(isValidElement(children[10]) && children[10].type).toBe(OpenRequestRouter);
   });
 });

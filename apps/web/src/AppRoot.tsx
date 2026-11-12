@@ -19,6 +19,7 @@ import { useEnvironments } from "./state/environments";
 import { isDesktopLocalConnectionTarget } from "./connection/desktopLocal";
 import { useShareExposureReconciler } from "./state/shareExposureReconciler";
 import { RemoteUpdateConfirmationCoordinator } from "./components/settings/UpdateServerDialog";
+import { HostDashboardCoordinator } from "./components/hostDashboard/HostDashboardSheet";
 import { RemoteUpdateRequestNotifier } from "./components/RemoteUpdateRequestNotifier";
 import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
 import { McpAuthorizationNotifier } from "./components/McpAuthorizationNotifier";
@@ -162,6 +163,9 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       <ProjectDataRecoveryCoordinator />
       <RouterProvider router={router} />
       <RemoteUpdateConfirmationCoordinator />
+      <HostDashboardCoordinator
+        onOpenRemoteServers={() => void router.navigate({ to: "/settings/remote-servers" })}
+      />
       {isDesktopHost ? (
         <RemoteUpdateRequestNotifier
           onManageDevices={() => {
