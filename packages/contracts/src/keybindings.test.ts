@@ -102,6 +102,49 @@ it.effect("decodes a resolved list that names chat.find", () =>
   }),
 );
 
+// #293: a newer server may name a command this client does not have; that rule alone is
+// dropped instead of failing the whole server configuration.
+it.effect("drops resolved rules whose command this client does not know", () =>
+  Effect.gen(function* () {
+    const shortcut = {
+      key: "r",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: true,
+      altKey: false,
+      modKey: true,
+    };
+    const parsed = yield* decode(ResolvedKeybindingsConfig, [
+      { command: "sidebar.toggle", shortcut: { ...shortcut, key: "b" } },
+      { command: "future.command", shortcut },
+      { command: "script.build.run", shortcut: { ...shortcut, key: "u" } },
+    ]);
+    assert.deepStrictEqual(
+      parsed.map((rule) => rule.command),
+      ["sidebar.toggle", "script.build.run"],
+    );
+  }),
+);
+
+it("still rejects a resolved rule whose known command has a malformed shortcut", () => {
+  assert.isTrue(
+    Schema.decodeUnknownExit(ResolvedKeybindingsConfig)([
+      { command: "sidebar.toggle", shortcut: { key: "b" } },
+    ])._tag === "Failure",
+  );
+  assert.isTrue(
+    Schema.decodeUnknownExit(ResolvedKeybindingsConfig)([{ command: 7, shortcut: {} }])._tag ===
+      "Failure",
+  );
+});
+
+it("keeps user-written keybinding rules strict about the command", () => {
+  assert.isTrue(
+    Schema.decodeUnknownExit(KeybindingsConfig)([{ key: "mod+r", command: "future.command" }])
+      ._tag === "Failure",
+  );
+});
+
 it("accepts the center-terminal command", () => {
   assert.strictEqual(decodeKeybindingCommand("terminal.newCenter"), "terminal.newCenter");
 });
