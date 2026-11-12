@@ -2104,8 +2104,15 @@ mod tests {
             .expect("spawn root");
         let pid = root.id();
         let ownership = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        let started = std::time::Instant::now();
         let error = close_unix_process_group(pid as i32, &ownership, pid, refused)
             .expect_err("EPERM while the root runs is a failure");
+        // The wait blocks a runtime thread, so it gives up quickly on a root that keeps running.
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "refused close waited {:?}",
+            started.elapsed()
+        );
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         assert_eq!(
             *ownership
