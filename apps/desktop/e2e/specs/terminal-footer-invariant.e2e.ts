@@ -22,7 +22,8 @@ import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-sta
  *   - the PTY's rows (the TUI's last logged size) equal the rows xterm draws;
  *   - the rows xterm draws equal the rows that fit its mount;
  *   - the last row's bottom edge is inside every clipping ancestor; and
- *   - with the DOM renderer, the footer text is on the last row.
+ *   - with the DOM renderer, the footer text is on the last row (or, with
+ *     BIBCODE_E2E_FOOTER_LAYOUT=floating, appears exactly once at the current size).
  * BIBCODE_E2E_FOOTER_SEED and BIBCODE_E2E_FOOTER_STEPS replay or lengthen a run.
  */
 
@@ -49,6 +50,8 @@ function readPositiveInteger(name: string, fallback: number): number {
 }
 const seed = readPositiveInteger("BIBCODE_E2E_FOOTER_SEED", 348);
 const stepCount = readPositiveInteger("BIBCODE_E2E_FOOTER_STEPS", 40);
+/** "floating" runs a frame drawn in the normal buffer (like Claude's CLI), not pinned to the last row. */
+const floatingLayout = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "floating";
 
 /** mulberry32: small, deterministic, and enough to replay a failing sequence. */
 function createRandom(initial: number): () => number {
@@ -85,6 +88,8 @@ interface TerminalGeometry {
   readonly screenBottom: number;
   readonly domRows: number | null;
   readonly lastRows: ReadonlyArray<string>;
+  /** Every drawn row that holds the footer's last line, whatever its position. */
+  readonly footerRows: ReadonlyArray<string>;
   readonly clippedBy: ReadonlyArray<{ readonly element: string; readonly overflow: number }>;
   readonly notice: boolean;
   readonly viewport: { readonly width: number; readonly height: number };
@@ -101,6 +106,7 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
       screenBottom: 0,
       domRows: null,
       lastRows: [],
+      footerRows: [],
       clippedBy: [],
       notice: false,
       viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -108,7 +114,10 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
     const mount = document.querySelector<HTMLElement>(
       `[data-terminal-xterm-mount="${CSS.escape(id)}"]`,
     );
-    if (!mount || mount.getBoundingClientRect().height <= 0) return empty;
+    // A center column collapsed behind a maximized right panel keeps its height but has no
+    // width: nothing is shown, and the terminal deliberately keeps its last size (c192a96c7).
+    const mountRect = mount?.getBoundingClientRect();
+    if (!mount || !mountRect || mountRect.height <= 0 || mountRect.width <= 0) return empty;
     if (mount.closest('[data-visible="false"]') || getComputedStyle(mount).visibility === "hidden")
       return empty;
     const xterm = mount.querySelector<HTMLElement>(".xterm");
@@ -153,6 +162,12 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
         domRows === null
           ? []
           : [...rowsElement!.children].slice(-3).map((row) => (row.textContent ?? "").trimEnd()),
+      footerRows:
+        domRows === null
+          ? []
+          : [...rowsElement!.children]
+              .map((row) => (row.textContent ?? "").trimEnd())
+              .filter((text) => text.includes("fixture-footer-z")),
       clippedBy,
       notice: (mount.parentElement?.textContent ?? "").includes("Sized for another window"),
       viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -193,8 +208,25 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
     violations.push(`xterm draws ${xtermRows} rows but ${fitRows} fit its mount`);
   for (const clip of geometry.clippedBy)
     violations.push(`the last row is ${clip.overflow.toFixed(1)}px below ${clip.element}`);
-  if (geometry.renderer === "dom" && tui !== null && tui.rows >= 5) {
-    if (!geometry.lastRows.at(-1)?.startsWith(`fixture-footer-z ${tui.rows}`))
+  if (floatingLayout) {
+    // A frame drawn in the normal buffer sits wherever the cursor was, so only its count is
+    // known: the footer must appear exactly once at the current size, never stale or doubled.
+    if (geometry.renderer === "dom" && tui !== null) {
+      const expected = `fixture-footer-z ${tui.rows}`;
+      // A narrow terminal truncates the footer; a cut-off prefix still counts as it.
+      const current = geometry.footerRows.filter(
+        (text) => text.startsWith(expected) || expected.startsWith(text),
+      );
+      if (current.length !== 1)
+        violations.push(
+          `the footer appears ${current.length} times at ${tui.rows} rows: ${JSON.stringify(geometry.footerRows)}`,
+        );
+    }
+  } else if (geometry.renderer === "dom" && tui !== null && tui.rows >= 5) {
+    // A terminal narrower than the footer truncates it; a cut-off prefix is still the footer.
+    const last = geometry.lastRows.at(-1) ?? "";
+    const expected = `fixture-footer-z ${tui.rows}`;
+    if (!(last.startsWith(expected) || (last.length > 0 && expected.startsWith(last))))
       violations.push(`the footer is not on the last row: ${JSON.stringify(geometry.lastRows)}`);
   }
   return { at, tui, geometry, xtermRows, fitRows, violations };
@@ -501,7 +533,9 @@ async function openCodexTerminal(): Promise<string> {
 }
 
 describe("packaged AI terminal footer invariant (#348)", () => {
-  it("keeps the PTY, xterm and the visible mount in agreement across seeded layout changes", async () => {
+  it("keeps the PTY, xterm and the visible mount in agreement across seeded layout changes", async function () {
+    // Each step takes about 3 s; the configured case timeout alone ends the loop near step 40.
+    this.timeout(Math.max(this.timeout(), stepCount * 20_000));
     clearDesktopActivityMarker(preparedProjectPath);
     await setDesktopUiWindowSize(1_200, 720);
     await openFixtureThread();

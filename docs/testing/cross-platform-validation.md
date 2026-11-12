@@ -753,8 +753,13 @@ reloads. Each step is measured once it settles and again 1.5 s later; only the
 later measurement fails the run. Then the PTY's rows must equal the
 rows xterm draws and the rows that fit the mount, the last row must sit inside
 every clipping ancestor, and with the DOM renderer the footer must be on the
-last row. `BIBCODE_E2E_FOOTER_SEED` (default 348) replays a run and
-`BIBCODE_E2E_FOOTER_STEPS` (default 40) lengthens it. A violation fails with
+last row. A center column collapsed behind a maximized right panel (zero width)
+counts as not shown, and a footer cut off by a narrow terminal still counts as
+the footer. `BIBCODE_E2E_FOOTER_LAYOUT=floating` runs a frame drawn in the
+normal buffer, as Claude's CLI does, and checks instead that the footer appears
+exactly once at the current size. `BIBCODE_E2E_FOOTER_SEED` (default 348)
+replays a run and `BIBCODE_E2E_FOOTER_STEPS` (default 40) lengthens it; the
+case timeout grows with the step count. A violation fails with
 the seed, the steps so far, the measurements, and a
 `terminal-footer-<seed>-<step>-<time>.png` screenshot with a `.json` report
 beside it. An edge drag that the driver cannot perform is logged as skipped.

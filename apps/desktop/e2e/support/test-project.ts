@@ -358,9 +358,22 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
 // Each size is also appended inside .git, out of the worktree's status, where
 // the packaged scenario reads it: a WebGL terminal has no text in the DOM.
 if (process.stdout.isTTY) {
+  // BIBCODE_E2E_FOOTER_LAYOUT=floating draws a short frame in the normal buffer and redraws it
+  // in place, as Claude's CLI does, instead of pinning a footer to the last row.
+  const floatingFrame = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "floating";
+  let floatingLines = 0;
   const drawTerminalSize = () => {
     const rows = process.stdout.rows;
     const size = process.stdout.columns + "x" + rows;
+    if (floatingFrame) {
+      const frame = ["fixture-tui " + size, "fixture-footer-a " + size, "fixture-footer-b", "fixture-footer-z " + rows];
+      process.stdout.write((floatingLines > 0 ? "\x1b[" + floatingLines + "A\r\x1b[J" : "") + frame.join("\r\n") + "\r\n");
+      floatingLines = frame.length;
+      try {
+        fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
+      } catch {}
+      return;
+    }
     // A footer on the last three rows, as an agent CLI draws one, shows a clipped bottom (#348).
     const footer = rows >= 5
       ? "\x1b[" + (rows - 2) + ";1Hfixture-footer-a " + size +
