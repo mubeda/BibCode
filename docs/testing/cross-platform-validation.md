@@ -822,7 +822,12 @@ keeps its size), shrinks the window so the PTY's rows shrink, lets the fixture
 CLI stream for 3 s, and brings the surface back with no size change: xterm's
 slider must end at its track's end and, with the DOM renderer (the default;
 `BIBCODE_E2E_FOOTER_RENDERER=webgl` keeps WebGL and checks only the slider),
-the footer must be on the last row.
+the footer must be on the last row. A missing slider or a track without height
+fails the check instead of passing as at the bottom. Green proves the repair for
+the off-screen route only: the release route (a 1000 px window whose right
+panel collapses the center column to a 0 px mount, which pauses xterm, while a
+second viewer shrinks the rows) needs a second viewer and is checked on the
+two-machine pair.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head

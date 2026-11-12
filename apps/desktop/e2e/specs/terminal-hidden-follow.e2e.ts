@@ -23,6 +23,13 @@ import { setDesktopUiWindowSize } from "../support/ui-state.ts";
  * must end at the bottom of its scrollback with the footer on the last row. The first case
  * runs the same shrink while drawing, the premise that the view only drifts while paused.
  *
+ * What green proves: the panel repairs a view that drifted while xterm's renderer was paused,
+ * for the off-screen route, which pauses it the same way as the release route the real pair
+ * measured (a 1000 px window whose right panel collapses the center column to a 0 px mount while
+ * another viewer shrinks the rows). This spec cannot drive that route: with a 0 px mount the
+ * window itself never claims a size, so the shrink needs a second viewer, which the packaged
+ * harness does not have. The release route stays the real pair's check.
+ *
  * Needs BIBCODE_E2E_FOOTER_LAYOUT=cli in the runner's environment (the fixture TUI streams a
  * transcript under an Ink-like frame). The DOM renderer is used so the rows can be read;
  * BIBCODE_E2E_FOOTER_RENDERER=webgl keeps WebGL and checks only the scroll position.
@@ -46,8 +53,11 @@ const domRenderer = process.env.BIBCODE_E2E_FOOTER_RENDERER !== "webgl";
 
 interface FollowView {
   readonly found: boolean;
-  /** Pixels between the end of xterm's scrollbar slider and the end of its track. */
-  readonly scrollGap: number;
+  /**
+   * Pixels between the end of xterm's scrollbar slider and the end of its track, or null when
+   * the slider or a track with height is missing (a renamed class must not pass as 0).
+   */
+  readonly scrollGap: number | null;
   /** The last drawn rows, with the DOM renderer. */
   readonly lastRows: ReadonlyArray<string>;
 }
@@ -57,17 +67,20 @@ function readFollowView(terminalId: string): Promise<FollowView> {
     const mount = document.querySelector<HTMLElement>(
       `[data-terminal-xterm-mount="${CSS.escape(id)}"]`,
     );
-    if (!mount) return { found: false, scrollGap: 0, lastRows: [] };
+    if (!mount) return { found: false, scrollGap: null, lastRows: [] };
     // xterm 6 scrolls a virtual element: the slider ends at its track's end at the bottom.
-    const slider = mount.querySelector<HTMLElement>(".scrollbar.vertical > .slider");
+    // xterm 6.1 renames the classes to `.xterm-scrollbar` and `.xterm-slider`.
+    const slider = mount.querySelector<HTMLElement>(
+      ".scrollbar.vertical > .slider, .xterm-scrollbar.vertical > .xterm-slider, .xterm-scrollbar > .xterm-slider",
+    );
     const track = slider?.parentElement;
     const rows = mount.querySelector<HTMLElement>(".xterm-rows");
     return {
       found: true,
       scrollGap:
-        slider && track
+        slider && track && track.clientHeight > 0
           ? Math.round(track.clientHeight - slider.offsetTop - slider.offsetHeight)
-          : 0,
+          : null,
       lastRows: rows
         ? [...rows.children].slice(-3).map((row) => (row.textContent ?? "").trimEnd())
         : [],
@@ -99,7 +112,9 @@ async function expectFollowing(terminalId: string, at: string): Promise<void> {
   const view = await readFollowView(terminalId);
   const problems: string[] = [];
   if (!view.found) problems.push("the terminal is not mounted");
-  if (view.scrollGap > 1) problems.push(`the view is ${view.scrollGap}px above the bottom`);
+  if (view.scrollGap === null)
+    problems.push("xterm's scroll bar slider or its track was not found");
+  else if (view.scrollGap > 1) problems.push(`the view is ${view.scrollGap}px above the bottom`);
   if (domRenderer && !(view.lastRows.at(-1) ?? "").startsWith("fixture-footer-z"))
     problems.push(`the footer is not on the last row: ${JSON.stringify(view.lastRows)}`);
   if (problems.length > 0) throw new Error(`#348 ${at}: ${problems.join("; ")}`);

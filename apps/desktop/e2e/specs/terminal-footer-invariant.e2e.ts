@@ -94,8 +94,11 @@ interface TerminalGeometry {
   readonly footerRows: ReadonlyArray<string>;
   readonly clippedBy: ReadonlyArray<{ readonly element: string; readonly overflow: number }>;
   readonly notice: boolean;
-  /** Pixels between the end of xterm's scrollbar slider and the end of its track. */
-  readonly scrollGap: number;
+  /**
+   * Pixels between the end of xterm's scrollbar slider and the end of its track, or null when
+   * the slider or a track with height is missing (a renamed class must not pass as 0).
+   */
+  readonly scrollGap: number | null;
   readonly viewport: { readonly width: number; readonly height: number };
 }
 
@@ -113,7 +116,7 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
       footerRows: [],
       clippedBy: [],
       notice: false,
-      scrollGap: 0,
+      scrollGap: null,
       viewport: { width: window.innerWidth, height: window.innerHeight },
     };
     const mount = document.querySelector<HTMLElement>(
@@ -184,12 +187,15 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
       notice: (mount.parentElement?.textContent ?? "").includes("Sized for another window"),
       // xterm 6 scrolls a virtual element, not .xterm-viewport: its vertical slider ends at
       // the bottom of its track exactly when the viewport is at the bottom.
+      // xterm 6.1 renames the classes to `.xterm-scrollbar` and `.xterm-slider`.
       scrollGap: (() => {
-        const slider = mount.querySelector<HTMLElement>(".scrollbar.vertical > .slider");
+        const slider = mount.querySelector<HTMLElement>(
+          ".scrollbar.vertical > .slider, .xterm-scrollbar.vertical > .xterm-slider, .xterm-scrollbar > .xterm-slider",
+        );
         const track = slider?.parentElement;
-        return slider && track
+        return slider && track && track.clientHeight > 0
           ? Math.round(track.clientHeight - slider.offsetTop - slider.offsetHeight)
-          : 0;
+          : null;
       })(),
       viewport: { width: window.innerWidth, height: window.innerHeight },
     };
@@ -230,7 +236,9 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
   for (const clip of geometry.clippedBy)
     violations.push(`the last row is ${clip.overflow.toFixed(1)}px below ${clip.element}`);
   // A program writing a transcript keeps the viewport pinned to the bottom.
-  if (cliLayout && geometry.scrollGap > 1)
+  if (cliLayout && geometry.scrollGap === null)
+    violations.push("xterm's scroll bar slider or its track was not found");
+  else if (cliLayout && geometry.scrollGap !== null && geometry.scrollGap > 1)
     violations.push(`the viewport is scrolled up (slider ${geometry.scrollGap}px above its end)`);
   if (floatingLayout) {
     // A frame drawn in the normal buffer sits wherever the cursor was, so only its count is
