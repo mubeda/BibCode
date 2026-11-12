@@ -509,6 +509,15 @@ each time, which can hang and repeats the space reads the disk loop already make
   test on Windows and macOS; each command fails its step when its filter matches no test. Linux
   runs them in the `test` job with every other server test.
 
+- **Hidden volumes (Task 11.11).** `hiddenVolumes` entries carry `mountPoint`, `fileSystem`,
+  `reason` and, for `sameStorage`, `sameStorageAs` (the shown volume they share, which is not
+  always `/`, so the sheet says "Same storage as <mount point>"). `reason` is an open string, not
+  a literal union, so a reason a later server adds cannot fail an older client's snapshot; the
+  sheet shows an unknown one as "Hidden by the volume filter". A Sample carries the list only
+  with `uptime`; a Snapshot from an older server decodes with an empty list. The `sysinfo`
+  features `linux-netdevs` and `linux-tmpfs` add network and tmpfs mounts to the Linux listing,
+  which makes no `statvfs` call, so the filter sees and discloses them.
+
 ## Open points from the build
 
 - On macOS the entry kept for the APFS container is `/`, the sealed read-only system volume.

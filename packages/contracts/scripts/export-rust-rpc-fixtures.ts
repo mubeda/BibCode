@@ -474,6 +474,10 @@ const manualStreamSamples = new Map<string, unknown>([
           memoryPeak: 36.5,
         },
       ],
+      hiddenVolumes: [
+        { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
+        { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
+      ],
     },
   ],
   [

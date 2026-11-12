@@ -607,6 +607,19 @@ export const ServerHostMetricsChartBucket = Schema.Struct({
 export type ServerHostMetricsChartBucket = typeof ServerHostMetricsChartBucket.Type;
 
 /**
+ * A volume the filter hid (R81). `reason` is `network`, `overlay`, `fileMount`, `empty` or
+ * `sameStorage`; it is an open string so a reason a newer server adds cannot fail an older
+ * client's whole snapshot. `sameStorageAs` names the shown volume a `sameStorage` one shares.
+ */
+export const ServerHostMetricsHiddenVolume = Schema.Struct({
+  mountPoint: Schema.String,
+  fileSystem: Schema.String,
+  reason: Schema.String,
+  sameStorageAs: Schema.optionalKey(Schema.String),
+});
+export type ServerHostMetricsHiddenVolume = typeof ServerHostMetricsHiddenVolume.Type;
+
+/**
  * An item of `server.subscribeHostMetrics`: a `Snapshot` first, then one `Sample` per live
  * reading. A Sample carries `uptime` only when the subscriber has not been sent that chart yet.
  */
@@ -621,6 +634,9 @@ export const ServerHostMetricsEvent = Schema.Union([
     memory: Schema.NullOr(ServerHostMetricsStatistic),
     recent: Schema.Array(ServerHostMetricsChartPoint),
     uptime: Schema.Array(ServerHostMetricsChartBucket),
+    hiddenVolumes: Schema.Array(ServerHostMetricsHiddenVolume).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+    ),
   }),
   Schema.TaggedStruct("Sample", {
     /** The snapshot's `statisticsSince`, so a stream that began before the first reading learns it. */
@@ -629,6 +645,8 @@ export const ServerHostMetricsEvent = Schema.Union([
     cpu: ServerHostMetricsStatistic,
     memory: ServerHostMetricsStatistic,
     uptime: Schema.NullOr(Schema.Array(ServerHostMetricsChartBucket)),
+    /** Sent with `uptime`, as part of the same chart state; absent means unchanged. */
+    hiddenVolumes: Schema.optionalKey(Schema.Array(ServerHostMetricsHiddenVolume)),
   }),
 ]);
 export type ServerHostMetricsEvent = typeof ServerHostMetricsEvent.Type;

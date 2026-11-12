@@ -5,6 +5,7 @@ import type {
 import type {
   ServerHostMetricsChartBucket,
   ServerHostMetricsChartPoint,
+  ServerHostMetricsHiddenVolume,
   ServerHostMetricsStatistic,
   ServerHostMetricsVolume,
 } from "@bibcode/contracts";
@@ -45,6 +46,12 @@ export interface HostDashboardVolumeRow {
   readonly badges: ReadonlyArray<"Removable" | "Read-only" | "Not responding">;
 }
 
+export interface HostDashboardHiddenVolumeRow {
+  readonly key: string;
+  readonly mountPoint: string;
+  readonly reason: string;
+}
+
 export interface HostDashboardStatisticRow {
   readonly label: "CPU" | "Memory";
   readonly figures: ReadonlyArray<{
@@ -61,6 +68,8 @@ export interface HostDashboardValues {
   readonly volumes: ReadonlyArray<HostDashboardVolumeRow>;
   readonly volumesPaused: boolean;
   readonly volumeListingNotResponding: boolean;
+  /** Volumes the filter hid, with the reason (R81); never sized. */
+  readonly hiddenVolumes: ReadonlyArray<HostDashboardHiddenVolumeRow>;
   /** "Since <time> (up <duration>)", or null before the first reading. */
   readonly since: string | null;
   readonly statistics: ReadonlyArray<HostDashboardStatisticRow>;
@@ -113,6 +122,25 @@ function volumeRow(volume: ServerHostMetricsVolume): HostDashboardVolumeRow {
   };
 }
 
+const HIDDEN_REASON_LABELS: Readonly<Record<string, string>> = {
+  network: "Network volume",
+  overlay: "Container layer",
+  fileMount: "File mount",
+  empty: "Empty",
+};
+
+function hiddenVolumeRow(
+  volume: ServerHostMetricsHiddenVolume,
+  index: number,
+): HostDashboardHiddenVolumeRow {
+  const reason =
+    volume.reason === "sameStorage"
+      ? `Same storage as ${volume.sameStorageAs ?? "another volume"}`
+      : (HIDDEN_REASON_LABELS[volume.reason] ?? "Hidden by the volume filter");
+  // A mount point can be listed twice (a file mounted over a folder); the index keeps keys unique.
+  return { key: `${index}:${volume.mountPoint}`, mountPoint: volume.mountPoint, reason };
+}
+
 function statisticRow(
   label: HostDashboardStatisticRow["label"],
   statistic: ServerHostMetricsStatistic,
@@ -155,6 +183,7 @@ function presentValues(
     volumes: sample?.volumes.map(volumeRow) ?? [],
     volumesPaused: sample?.volumesPaused ?? false,
     volumeListingNotResponding: sample?.volumeListingNotResponding ?? false,
+    hiddenVolumes: view.hiddenVolumes.map(hiddenVolumeRow),
     since:
       view.statisticsSince === null
         ? null

@@ -2,6 +2,7 @@ import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
 import type { EnvironmentId } from "@bibcode/contracts";
 import type { ClientSettings } from "@bibcode/contracts/settings";
+import { ChevronRightIcon } from "lucide-react";
 import { type JSX, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { useClientSettings } from "~/hooks/useSettings";
@@ -14,6 +15,7 @@ import { serverEnvironment } from "~/state/server";
 import { useDocumentVisible } from "../pullRequests/useDocumentVisible";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { RetryButton } from "../ui/retry-button";
 import {
   Sheet,
@@ -299,6 +301,33 @@ function HostDashboardValuesView({
               </li>
             ))}
           </ul>
+        )}
+        {values.hiddenVolumes.length === 0 ? null : (
+          <Collapsible>
+            <CollapsibleTrigger className="flex w-fit items-center gap-1 text-muted-foreground text-xs hover:text-foreground data-panel-open:[&_svg]:rotate-90">
+              <ChevronRightIcon
+                aria-hidden
+                className="size-3.5 transition-transform"
+              />
+              Hidden volumes ({values.hiddenVolumes.length})
+            </CollapsibleTrigger>
+            <CollapsiblePanel>
+              <ul className="grid gap-1 pt-2 text-xs">
+                {values.hiddenVolumes.map((volume) => (
+                  <li
+                    key={volume.key}
+                    data-testid="host-dashboard-hidden-volume"
+                    className="flex min-w-0 justify-between gap-2"
+                  >
+                    <span className="truncate" title={volume.mountPoint}>
+                      {volume.mountPoint}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">{volume.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </CollapsiblePanel>
+          </Collapsible>
         )}
       </section>
       <section data-testid="host-dashboard-since" className="grid gap-3">

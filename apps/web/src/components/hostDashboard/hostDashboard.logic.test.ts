@@ -55,6 +55,7 @@ function view(overrides: Partial<HostMetricsView> = {}): HostMetricsView {
     memory: { current: 35, minimum: 30, average: 33, p95: 36, maximum: 40 },
     recent: [],
     uptime: [],
+    hiddenVolumes: [],
     ...overrides,
   };
 }

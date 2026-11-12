@@ -3,6 +3,7 @@ import type {
   ServerHostMetricsChartBucket,
   ServerHostMetricsChartPoint,
   ServerHostMetricsEvent,
+  ServerHostMetricsHiddenVolume,
   ServerHostMetricsSample,
   ServerHostMetricsStatistic,
 } from "@bibcode/contracts";
@@ -24,6 +25,8 @@ export interface HostMetricsView {
   readonly memory: ServerHostMetricsStatistic | null;
   readonly recent: ReadonlyArray<ServerHostMetricsChartPoint>;
   readonly uptime: ReadonlyArray<ServerHostMetricsChartBucket>;
+  /** Volumes the filter hid (R81); part of the chart state, so it changes with `uptime`. */
+  readonly hiddenVolumes: ReadonlyArray<ServerHostMetricsHiddenVolume>;
 }
 
 function chartPoint(sample: ServerHostMetricsSample): ServerHostMetricsChartPoint {
@@ -76,7 +79,7 @@ function isNewerSample(
 /**
  * Folds stream items into the view, in the shape `Stream.mapAccum` takes: a Snapshot replaces
  * the view, a Sample newer than the last applied one updates it and appends a recent point, and
- * an uptime chart replaces the previous one whenever an item carries it.
+ * an uptime chart and the hidden volumes replace the previous ones whenever an item carries them.
  */
 export function accumulateHostMetrics(
   previous: Option.Option<HostMetricsView>,
@@ -93,6 +96,7 @@ export function accumulateHostMetrics(
       memory: event.memory,
       recent: pruneRecent(event.recent),
       uptime: event.uptime,
+      hiddenVolumes: event.hiddenVolumes,
     };
     return [Option.some(view), [view]];
   }
@@ -101,7 +105,11 @@ export function accumulateHostMetrics(
   if (current.sample !== null && !isNewerSample(current.sample, event.sample)) {
     // A stale or repeated sample changes nothing but may still carry a newer chart.
     if (event.uptime === null) return [previous, []];
-    const view = { ...current, uptime: event.uptime };
+    const view = {
+      ...current,
+      uptime: event.uptime,
+      hiddenVolumes: event.hiddenVolumes ?? current.hiddenVolumes,
+    };
     return [Option.some(view), [view]];
   }
   const view: HostMetricsView = {
@@ -118,6 +126,7 @@ export function accumulateHostMetrics(
     memory: event.memory,
     recent: pruneRecent([...current.recent, chartPoint(event.sample)]),
     uptime: event.uptime ?? current.uptime,
+    hiddenVolumes: event.hiddenVolumes ?? current.hiddenVolumes,
   };
   return [Option.some(view), [view]];
 }

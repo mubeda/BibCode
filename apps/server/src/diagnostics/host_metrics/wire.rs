@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ChartBucket, ChartPoint, HostFacts, HostMetricsCollector, HostMetricsSnapshot,
+    ChartBucket, ChartPoint, HiddenReason, HiddenVolume, HostFacts, HostMetricsCollector, HostMetricsSnapshot,
     HostMetricsUpdate, HostReading, MeasureStatistics, VolumeReading, VolumeState,
 };
 use crate::rpc::RpcStreamChunk;
@@ -114,6 +114,19 @@ pub(crate) struct SnapshotWire {
     memory: Option<StatisticWire>,
     recent: Vec<ChartPointWire>,
     uptime: Vec<ChartBucketWire>,
+    /// Older servers leave it out.
+    #[serde(default)]
+    hidden_volumes: Vec<HiddenVolumeWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HiddenVolumeWire {
+    mount_point: String,
+    file_system: String,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    same_storage_as: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,6 +140,28 @@ pub(crate) struct SampleWire {
     memory: StatisticWire,
     /// The latest chart when the subscriber has not been sent it yet; `null` otherwise.
     uptime: Option<Vec<ChartBucketWire>>,
+    /// Sent with `uptime`, as part of the same chart state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hidden_volumes: Option<Vec<HiddenVolumeWire>>,
+}
+
+fn hidden_volume(hidden: &HiddenVolume) -> HiddenVolumeWire {
+    let (reason, same_storage_as) = match &hidden.reason {
+        HiddenReason::Network => ("network", None),
+        HiddenReason::Overlay => ("overlay", None),
+        HiddenReason::FileMount => ("fileMount", None),
+        HiddenReason::Empty => ("empty", None),
+        HiddenReason::SameStorage { as_mount } => (
+            "sameStorage",
+            Some(as_mount.to_string_lossy().into_owned()),
+        ),
+    };
+    HiddenVolumeWire {
+        mount_point: hidden.descriptor.mount_point.to_string_lossy().into_owned(),
+        file_system: hidden.descriptor.file_system.clone(),
+        reason: reason.to_owned(),
+        same_storage_as,
+    }
 }
 
 fn format_ms(ms: i128) -> String {
@@ -222,6 +257,12 @@ pub(crate) fn encode_snapshot(snapshot: &HostMetricsSnapshot) -> Value {
         memory: snapshot.memory.as_ref().map(statistic),
         recent: snapshot.recent.iter().map(point).collect(),
         uptime: snapshot.chart.uptime.iter().map(bucket).collect(),
+        hidden_volumes: snapshot
+            .chart
+            .hidden_volumes
+            .iter()
+            .map(hidden_volume)
+            .collect(),
     }))
 }
 
@@ -232,6 +273,14 @@ pub(crate) fn encode_update(update: &HostMetricsUpdate, include_chart: bool) -> 
         cpu: statistic(&update.cpu),
         memory: statistic(&update.memory),
         uptime: include_chart.then(|| update.chart.uptime.iter().map(bucket).collect()),
+        hidden_volumes: include_chart.then(|| {
+            update
+                .chart
+                .hidden_volumes
+                .iter()
+                .map(hidden_volume)
+                .collect()
+        }),
     }))
 }
 
@@ -436,6 +485,25 @@ mod tests {
             serde_json::from_value(wire.clone()).expect("the old shape decodes");
 
         assert_eq!(serde_json::to_value(&event).expect("re-encodes"), wire);
+    }
+
+    /// R81: a Snapshot from a server older than the hidden volumes still decodes.
+    #[test]
+    fn a_snapshot_without_hidden_volumes_decodes() {
+        let mut wire = fixture("server__subscribeHostMetrics-00.json");
+        let hidden = wire
+            .as_object_mut()
+            .expect("a Snapshot")
+            .remove("hiddenVolumes")
+            .expect("the fixture is the new shape");
+        assert_eq!(hidden[1]["sameStorageAs"], "/");
+
+        let event: HostMetricsEventWire =
+            serde_json::from_value(wire).expect("the old shape decodes");
+        let HostMetricsEventWire::Snapshot(snapshot) = event else {
+            panic!("a Snapshot");
+        };
+        assert!(snapshot.hidden_volumes.is_empty());
     }
 
     /// #292 review: every reading says its order and age, and every Sample says when the
