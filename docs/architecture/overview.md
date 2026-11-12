@@ -1593,6 +1593,21 @@ transcript. The runtime consumes the first-attachment grant once for the
 matching renderer claim; cached remounts cannot reuse it. Raw bounded transcript
 replay is retained.
 
+A resize keeps the view at the bottom when the view followed the output. While
+xterm's renderer is paused (its screen does not intersect the viewport, under
+`display: none` or off-screen), xterm 6 clamps its scroll position with the
+canvas height it had before a resize, so a row shrink followed by scrolling
+output moves the view up by itself. Nobody can scroll a terminal that is not
+drawn, so `terminalFollowOutput.ts` records the normal buffer's position when
+its own IntersectionObserver on `.xterm-screen` sees drawing stop; resizes use
+that record while paused instead of the live position, and once drawing
+resumes (after xterm's next render, or two frames when it renders nothing) a
+deferred, coalesced repair scrolls a view that followed back to the bottom. A
+view scrolled up before the pause is kept. Alternate-screen scrolling never
+changes the record, and a repair waits for the normal buffer to return. The
+record belongs to the xterm instance, so it survives a snapshot reset and a
+WebGL-to-DOM fallback; a hidden pane or document disposes the instance.
+
 During ordinary reset/history writes, a replay guard drops xterm `onData` until
 the final write callback; input typed during this brief interval is also
 dropped. The granted first-attachment history pass allows replies. Input before

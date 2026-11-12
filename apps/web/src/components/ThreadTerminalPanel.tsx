@@ -89,6 +89,7 @@ import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/brows
 import { openFileInPreview } from "~/browser/openFileInPreview";
 import { canPreviewAnyUrlInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
+import { createTerminalFollowOutput, observeTerminalDrawing } from "./terminalFollowOutput";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
 import {
   proposeTerminalDimensions,
@@ -1470,6 +1471,16 @@ export function TerminalViewport({
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
     if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
+    // A paused renderer can move the view by itself; the position it had when drawing
+    // stopped decides whether a resize keeps following the output (#348).
+    const followScreen = mount.querySelector(".xterm-screen");
+    const followOutput = followScreen
+      ? createTerminalFollowOutput(terminal, {
+          observeDrawing: observeTerminalDrawing(followScreen),
+        })
+      : null;
+    const followsOutput = () =>
+      followOutput?.atBottom() ?? terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
     const sizeClaim = viewportSizeClaim;
     let fittedDimensions = proposeTerminalDimensions(fitAddon, mount);
     const updateFittedDimensions = () =>
@@ -1708,7 +1719,7 @@ export function TerminalViewport({
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
       if (!sizeOwnership) {
         if (trigger !== "layout" || !terminalHostHasArea(mount)) return;
-        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        const wasAtBottom = followsOutput();
         fitTerminalSafely(fitAddon);
         if (wasAtBottom) terminal.scrollToBottom();
         requestTerminalResize(resizeRendererGeneration, {
@@ -1814,7 +1825,7 @@ export function TerminalViewport({
       // A window attaching to a size the server left un-owned waits to be used as well.
       else if (isUnownedUntilUsed(size)) unownedUntilUsed = true;
       if (size && !terminalDimensionsEqual(terminal, size)) {
-        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        const wasAtBottom = followsOutput();
         terminal.resize(size.cols, size.rows);
         if (wasAtBottom) terminal.scrollToBottom();
       }
@@ -2395,6 +2406,7 @@ export function TerminalViewport({
       mount.removeEventListener("focusin", handleFocus);
       window.removeEventListener("focus", handleWindowFocus);
       themeObserver.disconnect();
+      followOutput?.dispose();
       if (inputBinding.renderer?.owner === rendererOwner) {
         inputBinding.renderer = null;
       }

@@ -408,11 +408,17 @@ vi.mock("@xterm/xterm", () => ({
     readonly bufferLines: Array<FakeTerminalBufferLine | undefined> = [];
     readonly buffer = {
       active: {
+        type: "normal" as const,
         viewportY: 0,
         baseY: 0,
         getLine: (index: number) => this.bufferLines[index],
       },
+      get normal() {
+        return this.active;
+      },
+      onBufferChange: () => ({ dispose() {} }),
     };
+    readonly onRender = vi.fn(() => ({ dispose() {} }));
     dataHandler: ((data: string) => void) | null = null;
     linkProvider: FakeTerminalLinkProvider | null = null;
     selectionHandler: (() => void) | null = null;
