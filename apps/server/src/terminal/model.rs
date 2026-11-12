@@ -185,6 +185,18 @@ pub enum TerminalResizeOutcome {
     GenerationInvalidated,
 }
 
+/// Who produced a piece of terminal input, for the rule that the window last used sizes the
+/// terminal (#348).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalInputOrigin<'a> {
+    /// A caller that does not say, such as an older client: all its input counts as use.
+    Unmarked,
+    /// The terminal answering a query by itself: not use.
+    Automatic,
+    /// A user in the window that holds this size claim.
+    User(&'a str),
+}
+
 /// The size the server holds after a resize request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

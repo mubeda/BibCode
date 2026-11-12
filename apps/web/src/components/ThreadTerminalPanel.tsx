@@ -10,6 +10,7 @@ import {
   createTerminalInputScheduler,
   createTerminalInputSchedulerRegistry,
   type TerminalInputScheduler,
+  type TerminalInputSchedulerOrigin,
   type TerminalInputSendResult,
   type TerminalRenderSignal,
   type TerminalSizePosition,
@@ -145,7 +146,13 @@ interface TerminalInputBinding {
     readonly terminal: Terminal;
     readonly onInputError: (message: string | null) => void;
   } | null;
-  write: ((data: string, fallbackError: string) => Promise<TerminalInputSendResult>) | null;
+  write:
+    | ((
+        data: string,
+        fallbackError: string,
+        origin: TerminalInputSchedulerOrigin,
+      ) => Promise<TerminalInputSendResult>)
+    | null;
   ordered: boolean;
   generation: number;
   attachment: { readonly runtime: object; readonly generation: number } | null;
@@ -289,14 +296,20 @@ function createTerminalInputWriter<A, E>(input: {
       readonly threadId: ThreadId;
       readonly terminalId: string;
       readonly data: string;
+      readonly userInputClaim?: string | null;
     };
   }) => Promise<AtomCommandResult<A, E>>;
 }): NonNullable<TerminalInputBinding["write"]> {
   const { environmentId, threadId, terminalId, run } = input;
-  return async (data, fallbackError) => {
+  return async (data, fallbackError, origin) => {
     const result = await run({
       environmentId,
-      input: { threadId, terminalId, data },
+      input: {
+        threadId,
+        terminalId,
+        data,
+        ...(origin === undefined ? {} : { userInputClaim: origin }),
+      },
     });
     return atomCommandTerminalInputResult(result, fallbackError);
   };
@@ -322,8 +335,11 @@ export function enqueueTerminalInput<A, E>(input: {
     }
     return;
   }
-  binding.write = async (data, fallbackError) =>
-    atomCommandTerminalInputResult(await input.write(data), fallbackError);
+  // A mounted renderer's writer keeps marking who produced its input (#348).
+  if (binding.renderer === null) {
+    binding.write = async (data, fallbackError) =>
+      atomCommandTerminalInputResult(await input.write(data), fallbackError);
+  }
   binding.pendingFallbacks.push({
     remaining: input.data.length,
     message: input.fallbackError,
@@ -469,7 +485,7 @@ function acquireTerminalInputBinding(inputKey: string): {
       maxPendingBytes: 1024 * 1024,
       stopOnError: () => keyedBinding.ordered,
       onReset: () => keyedBinding.resetInput?.(),
-      send: async (data) => {
+      send: async (data, origin) => {
         const generation = keyedBinding.generation;
         let remaining = data.length;
         let fallbackError = "Terminal write failed";
@@ -515,7 +531,7 @@ function acquireTerminalInputBinding(inputKey: string): {
         }
         let result: TerminalInputSendResult;
         try {
-          result = await write(data, fallbackError);
+          result = await write(data, fallbackError, origin);
         } catch (error) {
           notifyFallbackFailures(error);
           throw error;
@@ -552,8 +568,8 @@ function acquireTerminalInputBinding(inputKey: string): {
     });
 
     return {
-      enqueue: (data) => rawScheduler.enqueue(data),
-      reserve: () => rawScheduler.reserve(),
+      enqueue: (data, origin) => rawScheduler.enqueue(data, origin),
+      reserve: (origin) => rawScheduler.reserve(origin),
       reset: () => {
         keyedBinding.generation += 1;
         keyedBinding.error = null;
@@ -568,6 +584,21 @@ function acquireTerminalInputBinding(inputKey: string): {
 
   return { binding: keyedBinding, scheduler };
 }
+
+/** Events on a terminal's mount that only a user produces; their input counts as use (#348). */
+const TERMINAL_USER_INPUT_EVENTS = [
+  "keydown",
+  "paste",
+  "compositionstart",
+  "compositionupdate",
+  "compositionend",
+  "input",
+  "pointerdown",
+  "pointerup",
+  "wheel",
+] as const;
+/** How long after a user event the terminal's input still counts as that user's. */
+const TERMINAL_USER_INPUT_WINDOW_MS = 500;
 
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
@@ -914,6 +945,9 @@ export function TerminalViewport({
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const orderedInput = serverConfig?.environment.capabilities?.terminalOrderedInput === true;
   const sizeOwnership = serverConfig?.environment.capabilities?.terminalSizeOwnership === true;
+  // The server tells a user's input from the terminal's own replies (#348).
+  const userInputClaim =
+    sizeOwnership && serverConfig?.environment.capabilities?.terminalUserInputClaim === true;
   const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
   const [rendererAttachmentInput, setRendererAttachmentInput] = useState<{
     readonly target: string;
@@ -1563,10 +1597,19 @@ export function TerminalViewport({
         write: (data, onParsed) => terminal.write(data, onParsed),
       });
     let outputSink = createOutputSink();
+    // xterm answers a query inside the parse that read it; nothing a user does runs there.
+    let replying = false;
     const replyGuard = installTerminalReplyGuard(
       terminal,
       () => !sizeOwnership || !hasForeignTerminalSizeOwner(appliedSize, sizeClaim),
       () => oscColorResponderActive,
+      () => {
+        if (replying) return;
+        replying = true;
+        queueMicrotask(() => {
+          replying = false;
+        });
+      },
     );
     const updateSizeNotice = (fitted = updateFittedDimensions()) => {
       applyMirrorScale(fitted);
@@ -1929,11 +1972,27 @@ export function TerminalViewport({
       Boolean(readWorkspaceUnavailable()) ||
       (inputBinding.ordered && inputBinding.error !== null) ||
       inputBinding.renderer?.owner !== rendererOwner;
+    // Input a user produced here carries this renderer's claim and the terminal's own replies
+    // carry null, so an idle window answering a program is not a window in use (#348). xterm's
+    // onData does not say which is which: a query answer is marked by the reply guard, and
+    // other input is the user's only within a moment of a user event on this mount (composed
+    // text arrives from a timer after compositionend, a mouse report on release), so a focus
+    // report from a window losing focus is not.
+    let lastUserInputAt = Number.NEGATIVE_INFINITY;
+    const noteUserInput = () => {
+      lastUserInputAt = performance.now();
+    };
+    const inputOrigin = (): TerminalInputSchedulerOrigin => {
+      if (!userInputClaim) return undefined;
+      return !replying && performance.now() - lastUserInputAt <= TERMINAL_USER_INPUT_WINDOW_MS
+        ? sizeClaim
+        : null;
+    };
     const sendTerminalInput = (data: string, fallbackError: string) => {
       if (!replyGuard.acceptInput()) return;
       if (inputBlocked() || data.length === 0) return;
       inputBinding.pendingFallbacks.push({ remaining: data.length, message: fallbackError });
-      inputScheduler.enqueue(data);
+      inputScheduler.enqueue(data, inputOrigin());
     };
 
     terminal.attachCustomKeyEventHandler((event) => {
@@ -2185,7 +2244,7 @@ export function TerminalViewport({
       const bracketedAtPaste = terminal.modes.bracketedPasteMode;
       const fallback = { remaining: 0, message: "Terminal write failed" };
       inputBinding.pendingFallbacks.push(fallback);
-      const fill = inputScheduler.reserve();
+      const fill = inputScheduler.reserve(inputOrigin());
       pasteAborts.add(abort);
       setImagePastesPending((count) => count + 1);
       void staging.then((result) => {
@@ -2217,6 +2276,8 @@ export function TerminalViewport({
       });
     };
     const ownerDocument = mount.ownerDocument;
+    for (const type of TERMINAL_USER_INPUT_EVENTS)
+      mount.addEventListener(type, noteUserInput, { capture: true, passive: true });
     mount.addEventListener("paste", handlePaste, true);
     mount.addEventListener("mousedown", handleMouseDown, true);
     const screenElement = mount.querySelector<HTMLElement>(".xterm-screen");
@@ -2279,6 +2340,8 @@ export function TerminalViewport({
       clearSelectionAction();
       cancelImagePastesRef.current();
       cancelImagePastesRef.current = () => undefined;
+      for (const type of TERMINAL_USER_INPUT_EVENTS)
+        mount.removeEventListener(type, noteUserInput, true);
       mount.removeEventListener("paste", handlePaste, true);
       mount.removeEventListener("mousedown", handleMouseDown, true);
       screenElement?.removeEventListener("mousemove", handleHover);
@@ -2326,6 +2389,7 @@ export function TerminalViewport({
     threadId,
     sizeOwnership,
     orderedInput,
+    userInputClaim,
   ]);
 
   useEffect(() => {

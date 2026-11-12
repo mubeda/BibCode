@@ -73,6 +73,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   remoteUpdateProgress: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalOrderedInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Terminal writes and input frames accept `userInputClaim` (#348). */
+  terminalUserInputClaim: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `terminal.stageImagePaste` turns a pasted clipboard image into a server file path. */
   terminalImagePaste: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `git.runStackedAction` accepts `pullRequestOptions` and reports `pr.warning`. */

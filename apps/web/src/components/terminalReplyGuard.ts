@@ -53,16 +53,25 @@ export function writeTerminalBuffer(
   if (suffix.length > 0) terminal.write(suffix, onParsed);
 }
 
-/** Query interception leaves ordinary keystrokes and terminal setters untouched. */
+/**
+ * Query interception leaves ordinary keystrokes and terminal setters untouched. `onReply` runs
+ * as xterm is about to answer a query itself, in the same call that emits the answer through
+ * `onData`, so the caller can tell the terminal's replies from a user's input (#348).
+ */
 export function installTerminalReplyGuard(
   terminal: Pick<Terminal, "parser" | "write">,
   ownsReplies: () => boolean,
   serverAnswersColors: () => boolean = () => false,
+  onReply: () => void = () => undefined,
 ): TerminalReplyGuard {
   let replays = 0;
   let parsingFirstAttachmentGrant = false;
   let disposed = false;
-  const suppressClientReply = () => !ownsReplies();
+  const suppressClientReply = () => {
+    if (!ownsReplies()) return true;
+    onReply();
+    return false;
+  };
   const parser = terminal.parser;
   const handlers = [
     parser.registerCsiHandler({ final: "c" }, suppressClientReply),

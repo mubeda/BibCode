@@ -1487,9 +1487,16 @@ Attachment lifetime owns claim eligibility. Dropping the owner unregisters its
 claim and signals a manager-tracked cleanup worker to republish ownership
 under the current generation's publication lock, preserving PTY dimensions:
 a lone remaining claimed viewer takes the size at once; with several left the
-size is un-owned. The departed owner's claim is remembered, and when it
-attaches again before anyone typed into the terminal it takes the size back,
-so a client whose connection dropped is the owner again without a click.
+one a user typed in last takes it, and with none typed in the size is un-owned.
+The departed owner's claim is remembered, and when it attaches again before
+anyone typed into the terminal it takes the size back, so a client whose
+connection dropped is the owner again without a click. Only a user's input
+counts as typing: input and input frames carry `userInputClaim`, the size claim
+of the window a user typed, pasted or clicked in, or `null` for the terminal's
+own answers to a program's queries. Input without the field, from an older
+client, counts as use as before, since such a client cannot tell its replies
+from typing. Clients send it only to servers advertising
+`terminalUserInputClaim`, because input frames refuse unknown fields.
 Attachment identities prevent an old stream from clearing a replacement that
 reuses its claim, including across process restarts. Queued requests from an
 unregistered claim cannot resurrect it. Manager shutdown fences new claim

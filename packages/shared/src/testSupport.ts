@@ -8,6 +8,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     repositoryIdentity: false,
     terminalOrderedInput: false,
     terminalSizeOwnership: false,
+    terminalUserInputClaim: false,
     terminalImagePaste: false,
     pullRequestCreateOptions: false,
     worktreeCatalog: false,

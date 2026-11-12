@@ -1,4 +1,9 @@
-import { TerminalInputError, WS_METHODS, type TerminalBeginInput } from "@bibcode/contracts";
+import {
+  TerminalInputError,
+  WS_METHODS,
+  type TerminalBeginInput,
+  type TerminalWriteInputFrame,
+} from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,6 +19,8 @@ import type { RpcSession } from "../rpc/session.ts";
 import { terminalInputCharacterBytes } from "./terminalInput.ts";
 
 export type TerminalInputTarget = Omit<TerminalBeginInput, "attachmentSequence">;
+/** Who produced input (`userInputClaim`); `undefined` leaves it unmarked, as older clients do. */
+export type TerminalInputOrigin = TerminalWriteInputFrame["userInputClaim"];
 
 const nextAttachmentSequence = new WeakMap<RpcSession, number>();
 const encoder = new TextEncoder();
@@ -53,7 +60,10 @@ export function splitTerminalInputFrames(data: string): string[] {
 export interface OrderedTerminalInputBinding {
   readonly session: RpcSession;
   readonly prepare: Effect.Effect<void, TerminalInputError>;
-  readonly write: (data: string) => Effect.Effect<void, TerminalInputError>;
+  readonly write: (
+    data: string,
+    origin?: TerminalInputOrigin,
+  ) => Effect.Effect<void, TerminalInputError>;
   /** Synchronously fences all work; cancellation of the captured lease runs independently. */
   readonly dispose: () => void;
 }
@@ -144,7 +154,7 @@ export function createOrderedTerminalInputBinding(
   return {
     session,
     prepare: Effect.tryPromise({ try: prepare, catch: mapError }),
-    write: (data) =>
+    write: (data, origin) =>
       Effect.tryPromise({
         try: async (signal) => {
           check();
@@ -160,6 +170,10 @@ export function createOrderedTerminalInputBinding(
           pendingBytes += bytes;
           const abort = () => dispose();
           signal.addEventListener("abort", abort, { once: true });
+          const marked = origin === undefined ? {} : { userInputClaim: origin };
+          // A binding created by a write keeps that write's input as its target: frames take
+          // only the session fields from it, so one write's origin never marks another's.
+          const sessionTarget = { threadId: target.threadId, terminalId: target.terminalId };
           try {
             await prepare();
             check();
@@ -171,10 +185,11 @@ export function createOrderedTerminalInputBinding(
                   const frameSequence = sequence++;
                   const lease = inputId!;
                   const acknowledgement = await run(WS_METHODS.terminalWriteInput, {
-                    ...target,
+                    ...sessionTarget,
                     inputId: lease,
                     sequence: frameSequence,
                     data: frame,
+                    ...marked,
                   });
                   check();
                   if (
@@ -192,7 +207,7 @@ export function createOrderedTerminalInputBinding(
               const write = legacyTail.then(async () => {
                 check();
                 for (const frame of frames)
-                  await run(WS_METHODS.terminalWrite, { ...target, data: frame });
+                  await run(WS_METHODS.terminalWrite, { ...sessionTarget, data: frame, ...marked });
               });
               legacyTail = write.catch(() => undefined);
               await write;
@@ -238,6 +253,7 @@ export function createTerminalInputBindingRegistry() {
       target: TerminalInputTarget,
       data: string,
       context?: Context.Context<never>,
+      origin?: TerminalInputOrigin,
     ) {
       const id = key(environmentId, target);
       let binding = bindings.get(id);
@@ -249,7 +265,7 @@ export function createTerminalInputBindingRegistry() {
         binding = createOrderedTerminalInputBinding(session, environmentId, target, context);
         bindings.set(id, binding);
       }
-      return binding.write(data);
+      return binding.write(data, origin);
     },
     reset(
       environmentId: string,

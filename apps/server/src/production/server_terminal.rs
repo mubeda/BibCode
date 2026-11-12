@@ -36,8 +36,8 @@ use crate::{
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
         AttachmentItem, InputReadmissionScope, TerminalAttachInput, TerminalError, TerminalEvent,
-        TerminalInputAdmission, TerminalLaunchCommand, TerminalManager, TerminalMetadataEvent,
-        TerminalOpenInput, TerminalSessionIdentity,
+        TerminalInputAdmission, TerminalInputOrigin, TerminalLaunchCommand, TerminalManager,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalSessionIdentity,
     },
     worktree_catalog::{
         WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
@@ -975,10 +975,11 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         let availability = availability.clone();
         async move {
             let input: TerminalWritePayload = decode_payload(&request.payload)?;
+            let origin = terminal_input_origin(request.payload.get("userInputClaim"))?;
             let _workspace_admission =
                 acquire_terminal_thread(availability.as_ref(), &input.thread_id).await?;
             terminal
-                .write(&input.thread_id, &input.terminal_id, &input.data)
+                .write_from(&input.thread_id, &input.terminal_id, &input.data, origin)
                 .await
                 .map_err(terminal_error)?;
             Ok(Value::Null)
@@ -1257,9 +1258,10 @@ fn register_ordered_input_rpcs(registry: &mut RpcRegistry, services: &ServerTerm
                     return Err(json!({"_tag":"TerminalInputError", "code":"capacity", "message":"Terminal input exceeded its frame limit. Reconnect input before typing again."}));
                 }
                 let input: TerminalInputFramePayload = decode_payload(&request.payload)?;
+                let origin = terminal_input_origin(request.payload.get("userInputClaim"))?;
                 // In memory only: the session's lease already holds the workspace admission
                 // `terminal.beginInput` took, so a keystroke never waits for the database.
-                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?;
+                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?.with_origin(origin);
                 // Loss of the session's current admission seals it, which fails this frame
                 // wherever it waits; report that loss rather than the sealed session.
                 let seal = frame.seal();
@@ -1526,6 +1528,23 @@ fn validate_terminal_size_claim(value: Option<&Value>) -> Result<Option<String>,
     Ok(Some(claim.to_owned()))
 }
 
+/// `userInputClaim`: absent from an older client, `null` for the terminal's own replies, else
+/// the size claim of the window a user typed in (#348).
+fn terminal_input_origin(value: Option<&Value>) -> Result<TerminalInputOrigin<'_>, Value> {
+    match value {
+        None => Ok(TerminalInputOrigin::Unmarked),
+        Some(Value::Null) => Ok(TerminalInputOrigin::Automatic),
+        Some(Value::String(claim)) => {
+            let claim = trim_ecmascript(claim);
+            if claim.is_empty() || claim.encode_utf16().count() > TERMINAL_SIZE_CLAIM_MAX_LENGTH {
+                return Err(invalid_request("userInputClaim must be a size claim"));
+            }
+            Ok(TerminalInputOrigin::User(claim))
+        }
+        Some(_) => Err(invalid_request("userInputClaim must be a string or null")),
+    }
+}
+
 fn validate_terminal_launch_command(
     command: Option<TerminalLaunchCommand>,
 ) -> Result<Option<TerminalLaunchCommand>, Value> {
@@ -1713,6 +1732,9 @@ struct TerminalInputFramePayload {
     input_id: String,
     sequence: u64,
     data: String,
+    /// Read from the payload by [`terminal_input_origin`], which tells null from absent.
+    #[serde(default, rename = "userInputClaim")]
+    _user_input_claim: serde::de::IgnoredAny,
 }
 
 #[derive(Deserialize)]

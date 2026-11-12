@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::manager::{TerminalError, TerminalSessionIdentity};
+use super::model::TerminalInputOrigin;
 
 const MAX_FRAMES: usize = 16;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
@@ -441,6 +442,7 @@ impl TerminalInputRegistry {
             input_id,
             sequence,
             data,
+            origin: TerminalInputOrigin::Unmarked,
         })
     }
 }
@@ -464,9 +466,16 @@ pub(crate) struct PreparedTerminalInput<'a> {
     input_id: &'a str,
     sequence: u64,
     data: &'a str,
+    origin: TerminalInputOrigin<'a>,
 }
 
-impl PreparedTerminalInput<'_> {
+impl<'a> PreparedTerminalInput<'a> {
+    /// Who produced this frame; unmarked by default, as an older client's.
+    pub(crate) fn with_origin(mut self, origin: TerminalInputOrigin<'a>) -> Self {
+        self.origin = origin;
+        self
+    }
+
     /// Tells, once the write has failed, whether the session was sealed by the loss of its
     /// current admission.
     pub(crate) fn seal(&self) -> TerminalInputSeal {
@@ -477,6 +486,7 @@ impl PreparedTerminalInput<'_> {
         let lease = self.frame.lease.clone();
         let sequence = self.sequence;
         let data = self.data;
+        let origin = self.origin;
         lease.wait_turn(sequence).await?;
         // Loss of the current admission stops the write at once, without waiting for the
         // cleanup task; a replaced admission's loss does not. The frame is queued once: a
@@ -490,7 +500,7 @@ impl PreparedTerminalInput<'_> {
             let enqueue =
                 lease
                     .identity
-                    .enqueue_input(data, &lease.closed, &lease.connection_closed);
+                    .enqueue_input(data, origin, &lease.closed, &lease.connection_closed);
             tokio::select! {
                 biased;
                 () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {

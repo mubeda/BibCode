@@ -122,9 +122,18 @@ export const TerminalAttachInput = Schema.Struct({
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;
 
+/**
+ * Who produced terminal input, for the rule that the window last used sizes the terminal
+ * (#348): the size claim of the window a user typed, pasted or clicked in, or `null` for the
+ * terminal's own replies to queries. Absent from older clients, whose input all counts as
+ * use. Sent only to servers advertising `terminalUserInputClaim`.
+ */
+const TerminalUserInputClaim = Schema.optional(Schema.NullOr(TerminalSizeClaimSchema));
+
 export const TerminalWriteInput = Schema.Struct({
   ...TerminalSessionInput.fields,
   data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(65_536)),
+  userInputClaim: TerminalUserInputClaim,
 });
 export type TerminalWriteInput = Schema.Codec.Encoded<typeof TerminalWriteInput>;
 
@@ -146,6 +155,7 @@ export const TerminalWriteInputFrame = Schema.Struct({
   inputId: TrimmedNonEmptyStringSchema,
   sequence: TerminalInputSequence,
   data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(16_384)),
+  userInputClaim: TerminalUserInputClaim,
 });
 export type TerminalWriteInputFrame = typeof TerminalWriteInputFrame.Type;
 

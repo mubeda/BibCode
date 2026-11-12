@@ -16,8 +16,8 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::model::{
-    TerminalConsoleTheme, TerminalGeneration, TerminalResizeOutcome, TerminalResizeResult,
-    terminal_console_theme_from_env,
+    TerminalConsoleTheme, TerminalGeneration, TerminalInputOrigin, TerminalResizeOutcome,
+    TerminalResizeResult, terminal_console_theme_from_env,
 };
 use super::{
     PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
@@ -298,6 +298,10 @@ struct Session {
     departed_owner: Option<String>,
     /// The owner received the size when the previous owner left, and nobody typed since.
     owner_unused_since_handoff: bool,
+    /// When a user last typed in each window, by size claim, on `user_input_clock`: the size
+    /// goes to the one used last when its owner leaves several viewers (#348).
+    user_input_order: HashMap<String, u64>,
+    user_input_clock: u64,
     first_attachment_grant_used: bool,
     osc_color_responder_active: bool,
     process: Option<Arc<dyn PtyProcess>>,
@@ -366,6 +370,9 @@ impl SessionAgentStatus {
 /// agent's tool calls do not flood the metadata stream.
 const AGENT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The windows whose typing a session orders at once; more are not tracked (#348).
+const MAX_USER_INPUT_CLAIMS: usize = 64;
+
 /// What a replacement process keeps from the session it replaces.
 #[derive(Default)]
 struct SessionCarryOver {
@@ -399,6 +406,7 @@ impl TerminalSessionIdentity {
     pub(super) async fn enqueue_input(
         &self,
         data: &str,
+        origin: TerminalInputOrigin<'_>,
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
     ) -> Result<super::writer::PendingWrite, TerminalError> {
@@ -429,9 +437,7 @@ impl TerminalSessionIdentity {
                 terminal_id: self.key.1.clone(),
             });
         }
-        // Typing uses the window the size went to: it keeps the size from now on.
-        session.departed_owner = None;
-        session.owner_unused_since_handoff = false;
+        session.note_input(origin);
         drop(session);
         let pending = self.generation.writer.enqueue(&self.process, data, true)?;
         self.generation
@@ -1787,6 +1793,29 @@ impl Session {
         }
     }
 
+    /// Input counts as use of a window unless it is the terminal's own reply: use ends the
+    /// departed owner's claim to the size, and a user's input orders the windows (#348).
+    fn note_input(&mut self, origin: TerminalInputOrigin<'_>) {
+        if origin == TerminalInputOrigin::Automatic {
+            return;
+        }
+        self.departed_owner = None;
+        self.owner_unused_since_handoff = false;
+        if let TerminalInputOrigin::User(claim) = origin {
+            self.user_input_clock += 1;
+            let tracked = self.user_input_order.len();
+            match self.user_input_order.get_mut(claim) {
+                Some(order) => *order = self.user_input_clock,
+                // Bounded: a claim that is not attached is dropped at the next release.
+                None if tracked < MAX_USER_INPUT_CLAIMS => {
+                    self.user_input_order
+                        .insert(claim.to_owned(), self.user_input_clock);
+                }
+                None => {}
+            }
+        }
+    }
+
     /// What this session holds, as a resize request's answer.
     fn resize_result(&self, outcome: TerminalResizeOutcome) -> TerminalResizeResult {
         TerminalResizeResult {
@@ -2646,6 +2675,8 @@ impl TerminalManager {
             size_sequence: 1,
             departed_owner: None,
             owner_unused_since_handoff: false,
+            user_input_order: HashMap::new(),
+            user_input_clock: 0,
             first_attachment_grant_used: false,
             osc_color_responder_active: process.osc_color_responder_active(),
             process: Some(process.clone()),
@@ -3637,6 +3668,19 @@ impl TerminalManager {
         terminal_id: &str,
         data: &str,
     ) -> Result<(), TerminalError> {
+        self.write_from(thread_id, terminal_id, data, TerminalInputOrigin::Unmarked)
+            .await
+    }
+
+    /// [`Self::write`] from `origin`: only a user's input, or an older client's, counts as use
+    /// of a window for the size rule (#348).
+    pub async fn write_from(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        data: &str,
+        origin: TerminalInputOrigin<'_>,
+    ) -> Result<(), TerminalError> {
         let not_running = || TerminalError::NotRunning {
             thread_id: thread_id.to_owned(),
             terminal_id: terminal_id.to_owned(),
@@ -3647,9 +3691,7 @@ impl TerminalManager {
             let _publication = generation.publication.lock().await;
             let (process, status) = {
                 let mut session = session.lock().await;
-                // Typing uses the window the size went to: it keeps the size from now on.
-                session.departed_owner = None;
-                session.owner_unused_since_handoff = false;
+                session.note_input(origin);
                 (session.process.clone(), session.status)
             };
             // An exit invalidates the generation and then marks the session exited, both under
@@ -3802,17 +3844,30 @@ impl TerminalManager {
             return;
         }
         // The window last used sizes the terminal (#348). A lone remaining viewer takes the
-        // size at once; among several, none is known to be in use, so it stays un-owned until
-        // one claims it. The departed owner gets it back if it returns before anyone types.
+        // size at once; among several, the one a user typed in last does, and with none typed
+        // in it stays un-owned until one claims it. The departed owner gets it back if it
+        // returns before anyone types.
         let remaining = {
             let attachments = inner
                 .size_claim_attachments
                 .lock()
                 .expect("terminal attachment claims");
-            attachments
-                .get(key)
-                .filter(|claims| claims.len() == 1)
-                .and_then(|claims| claims.iter().next())
+            let claims = attachments.get(key);
+            session
+                .user_input_order
+                .retain(|claim, _| claims.is_some_and(|claims| claims.contains_key(claim)));
+            let order = &session.user_input_order;
+            claims
+                .and_then(|claims| {
+                    if claims.len() == 1 {
+                        return claims.iter().next();
+                    }
+                    claims
+                        .iter()
+                        .filter_map(|entry| order.get(entry.0).map(|typed| (typed, entry)))
+                        .max_by_key(|(typed, _)| **typed)
+                        .map(|(_, entry)| entry)
+                })
                 .map(|(claim, id)| SizeOwner {
                     claim: claim.clone(),
                     attachment: *id,

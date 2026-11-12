@@ -278,6 +278,7 @@ export function createTerminalEnvironmentAtoms<R, E>(
           input,
           input.data,
           yield* Effect.context(),
+          input.userInputClaim,
         );
       }),
     }),

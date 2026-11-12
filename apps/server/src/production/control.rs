@@ -2883,6 +2883,8 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
+    // Outside the literal above, which is at `json!`'s recursion limit.
+    capabilities["terminalUserInputClaim"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
         json!(crate::production::pipelines_rpc::pipelines_reads_registered());
@@ -7502,6 +7504,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
+        assert_eq!(descriptor["capabilities"]["terminalUserInputClaim"], true);
         assert_eq!(descriptor["capabilities"]["previewTunnels"], true);
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
