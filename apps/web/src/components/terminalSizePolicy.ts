@@ -42,6 +42,9 @@ export function hasForeignTerminalSizeOwner(
  * names none, and every window without a foreign owner answers (#348).
  */
 export function answersTerminalQueries(applied: TerminalSize | null, sizeClaim: string): boolean {
+  // shortcut: a query the other windows suppressed is lost if the replier (or owner) leaves or
+  // is frozen before answering it; upgrade to retrying pending queries under the next replier
+  // if programs are seen waiting on an unanswered query after a window closes.
   if (hasForeignTerminalSizeOwner(applied, sizeClaim)) return false;
   return (
     applied?.sizeClaim != null || applied?.replyClaim == null || applied.replyClaim === sizeClaim

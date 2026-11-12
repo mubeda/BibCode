@@ -5105,7 +5105,10 @@ reclaim it. While a size is left un-owned that way, `size.replyClaim` names one
 remaining viewer (the least claim; another when it leaves) that alone answers
 the terminal's queries, a new attach does not take the size (only the departed
 claim does), and a lone viewer left takes it. The field is absent otherwise and
-from older servers, whose clients keep answering from every window. Manager shutdown cancels and drains attachment cleanup
+from older servers, whose clients keep answering from every window. A query the
+other viewers suppressed is lost if the replier leaves or is frozen before it
+answers, as it is when an owner does; it is not retried under the next replier.
+Manager shutdown cancels and drains attachment cleanup
 workers.
 
 Accepted resize/claim changes publish before subsequent PTY output under the
