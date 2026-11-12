@@ -1854,7 +1854,8 @@ export const WsTerminalCancelInputRpc = Rpc.make(WS_METHODS.terminalCancelInput,
 
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput,
-  // Older servers answer `null`; older clients decode the result as void and ignore it.
+  // `null` from older servers, and to a request without `structuredResult`: older clients
+  // decode this result as void, a null-only JSON codec (#348).
   success: Schema.NullOr(TerminalResizeResult),
   error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });

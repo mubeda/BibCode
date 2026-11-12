@@ -3689,6 +3689,22 @@ impl TerminalManager {
         rows: u16,
         size_claim: Option<String>,
     ) -> Result<TerminalResizeResult, TerminalError> {
+        self.resize_acknowledging(thread_id, terminal_id, cols, rows, size_claim, true)
+            .await
+    }
+
+    /// [`Self::resize`] for a caller that may predate the acknowledgement: without
+    /// `acknowledge`, a claim of the size and owner already held publishes nothing, as before
+    /// the structured answer (#348).
+    pub async fn resize_acknowledging(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+        size_claim: Option<String>,
+        acknowledge: bool,
+    ) -> Result<TerminalResizeResult, TerminalError> {
         validate_dimensions(cols, rows)?;
         let Some(session) = self
             .inner
@@ -3743,7 +3759,7 @@ impl TerminalManager {
         // Applying a claim consumes the grant even if no dimensions changed.
         session.first_attachment_grant_used |= size_owner.is_some();
         if !size_changed && !owner_changed {
-            if let Some(owner) = size_owner {
+            if let Some(owner) = size_owner.filter(|_| acknowledge) {
                 let mut event = session.resized();
                 if let TerminalEvent::Resized { only_for, .. } = &mut event {
                     *only_for = Some(owner.attachment);

@@ -166,6 +166,11 @@ export const TerminalResizeInput = Schema.Struct({
   cols: TerminalColsSchema,
   rows: TerminalRowsSchema,
   sizeClaim: Schema.optional(TerminalSizeClaimSchema),
+  /**
+   * The caller decodes a `TerminalResizeResult`. Without it the server answers `null`: older
+   * clients decode this method's result as void, which rejects anything else (#348).
+   */
+  structuredResult: Schema.optional(Schema.Boolean),
 });
 export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInput>;
 
@@ -184,7 +189,10 @@ export const TerminalResizeOutcome = Schema.Literals([
 ]);
 export type TerminalResizeOutcome = typeof TerminalResizeOutcome.Type;
 
-/** The size the server holds after a resize request; older servers answer `null`. */
+/**
+ * The size the server holds after a resize request that set `structuredResult`; older
+ * servers answer `null`.
+ */
 export const TerminalResizeResult = Schema.Struct({
   outcome: TerminalResizeOutcome,
   /** Absent only when the session is missing. */

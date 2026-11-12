@@ -1500,8 +1500,12 @@ export function TerminalViewport({
         handleSizeTrigger("layout");
       }, delay);
     };
+    // An older server ignores `structuredResult` and answers null, which `completeClaim` handles.
     const resizeTerminal = (size: Pick<TerminalResizeInput, "cols" | "rows" | "sizeClaim">) =>
-      runTerminalResize({ environmentId, input: { threadId, terminalId, ...size } });
+      runTerminalResize({
+        environmentId,
+        input: { threadId, terminalId, ...size, structuredResult: true },
+      });
     const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
       if (resizeRendererGenerationRef.current !== rendererGeneration) return;
       const current = lastRequestedSizeRef.current;

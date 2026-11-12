@@ -993,16 +993,22 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             Box::pin(async move {
                 let input: TerminalResizePayload = decode_payload(&payload)?;
                 let result = terminal
-                    .resize(
+                    .resize_acknowledging(
                         &input.thread_id,
                         &input.terminal_id,
                         input.cols,
                         input.rows,
                         validate_terminal_size_claim(payload.get("sizeClaim"))?,
+                        input.structured_result,
                     )
                     .await
                     .map_err(terminal_error)?;
-                Ok(serde_json::to_value(result).expect("terminal resize result serializes"))
+                // An older client decodes this result as void, which accepts only null (#348).
+                Ok(if input.structured_result {
+                    serde_json::to_value(result).expect("terminal resize result serializes")
+                } else {
+                    Value::Null
+                })
             })
         },
     );
@@ -1723,6 +1729,8 @@ struct TerminalResizePayload {
     terminal_id: String,
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    structured_result: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
