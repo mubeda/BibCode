@@ -303,6 +303,7 @@ import {
   TerminalMetadataStreamEvent,
   TerminalOpenInput,
   TerminalResizeInput,
+  TerminalResizeResult,
   TerminalRestartInput,
   TerminalSessionSnapshot,
   TerminalWriteInput,
@@ -1853,6 +1854,8 @@ export const WsTerminalCancelInputRpc = Rpc.make(WS_METHODS.terminalCancelInput,
 
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput,
+  // Older servers answer `null`; older clients decode the result as void and ignore it.
+  success: Schema.NullOr(TerminalResizeResult),
   error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });
 

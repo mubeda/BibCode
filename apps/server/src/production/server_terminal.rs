@@ -992,7 +992,7 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         |terminal, payload| {
             Box::pin(async move {
                 let input: TerminalResizePayload = decode_payload(&payload)?;
-                terminal
+                let result = terminal
                     .resize(
                         &input.thread_id,
                         &input.terminal_id,
@@ -1002,7 +1002,7 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
                     )
                     .await
                     .map_err(terminal_error)?;
-                Ok(Value::Null)
+                Ok(serde_json::to_value(result).expect("terminal resize result serializes"))
             })
         },
     );

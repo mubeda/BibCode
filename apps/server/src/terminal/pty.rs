@@ -6,7 +6,11 @@ use std::{
     fmt,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -156,6 +160,11 @@ pub trait PtyProcess: fmt::Debug + Send + Sync {
     }
     fn write(&self, data: &str) -> Result<(), String>;
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
+    /// The PTY refused the last size it was asked for, so it is not at the size the manager
+    /// records: an equal request must be sent again rather than treated as a no-op (#348).
+    fn resize_needs_retry(&self) -> bool {
+        false
+    }
     fn kill(&self) -> Result<(), String>;
     fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
         Ok(None)
@@ -367,6 +376,35 @@ fn coalesce_pending_resizes(first: PtySize, requests: &mpsc::Receiver<PtySize>) 
     newest
 }
 
+/// Applies queued sizes, newest first, until the process drops its sender. `failed` says
+/// whether the PTY refused the last one: the manager has already recorded and published that
+/// size, so the next request for it must reach the PTY again instead of being a no-op.
+fn run_resize_worker<E: fmt::Display>(
+    pid: u32,
+    requests: &mpsc::Receiver<PtySize>,
+    failed: &AtomicBool,
+    mut resize: impl FnMut(PtySize) -> Result<(), E>,
+) {
+    while let Ok(size) = requests.recv() {
+        let size = coalesce_pending_resizes(size, requests);
+        match resize(size) {
+            Ok(()) => failed.store(false, Ordering::Release),
+            Err(error) => {
+                failed.store(true, Ordering::Release);
+                // A dropped resize strands full-screen TUIs at a stale row count, so make the
+                // failure visible; the next request for this size retries it.
+                tracing::warn!(
+                    %error,
+                    pid,
+                    cols = size.cols,
+                    rows = size.rows,
+                    "failed to resize PTY"
+                );
+            }
+        }
+    }
+}
+
 impl PortablePtyBackend {
     fn spawn_command(
         &self,
@@ -454,6 +492,8 @@ impl PortablePtyBackend {
         let (output, initial_output) = broadcast::channel(1024);
         let (exit, _) = watch::channel(None);
         let (resize, resize_requests) = mpsc::channel();
+        let resize_failed = Arc::new(AtomicBool::new(false));
+        let worker_resize_failed = Arc::clone(&resize_failed);
 
         // Answer OSC color queries (e.g. OpenCode's OSC 11 light/dark probe) at
         // the PTY layer, using the app's resolved theme colors, so detection
@@ -479,21 +519,9 @@ impl PortablePtyBackend {
         if let Err(error) = thread::Builder::new()
             .name(format!("bibcode-pty-resize-{pid}"))
             .spawn(move || {
-                while let Ok(size) = resize_requests.recv() {
-                    let size = coalesce_pending_resizes(size, &resize_requests);
-                    if let Err(error) = pair.master.resize(size) {
-                        // A dropped resize strands full-screen TUIs at a stale
-                        // row count, so make the failure visible instead of
-                        // leaving the PTY silently out of sync with the client.
-                        tracing::warn!(
-                            %error,
-                            pid,
-                            cols = size.cols,
-                            rows = size.rows,
-                            "failed to resize PTY"
-                        );
-                    }
-                }
+                run_resize_worker(pid, &resize_requests, &worker_resize_failed, |size| {
+                    pair.master.resize(size)
+                });
             })
         {
             return Err(error.to_string());
@@ -605,6 +633,7 @@ impl PortablePtyBackend {
             process_identity,
             osc_color_responder_active,
             resize,
+            resize_failed,
             writer,
             #[cfg(not(windows))]
             killer: Mutex::new(killer),
@@ -1034,6 +1063,8 @@ struct PortablePtyProcess {
     process_identity: Option<ProcessIdentity>,
     osc_color_responder_active: bool,
     resize: mpsc::Sender<PtySize>,
+    /// Set by the resize worker while the PTY refuses the last size it was sent.
+    resize_failed: Arc<AtomicBool>,
     writer: SharedPtyWriter,
     #[cfg(not(windows))]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
@@ -1110,6 +1141,10 @@ impl PtyProcess for PortablePtyProcess {
             Ok(()) => Ok(()),
             Err(mpsc::SendError(_)) => Err("PTY resize worker is not available".to_string()),
         }
+    }
+
+    fn resize_needs_retry(&self) -> bool {
+        self.resize_failed.load(Ordering::Acquire)
     }
 
     fn kill(&self) -> Result<(), String> {
@@ -3189,6 +3224,74 @@ mod tests {
         assert!(requests.try_recv().is_err(), "backlog must be drained");
     }
 
+    /// A refused resize leaves the real PTY at its old size and says so; the next request
+    /// for the same size reaches the PTY and clears it (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_resize_is_reported_and_an_equal_request_retries_it() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 30,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let size = |cols, rows| PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let (requests, worker_requests) = mpsc::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let refuse_next = Arc::new(AtomicBool::new(true));
+        let (applied, outcomes) = mpsc::channel();
+        let worker = {
+            let failed = Arc::clone(&failed);
+            let refuse_next = Arc::clone(&refuse_next);
+            thread::spawn(move || {
+                run_resize_worker(7, &worker_requests, &failed, |size| {
+                    let result = if refuse_next.swap(false, Ordering::AcqRel) {
+                        Err("injected refusal".to_owned())
+                    } else {
+                        pair.master.resize(size).map_err(|error| error.to_string())
+                    };
+                    // TIOCGWINSZ on the master reads the size the child sees.
+                    applied.send(pair.master.get_size().unwrap()).unwrap();
+                    result
+                });
+            })
+        };
+
+        requests.send(size(80, 20)).unwrap();
+        let held = outcomes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (held.cols, held.rows),
+            (80, 30),
+            "the refused size never reached the PTY"
+        );
+        // The worker records the outcome once the attempt returns.
+        let settles_to = |expected: bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while failed.load(Ordering::Acquire) != expected {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "outcome never recorded"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        settles_to(true);
+
+        requests.send(size(80, 20)).unwrap();
+        let held = outcomes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((held.cols, held.rows), (80, 20));
+        settles_to(false);
+        drop(requests);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn coalescing_pending_resizes_passes_through_a_lone_size() {
         let (resize, requests) = mpsc::channel::<PtySize>();
@@ -3219,6 +3322,7 @@ mod tests {
             pid: 44,
             process_identity: None,
             resize,
+            resize_failed: Arc::default(),
             writer: Arc::new(Mutex::new(Box::new(TestWriter::WriteError))),
             killer: Mutex::new(Box::new(TestKiller { fail: false })),
             output,
@@ -3253,6 +3357,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             resize,
+            resize_failed: Arc::default(),
             writer: Arc::new(Mutex::new(Box::new(TestWriter::WriteError))),
             killer: Mutex::new(Box::new(TestKiller { fail: true })),
             output,
@@ -3301,6 +3406,7 @@ mod tests {
             pid: 43,
             process_identity: None,
             resize,
+            resize_failed: Arc::default(),
             writer: Arc::new(Mutex::new(Box::new(TestWriter::FlushError))),
             killer: Mutex::new(Box::new(TestKiller { fail: false })),
             output,

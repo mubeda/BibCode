@@ -163,6 +163,50 @@ pub struct TerminalSize {
     pub size_claim: Option<String>,
 }
 
+/// The process a terminal state belongs to: `boot` names this manager instance, `process`
+/// grows with every process it starts and is never reused (#348).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalGeneration {
+    pub boot: String,
+    pub process: u64,
+}
+
+/// What a resize request did. `Applied` and `Unchanged` are acknowledged by a `resized` event
+/// on the requester's claimed stream; the rest changed and published nothing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalResizeOutcome {
+    Applied,
+    Unchanged,
+    SessionMissing,
+    ClaimNotRegistered,
+    ProcessAbsent,
+    GenerationInvalidated,
+}
+
+/// The size the server holds after a resize request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResizeResult {
+    pub outcome: TerminalResizeOutcome,
+    pub size: Option<TerminalSize>,
+    pub generation: Option<TerminalGeneration>,
+    /// The last size event's sequence: the acknowledgement's when there is one.
+    pub sequence: Option<u64>,
+}
+
+impl TerminalResizeResult {
+    pub const fn session_missing() -> Self {
+        Self {
+            outcome: TerminalResizeOutcome::SessionMissing,
+            size: None,
+            generation: None,
+            sequence: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSessionSnapshot {
@@ -182,6 +226,8 @@ pub struct TerminalSessionSnapshot {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TerminalSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<TerminalGeneration>,
     #[serde(default)]
     pub osc_color_responder_active: bool,
     #[serde(default)]
@@ -269,6 +315,10 @@ pub enum TerminalEvent {
         terminal_id: String,
         sequence: u64,
         size: TerminalSize,
+        /// Set on an acknowledgement of an unchanged size: only that claimed attachment
+        /// receives it. Never on the wire.
+        #[serde(skip)]
+        only_for: Option<uuid::Uuid>,
     },
     Exited {
         #[serde(rename = "threadId")]
@@ -280,6 +330,8 @@ pub enum TerminalEvent {
         exit_code: Option<i32>,
         #[serde(rename = "exitSignal")]
         exit_signal: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<TerminalGeneration>,
     },
     Closed {
         #[serde(rename = "threadId")]
@@ -287,6 +339,9 @@ pub enum TerminalEvent {
         #[serde(rename = "terminalId")]
         terminal_id: String,
         sequence: u64,
+        /// At or above every process the session had, so a client applies it by generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<TerminalGeneration>,
     },
     Error {
         #[serde(rename = "threadId")]
@@ -334,6 +389,66 @@ mod tests {
         assert_eq!(input.terminal_id, "terminal");
         assert!(input.cwd.is_none());
         assert!(!input.restart_if_not_running);
+    }
+
+    /// The resize answer and the generation fields decode in their new shapes, and events from
+    /// an older server, without a generation, still decode (#348).
+    #[test]
+    fn resize_results_and_generations_decode_in_new_and_old_shapes() {
+        let result: TerminalResizeResult = serde_json::from_value(serde_json::json!({
+            "outcome": "claimNotRegistered",
+            "size": { "cols": 80, "rows": 24, "sizeClaim": "owner" },
+            "generation": { "boot": "b", "process": 3 },
+            "sequence": 9,
+        }))
+        .unwrap();
+        assert_eq!(result.outcome, TerminalResizeOutcome::ClaimNotRegistered);
+        assert_eq!(result.generation.unwrap().process, 3);
+        assert_eq!(
+            serde_json::to_value(TerminalResizeResult::session_missing()).unwrap(),
+            serde_json::json!({
+                "outcome": "sessionMissing", "size": null, "generation": null, "sequence": null
+            })
+        );
+        let closed: TerminalEvent = serde_json::from_value(serde_json::json!({
+            "type": "closed", "threadId": "t", "terminalId": "x", "sequence": 4,
+        }))
+        .unwrap();
+        assert!(matches!(
+            closed,
+            TerminalEvent::Closed {
+                generation: None,
+                ..
+            }
+        ));
+        let exited: TerminalEvent = serde_json::from_value(serde_json::json!({
+            "type": "exited", "threadId": "t", "terminalId": "x", "sequence": 4,
+            "exitCode": 0, "exitSignal": null, "generation": { "boot": "b", "process": 2 },
+        }))
+        .unwrap();
+        assert!(matches!(
+            exited,
+            TerminalEvent::Exited {
+                generation: Some(_),
+                ..
+            }
+        ));
+        let resized: TerminalEvent = serde_json::from_value(serde_json::json!({
+            "type": "resized", "threadId": "t", "terminalId": "x", "sequence": 5,
+            "size": { "cols": 80, "rows": 24, "sizeClaim": null },
+        }))
+        .unwrap();
+        assert!(matches!(
+            resized,
+            TerminalEvent::Resized { only_for: None, .. }
+        ));
+        let snapshot: TerminalSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "threadId": "t", "terminalId": "x", "cwd": "/", "worktreePath": null,
+            "status": "exited", "pid": null, "history": "", "exitCode": 0, "exitSignal": null,
+            "label": "l", "updatedAt": "u", "sequence": 3,
+        }))
+        .unwrap();
+        assert_eq!(snapshot.generation, None);
     }
 }
 

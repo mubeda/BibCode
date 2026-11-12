@@ -34,6 +34,19 @@ export const TerminalSize = Schema.Struct({
   sizeClaim: Schema.NullOr(TerminalSizeClaimSchema),
 });
 export type TerminalSize = typeof TerminalSize.Type;
+
+/**
+ * The process a terminal's state belongs to. `boot` names the server instance; `process`
+ * grows with every process that instance starts and is never reused, so a client orders
+ * two states of one terminal without trusting pids or per-process sequences.
+ */
+export const TerminalGeneration = Schema.Struct({
+  boot: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(64)),
+  process: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
+    Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+  ),
+});
+export type TerminalGeneration = typeof TerminalGeneration.Type;
 const TerminalEnvKeySchema = Schema.String.check(
   Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/),
 ).check(Schema.isMaxLength(128));
@@ -156,6 +169,32 @@ export const TerminalResizeInput = Schema.Struct({
 });
 export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInput>;
 
+/**
+ * What a resize request did. `applied` and `unchanged` are each answered by a `resized`
+ * event at `sequence` on the requester's claimed attach stream, behind the output already
+ * queued for it; the other outcomes changed nothing and publish nothing.
+ */
+export const TerminalResizeOutcome = Schema.Literals([
+  "applied",
+  "unchanged",
+  "sessionMissing",
+  "claimNotRegistered",
+  "processAbsent",
+  "generationInvalidated",
+]);
+export type TerminalResizeOutcome = typeof TerminalResizeOutcome.Type;
+
+/** The size the server holds after a resize request; older servers answer `null`. */
+export const TerminalResizeResult = Schema.Struct({
+  outcome: TerminalResizeOutcome,
+  /** Absent only when the session is missing. */
+  size: Schema.NullOr(TerminalSize),
+  generation: Schema.NullOr(TerminalGeneration),
+  /** The sequence of the last size event published, the acknowledgement's when there is one. */
+  sequence: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+});
+export type TerminalResizeResult = typeof TerminalResizeResult.Type;
+
 export const TerminalClearInput = TerminalSessionInput;
 export type TerminalClearInput = Schema.Codec.Encoded<typeof TerminalClearInput>;
 
@@ -201,6 +240,8 @@ export const TerminalSessionSnapshot = Schema.Struct({
   sequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /** Applied PTY size; absent on older servers. */
   size: Schema.optional(TerminalSize),
+  /** The process this state belongs to, kept after it exits; absent on older servers. */
+  generation: Schema.optional(TerminalGeneration),
   oscColorResponderActive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** First-attachment grant: one startup-history reply pass, issued only before any claim, or a claimed stream surviving a restart, has consumed it. */
   firstAttachmentGrant: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -316,11 +357,19 @@ const TerminalExitedEvent = Schema.Struct({
   type: Schema.Literal("exited"),
   exitCode: Schema.NullOr(Schema.Int),
   exitSignal: Schema.NullOr(Schema.Int),
+  /** The process that exited; absent on older servers. */
+  generation: Schema.optional(TerminalGeneration),
 });
 
 const TerminalClosedEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("closed"),
+  /**
+   * At or above every process the closed session had. A close an attachment reports after
+   * falling behind carries one too, so a client applies it by generation, not by sequence.
+   * Absent on older servers.
+   */
+  generation: Schema.optional(TerminalGeneration),
 });
 
 const TerminalErrorEvent = Schema.Struct({
