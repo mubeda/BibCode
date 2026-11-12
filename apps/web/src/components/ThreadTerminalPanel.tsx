@@ -568,6 +568,8 @@ function acquireTerminalInputBinding(inputKey: string): {
 
 /** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
 const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+/** How long a successful claim waits for its echo before settling without one (#348). */
+const TERMINAL_CLAIM_SETTLE_MS = 250;
 
 export function fitTerminalSafely(fitAddon: FitAddon): boolean {
   try {
@@ -1413,6 +1415,7 @@ export function TerminalViewport({
     // Hides the notice only while a claim is pending or its success has not settled.
     let claimNoticeSuppressed = false;
     let keypressMeasureFrame: number | null = null;
+    let claimSettleTimer: number | null = null;
     let oscColorResponderActive = false;
     let disposed = false;
     let resizeRetryTimer: number | null = null;
@@ -1509,23 +1512,30 @@ export function TerminalViewport({
       );
     };
     // The server answers a claim for the size and owner it already holds with success and no
-    // echo, so a stale applied size survived its own repair (#348). Once queued output and any
-    // echo have parsed: if no size arrived since the claim and this renderer already owned the
-    // size, the claim is the applied state; a later echo or snapshot still wins. A takeover
-    // always echoes its owner change, so one without an echo was not applied.
-    const settleSuccessfulClaim = (request: TerminalSize, appliedAtClaim: TerminalSize | null) =>
-      outputSink.barrier(() => {
-        if (
-          disposed ||
-          resizeRendererGenerationRef.current !== resizeRendererGeneration ||
-          claimInFlight !== null
-        )
-          return;
-        claimNoticeSuppressed = false;
-        if (appliedSize === appliedAtClaim && appliedAtClaim?.sizeClaim === sizeClaim)
-          applySize(request);
-        else updateSizeNotice();
-      });
+    // echo, so a stale applied size survived its own repair (#348). The answer can also arrive
+    // before an echo and the output printed ahead of it, so the claim settles once, a bounded
+    // moment later, behind the output queued by then: if no size arrived since the claim and
+    // this renderer already owned the size, the claim is the applied state; a later echo or
+    // snapshot still wins. A takeover always echoes its owner change, so one without an echo
+    // was not applied.
+    const settleSuccessfulClaim = (request: TerminalSize, appliedAtClaim: TerminalSize | null) => {
+      if (claimSettleTimer !== null) window.clearTimeout(claimSettleTimer);
+      claimSettleTimer = window.setTimeout(() => {
+        claimSettleTimer = null;
+        outputSink.barrier(() => {
+          if (
+            disposed ||
+            resizeRendererGenerationRef.current !== resizeRendererGeneration ||
+            claimInFlight !== null
+          )
+            return;
+          claimNoticeSuppressed = false;
+          if (appliedSize === appliedAtClaim && appliedAtClaim?.sizeClaim === sizeClaim)
+            applySize(request);
+          else updateSizeNotice();
+        });
+      }, TERMINAL_CLAIM_SETTLE_MS);
+    };
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
@@ -1605,7 +1615,9 @@ export function TerminalViewport({
     };
     const applySize = (size: TerminalSize | undefined, claimOnAttach = false) => {
       if (disposed) return;
-      if (!terminalSizesEqual(appliedSize, size)) claimNoticeSuppressed = false;
+      // A size published after the claim was answered is the outcome of that claim.
+      if (claimInFlight === null || !terminalSizesEqual(appliedSize, size))
+        claimNoticeSuppressed = false;
       const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
@@ -2117,6 +2129,7 @@ export function TerminalViewport({
       window.clearTimeout(fitTimer);
       if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
       if (keypressMeasureFrame !== null) window.cancelAnimationFrame(keypressMeasureFrame);
+      if (claimSettleTimer !== null) window.clearTimeout(claimSettleTimer);
       outputSink.dispose();
       replyGuard.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;

@@ -5074,14 +5074,17 @@ renderer retains one pending claim until RPC completion, on success or failure.
 Resize requests queue per terminal and renderer claim, so a successful result
 is always the result of that renderer's own latest claim. The ordered echo
 updates applied dimensions and reply ownership. Because an exact no-op succeeds
-without an echo, a successful claim settles behind the output already queued
-for xterm: if this renderer already owned the size and no size arrived since the
-claim, the claimed size becomes the applied size, so a stale applied size cannot
-survive its own repair; any later echo or snapshot still wins. A takeover always
-echoes its owner change, so a successful takeover without one leaves the other
-owner's size applied. Notice suppression covers only the pending claim and its
-settlement; after it the notice shows whenever another owner's size differs
-from this renderer's fit. Input
+without an echo, and the answer can reach the page before the echo and the
+output printed ahead of it, a successful claim settles once, 250 ms after its
+answer, behind the output queued for xterm by then: if this renderer already
+owned the size and no size arrived since the claim, the claimed size becomes the
+applied size, so a stale applied size cannot survive its own repair; any later
+echo or snapshot still wins. A takeover always echoes its owner change, so a
+successful takeover without one leaves the other owner's size applied. Notice
+suppression covers only the pending claim and the time until its outcome (an
+applied size published after the answer, or the settlement); after it the
+notice shows whenever another owner's size differs from this renderer's fit.
+Input
 and reply decisions do not treat a pending claim as applied ownership. Null
 ownership permits live replies while attached renderers immediately try to claim
 it; mirrors suppress device/status/palette query replies. OSC 10/11/12 are
@@ -5089,14 +5092,16 @@ suppressed for all renderers when the server responder is active; otherwise the
 owner can answer. The server continues handling `CSI ? 996 n`.
 
 Each attach stream is in sequence order, but several streams for one terminal
-(a remounted renderer's old and new attachment while the old one is still being
-released, or two viewports of one terminal) feed the same transcript runtime.
-The runtime applies each server sequence once per process: an event at or below
+can feed the same transcript runtime (two mounted viewports of one terminal, or
+a remounted renderer's old attachment until its release, which the atom
+registry defers by one scheduler task). The runtime applies each server
+sequence once per process: an event at or below
 the highest sequence another stream already applied is skipped, a stream's
 events count only once it has delivered the snapshot or restart of the current
-process (identified by its `pid`), and a same-process snapshot or restart that
-another stream has already passed is not applied again. A snapshot of a different
-process always resets. Pointer-down, focus and the first keydown of each frame
+process (identified by its `pid`; a snapshot without one, taken after exit,
+belongs to the last process), and a same-process snapshot or restart that
+another stream has already passed is not applied again. A snapshot of a
+different process always resets. Pointer-down, focus and the first keydown of each frame
 re-measure the mount before deciding a claim.
 
 The transcript runtime delivers the first-attachment grant once to the renderer

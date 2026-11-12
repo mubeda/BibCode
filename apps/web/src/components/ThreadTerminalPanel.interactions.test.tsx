@@ -2488,6 +2488,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     await act(async () => view.pointerDownOnSurface());
     await view.flushFrame();
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    vi.useRealTimers();
     expect(view.fakeTerminal!.rows).toBe(20);
     expect(view.mounted.container.textContent).not.toContain("Sized for another window.");
     // A width change still produces an echo.
@@ -2518,6 +2519,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledTimes(1);
     await view.flushFrame();
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    vi.useRealTimers();
     expect(view.fakeTerminal!.cols).toBe(151);
     expect(view.mounted.container.textContent).toContain("Sized for another window.");
   });

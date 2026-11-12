@@ -1494,8 +1494,9 @@ successfully or with failure; the echo updates the applied size. A layout change
 deferred during a pending claim is reconsidered on completion; a new
 attachment/process snapshot retires the prior generation's request.
 
-The notice stays hidden while claiming and until a successful claim settles
-behind the output and echo xterm has not parsed yet, avoiding a flash. Failure
+The notice stays hidden while claiming and until the claim's outcome is known
+(a size published after its answer, or its settlement 250 ms later behind the
+output xterm has not parsed yet), avoiding a flash. Failure
 releases that suppression immediately. A successful claim for a size this
 renderer already owned settles as the applied size even when the server, already
 holding it, sends no echo; a successful takeover without an echo leaves the other

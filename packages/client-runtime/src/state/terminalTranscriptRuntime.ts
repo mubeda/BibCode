@@ -162,7 +162,12 @@ export function createTerminalTranscriptRuntime(
 
   const accept = (event: TerminalAttachStreamEvent, source: object): boolean => {
     if (event.type === "snapshot" || event.type === "restarted") {
-      const { pid, sequence } = event.snapshot;
+      const { sequence } = event.snapshot;
+      // An exited session has no pid: its snapshot is of the last process, not a new one.
+      const pid =
+        event.type === "snapshot" && event.snapshot.pid === null
+          ? (processId ?? null)
+          : event.snapshot.pid;
       sourceProcesses.set(source, pid);
       if (
         source !== sequenceSource &&
