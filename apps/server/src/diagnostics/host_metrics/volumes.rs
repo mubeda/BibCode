@@ -33,7 +33,9 @@ pub(crate) fn add_unlisted_network(
     mounted: Vec<(PathBuf, String)>,
 ) {
     for (mount_point, file_system) in mounted {
+        // A stock Mac's automount map (the home trigger) is no volume anyone mounted.
         if is_network(&file_system)
+            && file_system != "autofs"
             && !listed
                 .iter()
                 .any(|volume| volume.mount_point == mount_point)
