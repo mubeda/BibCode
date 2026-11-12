@@ -344,7 +344,11 @@ function HostDashboardValuesView({
             <tbody>
               {values.statistics.map((row) => (
                 <tr key={row.label}>
-                  <th scope="row" className="py-0.5 font-medium">
+                  <th
+                    scope="row"
+                    className="max-w-40 truncate py-0.5 pr-2 font-medium"
+                    title={row.label}
+                  >
                     {row.label}
                   </th>
                   {row.figures.map((figure) => (

@@ -7,6 +7,11 @@ use super::{HiddenReason, HiddenVolume, VolumeDescriptor, VolumeReading};
 /// Network file systems `sysinfo` does not already skip, or that a FUSE mount reports.
 const NETWORK_FILE_SYSTEMS: [&str; 6] = ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"];
 
+/// A network file system: any call on its mount point, an `lstat` included, can hang.
+pub(crate) fn is_network(file_system: &str) -> bool {
+    NETWORK_FILE_SYSTEMS.contains(&file_system)
+}
+
 /// Drops, before any space read, the volumes that must never be read.
 pub(crate) fn pre_filter(
     listed: Vec<VolumeDescriptor>,
@@ -14,7 +19,7 @@ pub(crate) fn pre_filter(
     let mut kept = Vec::with_capacity(listed.len());
     let mut hidden = Vec::new();
     for descriptor in listed {
-        let reason = if NETWORK_FILE_SYSTEMS.contains(&descriptor.file_system.as_str()) {
+        let reason = if is_network(&descriptor.file_system) {
             Some(HiddenReason::Network)
         } else if descriptor.file_system == "overlay" && descriptor.mount_point != Path::new("/") {
             Some(HiddenReason::Overlay)
@@ -112,6 +117,19 @@ mod tests {
             removable: false,
             read_only: false,
             is_file: false,
+        }
+    }
+
+    /// The listing skips its `lstat` for exactly the file systems the filter hides as network.
+    #[test]
+    fn network_file_systems_are_never_stat_by_the_listing() {
+        for file_system in ["nfs", "nfs4", "cifs", "smbfs", "autofs", "fuse.sshfs"] {
+            assert!(is_network(file_system), "{file_system}");
+            let (_, hidden) = pre_filter(vec![descriptor("/mnt/share", file_system)]);
+            assert_eq!(hidden[0].reason, HiddenReason::Network, "{file_system}");
+        }
+        for file_system in ["ext4", "apfs", "tmpfs", "overlay", "ntfs"] {
+            assert!(!is_network(file_system), "{file_system}");
         }
     }
 
