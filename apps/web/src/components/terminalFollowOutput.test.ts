@@ -50,6 +50,10 @@ function harness() {
       },
     },
     {
+      // What xterm's own viewport sync does: the scroll area takes the current height.
+      syncScrollArea: () => {
+        staleMax = null;
+      },
       observeDrawing: (onChange) => {
         setDrawing = onChange;
         return () => (setDrawing = () => undefined);
@@ -164,6 +168,35 @@ describe("terminal follow output across a paused renderer (#348)", () => {
     const [viewportY, baseY] = test.position();
     expect(baseY).toBeGreaterThan(0);
     expect(viewportY).toBe(baseY);
+  });
+
+  it("leaves the program's margins, cursors, tab stops and screens as they were", async () => {
+    const test = await setUp();
+    const { terminal } = test;
+    const screenRow = (row: number) =>
+      terminal.buffer.normal
+        .getLine(terminal.buffer.normal.baseY + row - 1)
+        ?.translateToString(true);
+    // A scrolling region on rows 2 to 4, a footer on row 5, a tab stop at column 11, a saved
+    // cursor at row 3 column 7, and the cursor on the region's bottom row.
+    await write(terminal, "\u001b[5;1H\u001b[2KFOOTER\u001b[1;11H\u001bH\u001b[3;7H\u001b7");
+    await write(terminal, "\u001b[2;4r\u001b[4;1H");
+    test.pause();
+    test.clamp(18);
+    test.staleScrollArea(test.position()[0]! + 1);
+    await resumeAndDraw(test);
+    expect(test.position()[0]).toBe(test.position()[1]);
+    expect(terminal.buffer.active.type).toBe("normal");
+    expect([terminal.buffer.normal.cursorY, terminal.buffer.normal.cursorX]).toEqual([3, 0]);
+
+    // A newline on the region's bottom row scrolls only the region: the footer stays.
+    await write(terminal, "\nX\r\tT");
+    expect(screenRow(5)).toBe("FOOTER");
+    expect(screenRow(4)).toBe("X         T");
+    // The saved cursor comes back where the program saved it.
+    await write(terminal, "\u001b8");
+    expect([terminal.buffer.normal.cursorY, terminal.buffer.normal.cursorX]).toEqual([2, 6]);
+    expect(terminal.buffer.alternate.getLine(0)?.translateToString(true)).toBe("");
   });
 
   it("keeps a scroll the user makes after the show while the repair is pending", async () => {
