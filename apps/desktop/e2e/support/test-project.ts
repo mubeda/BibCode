@@ -35,6 +35,13 @@ const LONG_REPLY_TURN_MARKER = "[[long-reply]]";
 const LONG_REPLY_LINES = 1_000;
 /** Matches the line the Claude shim writes. */
 const longReplyLine = (line: number) => `Fixture long reply line ${line} fills the timeline.`;
+/**
+ * A Claude prompt that starts with the code review lead-in (#293) is answered, as Claude in plan
+ * mode answers, with an `ExitPlanMode` call whose plan holds the findings.
+ */
+const CODE_REVIEW_LEAD_IN = "Code review requested from BiBCode.";
+const CODE_REVIEW_FINDING = "Low: example finding";
+const CODE_REVIEW_PLAN = `## Review findings\n\n- ${CODE_REVIEW_FINDING}`;
 /** An answer line names its prompt without the marker, so each turn's answer is its own. */
 const reasoningAnswerLine = (variant: string, line: number, label: string) =>
   `Fixture ${variant} answer line ${line} (${label}).`;
@@ -793,6 +800,33 @@ reader.on("line", (line) => {
   const prompt = promptTextFromParts(message.message?.content);
   appendProviderInput("claudeAgent", prompt);
   send(message);
+  if (prompt.startsWith(${JSON.stringify(CODE_REVIEW_LEAD_IN)})) {
+    send({
+      type: "assistant",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-review-plan-" + randomUUID(),
+      parent_tool_use_id: null,
+      message: {
+        id: "bibcode-ui-review-" + randomUUID(),
+        content: [{
+          type: "tool_use",
+          id: "bibcode-ui-review-exit-plan-" + randomUUID(),
+          name: "ExitPlanMode",
+          input: { plan: ${JSON.stringify(CODE_REVIEW_PLAN)} }
+        }]
+      }
+    });
+    send({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      errors: [],
+      stop_reason: "end_turn",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-review-result"
+    });
+    return;
+  }
   const slowReasoning = prompt.includes(${JSON.stringify(SLOW_REASONING_TURN_MARKER)});
   if (slowReasoning || prompt.includes(${JSON.stringify(REASONING_TURN_MARKER)})) {
     void streamReasoningTurn(sessionId, slowReasoning, prompt);
@@ -1484,6 +1518,7 @@ export const desktopUiFixture = {
   reasoningTurnMarker: REASONING_TURN_MARKER,
   slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
   longReplyTurnMarker: LONG_REPLY_TURN_MARKER,
+  codeReviewFinding: CODE_REVIEW_FINDING,
   longReplyLastLine: longReplyLine(LONG_REPLY_LINES),
   reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
   /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */

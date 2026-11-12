@@ -66,6 +66,7 @@ const desktopUiSpecFiles =
         "./specs/files-binary-preview.e2e.ts",
         "./specs/files-rich-markdown.e2e.ts",
         "./specs/appearance-themes.e2e.ts",
+        "./specs/source-control-review.e2e.ts",
         closingSpec,
       ];
 // The default specs share one app session. The closing spec ends the app, so it runs last in a
