@@ -97,7 +97,8 @@ jobs:
             gstreamer1.0-plugins-good \
             gstreamer1.0-alsa \
             xvfb \
-            xdotool
+            xdotool \
+            lsof
 
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile

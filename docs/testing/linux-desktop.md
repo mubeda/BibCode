@@ -330,6 +330,9 @@ verify it is nonempty and executable, and inspect version/architecture without
 modifying the artifact. Record whether FUSE is available or the AppImage needs
 its supported extraction fallback for testing.
 
+Packaged E2E also needs `lsof`: the harness finds the running app through it
+when it relaunches the app after a webview crash.
+
 Build and run packaged E2E with:
 
 ```sh
