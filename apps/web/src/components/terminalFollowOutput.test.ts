@@ -12,20 +12,38 @@ const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 /**
  * An unopened xterm keeps a real buffer but never renders, so the test drives what an opened
  * one does in a browser: the observer's pause, the paused clamp (a scroll nobody asked for),
- * frames and renders.
+ * frames, renders, and xterm 6's scroll area, which can keep the paused height after drawing
+ * resumes and clamps every scroll to it until xterm syncs it (a resize, or a scroll that
+ * really moves the view).
  */
 function harness() {
   const terminal = new Terminal({ cols: 46, rows: 43, scrollback: 5000, allowProposedApi: true });
   let setDrawing: (drawing: boolean) => void = () => undefined;
+  let userScrolled: () => void = () => undefined;
   let frames: Array<() => void> = [];
-  /** Bottom scrolls that xterm's stale scroll area clamps short (they move nothing here). */
-  let stuckScrolls = 0;
+  /** The highest row the stale scroll area reaches; null once xterm has synced it. */
+  let staleMax: number | null = null;
+  terminal.onResize(() => (staleMax = null));
+  const scrollTo = (row: number) => {
+    const normal = terminal.buffer.normal;
+    const target = Math.max(0, Math.min(row, normal.baseY, staleMax ?? Number.POSITIVE_INFINITY));
+    if (target === normal.viewportY) return;
+    terminal.scrollLines(target - normal.viewportY);
+    staleMax = null;
+  };
   const renders = new Set<() => void>();
   const follow = createTerminalFollowOutput(
     {
       buffer: terminal.buffer,
-      scrollLines: (amount) => terminal.scrollLines(amount),
-      scrollToBottom: () => (stuckScrolls > 0 ? (stuckScrolls -= 1) : terminal.scrollToBottom()),
+      get cols() {
+        return terminal.cols;
+      },
+      get rows() {
+        return terminal.rows;
+      },
+      resize: (cols, rows) => terminal.resize(cols, rows),
+      scrollLines: (amount) => scrollTo(terminal.buffer.normal.viewportY + amount),
+      scrollToBottom: () => scrollTo(terminal.buffer.normal.baseY),
       onRender: (listener) => {
         const callback = () => listener({ start: 0, end: terminal.rows - 1 });
         renders.add(callback);
@@ -36,6 +54,10 @@ function harness() {
       observeDrawing: (onChange) => {
         setDrawing = onChange;
         return () => (setDrawing = () => undefined);
+      },
+      observeUserScroll: (onScroll) => {
+        userScrolled = onScroll;
+        return () => (userScrolled = () => undefined);
       },
       scheduleFrame: (callback) => frames.push(callback),
       cancelFrame: (handle) => {
@@ -59,8 +81,14 @@ function harness() {
     runFrames,
     /** What xterm 6's paused viewport does after a row shrink: moves the view up by itself. */
     clamp: (rows: number) => terminal.scrollLines(-rows),
-    clampNextBottomScroll: () => {
-      stuckScrolls = 1;
+    /** Drawing resumed but xterm's scroll area still ends at this row. */
+    staleScrollArea: (maxRow: number) => {
+      staleMax = maxRow;
+    },
+    /** A wheel over the mount or a press on xterm's scroll bar. */
+    userScroll: (rows: number) => {
+      userScrolled();
+      terminal.scrollLines(rows);
     },
     position: () => [terminal.buffer.normal.viewportY, terminal.buffer.normal.baseY],
   };
@@ -100,15 +128,58 @@ describe("terminal follow output across a paused renderer (#348)", () => {
     expect(test.follow.atBottom()).toBe(true);
   });
 
+  /** Resumes and lets every repair attempt run: a render, its tick, then two frames each. */
+  async function resumeAndDraw(test: Awaited<ReturnType<typeof setUp>>) {
+    test.resume();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      test.render();
+      await tick();
+      test.runFrames();
+      await tick();
+    }
+  }
+
   it("syncs a scroll area still clamped to the paused height, then reaches the bottom", async () => {
     const test = await setUp();
     test.pause();
     test.clamp(18);
+    const [drifted] = test.position();
+    test.staleScrollArea(drifted! + 1);
+    await resumeAndDraw(test);
+    expect(test.position()[0]).toBe(test.position()[1]);
+  });
+
+  it("syncs a stale scroll area with no range at all, the view on row 0", async () => {
+    const test = harness();
+    opened.push(test);
+    // 40 lines in 43 rows: nothing to scroll until the paused shrink to 26 rows.
+    await write(test.terminal, lines(40));
+    test.pause();
+    test.terminal.resize(46, 26);
+    await write(test.terminal, lines(1, 40));
+    test.clamp(100);
+    expect(test.position()[0]).toBe(0);
+    test.staleScrollArea(0);
+    // No output after the show: an idle program prints nothing that could sync it.
+    await resumeAndDraw(test);
+    const [viewportY, baseY] = test.position();
+    expect(baseY).toBeGreaterThan(0);
+    expect(viewportY).toBe(baseY);
+  });
+
+  it("keeps a scroll the user makes after the show while the repair is pending", async () => {
+    const test = await setUp();
+    test.pause();
+    test.clamp(20);
     test.resume();
-    test.clampNextBottomScroll();
+    test.userScroll(-30);
+    const [chosen] = test.position();
     test.render();
     await tick();
-    expect(test.position()[0]).toBe(test.position()[1]);
+    test.runFrames();
+    await tick();
+    expect(test.position()[0]).toBe(chosen);
+    expect(test.follow.atBottom()).toBe(false);
   });
 
   it("repairs after two frames when the resumed renderer draws nothing", async () => {
