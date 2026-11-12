@@ -437,7 +437,9 @@ flowchart TB
   still runs 2 seconds later, and on Windows it is killed at once. After a
   forced stop of a command that takes `index.lock` itself, the server removes a
   lock that command left only if the lock did not exist before the command and
-  stays unchanged for another 2 seconds. Shutdown refuses new Git writes and
+  stays unchanged for another 2 seconds; on Linux and macOS the killed process
+  must also have held the lock open just before the kill, which Windows cannot
+  check. Shutdown refuses new Git writes and
   waits for the running ones to stop before the Profiler's teardown; see
   [Observability](../operations/observability.md).
 

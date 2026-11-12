@@ -478,7 +478,14 @@ impl ProcessRunner {
             None
         };
         let stop = ticket.cancellation.clone();
-        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+        let mut reports = TerminationReports::new(sender);
+        if let Some(watch) = &watch
+            && !watch.existed
+        {
+            let lock = watch.lock.clone();
+            reports = reports.checking_before_force(move |pid| holds_open(pid, &lock));
+        }
         // Owns the release: a dropped run still settles it in the background.
         let mut settlement = PendingSettlement(Some(WriteSettlement {
             _ticket: ticket,
@@ -568,6 +575,14 @@ impl WriteSettlement {
         if !(report.requested && report.forced && report.exited) {
             return;
         }
+        // Linux and macOS ask Git to stop first, and Git removes its own lock then, so a forced
+        // stop leaves one only when Git could not act on the request. Its lock is ours only if
+        // the root still held it open just before the kill: a lock nobody of ours held is
+        // another Git process's, even one that stays unchanged during the wait.
+        if cfg!(any(target_os = "linux", target_os = "macos")) && report.before_force != Some(true)
+        {
+            return;
+        }
         let worktree = redact_path(&self.cwd.to_string_lossy());
         let lock = watch.lock.clone();
         match watch.after_forced_stop().await {
@@ -643,6 +658,12 @@ impl IndexLockWatch {
 
     /// Removes a lock that appeared during the command and stayed unchanged for
     /// [`LOCK_UNCHANGED_WAIT`]. A lock that existed before the command is never removed.
+    ///
+    /// Time alone cannot tell whose lock this is. On Linux and macOS the settlement calls this
+    /// only when the killed Git process held the lock open just before the kill
+    /// ([`holds_open`]). Windows offers no such check here and every stop there is forced, so
+    /// a lock another Git process took while the killed command held none, and kept unchanged
+    /// for the wait, is still removed there.
     pub(crate) async fn after_forced_stop(self) -> LockCleanup {
         if self.existed {
             return LockCleanup::NotOurs;
@@ -664,6 +685,68 @@ impl IndexLockWatch {
             },
         }
     }
+}
+
+/// Whether process `pid` has `file` open. Git keeps `index.lock` open while it writes the
+/// index, but closes it while a hook or the editor runs; there it removes the lock on
+/// `SIGTERM`, so such a lock is never left by a forced stop.
+#[cfg(target_os = "linux")]
+fn holds_open(pid: u32, file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = file.symlink_metadata() else {
+        return false;
+    };
+    let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    descriptors.flatten().any(|descriptor| {
+        std::fs::metadata(descriptor.path())
+            .is_ok_and(|open| open.dev() == target.dev() && open.ino() == target.ino())
+    })
+}
+
+/// See the Linux version. The root leads its own process group, which the search is limited to.
+#[cfg(target_os = "macos")]
+fn holds_open(pid: u32, file: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        // libproc, part of libSystem: the processes that have `path` open.
+        fn proc_listpidspath(
+            kind: u32,
+            info: u32,
+            path: *const libc::c_char,
+            flags: u32,
+            buffer: *mut libc::c_void,
+            size: libc::c_int,
+        ) -> libc::c_int;
+    }
+    const PROC_PGRP_ONLY: u32 = 2;
+    let Ok(path) = std::ffi::CString::new(file.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // shortcut: a group of more than 64 processes may hide the root, which keeps the lock.
+    let mut pids = [0 as libc::pid_t; 64];
+    // SAFETY: `path` is a NUL-terminated string and `pids` is writable for the size given.
+    let bytes = unsafe {
+        proc_listpidspath(
+            PROC_PGRP_ONLY,
+            pid,
+            path.as_ptr(),
+            0,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    let found = usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<libc::pid_t>();
+    pids[..found.min(pids.len())]
+        .iter()
+        .any(|&found| u32::try_from(found) == Ok(pid))
+}
+
+/// No check on other platforms; the settlement does not ask for one there.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn holds_open(_pid: u32, _file: &Path) -> bool {
+    false
 }
 
 /// A lock's length and modification time.
@@ -1341,7 +1424,10 @@ mod tests {
         .await;
 
         assert_eq!(settled, QuiesceOutcome::Clean);
-        assert!(held.lock.exists(), "the other Git process's index.lock is kept");
+        assert!(
+            held.lock.exists(),
+            "the other Git process's index.lock is kept"
+        );
     }
 
     /// R16: a lock the forced write itself held is removed.
@@ -1358,7 +1444,10 @@ mod tests {
         .await;
 
         assert_eq!(settled, QuiesceOutcome::Clean);
-        assert!(!held.lock.exists(), "the forced write's index.lock is removed");
+        assert!(
+            !held.lock.exists(),
+            "the forced write's index.lock is removed"
+        );
     }
 
     /// Every command shape the server runs as a write, with whether a real Git took
@@ -1726,6 +1815,7 @@ mod tests {
                     requested: true,
                     forced: true,
                     exited: true,
+                    before_force: Some(true),
                 },
                 false,
             ),
@@ -1734,8 +1824,20 @@ mod tests {
                     requested: true,
                     forced: false,
                     exited: true,
+                    before_force: None,
                 },
                 true,
+            ),
+            // A forced stop whose root did not hold the lock: another Git process's lock on
+            // Linux and macOS, where that can be checked.
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: true,
+                    exited: true,
+                    before_force: Some(false),
+                },
+                cfg!(any(target_os = "linux", target_os = "macos")),
             ),
         ] {
             let git_dir = tempfile::tempdir().expect("Git directory");
@@ -1780,6 +1882,7 @@ mod tests {
                 requested: true,
                 forced: true,
                 exited: true,
+                before_force: Some(true),
             })
             .expect("the stop report");
         let settlement = WriteSettlement {
@@ -1831,6 +1934,7 @@ mod tests {
                 requested: true,
                 forced: true,
                 exited: true,
+                before_force: Some(true),
             })
             .expect("the stop report");
         WriteSettlement {

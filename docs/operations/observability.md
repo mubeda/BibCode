@@ -85,7 +85,12 @@ lock stays unchanged for another 2 seconds, the server removes it and writes
 one `warn` line, `removed index.lock left by a Git process BiBCode had to
 force to stop`, with the operation name and the worktree path after the
 Profiler's path redaction. A lock that existed before the command started, or
-that changes during the wait, is never removed. If deleting the lock fails, the
+that changes during the wait, is never removed. On Linux and macOS, where Git
+removes its own lock when asked to stop, the server removes a lock only if the
+killed Git process still held it open just before the kill, so a lock another
+Git process took meanwhile stays even when it does not change. Windows has no
+such check: there a lock another Git process took while the killed command held
+none, and that stays unchanged for the 2 seconds, is still removed. If deleting the lock fails, the
 server writes one `warn` line, `could not remove index.lock left by a Git
 process BiBCode had to force to stop`, with the same fields and the error kind,
 and the lock stays. At shutdown the server refuses

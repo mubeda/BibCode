@@ -4,6 +4,7 @@ use std::{
     io,
     path::Path,
     process::ExitStatus,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -43,13 +44,39 @@ pub(crate) struct TerminationReport {
     pub(crate) forced: bool,
     /// The process has exited.
     pub(crate) exited: bool,
+    /// The [`TerminationReports::before_force`] answer, taken while the root still ran just
+    /// before it was forced to stop. `None` when nothing was checked.
+    pub(crate) before_force: Option<bool>,
 }
 
-pub(crate) type TerminationReports = tokio::sync::mpsc::UnboundedSender<TerminationReport>;
+/// Where a run sends its [`TerminationReport`].
+#[derive(Clone)]
+pub(crate) struct TerminationReports {
+    sender: tokio::sync::mpsc::UnboundedSender<TerminationReport>,
+    /// Asked about the root's process id just before a forced stop, while the root still runs.
+    before_force: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
+}
+
+impl TerminationReports {
+    pub(crate) fn new(sender: tokio::sync::mpsc::UnboundedSender<TerminationReport>) -> Self {
+        Self {
+            sender,
+            before_force: None,
+        }
+    }
+
+    pub(crate) fn checking_before_force(
+        mut self,
+        check: impl Fn(u32) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.before_force = Some(Arc::new(check));
+        self
+    }
+}
 
 fn send_report(reports: Option<&TerminationReports>, report: TerminationReport) {
     if let Some(reports) = reports {
-        let _ = reports.send(report);
+        let _ = reports.sender.send(report);
     }
 }
 
@@ -262,6 +289,7 @@ where
                 requested: false,
                 forced: false,
                 exited: true,
+                before_force: None,
             },
         );
     }
@@ -381,6 +409,7 @@ impl Drop for SupervisedChildGuard {
                     requested: false,
                     forced: false,
                     exited: true,
+                    before_force: None,
                 },
             );
             return;
@@ -681,12 +710,21 @@ async fn terminate_and_wait_owned(
     stopped_when_asked: bool,
     reports: Option<TerminationReports>,
 ) {
+    let before_force = if stopped_when_asked {
+        None
+    } else {
+        reports
+            .as_ref()
+            .and_then(|reports| reports.before_force.as_ref())
+            .and_then(|check| child.id().map(|pid| check(pid)))
+    };
     let mut report = ProcessCleanupReport::default();
     request_termination(&mut *child, &mut report);
     let stopped = move |exited| TerminationReport {
         requested: true,
         forced: !stopped_when_asked,
         exited,
+        before_force,
     };
     match tokio::time::timeout(wait_timeout, child.wait()).await {
         Ok(Ok(_)) => {
@@ -2005,7 +2043,11 @@ mod tests {
     ) {
         let cancellation = CancellationToken::new();
         let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
-        let run = run_supervised_reporting(request, &cancellation, Some(report_sender));
+        let run = run_supervised_reporting(
+            request,
+            &cancellation,
+            Some(TerminationReports::new(report_sender)),
+        );
         tokio::pin!(run);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         tokio::select! {
@@ -2151,7 +2193,7 @@ mod tests {
         let mut run = Box::pin(run_supervised_reporting(
             stop_policy_request(IGNORES_THE_REQUEST, &marker, StopPolicy::AskThenForce),
             &cancellation,
-            Some(report_sender),
+            Some(TerminationReports::new(report_sender)),
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         tokio::select! {
@@ -2206,7 +2248,8 @@ mod tests {
             TerminationReport {
                 requested: true,
                 forced: false,
-                exited: true
+                exited: true,
+                before_force: None
             }
         );
         assert_eq!(
@@ -2214,7 +2257,8 @@ mod tests {
             TerminationReport {
                 requested: true,
                 forced: true,
-                exited: true
+                exited: true,
+                before_force: None
             }
         );
     }
