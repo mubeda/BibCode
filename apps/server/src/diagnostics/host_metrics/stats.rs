@@ -114,11 +114,13 @@ pub struct ChartBucket {
     pub memory_peak: f64,
 }
 
-/// A closed bucket, stored compactly: offsets in seconds from the first reading.
+/// A closed bucket, stored compactly: offsets in seconds from the first reading. `weight_s` is
+/// the time its readings observed, which a suspend inside `width_s` does not add to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StoredBucket {
     start_s: u32,
     width_s: u32,
+    weight_s: f32,
     cpu_average: f32,
     cpu_peak: f32,
     memory_average: f32,
@@ -130,7 +132,7 @@ impl StoredBucket {
         self.start_s.saturating_add(self.width_s)
     }
 
-    /// Merges consecutive buckets, weighting each by its width.
+    /// Merges consecutive buckets, weighting each by the time it observed.
     fn merge(buckets: &[StoredBucket]) -> Option<StoredBucket> {
         let first = buckets.first()?;
         let mut open = OpenBucket::starting_at(first.start_s);
@@ -178,7 +180,7 @@ impl OpenBucket {
         self.add(
             f64::from(bucket.cpu_average),
             f64::from(bucket.memory_average),
-            f64::from(bucket.width_s.max(1)),
+            f64::from(bucket.weight_s),
             f64::from(bucket.cpu_peak),
             f64::from(bucket.memory_peak),
         );
@@ -193,6 +195,7 @@ impl OpenBucket {
         StoredBucket {
             start_s: self.start_s,
             width_s: self.end_s.saturating_sub(self.start_s),
+            weight_s: weight as f32,
             cpu_average: ((self.cpu_sum / weight) as f32).min(cpu_peak),
             cpu_peak,
             memory_average: ((self.memory_sum / weight) as f32).min(memory_peak),
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn the_oldest_tier_fits_in_one_mebibyte() {
-        assert_eq!(std::mem::size_of::<StoredBucket>(), 24);
+        assert_eq!(std::mem::size_of::<StoredBucket>(), 28);
         assert!(std::mem::size_of::<StoredBucket>() * OLDEST_TIER_MAX_BUCKETS < 1_048_576);
     }
 
