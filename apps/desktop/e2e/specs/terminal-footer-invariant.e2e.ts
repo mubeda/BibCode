@@ -603,7 +603,8 @@ async function openCodexTerminal(): Promise<string> {
 describe("packaged AI terminal footer invariant (#348)", () => {
   it("keeps the PTY, xterm and the visible mount in agreement across seeded layout changes", async function () {
     // Each step takes about 3 s; the configured case timeout alone ends the loop near step 40.
-    this.timeout(Math.max(this.timeout(), stepCount * 20_000));
+    // Setup and the chat mode's turns add up to a minute on a loaded host before the first step.
+    this.timeout(Math.max(this.timeout(), 120_000 + stepCount * 20_000));
     clearDesktopActivityMarker(preparedProjectPath);
     await setDesktopUiWindowSize(1_200, 720);
     await openFixtureThread();
