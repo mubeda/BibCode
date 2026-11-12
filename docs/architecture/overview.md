@@ -1465,14 +1465,31 @@ plain `snapshot`, handled as a new attachment. Clients that predate the flag
 handle every resync that way.
 
 Resize requests publish `resized { size }` after the PTY accepts the size,
-before subsequent output can publish. Claim-only changes publish; exact no-ops
-do not. Failed resizes preserve the prior state. Legacy resizes without a claim
-clear the owner. Open/attach dimensions initialize new PTYs; attaching to an
-existing process preserves its dimensions.
+before subsequent output can publish. Claim-only changes publish; an exact
+no-op with a registered claim publishes `resized` to that claim's attachment
+alone, and a no-op without a claim publishes nothing. `terminal.resize`
+answers with what the session then holds (outcome, size, generation, last size
+sequence; see [Terminal size and reply ownership](rpc-and-orchestration.md#terminal-size-and-reply-ownership)).
+Failed resizes preserve the prior state. The PTY resize worker records a size
+the PTY refused, and the next request for that size sends it again instead of
+treating it as a no-op. Legacy resizes without a claim clear the owner.
+Open/attach dimensions initialize new PTYs; attaching to an existing process
+preserves its dimensions.
+
+Every process a manager starts gets a generation, `{ boot, process }`: `boot`
+is a random id of this manager instance, `process` a counter that only grows.
+Snapshots (also after exit, without a pid), `exited` and `closed` carry it; a
+`closed` an attachment reports after falling behind carries the latest
+generation issued, since its sequence is that attachment's own guess. The
+fields are optional on the wire, so older servers and clients still decode.
 
 Attachment lifetime owns claim eligibility. Dropping the owner unregisters its
-claim and signals a manager-tracked cleanup worker to publish null ownership
-under the current generation's publication lock, preserving PTY dimensions.
+claim and signals a manager-tracked cleanup worker to republish ownership
+under the current generation's publication lock, preserving PTY dimensions:
+a lone remaining claimed viewer takes the size at once; with several left the
+size is un-owned. The departed owner's claim is remembered, and when it
+attaches again before anyone typed into the terminal it takes the size back,
+so a client whose connection dropped is the owner again without a click.
 Attachment identities prevent an old stream from clearing a replacement that
 reuses its claim, including across process restarts. Queued requests from an
 unregistered claim cannot resurrect it. Manager shutdown fences new claim

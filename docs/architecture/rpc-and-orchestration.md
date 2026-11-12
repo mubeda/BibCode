@@ -5059,13 +5059,19 @@ during ordinary typing; remote echo still includes network round-trip latency.
 ## Terminal size and reply ownership
 
 `terminalSizeOwnership` is negotiated from the environment capability set and is
-decoded as false when absent. The terminal manager owns PTY dimensions and one
+decoded as false when absent. The rule: the window last used sizes the terminal. Another
+window never clips it: it scales the picture down to fit (floor 0.5, then
+scrolls pinned to the bottom) or shows it at normal size with empty space. An
+unattended window never takes the size by itself; when the sizing window goes
+away, a visible window takes it. The terminal manager owns PTY dimensions and one
 optional attachment owner; renderers mirror that applied state.
 
 | Protocol surface        | Additions and behavior                                                                                                                                                    |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `terminal.attach` input | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.              |
 | `terminal.resize` input | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers.                             |
+| `terminal.resize` result | `{ outcome, size, generation, sequence }`: `applied`, `unchanged`, `sessionMissing`, `claimNotRegistered`, `processAbsent` or `generationInvalidated`, with the size the server holds. Older servers answer `null`; older clients ignore it. |
+| Snapshot, `exited`, `closed` | Optional `generation { boot, process }`; see the terminal section of the architecture overview.                                                                  |
 | Attach snapshot         | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                          |
 | Attach snapshot         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                   |
 | Attach snapshot         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it. |
@@ -5088,26 +5094,35 @@ Dropping that `Started` event is a known limitation of surviving streams. Later
 and concurrent
 attaches neither renew a consumed grant nor displace a live owner. Claim
 eligibility ends with the exact attachment lifetime; dropping the owner
-publishes a null owner without changing dimensions, and stale resize requests
-cannot reclaim it. Manager shutdown cancels and drains attachment cleanup
+republishes ownership without changing dimensions (a lone remaining claimed
+viewer takes it, several leave it un-owned, and the departed claim gets it back
+if it attaches again before anyone types), and stale resize requests cannot
+reclaim it. Manager shutdown cancels and drains attachment cleanup
 workers.
 
 Accepted resize/claim changes publish before subsequent PTY output under the
-same lock; failed resizes preserve state and exact no-ops emit nothing. A
-renderer retains one pending claim until RPC completion, on success or failure.
-Resize requests queue per terminal and renderer claim, so a successful result
-is always the result of that renderer's own latest claim. The ordered echo
-updates applied dimensions and reply ownership. Because an exact no-op succeeds
-without an echo, and the answer can reach the page before the echo and the
-output printed ahead of it, a successful claim settles once, 250 ms after its
-answer, behind the output queued for xterm by then: if this renderer already
-owned the size and no size arrived since the claim, the claimed size becomes the
-applied size, so a stale applied size cannot survive its own repair; any later
-echo or snapshot still wins. A takeover always echoes its owner change, so a
-successful takeover without one leaves the other owner's size applied. Notice
-suppression covers only the pending claim and the time until its outcome (an
-applied size published after the answer, or the settlement); after it the
-notice shows whenever another owner's size differs from this renderer's fit.
+same lock; failed resizes preserve state. An exact no-op with a registered
+claim publishes `resized` to that claim's attachment only, behind the output
+already queued for it, so a renderer whose applied size went stale repairs it
+with an ordered event and no timer (#348). A renderer retains one pending claim
+until RPC completion, on success or failure. Resize requests queue per terminal
+and renderer claim, so a result is always that renderer's own latest claim's.
+xterm geometry changes only through ordered size events and snapshots, behind
+the output parsed before them. An `applied` or `unchanged` answer names the
+sequence of its acknowledgement; the claim's outcome is the applied size at or
+after that sequence in the same generation, so an older publication parsed
+after the answer neither applies the claim nor ends notice suppression. Any
+other outcome changed nothing: xterm keeps its size and the same geometry is
+not sent again until the server's state changes. A claim the server did not
+know (a remount claiming before its stream attached, or a reconnecting stream)
+is claimed again when the renderer's own stream attaches, even when that
+stream's snapshot is a state the shared runtime already applied; the client
+does not re-attach for it, since an attach can recreate a closed terminal. An
+`unchanged` claim for the geometry still awaiting its acknowledgement is not
+re-sent, so typing sends no repeated requests. With an older server (`null`
+answer) the next published size is the claim's outcome. Notice suppression
+covers the pending claim and its acknowledgement; after it the notice shows
+whenever another owner's size differs from this renderer's fit.
 A mirror scales its xterm element down to show the owner's whole grid, never
 up, with a 0.5 floor below which it scrolls pinned to the bottom rows; this is
 presentation only and sends no request. Attach and focus claims against a live
@@ -5123,14 +5138,17 @@ owner can answer. The server continues handling `CSI ? 996 n`.
 Each attach stream is in sequence order, but several streams for one terminal
 can feed the same transcript runtime (two mounted viewports of one terminal, or
 a remounted renderer's old attachment until its release, which the atom
-registry defers by one scheduler task). The runtime applies each server
-sequence once per process: an event at or below
-the highest sequence another stream already applied is skipped, a stream's
-events count only once it has delivered the snapshot or restart of the current
-process (identified by its `pid`; a snapshot without one, taken after exit,
-belongs to the last process), and a same-process snapshot or restart that
-another stream has already passed is not applied again. A snapshot of a
-different process always resets. Pointer-down, focus and the first keydown of each frame
+registry defers by one scheduler task). The runtime orders processes by the
+server's generation: a snapshot or restart of an earlier process, or of a
+server instance the runtime has left, is never applied, and a stream's events
+count only once it has delivered the snapshot or restart of the current
+process. Within a process each sequence is applied once: an event at or below
+the highest sequence another stream already applied is skipped, and size
+events keep their own watermark because only claimed streams receive them. A
+`closed` with a generation is applied by generation (once), not against
+another stream's sequence. With an older server (no generation) the `pid`
+tells processes apart as before, and a snapshot without one belongs to the
+last process. Pointer-down, focus and the first keydown of each frame
 re-measure the mount before deciding a claim.
 
 The transcript runtime delivers the first-attachment grant once to the renderer
