@@ -369,9 +369,51 @@ if (process.stdout.isTTY) {
   // in place, as Claude's CLI does, instead of pinning a footer to the last row.
   const floatingFrame = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "floating";
   let floatingLines = 0;
+  // BIBCODE_E2E_FOOTER_LAYOUT=cli behaves like an Ink CLI such as Claude's: a long transcript in
+  // the normal buffer, a six-row frame on the bottom rows erased line by line (never a full clear)
+  // and rewritten every 80-120 ms, transcript lines streamed above it, lines cut to the width.
+  const cliFrame = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "cli";
+  let cliRows = 0;
+  let cliTick = 0;
+  let cliLine = 0;
+  const drawCliFrame = (transcript) => {
+    const rows = process.stdout.rows;
+    const cols = process.stdout.columns;
+    const size = cols + "x" + rows;
+    const frame = [
+      "|/-\\"[cliTick % 4] + " fixture working " + cliTick,
+      "> " + "draft".padEnd(Math.max(0, Math.min(cols - 3, 40)), "."),
+      "",
+      "fixture-footer-a " + size,
+      "fixture-footer-b",
+      "fixture-footer-z " + rows,
+    ].map((text) => text.slice(0, Math.max(1, cols - 1)));
+    let erase = "";
+    for (let index = 0; index < cliRows; index += 1) erase += "\x1b[2K" + (index < cliRows - 1 ? "\x1b[1A" : "");
+    process.stdout.write(erase + "\r" + transcript.map((text) => text + "\r\n").join("") + frame.join("\r\n"));
+    cliRows = frame.length;
+  };
+  if (cliFrame) {
+    let intro = "";
+    for (; cliLine < 200; cliLine += 1) intro += "transcript " + cliLine + " " + "lorem ipsum ".repeat(4) + "\r\n";
+    process.stdout.write(intro);
+    const redraw = () => {
+      cliTick += 1;
+      drawCliFrame(Math.random() < 0.3 ? ["transcript " + cliLine++ + " streamed while the frame redraws"] : []);
+      setTimeout(redraw, 80 + Math.floor(Math.random() * 41));
+    };
+    setTimeout(redraw, 100);
+  }
   const drawTerminalSize = () => {
     const rows = process.stdout.rows;
     const size = process.stdout.columns + "x" + rows;
+    if (cliFrame) {
+      drawCliFrame([]);
+      try {
+        fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
+      } catch {}
+      return;
+    }
     if (floatingFrame) {
       const frame = ["fixture-tui " + size, "fixture-footer-a " + size, "fixture-footer-b", "fixture-footer-z " + rows];
       process.stdout.write((floatingLines > 0 ? "\x1b[" + floatingLines + "A\r\x1b[J" : "") + frame.join("\r\n") + "\r\n");

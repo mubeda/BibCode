@@ -347,13 +347,19 @@ export async function stopDesktopActivitySession(): Promise<void> {
  * Refreshes the server config stream with the same absolute Codex executable
  * that the disposable provider inventory authorizes for the terminal launch.
  */
-export async function configureDesktopActivityCodexExecutable(executable: string): Promise<void> {
+export async function configureDesktopActivityCodexExecutable(
+  executable: string,
+  options: { readonly webglEnabled?: boolean } = {},
+): Promise<void> {
   await dispatchDesktopActivityCommands([], null, [
     {
       tag: "server.updateSettings",
       payload: {
         patch: {
           enableTerminalAgentActivity: true,
+          ...(options.webglEnabled === undefined
+            ? {}
+            : { terminal: { webglEnabled: options.webglEnabled } }),
           providers: {
             codex: {
               enabled: true,

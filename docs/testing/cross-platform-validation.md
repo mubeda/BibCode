@@ -771,20 +771,33 @@ Terminal on the fixture TUI, which draws a footer on its last three rows and
 logs each PTY size, and drives random layout actions around it: the right
 panel's toggle, maximize and edge drag, the terminal's Activity panel, a center
 split or unsplit, tab and route switches, the sidebar, window resizes, and
-reloads. Each step is measured once it settles and again 1.5 s later; only the
+reloads. The baseline waits for the terminal's Activity dock, which mounts
+after the terminal and shrinks it, and for the refit that follows. Each step is
+measured once it settles and again 1.5 s later; only the
 later measurement fails the run. Then the PTY's rows must equal the
 rows xterm draws and the rows that fit the mount, the last row must sit inside
 every clipping ancestor, and with the DOM renderer the footer must be on the
-last row. A center column collapsed behind a maximized right panel (zero width)
-counts as not shown, and a footer cut off by a narrow terminal still counts as
-the footer. `BIBCODE_E2E_FOOTER_LAYOUT=floating` runs a frame drawn in the
-normal buffer, as Claude's CLI does, and checks instead that the footer appears
-exactly once at the current size. `BIBCODE_E2E_FOOTER_SEED` (default 348)
+last row when the terminal is wide enough for its text. A center column
+collapsed behind a maximized right panel (zero width), or covered by one (what
+is drawn at the mount's corner is not the terminal), counts as not shown.
+`BIBCODE_E2E_FOOTER_LAYOUT=floating` runs a frame drawn in the
+normal buffer and checks instead that the footer appears
+exactly once at the current size. `BIBCODE_E2E_FOOTER_LAYOUT=cli` runs an
+Ink-like program, as Claude's CLI is: a long transcript, and a six-row frame on
+the bottom rows erased line by line and rewritten every 80 to 120 ms; it also
+requires the viewport to stay at the bottom. `BIBCODE_E2E_FOOTER_RENDERER=dom`
+turns the WebGL renderer off so every check reads the text, and
+`BIBCODE_E2E_FOOTER_CHAT=1` adds chat sends and a growing composer to the
+actions. `BIBCODE_E2E_FOOTER_SEED` (default 348)
 replays a run and `BIBCODE_E2E_FOOTER_STEPS` (default 40) lengthens it; the
-case timeout grows with the step count. A violation fails with
+case timeout grows with the step count. A window resize the window manager
+does not settle exactly (GTK under Xvfb) is recorded with the size it reached.
+A violation fails with
 the seed, the steps so far, the measurements, and a
 `terminal-footer-<seed>-<step>-<time>.png` screenshot with a `.json` report
-beside it. An edge drag that the driver cannot perform is logged as skipped.
+beside it. A passing run writes `terminal-footer-<seed>-passed.json` with its
+steps, the settling checks that disagreed and cleared, and the renderers seen.
+An edge drag that the driver cannot perform is logged as skipped.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head

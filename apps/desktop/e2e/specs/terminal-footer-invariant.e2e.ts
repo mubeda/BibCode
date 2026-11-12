@@ -24,6 +24,10 @@ import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-sta
  *   - the last row's bottom edge is inside every clipping ancestor; and
  *   - with the DOM renderer, the footer text is on the last row (or, with
  *     BIBCODE_E2E_FOOTER_LAYOUT=floating, appears exactly once at the current size).
+ * BIBCODE_E2E_FOOTER_LAYOUT=cli runs an Ink-like program that rewrites a bottom frame every
+ * 100 ms above a long transcript, and also checks that the viewport stays at the bottom.
+ * BIBCODE_E2E_FOOTER_RENDERER=dom turns the WebGL renderer off, so every check reads the text.
+ * BIBCODE_E2E_FOOTER_CHAT=1 adds chat sends and a growing composer to the actions.
  * BIBCODE_E2E_FOOTER_SEED and BIBCODE_E2E_FOOTER_STEPS replay or lengthen a run.
  */
 
@@ -52,6 +56,9 @@ const seed = readPositiveInteger("BIBCODE_E2E_FOOTER_SEED", 348);
 const stepCount = readPositiveInteger("BIBCODE_E2E_FOOTER_STEPS", 40);
 /** "floating" runs a frame drawn in the normal buffer (like Claude's CLI), not pinned to the last row. */
 const floatingLayout = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "floating";
+const cliLayout = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "cli";
+const domRenderer = process.env.BIBCODE_E2E_FOOTER_RENDERER === "dom";
+const chatActions = process.env.BIBCODE_E2E_FOOTER_CHAT === "1";
 
 /** mulberry32: small, deterministic, and enough to replay a failing sequence. */
 function createRandom(initial: number): () => number {
@@ -92,6 +99,8 @@ interface TerminalGeometry {
   readonly footerRows: ReadonlyArray<string>;
   readonly clippedBy: ReadonlyArray<{ readonly element: string; readonly overflow: number }>;
   readonly notice: boolean;
+  /** Pixels the xterm viewport is scrolled above its bottom. */
+  readonly scrollGap: number;
   readonly viewport: { readonly width: number; readonly height: number };
 }
 
@@ -109,6 +118,7 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
       footerRows: [],
       clippedBy: [],
       notice: false,
+      scrollGap: 0,
       viewport: { width: window.innerWidth, height: window.innerHeight },
     };
     const mount = document.querySelector<HTMLElement>(
@@ -120,6 +130,13 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
     if (!mount || !mountRect || mountRect.height <= 0 || mountRect.width <= 0) return empty;
     if (mount.closest('[data-visible="false"]') || getComputedStyle(mount).visibility === "hidden")
       return empty;
+    // A maximized right panel can also cover a center column that keeps its size: what is
+    // drawn at the mount's corner then belongs to the panel, and the terminal is not shown.
+    const probe = document.elementFromPoint(
+      mountRect.left + Math.min(8, mountRect.width / 2),
+      mountRect.top + Math.min(8, mountRect.height / 2),
+    );
+    if (!probe || !mount.contains(probe)) return empty;
     const xterm = mount.querySelector<HTMLElement>(".xterm");
     const screen = mount.querySelector<HTMLElement>(".xterm-screen");
     if (!xterm || !screen) return empty;
@@ -170,6 +187,12 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
               .filter((text) => text.includes("fixture-footer-z")),
       clippedBy,
       notice: (mount.parentElement?.textContent ?? "").includes("Sized for another window"),
+      scrollGap: (() => {
+        const viewport = mount.querySelector<HTMLElement>(".xterm-viewport");
+        return viewport
+          ? Math.round(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop)
+          : 0;
+      })(),
       viewport: { width: window.innerWidth, height: window.innerHeight },
     };
   }, terminalId);
@@ -208,6 +231,9 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
     violations.push(`xterm draws ${xtermRows} rows but ${fitRows} fit its mount`);
   for (const clip of geometry.clippedBy)
     violations.push(`the last row is ${clip.overflow.toFixed(1)}px below ${clip.element}`);
+  // A program writing a transcript keeps the viewport pinned to the bottom.
+  if (cliLayout && geometry.scrollGap > 1)
+    violations.push(`the viewport is ${geometry.scrollGap}px above the bottom`);
   if (floatingLayout) {
     // A frame drawn in the normal buffer sits wherever the cursor was, so only its count is
     // known: the footer must appear exactly once at the current size, never stale or doubled.
@@ -223,10 +249,10 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
         );
     }
   } else if (geometry.renderer === "dom" && tui !== null && tui.rows >= 5) {
-    // A terminal narrower than the footer truncates it; a cut-off prefix is still the footer.
-    const last = geometry.lastRows.at(-1) ?? "";
+    // A narrower terminal wraps the footer (the full-screen TUI) or cuts it at the width less
+    // one column (the cli program), so its text is checked only where it fits.
     const expected = `fixture-footer-z ${tui.rows}`;
-    if (!(last.startsWith(expected) || (last.length > 0 && expected.startsWith(last))))
+    if (tui.cols > expected.length && !(geometry.lastRows.at(-1) ?? "").startsWith(expected))
       violations.push(`the footer is not on the last row: ${JSON.stringify(geometry.lastRows)}`);
   }
   return { at, tui, geometry, xtermRows, fitRows, violations };
@@ -362,9 +388,20 @@ async function setSplit(terminalId: string, split: boolean): Promise<void> {
   await reloadDocument();
 }
 
+/** A chat action can leave the chat tab active, and the terminal mounts only when shown. */
+async function showTerminalAfterChat(): Promise<void> {
+  if (!chatActions) return;
+  await browser
+    .$(terminalTab)
+    .waitForExist({ timeout: 15_000 })
+    .catch(() => undefined);
+  await showTerminal();
+}
+
 async function reloadDocument(): Promise<void> {
   await refreshDesktopUiDocument();
   await installDesktopUiMotionGuard();
+  await showTerminalAfterChat();
   await browser.$(`[data-terminal-xterm-mount]`).waitForExist({
     timeout: 30_000,
     timeoutMsg: "The terminal did not mount again after a reload.",
@@ -453,6 +490,7 @@ const actions: ReadonlyArray<readonly [string, Action]> = [
       await browser.url(`${origin}/#/settings/terminal`);
       await browser.pause(500);
       await browser.url(current);
+      await showTerminalAfterChat();
       await browser.$(`[data-terminal-xterm-mount]`).waitForExist({ timeout: 15_000 });
       await showTerminal();
       return "open settings and come back";
@@ -478,7 +516,14 @@ const actions: ReadonlyArray<readonly [string, Action]> = [
           : mode < 2 / 3
             ? { width, height: viewport.height }
             : { width, height };
-      await setDesktopUiWindowSize(next.width, next.height);
+      try {
+        await setDesktopUiWindowSize(next.width, next.height);
+      } catch {
+        // Some window managers (GTK under Xvfb) settle near the size but never on it; the
+        // invariant holds at whatever size the window reached, so the step records that.
+        const reached = await browser.execute(() => `${window.innerWidth}x${window.innerHeight}`);
+        return `resize window toward ${next.width}x${next.height} (reached ${reached})`;
+      }
       return `resize window to ${next.width}x${next.height}`;
     },
   ],
@@ -492,10 +537,58 @@ const actions: ReadonlyArray<readonly [string, Action]> = [
   ],
 ];
 
+let chatMessages = 0;
+const visibleComposer =
+  '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
+
+/** Uses the chat beside (or instead of) the terminal: a send, or a composer that grows and empties. */
+function chatAction(kind: "send" | "grow"): Action {
+  return async (_session, random) => {
+    let composer = browser.$(visibleComposer);
+    let switched = false;
+    if (!(await composer.isExisting()) || !(await composer.isDisplayed())) {
+      if (!(await clickIfUsable(chatTab))) return null;
+      switched = true;
+      composer = browser.$(visibleComposer);
+      if (!(await composer.isDisplayed().catch(() => false))) return null;
+    }
+    await composer.click();
+    if (kind === "send") {
+      chatMessages += 1;
+      await composer.addValue(`fixture message ${chatMessages}`);
+      await browser.keys("Enter");
+      await browser.pause(400 + Math.round(random() * 1_200));
+    } else {
+      for (let line = 0; line < 6; line += 1) {
+        await composer.addValue(`grow line ${line}`);
+        await browser.keys(["Shift", "Enter"]);
+      }
+      await browser.pause(600);
+      await browser.keys(["Control", "a"]);
+      await browser.keys("Backspace");
+    }
+    if (switched && random() < 0.7) await showTerminal();
+    return `chat ${kind}${switched ? " via the chat tab" : " beside the terminal"}`;
+  };
+}
+
+const actionList: ReadonlyArray<readonly [string, Action]> = chatActions
+  ? [
+      ...actions,
+      ["chat send", chatAction("send")],
+      ["chat send", chatAction("send")],
+      // The center split already puts the chat beside the terminal.
+      ["composer grow", chatAction("grow")],
+    ]
+  : actions;
+
 async function openFixtureThread(): Promise<void> {
   await ensureMainSidebarOpen();
   await materializeDesktopActivitySession(preparedProjectPath);
-  await configureDesktopActivityCodexExecutable(preparedCodexExecutable);
+  await configureDesktopActivityCodexExecutable(
+    preparedCodexExecutable,
+    domRenderer ? { webglEnabled: false } : {},
+  );
   await refreshDesktopUiDocument();
   await installDesktopUiMotionGuard();
   const threadRow = `//*[starts-with(@data-testid, "thread-row-") and .//*[normalize-space()="${desktopActivityFixture.thread.title}"]]`;
@@ -546,6 +639,16 @@ describe("packaged AI terminal footer invariant (#348)", () => {
       timeoutMsg: "The fixture TUI never drew in the Codex Terminal.",
     });
     await settle();
+    // The Activity dock mounts 0.4 s or so after the terminal and shrinks it, and the refit
+    // lands about 100 ms later: the baseline waits for the dock, then for that size to hold.
+    const dockMounted = await browser
+      .$(`[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`)
+      .waitForExist({ timeout: 5_000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    if (dockMounted) await settle();
 
     const baseline = await readTerminalGeometry(terminalId);
     const baselineTui = readTuiSize();
@@ -560,7 +663,7 @@ describe("packaged AI terminal footer invariant (#348)", () => {
 
     const random = createRandom(seed);
     for (let index = 0; index < stepCount; index += 1) {
-      const [name, run] = actions[Math.floor(random() * actions.length)]!;
+      const [name, run] = actionList[Math.floor(random() * actionList.length)]!;
       const description = await run(session, random);
       session.steps.push(description ?? `${name} (unavailable, skipped)`);
       await settle();
@@ -570,7 +673,19 @@ describe("packaged AI terminal footer invariant (#348)", () => {
     }
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, `terminal-footer-${seed}-passed.json`),
-      JSON.stringify({ seed, stepCount, steps: session.steps, cellHeight }, null, 2),
+      JSON.stringify(
+        {
+          seed,
+          stepCount,
+          steps: session.steps,
+          cellHeight,
+          // Settling checks that disagreed and cleared within 1.5 s, and the renderers seen.
+          transients: session.checks.filter((check) => check.violations.length > 0),
+          renderers: [...new Set(session.checks.map((check) => check.geometry.renderer))],
+        },
+        null,
+        2,
+      ),
     );
   });
 });
