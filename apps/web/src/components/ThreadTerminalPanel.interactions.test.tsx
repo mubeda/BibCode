@@ -115,6 +115,8 @@ const xtermState = vi.hoisted(() => ({
   /** Makes fit resize the fake grid to the proposed size, as xterm's addon does. */
   fitAppliesProposal: false,
   proposedDimensions: { cols: 80, rows: 24 } as { cols: number; rows: number } | null,
+  // Per-terminal fit, for viewports that stand in for windows of different sizes.
+  proposeFor: null as ((terminal: object) => { cols: number; rows: number } | null) | null,
   loadWebglShouldThrow: false,
 }));
 
@@ -158,7 +160,12 @@ vi.mock("@xterm/addon-fit", () => ({
     activate(terminal: { cols: number; rows: number }): void {
       this.terminal = terminal;
     }
-    readonly proposeDimensions = vi.fn(() => xtermState.proposedDimensions ?? undefined);
+    readonly proposeDimensions = vi.fn(
+      () =>
+        (this.terminal && xtermState.proposeFor?.(this.terminal)) ??
+        xtermState.proposedDimensions ??
+        undefined,
+    );
     constructor() {
       if (xtermState.fitShouldThrow) {
         this.fit.mockImplementation(() => {
@@ -329,10 +336,12 @@ vi.mock("@xterm/xterm", () => ({
     displayedText = "";
     resetCount = 0;
     private disposed = false;
+    element: HTMLElement | undefined = undefined;
     readonly open = vi.fn((parent: HTMLElement) => {
       const screen = document.createElement("div");
       screen.className = "xterm-screen";
       parent.append(screen);
+      this.element = screen;
     });
     readonly focus = vi.fn();
     readonly refresh = vi.fn();
@@ -505,6 +514,8 @@ const testState = vi.hoisted(() => ({
     transcriptRuntime: null as TerminalTranscriptRuntime | null,
   },
   attachedSessionInputs: [] as unknown[],
+  // Per-environment sessions, for viewports that stand in for different machines.
+  sessionsByEnvironment: new Map<string, unknown>(),
   writeCommand: vi.fn(),
   prepareInputCommand: vi.fn(),
   resetInputCommand: vi.fn(),
@@ -585,9 +596,10 @@ vi.mock("../state/use-atom-command", () => ({
   },
 }));
 vi.mock("../state/terminalSessions", () => ({
-  useAttachedTerminalSession: (input: unknown) => {
+  useAttachedTerminalSession: (input: { readonly environmentId: string }) => {
     testState.attachedSessionInputs.push(input);
-    return { ...testState.session, reattach: testState.reattachCommand };
+    const session = testState.sessionsByEnvironment.get(input.environmentId) ?? testState.session;
+    return { ...(session as object), reattach: testState.reattachCommand };
   },
 }));
 vi.mock("../hooks/useSettings", () => ({
@@ -1260,6 +1272,8 @@ beforeEach(() => {
   xtermState.deferWrites = false;
   xtermState.pendingWrites = [];
   xtermState.proposedDimensions = { cols: 80, rows: 24 };
+  xtermState.proposeFor = null;
+  testState.sessionsByEnvironment.clear();
   xtermState.loadWebglShouldThrow = false;
   webglState.instances = [];
   webglState.importCount = 0;
@@ -7398,5 +7412,288 @@ describe("ThreadTerminalPanel mounted controls", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(testState.writeCommand).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Two windows on two machines showing one terminal (#348): the server host's own desktop
+ * window and a remote client window. Each has its own transcript runtime, as each machine
+ * has its own client. The fake manager follows `apps/server/src/terminal/manager.rs`:
+ * attach takes ownership only when unowned and publishes it (3379-3396); a resize from an
+ * unregistered claim and an exact no-op succeed without an echo (3621-3663); dropping a
+ * stream unregisters its claim only for that attachment and, if it held the size, publishes
+ * a null owner with the size kept (3666-3690, 4346-4365); `resized` reaches only streams
+ * that carried a claim (4316), which every renderer here does.
+ */
+describe("TerminalViewport shared by windows on two machines (#348)", () => {
+  const SERVER_HOST = EnvironmentId.make("server-host-window");
+  const CLIENT = EnvironmentId.make("remote-client-window");
+  const THIRD = EnvironmentId.make("third-window");
+
+  interface Stream {
+    readonly claim: string;
+    readonly runtime: TerminalTranscriptRuntime;
+    readonly source: object;
+  }
+
+  class FakeTerminalManager {
+    cols = 80;
+    rows = 24;
+    owner: { claim: string; attachment: number } | null = null;
+    private readonly claims = new Map<string, number>();
+    private readonly streams = new Map<number, Stream>();
+    private readonly outbox: Array<() => void> = [];
+    private nextAttachment = 1;
+    private sequence = 1;
+
+    size() {
+      return { cols: this.cols, rows: this.rows, sizeClaim: this.owner?.claim ?? null };
+    }
+
+    attach(claim: string, runtime: TerminalTranscriptRuntime): number {
+      const id = this.nextAttachment++;
+      this.claims.set(claim, id);
+      if (this.owner === null) {
+        this.owner = { claim, attachment: id };
+        this.publish();
+      } else if (this.owner.claim === claim) {
+        this.owner.attachment = id;
+      }
+      const stream = { claim, runtime, source: {} };
+      this.streams.set(id, stream);
+      const snapshot = { ...terminalSnapshot(""), sequence: this.sequence, size: this.size() };
+      this.outbox.push(() => runtime.ingest({ type: "snapshot", snapshot }, stream.source));
+      return id;
+    }
+
+    resize(claim: string | undefined, cols: number, rows: number): void {
+      if (claim === undefined) throw new Error("every renderer here negotiates ownership");
+      const attachment = this.claims.get(claim);
+      if (attachment === undefined) return;
+      const sizeChanged = this.cols !== cols || this.rows !== rows;
+      const ownerChanged = this.owner?.claim !== claim;
+      if (!sizeChanged && !ownerChanged) return;
+      this.cols = cols;
+      this.rows = rows;
+      this.owner = { claim, attachment };
+      this.publish();
+    }
+
+    drop(id: number): void {
+      const stream = this.streams.get(id);
+      if (!stream) return;
+      this.streams.delete(id);
+      if (this.claims.get(stream.claim) === id) this.claims.delete(stream.claim);
+      if (this.owner?.attachment === id) {
+        this.owner = null;
+        this.publish();
+      }
+    }
+
+    private publish(): void {
+      this.sequence += 1;
+      const event: TerminalAttachStreamEvent = {
+        type: "resized",
+        threadId: THREAD_ID,
+        terminalId: "term-1",
+        sequence: this.sequence,
+        size: this.size(),
+      };
+      for (const stream of this.streams.values()) {
+        this.outbox.push(() => stream.runtime.ingest(event, stream.source));
+      }
+    }
+
+    /** Delivers queued stream events until no renderer reacts with another request. */
+    async deliver(): Promise<void> {
+      for (let round = 0; round < 20; round += 1) {
+        await act(async () => {
+          while (this.outbox.length > 0) this.outbox.shift()!();
+          for (let tick = 0; tick < 6; tick += 1) await Promise.resolve();
+        });
+        await flushAnimationFrames();
+        if (this.outbox.length === 0) return;
+      }
+      throw new Error("terminal size requests did not settle");
+    }
+  }
+
+  interface Machine {
+    readonly environmentId: EnvironmentId;
+    fit: { cols: number; rows: number };
+    readonly runtime: TerminalTranscriptRuntime;
+    mounted: MountedTree;
+    attachment: number | null;
+    props: ViewportProps;
+  }
+
+  let server: FakeTerminalManager;
+  let machines: Machine[];
+  let hasFocus: { mockReturnValue(value: boolean): unknown };
+
+  beforeEach(() => {
+    testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+    server = new FakeTerminalManager();
+    machines = [];
+    hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    xtermState.proposeFor = (terminal) => {
+      const parent = (terminal as FakeTerminalInstance).open.mock.calls[0]?.[0];
+      return (
+        machines.find(
+          (machine) => parent instanceof Node && machine.mounted.container.contains(parent),
+        )?.fit ?? null
+      );
+    };
+    testState.resizeCommand.mockImplementation(
+      async ({ input }: { input: { cols: number; rows: number; sizeClaim?: string } }) => {
+        server.resize(input.sizeClaim, input.cols, input.rows);
+        return AsyncResult.success(undefined);
+      },
+    );
+  });
+
+  afterEach(() => {
+    for (const environmentId of [SERVER_HOST, CLIENT, THIRD]) {
+      releaseTerminalUiResources(environmentId, THREAD_ID, "term-1");
+    }
+  });
+
+  const claimOf = (machine: Machine) =>
+    (
+      testState.attachedSessionInputs.findLast(
+        (input) =>
+          (input as { environmentId: string }).environmentId === machine.environmentId &&
+          (input as { attach: boolean }).attach,
+      ) as { terminal: { sizeClaim: string } }
+    ).terminal.sizeClaim;
+
+  const xtermOf = (machine: Machine) =>
+    xtermState.terminals.findLast(
+      (terminal) =>
+        terminal.dispose.mock.calls.length === 0 &&
+        terminal.open.mock.calls.some(
+          ([element]) => element instanceof Node && machine.mounted.container.contains(element),
+        ),
+    )!;
+
+  /** Opens the window's attach stream, as the client runtime does once its renderer is ready. */
+  const connect = async (machine: Machine) => {
+    machine.attachment = server.attach(claimOf(machine), machine.runtime);
+    await server.deliver();
+  };
+
+  /** Ends the window's attach stream: a network drop, suspend, or renderer teardown. */
+  const disconnect = async (machine: Machine) => {
+    if (machine.attachment !== null) server.drop(machine.attachment);
+    machine.attachment = null;
+    await server.deliver();
+  };
+
+  const openWindow = async (
+    environmentId: EnvironmentId,
+    fit: { cols: number; rows: number },
+  ): Promise<Machine> => {
+    const runtime = createTerminalTranscriptRuntime();
+    testState.sessionsByEnvironment.set(environmentId, {
+      ...testState.session,
+      generation: runtime.metadata().generation,
+      transcriptRuntime: runtime,
+    });
+    const props = viewportProps({ threadRef: scopeThreadRef(environmentId, THREAD_ID) });
+    const machine: Machine = {
+      environmentId,
+      fit,
+      runtime,
+      mounted: null as unknown as MountedTree,
+      attachment: null,
+      props,
+    };
+    machines.push(machine);
+    machine.mounted = await mount(<TerminalViewport {...props} />);
+    await flushAnimationFrames();
+    await connect(machine);
+    return machine;
+  };
+
+  /** Hiding the window tears its renderer down, which ends its attach stream. */
+  const setWindowVisible = async (machine: Machine, visible: boolean) => {
+    machine.props = { ...machine.props, visible };
+    await act(async () => machine.mounted.root.render(<TerminalViewport {...machine.props} />));
+    if (!visible) await disconnect(machine);
+    else {
+      await flushAnimationFrames();
+      await connect(machine);
+    }
+  };
+
+  const relayout = async (machine: Machine, fit: { cols: number; rows: number }) => {
+    machine.fit = fit;
+    await resizeTerminalMounts(machine.mounted.container);
+    await flushAnimationFrames();
+    await server.deliver();
+  };
+
+  const noticeShown = (machine: Machine) =>
+    machine.mounted.container.textContent?.includes("Sized for another window.") ?? false;
+
+  /** What one window shows: its grid against its fit, the owner, and the notice. */
+  const view = (machine: Machine) => {
+    const terminal = xtermOf(machine);
+    return {
+      grid: `${terminal.cols}x${terminal.rows}`,
+      fit: `${machine.fit.cols}x${machine.fit.rows}`,
+      clipped: terminal.rows > machine.fit.rows || terminal.cols > machine.fit.cols,
+      owner:
+        server.owner === null
+          ? "nobody"
+          : server.owner.claim === claimOf(machine)
+            ? "this window"
+            : "the other window",
+      notice: noticeShown(machine),
+    };
+  };
+
+  /** The server host window owns a taller grid; the client mirrors it, clipped at the bottom. */
+  const serverHostOwnsTallerGrid = async () => {
+    hasFocus.mockReturnValue(true);
+    const host = await openWindow(SERVER_HOST, { cols: 120, rows: 50 });
+    hasFocus.mockReturnValue(false);
+    const client = await openWindow(CLIENT, { cols: 100, rows: 30 });
+    expect(view(client)).toEqual({
+      grid: "120x50",
+      fit: "100x30",
+      clipped: true,
+      owner: "the other window",
+      notice: true,
+    });
+    return { host, client };
+  };
+
+  it("lets the visible client claim its fit as soon as the server host window releases the size", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    await setWindowVisible(host, false);
+    expect(server.size()).toEqual({ cols: 100, rows: 30, sizeClaim: claimOf(client) });
+    expect(view(client)).toEqual({
+      grid: "100x30",
+      fit: "100x30",
+      clipped: false,
+      owner: "this window",
+      notice: false,
+    });
+  });
+
+  it("converges on one owner when two windows race for a released size", async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    const third = await openWindow(THIRD, { cols: 90, rows: 28 });
+    await disconnect(host);
+    const owner = server.owner?.claim;
+    expect([claimOf(client), claimOf(third)]).toContain(owner);
+    const winner = owner === claimOf(client) ? client : third;
+    const loser = winner === client ? third : client;
+    expect(view(winner).clipped).toBe(false);
+    expect(view(loser).owner).toBe("the other window");
+    const requests = testState.resizeCommand.mock.calls.length;
+    await relayout(loser, { cols: loser.fit.cols, rows: loser.fit.rows - 1 });
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
   });
 });
