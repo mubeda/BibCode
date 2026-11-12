@@ -573,6 +573,10 @@ describe("ServerHostMetricsEvent", () => {
     memory: statistic,
     recent: [{ sampledAt: sample.sampledAt, cpuPercent: 23.5, memoryPercent: 35.5 }],
     uptime: [bucket],
+    hiddenVolumes: [
+      { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
+      { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
+    ],
   };
 
   it("round-trips a snapshot and a sample", () => {
@@ -595,6 +599,25 @@ describe("ServerHostMetricsEvent", () => {
       uptime: [],
     };
     expect(decode(empty)).toMatchObject({ _tag: "Snapshot", bootId: null, sample: null });
+  });
+
+  it("decodes hidden volumes as none from an older server, and a reason it does not know", () => {
+    const { hiddenVolumes: _, ...older } = snapshot;
+    expect(decode(older)).toMatchObject({ _tag: "Snapshot", hiddenVolumes: [] });
+    const later = {
+      ...snapshot,
+      hiddenVolumes: [{ mountPoint: "/mnt/x", fileSystem: "ext4", reason: "aLaterReason" }],
+    };
+    expect(encode(decode(later))).toEqual(later);
+    const withChart = {
+      _tag: "Sample",
+      sample,
+      cpu: statistic,
+      memory: statistic,
+      uptime: [bucket],
+      hiddenVolumes: snapshot.hiddenVolumes,
+    };
+    expect(encode(decode(withChart))).toEqual(withChart);
   });
 
   it("rejects an unknown item", () => {
