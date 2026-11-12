@@ -874,22 +874,48 @@ describe("createTerminalTranscriptRuntime ordered by server generation (#348)", 
     expect(runtime.snapshot()).toBe("after");
   });
 
-  it("applies a claimed stream's size even after another stream's output passed its sequence", () => {
+  it("renders output after the size the server published before it, across streams", () => {
     const runtime = createTerminalTranscriptRuntime();
-    const claimed = {};
+    const claimed = { sizeClaim: "a" };
     const unclaimed = {};
     runtime.ingest(snapshotAt(1, 10, "h"), claimed);
     runtime.ingest(snapshotAt(1, 10, "h"), unclaimed);
-    const rows: Array<number> = [];
+    const order: Array<string> = [];
     runtime.attachRenderer((signal) => {
-      if (signal.type === "resized") rows.push(signal.size.rows);
+      if (signal.type === "resized") order.push(`resized ${signal.size.rows}`);
+      if (signal.type === "delta") order.push(`delta ${signal.data}`);
     });
-    // Size events reach only claimed streams, so another stream's output can run ahead.
+    // Size events reach only claimed streams, so the unclaimed stream's output 12 arrives
+    // before resize 11; parsed first, it would be laid out at the old size for good.
     runtime.ingest(outputAt(12, "!"), unclaimed);
     runtime.ingest(resizedAt(11, 20), claimed);
     runtime.ingest(outputAt(12, "!"), claimed);
-    expect(rows).toEqual([20]);
+    expect(order).toEqual(["resized 20", "delta !"]);
     expect(runtime.snapshot()).toBe("h!");
+  });
+
+  it("lets a stream without sizes order output again once the claimed stream ends", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const claimed = { sizeClaim: "a" };
+    const unclaimed = {};
+    runtime.ingest(snapshotAt(1, 10, "h"), claimed);
+    runtime.ingest(snapshotAt(1, 10, "h"), unclaimed);
+    runtime.ingest(outputAt(11, "1"), claimed);
+    runtime.ingest(outputAt(11, "1"), unclaimed);
+    runtime.releaseSource(claimed);
+    runtime.ingest(outputAt(12, "2"), unclaimed);
+    expect(runtime.snapshot()).toBe("h12");
+  });
+
+  it("does not hold output back for a claimed stream still on an earlier process", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const claimed = { sizeClaim: "a" };
+    const unclaimed = {};
+    runtime.ingest(snapshotAt(1, 10, "h"), claimed);
+    runtime.ingest(snapshotAt(1, 10, "h"), unclaimed);
+    runtime.ingest(restartedAt(2, 1, "new"), unclaimed);
+    runtime.ingest(outputAt(2, "!"), unclaimed);
+    expect(runtime.snapshot()).toBe("new!");
   });
 
   it("tells a renderer its own stream attached when that stream's snapshot was already applied", () => {

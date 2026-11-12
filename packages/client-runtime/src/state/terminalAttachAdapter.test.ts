@@ -203,6 +203,26 @@ describe("two attach producers sharing one transcript runtime (#348)", () => {
       expect(runtime.snapshot()).toBe("hx");
     }),
   );
+
+  it.effect("a claimed stream that ended no longer holds back a stream without sizes", () =>
+    Effect.gen(function* () {
+      const runtime = createTerminalTranscriptRuntime();
+      const attached: TerminalAttachStreamEvent = {
+        type: "snapshot",
+        snapshot: { ...snapshotData("h"), sequence: 10 },
+      };
+      yield* Stream.runDrain(
+        projectTerminalMetadataStream(Stream.make(attached), runtime, "claimed"),
+      );
+      yield* Stream.runDrain(
+        projectTerminalMetadataStream(
+          Stream.make(attached, { ...output("!"), sequence: 11 }),
+          runtime,
+        ),
+      );
+      expect(runtime.snapshot()).toBe("h!");
+    }),
+  );
 });
 
 describe("createTerminalTranscriptRuntimeRegistry", () => {
