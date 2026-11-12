@@ -176,6 +176,13 @@ pub trait PtyProcess: fmt::Debug + Send + Sync {
         0
     }
     fn kill(&self) -> Result<(), String>;
+    /// Sends `SIGCONT` to the session's own process group, and only while the waiter still
+    /// reserves it, so a reaped or closing group is never signalled. Ownership is unchanged:
+    /// close still kills the group afterwards. `Ok(false)`: nothing was sent (#348).
+    #[cfg(unix)]
+    fn resume(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
         Ok(None)
     }
@@ -1334,6 +1341,19 @@ impl PtyProcess for PortablePtyProcess {
         Ok(Some(exited))
     }
 
+    #[cfg(unix)]
+    fn resume(&self) -> Result<bool, String> {
+        let Some(process_group) = self.process_group else {
+            return Ok(false);
+        };
+        resume_reserved_unix_process_group(
+            process_group,
+            &self.process_group_ownership,
+            continue_unix_process_group,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn subscribe_output(&self) -> broadcast::Receiver<String> {
         self.initial_output
             .lock()
@@ -1389,6 +1409,42 @@ fn signal_reserved_unix_process_group_with(
     signal(process_group)?;
     *ownership = UnixProcessGroupOwnership::Released;
     Ok(())
+}
+
+/// Signals the reserved group without consuming it, unlike
+/// [`signal_reserved_unix_process_group_with`]: a resumed group is still the close path's to
+/// kill. A close holding the ownership lock (it may wait for the root) means the group is
+/// going away, so nothing is sent rather than blocking the caller.
+#[cfg(unix)]
+fn resume_reserved_unix_process_group(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+    signal: impl FnOnce(i32) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let ownership = match ownership.try_lock() {
+        Ok(ownership) => ownership,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+    };
+    if *ownership == UnixProcessGroupOwnership::Released {
+        return Ok(false);
+    }
+    let _ = (signal, process_group); // stub: the fix commit sends the signal (#348)
+    Ok(false)
+}
+
+/// `SIGCONT` to the whole group. `Ok(false)` when no member is left to receive it.
+#[cfg(unix)]
+fn continue_unix_process_group(process_group: i32) -> std::io::Result<bool> {
+    if unsafe { kill(-process_group, libc::SIGCONT) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
 }
 
 /// Kills the owned group once. `root_exited` is asked only when the kill is refused: with the
@@ -2044,6 +2100,65 @@ mod tests {
 
         assert!(result.is_err());
         assert!(killed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A resume signals the session's own group and leaves it reserved: the close that follows
+    /// still kills it (#348).
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_signals_the_reserved_group_and_close_still_kills_it() {
+        let ownership = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        let mut resumed = Vec::new();
+        let sent = resume_reserved_unix_process_group(4242, &ownership, |group| {
+            resumed.push(group);
+            Ok(true)
+        })
+        .expect("resume");
+        assert!(sent);
+        assert_eq!(resumed, [4242]);
+        assert_eq!(
+            *ownership.lock().unwrap(),
+            UnixProcessGroupOwnership::Reserved
+        );
+
+        let mut killed = Vec::new();
+        kill_reserved_unix_process_group(
+            4242,
+            &ownership,
+            |group| {
+                killed.push(group);
+                Ok(())
+            },
+            || false,
+        )
+        .expect("close kill");
+        assert_eq!(killed, [4242]);
+        assert_eq!(
+            *ownership.lock().unwrap(),
+            UnixProcessGroupOwnership::Released
+        );
+    }
+
+    /// A released group (reaped root, or already killed) and one a close is busy with get no
+    /// signal at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_never_signals_a_released_or_closing_group() {
+        let released = Mutex::new(UnixProcessGroupOwnership::Released);
+        let sent = resume_reserved_unix_process_group(4242, &released, |_| {
+            panic!("a released group was signalled")
+        })
+        .expect("resume");
+        assert!(!sent);
+
+        let closing = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        let held = closing.lock().unwrap();
+        let sent = resume_reserved_unix_process_group(4242, &closing, |_| {
+            panic!("a group being closed was signalled")
+        })
+        .expect("resume");
+        assert!(!sent);
+        drop(held);
     }
 
     /// macOS refuses (`EPERM`) a group kill once every member has exited unreaped; a close

@@ -15,6 +15,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+#[cfg(unix)]
+use super::history::LossyReplay;
 use super::model::{
     TerminalConsoleTheme, TerminalGeneration, TerminalInputOrigin, TerminalResizeOutcome,
     TerminalResizeResult, terminal_console_theme_from_env,
@@ -1870,6 +1872,23 @@ impl Session {
         }
     }
 
+    /// The process to ask for a repaint after an attach replayed a lossy history, and why:
+    /// best-effort repaint recovery for Claude terminals that BiBCode starts, not terminal-state
+    /// reconstruction. The Claude CLI repaints in full on `SIGCONT`; other programs are not
+    /// known to, so they get nothing (#348).
+    #[cfg(unix)]
+    fn resume_after_lossy_attach(&self) -> Option<(Arc<dyn PtyProcess>, LossyReplay)> {
+        if self.status != TerminalStatus::Running {
+            return None;
+        }
+        self.command
+            .as_ref()
+            .and_then(|command| command.activity.as_ref())
+            .filter(|activity| activity.driver_kind == CLAUDE_DRIVER_KIND)?;
+        let reason = self.history.lossy_replay()?;
+        Some((self.process.clone()?, reason))
+    }
+
     fn snapshot(&self) -> TerminalSessionSnapshot {
         TerminalSessionSnapshot {
             thread_id: self.thread_id.clone(),
@@ -3635,9 +3654,19 @@ impl TerminalManager {
             });
         let mut initial = current.snapshot();
         initial.first_attachment_grant = first_attachment_grant;
+        let generation = current.generation.clone();
+        #[cfg(unix)]
+        let resume = current.resume_after_lossy_attach();
+        // The repaint is published under these locks: release them before asking for it.
+        drop(current);
+        drop(_publication);
+        #[cfg(unix)]
+        if let Some((process, reason)) = resume {
+            resume_after_lossy_attach(&input.thread_id, &input.terminal_id, &*process, reason);
+        }
         Ok(TerminalAttachment {
             inner: Arc::downgrade(&self.inner),
-            generation: Some(current.generation.clone()),
+            generation: Some(generation),
             thread_id: input.thread_id,
             terminal_id: input.terminal_id,
             next_sequence: initial.sequence,
@@ -4562,6 +4591,37 @@ impl TerminalManager {
     }
 }
 
+/// The provider driver whose terminals get a repaint signal after a lossy attach (#348).
+#[cfg(unix)]
+const CLAUDE_DRIVER_KIND: &str = "claudeAgent";
+
+/// Sends the one repaint signal of a lossy attach; logs no terminal content.
+#[cfg(unix)]
+fn resume_after_lossy_attach(
+    thread_id: &str,
+    terminal_id: &str,
+    process: &dyn PtyProcess,
+    reason: LossyReplay,
+) {
+    let _ = process; // stub: the fix commit sends the signal (#348)
+    match Ok::<bool, String>(false) {
+        Ok(sent) => tracing::debug!(
+            thread_id,
+            terminal_id,
+            reason = reason.as_str(),
+            sent,
+            "asked a Claude terminal to repaint after a lossy attach"
+        ),
+        Err(error) => tracing::warn!(
+            thread_id,
+            terminal_id,
+            reason = reason.as_str(),
+            %error,
+            "failed to ask a Claude terminal to repaint after a lossy attach"
+        ),
+    }
+}
+
 /// Reports a session's process that ended by itself to the profiler. Only crash signals
 /// count: in a terminal people end processes with `exit 1`, Ctrl-C or `kill`. BiBCode's own
 /// stops invalidate the generation first, or note the stop.
@@ -5469,6 +5529,9 @@ mod tests {
         /// Sizes asked of this PTY, and the resize worker's report of one it kept refusing.
         resize_requests: std::sync::atomic::AtomicU64,
         resize_exhausted: tokio::sync::watch::Sender<Option<ExhaustedResize>>,
+        /// Every resume signal the manager asked of this PTY (#348).
+        #[cfg(unix)]
+        resumes: std::sync::atomic::AtomicUsize,
     }
 
     /// Holds PTY writes until opened. Opening it on drop keeps a failed test from hanging in
@@ -5554,7 +5617,14 @@ mod tests {
                 resize_needs_retry: std::sync::atomic::AtomicBool::new(false),
                 resize_requests: std::sync::atomic::AtomicU64::new(0),
                 resize_exhausted: tokio::sync::watch::channel(None).0,
+                #[cfg(unix)]
+                resumes: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        #[cfg(unix)]
+        fn resumes(&self) -> usize {
+            self.resumes.load(std::sync::atomic::Ordering::Acquire)
         }
 
         fn with_identity(pid: u32) -> Self {
@@ -5699,6 +5769,13 @@ mod tests {
                 }));
             }
             result
+        }
+
+        #[cfg(unix)]
+        fn resume(&self) -> Result<bool, String> {
+            self.resumes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(true)
         }
 
         fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
@@ -5884,6 +5961,268 @@ mod tests {
             AttachmentItem::Event(event) => event,
             AttachmentItem::Resync { .. } => panic!("expected an event, not a resync"),
         }
+    }
+
+    /// A manager for the resume-signal tests (#348): `history_line_limit` lines retained.
+    #[cfg(unix)]
+    fn resume_manager(
+        history_line_limit: usize,
+        event_capacity: usize,
+    ) -> (tempfile::TempDir, Arc<HistoryTestBackend>, TerminalManager) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                history_line_limit,
+                event_capacity,
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        (root, backend, manager)
+    }
+
+    /// A terminal of `thread`, launched as a provider terminal of `driver`, or a shell.
+    #[cfg(unix)]
+    fn resume_terminal(
+        root: &tempfile::TempDir,
+        thread: &str,
+        driver: Option<&str>,
+    ) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new(thread, "term", root.path().to_path_buf(), 80, 24);
+        input.command = driver.map(|driver| TerminalLaunchCommand {
+            executable: "provider-cli".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: driver.to_owned(),
+                provider_instance_id: driver.to_owned(),
+            }),
+            env: None,
+        });
+        input
+    }
+
+    /// Emits `data` and waits until the session's history has taken it in.
+    #[cfg(unix)]
+    async fn emit_into_history(
+        manager: &TerminalManager,
+        pty: &HistoryTestPty,
+        thread: &str,
+        data: &str,
+    ) {
+        let before = manager
+            .read_history(thread, "term", None, 0)
+            .await
+            .unwrap()
+            .total;
+        pty.emit(data);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .read_history(thread, "term", None, 0)
+                .await
+                .unwrap()
+                .total
+                < before + data.len() as u64
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output reached the history");
+    }
+
+    /// Attaches and drops the attachment, as a window that is shown and hidden again.
+    #[cfg(unix)]
+    async fn attach_once(manager: &TerminalManager, thread: &str) {
+        drop(
+            manager
+                .attach(TerminalAttachInput::existing(thread, "term"))
+                .await
+                .expect("attach"),
+        );
+    }
+
+    /// A complete history under the client's cut replays the whole screen: no signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossless_attach_of_a_claude_terminal_sends_no_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "frame\n").await;
+        attach_once(&manager, "claude").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// Each attach after eviction asks the session's own group to repaint once, and the close
+    /// that follows still kills the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_lossy_attach_of_a_claude_terminal_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "one\ntwo\nthree\nfour\n").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 2);
+
+        manager.close("claude", Some("term")).await.unwrap();
+        assert!(pty.is_killed(), "close kills after a resume");
+        manager.shutdown().await;
+    }
+
+    /// Nothing evicted, but more retained than a released client keeps of the snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_over_the_client_cut_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", &"x".repeat(512 * 1024 + 1)).await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        manager.shutdown().await;
+    }
+
+    /// A clear discards the program's last paint like eviction does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_after_clear_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "frame\n").await;
+        manager.clear("claude", "term").await.unwrap();
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        manager.shutdown().await;
+    }
+
+    /// Only Claude terminals BiBCode starts are signalled: not a shell, not another provider.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lossy_attaches_of_shells_and_other_providers_send_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        for (thread, driver) in [
+            ("shell", None),
+            ("codex", Some("codex")),
+            ("opencode", Some("opencode")),
+        ] {
+            manager
+                .open(resume_terminal(&root, thread, driver))
+                .await
+                .unwrap();
+            let pty = backend.latest();
+            emit_into_history(&manager, &pty, thread, "one\ntwo\nthree\nfour\n").await;
+            attach_once(&manager, thread).await;
+            assert_eq!(pty.resumes(), 0, "{thread}");
+        }
+        manager.shutdown().await;
+    }
+
+    /// An exited session's process is not signalled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossy_attach_of_an_exited_claude_terminal_sends_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "one\ntwo\nthree\nfour\n").await;
+        pty.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .read_history("claude", "term", None, 0)
+                .await
+                .unwrap()
+                .status
+                == TerminalStatus::Running
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exit published");
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// History reads and a lagging attachment's resync are not attaches: no signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_reads_and_lag_resyncs_send_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 16);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let mut attachment = manager
+            .attach(TerminalAttachInput::existing("claude", "term"))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        for line in 0..100 {
+            pty.emit(&format!("line {line}\n"));
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let item = tokio::time::timeout(Duration::from_secs(2), attachment.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(item, AttachmentItem::Resync { .. }),
+            "a lag resync"
+        );
+        manager
+            .read_history("claude", "term", None, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// A restart's new process is the only one a later lossy attach signals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_claude_terminal_resumes_only_its_new_process() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        let input = resume_terminal(&root, "claude", Some("claudeAgent"));
+        manager.open(input.clone()).await.unwrap();
+        let old = backend.latest();
+        emit_into_history(&manager, &old, "claude", "one\ntwo\nthree\nfour\n").await;
+        manager.restart(input).await.unwrap();
+        let new = backend.latest();
+        assert!(!Arc::ptr_eq(&old, &new));
+        attach_once(&manager, "claude").await;
+        assert_eq!(new.resumes(), 0, "a fresh history replays without loss");
+        emit_into_history(&manager, &new, "claude", "one\ntwo\nthree\nfour\n").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!((old.resumes(), new.resumes()), (0, 1));
+        manager.shutdown().await;
     }
 
     /// An attachment that falls further behind than the event channel holds resets its client
@@ -11153,6 +11492,90 @@ mod tests {
                 .iter()
                 .all(|(_, reason)| *reason == TerminalRemovalReason::Shutdown)
         );
+    }
+
+    /// Through the real PTY launch path (Unix runs the provider executable as the PTY root, in
+    /// its own session and group): a stand-in for the Claude CLI that reports `SIGCONT` with
+    /// the size it reads from its terminal gets the resume after a lossy attach, at the size it
+    /// started with (#348).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossy_attach_resumes_a_real_claude_terminal_at_its_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("claude");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\n\
+             trap 'echo \"RESUMED $(stty size)\"' CONT\n\
+             echo \"START $(stty size)\"\n\
+             i=0; while [ $i -lt 20 ]; do echo \"line $i\"; i=$((i+1)); done\n\
+             echo READY\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manager = TerminalManager::new(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                history_line_limit: 5,
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut input =
+            TerminalOpenInput::new("claude", "term", root.path().to_path_buf(), 100, 30);
+        input.command = Some(TerminalLaunchCommand {
+            executable: fixture.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: "claudeAgent".to_owned(),
+                provider_instance_id: "claudeAgent".to_owned(),
+            }),
+            env: None,
+        });
+        manager.open(input).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !manager
+                .read_history("claude", "term", None, 1_000)
+                .await
+                .unwrap()
+                .window
+                .text
+                .contains("READY")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture started");
+
+        let mut attachment = manager
+            .attach(TerminalAttachInput::existing("claude", "term"))
+            .await
+            .unwrap();
+        assert!(!attachment.initial.history.contains("RESUMED"));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut output = String::new();
+            loop {
+                match attachment.recv().await {
+                    Some(AttachmentItem::Event(TerminalEvent::Output { data, .. })) => {
+                        output.push_str(&data);
+                    }
+                    Some(_) => {}
+                    None => panic!("the attachment ended: {output}"),
+                }
+                if let Some(line) = output.lines().find(|line| line.starts_with("RESUMED")) {
+                    break line.trim_end().to_owned();
+                }
+            }
+        })
+        .await
+        .expect("the fixture got SIGCONT after the lossy attach");
+        assert_eq!(resumed, "RESUMED 30 100", "the PTY keeps its size");
+        manager.close("claude", Some("term")).await.unwrap();
+        manager.shutdown().await;
     }
 
     #[tokio::test]
