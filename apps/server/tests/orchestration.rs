@@ -670,6 +670,78 @@ async fn code_review_prompt_replays_events_recorded_without_it() {
     rebuilt.shutdown().await;
 }
 
+/// #293: a stored project review prompt holds no control character but tab, line feed and
+/// carriage return (C0, DEL and C1, as the web checks), and one stored before the rule loads.
+#[tokio::test]
+async fn code_review_prompt_rejects_control_characters_on_write_only() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    engine
+        .dispatch(review_project_create())
+        .await
+        .expect("project creates");
+    let update = |command_id: &str, prompt: &str| {
+        decode(json!({
+            "type": "project.meta.update",
+            "commandId": command_id,
+            "projectId": "review-project",
+            "codeReviewPrompt": prompt,
+        }))
+    };
+    engine
+        .dispatch(update("review-set", "Kept\tline\r\nnext\u{a0}"))
+        .await
+        .expect("tab, line breaks and U+00A0 are allowed");
+    for (index, control) in [
+        '\u{0}', '\u{8}', '\u{b}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}',
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = engine
+            .dispatch(update(
+                &format!("review-control-{index}"),
+                &format!("a{control}b"),
+            ))
+            .await
+            .expect_err("a control character is rejected");
+        assert!(
+            format!("{error:?}").contains("control character"),
+            "{control:?}: {error:?}"
+        );
+    }
+    assert_eq!(review_prompt(&engine).await, "Kept\tline\r\nnext\u{a0}");
+    engine.shutdown().await;
+
+    // A prompt stored before the rule existed still loads and does not block other updates.
+    repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.execute(
+                "UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.codeReviewPrompt', 'Old' || char(27) || 'text') WHERE event_type = 'project.meta-updated'",
+                [],
+            )?)
+        })
+        .await
+        .expect("store an old prompt");
+    let rebuilt = rebuild_project_projection(&repositories).await;
+    assert_eq!(review_prompt(&rebuilt).await, "Old\u{1b}text");
+    rebuilt
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "review-title",
+            "projectId": "review-project",
+            "title": "Renamed review project",
+        })))
+        .await
+        .expect("a title update leaves the old prompt alone");
+    assert_eq!(review_prompt(&rebuilt).await, "Old\u{1b}text");
+    rebuilt.shutdown().await;
+}
+
 #[tokio::test]
 async fn code_review_prompt_over_limit_is_rejected() {
     let repositories = migrated_repositories().await;
