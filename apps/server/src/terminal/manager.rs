@@ -395,10 +395,17 @@ async fn next_exhausted_resize(
 /// The windows whose typing a session orders at once; more are not tracked (#348).
 const MAX_USER_INPUT_CLAIMS: usize = 64;
 
+/// The viewer that answers the terminal's queries while the size is un-owned: the least claim,
+/// any one would do, and it stays the same while it is attached (#348).
+fn handover_replier(claims: Option<&HashMap<String, uuid::Uuid>>) -> Option<String> {
+    claims.and_then(|claims| claims.keys().min().cloned())
+}
+
 /// What a replacement process keeps from the session it replaces.
 #[derive(Default)]
 struct SessionCarryOver {
     center_panel: bool,
+    size_owner: Option<SizeOwner>,
 }
 
 type SessionKey = (String, String);
@@ -1901,6 +1908,10 @@ impl Session {
     fn carry_over(&self) -> SessionCarryOver {
         SessionCarryOver {
             center_panel: self.center_panel,
+            size_owner: self.size_owner.as_ref().map(|owner| SizeOwner {
+                claim: owner.claim.clone(),
+                attachment: owner.attachment,
+            }),
         }
     }
 
@@ -2773,15 +2784,29 @@ impl TerminalManager {
         }
         // Only Restarted resets surviving attachments' sequence cursors.
         // A non-restart reopen leaves the first-attachment grant available.
-        let first_attachment_grant_used = is_restart
-            && self
+        let (first_attachment_grant_used, kept_owner) = {
+            let attachments = self
                 .inner
                 .size_claim_attachments
                 .lock()
-                .expect("terminal attachment claims")
-                .get(&key)
-                .is_some_and(|claims| !claims.is_empty());
-        session.lock().await.first_attachment_grant_used = first_attachment_grant_used;
+                .expect("terminal attachment claims");
+            let claims = attachments.get(&key);
+            // The window that sized the replaced process sizes the restarted one while it is
+            // still attached; left un-owned, every surviving window would race to claim it.
+            let kept_owner = carry_over.size_owner.take().filter(|owner| {
+                is_restart
+                    && claims.and_then(|claims| claims.get(&owner.claim)) == Some(&owner.attachment)
+            });
+            (
+                is_restart && claims.is_some_and(|claims| !claims.is_empty()),
+                kept_owner,
+            )
+        };
+        {
+            let mut session = session.lock().await;
+            session.first_attachment_grant_used = first_attachment_grant_used;
+            session.size_owner = kept_owner;
+        }
         self.inner
             .sessions
             .write()
@@ -6978,17 +7003,10 @@ mod tests {
             ))
             .await
             .unwrap();
+        // The owner still attached keeps the size, so the surviving windows do not race (#348).
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.is_none())
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.as_deref() == Some("owner"))
         );
-        manager
-            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            next_attachment_event(&mut watcher).await,
-            TerminalEvent::Resized { .. }
-        ));
         drop(owner);
         assert!(
             matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))

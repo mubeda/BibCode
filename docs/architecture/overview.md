@@ -1431,7 +1431,9 @@ never renew the grant or displace a live owner.
 
 Restart publishes `Restarted`, which resets surviving streams' sequence cursors.
 Those renderers see the restarted process's startup output live and may answer
-while unowned. Restart without such streams allows one new grant. Reopening an
+while unowned. The owner of the replaced process stays the owner when its
+attachment survived the restart, so the surviving windows do not race for the
+size. Restart without such streams allows one new grant. Reopening an
 exited session through `terminal.open` instead publishes a `Started` event with
 sequence 1. That event does not reset surviving streams' cursors, so they drop
 it and early output (a known limitation of surviving streams). A reopen
