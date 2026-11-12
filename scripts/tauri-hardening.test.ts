@@ -430,6 +430,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
           (new RegExp(`(?:^|; )${name} ([^;]*)`).exec(policy ?? "")?.[1] ?? "").split(" ");
         assert.deepEqual(directive("media-src"), ["'self'", "blob:"]);
         assert.deepEqual(directive("object-src"), ["blob:"]);
+        // Chromium (WebView2) loads a PDF <embed> in a frame, so frame-src needs blob: too.
+        assert.deepEqual(directive("frame-src"), ["'self'", "blob:"]);
         assert.include(directive("img-src"), "blob:");
         assert.notInclude(directive("img-src"), "http:");
         assert.notInclude(directive("img-src"), "https:");

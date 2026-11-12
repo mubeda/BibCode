@@ -29,6 +29,7 @@
 - Ticking a task checkbox in a read-only Markdown or `.mdx` file keeps the file's source Undo history. (#342)
 - Mermaid diagrams in an editable rendered Markdown file are drawn again, as one block that is not edited in place; the file's source is kept as written. (#342)
 - The Linux AppImage now carries its own GStreamer plugins for the audio Files previews in WAV, MP3, Ogg, WebM and FLAC files, instead of relying on the system's plugins, which its bundled GStreamer cannot load on newer distributions. M4A is not covered: its AAC decoder is not bundled.
+- A PDF preview in the Files panel is no longer blocked by the page's content security policy in Chromium-based webviews and browsers: the Windows desktop app, and browser mode in Chrome or Edge.
 
 ### Appearance
 

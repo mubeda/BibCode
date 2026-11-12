@@ -5691,7 +5691,8 @@ H.264 video does not travel over RPC. The ticket from
   view is read again. SVG goes through `<img>` only, which runs no script
   whatever the file holds. The page policies (`tauri.conf.json` `csp` and
   `devCsp`, and the server's `CONTENT_SECURITY_POLICY_VALUE`) therefore add
-  exactly `media-src 'self' blob:` and `object-src blob:` (was `'none'`), with
+  exactly `media-src 'self' blob:`, `object-src blob:` (was `'none'`) and
+  `blob:` in `frame-src` (Chromium loads a PDF `<embed>` in a frame), with
   `img-src` already allowing `blob:`; an environment origin is deliberately not
   an image, media or object source. `scripts/tauri-hardening.test.ts` and the
   server's `the_ui_may_play_media_and_objects_from_blob_urls_only` pin them. The

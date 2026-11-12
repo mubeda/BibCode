@@ -181,7 +181,10 @@ Add Server attempt fail as "Server unreachable" before any packet leaves the
 machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
 
 The same policy gives `media-src` and `object-src` only `blob:` (plus `'self'`
-for media), and `img-src` never admits an environment origin. The Files panel
+for media), adds `blob:` to `frame-src` because Chromium, and so WebView2 on
+Windows, loads a PDF `<embed>` in a frame that `frame-src` governs, and
+`img-src` never admits an environment origin. A `blob:` URL can only be made by
+script already running in the page, so this admits no new origin. The Files panel
 previews an environment's images, PDFs and audio by fetching them through the
 signed asset URL (a `connect-src` request, so LAN, tailnet and relay hosts work)
 and showing the bytes from a `blob:` URL the app creates and revokes. Opening
@@ -1396,7 +1399,7 @@ in `apps/server/src/preview/gateway/`.
   response varies by `Cookie`. Only
   pages on the server's host may frame a preview, and a frame from another site
   never carries the `Lax` gateway cookie. The UI's own policy, in turn, adds
-  `frame-src 'self' http://<request host>:*` (the `Host` it was loaded from,
+  `frame-src 'self' blob: http://<request host>:*` (the `Host` it was loaded from,
   letters, digits, dots, and hyphens only; no host source for IPv6), so the page
   may frame its host's gateways on their per-target ports. `GET /__bibcode/frame.js` (no session needed) is a
   navigation reporter: inside a frame with a stored UI origin it posts
