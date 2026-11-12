@@ -600,6 +600,20 @@ Closing a panel closes it on every client: closing a terminal tab ends its
 session, and closing a chat panel archives its thread. A reopened chat panel
 returns to every client. Tab order and splits stay per client.
 
+A terminal's program has one size, so when two windows show the same terminal,
+for example the server host's desktop window and a client on another machine,
+the window you last used sizes it: clicking in it, typing in it, or choosing
+**Fit to this window**. The other window shows the program at that size. If it
+has less room, it shows the whole terminal scaled down to fit, down to half
+size, with a note that it is **Sized for another window** and the scale; below
+half size it keeps the bottom rows in view and scrolls for the rest. If it has
+more room, it shows the terminal at normal size with empty space around it.
+The first click in a scaled window takes the size and returns it to normal
+size; it is not passed to the program. A window that regains focus without
+anyone using it, such as a server host window after its screen unlocks, does
+not take the size. When the window that sized the terminal closes or
+disconnects, the other window takes the size.
+
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
 reclaiming keyboard input until the user explicitly activates a terminal again.

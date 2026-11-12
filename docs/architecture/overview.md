@@ -1484,10 +1484,16 @@ variant set and resize events are not operational-log records. Attach streams
 also filter it unless their request carried a claim. Older clients therefore
 never receive the new event; optional snapshot fields remain additive.
 
-The window in use owns size. It claims on focused attach; on terminal focus,
-click, or keypress whenever it is a mirror or its fitted size differs; on its
-own layout changes while already owner; and through **Fit to this window**. A
-null-claim snapshot or event prompts an immediate claim even without focus.
+The window in use owns size. It claims on attach while its document is focused
+and its page has transient user activation (`navigator.userActivation.isActive`);
+on terminal focus with that activation, or on click or keypress, whenever it is
+a mirror or its fitted size differs; on its own layout changes while already
+owner; and through **Fit to this window**. A window refocused or remounted with
+no recent input in its page, such as an unattended server host window after its
+display wakes, therefore does not take a live owner's size; engines without the
+API keep the focus-only rule. A null-claim snapshot or event prompts an
+immediate claim even without focus, so a visible mirror takes the size as soon
+as the owner's stream ends; a hidden or zero-area mirror does not.
 While ownership is null, renderers permit live replies until a claim wins. Each
 renderer keeps at most one claim pending until its resize RPC completes, whether
 successfully or with failure; the echo updates the applied size. A layout change
@@ -1501,13 +1507,20 @@ releases that suppression immediately. A successful claim for a size this
 renderer already owned settles as the applied size even when the server, already
 holding it, sends no echo; a successful takeover without an echo leaves the other
 owner's size and the notice in place. Mirrors resize xterm to the PTY
-dimensions instead of fitting their container; only a different-size mirror
-shows **Sized for another window** with fit and dismiss actions. Manual
+dimensions instead of fitting their container. A mirror whose box is smaller
+than the owner's grid scales the xterm element with a CSS transform by
+`min(fit cols / cols, fit rows / rows)`, its fit measured at full size, so the
+whole grid stays visible and the claimable fit is unaffected; it never scales
+up. The floor is 0.5: below it the mount scrolls and is pinned to the bottom
+rows. xterm maps clicks to cells at full size, so a scaled mirror's first
+primary mousedown only claims (its pointerdown) and does not reach xterm. Only a
+different-size mirror shows **Sized for another window** (with the scale when
+below 100%) and fit and dismiss actions. Manual
 dismissal is retained by terminal identity and applied dimensions/owner across
 renderer and component remounts. It is cleared by a changed applied size/owner
 or terminal retirement, alongside the retained input resources. Equal-size
-mirrors and the owner show no notice. Clipping or extra space is intentional;
-all windows render at the program's width.
+mirrors and the owner show no notice. Scaling or extra space is intentional;
+all windows render the program's grid.
 
 The viewport measures before subscribing and includes available fitted
 `cols`/`rows` on attach. UI creation uses `terminal.open` with its workspace

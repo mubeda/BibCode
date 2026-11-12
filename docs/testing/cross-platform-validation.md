@@ -287,7 +287,12 @@ once, and later windows do not answer them again.
 
 A lone window and an equal-size mirror must show no size notice. A
 different-size mirror explains that it is **Sized for another window** and
-offers **Fit to this window**. Dismiss the notice with its labeled button using
+offers **Fit to this window**. A mirror smaller than the owner shows the whole
+grid scaled down, with the scale in the notice, its last row inside its box;
+under half size it scrolls, pinned to the bottom rows. Its first click takes the
+size and must not reach the program. A larger mirror shows the grid at normal
+size. Refocus an idle mirror window without clicking or typing in it (switch
+to it from the keyboard, or wake the display): it must not take the size. Dismiss the notice with its labeled button using
 pointer and keyboard. It must remain hidden through layout changes, unchanged
 size events, hide/show, tab visibility changes, and panel remounts while
 size/owner remain the same. A changed applied size/owner makes it eligible to

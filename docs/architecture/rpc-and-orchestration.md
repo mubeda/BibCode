@@ -5084,6 +5084,11 @@ successful takeover without one leaves the other owner's size applied. Notice
 suppression covers only the pending claim and the time until its outcome (an
 applied size published after the answer, or the settlement); after it the
 notice shows whenever another owner's size differs from this renderer's fit.
+A mirror scales its xterm element down to show the owner's whole grid, never
+up, with a 0.5 floor below which it scrolls pinned to the bottom rows; this is
+presentation only and sends no request. Attach and focus claims against a live
+owner also require transient user activation in the page, so an unattended
+window does not take the size; null ownership is still claimed at once.
 Input
 and reply decisions do not treat a pending claim as applied ownership. Null
 ownership permits live replies while attached renderers immediately try to claim

@@ -7640,7 +7640,9 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
   /** What one window shows: its grid against its fit, the owner, and the notice. */
   const view = (machine: Machine) => {
     const terminal = xtermOf(machine);
-    const scale = Number(/scale\(([\d.]+)\)/.exec(terminal.element?.style.transform ?? "")?.[1] ?? 1);
+    const scale = Number(
+      /scale\(([\d.]+)\)/.exec(terminal.element?.style.transform ?? "")?.[1] ?? 1,
+    );
     return {
       grid: `${terminal.cols}x${terminal.rows}`,
       fit: `${machine.fit.cols}x${machine.fit.rows}`,
@@ -7742,9 +7744,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
 
   it("does not let an unattended window take the size when the page regains focus by itself", async () => {
     const { host, client } = await serverHostOwnsTallerGrid();
-    await act(async () =>
-      xtermOf(client).keyHandler?.(new KeyboardEvent("keydown", { key: "a" })),
-    );
+    await act(async () => xtermOf(client).keyHandler?.(new KeyboardEvent("keydown", { key: "a" })));
     await server.deliver();
     expect(view(client).owner).toBe("this window");
     const hostMount = host.mounted.container.querySelector<HTMLElement>(
