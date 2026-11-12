@@ -99,7 +99,7 @@ interface TerminalGeometry {
   readonly footerRows: ReadonlyArray<string>;
   readonly clippedBy: ReadonlyArray<{ readonly element: string; readonly overflow: number }>;
   readonly notice: boolean;
-  /** Pixels the xterm viewport is scrolled above its bottom. */
+  /** Pixels between the end of xterm's scrollbar slider and the end of its track. */
   readonly scrollGap: number;
   readonly viewport: { readonly width: number; readonly height: number };
 }
@@ -187,10 +187,13 @@ function readTerminalGeometry(terminalId: string): Promise<TerminalGeometry> {
               .filter((text) => text.includes("fixture-footer-z")),
       clippedBy,
       notice: (mount.parentElement?.textContent ?? "").includes("Sized for another window"),
+      // xterm 6 scrolls a virtual element, not .xterm-viewport: its vertical slider ends at
+      // the bottom of its track exactly when the viewport is at the bottom.
       scrollGap: (() => {
-        const viewport = mount.querySelector<HTMLElement>(".xterm-viewport");
-        return viewport
-          ? Math.round(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop)
+        const slider = mount.querySelector<HTMLElement>(".scrollbar.vertical > .slider");
+        const track = slider?.parentElement;
+        return slider && track
+          ? Math.round(track.clientHeight - slider.offsetTop - slider.offsetHeight)
           : 0;
       })(),
       viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -233,7 +236,7 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
     violations.push(`the last row is ${clip.overflow.toFixed(1)}px below ${clip.element}`);
   // A program writing a transcript keeps the viewport pinned to the bottom.
   if (cliLayout && geometry.scrollGap > 1)
-    violations.push(`the viewport is ${geometry.scrollGap}px above the bottom`);
+    violations.push(`the viewport is scrolled up (slider ${geometry.scrollGap}px above its end)`);
   if (floatingLayout) {
     // A frame drawn in the normal buffer sits wherever the cursor was, so only its count is
     // known: the footer must appear exactly once at the current size, never stale or doubled.
@@ -249,10 +252,12 @@ function evaluate(at: string, tui: TuiSize | null, geometry: TerminalGeometry): 
         );
     }
   } else if (geometry.renderer === "dom" && tui !== null && tui.rows >= 5) {
-    // A narrower terminal wraps the footer (the full-screen TUI) or cuts it at the width less
-    // one column (the cli program), so its text is checked only where it fits.
+    // A narrower terminal wraps the footer's lines (the full-screen TUI; a later reflow then
+    // merges rows) or cuts them at the width less one column (the cli program), so the text is
+    // checked only where its longest line fits.
     const expected = `fixture-footer-z ${tui.rows}`;
-    if (tui.cols > expected.length && !(geometry.lastRows.at(-1) ?? "").startsWith(expected))
+    const longest = `fixture-footer-a ${tui.cols}x${tui.rows}`;
+    if (tui.cols > longest.length && !(geometry.lastRows.at(-1) ?? "").startsWith(expected))
       violations.push(`the footer is not on the last row: ${JSON.stringify(geometry.lastRows)}`);
   }
   return { at, tui, geometry, xtermRows, fitRows, violations };
@@ -564,7 +569,15 @@ function chatAction(kind: "send" | "grow"): Action {
         await browser.keys(["Shift", "Enter"]);
       }
       await browser.pause(600);
-      await browser.keys(["Control", "a"]);
+      // Select the draft without a platform shortcut (Control+A is not select-all on macOS).
+      await browser.execute(() => {
+        const editor = document.activeElement;
+        if (!(editor instanceof HTMLElement)) return;
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(range);
+      });
       await browser.keys("Backspace");
     }
     if (switched && random() < 0.7) await showTerminal();
