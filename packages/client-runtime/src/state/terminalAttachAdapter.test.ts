@@ -346,7 +346,8 @@ describe("acquireTerminalMetadataStream", () => {
       yield* secondStarted.await;
       expect(registry.size()).toBe(1);
       const shared = registry.get("key");
-      expect(shared?.snapshot()).toBe("xx");
+      // Both leases delivered the same sequenced output: it is applied once (#348).
+      expect(shared?.snapshot()).toBe("x");
 
       yield* Fiber.interrupt(first);
       expect(registry.get("key")).toBe(shared);

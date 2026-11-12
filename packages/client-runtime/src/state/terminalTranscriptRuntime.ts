@@ -40,7 +40,11 @@ export const EMPTY_TERMINAL_METADATA_SNAPSHOT = Object.freeze<TerminalMetadataSn
 });
 
 export interface TerminalTranscriptRuntime {
-  ingest(event: TerminalAttachStreamEvent): void;
+  /**
+   * `source` identifies the attach stream the event came from (one object per stream). Several
+   * streams can feed one runtime, so an event another stream already delivered is skipped.
+   */
+  ingest(event: TerminalAttachStreamEvent, source?: object): void;
   attachRenderer(
     sink: (signal: TerminalRenderSignal) => void,
     sizeClaim?: string,
@@ -59,7 +63,17 @@ export function createTerminalTranscriptRuntime(
   const rendererClaims = new Map<(signal: TerminalRenderSignal) => void, string | undefined>();
   const metadataListeners = new Set<(metadata: TerminalMetadataSnapshot) => void>();
   const pendingEvents: Array<TerminalAttachStreamEvent> = [];
+  const pendingSources: Array<object> = [];
   let pendingHead = 0;
+  // Server sequences only grow within one process; a restart starts over. Each stream is in
+  // order, but several streams (a remount's old and new attachment, two viewports) can feed
+  // this runtime. The process each stream last reset to fences its events, and the highest
+  // sequence applied skips what another stream already delivered.
+  const defaultSource = {};
+  const sourceProcesses = new WeakMap<object, number | null>();
+  let processId: number | null | undefined;
+  let appliedSequence: number | undefined;
+  let sequenceSource: object | undefined;
   let processingEvents = false;
   let metadata = EMPTY_TERMINAL_METADATA_SNAPSHOT;
   let size: TerminalSize | undefined;
@@ -146,6 +160,40 @@ export function createTerminalTranscriptRuntime(
     notifyMetadata();
   };
 
+  const accept = (event: TerminalAttachStreamEvent, source: object): boolean => {
+    if (event.type === "snapshot" || event.type === "restarted") {
+      const { pid, sequence } = event.snapshot;
+      sourceProcesses.set(source, pid);
+      if (
+        source !== sequenceSource &&
+        pid === processId &&
+        sequence !== undefined &&
+        appliedSequence !== undefined &&
+        sequence <= appliedSequence
+      ) {
+        // Another stream already applied this state of the same process.
+        if (event.snapshot.firstAttachmentGrant) {
+          firstAttachmentGrantClaim = event.snapshot.size?.sizeClaim ?? null;
+        }
+        return false;
+      }
+      processId = pid;
+      appliedSequence = sequence;
+      sequenceSource = source;
+      return true;
+    }
+    // A stream still on an earlier process (it has not seen the restart yet).
+    if (sourceProcesses.get(source) !== processId) return false;
+    const sequence = event.sequence;
+    if (sequence === undefined) return true;
+    if (appliedSequence !== undefined && sequence <= appliedSequence) {
+      return source === sequenceSource;
+    }
+    appliedSequence = sequence;
+    sequenceSource = source;
+    return true;
+  };
+
   const processEvent = (event: TerminalAttachStreamEvent) => {
     switch (event.type) {
       case "snapshot":
@@ -188,18 +236,21 @@ export function createTerminalTranscriptRuntime(
   };
 
   return {
-    ingest(event) {
+    ingest(event, source = defaultSource) {
       pendingEvents.push(event);
+      pendingSources.push(source);
       if (processingEvents) return;
 
       processingEvents = true;
       try {
         while (pendingHead < pendingEvents.length) {
-          processEvent(pendingEvents[pendingHead]!);
+          const next = pendingEvents[pendingHead]!;
+          if (accept(next, pendingSources[pendingHead]!)) processEvent(next);
           pendingHead += 1;
         }
       } finally {
         pendingEvents.length = 0;
+        pendingSources.length = 0;
         pendingHead = 0;
         processingEvents = false;
       }

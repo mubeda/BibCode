@@ -30,12 +30,16 @@ export function projectTerminalMetadataStream<E, R>(
   events: Stream.Stream<TerminalAttachStreamEvent, E, R>,
   runtime: TerminalTranscriptRuntime,
 ): Stream.Stream<TerminalMetadataSnapshot, E, R> {
-  return events.pipe(
-    Stream.filterMap((event) => {
-      runtime.ingest(event);
-      return eventChangesMetadata(event) ? Result.succeed(runtime.metadata()) : Result.failVoid;
-    }),
-  );
+  return Stream.suspend(() => {
+    // One identity per run of the stream: the runtime orders events across streams by it.
+    const source = {};
+    return events.pipe(
+      Stream.filterMap((event) => {
+        runtime.ingest(event, source);
+        return eventChangesMetadata(event) ? Result.succeed(runtime.metadata()) : Result.failVoid;
+      }),
+    );
+  });
 }
 
 export interface TerminalTranscriptRuntimeRegistry {

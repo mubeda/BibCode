@@ -594,9 +594,9 @@ describe("createTerminalTranscriptRuntime with several attach streams (#348)", (
     runtime.ingest(outputAt(498, "stale"), b);
     runtime.ingest(resizedAt(499, 50), b);
     expect(runtime.snapshot()).toBe("newa");
-    expect(runtime.metadata().generation).toBe(3);
+    expect(runtime.metadata().generation).toBe(2);
     runtime.ingest(restartedAt(1, "new", 8), b);
-    expect(runtime.metadata().generation).toBe(3);
+    expect(runtime.metadata().generation).toBe(2);
     expect(runtime.snapshot()).toBe("newa");
     runtime.ingest(outputAt(2, "a"), b);
     runtime.ingest(outputAt(3, "b"), b);
