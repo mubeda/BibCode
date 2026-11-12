@@ -61,6 +61,7 @@ function snapshot(
     memory: STATISTIC,
     recent: recent.map((sampledAt) => ({ sampledAt, cpuPercent: 20, memoryPercent: 25 })),
     uptime,
+    hiddenVolumes: [{ mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" }],
   };
 }
 
@@ -128,6 +129,25 @@ describe("accumulateHostMetrics", () => {
     expect(kept.view.uptime).toBe(first);
     const replaced = run([snapshot([at(0)], first), sampleEvent(at(1), second)]);
     expect(replaced.view.uptime).toBe(second);
+  });
+
+  it("replaces the hidden volumes only when a sample carries the chart state", () => {
+    const kept = run([snapshot([at(0)]), sampleEvent(at(1), null)]);
+    expect(kept.view.hiddenVolumes.map((volume) => volume.mountPoint)).toEqual(["/mnt/share"]);
+    const replaced = run([
+      snapshot([at(0)]),
+      { ...sampleEvent(at(1), [bucket(at(0))]), hiddenVolumes: [] },
+    ]);
+    expect(replaced.view.hiddenVolumes).toEqual([]);
+    // A repeated sample can still carry a newer chart state.
+    const stale = run([
+      snapshot([at(5)]),
+      {
+        ...sampleEvent(at(4), [bucket(at(0))]),
+        hiddenVolumes: [{ mountPoint: "/mnt/empty", fileSystem: "tmpfs", reason: "empty" }],
+      },
+    ]);
+    expect(stale.view.hiddenVolumes.map((volume) => volume.mountPoint)).toEqual(["/mnt/empty"]);
   });
 
   it("keeps only points within 15 minutes of the newest after skipped samples", () => {

@@ -1156,3 +1156,82 @@ async fn a_panicking_disk_call_fails_its_job_and_keeps_the_worker() {
     assert!(!failed_read.contains("test-user"), "{failed_read}");
     workers.stop();
 }
+
+/// R81: a network volume is hidden with its reason before any space read.
+#[tokio::test(start_paused = true)]
+async fn a_network_volume_is_hidden_with_its_reason_and_never_read() {
+    let source = Arc::new(
+        FakeHostMetricsSource::new(vec![
+            descriptor("/", "ext4"),
+            descriptor("/mnt/share", "nfs4"),
+        ])
+        .space("/", 100 * GB, 40 * GB)
+        .space("/mnt/share", 100 * GB, 10 * GB),
+    );
+    let collector = collector(source.clone());
+    collector.start_background();
+    run_for(&collector, Duration::from_secs(5), Duration::from_secs(1)).await;
+
+    let snapshot = collector.snapshot().await;
+    let hidden = &snapshot.chart.hidden_volumes;
+    assert_eq!(hidden.len(), 1, "{hidden:?}");
+    assert_eq!(hidden[0].descriptor.mount_point, Path::new("/mnt/share"));
+    assert_eq!(hidden[0].reason, HiddenReason::Network);
+    assert_eq!(source.space_reads("/mnt/share"), 0);
+    assert_eq!(source.space_reads("/"), 1);
+    let wire = wire::encode_snapshot(&snapshot);
+    assert_eq!(
+        wire["hiddenVolumes"],
+        serde_json::json!([{ "mountPoint": "/mnt/share", "fileSystem": "nfs4", "reason": "network" }])
+    );
+    collector.shutdown().await;
+}
+
+/// R81: an empty volume and a second mount of `/`'s storage are read, then hidden.
+#[tokio::test(start_paused = true)]
+async fn an_empty_or_shared_volume_is_hidden_after_its_read() {
+    let source = Arc::new(
+        FakeHostMetricsSource::new(vec![
+            descriptor("/", "ext4"),
+            descriptor("/mnt/empty", "tmpfs"),
+            descriptor("/srv/same", "ext4"),
+        ])
+        .space("/", 100 * GB, 40 * GB)
+        .space("/mnt/empty", 0, 0)
+        .space("/srv/same", 100 * GB, 40 * GB),
+    );
+    let collector = collector(source.clone());
+    collector.start_background();
+    // The second background reading, at 60 s, is the first to carry the volumes read at 0 s.
+    run_for(&collector, Duration::from_secs(65), Duration::from_secs(5)).await;
+
+    let snapshot = collector.snapshot().await;
+    let reasons = snapshot
+        .chart
+        .hidden_volumes
+        .iter()
+        .map(|hidden| (hidden.descriptor.mount_point.clone(), hidden.reason.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            (PathBuf::from("/mnt/empty"), HiddenReason::Empty),
+            (
+                PathBuf::from("/srv/same"),
+                HiddenReason::SameStorage {
+                    as_mount: PathBuf::from("/")
+                }
+            ),
+        ]
+    );
+    assert_eq!(source.space_reads("/mnt/empty"), 1);
+    assert_eq!(source.space_reads("/srv/same"), 1);
+    assert_eq!(
+        snapshot.current.as_ref().expect("a reading").volumes.len(),
+        1
+    );
+    let wire = wire::encode_snapshot(&snapshot);
+    assert_eq!(wire["hiddenVolumes"][1]["reason"], "sameStorage");
+    assert_eq!(wire["hiddenVolumes"][1]["sameStorageAs"], "/");
+    collector.shutdown().await;
+}

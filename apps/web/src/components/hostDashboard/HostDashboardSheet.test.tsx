@@ -128,6 +128,7 @@ function view(overrides: Partial<HostMetricsView> = {}): HostMetricsView {
         memoryPeak: 36,
       },
     ],
+    hiddenVolumes: [],
     ...overrides,
   };
 }
@@ -229,6 +230,50 @@ describe("HostDashboardSheet", () => {
     expect(since?.textContent).toContain("40.0%");
     expect(since?.querySelector('[aria-label="CPU since start"]')?.children.length).toBe(1);
     expect(since?.querySelector('[aria-label="Memory since start"]')?.children.length).toBe(1);
+  });
+
+  it("lists hidden volumes with their reason under a closed disclosure", async () => {
+    h.data = view({
+      hiddenVolumes: [
+        { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
+        { mountPoint: "/run/overlay", fileSystem: "overlay", reason: "overlay" },
+        { mountPoint: "/etc/hostname", fileSystem: "ext4", reason: "fileMount" },
+        { mountPoint: "/mnt/empty", fileSystem: "tmpfs", reason: "empty" },
+        {
+          mountPoint: "/System/Volumes/Data",
+          fileSystem: "apfs",
+          reason: "sameStorage",
+          sameStorageAs: "/",
+        },
+        { mountPoint: "/mnt/future", fileSystem: "ext4", reason: "someNewReason" },
+      ],
+    });
+    await render();
+    const toggle = [...container!.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Hidden volumes (6)"),
+    );
+    expect(toggle).toBeDefined();
+    expect(toggle?.getAttribute("aria-expanded")).toBe("false");
+    expect(text()).not.toContain("/mnt/share");
+    await act(async () => toggle!.click());
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    const rows = [...container!.querySelectorAll('[data-testid="host-dashboard-hidden-volume"]')];
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "/mnt/shareNetwork volume",
+      "/run/overlayContainer layer",
+      "/etc/hostnameFile mount",
+      "/mnt/emptyEmpty",
+      "/System/Volumes/DataSame storage as /",
+      "/mnt/futureHidden by the volume filter",
+    ]);
+    // Hidden volumes are listed, never sized.
+    expect(rows.some((row) => /free|\bof\b|GB/u.test(row.textContent ?? ""))).toBe(false);
+  });
+
+  it("shows no hidden volumes disclosure when nothing is hidden", async () => {
+    h.data = view();
+    await render();
+    expect(text()).not.toContain("Hidden volumes");
   });
 
   it("says the volume list is not answering only when the server reports it", async () => {
