@@ -291,3 +291,171 @@ fn cost_probe() {
     });
     report("live", cost, source.reads());
 }
+
+/// Runs a system tool and returns its standard output.
+#[cfg(unix)]
+fn tool_output(program: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("{program} did not run: {error}"));
+    assert!(output.status.success(), "{program} failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The first number in `text` after `label`.
+#[cfg(unix)]
+fn number_after(text: &str, label: &str) -> f64 {
+    let start = text
+        .find(label)
+        .unwrap_or_else(|| panic!("no {label:?} in the tool output"))
+        + label.len();
+    text[start..]
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+        .unwrap_or_else(|| panic!("no number after {label:?}"))
+}
+
+/// Total and available bytes of `/` from `df -k -P /`: the 1024-blocks and Available columns,
+/// the same `statvfs` fields the collector reads.
+#[cfg(unix)]
+fn df_root() -> (u64, u64) {
+    let output = tool_output("df", &["-k", "-P", "/"]);
+    let line = output.lines().nth(1).expect("df printed no volume line");
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .take(3)
+        .map(|field| field.parse().expect("df column is a number"))
+        .collect();
+    (fields[0] * 1024, fields[2] * 1024)
+}
+
+/// Total and idle jiffies of `/proc/stat`'s "cpu" line (iowait counts as idle, as in `sysinfo`).
+#[cfg(target_os = "linux")]
+fn proc_stat_cpu() -> (u64, u64) {
+    let stat = std::fs::read_to_string("/proc/stat").expect("read /proc/stat");
+    let values: Vec<u64> = stat
+        .lines()
+        .next()
+        .expect("cpu line")
+        .split_whitespace()
+        .skip(1)
+        .map(|value| value.parse().expect("number"))
+        .collect();
+    // user nice system idle iowait irq softirq steal; guest time is already inside user.
+    (values.iter().take(8).sum(), values[3] + values[4])
+}
+
+#[cfg(unix)]
+fn within(name: &str, native: f64, tool: f64, tolerance: f64, unit: &str) {
+    let difference = (native - tool).abs();
+    println!(
+        "{name}: native {native:.2}{unit}, tool {tool:.2}{unit}, difference {difference:.2}{unit} \
+         (tolerance {tolerance:.2}{unit})"
+    );
+    assert!(difference <= tolerance, "{name} is outside its tolerance");
+}
+
+/// Task 11.10 (R80): compares the native source with the operating system's own tools over one
+/// 5 s window, naming only `/`. Windows has no part here: it is covered by CI build and unit
+/// tests only.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "probe: run by hand on a real host"]
+fn os_tools_probe() {
+    let source = NativeHostMetricsSource::new();
+    // Primes the CPU counters, so the next read covers the window below.
+    source.read_cpu_memory().expect("first read");
+
+    #[cfg(target_os = "linux")]
+    let tool_cpu = {
+        let (total_before, idle_before) = proc_stat_cpu();
+        std::thread::sleep(Duration::from_secs(5));
+        let (total_after, idle_after) = proc_stat_cpu();
+        let total = (total_after - total_before) as f64;
+        100.0 * (total - (idle_after - idle_before) as f64) / total
+    };
+    #[cfg(target_os = "macos")]
+    let tool_cpu = {
+        // The second sample covers the 5 s after the first.
+        let top = tool_output("top", &["-l", "2", "-s", "5", "-n", "0"]);
+        let second = top.rsplit("CPU usage:").next().expect("a CPU usage line");
+        100.0 - number_after(second, "sys, ")
+    };
+    let reading = source.read_cpu_memory().expect("window read");
+    within("CPU busy", reading.cpu_percent, tool_cpu, 10.0, " pp");
+
+    let native_memory =
+        100.0 * reading.memory_used_bytes as f64 / reading.memory_total_bytes as f64;
+    #[cfg(target_os = "linux")]
+    let tool_memory = {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read /proc/meminfo");
+        let total = number_after(&meminfo, "MemTotal:");
+        100.0 * (total - number_after(&meminfo, "MemAvailable:")) / total
+    };
+    #[cfg(target_os = "macos")]
+    let tool_memory = {
+        let vm_stat = tool_output("vm_stat", &[]);
+        let pages = |label: &str| number_after(&vm_stat, label);
+        let used = (pages("Anonymous pages:") - pages("Pages purgeable:")
+            + pages("Pages wired down:")
+            + pages("Pages occupied by compressor:"))
+            * pages("page size of ");
+        let total: f64 = tool_output("sysctl", &["-n", "hw.memsize"])
+            .trim()
+            .parse()
+            .expect("hw.memsize");
+        100.0 * used / total
+    };
+    within("memory used", native_memory, tool_memory, 3.0, " pp");
+
+    source.list_volumes();
+    let space = source
+        .read_volume_space(Path::new("/"))
+        .expect("space of /");
+    let (df_total, df_available) = df_root();
+    let percent_of_df_total = |bytes: u64| 100.0 * bytes as f64 / df_total as f64;
+    within(
+        "/ total, percent of df's total",
+        percent_of_df_total(space.total_bytes),
+        100.0,
+        1.0,
+        "%",
+    );
+    #[cfg(target_os = "linux")]
+    let tool_free = df_available;
+    #[cfg(target_os = "macos")]
+    let tool_free = {
+        // The property `sysinfo` reads, with its fallback (`src/unix/apple/disk.rs` 380-391).
+        let script = "ObjC.import('Foundation'); \
+            const url = $.NSURL.fileURLWithPath('/'); \
+            const keys = ['NSURLVolumeAvailableCapacityForImportantUsageKey', \
+            'NSURLVolumeAvailableCapacityKey']; \
+            const values = url.resourceValuesForKeysError($(keys), null); \
+            const important = Number(values.objectForKey(keys[0]).js); \
+            important > 0 ? important : Number(values.objectForKey(keys[1]).js)";
+        let important: f64 = tool_output("osascript", &["-l", "JavaScript", "-e", script])
+            .trim()
+            .parse()
+            .expect("available capacity");
+        println!(
+            "/ df Available {:.2}% of df's total; free must be at least that",
+            percent_of_df_total(df_available)
+        );
+        assert!(
+            space.free_bytes >= df_available,
+            "free is below df's Available"
+        );
+        important as u64
+    };
+    // Free within 1 percent of the tool's value.
+    within(
+        "/ free, percent of df's total",
+        percent_of_df_total(space.free_bytes),
+        percent_of_df_total(tool_free),
+        percent_of_df_total(tool_free) / 100.0,
+        "%",
+    );
+}
