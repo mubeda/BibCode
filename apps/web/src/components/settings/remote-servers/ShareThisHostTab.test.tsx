@@ -26,8 +26,6 @@ const h = vi.hoisted(() => ({
         mode: "local-only" as "local-only" | "network-accessible",
         endpointUrl: null as string | null,
         advertisedHost: null as string | null,
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
       },
       advertisedEndpoints: [] as AdvertisedEndpoint[],
     },
@@ -146,8 +144,6 @@ const localState = {
   mode: "local-only" as const,
   endpointUrl: null,
   advertisedHost: null,
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 const wideState = {
   ...localState,

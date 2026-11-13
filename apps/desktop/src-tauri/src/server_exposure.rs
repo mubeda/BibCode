@@ -428,8 +428,6 @@ mod tests {
             server_exposure_mode: mode.to_owned(),
             endpoint_url: wide.then(|| "http://192.168.1.20:3773".to_owned()),
             advertised_host: wide.then(|| "192.168.1.20".to_owned()),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 

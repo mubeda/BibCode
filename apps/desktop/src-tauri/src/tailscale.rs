@@ -13,6 +13,9 @@ use tokio::{
 
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// The only Tailscale command BiBCode runs. It reads; BiBCode never starts, changes or
+/// stops Tailscale Serve or anything else in Tailscale.
+const TAILSCALE_STATUS_ARGS: [&str; 2] = ["status", "--json"];
 /// Caps every CLI candidate together, so an address fetch waits at most this for status.
 const TAILSCALE_STATUS_TOTAL_TIMEOUT: Duration = Duration::from_millis(3_000);
 const TAILSCALE_PROBE_TIMEOUT: Duration = Duration::from_millis(2_500);
@@ -191,7 +194,7 @@ async fn read_tailscale_status_reporting(
     command.kill_on_drop(true);
     isolate_appimage_environment(&mut command);
     let child = command
-        .args(["status", "--json"])
+        .args(TAILSCALE_STATUS_ARGS)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -366,6 +369,20 @@ mod tests {
         assert!(!is_tailscale_ipv4_address("100.64.nope.1"));
         assert!(!is_tailscale_ipv4_address("100.64.0.nope"));
         assert!(!is_tailscale_ipv4_address("100.64.0.256"));
+    }
+
+    #[test]
+    fn the_only_tailscale_command_is_a_read_only_status_query() {
+        assert_eq!(TAILSCALE_STATUS_ARGS, ["status", "--json"]);
+        let source = include_str!("tailscale.rs");
+        // No other Tailscale invocation exists in this module (this test's own text aside).
+        assert_eq!(
+            source
+                .matches(concat!(".args(TAILSCALE", "_STATUS_ARGS)"))
+                .count(),
+            1
+        );
+        assert!(!source.contains(concat!("\"ser", "ve\"")));
     }
 
     #[test]

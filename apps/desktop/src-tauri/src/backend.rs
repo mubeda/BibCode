@@ -40,6 +40,8 @@ mod ui_process_observer;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const DESKTOP_MODE: &str = "desktop";
 const BACKEND_BOOTSTRAP_FD: &str = "0";
+/// Sent in the WSL bootstrap only because older `bibcode serve` builds require the field;
+/// BiBCode no longer manages Tailscale Serve.
 const TAILSCALE_SERVE_PORT: u16 = 443;
 const DESKTOP_LOOPBACK_HOST: &str = "127.0.0.1";
 const DESKTOP_LAN_BIND_HOST: &str = "0.0.0.0";
@@ -84,8 +86,6 @@ pub struct BackendRunConfig {
     pub server_exposure_mode: String,
     pub endpoint_url: Option<String>,
     pub advertised_host: Option<String>,
-    pub tailscale_serve_enabled: bool,
-    pub tailscale_serve_port: u16,
 }
 
 impl BackendRunConfig {
@@ -112,19 +112,16 @@ impl BackendRunConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BackendDesktopSettings {
     server_exposure_mode: String,
-    tailscale_serve_enabled: bool,
-    tailscale_serve_port: u16,
     wsl_backend_enabled: bool,
     wsl_only: bool,
     wsl_distro: Option<String>,
 }
 
+/// Keys an earlier version wrote, such as `tailscaleServeEnabled`, are ignored.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendDesktopSettingsDocument {
     server_exposure_mode: Option<String>,
-    tailscale_serve_enabled: Option<bool>,
-    tailscale_serve_port: Option<u64>,
     wsl_backend_enabled: Option<bool>,
     wsl_only: Option<bool>,
     wsl_distro: Option<String>,
@@ -249,8 +246,6 @@ impl BackendLaunchPlan {
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: TAILSCALE_SERVE_PORT,
         };
         let bootstrap = json!({
             "mode": DESKTOP_MODE,
@@ -3044,8 +3039,6 @@ fn default_launch_plans<R: Runtime>(
                 server_exposure_mode: exposure.mode,
                 endpoint_url: exposure.endpoint_url,
                 advertised_host: exposure.advertised_host,
-                tailscale_serve_enabled: settings.tailscale_serve_enabled,
-                tailscale_serve_port: settings.tailscale_serve_port,
             };
             Ok(
                 BackendLaunchPlan::local(data_root.effective.clone(), config)
@@ -3208,13 +3201,6 @@ fn can_listen_on_host(port: u16, host: &str) -> bool {
     bind_port_probe(port, host).is_some()
 }
 
-fn normalize_tailscale_serve_port(value: Option<u64>) -> u16 {
-    match value {
-        Some(value) if (1..=u16::MAX as u64).contains(&value) => value as u16,
-        _ => TAILSCALE_SERVE_PORT,
-    }
-}
-
 fn normalize_wsl_distro(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -3262,8 +3248,6 @@ fn decode_backend_desktop_settings(raw: Option<&str>) -> BackendDesktopSettings 
             Some("network-accessible") => "network-accessible".to_string(),
             _ => "local-only".to_string(),
         },
-        tailscale_serve_enabled: document.tailscale_serve_enabled.unwrap_or(false),
-        tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
         wsl_backend_enabled: wsl_only || document.wsl_backend_enabled.unwrap_or(false),
         wsl_only,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
@@ -4093,8 +4077,6 @@ exit /b 9
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 
@@ -6017,8 +5999,6 @@ exit /b 9
         let resolver = SystemWslCommandResolver;
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: false,
             wsl_distro: Some("Debian".to_string()),
@@ -6051,8 +6031,6 @@ exit /b 9
         );
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: true,
             wsl_distro: None,
@@ -6125,8 +6103,6 @@ exit /b 9
         let resolver = SystemWslCommandResolver;
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: true,
             wsl_distro: Some("Missing".to_string()),
@@ -6174,8 +6150,6 @@ exit /b 9
     fn wsl_only_planning_failure_never_builds_a_windows_fallback() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: true,
             wsl_distro: Some("Unavailable".to_string()),
@@ -6205,8 +6179,6 @@ exit /b 9
     fn persisted_wsl_only_intent_never_plans_windows_when_enabled_flag_is_skewed() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: false,
             wsl_only: true,
             wsl_distro: Some("Ubuntu".to_string()),
@@ -6236,8 +6208,6 @@ exit /b 9
     fn secondary_wsl_planning_failure_remains_in_desired_topology() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: false,
             wsl_distro: Some("Ubuntu".to_string()),
@@ -6272,8 +6242,6 @@ exit /b 9
     fn default_tracking_secondary_identity_is_stable_across_live_and_unavailable_states() {
         let default_tracking = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: true,
             wsl_only: false,
             wsl_distro: None,
@@ -6335,17 +6303,9 @@ exit /b 9
     }
 
     #[test]
-    fn normalizes_tailscale_ports_and_local_only_exposure() {
-        assert_eq!(normalize_tailscale_serve_port(None), 443);
-        assert_eq!(normalize_tailscale_serve_port(Some(0)), 443);
-        assert_eq!(normalize_tailscale_serve_port(Some(1)), 1);
-        assert_eq!(normalize_tailscale_serve_port(Some(65_535)), 65_535);
-        assert_eq!(normalize_tailscale_serve_port(Some(65_536)), 443);
-
+    fn normalizes_local_only_exposure() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "unsupported".to_string(),
-            tailscale_serve_enabled: true,
-            tailscale_serve_port: 8_443,
             wsl_backend_enabled: false,
             wsl_only: false,
             wsl_distro: None,
@@ -6368,8 +6328,6 @@ exit /b 9
             defaults,
             BackendDesktopSettings {
                 server_exposure_mode: "local-only".to_string(),
-                tailscale_serve_enabled: false,
-                tailscale_serve_port: 443,
                 wsl_backend_enabled: false,
                 wsl_only: false,
                 wsl_distro: None,
@@ -6377,6 +6335,7 @@ exit /b 9
         );
         assert_eq!(decode_backend_desktop_settings(Some("not-json")), defaults);
 
+        // Tailscale Serve keys an earlier version stored are ignored, not an error.
         assert_eq!(
             decode_backend_desktop_settings(Some(
                 r#"{
@@ -6390,8 +6349,6 @@ exit /b 9
             )),
             BackendDesktopSettings {
                 server_exposure_mode: "network-accessible".to_string(),
-                tailscale_serve_enabled: true,
-                tailscale_serve_port: 8_443,
                 wsl_backend_enabled: true,
                 wsl_only: true,
                 wsl_distro: Some("Ubuntu-24.04".to_string()),
@@ -6406,7 +6363,6 @@ exit /b 9
             }"#,
         ));
         assert_eq!(invalid.server_exposure_mode, "local-only");
-        assert_eq!(invalid.tailscale_serve_port, 443);
         assert_eq!(invalid.wsl_distro, None);
     }
 
@@ -6414,8 +6370,6 @@ exit /b 9
     fn network_exposure_uses_resolved_host_or_falls_back_closed() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "network-accessible".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: false,
             wsl_only: false,
             wsl_distro: None,
@@ -6468,8 +6422,6 @@ exit /b 9
     fn local_only_exposure_does_not_resolve_lan_route() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
             wsl_backend_enabled: false,
             wsl_only: false,
             wsl_distro: None,

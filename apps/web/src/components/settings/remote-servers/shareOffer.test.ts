@@ -61,8 +61,6 @@ const wideState = {
   mode: "network-accessible" as const,
   endpointUrl: "http://192.168.1.20:3773",
   advertisedHost: "192.168.1.20",
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 
 const loopbackState = {

@@ -1352,9 +1352,8 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
     await expect(bridge.applyServerExposure("network-accessible")).resolves.toBeNull();
-    await expect(
-      bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
-    ).resolves.toBeNull();
+    // BiBCode no longer manages Tailscale Serve, so the bridge offers no such method.
+    expect("setTailscaleServeEnabled" in bridge).toBe(false);
     await expect(bridge.getAdvertisedEndpoints()).resolves.toBeNull();
     await expect(bridge.getWslState()).resolves.toBeNull();
     await expect(bridge.setWslBackendEnabled(true)).resolves.toBeNull();
@@ -1404,6 +1403,7 @@ describe("tauriDesktopBridge", () => {
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_apply_server_exposure", {
       desired: "network-accessible",
+      allowElevationPrompt: false,
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_set_wsl_backend_enabled", {
       enabled: true,
@@ -1741,9 +1741,6 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.applyServerExposure("network-accessible")).rejects.toThrow(
       "unsupported fallback command: desktop_bridge_apply_server_exposure",
     );
-    await expect(
-      bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
-    ).resolves.toMatchObject({ tailscaleServeEnabled: false });
     await expect(bridge.getWslState()).resolves.toMatchObject({ enabled: false, distros: [] });
     // WSL mutations propagate failures instead of pretending a default state:
     // a swallowed set_wsl_only error could leave the firewall rule open while
