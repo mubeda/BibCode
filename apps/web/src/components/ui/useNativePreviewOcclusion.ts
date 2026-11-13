@@ -5,8 +5,8 @@ import { isMacPlatform } from "~/lib/utils";
 
 /**
  * A macOS native preview is a view above the webview, so a modal surface drawn over it would sit
- * under it. While `active`, hold an occlusion lease, which hides the preview. Not for menus and
- * popovers: the lease hides the whole preview and has no rectangle to test against.
+ * under it. While `active`, hold an occlusion lease, which hides the whole preview. Menus and
+ * popovers use `usePopupOcclusion` instead, which hides it only where the popup overlaps it.
  */
 export function useNativePreviewOcclusion(active: boolean): void {
   useEffect(() => {

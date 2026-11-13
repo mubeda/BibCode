@@ -20,6 +20,7 @@ import type { ModelEsque } from "./providerIconUtils";
 
 const captured = vi.hoisted(() => ({
   contentProps: null as null | Record<string, unknown>,
+  contentMounts: 0,
 }));
 
 vi.mock("lucide-react", () => ({
@@ -91,30 +92,44 @@ vi.mock("./ProviderInstanceIcon", () => ({
   ),
 }));
 
-vi.mock("./ModelPickerContent", () => ({
-  ModelPickerContent: (props: Record<string, unknown>) => {
-    captured.contentProps = props;
-    return (
-      <div data-model-picker-content>
-        <button
-          type="button"
-          data-select-model
-          onClick={() =>
-            (props.onInstanceModelChange as (instanceId: string, model: string) => void)(
-              "claude",
-              "opus",
-            )
-          }
-        />
-        <button
-          type="button"
-          data-request-close
-          onClick={() => (props.onRequestClose as () => void)()}
-        />
-      </div>
-    );
-  },
-}));
+// The stub owns a search value and counts its mounts, so a remount on reopening is observable.
+// It cannot prove the real search resets; ProviderModelPicker.real.test.tsx does that.
+vi.mock("./ModelPickerContent", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    ModelPickerContent: (props: Record<string, unknown>) => {
+      captured.contentProps = props;
+      const [search, setSearch] = useState("");
+      useEffect(() => {
+        captured.contentMounts += 1;
+      }, []);
+      return (
+        <div data-model-picker-content>
+          <input
+            data-stub-search
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          <button
+            type="button"
+            data-select-model
+            onClick={() =>
+              (props.onInstanceModelChange as (instanceId: string, model: string) => void)(
+                "claude",
+                "opus",
+              )
+            }
+          />
+          <button
+            type="button"
+            data-request-close
+            onClick={() => (props.onRequestClose as () => void)()}
+          />
+        </div>
+      );
+    },
+  };
+});
 
 import { ProviderModelPicker } from "./ProviderModelPicker";
 
@@ -193,6 +208,7 @@ async function click(container: HTMLElement, selector: string): Promise<void> {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   captured.contentProps = null;
+  captured.contentMounts = 0;
   onInstanceModelChange.mockReset();
   onOpenChange.mockReset();
   document.documentElement.style.overscrollBehavior = "";
@@ -372,5 +388,25 @@ describe("ProviderModelPicker", () => {
     expect(document.documentElement.style.overscrollBehavior).toBe("auto");
     expect(document.body.style.overflow).toBe("scroll");
     expect(document.body.style.paddingRight).toBe("3px");
+  });
+
+  it("reopening remounts the content through every route", async () => {
+    const mounted = await mount(renderPicker());
+    expect(captured.contentMounts).toBe(1);
+
+    await click(mounted.container, "[data-open-menu]");
+    expect(captured.contentMounts).toBe(2);
+    await act(async () => mounted.root.render(renderPicker({ terminalOpen: true })));
+    expect(captured.contentMounts).toBe(2);
+    await click(mounted.container, "[data-close-menu]");
+    expect(captured.contentMounts).toBe(2);
+    await click(mounted.container, "[data-open-menu]");
+    expect(captured.contentMounts).toBe(3);
+
+    await act(async () => mounted.root.render(renderPicker({ open: false })));
+    await act(async () => mounted.root.render(renderPicker({ open: true })));
+    expect(captured.contentMounts).toBe(4);
+    await act(async () => mounted.root.render(renderPicker({ open: true, model: "gpt-5-codex" })));
+    expect(captured.contentMounts).toBe(4);
   });
 });
