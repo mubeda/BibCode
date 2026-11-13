@@ -3,7 +3,8 @@ import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
 import type { EnvironmentId } from "@bibcode/contracts";
 import type { ClientSettings } from "@bibcode/contracts/settings";
 import { ChevronRightIcon } from "lucide-react";
-import { type JSX, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import * as Equal from "effect/Equal";
+import { type JSX, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { useClientSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
@@ -208,15 +209,30 @@ function SectionHeading({ children, aside }: { children: string; aside?: string 
   );
 }
 
-function HostDashboardValuesView({
-  values,
-  view,
-  timestampFormat,
-}: {
+interface HostDashboardValuesViewProps {
   readonly values: HostDashboardValues;
   readonly view: HostMetricsView | null;
   readonly timestampFormat: ClientSettings["timestampFormat"];
-}) {
+}
+
+// `presentHostDashboard` builds a fresh `values` on every 1 s tick, so compare it by content:
+// only a changed reading (or uptime text in `since`) renders the view again (R18).
+function valuesViewPropsEqual(
+  previous: HostDashboardValuesViewProps,
+  next: HostDashboardValuesViewProps,
+): boolean {
+  return (
+    previous.view === next.view &&
+    previous.timestampFormat === next.timestampFormat &&
+    Equal.equals(previous.values, next.values)
+  );
+}
+
+export const HostDashboardValuesView = memo(function HostDashboardValuesView({
+  values,
+  view,
+  timestampFormat,
+}: HostDashboardValuesViewProps) {
   const recent = view?.recent;
   const uptime = view?.uptime;
   const charts = useMemo(
@@ -373,4 +389,4 @@ function HostDashboardValuesView({
       </section>
     </>
   );
-}
+}, valuesViewPropsEqual);

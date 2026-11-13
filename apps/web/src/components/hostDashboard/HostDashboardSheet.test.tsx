@@ -14,6 +14,8 @@ const h = vi.hoisted(() => ({
   navigate: vi.fn(),
   visibility: "visible" as DocumentVisibilityState,
   environment: null as unknown,
+  /** Renders of the volume badges, which the values view rebuilds whenever its body runs. */
+  badgeRenders: 0,
 }));
 
 vi.mock("../ui/sheet", () => {
@@ -33,6 +35,14 @@ vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
   TooltipTrigger: ({ render }: { render: ReactElement }) => render,
   TooltipPopup: () => null,
+}));
+// A <Profiler> also reports an update when only its own element is new, even if the subtree
+// bailed out, so the values view's renders are counted on a child it rebuilds on each run.
+vi.mock("../ui/badge", () => ({
+  Badge: ({ children }: { children?: ReactNode }) => {
+    h.badgeRenders += 1;
+    return <span>{children}</span>;
+  },
 }));
 vi.mock("~/hooks/useSettings", () => ({ useClientSettings: () => "locale" }));
 vi.mock("~/state/environments", () => ({ useEnvironment: () => h.environment }));
@@ -55,7 +65,12 @@ import { RegistryContext } from "@effect/atom-react";
 import { AtomRegistry } from "effect/reactivity";
 
 import { hostDashboardRequest } from "~/state/hostDashboard";
-import { HostDashboardCoordinator, HostDashboardSheet } from "./HostDashboardSheet";
+import { presentHostDashboard } from "./hostDashboard.logic";
+import {
+  HostDashboardCoordinator,
+  HostDashboardSheet,
+  HostDashboardValuesView,
+} from "./HostDashboardSheet";
 
 const ENVIRONMENT_ID = EnvironmentId.make("example-server");
 
@@ -319,6 +334,67 @@ describe("HostDashboardSheet", () => {
       await render();
       expect(text()).not.toContain(notice);
     }
+  });
+
+  describe("values view commits", () => {
+    const NOW_MS = Date.UTC(2026, 10, 11, 20, 0, 0);
+
+    /** A fresh `values` object on every call, structurally equal for the same view. */
+    function freshValues(reading: HostMetricsView) {
+      const values = presentHostDashboard({
+        view: reading,
+        shownView: null,
+        connected: true,
+        supported: true,
+        failure: null,
+        lastItemAtMs: NOW_MS,
+        nowMs: NOW_MS,
+        timestampFormat: "locale",
+      }).values;
+      if (values === null) throw new Error("expected values");
+      return values;
+    }
+
+    /** Badge renders on each re-render after the mount; zero means the view did not run. */
+    async function rendersAfterMount(
+      valuesFor: (render: number) => ReturnType<typeof freshValues>,
+    ): Promise<number[]> {
+      vi.useFakeTimers({ now: NOW_MS, toFake: ["Date"] });
+      const reading = view();
+      const target = createRoot(document.body.appendChild(document.createElement("div")));
+      roots.push(target);
+      const counts: number[] = [];
+      for (let render = 0; render < 4; render += 1) {
+        h.badgeRenders = 0;
+        await act(async () =>
+          target.render(
+            <HostDashboardValuesView
+              values={valuesFor(render)}
+              view={reading}
+              timestampFormat="locale"
+            />,
+          ),
+        );
+        counts.push(h.badgeRenders);
+      }
+      expect(counts[0]).toBeGreaterThan(0);
+      return counts.slice(1);
+    }
+
+    it("does not render the values view again when its props are structurally equal", async () => {
+      const reading = view();
+      expect(await rendersAfterMount(() => freshValues(reading))).toEqual([0, 0, 0]);
+    });
+
+    it("renders the values view again when a reading changes", async () => {
+      const reading = view();
+      const counts = await rendersAfterMount((render) =>
+        render === 2 ? { ...freshValues(reading), cpu: "99.0%" } : freshValues(reading),
+      );
+      expect(counts[0]).toBe(0);
+      expect(counts[1]).toBeGreaterThan(0);
+      expect(counts[2]).toBeGreaterThan(0);
+    });
   });
 
   it("dims the values after 3 seconds without an item", async () => {
