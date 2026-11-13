@@ -1,14 +1,26 @@
 # Design: server-side terminal screen state and attach checkpoints (#350)
 
-Status: **Draft for review, revision 4 (server protocol reviewed three times; D1, D9 pending the harness report; D8 settled by test)**. No code is written until Codex and the advisor approve.
+Status: **Draft for review, revision 5**: the server protocol has been reviewed three times; D1, D2, D3, D5 and D9 are now filled from the serializer proof; D8 is settled by its test. No code is written until Codex and the advisor approve.
 Sources:
 
 - GitHub issue #350: the crate spike and its 16 review findings, cited as F1 to F16; they are binding;
 - this folder's `README.md`: the facts established since revision 1;
 - `reviews/design-review-1.md` to `reviews/design-review-3.md`: the reviews, cited as R1#n, R2#n and R3#n;
+- the serializer proof's report (a scratch project: 19,803 stream-and-cut comparisons against real xterm 6.0.0 with the unicode11 addon, 0 differences, 20.6% answered as fallbacks), cited as "the proof";
 - the current code on `main`.
 
 Every choice this document makes that the issue left open is marked **(agent's call)** and listed in section 6. The other issues' plan (`../2026-11-13-issue-batch-348-358/`) owns the client's Unicode 11 widths (its R5).
+
+## Changes since revision 4
+
+| Source                                                                                  | Where it is answered                       |
+| --------------------------------------------------------------------------------------- | ------------------------------------------ |
+| The proof: avt dropped, engine ported from xterm.js 6.0.0                               | D1 (engine, module layout, licence notice) |
+| The proof: generated width table                                                        | D2                                         |
+| The proof: the measured fallback reasons                                                | D3                                         |
+| The proof: required state, the option-backed state RIS keeps, the query-placement limit | D5                                         |
+| The proof: measurements and the self-check                                              | D9                                         |
+| Real size of the work                                                                   | Section 5                                  |
 
 ## Changes since revision 3
 
@@ -50,23 +62,48 @@ Out of scope: images (no image addon is installed in the panel); kitty keyboard 
 
 ## 2. Decisions
 
-### D1. Engine and vendoring (F1, F9, F13): **pending the harness report**
+### D1. Engine and module layout (F1, F9, F13)
 
-The harness work (README step 1) found that avt 0.20.0 and xterm 6.0.0 disagree in their basic model. It is building the engine on xterm's buffer model, with avt kept as a measured baseline. This design therefore does not specify the engine, its crate or its patches; the harness report will. Facts about avt 0.20.0 from its source, for the record:
+**Decision.** A new Rust engine, ported from xterm.js 6.0.0's own state model: its buffer, its input handler and its parser. avt is dropped. With only its widths patched, avt differs from xterm on 64% of random cuts on the visible grid alone: 10,621 of 19,671, even ignoring empty-versus-space cells. The differences are in:
 
-- the type is `avt::Terminal`;
-- `Line::is_wrapped()` is public and means "this row continues onto the next row";
-- the saved cursor and the character sets are private;
-- the scrollback limit is set at construction only;
-- `dump()` omits scrollback.
+- empty cells;
+- wide-character repair;
+- per-screen margins, tab stops and saved cursor;
+- separate bold and faint;
+- colour mode;
+- ED 2 pushing the screen into history.
 
-Whatever the engine, it lives behind `apps/server/src/terminal/screen.rs`, and the rest of this design depends only on this surface:
+Sizes from the proof: engine about 1,620 lines, parser 470, checkpoint serializer 960, screen wrapper 370, self-check 100, generated width table 490 (about 4,000 lines). Still to come: a port of xterm's `Buffer.resize` and `BufferReflow` (about 600 lines, in progress) and a marker index (D9).
+
+Module layout under `apps/server/src/terminal/`:
+
+| Path                    | Holds                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| `screen/mod.rs`         | `TerminalScreen`, the surface below; the held tail; the startup-query record                     |
+| `screen/engine.rs`      | buffers, cells, pens, modes, saved state, charsets (port of xterm's `Buffer` and `InputHandler`) |
+| `screen/parser.rs`      | the escape-sequence parser (port of `EscapeSequenceParser`)                                      |
+| `screen/reflow.rs`      | resize and reflow (port of `Buffer.resize` and `BufferReflow`)                                   |
+| `screen/checkpoint.rs`  | the serializer                                                                                   |
+| `screen/self_check.rs`  | replays a checkpoint into a fresh engine and compares (D9)                                       |
+| `screen/width_table.rs` | generated Unicode 11 widths (D2)                                                                 |
+| `screen/markers.rs`     | the marker index for hyperlinks (D9)                                                             |
+| `screen/NOTICE.md`      | xterm.js's MIT licence notice                                                                    |
+
+**Licence.** The engine is a port of MIT-licensed code, so xterm.js's copyright and permission notice must accompany it. The repository's pattern for code taken into the server is a `NOTICE.md` beside it (`apps/server/src/device/android/scrcpy/NOTICE.md`), and each ported file names its xterm.js source file at its top, as `apps/web/THIRD_PARTY_NOTICES.md` records for adapted web code. The notice is added as `screen/NOTICE.md`. Whether server binaries ship their notices inside the artifact is not established: `apps/desktop/THIRD_PARTY_NOTICES.md` says that file is not yet shipped. That is open question 1.
+
+Surface; the rest of this design depends only on it:
 
 ```rust
-pub(crate) struct TerminalScreen { /* engine, side tracker, held tail, query record, fallback */ }
+pub(crate) struct TerminalScreen { /* engine, held tail, query record, sticky reasons */ }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScreenFallback { UnsupportedState, TailOverflow, OverBudget }
+pub(crate) enum ScreenFallback {
+    // sticky until RIS (D3)
+    NationalCharset, CombinedTableFull, TabStopBeyondColumns, XtermWouldThrow, TailOverflow,
+    // computed per checkpoint (D3)
+    InconsistentPenAfterRestore, UnreachableGlCharset, AltScreenPendingWrap,
+    WrappedFirstLine, HyperlinkRegistry, OverBudget, SelfCheckMismatch,
+}
 
 pub(crate) struct TerminalCheckpoint {
     pub data: String,
@@ -76,36 +113,36 @@ pub(crate) struct TerminalCheckpoint {
 
 impl TerminalScreen {
     pub(crate) fn new(cols: u16, rows: u16) -> Self;
-    /// Exactly the bytes that were published, in publication order (D3, D4).
+    /// Exactly the strings that were published, in publication order (D3, D4).
     pub(crate) fn feed(&mut self, data: &str);
-    /// Every authoritative size transition, and nothing else (D4).
+    /// Every authoritative size transition, and nothing else (D4); reflows as xterm does.
     pub(crate) fn resize(&mut self, cols: u16, rows: u16);
-    /// `terminal.clear` (D3).
+    /// `terminal.clear`: RIS for the screen (D3).
     pub(crate) fn reset(&mut self);
-    pub(crate) fn fallback(&self) -> Option<ScreenFallback>;
-    /// Bytes that rebuild this state after a client's RIS, at most `max_bytes` (D6).
+    /// Serializes under the caller's locks; the self-check runs later, off-lock (D9).
     pub(crate) fn checkpoint(&self, max_bytes: usize, with_startup_queries: bool)
         -> Result<TerminalCheckpoint, ScreenFallback>;
 }
+/// Replays `checkpoint` into a fresh engine at `cols × rows` and compares it with `expected`.
+pub(crate) fn self_check(checkpoint: &TerminalCheckpoint, expected: &EngineState) -> bool;
 ```
 
 `TerminalScreen` has no handle to the PTY and no reply channel, so it cannot answer a query (F4).
 
+Alternatives:
+
+- **avt 0.20.0**, patched: 64% of cuts differ, as above;
+- **vt100 0.18.1**: no reflow, no DEC line drawing, no custom tab stops, no insert mode, no `?7`, no exposed saved cursor;
+- **alacritty_terminal 0.26.0**: inactive grid, tab stops, scroll region and charset private, and 38 dependencies;
+- **`@xterm/headless` in the server**: needs a Node runtime, which AGENTS.md forbids.
+
+The port follows the client's own model, which is what a checkpoint must reproduce.
+
 ### D2. Width parity, server side (F9, F13)
 
-The client's Unicode 11 widths ship with the other issues' plan (its R5). This design keeps only the server side.
-
-The engine uses a width table generated from `@xterm/addon-unicode11` 0.9.0's own tables, by a script in `scripts/`. A test fails when the checked-in table differs from a fresh generation. Width alone is not enough (R1#7). The engine also reproduces:
-
-- the provider's contextual joining: whether a mark joins depends on the preceding parser state, so `A ESC[31m U+0301 B` differs from `A U+0301 B`;
-- xterm's right-margin behaviour, including auto-wrap off: with 4 columns, `ABC ESC[?7l 界` leaves `ABC`;
-- wide-cell tails and control boundaries.
-
-VS16 and ZWJ stay explicitly non-grapheme-based, and ambiguous-width characters follow the provider's default-width policy. The harness corpus (section 4) is the gate.
+The client's Unicode 11 widths ship with the other issues' plan (its R5). The server's engine takes its widths from `screen/width_table.rs`, generated from `@xterm/addon-unicode11` 0.9.0's tables by a script in `scripts/`; a test fails when the checked-in table differs from a fresh generation. Because the engine ports xterm's input handler, it reproduces the provider's contextual joining, the right-margin behaviour with auto-wrap on and off, wide-cell tails and control boundaries as xterm does. VS16 and ZWJ stay non-grapheme-based, and ambiguous-width characters follow the provider's default. The proof's corpus (section 4) is the gate.
 
 The attach request value names the width mode (`"checkpoint-unicode11"`, D6). A client asks for it only while Unicode 11 is active in its terminals, so a future width change is a new value, not a silent mismatch.
-
-Alternative: unicode-graphemes on both sides. It lost because the server would have to reproduce grapheme clustering, and the client plan chose unicode11.
 
 ### D3. What the screen is fed, and when it falls back (F8, F9)
 
@@ -113,15 +150,28 @@ The screen is fed exactly the published bytes: the redacted output that `publish
 
 **Upstream loss needs no invalidation.** When the publisher falls behind the PTY broadcast (`Lagged`), `publish_output_gap` calls `redact_private_output_gap`. That publishes only what the redactor's `note_gap` returns (`[redacted]` when a prefix was withheld, otherwise nothing) through `record_private_output`; the lost bytes reach no attached window. A screen fed the same published bytes therefore equals a window that stayed attached, which is the goal. Invalidating it would make a re-attach worse than an attached window. Revision 1's `UpstreamLag` reason and its RIS rule are dropped: RIS does not reset xterm's stored title (R1#8), so it is no recovery boundary.
 
-A checkpoint answer falls back to raw history (`historyFormat: "raw"`, plus the existing SIGCONT recovery where D11 allows) for three reasons only. All three follow one rule (R2#9, R2#10): **a fallback reason stays set until the unrepresentable state is provably gone from every retained cell, the current pen and every saved pen, or until a restart.** Free capacity alone does not clear a reason, and neither does `terminal.clear`, because clear keeps side state such as the title.
+A checkpoint answer falls back to raw history (`historyFormat: "raw"`, plus the existing SIGCONT recovery where D11 allows) for the reasons the proof measured; on its 19,803 cuts, 20.6% of answers were fallbacks. Nothing is truncated. A reason is either **sticky**, staying set from the moment the screen sees it, or **computed per checkpoint** from the state at that moment. That keeps R2#9 and R2#10's rule: a fallback lasts exactly as long as the unrepresentable state can still matter.
 
-| Reason             | Set when                                                                                                                                                                                                                                                                                                | Gone when                                                                                                                                                                                 |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UnsupportedState` | The screen saw a setter for a state the checkpoint cannot carry. Which states exist is decided by the harness: a setter xterm 6.0.0 implements that no passing fixture covers. A sequence xterm ignores sets nothing. A title or other side value too large to carry counts here; nothing is truncated. | Its holder is gone. For a cell attribute: no retained cell, current pen or saved pen carries it (a per-state count kept by the screen). For a side value: a supported setter replaced it. |
-| `TailOverflow`     | The unfinished escape or control string exceeds 64 KiB (D5).                                                                                                                                                                                                                                            | The parser is back in its ground state.                                                                                                                                                   |
-| `OverBudget`       | One checkpoint answer exceeds `CHECKPOINT_MAX_BYTES` (D6), or a structure the screen bounds is full and something could not be retained, such as a link target.                                                                                                                                         | Every cell, pen and saved pen that lost something is gone, counted as for `UnsupportedState`. A single oversized answer clears with the next answer that fits.                            |
+| Reason                                                                                                                        | Kind           | Cleared when                                        |
+| ----------------------------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------- |
+| `NationalCharset`: a national replacement character set was designated                                                        | sticky         | a RIS in the stream, `terminal.clear`, or a restart |
+| `CombinedTableFull`: the combined-character table filled                                                                      | sticky         | the same                                            |
+| `TabStopBeyondColumns`: a tab stop beyond the current columns was set                                                         | sticky         | the same                                            |
+| `XtermWouldThrow`: an input that makes xterm itself throw (the proof found ED 1 at a specific position)                       | sticky         | the same                                            |
+| `TailOverflow`: the unfinished escape or control string exceeded 64 KiB (D5)                                                  | sticky         | the parser is idle again                            |
+| `InconsistentPenAfterRestore`: pens that disagree after DECRC                                                                 | per checkpoint | the state is gone at the next checkpoint            |
+| `UnreachableGlCharset`: a GL charset the checkpoint cannot reach                                                              | per checkpoint | the same                                            |
+| `AltScreenPendingWrap`: pending wrap on the alternate screen or in its saved cursor                                           | per checkpoint | the same                                            |
+| `WrappedFirstLine`: the first retained line is a continuation                                                                 | per checkpoint | the same                                            |
+| `HyperlinkRegistry`: a retained cell, pen or saved pen refers to a link state the checkpoint cannot carry (the largest class) | per checkpoint | no retained cell, pen or saved pen refers to it     |
+| `OverBudget`: the answer exceeds `CHECKPOINT_MAX_BYTES` (D6)                                                                  | per checkpoint | an answer fits                                      |
+| `SelfCheckMismatch`: the replayed checkpoint differs from the engine (D9)                                                     | per checkpoint | the next self-check passes                          |
 
-`terminal.clear` resets the screen like RIS does in an attached xterm. It keeps the side-tracked title, which RIS keeps (R1#8); the harness case `clear-matches-ris` decides every other side value.
+"Sticky until RIS" is the proof's measured rule for these states: xterm's own RIS removes each of them. RIS still is not a recovery boundary for the title (R1#8), which the checkpoint carries rather than falls back on.
+
+Resize is a sticky fallback in the proof only because reflow is not ported yet. It **must not ship as a fallback**: the reflow port (section 5, phase 2) removes it, and no phase that puts checkpoints on the wire starts before it does.
+
+`terminal.clear` resets the screen like RIS does in an attached xterm and keeps what RIS keeps (the title, R1#8); the harness case `clear-matches-ris` proves it.
 
 ### D4. Where the screen is fed and resized (F7, F11, F12, F14, F15)
 
@@ -135,24 +185,28 @@ Why not batched parsing (F12)? It needs a second journal, a parser-progress fenc
 
 ### D5. Checkpoint contents (F1, F2, F3)
 
-The checkpoint assumes the client has just written RIS and resized xterm to the snapshot's `size`. **The restoration order is whatever passes the differential harness** (section 4). It is not written here in prose: two rounds on paper each produced new failing sequences (R1#4 to R1#7). The harness must cover at least:
+The checkpoint assumes the client has just written RIS and resized xterm to the snapshot's `size`. **The restoration order is whatever the differential harness passes**; the proof's serializer passed 19,803 comparisons, and that serializer with its fixtures moves into the repository (section 4). The harness must keep covering at least:
 
-- both screens, the active buffer, and the normal screen restored after leaving the alternate one;
-- saved cursor and attributes for **both** buffers, whichever is active, including the saved character set. Fixtures: `ESC[?1047h ESC[3;4H ESC7 ESC[?1047l` then `ESC[?1047h ESC8 X` prints at row 3, column 4; `ESC(0 ESC7 ESC(B` then `ESC8q` prints `─` (R1#5);
-- scroll region and origin mode restored both **on and off**. Fixture: `ESC[2;4r ESC[?6h ESC[2;2H ESC7 ESC[?6l ESC[1;1H`, then a checkpoint, then `X` prints on row 1 (R1#4);
-- pending wrap, at the cursor and in saved state;
-- the preceding-character state that `REP` and combining marks use. Fixture: `A`, checkpoint, `ESC[3b` yields `AAAA`; plus combining marks at printable-character cuts (R1#6);
-- contextual joining and the right margin with auto-wrap on and off (R1#7, D2);
+- both screens, the active buffer, and the normal screen after leaving the alternate one;
+- saved cursor and attributes for both buffers, with the saved charset (R1#5 fixtures);
+- scroll region and origin mode, on and off (R1#4 fixture);
+- pending wrap, and the preceding-character state that `REP` and combining marks use (R1#6 fixture);
+- contextual joining and the right margin (R1#7);
 - tab stops, G0 to G3 and GL, IRM, DECAWM, LNM, DECCKM, cursor visibility and style;
-- SGR including underline style and colour, OSC 8 runs, and a link open at the cut;
-- title and palette (OSC 0, 2, 4, 10 to 12, 104, 110 to 112);
-- bracketed paste, mouse modes, SGR mouse, focus reporting, keypad mode, and synchronized output open at the cut;
-- soft-wrapped rows (printed to the margin without CR LF), scrollback, and reflow on a later resize;
-- DECSCA protection on cells and pens. Fixture: `ESC[1"qA ESC[0"q`, checkpoint, then `CR ESC[?2K`; `A` survives the selective erase (R2);
-- reverse wraparound `?45`. Fixture at four columns: `ABCDE ESC[?45h ESC[2;1H`, checkpoint, then `BS X` gives rows `ABCX` / `E` (R2);
-- the whole startup-query handoff (D7). Fixture `with_startup_queries`: `ESC[6nA`, checkpoint with the re-issued query, then `ESC[3b` yields `AAAA` (R2#4).
+- SGR with separate bold and faint, colour mode, underline style and colour, OSC 8 runs and an open link;
+- title and palette;
+- bracketed paste, mouse, focus, keypad, synchronized output open at the cut;
+- soft wraps, scrollback, ED 2 into history, and reflow on a later resize;
+- DECSCA protection on cells and pens, and reverse wraparound `?45` (R2 fixtures);
+- the whole startup-query handoff, fixture `with_startup_queries` (R2#4).
 
-Held-back tail (F2): the wrapper keeps the bytes of an escape or control string that has not finished (CSI, OSC, DCS, ESC with intermediates, an open ST) as raw text, and ends every checkpoint with them. It is capped at 64 KiB. Past the cap, the wrapper drops the held bytes and reports `TailOverflow` until the parser is back in ground state (D3). Nothing waits forever.
+**Cuts.** The proof cut streams on UTF-16 code units. The server publishes whole UTF-8 strings, so its checkpoints fall only on published string boundaries, a subset of the proven cuts. A cut inside a surrogate pair never occurs on the server.
+
+**State RIS does not reset (client side).** xterm keeps some option-backed state across RIS, for example the cursor-blink option that `?12h` sets. So the client resets those options to the panel's defaults before replaying a checkpoint. The exact list comes from the proof's next report; until then the client resets cursor blink, and the harness asserts that terminal B's options equal terminal A's.
+
+**Known limit: startup queries and preceding-character state.** When re-issued startup queries (D7) must be written while preceding-character state is live, they are placed before the reprint that restores it. A cursor-position reply then reports a different column than the uninterrupted program would have seen. Continuation itself is unaffected (`with_startup_queries` passes).
+
+Held-back tail (F2): the screen keeps the bytes of an escape or control string that has not finished as raw text, and ends every checkpoint with them. It is capped at 64 KiB; past the cap, `TailOverflow` holds until the parser is idle (D3). Nothing waits forever.
 
 ### D6. Wire contract, per-attachment format and the generation transition (F6, F11, F14, F16)
 
@@ -301,24 +355,37 @@ Live renderers are unaffected: they keep consuming every event, as today. Four r
 
 The test is written and run red before the runtime changes.
 
-### D9. Scrollback and memory (F10, F11): **pending the harness report**
+### D9. Memory, scrollback and the self-check (F10, F11)
 
-The engine's memory layout, scrollback limit and per-structure budgets come from the harness report (D1); this design states no numbers for them. What stays fixed:
+Measured by the proof (release build):
 
-- the scrollback depth matches today's line limit, and soft wraps are kept;
-- raw history is unchanged, so nothing MCP could read before is lost;
-- exited sessions keep their screen while they keep their history;
-- a structure that fills sets `OverBudget` under D3's rule, never silently truncates;
-- snapshot copies are bounded by D6's permits.
+| Case                                   | Checkpoint (with self-check) | Size                                        | Retained |
+| -------------------------------------- | ---------------------------- | ------------------------------------------- | -------- |
+| TUI at 120 × 40                        | 0.4 ms                       | 7 KB                                        | —        |
+| 120 × 40 with 5,000 scrollback lines   | 14 ms (28 ms)                | 260 KB                                      | 9.4 MiB  |
+| 1000 × 500 with 5,000 scrollback lines | 170 ms (440 ms)              | 5.5 MB, over the 4 MiB cap, so answered raw | 84 MiB   |
+
+Feed runs at 119 to 120 MiB/s on a TUI stream and on a 5,000-line shell stream. A link-heavy transcript feeds at 0.8 MiB/s until the marker index exists.
+
+Caps (**agent's call**):
+
+- **Retained cells per session: 1.6 million**, across both screens and scrollback. Scrollback is `min(5_000, (1_600_000 − 2 × cols × rows) / cols)` lines, never below 0. At 120 × 40 that is the full 5,000 lines (about 9.4 MiB, as measured). At 1000 × 500 it is 600 lines, about 1.6 / 5.5 of the measured 84 MiB, so roughly 25 MiB, and the answer is still raw whenever it exceeds 4 MiB. Fewer scrollback lines than the client's 5,000 at extreme widths is the accepted cost; raw history is unchanged.
+- **Hyperlink registry per session: 4,096 targets and 1 MiB of URI bytes.** A target beyond the cap is not retained; the cells that needed it raise `HyperlinkRegistry` until no retained cell or pen refers to it (D3).
+- The combined-character table keeps the proof's fixed size; when it fills, `CombinedTableFull` holds until RIS (D3).
+- Snapshot copies are bounded by D6's permits. Exited sessions keep their screen while they keep their history, and count against the same caps.
+
+**Self-check: on every checkpoint, off the locks** (**agent's call**). The serializer runs under the session lock (14 ms in the 5,000-line case). The self-check needs only the serialized bytes and a copy of the engine's comparable state taken under the same lock, so it runs after the locks are released, on a blocking task, before the answer is sent. A mismatch turns the answer into raw with `SelfCheckMismatch`. It doubles checkpoint time (28 ms) but adds nothing to the publication-lock hold time. Attaches are rare and correctness comes first (AGENTS.md: reliability first). Sampling would let a wrong checkpoint reach a user exactly in the states the corpus did not cover. An answer already over `CHECKPOINT_MAX_BYTES` is raw before any self-check runs, so the 440 ms case never happens.
+
+**Gate before the wire.** The marker index must bring the link-heavy feed to at least 50 MiB/s, the spec's R11 floor, before shadow integration ships. Until then, link-heavy sessions would slow the publisher.
 
 **Measurement (recorded, not pass or fail).** A release-mode run records, at 120 × 40 with 5,000 scrollback lines and at 1000 × 500:
 
 - publication-lock hold time per feed and per checkpoint (p50, p99, max);
 - input latency from `terminal.write` to PTY write;
-- upstream lag: `Lagged` count and gap events;
+- upstream lag (`Lagged` count and gap events);
 - retained memory per live and per exited session.
 
-The run uses an output burst of at least 64 MiB with eight sessions, four of them exited, and concurrent attaches every 250 ms. Increased upstream lag is a risk until measured. The spec's R11 targets are compared against the recorded numbers in the plan review.
+The run uses an output burst of at least 64 MiB with eight sessions, four of them exited, and concurrent attaches every 250 ms.
 
 ### D10. Raw history stays (F16)
 
@@ -332,12 +399,12 @@ The run uses an output burst of at least 64 MiB with eight sessions, four of the
 
 All payloads are content-free: no bytes, titles, URIs or paths.
 
-| Name                          | Kind                                              | Payload                                                                                                                                                                                                                              | When                                                    |
-| ----------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| `terminal.checkpoint`         | event                                             | path (`attach`, `resync`, `adopt`, `read`), requested and answered format, fallback reason (`unsupported-state`, `tail-overflow`, `over-budget`), bytes, scrollback lines, cells, serialize µs, startup queries recorded and dropped | every checkpoint answer                                 |
-| `terminal.screen-fallback`    | event                                             | reason, set or cleared                                                                                                                                                                                                               | each change                                             |
-| `terminal.hydration-fallback` | client event (client collector batch, a new kind) | reason (`pending-overflow`), attempts                                                                                                                                                                                                | a renderer falls back to raw after three refetches (D8) |
-| `terminal.screen-slow`        | finding                                           | operation (`feed`, `checkpoint`), µs, cols × rows bucket                                                                                                                                                                             | over the measured budget                                |
+| Name                          | Kind                                              | Payload                                                                                                                                                                                                                                | When                                                    |
+| ----------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `terminal.checkpoint`         | event                                             | path (`attach`, `resync`, `adopt`, `read`), requested and answered format, fallback reason (a `ScreenFallback` name, D3), self-check µs and result, bytes, scrollback lines, cells, serialize µs, startup queries recorded and dropped | every checkpoint answer                                 |
+| `terminal.screen-fallback`    | event                                             | reason, set or cleared                                                                                                                                                                                                                 | each change                                             |
+| `terminal.hydration-fallback` | client event (client collector batch, a new kind) | reason (`pending-overflow`), attempts                                                                                                                                                                                                  | a renderer falls back to raw after three refetches (D8) |
+| `terminal.screen-slow`        | finding                                           | operation (`feed`, `checkpoint`), µs, cols × rows bucket                                                                                                                                                                               | over the measured budget                                |
 
 All are emitted through `profiler::emit` and `profiler::record_finding`, behind `profiler::is_enabled()`. `terminal.readCheckpoint` is timed by the RPC wrapper. Documented in `docs/skills/bibcode-profiler/references/events.md` and `findings.md`, and in `docs/architecture/overview.md`.
 
@@ -360,12 +427,12 @@ Kept = carried in the checkpoint, once a harness fixture for it passes. Fallback
 | Soft wraps, scrollback, reflow                                                   | Kept                                            | `softwrap-scrollback`, `softwrap-resize-reflow`                           |
 | DECSCA protection on cells and pens; reverse wraparound `?45`                    | Kept, or fallback for the state's lifetime (D3) | `decsca-selective-erase`, `reverse-wrap-45`                               |
 | Startup-query handoff                                                            | Kept                                            | `with_startup_queries` (R2#4)                                             |
-| A setter xterm implements that no fixture covers                                 | Fallback (`UnsupportedState`)                   | Rust `unsupported_setter_falls_back`                                      |
+| The states in D3's fallback table                                                | Fallback, sticky or per checkpoint (D3)         | Rust `fallback_reasons_match_the_proof`                                   |
 | Images, kitty keyboard flags                                                     | Out of scope                                    | none                                                                      |
 
 ## 4. Test strategy
 
-**Fixtures (F13).** A Rust test module in `screen.rs` runs streams through the real `TerminalScreen`: the reviewer's sequences above, named cases, and a seeded generator. At chosen cuts (every byte for split cases, 64 seeded offsets otherwise) it writes each checkpoint with its stream into `apps/web/src/components/__fixtures__/terminal-checkpoints/*.json`. `BIBCODE_UPDATE_SCREEN_FIXTURES=1` rewrites them; otherwise a stale fixture fails.
+**Fixtures (F13).** The proof's fixtures and its differential test move into the repository as follows. A Rust test module in `screen/checkpoint.rs` runs streams through the real `TerminalScreen`: the reviewer's sequences above, named cases, and a seeded generator. At chosen cuts (every byte for split cases, 64 seeded offsets otherwise) it writes each checkpoint with its stream into `apps/web/src/components/__fixtures__/terminal-checkpoints/*.json`. `BIBCODE_UPDATE_SCREEN_FIXTURES=1` rewrites them; otherwise a stale fixture fails.
 
 **Differential harness.** `apps/web/src/components/terminalCheckpoint.xterm.test.ts` uses `@xterm/headless` 6.0.0 with `@xterm/addon-unicode11` 0.9.0. Terminal A takes the whole stream. Terminal B takes RIS, then the checkpoint, then the rest. The harness compares:
 
@@ -380,7 +447,7 @@ Each stream ends with a probe tail (DECRC on each buffer, TAB, IND at the margin
 
 | Layer                                                                                                                                       | Where                                               | Command                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust: screen, widths, fixtures                                                                                                              | `apps/server/src/terminal/screen.rs`                | `cargo test -p bibcode-server --lib -- terminal::screen`                                                                                |
+| Rust: engine, widths, serializer, self-check, fixtures                                                                                      | `apps/server/src/terminal/screen/`                  | `cargo test -p bibcode-server --lib -- terminal::screen`                                                                                |
 | Rust: feed and resize order, fallback rule, clear, restart, exit, `adopt_current_state` on both routes and grant, snapshot permits, SIGCONT | `manager.rs`, `server_terminal.rs` tests            | `cargo test -p bibcode-server --lib -- terminal::manager production::server_terminal`                                                   |
 | Contracts                                                                                                                                   | `packages/contracts`                                | from `packages/contracts`: `node ../../scripts/run-local-vp.mjs test run`                                                               |
 | Client runtime: the D8 failing-first scripted test with its named cases                                                                     | `terminalTranscriptRuntime.test.ts`                 | from `packages/client-runtime`: `node ../../scripts/run-local-vp.mjs test run src/state/terminalTranscriptRuntime.test.ts`              |
@@ -389,33 +456,37 @@ Each stream ends with a probe tail (DECRC on each buffer, TAB, IND at the margin
 
 ## 5. Phases
 
-| Phase                  | Goal                                                                                                            | Proof                                                 |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| 0. Harness             | The engine behind `screen.rs`, fixture generator, differential test with the reviewers' sequences failing first | Harness green; the harness report settles D1 and D9   |
-| 1. Shadow integration  | Feed and resize under the locks, fallback, profiler; nothing on the wire                                        | Rust manager tests; the D9 measurement recorded       |
-| 2. Wire and server     | Capability, fields, `adopt_current_state`, snapshot permits, `readCheckpoint`, grant, SIGCONT                   | Rust and contract tests; an old client still gets raw |
-| 3. Client              | Request field, guarded query range, per-renderer checkpoint fetch (D8)                                          | Runtime and web tests; React and `UI.md` reviews      |
-| 4. End to end and docs | Packaged spec on macOS, the Linux lab and the Windows VM; overview, runbooks, changelog                         | Spec green with the Profiler on                       |
+| Phase                                  | Goal                                                                                                                                           | Proof                                                                            |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1. Engine and serializer               | Port the engine, parser, serializer, self-check and width table into `screen/` with `NOTICE.md`; Rust fixture generator; web differential test | The harness passes all proven cuts with 0 differences                            |
+| 2. Reflow and marker index             | Port `Buffer.resize` and `BufferReflow`; resize stops being a fallback; marker index                                                           | Reflow fixtures at varied cuts and sizes pass; link-heavy feed at least 50 MiB/s |
+| 3. Shadow integration and measurements | Feed and resize under the locks, fallback reasons, caps, off-lock self-check, profiler; nothing on the wire                                    | Rust manager tests; the D9 measurement recorded in this folder                   |
+| 4. Wire and server selection           | Capability, fields, `adopt_current_state`, grant policy, snapshot permits and response guard, `readCheckpoint`, SIGCONT                        | Rust and contract tests; an old client still gets raw                            |
+| 5. Client                              | Request field, option reset before replay, guarded query range, per-renderer checkpoint fetch (D8)                                             | The D8 failing-first test; web tests; React and `UI.md` reviews                  |
+| 6. Packaged spec and labs              | Packaged spec on macOS, the Linux lab and the Windows VM (ConPTY); overview, runbooks, changelog                                               | Spec green with the Profiler on                                                  |
 
-The user-visible fix arrives with Phase 3, after the other issues' plan has shipped Unicode 11 widths. If the harness is still red after two fix rounds, the question goes to the user (README).
+Phases 1 and 2 touch only `apps/server/src/terminal/screen/` and the web harness, so they run in parallel with other work. The user-visible fix arrives with phase 5, after the other issues' plan has shipped Unicode 11 widths. No phase puts checkpoints on the wire before phase 2 removes resize as a fallback.
 
 ## 6. Risks, open questions and agent's calls
 
 Risks:
 
-1. The engine's size and maintenance cost, known only from the harness report (D1).
+1. The engine is about 4,600 ported lines, to be kept in step with xterm.js upgrades. A client xterm upgrade must rerun the harness (D1).
 2. Lock hold time and upstream lag under bursts (D9, measured before Phase 2).
 3. Width and joining mismatch on input outside the corpus.
 4. ConPTY output and the real Claude CLI stream: captured, sanitized fixtures (section 4).
 
 Open questions:
 
-1. The engine and its memory budget (D1, D9), pending the harness report.
-2. None on upstream loss: the second review confirmed that dropping its invalidation is sound (R2, Q1).
+1. Whether server artifacts ship third-party notices; today `apps/desktop/THIRD_PARTY_NOTICES.md` says it is not yet shipped (D1).
+2. The exact list of option-backed state the client resets before replay (D5), from the proof's next report.
+3. None on upstream loss: the second review confirmed that dropping its invalidation is sound (R2, Q1).
 
 Agent's calls:
 
-- AC1: the engine is chosen by the harness report (D1).
+- AC1: a Rust engine ported from xterm.js 6.0.0, with avt dropped (D1).
+- AC13: the self-check runs on every checkpoint, off the locks (D9).
+- AC14: caps of 1.6 million retained cells, and 4,096 link targets and 1 MiB of URI bytes, per session (D9).
 - AC2: the request value `"checkpoint-unicode11"` names the width mode (D2, D6).
 - AC3: three fallback reasons, each tracked and cleared per state (D3).
 - AC4: synchronous feed under the locks, subject to the D9 measurement (D4).
