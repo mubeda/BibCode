@@ -903,8 +903,8 @@ restart instead of reapplying a stale durable mode. Widening first ensures the
 program-scoped `BiBCode Remote Access` Windows Firewall rule (it names the
 program, not the port, so it can be checked before the server widens), then
 restarts with an ephemeral launch override, verifies a
-network-accessible advertised endpoint, and persists network-accessible only
-after those native side effects succeed. Any
+network-accessible advertised endpoint, and
+persists network-accessible only after those native side effects succeed. Any
 failure attempts every local safeguard even if an earlier recovery step fails:
 persist local-only, restart with a local-only override, close the firewall, and
 stop an unverified backend. Narrowing persists local-only first, restarts and
