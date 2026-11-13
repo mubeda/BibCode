@@ -937,6 +937,13 @@ pub fn reading_needs_guard(reading: &Value) -> bool {
 /// Whether a pending start needs a guard compaction before it is claimed. Only once per
 /// delivery, never right after a compaction no ordinary turn has followed (its reading predates
 /// that compaction), and only from a reading of the conversation the delivery will continue.
+/// Whether the thread's last completed compaction has no other turn that started after it.
+/// The `>` compares stored timestamp text, so both sides must share one width.
+const LAST_COMPACTION_WITHOUT_LATER_TURN_SQL: &str = "SELECT EXISTS(
+           SELECT 1 FROM (SELECT turn_id, updated_at FROM thread_compactions WHERE thread_id = ?1 AND state = 'completed' ORDER BY updated_at DESC LIMIT 1) AS last
+           WHERE NOT EXISTS(SELECT 1 FROM projection_turns AS turn WHERE turn.thread_id = ?1 AND turn.turn_id IS NOT NULL
+             AND turn.turn_id IS NOT last.turn_id AND COALESCE(turn.started_at, turn.requested_at) > last.updated_at))";
+
 fn guard_needed_on(
     connection: &Connection,
     thread_id: &str,
@@ -960,14 +967,10 @@ fn guard_needed_on(
     let Some(conversation_id) = target.conversation_id else {
         return Ok(false);
     };
-    let compacted_without_turn: bool = connection.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM (SELECT turn_id, updated_at FROM thread_compactions WHERE thread_id = ?1 AND state = 'completed' ORDER BY updated_at DESC LIMIT 1) AS last
-           WHERE NOT EXISTS(SELECT 1 FROM projection_turns AS turn WHERE turn.thread_id = ?1 AND turn.turn_id IS NOT NULL
-             AND turn.turn_id IS NOT last.turn_id AND COALESCE(turn.started_at, turn.requested_at) > last.updated_at))",
-        [thread_id],
-        |row| row.get(0),
-    )?;
+    let compacted_without_turn: bool =
+        connection.query_row(LAST_COMPACTION_WITHOUT_LATER_TURN_SQL, [thread_id], |row| {
+            row.get(0)
+        })?;
     if compacted_without_turn {
         return Ok(false);
     }
@@ -1131,5 +1134,56 @@ impl super::OrchestrationEngine {
                 )
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tie_tests {
+    use super::*;
+
+    /// #362: a turn that starts 500 microseconds after a compaction completed, in the same
+    /// millisecond, is a later turn, so the guard is still considered.
+    #[test]
+    fn a_turn_in_the_same_millisecond_after_a_compaction_counts_as_later() {
+        let at = |micros: i128| {
+            crate::persistence::format_timestamp(
+                time::OffsetDateTime::from_unix_timestamp_nanos(
+                    1_767_225_600_120_000_000 + micros * 1_000,
+                )
+                .expect("instant"),
+            )
+        };
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        crate::persistence::run_migrations(&mut connection, None).expect("migrations apply");
+        connection
+            .execute(
+                "INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, \
+                 provider_instance_id, provider_kind, turn_id, created_at, updated_at) \
+                 VALUES ('compaction-a', 'thread-a', 'auto', 'completed', 'instance-a', \
+                 'codex', 'turn-compacted', ?1, ?2)",
+                params![at(0), at(100)],
+            )
+            .expect("compaction row");
+        connection
+            .execute(
+                "INSERT INTO projection_turns (thread_id, turn_id, state, requested_at, \
+                 started_at, checkpoint_files_json) \
+                 VALUES ('thread-a', 'turn-next', 'running', ?1, ?2, '[]')",
+                params![at(50), at(600)],
+            )
+            .expect("turn row");
+        let compacted_without_turn: bool = connection
+            .query_row(
+                LAST_COMPACTION_WITHOUT_LATER_TURN_SQL,
+                ["thread-a"],
+                |row| row.get(0),
+            )
+            .expect("query runs");
+        assert!(
+            !compacted_without_turn,
+            "the turn started at {} after the compaction at {}",
+            at(600),
+            at(100)
+        );
     }
 }

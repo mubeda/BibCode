@@ -6762,8 +6762,11 @@ mod tests {
         }
         assert!(decode_persisted_scopes(serde_json::json!(42)).is_err());
         assert!(parse_timestamp_ms("not-a-timestamp").is_err());
-        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00.000Z");
-        assert_eq!(format_iso(1_767_225_600_120), "2026-01-01T00:00:00.120Z");
+        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(
+            format_iso(1_767_225_600_120),
+            "2026-01-01T00:00:00.120000000Z"
+        );
         assert_eq!(
             parse_timestamp_ms(&format_iso(1_767_225_600_120)).ok(),
             Some(1_767_225_600_120)

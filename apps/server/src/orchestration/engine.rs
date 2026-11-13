@@ -15496,3 +15496,41 @@ mod tests {
         engine.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod timestamp_tie_tests {
+    use super::*;
+
+    /// #362: two assistant messages 500 microseconds apart in one millisecond, the later with
+    /// the lower id: the later one is still the turn's latest.
+    #[test]
+    fn the_later_assistant_message_in_one_millisecond_is_the_latest() {
+        let at = |micros: i128| {
+            crate::persistence::format_timestamp(
+                time::OffsetDateTime::from_unix_timestamp_nanos(
+                    1_767_225_600_120_000_000 + micros * 1_000,
+                )
+                .expect("instant"),
+            )
+        };
+        let mut connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+        crate::persistence::run_migrations(&mut connection, None).expect("migrations apply");
+        for (message_id, micros) in [("message-b-earlier", 100), ("message-a-later", 600)] {
+            connection
+                .execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, \
+                     role, text, is_streaming, created_at, updated_at) \
+                     VALUES (?1, 'thread-a', 'turn-a', 'assistant', '', 0, ?2, ?2)",
+                    rusqlite::params![message_id, at(micros)],
+                )
+                .expect("message row");
+        }
+        let transaction = connection.transaction().expect("transaction");
+        assert_eq!(
+            latest_assistant_message_id_tx(&transaction, "thread-a", "turn-a")
+                .expect("query runs")
+                .as_deref(),
+            Some("message-a-later")
+        );
+    }
+}
