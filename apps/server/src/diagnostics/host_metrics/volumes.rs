@@ -90,10 +90,12 @@ fn is_system_memory_mount(descriptor: &VolumeDescriptor) -> bool {
         .any(|root| descriptor.mount_point.starts_with(root))
 }
 
-/// The running AppImage's own image: a read-only FUSE mount holding this executable that is the
-/// AppImage's by identity, from the listing alone. The runtime names the file system
-/// `fuse.<image file name>` and mounts it at `.mount_*`; either marks it, so an ordinary FUSE
-/// volume holding the executable stays shown. `APPIMAGE` can be inherited from another image, but
+/// An AppImage's image, from the listing alone. The runtime mounts every image read-only over
+/// FUSE at `.mount_*`, so such a mount is hidden whether this process or another instance (or a
+/// killed one that left it) runs from it. Cost: a user's own read-only FUSE volume mounted under a
+/// `.mount_` directory is hidden too. The runtime also names the file system
+/// `fuse.<image file name>`; that marker alone hides a mount only when it holds this executable,
+/// so an ordinary FUSE volume stays shown. `APPIMAGE` can be inherited from another image, but
 /// then it names a file system this mount does not have. `APPDIR` is not used for the same reason.
 /// Never `/`, which holds every executable: a read-only FUSE root is still the root volume.
 fn is_running_image(
@@ -109,12 +111,12 @@ fn is_running_image(
         .mount_point
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with(".mount_"));
+    let holds_executable = running_executable
+        .is_some_and(|executable| executable.starts_with(&descriptor.mount_point));
     descriptor.mount_point != Path::new("/")
         && (file_system == "fuse" || file_system.starts_with("fuse."))
         && descriptor.read_only
-        && (named_after_image || runtime_mount)
-        && running_executable
-            .is_some_and(|executable| executable.starts_with(&descriptor.mount_point))
+        && (runtime_mount || (named_after_image && holds_executable))
 }
 
 /// The AppImage file the runtime started this process from (`APPIMAGE`).
@@ -594,9 +596,9 @@ mod tests {
         );
     }
 
-    /// #292: the AppImage's own mount (read-only FUSE, 0 B free) holds the running executable,
-    /// which decides it without reading the volume. Another app's FUSE mount, a writable FUSE
-    /// mount holding the executable, and the mounts above the image stay shown.
+    /// #292, #353: the AppImage's own mount (read-only FUSE, 0 B free) and another image's
+    /// `.mount_` mount are hidden without reading the volume. A writable FUSE mount holding the
+    /// executable and the mounts above the images stay shown.
     #[test]
     fn the_running_app_image_mount_is_hidden_before_it_is_read() {
         let read_only = |mount_point: &str, file_system: &str| {
@@ -618,8 +620,12 @@ mod tests {
             reason_of(&hidden, "/tmp/.mount_BiBCodX"),
             &HiddenReason::System
         );
-        assert_eq!(hidden.len(), 1, "{hidden:?}");
-        assert_eq!(kept.len(), 3);
+        assert_eq!(
+            reason_of(&hidden, "/tmp/.mount_OtherY"),
+            &HiddenReason::System
+        );
+        assert_eq!(hidden.len(), 2, "{hidden:?}");
+        assert_eq!(kept.len(), 2);
 
         let (_, hidden) = pre_filter(
             vec![descriptor("/home", "fuse.mergerfs")],
@@ -635,7 +641,67 @@ mod tests {
             None,
             None,
         );
-        assert!(hidden.is_empty(), "without the executable nothing matches");
+        assert_eq!(
+            hidden.len(),
+            1,
+            "a `.mount_` mount is hidden without a known executable"
+        );
+    }
+
+    /// #353: every read-only FUSE mount under `.mount_` is some AppImage's runtime mount, so it is
+    /// hidden whether or not this process runs from it. The file system name alone still needs
+    /// the executable under the mount.
+    #[test]
+    fn another_app_image_mount_is_hidden_whether_or_not_this_process_runs_from_it() {
+        let read_only = |mount_point: &str, file_system: &str| {
+            let mut volume = descriptor(mount_point, file_system);
+            volume.read_only = true;
+            volume
+        };
+        let elsewhere = Some(Path::new("/home/test-user/bin/bibcode"));
+
+        let (_, hidden) = pre_filter(
+            vec![read_only("/tmp/.mount_OtherY", "fuse.BiBCode-1.0.AppImage")],
+            elsewhere,
+            None,
+        );
+        assert_eq!(hidden.len(), 1, "(a) {hidden:?}");
+        assert_eq!(hidden[0].reason, HiddenReason::System, "(a)");
+
+        let (_, hidden) = pre_filter(vec![read_only("/tmp/.mount_OtherY", "fuse")], None, None);
+        assert_eq!(hidden.len(), 1, "(b) {hidden:?}");
+        assert_eq!(hidden[0].reason, HiddenReason::System, "(b)");
+
+        let (_, hidden) = pre_filter(
+            vec![read_only("/mnt/tools", "fuse.gocryptfs")],
+            elsewhere,
+            None,
+        );
+        assert!(hidden.is_empty(), "(c) {hidden:?}");
+
+        let (_, hidden) = pre_filter(
+            vec![descriptor("/tmp/.mount_OtherY", "fuse.Other.AppImage")],
+            elsewhere,
+            None,
+        );
+        assert!(hidden.is_empty(), "(d) a writable mount: {hidden:?}");
+
+        let (_, hidden) = pre_filter(
+            vec![read_only("/", "fuse.BiBCode-1.0.AppImage")],
+            Some(Path::new("/usr/bin/bibcode")),
+            None,
+        );
+        assert!(hidden.is_empty(), "(e) the root: {hidden:?}");
+
+        let (_, hidden) = pre_filter(
+            vec![read_only("/opt/image", "fuse.BiBCode-1.0.AppImage")],
+            elsewhere,
+            Some(Path::new("/home/test-user/Apps/BiBCode-1.0.AppImage")),
+        );
+        assert!(
+            hidden.is_empty(),
+            "(f) the name marker needs the executable: {hidden:?}"
+        );
     }
 
     /// #292 review: a read-only FUSE root holds the executable too, and is still the root volume.
