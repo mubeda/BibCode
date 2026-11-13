@@ -2563,7 +2563,14 @@ export function TerminalViewport({
   useEffect(() => {
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!shouldRender || terminal === null || fitAddon === null) return;
+    // A renderer created after this effect last ran is repainted once its epoch commits.
+    if (
+      !shouldRender ||
+      terminal === null ||
+      fitAddon === null ||
+      rendererEpoch !== rendererEpochRef.current
+    )
+      return;
 
     terminal.options.fontFamily = terminalFontFamily;
     const rendererGeneration = resizeRendererGenerationRef.current;
@@ -2579,6 +2586,8 @@ export function TerminalViewport({
         return;
       }
 
+      // xterm measured the cell before the font loaded, or not at all for an equal family.
+      remeasureTerminalCharSize(terminal);
       terminal.clearTextureAtlas();
       rendererRef.current?.size("layout");
       terminal.refresh(0, terminal.rows - 1);
@@ -2587,7 +2596,7 @@ export function TerminalViewport({
     return () => {
       cancelled = true;
     };
-  }, [shouldRender, terminalFontFamily]);
+  }, [shouldRender, terminalFontFamily, rendererEpoch]);
 
   useEffect(() => {
     const terminal = terminalRef.current;

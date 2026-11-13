@@ -1817,12 +1817,18 @@ describe("TerminalViewport mounted lifecycle", () => {
       terminal.clearTextureAtlas.mockClear();
       fitAddon.fit.mockClear();
       testState.fontLoad.mockClear();
+      terminal._core._charSizeService.measure.mockClear();
       fitAddon.fit.mockImplementation(() => {
         terminal.cols += 1;
       });
 
       await view.setTerminalFontPreference({ mode: "custom", family: "Maple Mono" });
 
+      // xterm measured at the assignment, before the font loaded; the load measures again.
+      expect(terminal._core._charSizeService.measure).toHaveBeenCalledOnce();
+      expect(terminal._core._charSizeService.measure.mock.invocationCallOrder[0]).toBeLessThan(
+        fitAddon.fit.mock.invocationCallOrder[0]!,
+      );
       expect(xtermState.terminals).toHaveLength(1);
       expect(terminal.dispose).not.toHaveBeenCalled();
       expect(view.detachRendererSpy).not.toHaveBeenCalled();
@@ -4795,6 +4801,99 @@ describe("TerminalViewport mounted lifecycle", () => {
       },
     });
   });
+
+  it(
+    "repaints a renderer created after host config once the bundled font loads",
+    { timeout: 30_000 },
+    async () => {
+      testState.serverConfig = null;
+      let resolveFont: () => void = () => undefined;
+      testState.fontLoad.mockImplementation(
+        () => new Promise<void>((resolve) => (resolveFont = resolve)),
+      );
+      const props = viewportProps({
+        terminalId: "term-codex-config-loading",
+        command: decodeTerminalLaunchCommand({ executable: "codex.exe", args: [] })!,
+      });
+      const mounted = await mount(<TerminalViewport {...props} />);
+      expect(xtermState.terminals).toHaveLength(0);
+      testState.resizeCommand.mockClear();
+
+      testState.serverConfig = {
+        availableEditors: ["vscode"],
+        environment: { platform: { os: "windows" } },
+      };
+      const timerCallStart = beginComponentTimerCapture();
+      await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+      captureComponentTimers(timerCallStart);
+      elapseMountSettle();
+      await flushAnimationFrames();
+      await flushComponentFitTimers();
+      const terminal = xtermState.terminals.at(-1)!;
+      const fitAddon = xtermState.fitAddons.at(-1)!;
+      const measure = terminal._core._charSizeService.measure;
+      measure.mockClear();
+      fitAddon.fit.mockClear();
+      fitAddon.proposeDimensions.mockClear();
+      terminal.clearTextureAtlas.mockClear();
+      terminal.refresh.mockClear();
+
+      await act(async () => {
+        resolveFont();
+        await Promise.resolve();
+      });
+
+      expect(measure).toHaveBeenCalledOnce();
+      expect(measure.mock.invocationCallOrder[0]).toBeLessThan(
+        firstCallOrder(fitAddon.proposeDimensions, fitAddon.fit),
+      );
+      expect(terminal.clearTextureAtlas).toHaveBeenCalledOnce();
+      expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+      expect(testState.resizeCommand).toHaveBeenCalledOnce();
+    },
+  );
+
+  it(
+    "ignores a host config font load that resolves after its renderer was disposed",
+    { timeout: 30_000 },
+    async () => {
+      testState.serverConfig = null;
+      let resolveFont: () => void = () => undefined;
+      testState.fontLoad.mockImplementation(
+        () => new Promise<void>((resolve) => (resolveFont = resolve)),
+      );
+      const props = viewportProps({
+        terminalId: "term-codex-config-loading",
+        command: decodeTerminalLaunchCommand({ executable: "codex.exe", args: [] })!,
+      });
+      const mounted = await mount(<TerminalViewport {...props} />);
+      testState.serverConfig = {
+        availableEditors: ["vscode"],
+        environment: { platform: { os: "windows" } },
+      };
+      const timerCallStart = beginComponentTimerCapture();
+      await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+      captureComponentTimers(timerCallStart);
+      const terminal = xtermState.terminals.at(-1)!;
+      expect(testState.fontLoad).toHaveBeenCalled();
+
+      await act(async () => mounted.root.render(<TerminalViewport {...props} visible={false} />));
+      expect(terminal.dispose).toHaveBeenCalled();
+      const measure = terminal._core._charSizeService.measure;
+      measure.mockClear();
+      terminal.clearTextureAtlas.mockClear();
+      terminal.refresh.mockClear();
+
+      await act(async () => {
+        resolveFont();
+        await Promise.resolve();
+      });
+
+      expect(measure).not.toHaveBeenCalled();
+      expect(terminal.clearTextureAtlas).not.toHaveBeenCalled();
+      expect(terminal.refresh).not.toHaveBeenCalled();
+    },
+  );
 
   it("uses the current theme when a hidden Windows Codex terminal first attaches", async () => {
     testState.resolvedTheme = "dark";
