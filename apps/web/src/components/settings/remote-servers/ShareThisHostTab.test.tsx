@@ -570,6 +570,25 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("bind failed");
   });
 
+  it("notes on Windows that a network marked Public may still block other devices", async () => {
+    const note = "On a network Windows marks Public, other devices may still be blocked.";
+    installBridge();
+    await renderTab();
+    expect(container.textContent).not.toContain(note);
+
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    Object.defineProperty(navigator, "platform", { configurable: true, value: "Win32" });
+    await renderTab();
+    expect(container.textContent).toContain(
+      "The firewall rule BiBCode adds covers networks Windows marks Private or Domain.",
+    );
+    expect(container.textContent).toContain(note);
+
+    await selectIntent("this-computer");
+    expect(container.textContent).not.toContain(note);
+  });
+
   it("asks for administrator permission only on Generate and Retry, and explains a refusal", async () => {
     const apply = vi.fn<
       (

@@ -34,7 +34,7 @@ import {
   reconcileShareExposureOnce,
   withShareExposureBridgeTimeout,
 } from "~/state/shareExposureReconciler";
-import { randomUUID } from "~/lib/utils";
+import { isWindowsPlatform, randomUUID } from "~/lib/utils";
 
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
@@ -408,6 +408,14 @@ export function ShareThisHostTab(): ReactElement {
           <p className="mx-4 mb-3 text-xs text-warning">
             Enabling remote access restarts the local server. Running turns on this machine will
             stop.
+          </p>
+        ) : null}
+        {intent === "another-device" &&
+        canManageNativeExposure &&
+        isWindowsPlatform(navigator.platform) ? (
+          <p className="mx-4 mb-3 text-xs text-muted-foreground">
+            The firewall rule BiBCode adds covers networks Windows marks Private or Domain. On a
+            network Windows marks Public, other devices may still be blocked.
           </p>
         ) : null}
         {sectionError ? (

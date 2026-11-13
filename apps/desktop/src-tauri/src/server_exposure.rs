@@ -47,6 +47,26 @@ pub(crate) async fn apply_exposure(
         .await
 }
 
+/// Widens after `before_lock`, a firewall step that may wait for a person at the Windows
+/// prompt. It runs before the exposure lock and before any restart, so other exposure
+/// changes are not held behind the prompt, and a refusal leaves nothing to recover.
+pub(crate) async fn apply_exposure_after(
+    coordinator: &ServerExposureCoordinator,
+    operations: &impl ExposureOperations,
+    desired: &str,
+    before_lock: impl Future<Output = Result<(), String>>,
+) -> Result<ExposureTransition, String> {
+    if desired == "network-accessible"
+        && operations.native_exposure_available()?
+        && let Err(error) = before_lock.await
+    {
+        return Err(format!(
+            "Could not apply server exposure {desired}: open remote-access firewall rule: {error}. No exposure change was made."
+        ));
+    }
+    apply_exposure(coordinator, operations, desired).await
+}
+
 pub(crate) async fn recover_local(
     operations: &impl ExposureOperations,
 ) -> Result<ExposureTransition, String> {
@@ -226,6 +246,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use super::*;
@@ -685,6 +706,78 @@ mod tests {
                 "restart:local-only",
                 "firewall:false",
                 "verify:local-only",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_before_the_lock_changes_nothing() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("local-only");
+
+        let error = apply_exposure_after(&coordinator, &operations, "network-accessible", async {
+            Err("firewall-elevation-required".to_owned())
+        })
+        .await
+        .expect_err("a refused prompt fails the widen");
+
+        assert_eq!(
+            error,
+            "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. No exposure change was made."
+        );
+        assert!(operations.calls().is_empty(), "{:?}", operations.calls());
+    }
+
+    #[tokio::test]
+    async fn the_prompt_step_runs_only_for_a_native_widen() {
+        let coordinator = ServerExposureCoordinator::default();
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        apply_exposure_after(&coordinator, &narrowing, "local-only", async {
+            panic!("narrowing must not prompt")
+        })
+        .await
+        .expect("narrowing succeeds");
+
+        let wsl_only = FakeExposureOperations::with_persisted_mode("local-only");
+        wsl_only.set_native_exposure_available(false);
+        let error = apply_exposure_after(&coordinator, &wsl_only, "network-accessible", async {
+            panic!("WSL-only must not prompt")
+        })
+        .await
+        .expect_err("WSL-only rejects native exposure");
+        assert!(error.contains("WSL-only primary mode"));
+    }
+
+    #[tokio::test]
+    async fn other_exposure_changes_are_not_held_behind_an_open_prompt() {
+        let coordinator = ServerExposureCoordinator::default();
+        let widening = FakeExposureOperations::with_persisted_mode("local-only");
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+
+        let prompted = apply_exposure_after(&coordinator, &widening, "network-accessible", async {
+            answered.await.expect("the person answers");
+            Ok(())
+        });
+        let other = async {
+            apply_exposure(&coordinator, &narrowing, "local-only")
+                .await
+                .expect("a queued change runs while the prompt is open");
+            answer.send(()).expect("prompt still waiting");
+        };
+        let (prompted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(prompted, other)
+        })
+        .await
+        .expect("no change waits behind the prompt");
+
+        prompted.expect("the approved widen completes");
+        assert_eq!(
+            widening.calls(),
+            [
+                "restart:network-accessible",
+                "firewall:true",
+                "persist:network-accessible",
             ]
         );
     }

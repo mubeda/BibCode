@@ -35,7 +35,7 @@ use crate::security::{
     unprotect_string as unprotect_catalog_string,
 };
 use crate::server_exposure::{
-    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure, recover_local,
+    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure_after, recover_local,
 };
 #[cfg(not(test))]
 use crate::ssh::default_home_dir;
@@ -1349,8 +1349,6 @@ pub fn desktop_bridge_get_server_exposure_state(
 struct DesktopExposureOperations<'a> {
     app: &'a AppHandle<DesktopRuntime>,
     backend: &'a BackendSupervisor,
-    /// Only a widen the person started in Share this host may raise the Windows prompt.
-    allow_elevation_prompt: bool,
 }
 
 impl ExposureOperations for DesktopExposureOperations<'_> {
@@ -1387,10 +1385,8 @@ impl ExposureOperations for DesktopExposureOperations<'_> {
     }
 
     fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(crate::firewall::sync_remote_access_rule(
-            enabled,
-            enabled && self.allow_elevation_prompt,
-        ))
+        // Inside the exposure lock nothing waits for a person.
+        Box::pin(crate::firewall::sync_remote_access_rule(enabled, false))
     }
 
     fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
@@ -1451,9 +1447,17 @@ pub async fn desktop_bridge_apply_server_exposure(
     let operations = DesktopExposureOperations {
         app: &app,
         backend: backend.inner(),
-        allow_elevation_prompt: allow_elevation_prompt == Some(true),
     };
-    let transition = apply_exposure(coordinator.inner(), &operations, &desired).await?;
+    // Only a widen the person started in Share this host may raise the Windows prompt.
+    let prompt_first = async {
+        if allow_elevation_prompt == Some(true) {
+            crate::firewall::sync_remote_access_rule(true, true).await
+        } else {
+            Ok(())
+        }
+    };
+    let transition =
+        apply_exposure_after(coordinator.inner(), &operations, &desired, prompt_first).await?;
     let settings = read_desktop_settings(&app)?;
     Ok(server_exposure_state(
         &settings,
@@ -1553,7 +1557,6 @@ pub async fn desktop_bridge_set_wsl_only(
             let operations = DesktopExposureOperations {
                 app: &app,
                 backend: backend.inner(),
-                allow_elevation_prompt: false,
             };
             transition_wsl_only(&operations, enabled).await?;
             let settings = read_desktop_settings(&app)?;
