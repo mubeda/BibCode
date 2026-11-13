@@ -1,4 +1,4 @@
-import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import {
   AlertDialog,
@@ -14,6 +14,7 @@ import {
   attachLeaveQuestionHost,
   getLeaveQuestion,
   isUpdateInstalling,
+  recheckUpdateInstall,
   respondToDesktopCloseRequests,
   subscribeLeaveQuestion,
   type LeaveReason,
@@ -89,6 +90,11 @@ export function UnsavedChangesCloseDialog({
 
 /** Shown while an allowed update install runs, so no edit is made that the restart would lose. */
 function UpdateInstallingDialog() {
+  const [checking, setChecking] = useState(false);
+  const checkAgain = () => {
+    setChecking(true);
+    void recheckUpdateInstall().finally(() => setChecking(false));
+  };
   return (
     <AlertDialog open>
       <AlertDialogPopup>
@@ -99,9 +105,14 @@ function UpdateInstallingDialog() {
           </AlertDialogTitle>
           <AlertDialogDescription>
             Another device started this update. BiBCode restarts when it finishes, and you can work
-            again after that.
+            again after that. If it seems stuck, check again.
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <AlertDialogFooter>
+          <Button variant="outline" disabled={checking} onClick={checkAgain}>
+            {checking ? "Checking…" : "Check again"}
+          </Button>
+        </AlertDialogFooter>
       </AlertDialogPopup>
     </AlertDialog>
   );

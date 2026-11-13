@@ -181,6 +181,17 @@ function blockForUpdateInstall(): void {
   notifyQuestionListeners();
 }
 
+/** The installing dialog's button: set while a close-request subscription can ask the desktop. */
+let askInstallStateAgain: (() => Promise<void>) | null = null;
+
+/**
+ * Asks the desktop for its update state once more. Resolves after that attempt, answered or not;
+ * a failed attempt changes nothing and keeps asking.
+ */
+export function recheckUpdateInstall(): Promise<void> {
+  return askInstallStateAgain?.() ?? Promise.resolve();
+}
+
 /** The desktop install ended without a restart: saving and editing run again. */
 function endUpdateInstall(): void {
   releaseLeaveHolds();
@@ -356,8 +367,10 @@ export function respondToDesktopCloseRequests(
       finish(answer === "proceed" ? "allow" : "stay");
     });
   });
-  const stopUpdateState = onUpdateState?.(() => {
+  askInstallStateAgain = askAgain;
+  const stopUpdateState = onUpdateState?.((state) => {
     stopAsking();
+    settleInstallState(state);
   });
   if (getUpdateState) {
     // The reload of a window that allowed an install: hold saving before anything can run.
@@ -383,6 +396,7 @@ export function respondToDesktopCloseRequests(
     stopEnded?.();
     stopUpdateState?.();
     stopAsking();
+    if (askInstallStateAgain === askAgain) askInstallStateAgain = null;
     if (active === null) return;
     finish("stay");
     question?.answer("cancel");

@@ -712,6 +712,133 @@ describe("UnsavedChangesCloseHost", () => {
       });
       expect(dialogText()).toContain("Installing an update");
     });
+
+    async function allowInstall(bridge: ReturnType<typeof stateBridge>, requestId: number) {
+      await act(async () => bridge.send!({ requestId, reason: "update" }));
+      await advance(0);
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([requestId, "allow"]), {
+        timeout: 30_000,
+      });
+      expect(dialogText()).toContain("Installing an update");
+    }
+
+    it("a pushed update state with no remote install closes the installing dialog", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      await allowInstall(bridge, 5);
+      session.changeFromRichEditor("held edit");
+      await advance(700);
+      expect(persist).not.toHaveBeenCalled();
+
+      await act(async () => bridge.pushState!(notRunning));
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+      await advance(700);
+      expect(persist).toHaveBeenCalledWith("notes.md", "held edit", expect.anything());
+      expect(toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error", title: "The update did not install" }),
+      );
+    });
+
+    it("a pushed state that still names the requester keeps the installing dialog", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 6);
+      await act(async () => bridge.pushState!({ ...running, phase: "available" }));
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    it("an update state pushed after Discard on a quit keeps the Discard holds", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      loaded.openFile("notes.md", persist).changeFromRichEditor("discarded edit");
+      await act(async () => bridge.send!({ requestId: 7, reason: "quit" }));
+      await advance(0);
+      await click("Discard");
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([7, "allow"]), {
+        timeout: 30_000,
+      });
+      // A local update check or download pushes states with no remote requester.
+      await act(async () => bridge.pushState!(notRunning));
+      await advance(5_000);
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it("Check again asks the desktop for the state and closes the dialog when no install runs", async () => {
+      const answers: State[] = [notRunning, running, notRunning];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 8);
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(3);
+      expect(dialogText()).toBeUndefined();
+    });
+
+    it("Check again with an install still running keeps the dialog", async () => {
+      const answers: State[] = [notRunning, running];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 9);
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(button("Check again").disabled).toBe(false);
+    });
+
+    it("a block restored after a reload shows the Check again button", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      const answers: (() => Promise<State>)[] = [
+        () => Promise.reject(new Error("state unavailable")),
+        async () => notRunning,
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      await advance(0);
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+    });
+
+    it("a rejecting state query keeps the dialog, the block, the marker and the button, and the retry keeps asking", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const answers: (() => Promise<State>)[] = [async () => notRunning];
+      const bridge = stateBridge(
+        () => answers.shift()?.() ?? Promise.reject(new Error("state unavailable")),
+      );
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      await allowInstall(bridge, 10);
+      session.changeFromRichEditor("held edit");
+
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(button("Check again").disabled).toBe(false);
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+      await advance(2_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(3);
+      expect(dialogText()).toContain("Installing an update");
+      expect(persist).not.toHaveBeenCalled();
+    });
   });
 
   it("answers a desktop close request through the bridge", async () => {
