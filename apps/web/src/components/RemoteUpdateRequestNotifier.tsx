@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
+import { isUpdateInstalling, subscribeLeaveQuestion } from "./files/unsavedFileEdits";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 export function remoteUpdateRequestToast(
@@ -16,6 +17,9 @@ export function remoteUpdateRequestToast(
   };
 }
 
+/** Shown while the installing dialog holds the window: Settings would open beneath it. */
+export const MANAGE_DEVICES_AFTER_INSTALL = "Manage devices is available when the update finishes.";
+
 /** Host notice stays informational; remote installs are already authorized by the requesting client. */
 export function RemoteUpdateRequestNotifier({
   onManageDevices,
@@ -24,25 +28,57 @@ export function RemoteUpdateRequestNotifier({
 }) {
   const state = useDesktopUpdateState();
   const requestedBy = state?.requestedBy ?? null;
-  const announced = useRef(false);
+  const installing = useSyncExternalStore(
+    subscribeLeaveQuestion,
+    isUpdateInstalling,
+    isUpdateInstalling,
+  );
+  const manageDevices = useRef(onManageDevices);
+  useEffect(() => {
+    manageDevices.current = onManageDevices;
+  });
+  const notice = useRef<{ id: string; text: ReturnType<typeof remoteUpdateRequestToast> } | null>(
+    null,
+  );
   useEffect(() => {
     if (requestedBy === null) {
-      announced.current = false;
+      notice.current = null;
       return;
     }
-    if (announced.current) return;
-    announced.current = true;
-    toastManager.add(
-      stackedThreadToast({
-        type: "info",
-        ...remoteUpdateRequestToast(
-          requestedBy,
-          state?.downloadedVersion ?? state?.availableVersion ?? null,
-        ),
-        actionVariant: "outline",
-        actionProps: { children: "Manage devices", onClick: onManageDevices },
-      }),
+    if (notice.current !== null) return;
+    const text = remoteUpdateRequestToast(
+      requestedBy,
+      state?.downloadedVersion ?? state?.availableVersion ?? null,
     );
-  }, [onManageDevices, requestedBy, state?.downloadedVersion, state?.availableVersion]);
+    const id = toastManager.add(noticeToast(text, isUpdateInstalling(), manageDevices));
+    notice.current = { id, text };
+  }, [requestedBy, state?.downloadedVersion, state?.availableVersion]);
+  useEffect(() => {
+    const current = notice.current;
+    if (current === null) return;
+    toastManager.update(current.id, noticeToast(current.text, installing, manageDevices));
+  }, [installing]);
   return null;
+}
+
+function noticeToast(
+  text: ReturnType<typeof remoteUpdateRequestToast>,
+  installing: boolean,
+  manageDevices: { readonly current: () => void },
+) {
+  return stackedThreadToast({
+    type: "info",
+    title: text.title,
+    description: installing
+      ? `${text.description} ${MANAGE_DEVICES_AFTER_INSTALL}`
+      : text.description,
+    actionVariant: "outline",
+    actionProps: {
+      children: "Manage devices",
+      disabled: installing,
+      onClick: () => {
+        if (!isUpdateInstalling()) manageDevices.current();
+      },
+    },
+  });
 }
