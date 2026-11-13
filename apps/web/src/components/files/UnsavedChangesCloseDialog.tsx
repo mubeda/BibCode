@@ -16,9 +16,15 @@ import {
   isUpdateInstalling,
   recheckUpdateInstall,
   respondToDesktopCloseRequests,
+  type RecheckResult,
   subscribeLeaveQuestion,
   type LeaveReason,
 } from "./unsavedFileEdits";
+
+const RECHECK_MESSAGE: Record<NonNullable<RecheckResult>, string> = {
+  installing: "The update is still installing.",
+  unreachable: "Could not reach BiBCode to check. Try again.",
+};
 
 const TITLE: Record<LeaveReason, string> = {
   close: "Save your changes before leaving?",
@@ -91,9 +97,14 @@ export function UnsavedChangesCloseDialog({
 /** Shown while an allowed update install runs, so no edit is made that the restart would lose. */
 function UpdateInstallingDialog() {
   const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<RecheckResult>(null);
   const checkAgain = () => {
     setChecking(true);
-    void recheckUpdateInstall().finally(() => setChecking(false));
+    setResult(null);
+    void recheckUpdateInstall().then((next) => {
+      setResult(next);
+      setChecking(false);
+    });
   };
   return (
     <AlertDialog open>
@@ -108,6 +119,9 @@ function UpdateInstallingDialog() {
             again after that. If it seems stuck, check again.
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <p role="status" className="px-6 text-sm text-muted-foreground">
+          {result === null ? null : RECHECK_MESSAGE[result]}
+        </p>
         <AlertDialogFooter>
           <Button variant="outline" disabled={checking} onClick={checkAgain}>
             {checking ? "Checking…" : "Check again"}

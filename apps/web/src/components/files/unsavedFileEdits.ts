@@ -191,14 +191,17 @@ function blockForUpdateInstall(): void {
 }
 
 /** The installing dialog's button: set while a close-request subscription can ask the desktop. */
-let askInstallStateAgain: (() => Promise<void>) | null = null;
+let askInstallStateAgain: (() => Promise<RecheckResult>) | null = null;
+
+/** What a Check again found: the install still running, no answer, or nothing to report. */
+export type RecheckResult = "installing" | "unreachable" | null;
 
 /**
  * Asks the desktop for its update state once more. Resolves after that attempt, answered or not;
  * a failed attempt changes nothing and keeps asking.
  */
-export function recheckUpdateInstall(): Promise<void> {
-  return askInstallStateAgain?.() ?? Promise.resolve();
+export function recheckUpdateInstall(): Promise<RecheckResult> {
+  return askInstallStateAgain?.() ?? Promise.resolve(null);
 }
 
 /** The desktop install ended without a restart: saving and editing run again. */
@@ -323,25 +326,25 @@ export function respondToDesktopCloseRequests(
   if (!onCloseRequest || !replyCloseRequest) return () => {};
   let stopAsking = () => {};
   const askAgain = () =>
-    new Promise<void>((resolve) => {
+    new Promise<RecheckResult>((resolve) => {
       stopAsking();
       if (!getUpdateState) {
         settleInstallState(null);
-        resolve();
+        resolve(null);
         return;
       }
       const stop = askInstallState(
         bridge as Pick<DesktopBridge, "getUpdateState">,
         (state) => {
           settleInstallState(state);
-          resolve();
+          resolve(updateInstall === null ? null : "installing");
         },
-        resolve,
+        () => resolve("unreachable"),
       );
       // A push or an allow that stops this ask also settles a pending Check again.
       stopAsking = () => {
         stop();
-        resolve();
+        resolve(null);
       };
     });
   let active: {

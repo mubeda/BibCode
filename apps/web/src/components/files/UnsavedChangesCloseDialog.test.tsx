@@ -843,6 +843,47 @@ describe("UnsavedChangesCloseHost", () => {
       expect(button("Check again").disabled).toBe(false);
     });
 
+    const checkStatus = () =>
+      document.querySelector('[data-slot="alert-dialog-popup"] p[role="status"]')?.textContent ??
+      "";
+
+    it("Check again says when the install is still running, and a later answer clears it", async () => {
+      const answers: State[] = [notRunning, running, notRunning];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 13);
+      expect(checkStatus()).toBe("");
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("The update is still installing.");
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      // A later window block starts without the old message.
+      await act(async () => bridge.pushState!(running));
+      expect(checkStatus()).toBe("");
+    });
+
+    it("Check again says when the app could not be reached, and a later answer clears it", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const answers: (() => Promise<State>)[] = [
+        async () => notRunning,
+        () => Promise.reject(new Error("state unavailable")),
+        async () => running,
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 14);
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("Could not reach BiBCode to check. Try again.");
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("The update is still installing.");
+    });
+
     it("a block restored after a reload shows the Check again button", async () => {
       vi.spyOn(console, "warn").mockImplementation(() => {});
       window.sessionStorage.setItem(MARKER, "1");
