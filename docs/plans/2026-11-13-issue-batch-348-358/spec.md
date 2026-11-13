@@ -2,7 +2,7 @@
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30: reviewed by Codex twice and by the advisor, findings handled; the agent's calls D2, D4 to D13 are listed for the user's confirmation before the push)
 Size: full Mode: gated Type: bug class and chore (#348, #351 to #358) and feature (#350)
-Source: GitHub issues #348, #350 to #358 and (added by the user on 2026-11-13) #360 of this repository as they stood on 2026-11-13 (copies in `sources/`), the conversation of 2026-11-13 ("process all open issues, fix them all in this PR"), and a read of `main` at `a9938193b` by five read-only verifiers. Evidence record: [evidence.md](evidence.md). #350 has its own folder, [../2026-11-13-terminal-screen-350/](../2026-11-13-terminal-screen-350/terminal-screen-design.md), because its design did not pass its first review.
+Source: GitHub issues #348, #350 to #358 and (added by the user on 2026-11-13) #360 and #361 of this repository as they stood on 2026-11-13 (copies in `sources/`), the conversation of 2026-11-13 ("process all open issues, fix them all in this PR"), and a read of `main` at `a9938193b` by five read-only verifiers. Evidence record: [evidence.md](evidence.md). #350 has its own folder, [../2026-11-13-terminal-screen-350/](../2026-11-13-terminal-screen-350/terminal-screen-design.md), because its design did not pass its first review.
 
 The ten issues hold 45 separate items. Most were filed as "found by reading the code" or "not decided", so each item was checked against the code first. This spec gives every item one disposition:
 
@@ -63,6 +63,8 @@ Names used throughout:
 - D14. Test names, fixtures and docs use placeholders only (repository rule on sensitive data).
 - D15. During a remote update install, "Manage devices" is disabled with a one-line reason instead of being shown above the installing dialog (R39). An earlier DOM test had passed while the action only navigated under the dialog; the branch review caught it. Decided by: agent's call, to confirm with the user.
 - D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error screen catches) is part of #360 here as R51 ("follow-up, do it as part of 360", user, 2026-11-13).
+- D17. #361 is added to this pull request. Decided by: user, 2026-11-13.
+- D18. For the Windows firewall rule (R53): ask through Windows' own elevation prompt for that one command, and fall back to a message with Retry. Alternatives from the issue: a rule created by the installer (needs an installer design and does not help existing installs until they reinstall); a message only (leaves the person to find an administrator terminal). Decided by: agent's call, to confirm with the user; it is built only if Task 11.2 confirms the cause.
 
 ## Requirements
 
@@ -330,6 +332,31 @@ WHERE the Profiler is on, WHEN the app's error screen catches a render error, th
 - Given two identical errors, Then two events and one finding with a count of 2.
 - Given the Profiler is off, Then nothing is recorded or allocated, and the error screen behaves as before.
 - Reporting never throws from the error screen.
+
+**#361 Share this host: no addresses while local-only, and no code on Windows (added by the user on 2026-11-13)**
+
+Reported on BiBCode desktop v0.15.3 on Windows 11 with a LAN adapter and two overlay networks up: the Address list offers only "Automatic (LAN)", and "Generate pairing offer" fails with an error whose text was not captured. Two independent static diagnoses agree on two separate defects. The first is traced end to end in source: while local-only, the desktop marks every off-host address unavailable and the dialog drops unavailable addresses; it is documented and tested behavior that fails the person, on every platform. The second is unconfirmed: the leading candidate is that creating the Windows firewall rule needs administrator permission and nothing asks for it. Task 11.2 settles it before any fix.
+
+### R52. The dialog lists the addresses sharing can use
+
+WHILE native remote access is local-only, the Address list SHALL offer "Automatic (LAN)" and each usable private IPv4 address the desktop observed (local network, overlay network, Tailscale), each saying that choosing it enables remote access. A public address SHALL NOT be offered.
+
+- Given a local-only host with 192.168.0.10 on the default route, 10.20.0.5 and 100.64.0.7, Then the list holds "Automatic (LAN)" and those three addresses.
+- Given Tailscale Serve is off and exposure is local-only, Then Tailscale addresses are still observed.
+- Given a public-only host, Then the list and its text are as today.
+- Given a chosen local-only address, When a code is generated, Then exposure is widened first and the code is for that address.
+
+### R53. Widening works, or explains itself, on Windows without administrator rights
+
+WHEN a code is generated on Windows and the firewall rule cannot be created for lack of administrator permission, BiBCode SHALL ask for that permission through Windows' own prompt for that one change, and IF the person declines or it still fails, SHALL say that administrator permission is needed for the firewall rule, that nothing was changed, and offer Retry. It SHALL NOT show the raw command output or a generic message.
+
+- Given a desktop without administrator rights, When the person generates a code and approves the prompt, Then a code for the chosen address is shown.
+- Given the person declines, Then the server is verified local-only, with no rule added and no wide listener.
+- Given the default-route adapter's network profile is Public, Then the dialog warns that other devices may still be blocked.
+
+### R54. The safety guarantees stay
+
+Rollback to local-only on any failed switch, fail-closed firewall cleanup, no automatic choice of a public address and the WSL-only exclusion SHALL stay as they are. A string rejection from the desktop bridge SHALL keep a sanitized reason instead of "Could not enable remote access."
 
 ## Verification
 

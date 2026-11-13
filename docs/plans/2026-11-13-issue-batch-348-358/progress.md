@@ -1,65 +1,68 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 7bdf6460d5a6)
+Spec: spec.md (sha256 2fe538815249)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: inline
 Branch: claude/open-issues-pr-dc3c33
 
-| Task | Title                                                                                                   | Phase | State       | Owner    | Note                             |
-| ---- | ------------------------------------------------------------------------------------------------------- | ----- | ----------- | -------- | -------------------------------- |
-| 1.1  | Repaint after a late font load                                                                          | 1     | Closed      | lane 1   | integrated                       |
-| 1.2  | Repaint a renderer created after host configuration                                                     | 1     | Closed      | lane 1   | integrated                       |
-| 1.3  | Assert the repaint on a same-size return                                                                | 1     | Closed      | lane 1   | integrated                       |
-| 1.4  | Development record of size and repaint decisions                                                        | 1     | Closed      | lane 1   | integrated                       |
-| 1.5  | Say that the server kept the size when Fit sends nothing                                                | 1     | Closed      | lane 1   | integrated                       |
-| 1.6  | A dedicated hand-over capability                                                                        | 1     | Closed      | lane 1   | integrated                       |
-| 1.7  | Retry WebGL in a new terminal and say why it failed                                                     | 1     | Closed      | lane 1   | integrated                       |
-| 1.8  | Decide whether a re-attach sends a transient size (R16)                                                 | 1     | Closed      | lane 1   | integrated                       |
-| 1.9  | Decide whether the grid is taller than its mount before the first snapshot (R43)                        | 1     | Closed      | lane 1   | integrated                       |
-| 1.10 | Count columns by Unicode 11 in every terminal                                                           | 1     | Closed      | lane 1   | integrated                       |
-| 2.1  | Record the pull limit at takes_index_lock                                                               | 2     | Closed      | lane 2   | integrated                       |
-| 2.2  | Record the hook limit at the forced-stop cleanup                                                        | 2     | Closed      | lane 2   | integrated                       |
-| 2.3  | Anchor the sign-in detector to Git's fatal line                                                         | 2     | Closed      | lane 2   | integrated                       |
-| 2.4  | Wait for running lookups at quiesce                                                                     | 2     | Closed      | lane 2   | integrated                       |
-| 2.5  | Remember a failed lookup for 5 seconds                                                                  | 2     | Closed      | lane 2   | integrated                       |
-| 2.6  | Stop showing a remembered pull request after a failed lookup on stale data                              | 2     | Closed      | lane 2   | integrated                       |
-| 2.7  | Record the limit at spawn_for_subscribers                                                               | 2     | Closed      | lane 2   | integrated                       |
-| 2.8  | Decide by test whether a status-neutral local change leaves a stale answer                              | 2     | Closed      | lane 2   | integrated                       |
-| 3.1  | Make the drain test wait on the condition                                                               | 3     | In progress | lane 3   |                                  |
-| 3.2  | Delete creation records by id                                                                           | 3     | In progress | lane 3   |                                  |
-| 3.3  | Audit both creation-rollback arms                                                                       | 3     | In progress | lane 3   |                                  |
-| 3.4  | Reap a record only when its parent directory exists                                                     | 3     | In progress | lane 3   |                                  |
-| 3.5  | Record the limits in comments                                                                           | 3     | In progress | lane 3   |                                  |
-| 4.1  | Hold a source registered during the install                                                             | 4     | Closed      | lane 4   | integrated                       |
-| 4.2  | Restore the block when the window loads during an install                                               | 4     | Closed      | lane 4   | integrated                       |
-| 4.3  | Give the installing dialog a way out                                                                    | 4     | Closed      | lane 4   | integrated                       |
-| 4.4  | Decide whether the dialog hides the Manage devices toast                                                | 4     | Closed      | lane 4   | integrated                       |
-| 4.5  | Fail when a desktop event name exists on one side only                                                  | 4     | Closed      | lane 4   | integrated                       |
-| 5.1  | Diagnose which path scrolls to the end after a programmatic scroll and a toggle                         | 5     | Closed      | lane 5   | integrated; Windows proof 3 of 3 |
-| 5.2  | Fix the first wrong decision the Ruling names                                                           | 5     | Closed      | lane 5   | integrated; Windows proof 3 of 3 |
-| 5.3  | Measure the Host dashboard values view's renders on the clock tick, and stop them only if there are any | 5     | Closed      | lane 5   | integrated                       |
-| 6.1  | Occlusion leases that carry a rectangle                                                                 | 6     | Closed      | lane 6   | integrated                       |
-| 6.2  | Popups hold a rectangle lease only while open                                                           | 6     | Closed      | lane 6   | integrated                       |
-| 6.3  | The model picker reopens with an empty search                                                           | 6     | Closed      | lane 6   | integrated                       |
-| 6.4  | Read-only Markdown loads relative images from the workspace                                             | 6     | Closed      | lane 6   | integrated                       |
-| 7.1  | Hide any read-only FUSE mount under a `.mount_` directory                                               | 7     | Closed      | lane 7   | integrated; 7.2 lab proof in 8.1 |
-| 7.2  | Check for a dead webview before every test and keep the whole recovery inside one deadline              | 7     | Closed      | lane 7   | integrated; 7.2 lab proof in 8.1 |
-| 7.3  | Run the flaky hint test 50 times under CPU load and diagnose any failure                                | 7     | Closed      | lane 7   | integrated; 7.2 lab proof in 8.1 |
-| 7.4  | Log a rejected pairing offer and a rejected pairing credential at `warn` with a fixed class             | 7     | Closed      | lane 7   | integrated; 7.2 lab proof in 8.1 |
-| 8.1  | Linux lab run of the packaged list, with the webview-kill and route-change probes                       | 8     | Open        |          |                                  |
-| 8.2  | Mixed-version probe against the latest released server                                                  | 8     | Open        |          |                                  |
-| 8.3  | Windows VM runs                                                                                         | 8     | Open        |          |                                  |
-| 8.4  | Load runs on the Mac                                                                                    | 8     | Open        |          |                                  |
-| 9.1  | Profiler and validation references                                                                      | 9     | Open        |          |                                  |
-| 9.2  | Architecture docs, runbooks and changelog                                                               | 9     | Open        |          |                                  |
-| 9.3  | Final gates and reviews                                                                                 | 9     | Open        |          |                                  |
-| 9.4  | Reviews before the push, then the pull request                                                          | 9     | Open        |          |                                  |
-| 10.1 | Reproduce the nested-update crash with the real list library                                            | 10    | In progress | lane 10  |                                  |
-| 10.2 | The list library ignores a 0 by 0 measurement                                                           | 10    | Open        |          |                                  |
-| 10.3 | The closed branch picker does no list work                                                              | 10    | Open        |          |                                  |
-| 10.4 | The Profiler records an error the app's error screen caught                                             | 10    | In progress | lane 10b |                                  |
+| Task | Title                                                                                                   | Phase | State       | Owner       | Note                             |
+| ---- | ------------------------------------------------------------------------------------------------------- | ----- | ----------- | ----------- | -------------------------------- |
+| 1.1  | Repaint after a late font load                                                                          | 1     | Closed      | lane 1      | integrated                       |
+| 1.2  | Repaint a renderer created after host configuration                                                     | 1     | Closed      | lane 1      | integrated                       |
+| 1.3  | Assert the repaint on a same-size return                                                                | 1     | Closed      | lane 1      | integrated                       |
+| 1.4  | Development record of size and repaint decisions                                                        | 1     | Closed      | lane 1      | integrated                       |
+| 1.5  | Say that the server kept the size when Fit sends nothing                                                | 1     | Closed      | lane 1      | integrated                       |
+| 1.6  | A dedicated hand-over capability                                                                        | 1     | Closed      | lane 1      | integrated                       |
+| 1.7  | Retry WebGL in a new terminal and say why it failed                                                     | 1     | Closed      | lane 1      | integrated                       |
+| 1.8  | Decide whether a re-attach sends a transient size (R16)                                                 | 1     | Closed      | lane 1      | integrated                       |
+| 1.9  | Decide whether the grid is taller than its mount before the first snapshot (R43)                        | 1     | Closed      | lane 1      | integrated                       |
+| 1.10 | Count columns by Unicode 11 in every terminal                                                           | 1     | Closed      | lane 1      | integrated                       |
+| 2.1  | Record the pull limit at takes_index_lock                                                               | 2     | Closed      | lane 2      | integrated                       |
+| 2.2  | Record the hook limit at the forced-stop cleanup                                                        | 2     | Closed      | lane 2      | integrated                       |
+| 2.3  | Anchor the sign-in detector to Git's fatal line                                                         | 2     | Closed      | lane 2      | integrated                       |
+| 2.4  | Wait for running lookups at quiesce                                                                     | 2     | Closed      | lane 2      | integrated                       |
+| 2.5  | Remember a failed lookup for 5 seconds                                                                  | 2     | Closed      | lane 2      | integrated                       |
+| 2.6  | Stop showing a remembered pull request after a failed lookup on stale data                              | 2     | Closed      | lane 2      | integrated                       |
+| 2.7  | Record the limit at spawn_for_subscribers                                                               | 2     | Closed      | lane 2      | integrated                       |
+| 2.8  | Decide by test whether a status-neutral local change leaves a stale answer                              | 2     | Closed      | lane 2      | integrated                       |
+| 3.1  | Make the drain test wait on the condition                                                               | 3     | In progress | lane 3      |                                  |
+| 3.2  | Delete creation records by id                                                                           | 3     | In progress | lane 3      |                                  |
+| 3.3  | Audit both creation-rollback arms                                                                       | 3     | In progress | lane 3      |                                  |
+| 3.4  | Reap a record only when its parent directory exists                                                     | 3     | In progress | lane 3      |                                  |
+| 3.5  | Record the limits in comments                                                                           | 3     | In progress | lane 3      |                                  |
+| 4.1  | Hold a source registered during the install                                                             | 4     | Closed      | lane 4      | integrated                       |
+| 4.2  | Restore the block when the window loads during an install                                               | 4     | Closed      | lane 4      | integrated                       |
+| 4.3  | Give the installing dialog a way out                                                                    | 4     | Closed      | lane 4      | integrated                       |
+| 4.4  | Decide whether the dialog hides the Manage devices toast                                                | 4     | Closed      | lane 4      | integrated                       |
+| 4.5  | Fail when a desktop event name exists on one side only                                                  | 4     | Closed      | lane 4      | integrated                       |
+| 5.1  | Diagnose which path scrolls to the end after a programmatic scroll and a toggle                         | 5     | Closed      | lane 5      | integrated; Windows proof 3 of 3 |
+| 5.2  | Fix the first wrong decision the Ruling names                                                           | 5     | Closed      | lane 5      | integrated; Windows proof 3 of 3 |
+| 5.3  | Measure the Host dashboard values view's renders on the clock tick, and stop them only if there are any | 5     | Closed      | lane 5      | integrated                       |
+| 6.1  | Occlusion leases that carry a rectangle                                                                 | 6     | Closed      | lane 6      | integrated                       |
+| 6.2  | Popups hold a rectangle lease only while open                                                           | 6     | Closed      | lane 6      | integrated                       |
+| 6.3  | The model picker reopens with an empty search                                                           | 6     | Closed      | lane 6      | integrated                       |
+| 6.4  | Read-only Markdown loads relative images from the workspace                                             | 6     | Closed      | lane 6      | integrated                       |
+| 7.1  | Hide any read-only FUSE mount under a `.mount_` directory                                               | 7     | Closed      | lane 7      | integrated; 7.2 lab proof in 8.1 |
+| 7.2  | Check for a dead webview before every test and keep the whole recovery inside one deadline              | 7     | Closed      | lane 7      | integrated; 7.2 lab proof in 8.1 |
+| 7.3  | Run the flaky hint test 50 times under CPU load and diagnose any failure                                | 7     | Closed      | lane 7      | integrated; 7.2 lab proof in 8.1 |
+| 7.4  | Log a rejected pairing offer and a rejected pairing credential at `warn` with a fixed class             | 7     | Closed      | lane 7      | integrated; 7.2 lab proof in 8.1 |
+| 8.1  | Linux lab run of the packaged list, with the webview-kill and route-change probes                       | 8     | Open        |             |                                  |
+| 8.2  | Mixed-version probe against the latest released server                                                  | 8     | Open        |             |                                  |
+| 8.3  | Windows VM runs                                                                                         | 8     | Open        |             |                                  |
+| 8.4  | Load runs on the Mac                                                                                    | 8     | Open        |             |                                  |
+| 9.1  | Profiler and validation references                                                                      | 9     | Open        |             |                                  |
+| 9.2  | Architecture docs, runbooks and changelog                                                               | 9     | Open        |             |                                  |
+| 9.3  | Final gates and reviews                                                                                 | 9     | Open        |             |                                  |
+| 9.4  | Reviews before the push, then the pull request                                                          | 9     | Open        |             |                                  |
+| 10.1 | Reproduce the nested-update crash with the real list library                                            | 10    | In progress | lane 10     |                                  |
+| 10.2 | The list library ignores a 0 by 0 measurement                                                           | 10    | Open        |             |                                  |
+| 10.3 | The closed branch picker does no list work                                                              | 10    | Open        |             |                                  |
+| 10.4 | The Profiler records an error the app's error screen caught                                             | 10    | In progress | lane 10b    |                                  |
+| 11.1 | List usable private addresses while local-only                                                          | 11    | In progress | lane 11     |                                  |
+| 11.2 | Find out why generating a code fails on Windows                                                         | 11    | In progress | coordinator |                                  |
+| 11.3 | On Windows, obtain the firewall rule with an elevation prompt, or say exactly what is missing           | 11    | Open        |             |                                  |
 
 ## Log
 
@@ -95,3 +98,4 @@ Branch: claude/open-issues-pr-dc3c33
 - 2026-11-13 11:43 Ruling (user): "follow-up, do it as part of 360". The profiler event for a caught render error is R51 and Task 10.4.
 - 2026-11-13 12:08 10.1 to 10.3 Closed (lane 10), integrated by merge. Diagnosis of #360: symptom React error 185, "Maximum update depth exceeded", from `measureContainersInLayoutEffect` through `setSize` and `addTotalSize` to the store's forced re-render, the same chain as the issue's symbolized stack. Loop: `GitManagerBranchDropdown.hidden.dom.test.tsx` with the real list and the real popover. Minimal sequence: open the picker, close it, replace the refs; fails at 1,400 branches, passes at 1,200. Root cause, tier Confirmed: the list library records a 0 by 0 rectangle of a hidden row as its size, on the direct measurement path and in the deferred shrink confirmation; the one-variable probe (hidden rows measure 30 px) passes at 4,000 branches. The model picker's list fails the same way at 50 models once their keys change. Fix verdict VERIFIED in the DOM test environment: the guard alone and the gate alone each turn the failing test green; the guard is mirrored in both bundle formats. Follow-ups closed: a lasting model-picker test; the list stays rendered until the closing transition ends (`onOpenChangeComplete`); scroll position is not kept across a reopen, on purpose. Rulings: the tests carry a small ResizeObserver stand-in because the DOM test environment's never fires; the patch was rebuilt by hand so the ten earlier hunks stay byte-identical; `GitManagerToolbar.test.tsx` opens the picker before reading rows. Not proven: the owner's crash on the packaged macOS app; which of the two lists crashed there is unknown.
 - 2026-11-13 12:28 10.4 built (lane 10b), integrated by merge: the `client.render-error` event and finding over the existing client batch (`renderErrors`, optional, at most 8), sent at once and on page hide. Codex's review of the #360 changes (`gpt-6-astra`, effort high) confirmed the crash fix and found three faults in the event: server validation checks shape only (Major), a send refused as too frequent loses the record, and one environment's send drops records owed to another. A fourth (the client correlation id) is rejected: the other client events record it the same way. Fixes in progress; 10.4 stays In progress.
+- 2026-11-13 12:39 Ruling (user): issue #361 is added to this pull request ("You need to include this issue"). Spec amended with R52 to R54, D17 and D18; Phase 11 added with tasks 11.1 to 11.3. The Windows fix (11.3) waits for the diagnosis (11.2).
