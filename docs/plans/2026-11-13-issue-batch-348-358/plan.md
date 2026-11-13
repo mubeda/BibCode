@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 cd8779b5f2cb)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 eb9dc3b520e9)
 Repository: this repository
 Base: main
 
@@ -30,7 +30,7 @@ Base: main
 1. A mirror window must never reflow at its own size when it repaints after a font load. Pinned by Task 1.1 (a fit mock that really resizes).
 2. Shutdown order: lookups end before `git-writes` and the profiler teardown, and a lookup admitted after shutdown cannot panic or hang. Pinned by Task 2.4.
 3. A cancelled lookup must not be remembered as a failure, or a leaving caller poisons the key for 5 seconds. Pinned by Task 2.5.
-4. A failed desktop state query must never release the unsaved-edits block, and the block must survive a reload and a relaunched web process. Pinned by Task 4.2 and Task 8.1.
+4. A failed desktop state query must never release the unsaved-edits block, and the block must survive a page reload. Pinned by Task 4.2 and Task 8.1.
 5. A popup kept mounted while closed must hold no occlusion lease, and a popup that moves without resizing must update its lease. Pinned by Task 6.2.
 
 ## Out of scope

@@ -240,6 +240,7 @@ Comments SHALL state that a record can outlive its worktree when another folder 
 WHEN the window loads while a remote install it allowed is still protecting or installing, the unsaved-edits block SHALL be restored. A desktop without the state query counts as "not installing". A query that fails SHALL be retried and SHALL never release a block: only a confirmed state with no remote install in progress releases it.
 
 - Given a reload during an allowed install and a first state query that rejects, Then saving stays held and the query is asked again; When it then answers that no remote install is in progress, Then the block ends.
+- Limit, found in the Linux lab: this app does not restart a web process that died; the only recovery is a relaunch of the whole app, which opens a new window. So the block's survival is required and proven across a page reload only.
 
 ### R36. Way out
 
