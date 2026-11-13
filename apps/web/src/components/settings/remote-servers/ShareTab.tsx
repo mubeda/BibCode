@@ -1191,6 +1191,7 @@ export function ShareTab({
                 {desktopServerExposureError ? (
                   <SettingsRow
                     title="Network addresses"
+                    description="BiBCode could not read this computer's network addresses. Use Refresh in Share this host to try again."
                     status={
                       <span className="block text-destructive">{desktopServerExposureError}</span>
                     }
