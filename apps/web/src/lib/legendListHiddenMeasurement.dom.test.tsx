@@ -2,7 +2,7 @@
 
 import * as esm from "@legendapp/list/react";
 import type { LegendListRef } from "@legendapp/list/react";
-import { createRequire } from "node:module";
+import * as NodeModule from "node:module";
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
@@ -14,7 +14,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
  */
 const formats = {
   esm: esm.LegendList,
-  cjs: (createRequire(import.meta.url)("@legendapp/list/react") as typeof esm).LegendList,
+  cjs: (NodeModule.createRequire(import.meta.url)("@legendapp/list/react") as typeof esm)
+    .LegendList,
 };
 
 const ROW_HEIGHT = 30;
