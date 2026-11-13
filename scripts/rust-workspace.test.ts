@@ -28,6 +28,10 @@ const rustPackages = [
     cargoSelectedScriptNames: ["build", "start", "test", "typecheck"],
   },
   {
+    cargoPackage: "bibcode-objc-exception-probe",
+    memberPath: "tools/objc-exception-probe",
+  },
+  {
     cargoPackage: "bibcode-updater-verifier",
     memberPath: "tools/updater-verifier",
   },

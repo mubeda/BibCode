@@ -329,12 +329,36 @@ describe("cross-platform CI contract", () => {
     const matrix = nativeDesktopRows(workflow);
     expect(matrix).toHaveLength(6);
     for (const row of matrix) {
-      // macOS's cold optimized probe and native package use distinct dependency
-      // feature sets, in addition to the unoptimized host test graph.
-      // Intel's steps were estimated at about 260 minutes without a Rust cache.
-      const minimum = row.platform !== "mac" ? 120 : row.arch === "x64" ? 330 : 240;
+      // macOS builds the unoptimized host test graph and the optimized native
+      // package with its symbols.
+      // With a Rust cache the macOS rows took 215 and 228 minutes on 2026-11-13.
+      const minimum = row.platform === "mac" ? 330 : 120;
       expect(row.jobTimeoutMinutes, String(row.label)).toBeGreaterThanOrEqual(minimum);
     }
+  });
+
+  it("probes macOS exception recovery without a second desktop build", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const probe = requireJob(workflow, "native_desktop").steps?.find(
+      (step) => step.name === "Verify macOS release exception recovery",
+    );
+    expect(probe?.if).toBe("matrix.platform == 'mac'");
+    expect(probe?.run).toContain("cargo run --release");
+    expect(probe?.run).toContain("-p bibcode-objc-exception-probe");
+    // The shipped profile: an example of bibcode-desktop, or the symbol
+    // profile, would compile the desktop and server graph a second time.
+    expect(probe?.run).not.toContain("bibcode-desktop");
+    expect(probe?.env).toBeUndefined();
+    const manifest = NodeFS.readFileSync(
+      NodePath.join(REPOSITORY_ROOT, "tools/objc-exception-probe/Cargo.toml"),
+      "utf8",
+    );
+    expect(manifest).not.toMatch(/bibcode-(desktop|server)|tauri/);
+    expect(
+      NodeFS.existsSync(
+        NodePath.join(REPOSITORY_ROOT, "apps/desktop/src-tauri/examples/objc_exception_probe.rs"),
+      ),
+    ).toBe(false);
   });
 
   it("runs the macOS server tests off the native desktop job, without saving a cache", () => {

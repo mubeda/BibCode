@@ -388,18 +388,15 @@ jobs:
       - name: Test desktop Rust host
         run: vp run --filter @bibcode/desktop test
 
-      # The release symbol profile, as the bundle build below uses, so the
-      # dependencies both builds share compile once instead of once per
-      # profile. Strip and debug info do not change the unwinding it probes.
+      # A crate of its own with the desktop graph's objc2 features, under the
+      # shipped release profile. As a bibcode-desktop example it compiled the
+      # whole desktop and server graph a second time with test-only features:
+      # 84 of the 215 minutes of the macOS arm64 row on 2026-11-13.
       - name: Verify macOS release exception recovery
         if: matrix.platform == 'mac'
-        env:
-          CARGO_PROFILE_RELEASE_STRIP: none
-          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
-          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: packed
         run: |
           rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
-          cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
+          cargo run --release --target "$rust_target" -p bibcode-objc-exception-probe
 
       - name: Test Windows desktop E2E support contracts
         if: matrix.platform == 'win'
@@ -481,7 +478,10 @@ jobs:
             platform: mac
             target: dmg
             arch: arm64
-            jobTimeoutMinutes: 240
+            # With a Rust cache this row took 215 minutes on 2026-11-13, 84 of
+            # them in the exception probe's own full build, which is gone. The
+            # bundle build alone has taken 75 to 111 minutes.
+            jobTimeoutMinutes: 330
           # The release producer's runner (release.yml), so the Intel build
           # this tests and the cache it saves are the ones Release uses.
           # Seeded upgrade keeps macos-26-intel for newest-OS runtime coverage.
@@ -490,9 +490,9 @@ jobs:
             platform: mac
             target: dmg
             arch: x64
-            # Estimated from the 2026-11-13 run without a Rust cache, which was
-            # cancelled in the bundle step: about 260 minutes for these steps
-            # here and about 200 on arm64. Neither is a completed cold run.
+            # With a Rust cache this row took 228 minutes on 2026-11-13, 81 of
+            # them in the exception probe's own full build, which is gone. No
+            # run without a Rust cache has completed since.
             jobTimeoutMinutes: 330
     steps: *native_desktop_steps
 

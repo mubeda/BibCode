@@ -138,19 +138,21 @@ the merge.
   release symbol build (`STRIP=none`, line tables, a packed dSYM on macOS, a
   GNU build-id on Linux) that Release uses, so it also proves the `dump_syms`
   path on every pull request; the job installs `dump_syms` 2.3.9 for it, and
-  Rust Cache keeps the binary in `~/.cargo/bin`. The macOS exception probe uses
-  the same symbol profile so the dependencies both builds share compile once.
+  Rust Cache keeps the binary in `~/.cargo/bin`.
   Each matrix row declares its complete-job budget:
-  240 minutes for macOS arm64, 330 minutes for macOS x64, and 120 minutes for the other four targets.
+  330 minutes for each macOS row and 120 minutes for the other four targets.
   That budget includes setup, host tests, the macOS optimized exception-recovery
   probe, and native packaging without shortening any check or test-owned deadline.
-  Debug host tests cannot warm the optimized artifacts; the optimized example
-  also enables dev-dependency features (`tauri/test` and `tokio/test-util`) that
-  the ordinary production bundle does not use. Both optimized commands select
-  the same native target triple, but their feature differences require separate
-  compilation. Keep the real exception probe: a larger complete-job allowance
-  accommodates these deliberate checks without treating a cached build as the
-  cold-build baseline. The shared `scripts/run-msvc.mjs` launcher selects
+  Debug host tests cannot warm the optimized artifacts. The exception probe is
+  the `bibcode-objc-exception-probe` crate: it depends only on `objc2` and
+  `objc2-foundation`, with the `objc2` features the desktop graph enables, and
+  runs under the shipped release profile. Do not move it back into
+  `bibcode-desktop` as an example: an example enables the dev-dependency
+  features (`bibcode-server/hermetic-test-guard`, `tauri/test`,
+  `tokio/test-util`), so it compiled the whole desktop and server graph a
+  second time, 84 of the 215 minutes of the macOS arm64 row on 2026-11-13.
+  Check a change to the probe by running it once with
+  `CARGO_PROFILE_RELEASE_PANIC=abort`, where it must fail. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts`. That step is the
@@ -256,7 +258,7 @@ recently used entries above that. Which workflow saves which entry:
 
 A job cancelled by `timeout-minutes` or by a newer run skips the cache post
 step, so the Check and Test budgets above include a cold compile. Native
-desktop keeps its 120-minute, 240-minute and 330-minute row budgets.
+desktop keeps its 120-minute and 330-minute row budgets.
 
 Six native-desktop entries of about 1.6 GB each are about 10 GB on their own,
 before Check, Test, Crash smoke, Linux Git, and the setup-vp caches. Eviction
