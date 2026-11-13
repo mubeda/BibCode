@@ -104,6 +104,14 @@ import {
   terminalHostHasArea,
 } from "./terminalSizing";
 import {
+  readTerminalSizeDiagnostics,
+  recordTerminalSizeDiagnostic,
+  setTerminalSizeDiagnosticsEnabled,
+  terminalSizeDiagnosticsEnabled,
+  type TerminalSizeDiagnosticRecord,
+  type TerminalSizeDiagnosticTrigger,
+} from "./terminalSizeDiagnostics";
+import {
   answersTerminalQueries,
   isUnownedUntilUsed,
   shouldClaimTerminalSize,
@@ -149,6 +157,13 @@ const terminalInputBindings = new Map<string, TerminalInputBinding>();
 // releases it alongside the retained input resources below.
 const dismissedTerminalSizes = new Map<string, TerminalSize>();
 const TERMINAL_WRITE_INTERRUPTED = Symbol("terminal-write-interrupted");
+// A developer turns the size record on and reads it from the console (#348).
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  (window as { __bibcodeTerminalSizeDiagnostics?: unknown }).__bibcodeTerminalSizeDiagnostics = {
+    enable: setTerminalSizeDiagnosticsEnabled,
+    read: readTerminalSizeDiagnostics,
+  };
+}
 
 interface TerminalInputBinding {
   renderer: {
@@ -993,6 +1008,11 @@ export function TerminalViewport({
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
+    /** Records a decision made outside the renderer; callers check diagnostics are on. */
+    diagnose(
+      trigger: TerminalSizeDiagnosticTrigger,
+      repaint: TerminalSizeDiagnosticRecord["repaint"],
+    ): void;
     fit(): void;
     render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
@@ -1618,14 +1638,40 @@ export function TerminalViewport({
         environmentId,
         input: { threadId, terminalId, ...size, structuredResult: true },
       });
-    const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
-      if (resizeRendererGenerationRef.current !== rendererGeneration) return;
+    // A development-only record of size decisions (#348): numbers and enums, never content.
+    const diagnose = (
+      trigger: TerminalSizeDiagnosticTrigger,
+      fitted: TerminalDimensions | null,
+      request: TerminalSizeDiagnosticRecord["request"] = null,
+      repaint: TerminalSizeDiagnosticRecord["repaint"] = "none",
+    ) =>
+      recordTerminalSizeDiagnostic({
+        trigger,
+        rendererGeneration: resizeRendererGeneration,
+        mountWidth: mount.clientWidth,
+        mountHeight: mount.clientHeight,
+        fitted,
+        applied: !sizeOwnership
+          ? { cols: terminal.cols, rows: terminal.rows }
+          : appliedSize && { cols: appliedSize.cols, rows: appliedSize.rows },
+        role: !sizeOwnership ? "legacy" : appliedSize?.sizeClaim === sizeClaim ? "owner" : "mirror",
+        devicePixelRatio: globalThis.devicePixelRatio,
+        fontStatus: document.fonts?.status ?? "unavailable",
+        renderer: webglLifecycleRef.current !== null ? "webgl" : "standard",
+        request,
+        repaint,
+      });
+    const requestTerminalResize = (
+      rendererGeneration: number,
+      dimensions: TerminalDimensions,
+    ): boolean => {
+      if (resizeRendererGenerationRef.current !== rendererGeneration) return false;
       const current = lastRequestedSizeRef.current;
       if (
         current?.generation === rendererGeneration &&
         terminalDimensionsEqual(current.dimensions, dimensions)
       )
-        return;
+        return false;
       const request = { generation: rendererGeneration, dimensions };
       lastRequestedSizeRef.current = request;
       void resizeTerminal(dimensions).then((result) => {
@@ -1634,6 +1680,11 @@ export function TerminalViewport({
           lastRequestedSizeRef.current !== request
         )
           return;
+        if (terminalSizeDiagnosticsEnabled())
+          diagnose("resize-answer", null, {
+            ...dimensions,
+            outcome: result._tag === "Success" ? "applied" : "failed",
+          });
         if (result._tag === "Success") {
           resizeRetries = 0;
           return;
@@ -1641,6 +1692,7 @@ export function TerminalViewport({
         lastRequestedSizeRef.current = null;
         retryFailedResize();
       });
+      return true;
     };
 
     const resizeRendererGeneration = resizeRendererGenerationRef.current + 1;
@@ -1787,6 +1839,7 @@ export function TerminalViewport({
           handleSizeTrigger(pending);
         }, settleRemaining);
         if (sizeOwnership) updateSizeNotice();
+        if (terminalSizeDiagnosticsEnabled()) diagnose(trigger, fittedDimensions);
         return;
       }
       // A settled automatic trigger runs a deferred one now; an attach claim keeps its rule.
@@ -1801,10 +1854,10 @@ export function TerminalViewport({
         const wasAtBottom = followsOutput();
         fitTerminalSafely(fitAddon);
         if (wasAtBottom) terminal.scrollToBottom();
-        requestTerminalResize(resizeRendererGeneration, {
-          cols: terminal.cols,
-          rows: terminal.rows,
-        });
+        const fittedGrid = { cols: terminal.cols, rows: terminal.rows };
+        const sent = requestTerminalResize(resizeRendererGeneration, fittedGrid);
+        if (terminalSizeDiagnosticsEnabled())
+          diagnose(trigger, fittedGrid, sent ? { ...fittedGrid, outcome: "pending" } : null);
         return;
       }
       // A claim already answered for this geometry waits for its acknowledgement; sending it
@@ -1844,8 +1897,10 @@ export function TerminalViewport({
       ) {
         layoutChangedWhileClaimPending = true;
       }
+      let sentClaim: TerminalSize | null = null;
       if (fitted && shouldClaim(fitted)) {
         const request = { ...fitted, sizeClaim };
+        sentClaim = request;
         claimInFlight = request;
         awaitedAcknowledgement = null;
         claimNoticeSuppressed = true;
@@ -1857,6 +1912,13 @@ export function TerminalViewport({
           )
             return;
           claimInFlight = null;
+          if (terminalSizeDiagnosticsEnabled())
+            diagnose("resize-answer", fittedDimensions, {
+              cols: request.cols,
+              rows: request.rows,
+              // An older server answers null for a claim it took.
+              outcome: succeeded ? (result?.outcome ?? "applied") : "failed",
+            });
           if (succeeded) {
             resizeRetries = 0;
             completeClaim(request, result);
@@ -1881,6 +1943,12 @@ export function TerminalViewport({
         );
       }
       updateSizeNotice(fitted);
+      if (terminalSizeDiagnosticsEnabled())
+        diagnose(
+          trigger,
+          fitted,
+          sentClaim && { cols: sentClaim.cols, rows: sentClaim.rows, outcome: "pending" },
+        );
     };
     const applySize = (
       size: TerminalSize | undefined,
@@ -1990,6 +2058,12 @@ export function TerminalViewport({
       dismissSizeNotice() {
         if (appliedSize) dismissedTerminalSizes.set(terminalTargetKey, appliedSize);
         updateSizeNotice();
+      },
+      diagnose(
+        trigger: TerminalSizeDiagnosticTrigger,
+        repaint: TerminalSizeDiagnosticRecord["repaint"],
+      ) {
+        diagnose(trigger, fittedDimensions, null, repaint);
       },
     };
     rendererRef.current = renderer;
@@ -2591,6 +2665,7 @@ export function TerminalViewport({
       terminal.clearTextureAtlas();
       rendererRef.current?.size("layout");
       terminal.refresh(0, terminal.rows - 1);
+      if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("font", "done");
     });
 
     return () => {
@@ -2854,7 +2929,9 @@ export function TerminalViewport({
           }
           terminal.clearTextureAtlas();
           terminal.refresh(0, terminal.rows - 1);
+          if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("repaint", "done");
         }, 50);
+        if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("repaint", "scheduled");
       });
     };
     const observer = new ResizeObserver(scheduleResize);
@@ -2871,6 +2948,7 @@ export function TerminalViewport({
     };
     function handlePixelRatioChange() {
       watchPixelRatio();
+      if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("pixel-ratio", "none");
       scheduleResize();
     }
     watchPixelRatio();

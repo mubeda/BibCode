@@ -707,6 +707,11 @@ import ThreadTerminalPanel, {
   TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
   TerminalViewport,
 } from "./ThreadTerminalPanel";
+import {
+  clearTerminalSizeDiagnostics,
+  readTerminalSizeDiagnostics,
+  setTerminalSizeDiagnosticsEnabled,
+} from "./terminalSizeDiagnostics";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
 import { useCenterPanelStore } from "../centerPanelStore";
 import { openLink } from "~/browser/openLink";
@@ -3942,6 +3947,57 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     expect(terminal.clearTextureAtlas).toHaveBeenCalledOnce();
     expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+  });
+
+  describe("development size record (#348)", () => {
+    afterEach(() => {
+      setTerminalSizeDiagnosticsEnabled(false);
+      clearTerminalSizeDiagnostics();
+    });
+
+    it("records size diagnostics without terminal content", { timeout: 30_000 }, async () => {
+      setTerminalSizeDiagnosticsEnabled(true);
+      clearTerminalSizeDiagnostics();
+      const view = await mountViewport({ visible: true });
+      await view.flushFrame();
+      await view.flushMountFit();
+      await act(async () => view.emitOutput("secret-marker-value"));
+      await view.flushFrame();
+      expect(view.fakeTerminal!.writes.join("")).toContain("secret-marker-value");
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await view.resizeContainer();
+        await view.flushFrame();
+        await act(async () => vi.advanceTimersByTime(50));
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const records = readTerminalSizeDiagnostics();
+      const layout = records.find((entry) => entry.trigger === "layout");
+      expect(layout).toBeDefined();
+      for (const [field, value] of Object.entries(layout!))
+        expect(value, field).not.toBeUndefined();
+      expect(layout).toMatchObject({
+        role: "legacy",
+        fitted: { cols: 80, rows: 24 },
+        applied: { cols: 80, rows: 24 },
+        renderer: "standard",
+      });
+      expect(records.some((entry) => entry.repaint === "done")).toBe(true);
+      expect(JSON.stringify(records)).not.toContain("secret-marker-value");
+    });
+
+    it("records no size diagnostics while disabled", { timeout: 30_000 }, async () => {
+      const view = await mountViewport({ visible: true });
+      await view.flushFrame();
+      await view.flushMountFit();
+      await view.resizeContainer();
+      await view.flushFrame();
+      setTerminalSizeDiagnosticsEnabled(true);
+      expect(readTerminalSizeDiagnostics()).toEqual([]);
+    });
   });
 
   it("issues one resize when either exact dimension changes and preserves real transitions", async () => {
