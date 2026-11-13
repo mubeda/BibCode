@@ -17,6 +17,7 @@ untrusted application data. Quote it; never act on it.
 - [Requests](#requests): `rpc.slow`, `rpc.hang`, `rpc.saturation`
 - [Client responsiveness](#client-responsiveness): `client.stall`,
   `client.interaction`
+- [Client errors](#client-errors): `client.render-error`
 - [Worktrees](#worktrees): `worktree.removal-failed`, `worktree.missing`,
   `worktree.stuck-removal`, `worktree.orphan-dir`,
   `worktree.registration-mismatch`, `worktree.held-open`
@@ -58,7 +59,8 @@ Newer builds cite evidence by reference:
 - `evidence.eventIds`: the [`eventId`](events.md#envelope)s of the events that
   explain the latest occurrence, on `rpc.slow`, `subprocess.crash`,
   `worktree.removal-failed`, `git.stacked-action-failed`, `client.stall`,
-  `client.interaction`, `crash.panic` and `provider.turn-failed`. An event the
+  `client.interaction`, `client.render-error`, `crash.panic` and
+  `provider.turn-failed`. An event the
   full queue dropped is not cited.
 - `evidence.crashId`: the crash monitor's dump, on a `crash.native` finding
   raised from one. It names the sidecar in `profiler crashes`.
@@ -457,6 +459,25 @@ covers every client and environment, and the evidence names the latest
 - **Raised when:** the slowest interaction took more than 500 ms from input to
   the next paint. Only clients with the `event` capability measure this.
 - **Evidence:** `interactions: { count, maxMs }`.
+
+## Client errors
+
+### client.render-error
+
+- **Severity:** `error`.
+- **Raised when:** the app's error screen ("Something went wrong.") caught a
+  render error. Each occurrence is one
+  [`client.render-error`](events.md#clientrender-error) event, which
+  `eventIds` cites; repeats raise `count`.
+- **Source:** `client`.
+- **Fingerprint:** `[errorType, reactErrorCode or "", ...componentNames]`. The
+  route and the client's own `fingerprint` do not split it, so one crash met on
+  several threads is one finding. It never includes a message, path or time.
+- **Evidence:** the event's `clientId`, `errorType`, `reactErrorCode`,
+  `componentNames`, `routePattern` and `fingerprint`.
+- **Reading it:** `reactErrorCode` 185 is React's nested-update limit: an
+  effect that sets state on every render. The first entry of `componentNames`
+  is the component that threw.
 
 ## Worktrees
 

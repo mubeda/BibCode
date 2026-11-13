@@ -1,6 +1,11 @@
 import * as Schema from "effect/Schema";
 
-export const PROFILER_CLIENT_BATCH_LIMITS = { records: 64, histograms: 64 } as const;
+export const PROFILER_CLIENT_BATCH_LIMITS = {
+  records: 64,
+  histograms: 64,
+  renderErrors: 8,
+  componentNames: 12,
+} as const;
 
 export const ProfilerSeverity = Schema.Literals(["info", "warn", "error"]);
 export const ProfilerFindingState = Schema.Literals(["open", "resolved"]);
@@ -61,6 +66,24 @@ export const ProfilerClientHistogram = Schema.Struct({
   buckets: Schema.Array(Schema.Tuple([Schema.Number, Schema.Number])),
 });
 
+/**
+ * A render error the app's error screen caught: names and React's code only, never the
+ * message, a URL, a path or an id. `routePattern` is the route id (`/_chat/$environmentId/…`),
+ * and `fingerprint` hashes only the type, the code and the component names.
+ */
+export const ProfilerClientRenderError = Schema.Struct({
+  errorType: Schema.String,
+  /** `185` from "Minified React error #185"; `null` for any other message. */
+  reactErrorCode: Schema.NullOr(Schema.Number),
+  /** The top component-stack frames' names, innermost first. */
+  componentNames: Schema.Array(Schema.String).check(
+    Schema.isMaxLength(PROFILER_CLIENT_BATCH_LIMITS.componentNames),
+  ),
+  routePattern: Schema.NullOr(Schema.String),
+  fingerprint: Schema.String,
+});
+export type ProfilerClientRenderError = typeof ProfilerClientRenderError.Type;
+
 export const ProfilerClientBatch = Schema.Struct({
   clientId: Schema.String,
   capabilities: Schema.Array(Schema.String),
@@ -76,6 +99,12 @@ export const ProfilerClientBatch = Schema.Struct({
   jsHeapBytes: Schema.NullOr(Schema.Number),
   /** The client's own BiBCode version, which can differ from the server's. */
   appVersion: Schema.optionalKey(Schema.String),
+  /** Absent when there are none and from older clients; older servers ignore it. */
+  renderErrors: Schema.optionalKey(
+    Schema.Array(ProfilerClientRenderError).check(
+      Schema.isMaxLength(PROFILER_CLIENT_BATCH_LIMITS.renderErrors),
+    ),
+  ),
 });
 export type ProfilerClientBatch = typeof ProfilerClientBatch.Type;
 
@@ -86,7 +115,7 @@ export const ProfilerClientBatchResult = Schema.Struct({
 });
 export type ProfilerClientBatchResult = typeof ProfilerClientBatchResult.Type;
 
-/** The batch is over 64 KiB, 64 records or 64 histograms. Nothing was recorded. */
+/** The batch is over 64 KiB, 64 records, 64 histograms or 8 render errors. Nothing was recorded. */
 export class ProfilerClientBatchTooLarge extends Schema.TaggedError<ProfilerClientBatchTooLarge>()(
   "ProfilerClientBatchTooLarge",
   {

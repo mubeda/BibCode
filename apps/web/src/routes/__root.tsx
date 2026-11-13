@@ -284,6 +284,15 @@ function ProfilerClientCollector() {
   return null;
 }
 
+/**
+ * The error screen replaces the tree that ran the collector; this run keeps it measuring and
+ * sends the render error it just caught (`getRouter`'s `defaultOnCatch`).
+ */
+function ErrorScreenProfilerCollector() {
+  useEffect(() => startClientCollector(appAtomRegistry), []);
+  return null;
+}
+
 function HostedStaticEnvironmentBootstrap() {
   const { environments } = useEnvironments();
 
@@ -314,6 +323,7 @@ function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
       <UnsavedChangesCloseHost />
+      <ErrorScreenProfilerCollector />
       <div className="pointer-events-none absolute inset-0 opacity-80">
         <div className="absolute inset-x-0 top-0 h-44 bg-[radial-gradient(44rem_16rem_at_top,color-mix(in_srgb,var(--color-red-500)_16%,transparent),transparent)]" />
         <div className="absolute inset-0 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--background)_90%,var(--color-black))_0%,var(--background)_55%)]" />

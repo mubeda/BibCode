@@ -91,6 +91,77 @@ async fn profiler_runtime_scenarios_share_the_process_global_handle_in_sequence(
     the_sampler_records_the_server_process().await;
     turning_the_profiler_off_writes_the_open_minute().await;
     a_client_batch_is_joined_to_the_server_timing().await;
+    two_identical_render_errors_are_two_events_and_one_finding().await;
+}
+
+/// R51: a render error the client's error screen caught is one `client.render-error` event
+/// each time, and repeats count in one finding.
+async fn two_identical_render_errors_are_two_events_and_one_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_tx, rx) = watch::channel(true);
+    let runtime = ProfilerRuntime::start(dir.path(), rx, vec![]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let render_error = serde_json::json!({
+        "errorType": "Error",
+        "reactErrorCode": 185,
+        "componentNames": ["GitManagerBranchDropdown", "Popover"],
+        "routePattern": "/_chat/$environmentId/$threadId",
+        "fingerprint": "0a1b2c3d",
+        "message": "Maximum update depth exceeded in thread-secret",
+    });
+    // A client id of its own: the batch pacer is process-wide.
+    let batch = serde_json::json!({
+        "clientId": "render-errors",
+        "capabilities": ["heartbeat"],
+        "windowMs": 10_000,
+        "records": [],
+        "histograms": [],
+        "stalls": { "count": 0, "totalMs": 0, "maxMs": 0 },
+        "interactions": { "count": 0, "maxMs": 0 },
+        "jsHeapBytes": null,
+        "renderErrors": [render_error.clone(), render_error],
+    });
+    assert_eq!(
+        client::ingest_client_batch(batch, "env-1"),
+        Ok(serde_json::json!({ "accepted": true }))
+    );
+    let findings = runtime.status()["findings"].clone();
+    let render_findings: Vec<&serde_json::Value> = findings
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["kind"] == "client.render-error")
+        .collect();
+    assert_eq!(render_findings.len(), 1, "{findings}");
+    assert_eq!(render_findings[0]["count"], 2);
+    assert_eq!(render_findings[0]["severity"], "error");
+    assert_eq!(render_findings[0]["source"], "client");
+
+    for _ in 0..200 {
+        if runtime.status()["eventCount"].as_u64() >= Some(3) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    runtime.shutdown().await;
+    let lines: Vec<serde_json::Value> = std::fs::read_dir(profiler::profiler_dir(dir.path()))
+        .unwrap()
+        .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
+        .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|line| serde_json::from_str(&line).ok())
+        .collect();
+    let events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["kind"] == "client.render-error" && line["source"] != "client")
+        .collect();
+    assert_eq!(events.len(), 2, "two events");
+    for event in &events {
+        assert_eq!(event["source"], "client:render-errors");
+        assert_eq!(event["reactErrorCode"], 185);
+        let text = event.to_string();
+        assert!(!text.contains("Maximum update depth"), "{text}");
+        assert!(!text.contains("env-1"), "{text}");
+    }
 }
 
 async fn rapid_toggles_never_run_two_detector_sets() {

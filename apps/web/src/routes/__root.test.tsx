@@ -729,6 +729,17 @@ describe("Route.errorComponent", () => {
     const { markup } = renderError(new Error("   "));
     expect(markup).toContain("An unexpected router error occurred.");
   });
+
+  // R51: the screen replaced the tree that ran the collector, so it runs one of its own to
+  // send the error it caught.
+  it("keeps the profiler collector running while it shows", () => {
+    hk.reset();
+    renderError(new Error("boom"));
+    const cleanups = runEffects();
+    expect(s.collectorRuns).toBe(1);
+    for (const cleanup of cleanups) cleanup();
+    expect(s.collectorRuns).toBe(0);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────
