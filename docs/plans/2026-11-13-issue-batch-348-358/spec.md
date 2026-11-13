@@ -61,6 +61,7 @@ Names used throughout:
 - D12. A dedicated `terminalSizeHandOver` capability is added although no released server advertises one flag without the other; it is cheap and removes a silent coupling. Decided by: agent's call.
 - D13. The Fit button keeps sending nothing when the server already declined that size; it says so instead. Decided by: agent's call, from the existing test.
 - D14. Test names, fixtures and docs use placeholders only (repository rule on sensitive data).
+- D15. During a remote update install, "Manage devices" is disabled with a one-line reason instead of being shown above the installing dialog (R39). An earlier DOM test had passed while the action only navigated under the dialog; the branch review caught it. Decided by: agent's call, to confirm with the user.
 
 ## Requirements
 
@@ -254,9 +255,13 @@ A Files source registered during the install SHALL be held until the install end
 
 A test SHALL fail when a `desktop:` event name exists on only one side of the bridge.
 
-### R39. Toast reachability (decide by test)
+### R39. Manage devices during an install
 
-A DOM test opens the installing dialog over the remote-update toast. IF the toast's action is inert, device management SHALL be usable while the installing dialog is up (reached from the dialog and shown above it, with Files saving still held); a callback that only navigates the page beneath the dialog does not meet this. Otherwise the test stays as proof.
+WHILE the installing dialog is up, the remote-update toast's "Manage devices" action SHALL be disabled, and the toast SHALL say "Manage devices is available when the update finishes." WHEN the block ends, the action SHALL work again.
+
+- Why this and not device management shown above the dialog (D15): the dialog must stay undismissible, because saving is held and an edit typed then would be lost at the restart; the device management screen is about 2,000 lines with its own dialogs and needs the server, which the install stops.
+- Given an install this window allowed, When the person clicks "Manage devices" on the toast, Then nothing navigates under the dialog; When the block ends, Then the same action opens device management.
+- The test drives the real callback as the app root creates it, with the real close host mounted.
 
 **#358 Web and terminal**
 
