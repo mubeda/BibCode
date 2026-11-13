@@ -579,6 +579,12 @@ impl WriteSettlement {
         // stop leaves one only when Git could not act on the request. Its lock is ours only if
         // the root still held it open just before the kill: a lock nobody of ours held is
         // another Git process's, even one that stays unchanged during the wait.
+        //
+        // R22: a write stopped by force while a hook runs holds no open lock, so on Linux and
+        // macOS a lock another Git process took meanwhile is kept, as
+        // `index_lock_cleanup_keeps_a_lock_another_git_took_during_a_forced_write` proves. The
+        // cost is that a lock the killed Git itself left during a hook also stays. On Windows the
+        // 2-second rule has no ownership check and can still remove a foreign lock.
         if cfg!(any(target_os = "linux", target_os = "macos")) && report.before_force != Some(true)
         {
             return;
@@ -983,7 +989,12 @@ fn takes_index_lock(args: &[OsString]) -> bool {
         "checkout" | "switch" => checkout_takes_index_lock(&rest),
         "apply" => has("--cached"),
         "stash" => matches!(rest.first(), Some(&("push" | "apply" | "pop"))),
-        // `pull` holds no lock while it fetches, which is where it waits.
+        // shortcut: pull is unlisted on purpose (D5), for three reasons. Its merge child, not the
+        // root, holds `index.lock`. `holds_open` looks only at the root's process id on Linux and
+        // macOS, so a listed `pull` could never pass the ownership check there. On Windows a
+        // listed `pull` would arm the 2-second rule during the fetch, which holds no lock, and
+        // could remove a foreign lock. Upgrade when holds_open covers the process group and
+        // Windows can check ownership.
         _ => false,
     }
 }
