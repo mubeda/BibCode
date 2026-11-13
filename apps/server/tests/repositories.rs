@@ -489,7 +489,7 @@ fn public_repository_api_inventory_is_explicit() {
         "complete_worktree_removal_receipt",
         "list_incomplete_worktree_removal_paths",
         "record_worktree_creation",
-        "delete_worktree_creation_record",
+        "worktree_creation_record_id",
         "reap_worktree_creation_record",
         "list_worktree_creation_records",
         "register_mcp_oauth_client",

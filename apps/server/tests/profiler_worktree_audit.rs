@@ -332,6 +332,72 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         );
     }
 
+    // A creation whose thread dispatch is refused rolls its worktree back.
+    git(
+        &fixture.git_config,
+        &fixture.main,
+        &["branch", "feature/dup-a"],
+    );
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create",
+                "commandId":"dup-a-create",
+                "threadId":"dup-a-thread",
+                "projectId":"project-1",
+                "title":"Existing",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "createdAt":"2026-10-09T00:00:01Z"
+            }))
+            .expect("thread command"),
+        )
+        .await
+        .expect("existing thread");
+    let records_before = fixture.creation_records().await;
+    request(
+        fixture.socket(),
+        "800",
+        "worktree.createManaged",
+        managed_create_payload("dup-a", "dup-a-thread", "feature/dup-a"),
+    )
+    .await;
+    assert_eq!(
+        failure_reason(fixture.socket(), "800").await,
+        "orchestration-failed"
+    );
+    assert_eq!(
+        fixture.creation_records().await,
+        records_before,
+        "the rolled-back creation keeps no record"
+    );
+
+    // A creation whose record cannot be written rolls its worktree back. Last: it drops the
+    // records table, so no scan or record read follows.
+    git(
+        &fixture.git_config,
+        &fixture.main,
+        &["branch", "feature/dup-b"],
+    );
+    fixture
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute_batch("DROP TABLE worktree_creation_records")?;
+            Ok(())
+        })
+        .await
+        .expect("records table removed");
+    request(
+        fixture.socket(),
+        "801",
+        "worktree.createManaged",
+        managed_create_payload("dup-b", "dup-b-thread", "feature/dup-b"),
+    )
+    .await;
+    assert_eq!(failure_reason(fixture.socket(), "801").await, "internal");
+
     let events = shutdown_and_read_events(runtime, state.path()).await;
     let removals: Vec<_> = events
         .iter()
@@ -349,9 +415,27 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .collect();
     assert_eq!(
         removals.len(),
-        4,
-        "the replay is not recorded: {removals:?}"
+        6,
+        "four removals and two creation rollbacks; the replay is not recorded: {removals:?}"
     );
+    // One per rollback arm, so removing either audit call fails this count.
+    assert_eq!(
+        removals
+            .iter()
+            .filter(|&&(mode, ..)| mode == "create-rollback")
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            ("create-rollback", true, None, false, false),
+            ("create-rollback", true, None, false, false),
+        ],
+        "{removals:?}"
+    );
+    let rollback_ids: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "worktree.removal" && event["mode"] == "create-rollback")
+        .map(|event| &event["eventId"])
+        .collect();
     for expected in [
         (
             "delete-git-worktree",
@@ -389,6 +473,10 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .map(|finding| &finding["evidence"]["eventIds"][0])
         .collect();
     assert!(!cited.is_empty());
+    assert!(
+        cited.iter().all(|id| !rollback_ids.contains(id)),
+        "a successful rollback raises no finding: {cited:?}"
+    );
     assert!(
         cited
             .iter()
@@ -499,6 +587,24 @@ async fn remove(
         }),
     )
     .await;
+}
+
+/// A `worktree.createManaged` payload for `ref_name`, with the thread defaults `adopt` uses.
+fn managed_create_payload(command_id: &str, thread_id: &str, ref_name: &str) -> Value {
+    json!({
+        "commandId":command_id,
+        "projectId":"project-1",
+        "threadId":thread_id,
+        "title":"Managed",
+        "refName":ref_name,
+        "newRefName":null,
+        "baseRefName":null,
+        "threadDefaults":{
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access",
+            "interactionMode":"default"
+        }
+    })
 }
 
 async fn adopt(fixture: &mut Fixture) -> String {
