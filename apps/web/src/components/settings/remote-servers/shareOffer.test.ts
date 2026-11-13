@@ -34,6 +34,27 @@ const defaultDeps = {
   sleep: async () => {},
 };
 
+function localOnlyObservation(
+  idPrefix: string,
+  host: string,
+  reachability: AdvertisedEndpoint["reachability"],
+  isDefault: boolean | undefined,
+): AdvertisedEndpoint {
+  return {
+    id: `${idPrefix}:${host}:3773`,
+    label: reachability === "lan" ? "Local network" : "Private network",
+    provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+    httpBaseUrl: `http://${host}:3773/`,
+    wsBaseUrl: `ws://${host}:3773/`,
+    reachability,
+    compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+    source: "desktop-core",
+    status: "unavailable",
+    unavailableReason: "local-only",
+    ...(isDefault === undefined ? {} : { isDefault }),
+  };
+}
+
 describe("share offer links", () => {
   it("builds the deep link and browser URL from one code", () => {
     expect(buildPairingDeepLink("abc123")).toBe("bibcode://pair?code=abc123");
@@ -75,6 +96,41 @@ describe("generateShareOffer", () => {
       ok: true,
       offer: { endpoint: "http://192.168.1.20:3773", deepLink: "bibcode://pair?code=c0de" },
     });
+  });
+
+  it("widens first and keeps a chosen local-only address for the code", async () => {
+    const calls: string[] = [];
+    const applyServerExposure = vi.fn(async () => {
+      calls.push("widen");
+      return wideState;
+    });
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => {
+      calls.push(`mint ${input.endpoint}`);
+      return {
+        code: "c0de",
+        endpoint: input.endpoint,
+        name: "AI-SERVER",
+        expiresAt: "2026-08-27T01:00:00.000Z",
+      };
+    });
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "desktop-network:10.20.0.5:3773",
+        label: "10.20.0.5 (enables remote access)",
+        httpBaseUrl: "http://10.20.0.5:3773/",
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure,
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(calls).toEqual(["widen", "mint http://10.20.0.5:3773/"]);
+    expect(applyServerExposure).toHaveBeenCalledWith("network-accessible");
+    expect(result).toMatchObject({ ok: true, offer: { endpoint: "http://10.20.0.5:3773/" } });
   });
 
   it("fails visibly without minting when widening fails", async () => {
@@ -774,6 +830,7 @@ describe("resolveShareAddressOptions", () => {
           compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
           source: "desktop-core",
           status: "unavailable",
+          unavailableReason: "local-only",
           isDefault: false,
         },
       ],
@@ -798,6 +855,7 @@ describe("resolveShareAddressOptions", () => {
           compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
           source: "desktop-core",
           status: "unavailable",
+          unavailableReason: "local-only",
           isDefault: false,
         },
       ],
@@ -811,25 +869,86 @@ describe("resolveShareAddressOptions", () => {
   it("offers native automatic LAN for an observed private default route before widening", () => {
     const options = resolveShareAddressOptions({
       intent: "another-device",
+      advertisedEndpoints: [localOnlyObservation("desktop-network", "192.168.0.10", "lan", true)],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([
+      expect.objectContaining({ id: "auto-lan", httpBaseUrl: null }),
+      expect.objectContaining({
+        id: "desktop-network:192.168.0.10:3773",
+        httpBaseUrl: "http://192.168.0.10:3773/",
+      }),
+    ]);
+  });
+
+  it("lists every private address that enabling remote access makes reachable", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
       advertisedEndpoints: [
+        localOnlyObservation("desktop-network", "192.168.0.10", "lan", true),
+        localOnlyObservation("desktop-network", "10.20.0.5", "lan", false),
+        localOnlyObservation("desktop-network", "100.64.0.7", "private-network", false),
+        // The Tailscale CLI reports the same tailnet address the interface scan found.
         {
-          id: "desktop-network:192.168.1.20:3773",
-          label: "Local network",
-          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
-          httpBaseUrl: "http://192.168.1.20:3773/",
-          wsBaseUrl: "ws://192.168.1.20:3773/",
-          reachability: "lan",
-          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
-          source: "desktop-core",
-          status: "unavailable",
-          isDefault: true,
+          ...localOnlyObservation("tailscale-ip", "100.64.0.7", "private-network", undefined),
+          label: "Tailscale IP",
+          provider: { id: "tailscale", label: "Tailscale", kind: "private-network", isAddon: true },
+          source: "desktop-addon",
+        },
+        {
+          ...localOnlyObservation("desktop-network", "8.8.8.8", "public", false),
+          label: "Public address",
         },
       ],
       exposureState: loopbackState,
       primaryHttpBaseUrl: "http://127.0.0.1:3773",
     });
 
-    expect(options).toEqual([expect.objectContaining({ id: "auto-lan", httpBaseUrl: null })]);
+    expect(options).toEqual([
+      expect.objectContaining({ id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null }),
+      ...["192.168.0.10", "10.20.0.5", "100.64.0.7"].map((host) => ({
+        id: `desktop-network:${host}:3773`,
+        label: `${host} (enables remote access)`,
+        httpBaseUrl: `http://${host}:3773/`,
+        description: "BiBCode will enable remote access, then use this address.",
+      })),
+    ]);
+  });
+
+  it("leaves out an address that is unavailable for a reason other than local-only", () => {
+    const { unavailableReason: _omitted, ...withoutReason } = localOnlyObservation(
+      "desktop-network",
+      "10.20.0.5",
+      "lan",
+      false,
+    );
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        localOnlyObservation("desktop-network", "192.168.0.10", "lan", true),
+        withoutReason,
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options.map((option) => option.httpBaseUrl)).toEqual([
+      null,
+      "http://192.168.0.10:3773/",
+    ]);
+  });
+
+  it("does not offer local-only addresses while exposure is managed outside BiBCode", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [localOnlyObservation("desktop-network", "192.168.0.10", "lan", true)],
+      exposureState: { ...loopbackState, management: "external" },
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([]);
   });
 
   it("never offers public interface candidates for a native-managed wide server", () => {

@@ -62,6 +62,8 @@ export const AdvertisedEndpoint = Schema.Struct({
   compatibility: AdvertisedEndpointCompatibility,
   source: AdvertisedEndpointSource,
   status: AdvertisedEndpointStatus,
+  // Set with status "unavailable" when enabling native remote access would make it reachable.
+  unavailableReason: Schema.optional(Schema.Literals(["local-only"])),
   isDefault: Schema.optional(Schema.Boolean),
   description: Schema.optional(TrimmedNonEmptyString),
 });
