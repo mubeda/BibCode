@@ -4993,15 +4993,33 @@ mod mutation_invalidation_tests {
         let mut fixture = RemovalFixture::new().await;
         fixture.set_live_sessions(&["removed-thread"]);
         fixture.handler.services.removal_admission_timeout = Duration::from_millis(20);
+        let entered = Arc::new(Semaphore::new(0));
+        fixture.handler.services.removal_drain_entered = Some(Arc::clone(&entered));
         let payload = fixture.payload().await;
         let registry = fixture.handler.catalog.availability_registry();
         let _admission = registry
             .acquire_admission("removed-thread", [fixture.linked.as_path()])
             .await
             .expect("held admission");
-        let result = tokio::time::timeout(Duration::from_secs(2), fixture.remove(payload))
+        let services = fixture.handler.services.clone();
+        let removal = tokio::spawn(async move {
+            remove_worktree(
+                &services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
             .await
-            .expect("bounded admission drain");
+        });
+        // The 30 s guards are reached only by a real hang, never by a slow machine.
+        tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+            .await
+            .expect("removal reaches the admission drain")
+            .expect("drain signal")
+            .forget();
+        let result = tokio::time::timeout(Duration::from_secs(30), removal)
+            .await
+            .expect("removal ends after the drain deadline")
+            .expect("removal joins");
         fixture.assert_refused(result).await;
         fixture.handler.shutdown().await;
     }
