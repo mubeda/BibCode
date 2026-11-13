@@ -47,7 +47,11 @@ flowchart TB
   webviews into the window's content box, where bounds cannot move them, so
   the desktop wraps the main webview in a `GtkOverlay` with a pass-through
   `GtkFixed` layer and places preview views there
-  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). Removing an environment deletes its preview storage with its other
+  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). On macOS a native
+  preview is a view above the webview, so a popup drawn over it would sit under
+  it. Sheets and dialogs hide the whole preview; a menu, popover, select or
+  combobox leases the popup's rectangle while open, and a preview is hidden
+  only where that rectangle overlaps it. Removing an environment deletes its preview storage with its other
   environment-owned data (`EnvironmentOwnedDataCleanup`, through
   `desktop_preview_forget_environment`); a profile one of its previews used in
   this session stays on disk, since its native view lives until the app exits. In browser mode there is no child
@@ -105,7 +109,13 @@ flowchart TB
     without restarting (a refusal or a failure), the host emits
     `desktop:update-install-ended` (`onUpdateInstallEnded`) to the main window,
     and the web releases the holds, closes the dialog and says the update did
-    not install. Dock Quit on macOS, SIGTERM and session end do not
+    not install. A session marker in the window restores the hold after a
+    reload during the install, and a Files source registered during the
+    install is held as well. The hold ends only on a confirmed desktop update
+    state or the end event; a failed or timed-out state query never releases
+    it and is asked again. The dialog's **Check again** asks the desktop once
+    more and says when the install is still running or the app cannot be
+    reached. Dock Quit on macOS, SIGTERM and session end do not
     wait. A `desktop-e2e` teardown disarms the guard.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
@@ -117,6 +127,13 @@ flowchart TB
   and joined into project reads; generic projection writes cannot change it,
   and projection rewind/replay preserves it. It fences later fallback anchors
   and is not a persisted live catalog.
+  The catalog also keeps a creation record for each worktree BiBCode creates.
+  A removal or a creation rollback deletes the record by the id read when the
+  worktree was resolved, so a worktree recreated at the same path keeps its own
+  record. The profiler's worktree audit reaps a record only when its folder is
+  missing and the folder's parent directory exists; a missing parent cannot be
+  told from an unmounted volume, so that record is kept. Both creation-rollback
+  paths record a `create-rollback` removal outcome for the audit.
   Each project also carries a server-authored `repositoryIdentity` derived from
   its checkout's `origin` remote: a canonical key of the lowercased host and the
   repository path without `.git`, plus the remote (stored without userinfo,
@@ -174,8 +191,14 @@ flowchart TB
   through their final internal publication or delivery check without changing
   public status schemas. Stream and unary pull-request enrichment share one
   coalesced open-request lookup per worktree, provider, and branch, reused for
-  10 seconds after success and never after failure, and forgotten when a
-  mutation finishes, a local change is reported, or BiBCode creates a request.
+  10 seconds after success. A failure is remembered for 5 seconds, so a failing
+  forge CLI is not run back to back; a cancelled lookup is never remembered.
+  The lookup is forgotten when a mutation finishes, a local change is reported,
+  or BiBCode creates a request. A status-neutral local change that outdates a
+  running lookup starts a new one. The pull request the broadcaster remembers
+  for a branch is cleared by a failed lookup when its last success is more than
+  5 minutes old. Lookups run as tracked tasks that quiesce ends
+  (`pull-request-lookups`), so no forge CLI outlives the shutdown.
   Cached remote state additionally carries its producing
   ref identity; an external ref change clears it and resets branch-specific
   client remote fields before reconciliation;
@@ -691,6 +714,9 @@ the session when either passes. Desktop exposure remains a privileged
 externally managed, and only authoritative live grants or an explicit
 legacy-resume action can request a wide native bind. Pairing credentials remain
 pending until the verified client persists local state and confirms the session.
+A refused pairing offer is logged at `warn` with its fixed reason text, and a
+refused pairing credential at `warn` with a fixed class only, never the offered
+input or the credential.
 Desktop discovery advertises only usable IPv4 addresses until a dual-stack
 listener exists; public candidates are labeled, never defaulted, and require an
 explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
@@ -1366,6 +1392,19 @@ backing-store size through xterm's WebGL resize layers so the drawing viewport
 and glyph shader resolution change atomically with the canvas; resizing the
 canvas alone is not a valid renderer state during center-panel splits.
 
+Every terminal counts character widths by Unicode 11 (the
+`@xterm/addon-unicode11` addon in
+[`terminalUnicode.ts`](../../apps/web/src/components/terminalUnicode.ts)), so
+an emoji takes two columns, as programs such as the Claude CLI assume. xterm
+caches the cell size, so a font that loads after the first fit makes the
+client measure the cell again and fit from the new glyphs. The size request
+that follows waits for the layout to settle, as do a change of the display's
+pixel ratio and a bundled font loading. A new terminal tries WebGL again after
+an earlier terminal's WebGL failed, and its failure warning names the stage and
+the error type only. In development builds a bounded in-memory record
+(`terminalSizeDiagnostics.ts`) keeps the sizing and repaint decisions as
+numbers and enums; it holds no terminal content, id or path.
+
 A terminal session may keep running after its center panel stops rendering. The
 per-terminal input scheduler therefore survives renderer unmounts so an
 immediate replacement can preserve ordering, but its retained writer is
@@ -1537,7 +1576,10 @@ of the window a user typed, pasted or clicked in, or `null` for the terminal's
 own answers to a program's queries. Input without the field, from an older
 client, counts as use as before, since such a client cannot tell its replies
 from typing. Clients send it only to servers advertising
-`terminalUserInputClaim`, because input frames refuse unknown fields.
+`terminalUserInputClaim`, because input frames refuse unknown fields. The
+size hand-over rule (a released size waits, un-owned, for a window to be used)
+has its own capability, `terminalSizeHandOver`; a client never infers it from
+`terminalUserInputClaim`.
 Attachment identities prevent an old stream from clearing a replacement that
 reuses its claim, including across process restarts. Queued requests from an
 unregistered claim cannot resurrect it. Manager shutdown fences new claim
@@ -1570,10 +1612,10 @@ it no longer fits. At that deadline a proposal at the sizing minimum (the fit's
 waits for the quiet period like any other.
 Explicit triggers (click, typing, focus, **Fit to this window**) are not
 delayed. A null claim after a restart, or from a server
-without `terminalUserInputClaim` (which releases every size to nobody), prompts
+without `terminalSizeHandOver` (which releases every size to nobody), prompts
 an immediate claim even without focus, so a visible mirror takes the size as
 soon as the owner's stream ends; a hidden or zero-area mirror does not. A
-`resized` with a null claim from a server advertising `terminalUserInputClaim`
+`resized` with a null claim from a server advertising `terminalSizeHandOver`
 is an intentional hand-over to nobody: windows treat it like another window's
 size (scaled whole, with the notice) and claim it only through the same use
 triggers. A viewport keeps one claim for every renderer it creates, so a window
@@ -3536,7 +3578,10 @@ The host collector (`diagnostics/host_metrics`, #292) is the one diagnostics
 reader that samples while nobody watches: the production runtime starts it with
 the server, and it reads the host's CPU and memory every 60 seconds, and volume
 space every fifth reading, so the Host dashboard can show statistics since the
-server started. It never walks the process table. While at least one
+server started. The dashboard hides every read-only FUSE mount under a
+`.mount_` directory (an AppImage's image, whether this process, another
+instance or a killed one runs from it); a user's own read-only FUSE volume
+mounted there is hidden too. It never walks the process table. While at least one
 `server.subscribeHostMetrics` stream is open it reads once a second, shared by
 every subscriber through one watch channel, and it drops back to 60 seconds
 when the last stream closes. Volume lists and space reads run on four dedicated
@@ -3649,6 +3694,11 @@ sees partial source:
   is cancelled only when its last waiting block leaves, and a result shows only
   in a block that still holds its source. A failed renderer import is cleared
   so **Retry** can try again.
+- **Read-only file view.** The read-only rendered Markdown view of a file
+  (`ChatMarkdown` given the file's path) loads a relative image from the
+  workspace through the same `RichMarkdownImage` loader as the editable view,
+  so it is not requested against the app's own address. Chat messages pass no
+  path and keep a plain image.
 - **Editable file view.** The rendered view of an editable `.md` file is a
   TipTap editor, not `ChatMarkdown`. There,
   `components/files/richMarkdown/mermaidDiagramExtension.ts` turns each fence

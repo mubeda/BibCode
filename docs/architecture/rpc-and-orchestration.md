@@ -5079,6 +5079,13 @@ optional attachment owner; renderers mirror that applied state.
 | Attach snapshot                         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it.                                                                                                                                                                                            |
 | Attach event                            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                                                                                                                                                                                                                    |
 
+`terminalSizeHandOver` is a separate environment capability, decoded as false
+when absent. A server advertising it leaves a released size un-owned until a
+window is used and names the window that answers queries meanwhile
+(`replyClaim`). A client hands over only against such a server, and never infers
+it from `terminalUserInputClaim`. Against a server without it, a null owner
+prompts a visible window to claim the size at once, as it did before.
+
 First-attachment grant selection and ownership assignment are atomic under the
 PTY generation publication lock. Attach assigns an owner only when unowned; it
 grants startup-history replies only when no claim has been applied and no

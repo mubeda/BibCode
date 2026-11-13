@@ -5,6 +5,8 @@
 ### Diagnostics
 
 - Each environment has a Host dashboard (the environment card's menu, Settings > Remote Servers, and the status bar's Resource Manager) with its host's CPU, memory and volumes, live and since the server started. It lists the volumes it hides and why, shows per-volume statistics, never reads network volumes, and says when the volume list is not answering. Agents can read the same figures with the `host_metrics` MCP tool. (#292)
+- The Host dashboard on Linux no longer lists another running BiBCode AppImage's mount, or one a killed instance left behind, as a full read-only volume. (#353)
+- A refused pairing offer or pairing credential is now logged as a warning with a fixed reason, so a pairing that fails shows in the server log; the log never holds the offered link or the credential. (#358)
 
 ### Pipelines
 
@@ -18,10 +20,15 @@
 - The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
 - Create worktree starts fresh every time it opens, after a creation or a close: the last Name, Create From, mode, base override, Advanced, Create more and agent pick no longer come back. Input stays while the dialog is open, and Create more still keeps the project, mode, agent and base override for its batch. (#346)
 - Source Control has a **Review changes** button that starts a code review of your branch and its uncommitted changes in a chat panel beside the thread or in an AI Terminal. A Claude review starts in Claude's plan mode, a Codex review runs in Codex's read-only sandbox, other chat agents ask before edits or are only told not to edit, and Settings → Agents and the button's tooltip say which applies. A review's findings offer no Implement. The review prompt can be set per user in Settings → Agents and per project from the button's menu, which also starts a review once with another agent or with added instructions. Mod+Alt+Shift+R starts a review from the keyboard. On Windows, a terminal review gets the prompt with its line breaks as spaces. (#293)
+- Sign-in guidance after a failed fetch or push now appears only when Git's own `fatal:` line says it could not read a username, so a commit message or hook output that contains those words no longer triggers it. (#354)
+- A pull request that the forge CLI could not look up is no longer asked for again at once on every status change: a failed lookup waits 5 seconds, and a pull request shown for a branch disappears when the lookups keep failing and the last answer is more than 5 minutes old. A status-neutral local change no longer leaves an outdated answer in place, and a lookup that is running when BiBCode quits ends with it. (#355)
+- A worktree recreated at the path of a removed one keeps its own creation record, and a record on a volume that is not mounted is no longer deleted by the profiler's worktree audit. A failed worktree creation that is rolled back is now visible to the profiler. (#356)
 
 ### Chats
 
 - A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. A chat whose provider is disabled or removed now says so above the composer and keeps Send unavailable, and **Add as project** in Files opens the new Main on your Default Agent instead of Codex. (#347)
+- Expanding a reasoning row in the chat no longer scrolls the list to its end on Windows. (#351)
+- The model picker opens with an empty search every time, instead of the text from the last time it was open. (#358)
 
 ### Files
 
@@ -31,6 +38,8 @@
 - Mermaid diagrams in an editable rendered Markdown file are drawn again, as one block that is not edited in place; the file's source is kept as written. (#342)
 - The Linux AppImage now carries its own GStreamer plugins for the audio Files previews in WAV, MP3, Ogg, WebM and FLAC files, instead of relying on the system's plugins, which its bundled GStreamer cannot load on newer distributions. M4A is not covered: its AAC decoder is not bundled.
 - A PDF preview in the Files panel is no longer blocked by the page's content security policy in Chromium-based webviews and browsers: the Windows desktop app, and browser mode in Chrome or Edge.
+- A read-only rendered Markdown file (large files, and files the editor cannot change safely) now loads its relative images from the project, as the editable view does. (#358)
+- After you allow an update to install, the Files block survives a reload of the window and covers a Files source opened during the install, and the "Installing an update" dialog has **Check again**, which asks the desktop whether the install is still running. (#357)
 
 ### Appearance
 
@@ -38,6 +47,7 @@
 - Clicking a theme row applies it and, when the theme's base differs from the mode on screen, switches the mode with an Undo that restores the previous mode and theme. (#290)
 - The left panel draws its repository, environment, primary checkout, worktree and chat rows as five visually distinct levels in every built-in theme, and a theme can style each level. (#290)
 - On the desktop app, exporting a theme or plan opens the native Save dialog, and closing, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel. (#290, #342)
+- On the macOS desktop app, a menu, popover, select or combobox opened over a native browser preview is drawn above it, and the preview is hidden only where the popup covers it. (#358)
 
 ### Terminals
 
@@ -49,6 +59,11 @@
 - Opening, collapsing or dragging a panel no longer resizes its terminal's program to 2 or 5 columns on the way: a terminal takes a new size once its panel holds still for a moment, and a small panel that holds still still sizes it. (#348)
 - A terminal that was off-screen or hidden while its program kept printing after its rows shrank comes back showing its last lines and footer, instead of a view stuck rows above them until you changed a panel's size; a terminal you had scrolled up to read stays where you left it. (#348)
 - When two windows, for example on two machines, show the same terminal, the window you last used sizes it and the other one shows the whole terminal scaled down to fit instead of cutting off its bottom rows; a window nobody is clicking or typing in, such as an idle server host window, no longer takes the size back when it regains focus, where its web view reports recent input. A click or **Fit to this window** that takes the size leaves the terminal focused, so the first keys you type reach the program. (#348)
+- A terminal repaints and refits after a font loads late, and one created after the server's settings arrived no longer keeps a stale picture until a panel is resized. (#348)
+- Every terminal counts an emoji as two columns, as programs such as the Claude CLI assume, so their lines no longer drift. (#353)
+- **Fit to this window** now says when the server already holds the size, and a terminal no longer shows a transient size change of a few rows right after you return to it. (#353)
+- A new terminal tries the WebGL renderer again after an earlier terminal fell back to the standard one. (#353)
+- A client uses the typed-last size hand-over only with a server that says it has it, so a client and a server of different versions keep working. (#358)
 
 ## [v0.15.3] - 2026-11-08
 
