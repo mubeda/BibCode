@@ -1,9 +1,9 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 3b06d6886431)
-Plan status: Draft
-Plan review: Codex gpt-6.1-sol (effort high), round 1, needs rework; 22 findings handled, see reviews/plan-review-1.md
+Spec: spec.md (sha256 be2ccd2fab22)
+Plan status: Approved 2026-11-13
+Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: none
 Branch: claude/open-issues-pr-dc3c33
 
@@ -38,18 +38,18 @@ Branch: claude/open-issues-pr-dc3c33
 | 4.4 | Decide whether the dialog hides the Manage devices toast | 4 | Open | | |
 | 4.5 | Fail when a desktop event name exists on one side only | 4 | Open | | |
 | 5.1 | Diagnose which path scrolls to the end after a programmatic scroll and a toggle | 5 | Open | | |
-| 5.2 | Fix the first wrong decision the diagnosis names | 5 | Open | | |
-| 5.3 | Stop the Host dashboard values view re-rendering on the clock tick | 5 | Open | | |
+| 5.2 | Fix the first wrong decision the Ruling names | 5 | Open | | |
+| 5.3 | Measure the Host dashboard values view's renders on the clock tick, and stop them only if there are any | 5 | Open | | |
 | 6.1 | Occlusion leases that carry a rectangle | 6 | Open | | |
 | 6.2 | Popups hold a rectangle lease only while open | 6 | Open | | |
 | 6.3 | The model picker reopens with an empty search | 6 | Open | | |
 | 6.4 | Read-only Markdown loads relative images from the workspace | 6 | Open | | |
 | 7.1 | Hide any read-only FUSE mount under a `.mount_` directory | 7 | Open | | |
-| 7.2 | Check for a dead webview before every test and keep the relaunch inside the test allowance | 7 | Open | | |
+| 7.2 | Check for a dead webview before every test and keep the whole recovery inside one deadline | 7 | Open | | |
 | 7.3 | Run the flaky hint test 50 times under CPU load and diagnose any failure | 7 | Open | | |
 | 7.4 | Log a rejected pairing offer and a rejected pairing credential at `warn` with a fixed class | 7 | Open | | |
-| 8.1 | Linux lab run of the packaged list, with the two discriminating runs | 8 | Open | | |
-| 8.2 | Mixed-version probe against the previous release's server | 8 | Open | | |
+| 8.1 | Linux lab run of the packaged list, with the webview-kill and route-change probes | 8 | Open | | |
+| 8.2 | Mixed-version probe against the latest released server | 8 | Open | | |
 | 8.3 | Windows VM runs | 8 | Open | | |
 | 8.4 | Load runs on the Mac | 8 | Open | | |
 | 9.1 | Profiler and validation references | 9 | Open | | |
@@ -60,3 +60,4 @@ Branch: claude/open-issues-pr-dc3c33
 ## Log
 - 2026-11-13 Plan written. Sources: ten issues exported to `sources/`, `evidence.md`, `triage.md`. #350 moved to `../2026-11-13-terminal-screen-350/` after its design review returned "needs rework".
 - 2026-11-13 Baseline for Task 5.1 (plan decision P3): the packaged harness sets a 1000x720 viewport itself, and `chat-reasoning-rows` passed on Linux WebKitGTK in two full lab runs of the build that became `main` (31 passing each). No reproduction on Linux; the Windows VM (WebView2, device pixel ratio 2) is the signal.
+- 2026-11-13 Plan approved under the user's standing pre-approval (two Codex reviews and the advisor's; 22 and 13 findings handled).

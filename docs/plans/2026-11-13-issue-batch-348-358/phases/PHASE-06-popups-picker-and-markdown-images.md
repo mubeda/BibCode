@@ -11,6 +11,8 @@
 
 Facts confirmed in source: the store files live in `apps/web/src/browser/` (not `apps/web/src/`). `ProviderModelPicker.tsx` lives in `apps/web/src/components/chat/`. `occlusionOwners` is a `ReadonlySet<symbol>` in `BrowserSurfaceStoreState`; `browserSurfaceSync.ts` computes `occluded = state.occlusionOwners.size > 0`. `PopoverPopup` renders `PopoverPrimitive.Portal keepMounted`; `MenuPopup`, `SelectPopup`, `ComboboxPopup` and `AutocompletePopup` each render Portal, Positioner, Popup. `ModelPickerContent` keeps the search text in `useState("")` and stays mounted inside the keep-mounted popover. Existing DOM occlusion test to copy: `apps/web/src/components/ui/dialog.occlusion.dom.test.tsx` (it mocks `~/env` and the platform). Decision D11: tooltips take no lease and `tooltip.tsx` is not touched.
 
+Test rules for every task (class C): each async wait is `vi.waitFor(..., { timeout: 30_000 })` or an explicit flush of a controlled queue (the stubbed frame queue, fake timers), never a yield loop. Boundaries not crossed by a unit test and not proved here: the native `setBounds` call that really hides the macOS preview (Task 6.1 and 6.2 stop at the `setBounds` mock of `browserSurfaceSync.test.ts`; the real overlap on macOS is unproven in this batch and is stated in the final report), and the signed asset URL the server issues for a workspace image (Task 6.4 uses the same `~/state/assets` mock as `RichMarkdownImage.test.tsx`).
+
 ## Tasks
 
 ### Task 6.1: Occlusion leases that carry a rectangle

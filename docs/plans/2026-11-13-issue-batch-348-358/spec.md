@@ -1,6 +1,6 @@
 # Issue batch: terminal fidelity, Git and worktree follow-ups, update guard and web fixes
 
-Status: Draft
+Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30: reviewed by Codex twice and by the advisor, findings handled; the agent's calls D2, D4 to D13 are listed for the user's confirmation before the push)
 Size: full Mode: gated Type: bug class and chore (#348, #351 to #358) and feature (#350)
 Source: GitHub issues #348 and #350 to #358 of this repository as they stood on 2026-11-13 (copies in `sources/`), the conversation of 2026-11-13 ("process all open issues, fix them all in this PR"), and a read of `main` at `a9938193b` by five read-only verifiers. Evidence record: [evidence.md](evidence.md). #350 has its own folder, [../2026-11-13-terminal-screen-350/](../2026-11-13-terminal-screen-350/terminal-screen-design.md), because its design did not pass its first review.
 
@@ -72,6 +72,7 @@ Priority is Must unless marked. "Test seam" names the existing test file that ta
 
 WHEN any font finishes loading in the document while a terminal is rendered, the terminal SHALL re-measure and repaint at its current size.
 - Given a rendered terminal with an unchanged mount size, When `document.fonts` dispatches `loadingdone`, Then the terminal is re-measured and `clearTextureAtlas` and `refresh` each run once. An owner refits. A mirror keeps the server's columns and rows and sends no size claim: the test uses a fit mock that really resizes the terminal, as the real fit addon does, and asserts the mirror's grid is unchanged. The assertions for owner, mirror and the legacy path equal those of the existing device-pixel-ratio test.
+- Given a real xterm with an unchanged mount size, When the font's glyph metrics change and `loadingdone` fires, Then the terminal's cell dimensions are measured again before any size is proposed (a repaint alone is not enough: the fit addon reads cached cell dimensions).
 - Given the terminal is unmounted, When `loadingdone` fires, Then nothing runs.
 - Test seam: `apps/web/src/components/ThreadTerminalPanel.interactions.test.tsx`, next to "refits when the device pixel ratio changes under an unchanged mount".
 ### R2. Late creation
@@ -103,6 +104,7 @@ Every terminal in the client SHALL count columns by Unicode 11 (the `@xterm/addo
 WHEN the reader has brought a reasoning row into view away from the turn's end and expands or collapses it, the row's header SHALL stay within 2 px of where it was. This is the invariant the packaged spec `chat-reasoning-rows` asserts in `expandThoughtAwayFromEnd` (scroll the row to the center, toggle, compare the header's position).
 - Diagnose first, before any fix. Known on 2026-11-13: the packaged harness already runs at a 1000x720 viewport on every platform, and the spec passes there on Linux (WebKitGTK), so neither that viewport nor the shared code alone reproduces it; Windows differs by WebView2 (Chromium) and a device pixel ratio of 2. Step 1: get a live trace of which code path scrolls (the toggle's end reveal, the grown-turn follow, or the list's end maintenance, with the real value of each decision), from Chromium at device pixel ratio 2 if that reproduces it, otherwise from the Windows VM. Step 2: a unit test reproduces that path with the trace's metrics. The fix goes at the first wrong decision the trace names; no fix is chosen before it.
 - Given the reader scrolled a reasoning row to the center without a wheel or touch gesture (a programmatic scroll), When the row is toggled, Then no scroll to the end is made within three animation frames.
+- Given one work row that groups `[thought A, tool B, thought C]`, When thought A is toggled, Then its header stays in place (A is not the newest thought although no later list row exists), and toggling C at the turn's end still reveals the end.
 - Given the newest reasoning row at the end of an anchored turn, Then the existing reveal still happens (the #173 behavior, asserted by `expandStreamingThoughtAtEnd`).
 - Proof on Windows: the packaged `chat-reasoning-rows` spec passes in the Windows VM at the viewport where it failed.
 - Test seam: `apps/web/src/components/ChatView.test.tsx`, "a pointer press on a Thinking row's toggle before a toggle at an anchored turn's end".
@@ -129,6 +131,8 @@ Using R4's record, a test replays an attach followed by a font-metrics change an
 
 WHEN "Fit to this window" is pressed and no size request can be sent, the size notice SHALL say that the server kept this size, in a status region. No request is sent and focus stays on the button.
 ### R18. Host dashboard re-render (Should)
+
+Measure first: a React Profiler `onRender` probe on the values view under the compiled build the tests use. IF a clock tick alone costs a render of the values view, the following holds; IF the compiler already skips it, the measurement is recorded and nothing changes.
 
 The values view SHALL not re-render when only the clock tick changed.
 ### R19. Mixed versions (decide by probe)
@@ -216,7 +220,7 @@ A Files source registered during the install SHALL be held until the install end
 A test SHALL fail when a `desktop:` event name exists on only one side of the bridge.
 ### R39. Toast reachability (decide by test)
 
-A DOM test opens the installing dialog over the remote-update toast. IF the toast's action is inert, the action SHALL be reachable from the dialog; otherwise the test stays as proof.
+A DOM test opens the installing dialog over the remote-update toast. IF the toast's action is inert, device management SHALL be usable while the installing dialog is up (reached from the dialog and shown above it, with Files saving still held); a callback that only navigates the page beneath the dialog does not meet this. Otherwise the test stays as proof.
 
 **#358 Web and terminal**
 

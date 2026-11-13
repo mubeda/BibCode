@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
-Status: Draft
-Spec: spec.md (Status line: Draft, sha256 3b06d6886431)
+Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 be2ccd2fab22)
 Repository: this repository
 Base: main
 
@@ -77,7 +77,7 @@ Phases in the same round run in parallel. A phase depends only on phases in earl
 |---|---|---|---|
 | `apps/web/src/components/ThreadTerminalPanel.tsx` and `ThreadTerminalPanel.interactions.test.tsx` | modify | 1 | from `apps/web`: `vp test run --project unit src/components/ThreadTerminalPanel.interactions.test.tsx` |
 | `apps/web/src/components/terminalSizeDiagnostics.ts` and its test | create | 1 | same command with the new test path |
-| `apps/web/src/components/terminalSizing.ts`, `terminalSizePolicy.ts`, `apps/web/src/lib/terminalFont.ts` | modify (only if a task needs it) | 1 | their existing tests |
+| `apps/web/src/components/terminalSizing.ts` (re-measure helper) and a new `terminalSizing.xterm.test.ts`; `terminalSizePolicy.ts`, `apps/web/src/lib/terminalFont.ts` (only if a task needs it) | modify | 1 | their existing tests |
 | `apps/web/package.json` (dependency `@xterm/addon-unicode11` 0.9.0) | modify | 1 | `vp install`, then the R5 xterm test |
 | `packages/contracts/src/environment.ts`, `packages/contracts/fixtures/**`, `packages/shared/src/testSupport.ts` | modify | 1 | `vp run check:contracts` |
 | `apps/server/src/lifecycle.rs`, `apps/server/src/production/control.rs` | modify | 1 | `cargo test -p bibcode-server --lib lifecycle` |
@@ -86,7 +86,7 @@ Phases in the same round run in parallel. A phase depends only on phases in earl
 | `apps/server/src/git/broadcaster.rs`, `apps/server/src/production/git_vcs.rs`, `apps/server/src/production/runtime.rs` | modify | 2 | Phase 2 checkpoint |
 | `apps/server/src/production/worktree_catalog_rpc.rs`, `apps/server/src/diagnostics/profiler/worktree_audit.rs` | modify | 3 | `cargo test -p bibcode-server --lib worktree` |
 | `apps/server/src/persistence/repositories.rs`, `apps/server/tests/repositories.rs`, `apps/server/src/production/orchestration_effects.rs`, `apps/server/tests/profiler_worktree_audit.rs`, `apps/server/src/mcp/tools/worktrees.rs` | modify | 3 | `cargo test -p bibcode-server --test repositories` and `--test profiler_worktree_audit` |
-| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/components/RemoteUpdateRequestNotifier.tsx`, `apps/web/src/routes/__root.tsx` and their tests (only if Task 4.4 finds the action unreachable) | modify | 4 | Phase 4 checkpoint |
+| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/tauriDesktopBridge.ts` (the `getUpdateState` entry) and its test | modify | 4 | Phase 4 checkpoint |
 | `scripts/desktop-event-names.test.ts` | create | 4 | `vp test run scripts/desktop-event-names.test.ts` |
 | `apps/web/src/components/ChatView.tsx` and `ChatView.test.tsx`; `apps/web/src/components/chat/timelineScrollAnchoring.ts`, `MessagesTimeline.logic.ts`, `MessagesTimeline.tsx` and their tests | modify | 5 | Phase 5 checkpoint |
 | `apps/web/src/components/hostDashboard/HostDashboardSheet.tsx` and its test | modify | 5 | Phase 5 checkpoint |
