@@ -91,6 +91,7 @@ it("a real nested-update crash is recorded with React's code 185", async () => {
   const sent: ProfilerClientBatch[] = [];
   setClientBatchSender(async (_environmentId, batch) => {
     sent.push(batch);
+    return { accepted: true };
   });
   const container = document.createElement("div");
   document.body.append(container);

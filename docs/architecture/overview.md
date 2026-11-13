@@ -2008,9 +2008,12 @@ it.
   plain identifier becomes `Unnamed`), the router's matched route id (checked
   against the app's route ids) and a client hash, never the message, a URL, a
   path or an id. The batch carries them in the optional `renderErrors` field,
-  which older servers ignore. Each environment keeps its pending errors until
-  its server accepted the batch that carried them, and every send waits out
-  the server's 5 s pacing. The server applies the closed set, the identifier
+  which older servers ignore. Each environment keeps its pending errors (the
+  newest 8) until its server answers `{ accepted: true }` to the batch that
+  carried them; only `{ accepted: false }` with no reason, the server's
+  profiler-off answer, drops them, and any other answer, no answer or a failed
+  send keeps them. Every send waits out the server's 5 s pacing, and a batch it
+  holds back keeps its whole window of measurements for the next one. The server applies the closed set, the identifier
   shape and a route-id grammar again, redacts, emits one event each and groups
   repeats by type, code, route and component names: the packaged bundle
   minifies component names, so the route keeps crashes apart. The error screen

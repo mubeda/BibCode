@@ -110,6 +110,7 @@ beforeEach(() => {
   sent.length = 0;
   setClientBatchSender(async (_environmentId, batch) => {
     sent.push(batch);
+    return { accepted: true };
   });
   scene.profiledEnvironments = ["env-1"];
   container = document.createElement("div");

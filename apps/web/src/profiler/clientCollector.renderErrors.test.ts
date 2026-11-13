@@ -168,4 +168,70 @@ describe("render error records", () => {
     expect(received.get("env-a")).toEqual(["Error", "RangeError"]);
     c.dispose();
   });
+
+  // Codex finding 6: a flush the pacing holds back must not drop the window's measurements.
+  it("keeps the window's measurements while the pacing holds a batch back", async () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));
+    const c = createClientCollector({
+      now: () => t,
+      send,
+      supportedEntryTypes: [],
+      clientId: "c1",
+    });
+    c.setEnabledEnvironments(new Set(["env-a"]));
+    t = 9_000;
+    c.recordRenderError(new Error("a"), null, () => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    const request = c.observeRequest("env-a", "server.getConfig");
+    t = 9_200;
+    request.complete();
+    t = 10_000;
+    await c.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    t = 20_000;
+    await c.flush();
+    expect(send).toHaveBeenCalledTimes(2);
+    const [, batch] = send.mock.calls[1]! as [string, any];
+    expect(batch.histograms.map((h: any) => h.method)).toEqual(["server.getConfig"]);
+    // The window runs from the batch at 9 s, so it holds the request.
+    expect(batch.windowMs).toBe(11_000);
+    c.dispose();
+  });
+
+  // Codex finding 7: a pending record leaves only on an explicit acceptance, or on purpose when
+  // that server's profiler is off (`{ accepted: false }` with no reason).
+  it.each([
+    ["accepted", { accepted: true }, "dropped"],
+    ["too frequent", { accepted: false, reason: "too-frequent" }, "kept"],
+    ["profiler off", { accepted: false }, "dropped"],
+    ["unknown reason", { accepted: false, reason: "something-new" }, "kept"],
+    ["no answer", undefined, "kept"],
+    ["a thrown error", "throw", "kept"],
+  ])("after %s, the record is %s", async (_name, answer, outcome) => {
+    let t = 0;
+    let first = true;
+    const send = vi.fn(async (_environmentId: string, _batch: any) => {
+      if (!first) return { accepted: true };
+      first = false;
+      if (answer === "throw") throw new Error("socket closed");
+      return answer;
+    });
+    const c = createClientCollector({
+      now: () => t,
+      send,
+      supportedEntryTypes: [],
+      clientId: "c1",
+    });
+    c.setEnabledEnvironments(new Set(["env-a"]));
+    c.recordRenderError(new Error("a"), null, () => undefined);
+    await c.flush();
+    t = 6_000;
+    await c.flush();
+    const again = send.mock.calls.slice(1).some(([, batch]) => batch.renderErrors !== undefined);
+    expect(again).toBe(outcome === "kept");
+    c.dispose();
+  });
 });

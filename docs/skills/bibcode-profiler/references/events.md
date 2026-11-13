@@ -310,9 +310,14 @@ What holds where:
   route, is recorded as it is.
 
 Delivery: an error stays pending for each environment until that server
-accepts the batch that carried it, so a send refused as too frequent, failed,
-or held back by another batch still on the wire is sent again later. At most 8
-are pending per environment; the oldest goes first. A pending error is also
+answers `{ accepted: true }` to the batch that carried it. It is dropped on
+purpose only when the server answers `{ accepted: false }` with no reason,
+which means its profiler is off, so nothing is kept for it. Any other answer
+(`too-frequent`, an unknown reason, no answer) or a failed send keeps it for
+the next allowed batch, as does a batch held back by the pacing or by another
+batch still on the wire; a held-back batch also keeps its window's requests,
+histograms, stalls and interactions. At most 8 are pending per environment;
+the oldest goes first. A pending error is also
 sent on `pagehide` and when the page is hidden, over the same WebSocket RPC.
 A reload or close inside the server's 5 s window, or before the connection can
 send, loses the record, as does an error in the very first render, before the

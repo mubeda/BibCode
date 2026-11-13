@@ -94,7 +94,23 @@ interface EnvironmentWindow {
   readonly records: PendingRecord[];
   /** Method → bucket → count. */
   readonly histograms: Map<string, Map<number, number>>;
+  /**
+   * The window's own start and client-wide figures: a batch the pacing or an upload holds
+   * back leaves them in place, so only a batch that goes out consumes them.
+   */
+  readonly startedAt: number;
+  readonly stalls: { count: number; totalMs: number; maxMs: number };
+  readonly interactions: { count: number; maxMs: number };
 }
+
+const newWindow = (recording: number, startedAt: number, records: PendingRecord[] = []) => ({
+  recording,
+  records,
+  histograms: new Map<string, Map<number, number>>(),
+  startedAt,
+  stalls: { count: 0, totalMs: 0, maxMs: 0 },
+  interactions: { count: 0, maxMs: 0 },
+});
 
 /** `interactionId` is missing on engines that predate it. */
 interface SlowEvent {
@@ -229,14 +245,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   let quietUntil = 0;
   let pausedAt = 0;
   let pausedAtWall = 0;
-  let windowStart = 0;
-  let stalls = { count: 0, totalMs: 0, maxMs: 0 };
-  let interactions = { count: 0, maxMs: 0 };
   let lastInteractionId = 0;
-  /**
-   * Client-wide like the stalls, and kept across a restart: the error screen replaces the
-   * tree that ran the collector, and its own run sends what the old one caught.
-   */
   /**
    * Per environment, the caught render errors its server has not accepted yet: an entry leaves
    * only with the accepted batch that carried it. Kept while the environment is disabled, so
@@ -257,10 +266,19 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   let expectedBeat = 0;
   let observers: PerformanceObserver[] = [];
 
+  /** Client-wide figures go to every environment's window. */
   const addStall = (ms: number) => {
-    stalls.count += 1;
-    stalls.totalMs += ms;
-    stalls.maxMs = Math.max(stalls.maxMs, ms);
+    for (const { stalls } of windows.values()) {
+      stalls.count += 1;
+      stalls.totalMs += ms;
+      stalls.maxMs = Math.max(stalls.maxMs, ms);
+    }
+  };
+  const addInteraction = (counted: boolean, ms: number) => {
+    for (const { interactions } of windows.values()) {
+      if (counted) interactions.count += 1;
+      interactions.maxMs = Math.max(interactions.maxMs, ms);
+    }
   };
 
   /**
@@ -361,9 +379,6 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   const start = () => {
     if (running) return;
     running = true;
-    windowStart = now();
-    stalls = { count: 0, totalMs: 0, maxMs: 0 };
-    interactions = { count: 0, maxMs: 0 };
     flushTimer = setInterval(() => void flush(), FLUSH_EVERY_MS);
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", onForegroundChange);
@@ -395,11 +410,10 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
         // 0 marks an event that is not part of an interaction (hover, scroll); older engines
         // have no `interactionId`, and every slow event counts there.
         if (entry.interactionId === 0) return;
-        if (entry.interactionId === undefined || entry.interactionId !== lastInteractionId) {
-          interactions.count += 1;
-          lastInteractionId = entry.interactionId ?? 0;
-        }
-        interactions.maxMs = Math.max(interactions.maxMs, entry.duration);
+        const counted =
+          entry.interactionId === undefined || entry.interactionId !== lastInteractionId;
+        if (counted) lastInteractionId = entry.interactionId ?? 0;
+        addInteraction(counted, entry.duration);
       });
     }
   };
@@ -465,13 +479,16 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     const sentAt = now();
     const carried = batch.renderErrors ?? [];
     try {
-      const result = (await send(environmentId, batch)) as
-        | { accepted?: unknown; reason?: unknown }
-        | undefined;
+      const result: unknown = await send(environmentId, batch);
       // Admitted, or refused as too frequent: either way the server's interval starts over.
       pacedAt.set(environmentId, sentAt);
-      // Not accepted without a reason: that server's profiler is off and will not record it.
-      if (result?.accepted === true || result?.reason === undefined) settle(environmentId, carried);
+      // Settled only on an explicit answer: `{ accepted: true }` recorded it, and
+      // `{ accepted: false }` with no reason is how the server says its profiler is off, so
+      // nothing is kept for it (R51). Any other answer, or none, keeps the record.
+      const answer = typeof result === "object" && result !== null ? result : null;
+      const accepted = answer !== null && "accepted" in answer ? answer.accepted : undefined;
+      const profilerOff = accepted === false && answer !== null && !("reason" in answer);
+      if (accepted === true || profilerOff) settle(environmentId, carried);
     } catch (error) {
       // A failed send waits the interval too, so a lost connection is not retried in a loop.
       pacedAt.set(environmentId, sentAt);
@@ -491,46 +508,42 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   const flush = async () => {
     if (windows.size === 0) return;
     const at = now();
-    const windowMs = Math.min(Math.max(at - windowStart, 0), MAX_WINDOW_MS);
-    windowStart = at;
-    // Capped like every duration, so one pathological window cannot get a batch rejected.
-    const clientWide = {
-      stalls: {
-        count: stalls.count,
-        totalMs: Math.min(stalls.totalMs, MAX_SAMPLE_MS),
-        maxMs: Math.min(stalls.maxMs, MAX_SAMPLE_MS),
-      },
-      interactions: {
-        count: interactions.count,
-        maxMs: Math.min(interactions.maxMs, MAX_SAMPLE_MS),
-      },
-    };
-    stalls = { count: 0, totalMs: 0, maxMs: 0 };
-    interactions = { count: 0, maxMs: 0 };
-    const quiet = clientWide.stalls.count === 0 && clientWide.interactions.count === 0;
     const heap = jsHeapBytes();
     const reports: Promise<void>[] = [];
     for (const [environmentId, window] of windows) {
       // While the previous batch is on the wire, or the server would refuse this one as too
-      // frequent, the window's records wait for the next one (still at most 64, the cap
-      // `complete` keeps) and the rest of the window is dropped.
-      const onTheWire = uploading.has(environmentId) || pacingWait(environmentId) > 0;
-      // A record still waiting for its frame goes out with a later batch.
-      const waiting = onTheWire
-        ? window.records
-        : window.records.filter((pending) => !pending.rendered);
-      windows.set(environmentId, {
-        recording: window.recording,
-        records: waiting,
-        histograms: new Map(),
-      });
-      if (onTheWire) continue;
+      // frequent, the whole window waits for a later batch: records (still at most 64, the
+      // cap `complete` keeps), histograms, stalls, interactions and its start.
+      if (uploading.has(environmentId) || pacingWait(environmentId) > 0) continue;
       // The Diagnostics page may have seen the environment refuse the profiler first.
       if (profilerRefused(environmentId)) {
         refused.add(environmentId);
         windows.delete(environmentId);
         continue;
       }
+      // A record still waiting for its frame goes out with a later batch.
+      windows.set(
+        environmentId,
+        newWindow(
+          window.recording,
+          at,
+          window.records.filter((pending) => !pending.rendered),
+        ),
+      );
+      const windowMs = Math.min(Math.max(at - window.startedAt, 0), MAX_WINDOW_MS);
+      // Capped like every duration, so one pathological window cannot get a batch rejected.
+      const clientWide = {
+        stalls: {
+          count: window.stalls.count,
+          totalMs: Math.min(window.stalls.totalMs, MAX_SAMPLE_MS),
+          maxMs: Math.min(window.stalls.maxMs, MAX_SAMPLE_MS),
+        },
+        interactions: {
+          count: window.interactions.count,
+          maxMs: Math.min(window.interactions.maxMs, MAX_SAMPLE_MS),
+        },
+      };
+      const quiet = clientWide.stalls.count === 0 && clientWide.interactions.count === 0;
       const records = window.records.filter((pending) => pending.rendered);
       const caught = [...(pendingRenderErrors.get(environmentId) ?? [])];
       if (quiet && records.length === 0 && window.histograms.size === 0 && caught.length === 0) {
@@ -611,7 +624,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
         if (!refused.has(environmentId) && !windows.has(environmentId)) {
           // A new recording: its requests in flight from before stay unmeasured.
           recordings += 1;
-          windows.set(environmentId, { recording: recordings, records: [], histograms: new Map() });
+          windows.set(environmentId, newWindow(recordings, now()));
         }
       }
       if (windows.size > 0) start();
