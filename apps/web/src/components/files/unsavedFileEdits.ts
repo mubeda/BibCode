@@ -32,10 +32,12 @@ let discardHolds: (() => void)[] = [];
  * without restarting. Saving is held and the installing dialog keeps edits out, so no edit made
  * during the install is lost when it restarts the app.
  */
-let updateInstall: { readonly release: () => void } | null = null;
+let updateInstall: { readonly holds: (() => void)[]; readonly release: () => void } | null = null;
 
 export function registerUnsavedSource(source: UnsavedSource): () => void {
   sources.add(source);
+  // A registry that mounts during the install is held like the ones that were there before it.
+  updateInstall?.holds.push(source.holdSavingForLeave());
   return () => {
     sources.delete(source);
   };
@@ -84,6 +86,7 @@ function blockForUpdateInstall(): void {
   if (updateInstall !== null) return;
   const holds = [...sources].map((source) => source.holdSavingForLeave());
   updateInstall = {
+    holds,
     release: () => {
       for (const release of holds) release();
     },
