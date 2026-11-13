@@ -115,12 +115,21 @@ function isRemoteInstallRunning(state: DesktopUpdateState | null | undefined): b
 }
 
 /**
- * A confirmed state starts or ends the block. Only a cleared requester ends it: between the allow
- * and the backup the phase still reads "available" with the requester set.
+ * A confirmed state starts or ends the block. Only a cleared requester outside protecting and
+ * installing ends it: between the allow and the backup the phase still reads "available" with the
+ * requester set, and a completed install clears the requester with the phase left at installing
+ * while the app restarts.
  */
 function settleInstallState(state: DesktopUpdateState | null | undefined): void {
   if (isRemoteInstallRunning(state)) blockForUpdateInstall();
-  else if (state?.requestedBy == null && updateInstall !== null) endUpdateInstall();
+  else if (
+    state?.requestedBy == null &&
+    state?.phase !== "protecting" &&
+    state?.phase !== "installing" &&
+    updateInstall !== null
+  ) {
+    endUpdateInstall();
+  }
 }
 
 const INSTALL_STATE_TIMEOUT_MS = 5_000;
@@ -321,7 +330,7 @@ export function respondToDesktopCloseRequests(
         resolve();
         return;
       }
-      stopAsking = askInstallState(
+      const stop = askInstallState(
         bridge as Pick<DesktopBridge, "getUpdateState">,
         (state) => {
           settleInstallState(state);
@@ -329,6 +338,11 @@ export function respondToDesktopCloseRequests(
         },
         resolve,
       );
+      // A push or an allow that stops this ask also settles a pending Check again.
+      stopAsking = () => {
+        stop();
+        resolve();
+      };
     });
   let active: {
     readonly requestId: number;

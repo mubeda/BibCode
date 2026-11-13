@@ -757,6 +757,46 @@ describe("UnsavedChangesCloseHost", () => {
       expect(dialogText()).toContain("Installing an update");
     });
 
+    it("a completed install that clears the requester keeps the dialog until the restart", async () => {
+      const completed: State = { requestedBy: null, phase: "installing" };
+      const answers: State[] = [notRunning, completed];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 11);
+      await act(async () => bridge.pushState!(completed));
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("a pushed state while Check again waits enables the button again", async () => {
+      const answers: (() => Promise<State>)[] = [async () => notRunning];
+      const bridge = stateBridge(() => answers.shift()?.() ?? new Promise<State>(() => {}));
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 12);
+      await click("Check again");
+      expect(button("Checking…").disabled).toBe(true);
+      await act(async () => bridge.pushState!(running));
+      await advance(0);
+      expect(button("Check again").disabled).toBe(false);
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    it("a pushed running remote install blocks a window that had no block", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      await loadWindow(bridge);
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      await act(async () => bridge.pushState!(running));
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
     it("an update state pushed after Discard on a quit keeps the Discard holds", async () => {
       const bridge = stateBridge(async () => notRunning);
       const loaded = await loadWindow(bridge);
