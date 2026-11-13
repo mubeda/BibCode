@@ -307,6 +307,90 @@ impl Repositories {
             .await
     }
 
+    /// Records that BiBCode created a worktree at `worktree_path`. A creation at a path that
+    /// still has a record replaces it with a new `record_id`.
+    pub async fn record_worktree_creation(
+        &self,
+        project_cwd: &str,
+        worktree_path: &str,
+    ) -> Result<()> {
+        let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO worktree_creation_records (worktree_path, project_cwd, created_at) \
+                     VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    params![worktree_path, project_cwd],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Deletes the creation record of a removed worktree, written under any project spelling.
+    pub async fn delete_worktree_creation_record(&self, worktree_path: &str) -> Result<()> {
+        let worktree_path = worktree_path.to_owned();
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM worktree_creation_records WHERE worktree_path = ?",
+                    [worktree_path],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Deletes exactly the creation record `record_id`, and never a later one at its path.
+    pub async fn reap_worktree_creation_record(&self, record_id: i64) -> Result<()> {
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM worktree_creation_records WHERE record_id = ?",
+                    [record_id],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list_worktree_creation_records(&self) -> Result<Vec<WorktreeCreationRecord>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT record_id, project_cwd, worktree_path FROM worktree_creation_records \
+                         ORDER BY worktree_path",
+                    )?
+                    .query_map([], |row| {
+                        Ok(WorktreeCreationRecord {
+                            record_id: row.get(0)?,
+                            project_cwd: row.get(1)?,
+                            worktree_path: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    /// The worktree paths of removals that were prepared and never completed, in every project.
+    pub async fn list_incomplete_worktree_removal_paths(&self) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT DISTINCT worktree_path FROM worktree_removal_receipts \
+                         WHERE state = 'prepared' ORDER BY worktree_path",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn upsert_checkpoint_diff_blob(&self, row: CheckpointDiffBlob) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
@@ -442,13 +526,13 @@ impl Repositories {
     pub async fn upsert_project(&self, row: ProjectionProject) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at, repository_identity_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (project_id) DO UPDATE SET \
                    title=excluded.title, workspace_root=excluded.workspace_root, \
                    default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, worktree_discovery_json=excluded.worktree_discovery_json, \
-                   created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, repository_identity_json=excluded.repository_identity_json",
-                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at, optional_json(&row.repository_identity)?],
+                   created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, repository_identity_json=excluded.repository_identity_json, code_review_prompt=excluded.code_review_prompt",
+                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at, optional_json(&row.repository_identity)?, row.code_review_prompt],
             )?; Ok(())
         }).await
     }
@@ -872,11 +956,11 @@ impl Repositories {
     pub async fn upsert_thread(&self, row: ProjectionThread) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, side_chat) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, side_chat, code_review) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (thread_id) DO UPDATE SET \
-                   project_id=excluded.project_id, title=excluded.title, kind=excluded.kind, model_selection_json=excluded.model_selection_json, runtime_mode=excluded.runtime_mode, interaction_mode=excluded.interaction_mode, branch=excluded.branch, worktree_path=excluded.worktree_path, latest_turn_id=excluded.latest_turn_id, created_at=excluded.created_at, updated_at=excluded.updated_at, archived_at=excluded.archived_at, latest_user_message_at=excluded.latest_user_message_at, pending_approval_count=excluded.pending_approval_count, pending_user_input_count=excluded.pending_user_input_count, has_actionable_proposed_plan=excluded.has_actionable_proposed_plan, deleted_at=excluded.deleted_at, host_thread_id=excluded.host_thread_id, side_chat=excluded.side_chat",
-                params![row.thread_id,row.project_id,row.title,row.kind,encode_json(&row.model_selection)?,row.runtime_mode,row.interaction_mode,row.branch,row.worktree_path,row.latest_turn_id,row.created_at,row.updated_at,row.archived_at,row.latest_user_message_at,row.pending_approval_count,row.pending_user_input_count,row.has_actionable_proposed_plan,row.deleted_at,row.host_thread_id,row.side_chat],
+                   project_id=excluded.project_id, title=excluded.title, kind=excluded.kind, model_selection_json=excluded.model_selection_json, runtime_mode=excluded.runtime_mode, interaction_mode=excluded.interaction_mode, branch=excluded.branch, worktree_path=excluded.worktree_path, latest_turn_id=excluded.latest_turn_id, created_at=excluded.created_at, updated_at=excluded.updated_at, archived_at=excluded.archived_at, latest_user_message_at=excluded.latest_user_message_at, pending_approval_count=excluded.pending_approval_count, pending_user_input_count=excluded.pending_user_input_count, has_actionable_proposed_plan=excluded.has_actionable_proposed_plan, deleted_at=excluded.deleted_at, host_thread_id=excluded.host_thread_id, side_chat=excluded.side_chat, code_review=excluded.code_review",
+                params![row.thread_id,row.project_id,row.title,row.kind,encode_json(&row.model_selection)?,row.runtime_mode,row.interaction_mode,row.branch,row.worktree_path,row.latest_turn_id,row.created_at,row.updated_at,row.archived_at,row.latest_user_message_at,row.pending_approval_count,row.pending_user_input_count,row.has_actionable_proposed_plan,row.deleted_at,row.host_thread_id,row.side_chat,row.code_review],
             )?; Ok(())
         }).await
     }
@@ -3472,6 +3556,13 @@ pub(crate) fn finalize_command_receipt_on(
         Err(PersistenceError::CommandReceiptConflict(command_id))
     }
 }
+/// A worktree BiBCode created, as `worktree_creation_records` stores it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeCreationRecord {
+    pub record_id: i64,
+    pub project_cwd: String,
+    pub worktree_path: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeRemovalReceipt {
     pub owner_thread_id: String,
@@ -3515,6 +3606,9 @@ pub struct ProjectionProject {
     pub updated_at: Timestamp,
     pub deleted_at: Option<Timestamp>,
     pub repository_identity: Option<Value>,
+    /// The project's review prompt (#293); `""` falls through to the user's and the built-in one.
+    #[serde(default)]
+    pub code_review_prompt: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3568,6 +3662,9 @@ pub struct ProjectionThread {
     /// carries the host's messages, and it captures no checkpoints.
     #[serde(default)]
     pub side_chat: bool,
+    /// A `panel` thread started as a code review (#293): it offers no Implement.
+    #[serde(default)]
+    pub code_review: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4091,8 +4188,8 @@ pub struct AuthSession {
     pub mcp_named_client: Option<McpNamedClient>,
 }
 
-const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat FROM projection_threads";
+const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt FROM projection_projects";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
@@ -5043,6 +5140,7 @@ fn decode_project(row: &Row<'_>) -> rusqlite::Result<ProjectionProject> {
         updated_at: row.get(8)?,
         deleted_at: row.get(9)?,
         repository_identity: decode_optional_json(row.get(10)?, "repository_identity_json")?,
+        code_review_prompt: row.get(11)?,
     })
 }
 fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
@@ -5072,6 +5170,7 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         last_activity_at: row.get(22)?,
         requester: decode_optional_json(row.get(23)?, "requester_json")?,
         side_chat: row.get(24)?,
+        code_review: row.get(25)?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
@@ -5571,6 +5670,155 @@ mod activity_order_tests {
         assert!(
             !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
             "{plan:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worktree_creation_record_tests {
+    use super::*;
+    use crate::persistence::run_migrations;
+
+    async fn migrated(database: Database) -> Repositories {
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        Repositories::new(database)
+    }
+
+    async fn recorded_paths(repositories: &Repositories) -> Vec<String> {
+        repositories
+            .list_worktree_creation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = Database::create_new(&path).await.unwrap();
+        let repositories = migrated(database.clone()).await;
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        drop(repositories);
+        database.close().await;
+
+        let reopened = migrated(Database::open_existing(&path).await.unwrap()).await;
+        let records = reopened.list_worktree_creation_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].project_cwd, "/repo");
+        assert_eq!(records[0].worktree_path, "/worktrees/feature-a");
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_is_idempotent() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for _ in 0..2 {
+            repositories
+                .record_worktree_creation("/repo", "/worktrees/feature-a")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_of_a_recreation_replaces_the_earlier_one() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        let first = repositories.list_worktree_creation_records().await.unwrap();
+        repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        let second = repositories.list_worktree_creation_records().await.unwrap();
+        assert_eq!(second.len(), 1, "one record per path: {second:?}");
+        assert_ne!(
+            first[0].record_id, second[0].record_id,
+            "a new creation is a new record"
+        );
+
+        repositories
+            .reap_worktree_creation_record(first[0].record_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-a"],
+            "reaping the earlier record keeps the later one"
+        );
+        repositories
+            .reap_worktree_creation_record(second[0].record_id)
+            .await
+            .unwrap();
+        assert!(recorded_paths(&repositories).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_delete_removes_only_that_path() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for (project, path) in [
+            ("/repo/", "/worktrees/feature-a"),
+            ("/repo", "/worktrees/feature-b"),
+        ] {
+            repositories
+                .record_worktree_creation(project, path)
+                .await
+                .unwrap();
+        }
+        // The worktree path alone names the record, however the project root is spelled.
+        repositories
+            .delete_worktree_creation_record("/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            ["/worktrees/feature-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_removal_paths_do_not_depend_on_the_project_spelling() {
+        let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
+        for (owner, project, path) in [
+            ("thread-a", "/repo/", "/worktrees/feature-a"),
+            ("thread-b", "/repo", "/worktrees/feature-b"),
+        ] {
+            repositories
+                .prepare_worktree_removal_receipt(WorktreeRemovalReceipt {
+                    owner_thread_id: owner.to_owned(),
+                    project_cwd: project.to_owned(),
+                    worktree_path: path.to_owned(),
+                    identity_nonce: format!("nonce-{owner}"),
+                    state: "prepared".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            repositories
+                .list_incomplete_worktree_removal_paths()
+                .await
+                .unwrap(),
+            ["/worktrees/feature-a", "/worktrees/feature-b"]
         );
     }
 }

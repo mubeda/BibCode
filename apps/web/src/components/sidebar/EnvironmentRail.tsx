@@ -43,7 +43,7 @@ const RAIL_BUTTON_CLASS =
 // the rail's `bg-sidebar` is not a theme color token, so an offset would paint
 // its gap in the default ring-offset color.
 const RAIL_BUTTON_SELECTED_CLASS =
-  "bg-accent text-foreground ring-2 ring-primary before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
+  "bg-selected text-selected-foreground ring-2 ring-primary before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
 
 export function EnvironmentStatusDot({
   status,

@@ -1,5 +1,6 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
+  type DefaultAgentSelection,
   GitSignInRequiredError,
   type GitActionProgressEvent,
   type GitManagerOperationEvent,
@@ -7,6 +8,7 @@ import {
   type GitManagerRefEntry,
   type GitRunStackedActionInput,
   type GitStackedAction,
+  type ProjectId,
   type ScopedProjectRef,
   type ScopedThreadRef,
   type VcsPullInput,
@@ -28,6 +30,7 @@ import {
   GitCommitIcon,
   ListChecksIcon,
   ListIcon,
+  ScanSearchIcon,
   SparklesIcon,
   SquareIcon,
   Undo2Icon,
@@ -43,8 +46,17 @@ import {
   DialogPopup,
   DialogTitle,
 } from "~/components/ui/dialog";
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
+import {
+  Menu,
+  MenuGroup,
+  MenuGroupLabel,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuTrigger,
+} from "~/components/ui/menu";
 import { Spinner } from "~/components/ui/spinner";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { Textarea } from "~/components/ui/textarea";
 import { stackedThreadToast, toastManager, type ThreadToastData } from "~/components/ui/toast";
 import { GitSignInPrompt } from "~/components/gitSignIn/GitSignInPrompt";
@@ -111,7 +123,11 @@ import {
   ignoreFileNamePattern,
   ignoreParentFolderPattern,
   isFileStaged,
+  type CodeReviewScope,
+  codeReviewTooltip,
   type PendingDiscard,
+  resolveCodeReviewButtonState,
+  resolveCodeReviewScope,
   resolveDiscardDialogCopy,
   resolveStagingToggleAction,
   resolveVsBaseLabel,
@@ -125,6 +141,9 @@ import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog"
 import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
 import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
+import { CodeReviewInstructionsDialog } from "./sourceControl/CodeReviewInstructionsDialog";
+import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
+import { CODE_REVIEW_SERVER_UPDATE_REASON, type CodeReviewMenuReviewer } from "~/codeReview";
 import {
   GitManagerCreatePullRequestDialog,
   type GitManagerCreatePullRequestDialogProps,
@@ -137,6 +156,23 @@ interface SourceControlPanelProps {
   workspaceUnavailable?: string | null;
   /** The thread's project; Git Manager operations (fetch, merge) are scoped to it. */
   projectRef?: ScopedProjectRef | null;
+  /** "Review changes" (#293); absent hides the button. */
+  codeReview?: {
+    readonly unavailableReason: string | null;
+    readonly guardLine: string | null;
+    /** `reviewer` is a one-off pick from the review menu; absent means the saved reviewer. */
+    readonly onStart: (
+      scope: CodeReviewScope,
+      reviewer?: DefaultAgentSelection,
+      instructions?: string,
+    ) => string | null | undefined;
+    /** The reviewers the review menu offers for one review (R103). */
+    readonly reviewers?: ReadonlyArray<CodeReviewMenuReviewer>;
+    /** The thread's project, whose review prompt the menu edits; `null` hides the menu. */
+    readonly projectId: ProjectId | null;
+    readonly projectPrompt: string;
+    readonly userPrompt: string;
+  } | null;
 }
 
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
@@ -187,6 +223,7 @@ export default function SourceControlPanel({
   gitCwd,
   workspaceUnavailable = null,
   projectRef = null,
+  codeReview = null,
 }: SourceControlPanelProps) {
   const environmentId = threadRef.environmentId;
   const scope = useMemo(() => ({ environmentId, cwd: gitCwd }), [environmentId, gitCwd]);
@@ -354,6 +391,35 @@ export default function SourceControlPanel({
   const isDefaultRef = status?.isDefaultRef ?? false;
   const hasPrimaryRemote = status?.hasPrimaryRemote ?? false;
   const vsBaseLabel = useMemo(() => resolveVsBaseLabel(status), [status]);
+  const [reviewPromptDialogOpen, setReviewPromptDialogOpen] = useState(false);
+  const [reviewInstructionsOpen, setReviewInstructionsOpen] = useState(false);
+  // An older server would drop the project prompt without an error (D47).
+  const codeReviewsSupported = capabilities?.codeReviews === true;
+  // Read once at the click: a later status change does not alter a started review.
+  const codeReviewScope = useMemo(() => resolveCodeReviewScope(status), [status]);
+  const codeReviewUnavailableReason = codeReview?.unavailableReason ?? null;
+  const codeReviewButton = useMemo(
+    () =>
+      resolveCodeReviewButtonState({
+        status,
+        scope: codeReviewScope,
+        unavailableReason: codeReviewUnavailableReason,
+      }),
+    [codeReviewScope, codeReviewUnavailableReason, status],
+  );
+  const codeReviewMenuReviewers = codeReview?.reviewers;
+  const codeReviewMenuItems = useMemo(
+    () =>
+      (codeReviewMenuReviewers ?? []).map((reviewer) => ({
+        reviewer,
+        state: resolveCodeReviewButtonState({
+          status,
+          scope: codeReviewScope,
+          unavailableReason: reviewer.disabledReason,
+        }),
+      })),
+    [codeReviewMenuReviewers, codeReviewScope, status],
+  );
 
   // Legacy servers (no staging areas) keep the chat-header cascade
   // (commit_push-first, commit-by-filePaths). The primary button and dropdown
@@ -1093,6 +1159,102 @@ export default function SourceControlPanel({
           {status.behindCount > 0 ? `↓${status.behindCount}` : ""}
         </span>
       ) : null}
+      {codeReview ? (
+        <Tooltip>
+          {/* Stays focusable while disabled, so its tooltip can say why. */}
+          <TooltipTrigger
+            render={
+              <Button
+                aria-disabled={codeReviewButton.disabled}
+                aria-label="Review changes"
+                className={cn("ml-auto shrink-0", codeReviewButton.disabled && "opacity-64")}
+                size="icon-xs"
+                variant="ghost"
+                onClick={() => {
+                  if (!codeReviewButton.disabled && codeReviewScope) {
+                    codeReview.onStart(codeReviewScope);
+                  }
+                }}
+              />
+            }
+          >
+            <ScanSearchIcon aria-hidden="true" className="size-3.5" />
+          </TooltipTrigger>
+          <TooltipPopup side="bottom">
+            {codeReviewButton.reason ?? (
+              <>
+                <span className="block">
+                  {codeReviewScope ? codeReviewTooltip(codeReviewScope) : "Review changes"}
+                </span>
+                {codeReview.guardLine ? (
+                  <span className="block text-muted-foreground">{codeReview.guardLine}</span>
+                ) : null}
+              </>
+            )}
+          </TooltipPopup>
+        </Tooltip>
+      ) : null}
+      {codeReview ? (
+        <Menu>
+          <MenuTrigger
+            render={<Button aria-label="Review options" size="icon-xs" variant="ghost" />}
+          >
+            <ChevronDownIcon aria-hidden="true" className="size-3.5" />
+          </MenuTrigger>
+          <MenuPopup align="end">
+            <MenuItem
+              disabled={codeReviewButton.disabled}
+              onClick={() => {
+                if (!codeReviewButton.disabled) setReviewInstructionsOpen(true);
+              }}
+            >
+              <span className="flex flex-col">
+                <span>Review with instructions…</span>
+                {codeReviewButton.reason ? (
+                  <span className="text-xs text-muted-foreground">{codeReviewButton.reason}</span>
+                ) : null}
+              </span>
+            </MenuItem>
+            {codeReviewMenuItems.length > 0 ? <MenuSeparator /> : null}
+            {codeReviewMenuItems.length > 0 ? (
+              <MenuGroup>
+                <MenuGroupLabel>Review once with</MenuGroupLabel>
+                {codeReviewMenuItems.map(({ reviewer, state }) => (
+                  <MenuItem
+                    key={reviewer.value}
+                    disabled={state.disabled}
+                    onClick={() => {
+                      if (!state.disabled && codeReviewScope) {
+                        codeReview.onStart(codeReviewScope, reviewer.selection);
+                      }
+                    }}
+                  >
+                    <span className="flex flex-col">
+                      <span>{reviewer.label}</span>
+                      {/* A disabled reviewer says why in place of its guard line. */}
+                      <span className="text-xs text-muted-foreground">
+                        {state.reason ?? reviewer.guardLine}
+                      </span>
+                    </span>
+                  </MenuItem>
+                ))}
+              </MenuGroup>
+            ) : null}
+            {codeReview.projectId ? (
+              <>
+                <MenuSeparator />
+                <MenuItem
+                  disabled={!codeReviewsSupported}
+                  {...(codeReviewsSupported ? {} : { title: CODE_REVIEW_SERVER_UPDATE_REASON })}
+                  onClick={() => setReviewPromptDialogOpen(true)}
+                >
+                  Review prompt for this project…
+                </MenuItem>
+              </>
+            ) : null}
+          </MenuPopup>
+        </Menu>
+      ) : null}
     </div>
   );
 
@@ -1566,6 +1728,28 @@ export default function SourceControlPanel({
           </div>
         ) : null}
       </div>
+
+      {codeReview ? (
+        <CodeReviewInstructionsDialog
+          open={reviewInstructionsOpen}
+          onOpenChange={setReviewInstructionsOpen}
+          onStart={(instructions) => {
+            // The scope at Start, as the button reads it at its click.
+            if (codeReviewButton.disabled || !codeReviewScope) return null;
+            return codeReview.onStart(codeReviewScope, undefined, instructions);
+          }}
+        />
+      ) : null}
+      {codeReview?.projectId ? (
+        <CodeReviewProjectPromptDialog
+          open={reviewPromptDialogOpen}
+          onOpenChange={setReviewPromptDialogOpen}
+          environmentId={environmentId}
+          projectId={codeReview.projectId}
+          projectPrompt={codeReview.projectPrompt}
+          userPrompt={codeReview.userPrompt}
+        />
+      ) : null}
 
       {pendingPullRequest !== null &&
       pendingPullRequest.scope.environmentId === environmentId &&

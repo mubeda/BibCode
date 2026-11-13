@@ -88,7 +88,7 @@ function WorkspaceMoreChatsPopup(
 }
 
 const ROW_CLASS =
-  "flex h-7 w-full min-w-0 items-center rounded-sm px-2 text-left text-[13px] text-foreground/80 hover:bg-accent focus-visible:bg-accent focus-visible:outline-hidden";
+  "flex h-7 w-full min-w-0 items-center rounded-sm px-2 text-left text-[13px] text-popover-foreground hover:bg-accent focus-visible:bg-accent focus-visible:outline-hidden";
 
 /**
  * The checkout's chats: the shell's, then a row that loads the left-out ones a page at a time,

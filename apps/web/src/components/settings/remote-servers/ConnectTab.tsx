@@ -55,6 +55,7 @@ import {
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
+import { useOpenHostDashboard } from "~/state/hostDashboard";
 import {
   remoteUpdateEnvironment,
   useRemoteUpdateCheckState,
@@ -190,6 +191,7 @@ function RemoteServerRow({
   const isConnected = connectionState === "connected";
   const isDisconnected = connectionState === "available" || connectionState === "offline";
   const isConnecting = connectionState === "connecting" || connectionState === "reconnecting";
+  const openHostDashboard = useOpenHostDashboard();
   const stateDotClassName =
     connectionState === "connected"
       ? "bg-success"
@@ -454,6 +456,11 @@ function RemoteServerRow({
                 Dismiss
               </Button>
             </>
+          ) : null}
+          {isConnected ? (
+            <Button size="xs" variant="outline" onClick={() => openHostDashboard(environmentId)}>
+              Host dashboard
+            </Button>
           ) : null}
           {isWslEnvironment ? (
             <Tooltip>

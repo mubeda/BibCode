@@ -78,9 +78,17 @@ const TOAST_ICONS = {
   warning: TriangleAlertIcon,
 } as const;
 
+/** Multi-line text (e.g. guidance, a blank line, then Git's own line) keeps its breaks and scrolls past ~6 lines instead of being clamped. */
+function isMultiLineDescription(description: unknown): description is string {
+  return typeof description === "string" && description.includes("\n");
+}
+
 /** Visually shorten long error bodies; clipboard copy still uses the full `description` string. */
 const ERROR_DESCRIPTION_CLAMP_MIN_CHARS = 180;
 function errorDescriptionClampClass(type: unknown, description: unknown): string | undefined {
+  if (isMultiLineDescription(description)) {
+    return "whitespace-pre-line";
+  }
   if (type !== "error" || typeof description !== "string") {
     return undefined;
   }
@@ -202,6 +210,15 @@ function ToastBodyContent({
   const leadingIcon = toastData?.leadingIcon;
   const { className: secondaryActionClassName, ...secondaryActionRest } =
     secondaryActionProps ?? {};
+  const description = (
+    <Toast.Description
+      className={cn(
+        "min-w-0 select-text wrap-break-word text-muted-foreground",
+        errorDescriptionClampClass(toastType, toastDescription),
+      )}
+      data-slot="toast-description"
+    />
+  );
 
   return (
     <>
@@ -228,13 +245,21 @@ function ToastBodyContent({
           )}
         >
           <Toast.Title className="min-w-0 wrap-break-word font-medium" data-slot="toast-title" />
-          <Toast.Description
-            className={cn(
-              "min-w-0 select-text wrap-break-word text-muted-foreground",
-              errorDescriptionClampClass(toastType, toastDescription),
-            )}
-            data-slot="toast-description"
-          />
+          {isMultiLineDescription(toastDescription) ? (
+            // The label sits here, not on the description, so the toast's aria-describedby still reads the text.
+            <div
+              aria-label={toastType === "error" ? "Error details" : "Details"}
+              className="max-h-32 overflow-y-auto rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+              // A touch drag here scrolls the text; without this Base UI reads it as swipe-to-dismiss.
+              data-base-ui-swipe-ignore
+              role="group"
+              tabIndex={0}
+            >
+              {description}
+            </div>
+          ) : (
+            description
+          )}
         </div>
       </div>
       {hasTrailingControls ? (

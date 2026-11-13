@@ -8,7 +8,7 @@ import {
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
-import type { Dispatch, ReactElement, SetStateAction } from "react";
+import { type Dispatch, type ReactElement, type SetStateAction } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -123,6 +123,7 @@ const testState = vi.hoisted(() => ({
   primaryEnvironmentId: null as unknown,
   pullRequestBranchSelection: true,
   mergeCapabilities: true,
+  codeReviews: true,
   runGitManagerOperation: vi.fn(),
   availableEditors: [] as string[],
   preferredEditor: null as string | null,
@@ -226,6 +227,24 @@ const captured = vi.hoisted(() => ({
   },
 }));
 
+const reviewPromptDialog = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+vi.mock("./sourceControl/CodeReviewProjectPromptDialog", () => ({
+  CodeReviewProjectPromptDialog: (props: Record<string, unknown>) => {
+    reviewPromptDialog.props = props;
+    return null;
+  },
+}));
+
+const reviewInstructionsDialog = vi.hoisted(() => ({
+  props: null as Record<string, unknown> | null,
+}));
+vi.mock("./sourceControl/CodeReviewInstructionsDialog", () => ({
+  CodeReviewInstructionsDialog: (props: Record<string, unknown>) => {
+    reviewInstructionsDialog.props = props;
+    return null;
+  },
+}));
+
 vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
   GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
     captured.createPullRequest = props;
@@ -320,6 +339,7 @@ vi.mock("~/state/entities", () => ({
           gitPullRequestBranchSelection: testState.pullRequestBranchSelection,
           gitManagerStashMergeOperations: testState.mergeCapabilities,
           gitManagerBranchSyncOperations: testState.mergeCapabilities,
+          codeReviews: testState.codeReviews,
         },
       },
     }),
@@ -442,6 +462,17 @@ vi.mock("~/components/ui/button", () => ({
   },
 }));
 
+vi.mock("~/components/ui/tooltip", () => ({
+  Tooltip: (props: { children?: unknown }) => <>{props.children as never}</>,
+  TooltipTrigger: (props: { render: ReactElement; children?: unknown }) => {
+    const Trigger = props.render.type as (input: Record<string, unknown>) => ReactElement;
+    return Trigger({ ...(props.render.props as object), children: props.children });
+  },
+  TooltipPopup: (props: { children?: unknown }) => (
+    <div data-testid="tooltip">{props.children as never}</div>
+  ),
+}));
+
 vi.mock("~/components/ui/dialog", () => ({
   Dialog: (props: CapturedDialogProps) => {
     captured.dialogs.push(props);
@@ -467,6 +498,8 @@ vi.mock("~/components/ui/menu", () => ({
   ),
   MenuPopup: (props: { children?: unknown }) => <div>{props.children as never}</div>,
   MenuSeparator: () => <hr data-testid="menu-separator" />,
+  MenuGroup: (props: { children?: unknown }) => <div>{props.children as never}</div>,
+  MenuGroupLabel: (props: { children?: unknown }) => <div>{props.children as never}</div>,
   MenuItem: (props: CapturedMenuItemProps) => {
     captured.menuItems.push(props);
     return (
@@ -717,6 +750,7 @@ beforeEach(() => {
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
   testState.pullRequestBranchSelection = true;
   testState.mergeCapabilities = true;
+  testState.codeReviews = true;
   testState.runGitManagerOperation = vi.fn(() => ({
     result: new Promise(() => undefined),
     cancel: vi.fn(),
@@ -748,6 +782,17 @@ beforeEach(() => {
   testState.toast.update.mockReset();
   testState.toast.close.mockReset();
 });
+
+const REMOTE_PUSH_GUIDANCE =
+  "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+const GIT_USERNAME_LINE =
+  "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
+
+/** The failure toast's description is the raw string; the shared toast renders the line breaks. */
+function expectMultiLineDescription(description: unknown): void {
+  expect(description).toBe(REMOTE_PUSH_FAILURE);
+}
 
 describe("SourceControlPanel", () => {
   it("pushes before opening the merge request review, and cancel does no further work", async () => {
@@ -1080,6 +1125,227 @@ describe("SourceControlPanel", () => {
       (testState.localApi as { shell: unknown }).shell,
       "https://example.com/pr/7",
     );
+  });
+
+  describe("Review changes (R90)", () => {
+    const GUARD = "Starts in Claude's plan mode.";
+    const reviewProps = (unavailableReason: string | null = null, onStart = vi.fn()) =>
+      buildProps({
+        codeReview: {
+          unavailableReason,
+          guardLine: GUARD,
+          onStart,
+          projectId: "project-1" as never,
+          projectPrompt: "",
+          userPrompt: "",
+        },
+      });
+    const reviewButton = () =>
+      captured.buttons.find((button) => button["aria-label"] === "Review changes");
+    const tooltipText = (markup: string) =>
+      [...markup.matchAll(/data-testid="tooltip">(.*?)<\/div>/g)].map((match) =>
+        match[1]!.replaceAll("&#x27;", "'"),
+      );
+
+    it("is absent without a review handler", () => {
+      render(buildProps());
+      expect(reviewButton()).toBeUndefined();
+    });
+
+    it("is enabled for a dirty tree and names the guard", () => {
+      testState.statusQuery.data = stagingStatus({
+        refName: "main",
+        isDefaultRef: true,
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+      });
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      expect(reviewButton()).toBeDefined();
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(false);
+      expect(tooltipText(markup).join("|")).toContain("Review uncommitted changes");
+      expect(tooltipText(markup).join("|")).toContain(GUARD);
+      reviewButton()!.onClick!();
+      expect(onStart).toHaveBeenCalledWith({ kind: "uncommitted", base: "origin/main" });
+    });
+
+    it("is enabled for a clean branch with commits ahead and starts a branch review", () => {
+      testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 2 });
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      // R104: the scope and base, then the guard line.
+      expect(tooltipText(markup)).toEqual([
+        `<span class="block">Review branch vs origin/main and uncommitted changes</span><span class="block text-muted-foreground">${GUARD}</span>`,
+      ]);
+      reviewButton()!.onClick!();
+      expect(onStart).toHaveBeenCalledWith({ kind: "branch", base: "origin/main" });
+    });
+
+    it.each([
+      ["nothing to review", () => status({ defaultRefName: "main", aheadOfDefaultCount: 0 })],
+      ["no count ahead from the server", () => status({ defaultRefName: "main" })],
+    ])("is disabled with %s", (_name, makeStatus) => {
+      testState.statusQuery.data = makeStatus();
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain("No changes to review");
+      reviewButton()!.onClick!();
+      expect(onStart).not.toHaveBeenCalled();
+    });
+
+    it("is disabled while the first status loads", () => {
+      testState.statusQuery = { data: null, error: null, isPending: true, refresh: vi.fn() };
+      const markup = render(reviewProps());
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain("Checking for changes");
+    });
+
+    it("opens the project review prompt dialog from the review menu (R100)", () => {
+      render(
+        buildProps({
+          codeReview: {
+            unavailableReason: null,
+            guardLine: GUARD,
+            onStart: vi.fn(),
+            projectId: "project-1" as never,
+            projectPrompt: "Our rules",
+            userPrompt: "User rules",
+          },
+        }),
+      );
+      expect(reviewPromptDialog.props?.["open"]).toBe(false);
+      const item = menuItemByText("Review prompt for this project…");
+      expect(item?.disabled).toBe(false);
+      item!.onClick!();
+      rerender();
+      expect(reviewPromptDialog.props).toMatchObject({
+        open: true,
+        environmentId: ENVIRONMENT_ID,
+        projectId: "project-1",
+        projectPrompt: "Our rules",
+        userPrompt: "User rules",
+      });
+    });
+
+    it("disables the project prompt on a server without code reviews", () => {
+      testState.codeReviews = false;
+      render(reviewProps());
+      const item = menuItemByText("Review prompt for this project…");
+      expect(item?.disabled).toBe(true);
+      expect(item?.title).toBe("Update the BiBCode server on this environment to use Review.");
+    });
+
+    describe("one-off reviewers in the review menu (R103)", () => {
+      const WINDOWS_REASON =
+        "Terminal reviews are off on Windows for now. Pick a chat reviewer in Settings → Agents.";
+      const CLAUDE_TERMINAL = { kind: "terminal", instanceId: "claudeAgent" } as never;
+      const CODEX_TERMINAL = { kind: "terminal", instanceId: "codex" } as never;
+      const reviewerProps = (onStart = vi.fn()) =>
+        buildProps({
+          codeReview: {
+            unavailableReason: null,
+            guardLine: GUARD,
+            onStart,
+            projectId: "project-1" as never,
+            projectPrompt: "",
+            userPrompt: "",
+            reviewers: [
+              {
+                value: "terminal:claudeAgent",
+                label: "Claude Terminal",
+                selection: CLAUDE_TERMINAL,
+                guardLine: GUARD,
+                disabledReason: null,
+              },
+              {
+                value: "terminal:codex",
+                label: "Codex Terminal",
+                selection: CODEX_TERMINAL,
+                guardLine: "Runs in Codex's read-only sandbox.",
+                disabledReason: WINDOWS_REASON,
+              },
+            ],
+          },
+        });
+
+      it("lists each reviewer with its guard line and starts the picked one", () => {
+        testState.statusQuery.data = stagingStatus({ defaultRefName: "main" });
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Claude Terminal");
+        expect(item?.disabled).toBe(false);
+        expect(flattenText(item?.children)).toContain(GUARD);
+        item!.onClick!();
+        expect(onStart).toHaveBeenCalledWith(
+          { kind: "uncommitted", base: "origin/main" },
+          CLAUDE_TERMINAL,
+        );
+      });
+
+      it("shows a disabled reviewer's reason in place of its guard line and starts nothing", () => {
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Codex Terminal");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain(WINDOWS_REASON);
+        expect(flattenText(item?.children)).not.toContain("read-only sandbox");
+        item!.onClick?.();
+        expect(onStart).not.toHaveBeenCalled();
+      });
+
+      it("disables every reviewer with the reason while there is nothing to review", () => {
+        testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 0 });
+        const onStart = vi.fn();
+        render(reviewerProps(onStart));
+        const item = menuItemByText("Claude Terminal");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain("No changes to review");
+        item!.onClick?.();
+        expect(onStart).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("Review with instructions (R105)", () => {
+      it("opens the instructions dialog and starts the saved reviewer with them", () => {
+        testState.statusQuery.data = stagingStatus({ defaultRefName: "main" });
+        const onStart = vi.fn();
+        render(reviewProps(null, onStart));
+        expect(reviewInstructionsDialog.props?.["open"]).toBe(false);
+        const item = menuItemByText("Review with instructions…");
+        expect(item?.disabled).toBe(false);
+        item!.onClick!();
+        rerender();
+        expect(reviewInstructionsDialog.props?.["open"]).toBe(true);
+        (reviewInstructionsDialog.props!["onStart"] as (extra: string) => void)(
+          "Focus on the parser.",
+        );
+        expect(onStart).toHaveBeenCalledWith(
+          { kind: "uncommitted", base: "origin/main" },
+          undefined,
+          "Focus on the parser.",
+        );
+      });
+
+      it("is disabled with the button's reason", () => {
+        testState.statusQuery.data = status({ defaultRefName: "main", aheadOfDefaultCount: 0 });
+        render(reviewProps());
+        const item = menuItemByText("Review with instructions…");
+        expect(item?.disabled).toBe(true);
+        expect(flattenText(item?.children)).toContain("No changes to review");
+      });
+    });
+
+    it("shows the unavailable reason first", () => {
+      const reason = "Update the BiBCode server on this environment to use Review.";
+      const onStart = vi.fn();
+      const markup = render(reviewProps(reason, onStart));
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(tooltipText(markup)).toContain(reason);
+      expect(tooltipText(markup).join("|")).not.toContain(GUARD);
+      reviewButton()!.onClick!();
+      expect(onStart).not.toHaveBeenCalled();
+    });
   });
 
   it("groups files into staged, unstaged and untracked sections", () => {
@@ -1578,6 +1844,33 @@ describe("SourceControlPanel", () => {
       "toast-1",
       expect.objectContaining({ title: "Commit failed", description: gitError }),
     );
+  });
+
+  it("a failed push from the panel shows the guidance and Git's own line", async () => {
+    testState.runAction.mockImplementationOnce(async (input: { actionId: string }) =>
+      AsyncResult.failure(
+        Cause.fail(
+          new VcsActionRemoteFailureError({
+            actionId: input.actionId,
+            transportActionId: input.actionId,
+            action: "commit_push",
+            environmentId: ENVIRONMENT_ID,
+            cwd: "/repo",
+            phase: "push",
+            remoteMessage: REMOTE_PUSH_FAILURE,
+          }),
+        ),
+      ),
+    );
+    render(buildProps());
+
+    buttonsByText("Commit (1)")[0]?.onClick?.();
+    await flushPromises();
+    expect(testState.toast.update).toHaveBeenLastCalledWith(
+      "toast-1",
+      expect.objectContaining({ type: "error", title: "Push failed" }),
+    );
+    expectMultiLineDescription(testState.toast.update.mock.calls.at(-1)?.[1].description);
   });
 
   it("renders the legacy flat section and commits by explicit file paths", async () => {

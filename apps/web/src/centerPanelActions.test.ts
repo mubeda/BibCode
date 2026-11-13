@@ -927,3 +927,109 @@ describe("side chats", () => {
     expect(h.drafts.get(hostRef.threadId)?.prompt).toBe(`${submittedText} and more`);
   });
 });
+
+describe("prompted chat panels (code reviews)", () => {
+  const claude = { instanceId: ProviderInstanceId.make("claudeAgent"), model: "opus" };
+  const prompt = "Code review requested from BiBCode. Do not edit files. Scope: x.\n\nReview.";
+  const review = () => ({
+    hostRef,
+    projectId: ProjectId.make("project-1"),
+    modelSelection: claude,
+    providerLabel: "Claude",
+    label: "Code review · Claude",
+    prompt,
+    runtimeMode: "approval-required" as const,
+    interactionMode: "plan" as const,
+    codeReview: true,
+  });
+  const panelRef = { environmentId: hostRef.environmentId, threadId: "new-panel-thread" };
+
+  it("creates a review panel with its modes and flag, then sends the prompt (R95)", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+
+    await expect(actions.createPromptedChatPanel(review())).resolves.toBe("new-panel-thread");
+
+    expect(h.createPanel).toHaveBeenCalledOnce();
+    expect(h.createPanel).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: {
+        commandId: "command-panel-create",
+        hostThreadId: hostRef.threadId,
+        threadId: "new-panel-thread",
+        title: "Panel: Code review · Claude",
+        threadDefaults: {
+          modelSelection: claude,
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+        },
+        codeReview: true,
+      },
+    });
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(
+      hostRef,
+      "new-panel-thread",
+      "Code review · Claude",
+    );
+    expect(h.startTurn).toHaveBeenCalledOnce();
+    expect(h.startTurn).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: {
+        threadId: "new-panel-thread",
+        message: { messageId: "side-question", role: "user", text: prompt, attachments: [] },
+        modelSelection: claude,
+        runtimeMode: "approval-required",
+        interactionMode: "plan",
+      },
+    });
+  });
+
+  it("creates nothing more while a review for the same host is pending", async () => {
+    const creation = deferred<unknown>();
+    h.createPanel.mockReturnValueOnce(creation.promise);
+    const actions = useCenterPanelActions({ onCloseTerminal });
+
+    const opening = actions.createPromptedChatPanel(review());
+    await flush();
+    await expect(actions.createPromptedChatPanel(review())).resolves.toBeNull();
+    expect(h.createPanel).toHaveBeenCalledOnce();
+
+    creation.resolve({ _tag: "Success", value: undefined });
+    await opening;
+    expect(h.startTurn).toHaveBeenCalledOnce();
+  });
+
+  it("puts the prompt in the panel's composer when the first message is refused", async () => {
+    h.startTurn.mockResolvedValueOnce({ _tag: "Failure", cause: new Error("offline") });
+    const actions = useCenterPanelActions({ onCloseTerminal });
+
+    await actions.createPromptedChatPanel(review());
+
+    expect(h.drafts.get("new-panel-thread")?.prompt).toBe(prompt);
+    expect(h.addToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Couldn't start the review",
+        description: "The review prompt is in its composer.",
+      }),
+    );
+  });
+
+  it("sends nothing when the tab closed while the panel was created", async () => {
+    const creation = deferred<unknown>();
+    h.createPanel.mockReturnValueOnce(creation.promise);
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const opening = actions.createPromptedChatPanel(review());
+    await flush();
+    const surface = { id: "chat:new-panel-thread", kind: "chat", threadId: panelRef.threadId };
+    h.closeSurface.mockReturnValueOnce([surface]);
+    actions.closeSurface(hostRef, "group-left", surface as never);
+    creation.resolve({ _tag: "Success", value: undefined });
+    await opening;
+    await flush();
+
+    expect(h.startTurn).not.toHaveBeenCalled();
+    expect(h.archiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: "new-panel-thread" },
+    });
+  });
+});

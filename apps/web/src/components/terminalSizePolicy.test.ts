@@ -1,13 +1,111 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  answersTerminalQueries,
+  isUnownedUntilUsed,
   shouldClaimTerminalSize,
   shouldShowTerminalSizeNotice,
   hasForeignTerminalSizeOwner,
+  terminalMirrorScale,
+  TERMINAL_MIRROR_MIN_SCALE,
 } from "./terminalSizePolicy";
 
 const applied = { cols: 151, rows: 50, sizeClaim: "other" };
 const fitted = { cols: 91, rows: 42 };
-const base = { sizeClaim: "mine", applied, fitted, documentFocused: true, claimInFlight: false };
+const base = {
+  sizeClaim: "mine",
+  applied,
+  fitted,
+  documentFocused: true,
+  userActive: true,
+  claimInFlight: false,
+};
+
+describe("one answer to the terminal's queries (#348)", () => {
+  it("lets only the named viewer answer while the size is un-owned", () => {
+    const unowned = { cols: 80, rows: 24, sizeClaim: null, replyClaim: "mine" };
+    expect(answersTerminalQueries(unowned, "mine")).toBe(true);
+    expect(answersTerminalQueries(unowned, "other")).toBe(false);
+    expect(isUnownedUntilUsed(unowned)).toBe(true);
+  });
+
+  it("keeps the owner's answers and an older server's rule", () => {
+    expect(answersTerminalQueries(applied, "other")).toBe(true);
+    expect(answersTerminalQueries(applied, "mine")).toBe(false);
+    const legacy = { cols: 80, rows: 24, sizeClaim: null };
+    expect(answersTerminalQueries(legacy, "mine")).toBe(true);
+    expect(answersTerminalQueries(null, "mine")).toBe(true);
+    expect(isUnownedUntilUsed(legacy)).toBe(false);
+  });
+});
+
+describe("unattended windows (#348)", () => {
+  it.each(["attach", "focus"] as const)(
+    "does not take a live owner's size on %s without recent input in this page",
+    (trigger) => {
+      expect(shouldClaimTerminalSize({ ...base, trigger, userActive: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...base, trigger, userActive: true })).toBe(true);
+    },
+  );
+
+  it.each(["attach", "focus"] as const)(
+    "does not take a live owner's size on %s while this page is not focused",
+    (trigger) => {
+      expect(shouldClaimTerminalSize({ ...base, trigger, documentFocused: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...base, trigger, documentFocused: true })).toBe(true);
+    },
+  );
+
+  it("waits for use of a size a newer server left un-owned, as for another window's", () => {
+    const unowned = { ...base, applied: { ...applied, sizeClaim: null }, unownedUntilUsed: true };
+    for (const trigger of ["attach", "focus"] as const) {
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, userActive: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, documentFocused: false })).toBe(false);
+      expect(shouldClaimTerminalSize({ ...unowned, trigger })).toBe(true);
+    }
+    expect(shouldClaimTerminalSize({ ...unowned, trigger: "layout" })).toBe(false);
+    for (const trigger of ["pointer", "keypress", "fit"] as const) {
+      expect(shouldClaimTerminalSize({ ...unowned, trigger, userActive: false })).toBe(true);
+    }
+    // Shown whole and with the notice, as a mirror of the window that left.
+    expect(terminalMirrorScale("mine", unowned.applied, { cols: 91, rows: 25 }, true)).toBe(0.5);
+    expect(terminalMirrorScale("mine", unowned.applied, { cols: 91, rows: 25 })).toBe(1);
+    expect(shouldShowTerminalSizeNotice(unowned)).toBe(true);
+    expect(shouldShowTerminalSizeNotice({ ...unowned, unownedUntilUsed: false })).toBe(false);
+  });
+
+  it("still claims a released size and still claims on pointer, keypress and fit", () => {
+    const released = { ...applied, sizeClaim: null };
+    expect(
+      shouldClaimTerminalSize({ ...base, trigger: "attach", applied: released, userActive: false }),
+    ).toBe(true);
+    for (const trigger of ["pointer", "keypress", "fit"] as const) {
+      expect(shouldClaimTerminalSize({ ...base, trigger, userActive: false })).toBe(true);
+    }
+  });
+});
+
+describe("mirror scale (#348)", () => {
+  const owner = (cols: number, rows: number) => ({ cols, rows, sizeClaim: "other" });
+
+  it("scales a mirror down by the tighter of rows and columns so nothing is cut off", () => {
+    expect(terminalMirrorScale("mine", owner(100, 50), { cols: 100, rows: 30 })).toBe(0.6);
+    expect(terminalMirrorScale("mine", owner(160, 30), { cols: 120, rows: 30 })).toBe(0.75);
+    expect(terminalMirrorScale("mine", owner(160, 50), { cols: 120, rows: 40 })).toBe(0.75);
+  });
+
+  it("never scales up, and leaves the owner and an unmeasured mirror at full size", () => {
+    expect(terminalMirrorScale("mine", owner(80, 24), { cols: 120, rows: 40 })).toBe(1);
+    expect(terminalMirrorScale("other", owner(160, 50), { cols: 120, rows: 30 })).toBe(1);
+    expect(terminalMirrorScale("mine", owner(160, 50), null)).toBe(1);
+    expect(terminalMirrorScale("mine", null, { cols: 120, rows: 30 })).toBe(1);
+  });
+
+  it("stops at the readability floor", () => {
+    expect(terminalMirrorScale("mine", owner(300, 100), { cols: 100, rows: 30 })).toBe(
+      TERMINAL_MIRROR_MIN_SCALE,
+    );
+  });
+});
 
 describe("terminal size ownership", () => {
   it.each(["focus", "pointer", "keypress"] as const)(

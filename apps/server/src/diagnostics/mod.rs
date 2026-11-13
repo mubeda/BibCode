@@ -1,6 +1,7 @@
 mod archive;
 mod attribution;
 pub(crate) mod history;
+pub mod host_metrics;
 mod model;
 mod monitor;
 mod native;
@@ -19,6 +20,10 @@ pub use attribution::{
 pub use history::{
     AttributedProcessSample, BucketMetric, ProcessResourceBucket, ProcessResourceHistory,
     ProcessResourceSummary, SplitMetric,
+};
+pub use host_metrics::{
+    HostMetricsCollector, HostMetricsIdentity, HostMetricsRates, HostMetricsSnapshot,
+    HostMetricsSource, HostMetricsUpdate,
 };
 pub use model::{
     DescendantEntry, PROCESS_CLAIM_LABEL_MAX_SCALARS, PROCESS_COMMAND_MAX_SCALARS,

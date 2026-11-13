@@ -1,16 +1,23 @@
 import type { FileSaveFlushResult, FileSaveSettleResult } from "./fileSaveCoordinator";
 import type { FilePathMutationLease, FilePathMutationRequest } from "./filePathMutationLease";
+import { registerUnsavedSource } from "./unsavedFileEdits";
 
 export interface ManagedFileEditingSession {
   relativePath: string;
   flush(): Promise<FileSaveFlushResult>;
-  settle(): Promise<FileSaveSettleResult>;
+  /** `lastResort` is for a session about to be disposed: it keeps an edit it cannot place. */
+  settle(lastResort?: boolean): Promise<FileSaveSettleResult>;
   setAutosaveEnabled(enabled: boolean): void;
   pauseSaving(): void;
   resumeSaving(): void;
   discardPendingSave(): void;
   rename(relativePath: string): void;
   dispose(): void;
+  // Optional so session fakes that never edit stay valid; `FileEditingSession` has both.
+  /** Non-null while a write is pending, in flight, failed or paused. */
+  readonly unsavedContents?: string | null;
+  /** `editPending` is true while a rendered-view edit waits on its delay or failed to deliver. */
+  getSnapshot?(): { readonly editPending: boolean };
 }
 
 function isPathAtOrUnder(candidate: string, parent: string): boolean {
@@ -62,6 +69,13 @@ export class FileEditingSessionRegistry<
   private ownerCount = 0;
   private activeRelativePath: string | null = null;
   private savingEnabled = true;
+  /** Held while the window leaves after Discard, so no write lands before it is gone. */
+  private leaveHolds = 0;
+  /** Leaves the window-wide set; set while this registry owns sessions. */
+  private leaveWindowSet: (() => void) | null = null;
+  /** Sessions a dispose is still settling, by the path they had. */
+  private readonly disposingSessions = new Map<Session, string>();
+  private disposeSaveFailed = false;
   private ownershipGeneration = 0;
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
@@ -79,7 +93,8 @@ export class FileEditingSessionRegistry<
     }
     const session = create();
     this.sessions.set(relativePath, session);
-    if (!this.savingEnabled) session.pauseSaving();
+    if (!this.disposed) this.leaveWindowSet ??= registerUnsavedSource(this);
+    if (!this.writesAllowed()) session.pauseSaving();
     if (relativePath === this.activeRelativePath) session.setAutosaveEnabled(false);
     for (const mutation of this.activePathMutations) {
       if (!mutation.scopePaths.some((path) => isPathAtOrUnder(relativePath, path))) continue;
@@ -111,8 +126,58 @@ export class FileEditingSessionRegistry<
   setSavingEnabled(enabled: boolean): void {
     if (this.disposed || this.savingEnabled === enabled) return;
     this.savingEnabled = enabled;
+    this.applySavingState();
+  }
+
+  /** The sessions holding an edit that is not on disk. */
+  unsavedSessions(): { path: string }[] {
+    const unsaved = (session: Session) =>
+      session.unsavedContents != null || session.getSnapshot?.().editPending === true;
+    return [
+      ...[...this.sessions.entries()].filter(([, session]) => unsaved(session)),
+      ...[...this.disposingSessions.entries()]
+        .filter(([session]) => unsaved(session))
+        .map(([session, path]) => [path, session] as const),
+    ].map(([path]) => ({ path }));
+  }
+
+  /** Writes every session through the normal save path; "blocked" when any write failed. */
+  async saveAll(): Promise<"saved" | "blocked"> {
+    const results = await Promise.all(
+      [...this.sessions.values()].map((session) =>
+        session.settle().catch((error: unknown) => {
+          this.reportSessionCleanupError(error);
+          return "failed" as const;
+        }),
+      ),
+    );
+    // A dispose already settles its sessions; wait for it instead of saving them twice.
+    if (this.disposePromise !== null) await this.disposePromise;
+    return results.includes("failed") || this.disposeSaveFailed ? "blocked" : "saved";
+  }
+
+  /** Pauses every write until the returned release runs, whatever else enables saving. */
+  holdSavingForLeave(): () => void {
+    this.leaveHolds += 1;
+    this.applySavingState();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.leaveHolds -= 1;
+      this.applySavingState();
+    };
+  }
+
+  private writesAllowed(): boolean {
+    return this.savingEnabled && this.leaveHolds === 0;
+  }
+
+  private applySavingState(): void {
+    if (this.disposed) return;
+    const allowed = this.writesAllowed();
     for (const session of this.sessions.values()) {
-      if (enabled && !this.isSessionLeased(session)) session.resumeSaving();
+      if (allowed && !this.isSessionLeased(session)) session.resumeSaving();
       else session.pauseSaving();
     }
   }
@@ -244,22 +309,28 @@ export class FileEditingSessionRegistry<
     const sessions = [...this.sessions.entries()].filter(
       ([, session]) => !leasedSessions.has(session),
     );
-    for (const [path] of sessions) this.sessions.delete(path);
+    for (const [path, session] of sessions) {
+      this.sessions.delete(path);
+      this.disposingSessions.set(session, path);
+    }
     await Promise.all(sessions.map(([, session]) => this.settleAndDisposeSession(session)));
     await Promise.all(activeMutations.map((mutation) => mutation.completion));
+    this.leaveWindowSet?.();
   }
 
   private async settleAndDisposeSession(session: Session): Promise<void> {
     const closeState = this.sessionCloseStates.get(session);
-    if (closeState?.phase === "settling") {
-      await closeState.completion;
-    } else if (closeState === undefined) {
+    if (closeState?.phase === "settling") await closeState.completion;
+    // A close that failed still holds an edit, and nothing retries it after the dispose.
+    if (this.sessionCloseStates.get(session)?.phase !== "settled") {
       try {
-        await session.settle();
+        if ((await session.settle(true)) === "failed") this.disposeSaveFailed = true;
       } catch (error) {
+        this.disposeSaveFailed = true;
         this.reportSessionCleanupError(error);
       }
     }
+    this.disposingSessions.delete(session);
     this.sessionCloseStates.delete(session);
     try {
       session.dispose();
@@ -465,7 +536,7 @@ export class FileEditingSessionRegistry<
   ): Promise<void> {
     this.activePathMutations.delete(mutation);
     try {
-      if (resumeSaving && this.savingEnabled) {
+      if (resumeSaving && this.writesAllowed()) {
         for (const session of mutation.pausedSessions) {
           if (!this.isSessionLeased(session)) session.resumeSaving();
         }

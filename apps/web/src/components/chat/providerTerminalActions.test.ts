@@ -14,8 +14,14 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ProviderInstanceEntry } from "~/providerInstances";
+import { resolveCodeReviewPrompt } from "~/codeReview";
 import { decodeTerminalLaunchCommand } from "~/lib/terminalLaunchCommand";
-import { resolveProviderTerminalAction } from "./providerTerminalActions";
+import {
+  CODE_REVIEW_DRIVERS_WITH_TERMINALS,
+  WINDOWS_TERMINAL_REVIEWS_ENABLED,
+  resolveProviderReviewTerminalAction,
+  resolveProviderTerminalAction,
+} from "./providerTerminalActions";
 
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
@@ -725,5 +731,154 @@ describe("resolveProviderTerminalAction", () => {
     ]) {
       expect(decodeTerminalLaunchCommand(candidate)).toBeNull();
     }
+  });
+});
+
+describe("resolveProviderReviewTerminalAction", () => {
+  const PROMPT =
+    "Code review requested from BiBCode. Do not edit files. Scope: the staged, unstaged and untracked changes in the working tree.\n\nReview.";
+  const claude = entry("claudeAgent", "claudeAgent", "Claude", [
+    model("opus", []),
+    model("sonnet", []),
+  ]);
+  const codex = entry("codex", "codex", "Codex", [model("gpt-5", []), model("gpt-5.4", [])]);
+  const review = (
+    target: ProviderInstanceEntry,
+    input: Partial<Parameters<typeof resolveProviderReviewTerminalAction>[2]> = {},
+  ) =>
+    resolveProviderReviewTerminalAction(target, DEFAULT_SERVER_SETTINGS, {
+      prompt: PROMPT,
+      platformOs: "darwin",
+      modelSelection: null,
+      ...input,
+    });
+
+  it("starts Claude in plan mode with the prompt last, after -- (R97)", () => {
+    const action = review(claude, {
+      modelSelection: { instanceId: ProviderInstanceId.make("claudeAgent"), model: "opus" },
+    });
+    expect(action?.disabledReason).toBeNull();
+    expect(action?.label).toBe("Claude Review");
+    expect(action?.command?.executable).toBe("claude");
+    expect(action?.command?.args).toEqual([
+      "--permission-mode",
+      "plan",
+      "--model",
+      "opus",
+      "--",
+      PROMPT,
+    ]);
+    expect(action?.command?.activity).toEqual({
+      driverKind: CLAUDE_DRIVER,
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+    });
+  });
+
+  it("starts Codex in the read-only sandbox with the prompt last, after -- (R97)", () => {
+    const args = review(codex)?.command?.args ?? [];
+    expect(args.slice(0, 4)).toEqual(["--sandbox", "read-only", "--ask-for-approval", "never"]);
+    expect(args.slice(-2)).toEqual(["--", PROMPT]);
+  });
+
+  it("never carries a bypass flag", () => {
+    for (const target of [claude, codex]) {
+      const args = review(target)?.command?.args ?? [];
+      expect(args.length).toBeGreaterThan(0);
+      for (const flag of [
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--dangerously-bypass-approvals-and-sandbox",
+      ]) {
+        expect(args).not.toContain(flag);
+      }
+    }
+  });
+
+  it("uses the review model only for its own instance", () => {
+    const foreign = review(claude, {
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "sonnet" },
+    });
+    expect(foreign?.command?.args.slice(2, 4)).toEqual(["--model", "opus"]);
+    const own = review(codex, {
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+    });
+    expect(own?.command?.args.slice(4, 6)).toEqual(["--model", "gpt-5.4"]);
+  });
+
+  it("offers no review terminal for other drivers", () => {
+    expect(review(entry("cursor"))).toBeNull();
+    expect(review(entry("opencode"))).toBeNull();
+    expect(review(entry("grok"))).toBeNull();
+    expect(CODE_REVIEW_DRIVERS_WITH_TERMINALS).toEqual(new Set([CLAUDE_DRIVER, CODEX_DRIVER]));
+  });
+
+  it("refuses a prompt over 8,192 characters", () => {
+    expect(review(claude, { prompt: "x".repeat(8_192) })?.disabledReason).toBeNull();
+    expect(review(claude, { prompt: "x".repeat(8_193) })).toMatchObject({
+      command: null,
+      disabledReason:
+        "Review prompt is longer than 8,192 characters. Shorten it in Settings → Agents.",
+    });
+  });
+
+  it("refuses control characters other than tab and line breaks", () => {
+    expect(review(codex, { prompt: "a\tb\r\nc" })?.disabledReason).toBeNull();
+    expect(review(codex, { prompt: "a b" })?.disabledReason).toBeNull();
+    for (const prompt of [
+      "a\u0000b",
+      "a\u001bb",
+      "a\u007fb",
+      "a\u0080b",
+      "a\u0085b",
+      "a\u009bb",
+      "a\u009fb",
+    ]) {
+      expect(review(codex, { prompt })).toMatchObject({
+        command: null,
+        disabledReason:
+          "Review prompt holds a control character other than tab or a line break. Remove it in Settings → Agents.",
+      });
+    }
+  });
+
+  it("keeps a prompt that starts with a dash after --", () => {
+    const args = review(claude, { prompt: "--dangerously-skip-permissions" })?.command?.args ?? [];
+    expect(args.at(-2)).toBe("--");
+    expect(args.indexOf("--dangerously-skip-permissions")).toBe(args.length - 1);
+  });
+
+  it("is on on Windows, with line breaks flattened (R98)", () => {
+    expect(WINDOWS_TERMINAL_REVIEWS_ENABLED).toBe(true);
+    for (const target of [claude, codex]) {
+      const action = review(target, { prompt: "a\nb\r\nc\rd", platformOs: "windows" });
+      expect(action?.disabledReason).toBeNull();
+      expect(action?.command?.args.at(-1)).toBe("a b c d");
+      for (const platformOs of ["darwin", "linux", null]) {
+        expect(review(target, { platformOs })?.disabledReason).toBeNull();
+      }
+    }
+  });
+
+  it("flattens line breaks on Windows only", () => {
+    const prompt = "a\nb\r\nc\rd";
+    expect(review(codex, { prompt, platformOs: "windows" })?.command?.args.at(-1)).toBe("a b c d");
+    expect(review(codex, { prompt, platformOs: "linux" })?.command?.args.at(-1)).toBe(prompt);
+  });
+
+  it("ends with one-off instructions, flattened only on Windows (R105)", () => {
+    const prompt = resolveCodeReviewPrompt({
+      project: "Rules",
+      user: "",
+      scope: { kind: "uncommitted", base: "origin/main" },
+      extra: "Focus on the parser.",
+    });
+    for (const platformOs of ["darwin", "linux"]) {
+      expect(review(claude, { prompt, platformOs })?.command?.args.at(-1)).toMatch(
+        /Rules\n\nFocus on the parser\.$/,
+      );
+    }
+    expect(review(claude, { prompt, platformOs: "windows" })?.command?.args.at(-1)).toMatch(
+      /Rules {2}Focus on the parser\.$/,
+    );
   });
 });

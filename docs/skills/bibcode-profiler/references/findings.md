@@ -486,8 +486,10 @@ name for paths outside home.
 - **`error` reasons:** every other reason, such as `git-failed`, `internal`,
   `orchestration-failed` and `workspace-identity-unavailable`.
 
-The remaining kinds come from the read-only scan in
-[`worktree.audit`](events.md#worktreeaudit). It never prunes or deletes.
+The remaining kinds come from the scan in
+[`worktree.audit`](events.md#worktreeaudit). It never prunes, and never
+deletes a file, a folder or a Git registration. Its only write deletes the
+creation record of a worktree whose folder is gone.
 
 ### worktree.missing
 
@@ -508,15 +510,31 @@ The remaining kinds come from the read-only scan in
 
 - **Severity:** `warn`.
 - **Raised when:** a directory in a managed worktree directory has no catalog
-  entry and no Git registration. Entries whose names start with a dot belong to
-  other tools, such as Orca's `.orca-worktree-trash`, and are skipped; builds
-  through v0.9.2 reported them at every audit (#105).
+  entry, no Git registration, and worktree evidence (#344). The evidence is the
+  first of these, in this order:
+  - `creation-record`: BiBCode recorded that it created a worktree at that path.
+  - `incomplete-removal`: a removal receipt for the path is still `prepared`.
+  - `git-pointer-file`: a `.git` regular file at its root, not a link or a
+    FIFO, starts with `gitdir:`.
+  - `removal-marker`: `.bibcode-removal-identity` or
+    `.bibcode-removal-tombstone` is at its root.
+- A directory without evidence is never reported, whatever its name, and the
+  audit does not look below its root. A leftover created before BiBCode
+  recorded its worktrees, with no `.git` file, receipt or marker, stops being
+  reported. Entries whose names start with a dot belong to other tools, such as
+  Orca's `.orca-worktree-trash`, and are skipped; builds through v0.9.2
+  reported them at every audit (#105).
 - **Fingerprint:** `unowned-unregistered` and short SHA-256 hashes of the
   managed parent and relative directory name. The parent hash separates
   identically named directories in different managed parents.
-- **Evidence:** `path`.
-- Once removed or registered, that directory stops recurring; existing findings
-  remain in the book (there is no automatic resolved-state transition).
+- **Evidence:** `path`, `name` (the directory name) and `reason` (the evidence
+  kind above).
+- Once removed, registered or owned, that directory stops recurring; existing
+  findings remain in the book (there is no automatic resolved-state
+  transition). An audit deletes the creation record of a directory that is
+  still gone when it deletes, so a later folder at that path has no evidence.
+  A worktree BiBCode creates there again gets a new record, which that delete
+  never removes.
 
 ### worktree.registration-mismatch
 

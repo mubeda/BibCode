@@ -73,6 +73,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   remoteUpdateProgress: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalOrderedInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Terminal writes and input frames accept `userInputClaim` (#348). */
+  terminalUserInputClaim: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `terminal.stageImagePaste` turns a pasted clipboard image into a server file path. */
   terminalImagePaste: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `git.runStackedAction` accepts `pullRequestOptions` and reports `pr.warning`. */
@@ -102,8 +104,12 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   webhookStatusKinds: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `worktree.createPanel` takes `sideChat`: a panel seeded with its host's messages (#265). */
   sideChats: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `worktree.createPanel` takes `codeReview`: a review panel that offers no Implement (#293). */
+  codeReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
   threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `server.subscribeHostMetrics`: the host's CPU, memory and volumes (#292). */
+  hostMetrics: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

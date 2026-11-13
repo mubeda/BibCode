@@ -1,0 +1,106 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "_tag": "Snapshot",
+      "host": {
+        "os": "linux",
+        "arch": "x86_64",
+        "cpuCount": 12,
+        "memoryTotalBytes": 34359738368
+      },
+      "bootId": "00000000-0000-0000-0000-000000000000",
+      "startedAt": "2026-07-22T09:00:00.000Z",
+      "statisticsSince": "2026-07-22T09:00:00.000Z",
+      "sample": {
+        "sampledAt": "2026-07-22T12:00:01.000Z",
+        "cpuPercent": 23.5,
+        "memoryTotalBytes": 34359738368,
+        "memoryUsedBytes": 12025908428,
+        "memoryAvailableBytes": 22333829940,
+        "volumes": [
+          {
+            "mountPoint": "/",
+            "name": "",
+            "fileSystem": "ext4",
+            "totalBytes": 2147483648000,
+            "freeBytes": 671088640000,
+            "usedBytes": 1476395008000,
+            "removable": false,
+            "readOnly": false,
+            "state": "ok"
+          },
+          {
+            "mountPoint": "/mnt/slow",
+            "name": "",
+            "fileSystem": "ext4",
+            "totalBytes": null,
+            "freeBytes": null,
+            "usedBytes": null,
+            "removable": false,
+            "readOnly": false,
+            "state": "notResponding"
+          }
+        ],
+        "volumesPaused": false
+      },
+      "cpu": {
+        "current": 23.5,
+        "minimum": 1.5,
+        "average": 11.25,
+        "p95": 40.5,
+        "maximum": 97.5
+      },
+      "memory": {
+        "current": 23.5,
+        "minimum": 1.5,
+        "average": 11.25,
+        "p95": 40.5,
+        "maximum": 97.5
+      },
+      "recent": [
+        {
+          "sampledAt": "2026-07-22T12:00:01.000Z",
+          "cpuPercent": 23.5,
+          "memoryPercent": 35.25
+        }
+      ],
+      "uptime": [
+        {
+          "startedAt": "2026-07-22T11:59:00.000Z",
+          "durationMs": 60000,
+          "cpuAverage": 12.5,
+          "cpuPeak": 40.5,
+          "memoryAverage": 35.25,
+          "memoryPeak": 36.5
+        }
+      ],
+      "hiddenVolumes": [
+        {
+          "mountPoint": "/mnt/share",
+          "fileSystem": "nfs4",
+          "reason": "network"
+        },
+        {
+          "mountPoint": "/srv/same",
+          "fileSystem": "ext4",
+          "reason": "sameStorage",
+          "sameStorageAs": "/"
+        }
+      ],
+      "volumeStatistics": [
+        {
+          "mountPoint": "/",
+          "statistic": {
+            "current": 23.5,
+            "minimum": 1.5,
+            "average": 11.25,
+            "p95": 40.5,
+            "maximum": 97.5
+          }
+        }
+      ]
+    }
+  ]
+}

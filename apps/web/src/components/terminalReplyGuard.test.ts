@@ -8,6 +8,30 @@ const write = (terminal: Terminal, data: string) =>
   new Promise<void>((resolve) => terminal.write(data, resolve));
 
 describe("terminal reply guard", () => {
+  it("reports each answer xterm sends to a query before it reaches onData (#348)", async () => {
+    const terminal = new Terminal();
+    let replying = false;
+    const guard = installTerminalReplyGuard(
+      terminal,
+      () => true,
+      () => false,
+      () => {
+        replying = true;
+        queueMicrotask(() => {
+          replying = false;
+        });
+      },
+    );
+    const answers: Array<[string, boolean]> = [];
+    terminal.onData((data) => answers.push([data, replying]));
+    await write(terminal, queries);
+    expect(answers.length).toBeGreaterThanOrEqual(5);
+    expect(answers.filter(([, marked]) => !marked)).toEqual([]);
+    expect(replying).toBe(false);
+    guard.dispose();
+    terminal.dispose();
+  });
+
   it("answers DSR and DA in permitted startup history once and guards later replay", async () => {
     const terminal = new Terminal();
     const guard = installTerminalReplyGuard(terminal, () => true);

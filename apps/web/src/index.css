@@ -50,12 +50,34 @@
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
   /* text-xs (12px) is the declared text-size floor: new UI never goes below it
      and older screens are being swept to it (UI.md, Typography). */
+  /* Theme-only color roles (#290): each default is a fallback here, not a root declaration,
+     so it follows a base token that a subtree overrides. */
+  --color-foreground-strong: var(--foreground-strong, var(--foreground));
+  --color-placeholder: var(
+    --placeholder,
+    color-mix(in srgb, var(--muted-foreground) 72%, transparent)
+  );
+  --color-primary-hover: var(--primary-hover, color-mix(in srgb, var(--primary) 90%, transparent));
+  --color-primary-active: var(
+    --primary-active,
+    color-mix(in srgb, var(--primary) 90%, transparent)
+  );
+  --color-selected: var(--selected, var(--accent));
+  --color-selected-foreground: var(--selected-foreground, var(--accent-foreground));
   --color-panel-separator: var(--panel-separator);
   --color-sidebar-well: var(--sidebar-well);
   --color-sidebar-card: var(--sidebar-card);
   --color-sidebar-card-border: var(--sidebar-card-border);
   --color-sidebar-env-band: var(--sidebar-env-band);
   --shadow-sidebar-card: var(--sidebar-card-shadow);
+  --color-sidebar-env-accent: var(--sidebar-env-accent);
+  --color-sidebar-primary-badge: var(--sidebar-primary-badge);
+  --color-sidebar-primary-badge-foreground: var(--sidebar-primary-badge-foreground);
+  --color-sidebar-worktree: var(--sidebar-worktree);
+  --color-sidebar-worktree-border: var(--sidebar-worktree-border);
+  --color-sidebar-worktree-icon: var(--sidebar-worktree-icon);
+  --color-sidebar-chat-foreground: var(--sidebar-chat-foreground);
+  --color-sidebar-indent-guide: var(--sidebar-indent-guide);
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
@@ -273,6 +295,15 @@
   --sidebar-card-border: --alpha(var(--color-black) / 9%);
   --sidebar-card-shadow: 0 1px 2px --alpha(var(--color-black) / 6%);
   --sidebar-env-band: color-mix(in srgb, var(--color-black) 2.5%, var(--background));
+  /* Sidebar levels (#290, R65): each follows the tokens a theme overrides. */
+  --sidebar-env-accent: var(--primary);
+  --sidebar-primary-badge: color-mix(in srgb, var(--primary) 14%, var(--sidebar-card));
+  --sidebar-primary-badge-foreground: color-mix(in srgb, var(--primary) 65%, var(--color-black));
+  --sidebar-worktree: color-mix(in srgb, var(--primary) 5%, var(--sidebar-card));
+  --sidebar-worktree-border: color-mix(in srgb, var(--foreground) 16%, var(--sidebar-worktree));
+  --sidebar-worktree-icon: color-mix(in srgb, var(--primary) 80%, var(--color-black));
+  --sidebar-chat-foreground: color-mix(in srgb, var(--foreground) 80%, var(--sidebar-card));
+  --sidebar-indent-guide: color-mix(in srgb, var(--foreground) 45%, var(--sidebar-env-band));
   --destructive-foreground: var(--color-red-700);
   --link: var(--color-blue-700);
   --info: var(--color-blue-500);
@@ -286,6 +317,12 @@
   --find-match-foreground: var(--color-neutral-900);
   --find-match-active: var(--color-amber-500);
   --find-match-active-foreground: var(--color-neutral-950);
+  /* Not themable tokens: applyTheme derives them when a theme overrides their source (R57). */
+  --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+  --scrollbar-thumb-subtle: rgba(0, 0, 0, 0.1);
+  --scrollbar-thumb-subtle-hover: rgba(0, 0, 0, 0.2);
+  --sidebar-card-muted-foreground: var(--muted-foreground);
 
   @variant dark {
     color-scheme: dark;
@@ -316,6 +353,13 @@
     --sidebar-card-shadow:
       inset 0 1px 0 --alpha(var(--color-white) / 5%), 0 2px 6px --alpha(var(--color-black) / 60%);
     --sidebar-env-band: color-mix(in srgb, var(--color-white) 7%, var(--background));
+    /* Dark tints lighten instead of darken, and a worktree lifts off the band. */
+    --sidebar-primary-badge: color-mix(in srgb, var(--primary) 24%, var(--sidebar-card));
+    --sidebar-primary-badge-foreground: color-mix(in srgb, var(--primary) 55%, var(--color-white));
+    --sidebar-worktree: color-mix(in srgb, var(--primary) 7%, var(--sidebar-env-band));
+    --sidebar-worktree-border: color-mix(in srgb, var(--foreground) 18%, var(--sidebar-worktree));
+    --sidebar-worktree-icon: color-mix(in srgb, var(--primary) 70%, var(--color-white));
+    --sidebar-chat-foreground: color-mix(in srgb, var(--foreground) 78%, var(--sidebar-card));
     --destructive-foreground: var(--color-red-400);
     --link: var(--color-blue-400);
     --info: var(--color-blue-500);
@@ -328,6 +372,12 @@
     --find-match-foreground: var(--color-neutral-50);
     --find-match-active: var(--color-amber-300);
     --find-match-active-foreground: var(--color-neutral-950);
+    --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
+    --scrollbar-thumb-subtle: rgba(255, 255, 255, 0.08);
+    --scrollbar-thumb-subtle-hover: rgba(255, 255, 255, 0.15);
+    /* Brighter than the global muted grey, which falls just under 4.5:1 on the lifted card. */
+    --sidebar-card-muted-foreground: var(--color-neutral-400);
   }
 }
 
@@ -349,10 +399,208 @@
   outline-offset: 2px;
 }
 
-/* Secondary text on a dark sidebar card is brighter than the global muted grey,
-   which falls just under 4.5:1 on the lifted card surface. */
-.dark [data-sidebar-card] {
-  --muted-foreground: var(--color-neutral-400);
+/* A theme's focus ring and control shadow (#290, R59). These rules sit outside the cascade
+   layers so they win over utilities such as outline-none; without the root attributes nothing
+   changes. The owner of an input's ring draws the outline for its inner control, and the popups
+   the base layer silences and the terminal's hidden text area stay as they are. */
+:root[data-theme-focus-ring]
+  :focus-visible:not(
+    [data-slot="menu-popup"],
+    [data-slot="select-popup"],
+    [data-slot="popover-popup"],
+    .xterm-helper-textarea
+  ),
+:root[data-theme-focus-ring]
+  [data-focus-ring-owner]:not([data-slot="input-group"]):has(:focus-visible),
+:root[data-theme-focus-ring] [data-slot="input-group"]:has(:is(input, textarea):focus-visible) {
+  outline: var(--focus-ring-width, 2px) solid var(--ring);
+  outline-offset: var(--focus-ring-offset, 2px);
+  --tw-ring-shadow: 0 0 #0000;
+  --tw-ring-offset-shadow: 0 0 #0000;
+}
+
+/* An input group owns only its text field's ring, so a button in an addon keeps its own. */
+:root[data-theme-focus-ring] [data-focus-ring-owner]:not([data-slot="input-group"]) :focus-visible,
+:root[data-theme-focus-ring] [data-slot="input-group"] :is(input, textarea):focus-visible {
+  outline: none;
+}
+
+/* The command palette search sets ring-0, so it shows no ring in the base and the theme adds none. */
+:root[data-theme-focus-ring]
+  [data-slot="command-input"]
+  [data-focus-ring-owner]:has(:focus-visible) {
+  outline: none;
+}
+
+/* Removes the drop shadows and keeps a focus ring a theme without focus tokens still draws. */
+:root[data-theme-control-shadow="none"] [data-control-shadow],
+:root[data-theme-control-shadow="none"] [data-control-shadow]::before,
+:root[data-theme-control-shadow="none"] [data-control-shadow]::after,
+:root[data-theme-control-shadow="none"] .chat-composer-glass {
+  box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000);
+}
+
+/* Secondary text on a sidebar card; the dark default is brighter than the global muted grey. */
+[data-sidebar-card] {
+  --muted-foreground: var(--sidebar-card-muted-foreground);
+}
+
+/* The five sidebar levels (#290, R63 to R65), drawn for the left panel and the theme editor's
+   preview alike from data-sidebar-level and data-primary. The repository card keeps
+   SIDEBAR_CARD_CLASS. These rules sit in the components layer, so the card state utilities
+   (selected, active, hover, unavailable) still win over a level's resting look (R64). */
+@layer components {
+  [data-sidebar-level="environment"] {
+    /* Outside a repository card (the Environments view) too, the band's muted text is the
+       sidebar card's, which the band contrast pairs check. */
+    --muted-foreground: var(--sidebar-card-muted-foreground);
+    border-radius: calc(var(--radius) - 2px);
+    background-color: var(--sidebar-env-band);
+    box-shadow: inset 3px 0 0 var(--sidebar-env-accent);
+  }
+
+  /* An unavailable environment weakens its band and rule instead of fading it with opacity, which
+     would drop its rows' text and focus ring below contrast. Only the header dims. */
+  [data-sidebar-level="environment"][data-unavailable="true"] {
+    background-color: color-mix(in srgb, var(--sidebar-env-band) 50%, transparent);
+    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--sidebar-env-accent) 50%, transparent);
+  }
+
+  [data-sidebar-level="checkout"] {
+    font-size: 13px;
+  }
+
+  /* A checkout or branch name at rest. Labels and chat text carry no colour utility. */
+  [data-sidebar-label] {
+    color: color-mix(in srgb, var(--foreground) 90%, transparent);
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-label] {
+    font-weight: 600;
+    color: var(--foreground-strong, var(--foreground));
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-icon] {
+    color: var(--sidebar-primary-badge-foreground);
+  }
+
+  [data-sidebar-level="checkout"][data-primary] [data-sidebar-badge] {
+    border-radius: calc(var(--radius) - 6px);
+    background-color: var(--sidebar-primary-badge);
+    color: var(--sidebar-primary-badge-foreground);
+    font-weight: 500;
+  }
+
+  [data-sidebar-level="worktree"] {
+    position: relative;
+    /* The card class sets w-full, so the indent also narrows the row. */
+    max-width: calc(100% - 0.75rem);
+    margin-inline-start: 0.75rem;
+    font-size: 13px;
+  }
+
+  /* The indent guide runs beside the worktree, under its environment. */
+  [data-sidebar-level="worktree"]::before {
+    position: absolute;
+    inset-block: -2px;
+    inset-inline-start: calc(-0.5rem - 1px);
+    width: 1px;
+    background-color: var(--sidebar-indent-guide);
+    content: "";
+  }
+
+  [data-sidebar-level="worktree"] [data-sidebar-icon] {
+    color: var(--sidebar-worktree-icon);
+  }
+
+  [data-sidebar-level="chat"] {
+    /* text-xs, the app's smallest size (UI.md, Typography). */
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1rem;
+    color: var(--sidebar-chat-foreground);
+  }
+
+  /* Unread: a dot before the title (the shape is the cue) and the title at foreground. The
+     primary label keeps its stronger rule. */
+  [data-sidebar-unread] {
+    background-color: var(--sidebar-primary-badge-foreground);
+  }
+
+  [data-sidebar-label][data-unread="true"],
+  [data-sidebar-level="chat"][data-unread="true"] {
+    color: var(--foreground);
+  }
+}
+
+/* Checkout and worktree row states (R64), keyed on data-selected and data-active. Outside the
+   layers, so they win over the card state utilities, whose translucent fills would replace the
+   worktree surface and drop text under 4.5:1. Every state of either row mixes into the worktree
+   surface, so a selected checkout and a selected worktree look alike. On a state surface the
+   label and the muted text step up one level. Hover, active and selected share a specificity, so
+   their source order below decides which wins. Task 10.2 sets both attributes in the left panel. */
+[data-sidebar-level="worktree"] {
+  border-color: var(--sidebar-worktree-border);
+  background-color: var(--sidebar-worktree);
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):hover {
+  background-color: color-mix(in srgb, var(--foreground) 5%, var(--sidebar-worktree));
+}
+
+/* A checkout rests on the band, so its hover tints the band rather than the worktree surface,
+   which sits near the band in some themes and left the step under 1.06:1. */
+[data-sidebar-level="checkout"]:hover {
+  background-color: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-active="true"] {
+  border-color: color-mix(in srgb, var(--foreground) 40%, var(--sidebar-worktree));
+  background-color: color-mix(in srgb, var(--foreground) 8%, var(--sidebar-worktree));
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-selected="true"] {
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+  background-color: color-mix(in srgb, var(--primary) 16%, var(--sidebar-worktree));
+}
+
+:is(
+    [data-sidebar-level="checkout"],
+    [data-sidebar-level="worktree"]
+  )[data-selected="true"][data-active="true"] {
+  border-color: color-mix(in srgb, var(--primary) 60%, transparent);
+  background-color: color-mix(in srgb, var(--primary) 20%, var(--sidebar-worktree));
+}
+
+/* The dark base lifts hover more per percent, so its selection mixes in more primary to stay
+   clearly stronger than hover. */
+.dark :is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"])[data-selected="true"] {
+  background-color: color-mix(in srgb, var(--primary) 18%, var(--sidebar-worktree));
+}
+
+.dark
+  :is(
+    [data-sidebar-level="checkout"],
+    [data-sidebar-level="worktree"]
+  )[data-selected="true"][data-active="true"] {
+  background-color: color-mix(in srgb, var(--primary) 22%, var(--sidebar-worktree));
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):is(
+  :hover,
+  [data-active="true"],
+  [data-selected="true"]
+) {
+  --muted-foreground: var(--sidebar-chat-foreground);
+}
+
+:is([data-sidebar-level="checkout"], [data-sidebar-level="worktree"]):not([data-primary]):is(
+    :hover,
+    [data-active="true"],
+    [data-selected="true"]
+  )
+  [data-sidebar-label] {
+  color: var(--foreground);
 }
 
 body {
@@ -463,20 +711,12 @@ code {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.15);
+  background: var(--scrollbar-thumb);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.25);
-}
-
-.dark ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.dark ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--scrollbar-thumb-hover);
 }
 
 .turn-chip-strip {
@@ -549,7 +789,7 @@ label:has(> select#reasoning-effort) select {
   margin: 1.25rem 0 0.5rem;
   font-weight: 600;
   line-height: 1.3;
-  color: var(--foreground);
+  color: var(--foreground-strong, var(--foreground));
 }
 
 .chat-markdown h1 {
@@ -1048,18 +1288,10 @@ label:has(> select#reasoning-effort) select {
 }
 
 .model-picker-list::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.1);
+  background: var(--scrollbar-thumb-subtle);
   border-radius: 2px;
 }
 
 .model-picker-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.2);
-}
-
-.dark .model-picker-list::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.dark .model-picker-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--scrollbar-thumb-subtle-hover);
 }

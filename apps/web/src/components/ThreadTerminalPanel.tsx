@@ -10,8 +10,10 @@ import {
   createTerminalInputScheduler,
   createTerminalInputSchedulerRegistry,
   type TerminalInputScheduler,
+  type TerminalInputSchedulerOrigin,
   type TerminalInputSendResult,
   type TerminalRenderSignal,
+  type TerminalSizePosition,
   terminalInputKey,
 } from "@bibcode/client-runtime/state/terminal";
 import {
@@ -28,6 +30,7 @@ import {
   type TerminalLaunchCommand,
   type TerminalSize,
   type TerminalResizeInput,
+  type TerminalResizeResult,
   type ThreadId,
 } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
@@ -86,14 +89,28 @@ import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/brows
 import { openFileInPreview } from "~/browser/openFileInPreview";
 import { canPreviewAnyUrlInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
-import { installTerminalReplyGuard } from "./terminalReplyGuard";
-import { proposeTerminalDimensions, registerTerminalSizeReader } from "./terminalSizing";
 import {
+  createTerminalFollowOutput,
+  observeTerminalDrawing,
+  observeTerminalUserScroll,
+  syncXtermScrollArea,
+} from "./terminalFollowOutput";
+import { installTerminalReplyGuard } from "./terminalReplyGuard";
+import {
+  isTerminalSizingMinimum,
+  proposeTerminalDimensions,
+  registerTerminalSizeReader,
+  terminalHostHasArea,
+} from "./terminalSizing";
+import {
+  answersTerminalQueries,
+  isUnownedUntilUsed,
   shouldClaimTerminalSize,
   terminalDimensionsEqual,
   terminalSizesEqual,
   hasForeignTerminalSizeOwner,
   shouldShowTerminalSizeNotice,
+  terminalMirrorScale,
   type TerminalDimensions,
   type TerminalSizeTrigger,
 } from "./terminalSizePolicy";
@@ -108,15 +125,19 @@ import {
 import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironmentSettings, usePrimarySettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
+import { useThemeLibrary } from "../themes/customThemes";
 import { ensureBundledTerminalFontLoaded, resolveTerminalFontFamily } from "../lib/terminalFont";
 import {
   mergeTerminalSpawnEnv,
   resolveTerminalThemeMode,
+  isBuiltinTerminalPalette,
+  resolveTerminalPalette,
   retainTerminalLaunchTheme,
   terminalAnsiColors,
   terminalExtendedAnsiPalette,
   usesPersistentWindowsConsoleTheme,
   type TerminalLaunchThemeState,
+  type TerminalPalette,
   type TerminalThemeMode,
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
@@ -134,7 +155,13 @@ interface TerminalInputBinding {
     readonly terminal: Terminal;
     readonly onInputError: (message: string | null) => void;
   } | null;
-  write: ((data: string, fallbackError: string) => Promise<TerminalInputSendResult>) | null;
+  write:
+    | ((
+        data: string,
+        fallbackError: string,
+        origin: TerminalInputSchedulerOrigin,
+      ) => Promise<TerminalInputSendResult>)
+    | null;
   ordered: boolean;
   generation: number;
   attachment: { readonly runtime: object; readonly generation: number } | null;
@@ -278,14 +305,20 @@ function createTerminalInputWriter<A, E>(input: {
       readonly threadId: ThreadId;
       readonly terminalId: string;
       readonly data: string;
+      readonly userInputClaim?: string | null;
     };
   }) => Promise<AtomCommandResult<A, E>>;
 }): NonNullable<TerminalInputBinding["write"]> {
   const { environmentId, threadId, terminalId, run } = input;
-  return async (data, fallbackError) => {
+  return async (data, fallbackError, origin) => {
     const result = await run({
       environmentId,
-      input: { threadId, terminalId, data },
+      input: {
+        threadId,
+        terminalId,
+        data,
+        ...(origin === undefined ? {} : { userInputClaim: origin }),
+      },
     });
     return atomCommandTerminalInputResult(result, fallbackError);
   };
@@ -311,8 +344,11 @@ export function enqueueTerminalInput<A, E>(input: {
     }
     return;
   }
-  binding.write = async (data, fallbackError) =>
-    atomCommandTerminalInputResult(await input.write(data), fallbackError);
+  // A mounted renderer's writer keeps marking who produced its input (#348).
+  if (binding.renderer === null) {
+    binding.write = async (data, fallbackError) =>
+      atomCommandTerminalInputResult(await input.write(data), fallbackError);
+  }
   binding.pendingFallbacks.push({
     remaining: input.data.length,
     message: input.fallbackError,
@@ -458,7 +494,7 @@ function acquireTerminalInputBinding(inputKey: string): {
       maxPendingBytes: 1024 * 1024,
       stopOnError: () => keyedBinding.ordered,
       onReset: () => keyedBinding.resetInput?.(),
-      send: async (data) => {
+      send: async (data, origin) => {
         const generation = keyedBinding.generation;
         let remaining = data.length;
         let fallbackError = "Terminal write failed";
@@ -504,7 +540,7 @@ function acquireTerminalInputBinding(inputKey: string): {
         }
         let result: TerminalInputSendResult;
         try {
-          result = await write(data, fallbackError);
+          result = await write(data, fallbackError, origin);
         } catch (error) {
           notifyFallbackFailures(error);
           throw error;
@@ -541,8 +577,8 @@ function acquireTerminalInputBinding(inputKey: string): {
     });
 
     return {
-      enqueue: (data) => rawScheduler.enqueue(data),
-      reserve: () => rawScheduler.reserve(),
+      enqueue: (data, origin) => rawScheduler.enqueue(data, origin),
+      reserve: (origin) => rawScheduler.reserve(origin),
       reset: () => {
         keyedBinding.generation += 1;
         keyedBinding.error = null;
@@ -556,6 +592,67 @@ function acquireTerminalInputBinding(inputKey: string): {
   });
 
   return { binding: keyedBinding, scheduler };
+}
+
+/** Events on a terminal's mount that only a user produces; their input counts as use (#348). */
+const TERMINAL_USER_INPUT_EVENTS = [
+  "keydown",
+  "paste",
+  "compositionstart",
+  "compositionupdate",
+  "compositionend",
+  "input",
+  "pointerdown",
+  "pointerup",
+  "wheel",
+] as const;
+/** How long after a user event the terminal's input still counts as that user's. */
+const TERMINAL_USER_INPUT_WINDOW_MS = 500;
+const TERMINAL_FOCUS_IN_REPORT = "\u001b[I";
+const TERMINAL_FOCUS_OUT_REPORT = "\u001b[O";
+
+/**
+ * How long a mount must hold its size before an automatic size claim (layout, attach) is
+ * sent. A panel opening, collapsing or being dragged passes through a few pixels on the way,
+ * which would size the program to 2 columns; a small panel that holds still is claimed (#348).
+ */
+export const TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS = 100;
+/**
+ * The longest an automatic claim waits for a mount that keeps changing size. An owner is not
+ * scaled, so its box cuts off the rows it no longer fits until a claim lands (#348).
+ */
+export const TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS = 500;
+
+/** Backoff for retrying a failed final resize; bounded so a dead link cannot spin. */
+const TERMINAL_RESIZE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
+
+/** A claim the server applied or already held, waiting for its ordered `resized` (#348). */
+interface TerminalClaimAcknowledgement {
+  readonly request: TerminalSize;
+  readonly sequence: number;
+  readonly generation: TerminalResizeResult["generation"];
+}
+
+/**
+ * Whether an applied size is the acknowledgement, or later: the server publishes it at the
+ * answer's sequence, behind the output queued before it. A size of another process ends the
+ * wait, as does one without a position, which an older server sends.
+ */
+function sizePositionReaches(
+  position: TerminalSizePosition,
+  acknowledgement: TerminalClaimAcknowledgement,
+): boolean {
+  if (position.sequence === undefined) return true;
+  const { generation } = acknowledgement;
+  if (
+    generation !== null &&
+    position.generation !== undefined &&
+    (generation.boot !== position.generation.boot ||
+      generation.process !== position.generation.process)
+  ) {
+    return true;
+  }
+  return position.sequence >= acknowledgement.sequence;
 }
 
 export function fitTerminalSafely(fitAddon: FitAddon): boolean {
@@ -634,19 +731,49 @@ function terminalThemesEqual(left: ITheme, right: ITheme): boolean {
 function repaintTerminalTheme(
   terminal: Terminal,
   resolvedTheme: TerminalThemeMode,
-  mountElement?: HTMLElement | null,
+  mountElement: HTMLElement | null,
+  palette: TerminalPalette | undefined,
+  appThemeIsBuiltin: boolean,
 ): void {
-  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement);
+  const nextTheme = terminalThemeFromApp(resolvedTheme, mountElement, palette, appThemeIsBuiltin);
   const currentTheme = terminal.options.theme;
   if (currentTheme && terminalThemesEqual(currentTheme, nextTheme)) return;
   terminal.options.theme = nextTheme;
   terminal.refresh(0, terminal.rows - 1);
 }
 
-function terminalThemeFromApp(
+/**
+ * `appThemeIsBuiltin` is true while the app shows built-in Light or Dark. Only then does a
+ * built-in palette take the app's panel surfaces, as it always has; under a custom app theme it
+ * keeps the built-in colors the shell is told about (R51).
+ */
+export function terminalThemeFromApp(
   resolvedTheme: TerminalThemeMode,
-  mountElement?: HTMLElement | null,
+  mountElement: HTMLElement | null | undefined,
+  palette: TerminalPalette | undefined,
+  appThemeIsBuiltin: boolean,
 ): ITheme {
+  // A theme's own terminal colors (preference "Follow app theme"), as the session launched them.
+  // A running session keeps them in their own mode whatever the app shows now (R51).
+  if (palette && !isBuiltinTerminalPalette(palette)) {
+    const paletteDark = palette.mode === "dark";
+    return {
+      background: palette.background,
+      foreground: palette.foreground,
+      extendedAnsi: terminalExtendedAnsiPalette(palette.mode),
+      cursor: palette.cursor,
+      selectionBackground: palette.selectionBackground,
+      selectionForeground: palette.selectionForeground,
+      scrollbarSliderBackground: paletteDark ? "rgba(255, 255, 255, 0.1)" : "rgba(0, 0, 0, 0.15)",
+      scrollbarSliderHoverBackground: paletteDark
+        ? "rgba(255, 255, 255, 0.18)"
+        : "rgba(0, 0, 0, 0.25)",
+      scrollbarSliderActiveBackground: paletteDark
+        ? "rgba(255, 255, 255, 0.22)"
+        : "rgba(0, 0, 0, 0.3)",
+      ...palette.ansi,
+    };
+  }
   const isDark = resolvedTheme === "dark";
   const fallbackBackground = isDark ? "rgb(14, 18, 24)" : "rgb(255, 255, 255)";
   const fallbackForeground = isDark ? "rgb(237, 241, 247)" : "rgb(28, 33, 41)";
@@ -657,7 +784,7 @@ function terminalThemeFromApp(
   const panelStyles = getComputedStyle(panelSurface);
   const bodyStyles = getComputedStyle(document.body);
   const requestedThemeMatchesDocument =
-    document.documentElement.classList.contains("dark") === isDark;
+    appThemeIsBuiltin && document.documentElement.classList.contains("dark") === isDark;
   const background = requestedThemeMatchesDocument
     ? normalizeComputedColor(
         panelStyles.backgroundColor,
@@ -815,7 +942,7 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
 }: TerminalViewportProps) {
-  const { resolvedTheme: appTheme } = useTheme();
+  const { resolvedTheme: appTheme, resolvedThemeId } = useTheme();
   const terminalThemePreference = usePrimarySettings(
     (settings) => settings.terminalThemePreference,
   );
@@ -825,6 +952,15 @@ export function TerminalViewport({
   // Everything downstream — the xterm theme and the OSC colours the PTY reports
   // to providers — is derived from this, never from the app theme directly.
   const resolvedTheme = resolveTerminalThemeMode(terminalThemePreference, appTheme);
+  // The library snapshot changes when a theme with the same id is saved with new colors.
+  const { themes } = useThemeLibrary();
+  const activeTheme =
+    themes.find((theme) => theme.id === resolvedThemeId) ??
+    themes.find((theme) => theme.id === appTheme)!;
+  const terminalPalette = useMemo(
+    () => resolveTerminalPalette(terminalThemePreference, activeTheme),
+    [activeTheme, terminalThemePreference],
+  );
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -832,7 +968,14 @@ export function TerminalViewport({
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const orderedInput = serverConfig?.environment.capabilities?.terminalOrderedInput === true;
   const sizeOwnership = serverConfig?.environment.capabilities?.terminalSizeOwnership === true;
+  // The server tells a user's input from the terminal's own replies (#348).
+  const userInputClaim =
+    sizeOwnership && serverConfig?.environment.capabilities?.terminalUserInputClaim === true;
   const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
+  // One claim for this viewport's renderers: a renderer recreated when the window is hidden
+  // and shown is the same window to the server, which gives a returning owner its size back.
+  // Another viewport of the terminal in this window has its own claim (#348).
+  const [viewportSizeClaim] = useState(randomUUID);
   const [rendererAttachmentInput, setRendererAttachmentInput] = useState<{
     readonly target: string;
     readonly sizeClaim: string;
@@ -844,10 +987,12 @@ export function TerminalViewport({
     rendererAttachmentInput.sizeOwnership === sizeOwnership
       ? rendererAttachmentInput
       : null;
-  const [mirroringSize, setMirroringSize] = useState(false);
+  // The size notice's scale (1 when the owner's grid fits unscaled), or null while hidden.
+  const [mirroringSize, setMirroringSize] = useState<number | null>(null);
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
+    fit(): void;
     render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
@@ -916,6 +1061,9 @@ export function TerminalViewport({
   });
   const runResetInput = useAtomCommand(terminalEnvironment.resetInput, { reportFailure: false });
   const runTerminalResize = useAtomCommand(terminalEnvironment.resize, {
+    reportFailure: false,
+  });
+  const runReadTerminalSize = useAtomCommand(terminalEnvironment.readSize, {
     reportFailure: false,
   });
   const runTerminalRestart = useAtomCommand(terminalEnvironment.restart, {
@@ -996,10 +1144,12 @@ export function TerminalViewport({
   const [attachmentLaunchThemeState, setAttachmentLaunchThemeState] = useState<{
     readonly targetKey: string;
     readonly theme: TerminalThemeMode;
+    readonly palette: TerminalPalette;
     readonly pinned: boolean;
   }>(() => ({
     targetKey: terminalTargetKey,
     theme: resolvedTheme,
+    palette: terminalPalette,
     pinned: shouldPinAttachmentTheme,
   }));
   let attachmentLaunchThemeEntry = attachmentLaunchThemeState;
@@ -1010,10 +1160,12 @@ export function TerminalViewport({
     attachmentLaunchThemeEntry = {
       targetKey: terminalTargetKey,
       theme: resolvedTheme,
+      palette: terminalPalette,
       pinned: shouldPinAttachmentTheme,
     };
   }
   const attachmentLaunchTheme = attachmentLaunchThemeEntry.theme;
+  const attachmentLaunchPalette = attachmentLaunchThemeEntry.palette;
   // Launch-command env supplies provider defaults and the thread's runtime env
   // wins ordinary conflicts. Theme colors and the Codex-only Windows console
   // theme are authoritative because the PTY consumes them during spawn.
@@ -1022,10 +1174,17 @@ export function TerminalViewport({
       commandEnv: command?.env,
       runtimeEnv,
       resolvedTheme: attachmentLaunchTheme,
+      palette: attachmentLaunchPalette,
       windowsConsoleTheme: hasPersistentWindowsConsoleTheme,
     });
     return Object.keys(merged).length > 0 ? merged : undefined;
-  }, [attachmentLaunchTheme, command, hasPersistentWindowsConsoleTheme, runtimeEnv]);
+  }, [
+    attachmentLaunchPalette,
+    attachmentLaunchTheme,
+    command,
+    hasPersistentWindowsConsoleTheme,
+    runtimeEnv,
+  ]);
   const terminalSession = useAttachedTerminalSession({
     environmentId,
     terminal: {
@@ -1064,6 +1223,7 @@ export function TerminalViewport({
     resolvedTheme: hasPersistentWindowsConsoleTheme ? attachmentLaunchTheme : resolvedTheme,
     authoritativeTheme: terminalSession.consoleTheme,
     restartRequest: themeRestartRequest,
+    palette: terminalPalette,
   };
   const [launchThemeState, setLaunchThemeState] = useState<TerminalLaunchThemeState>(() =>
     retainTerminalLaunchTheme(null, launchThemeInput),
@@ -1071,7 +1231,8 @@ export function TerminalViewport({
   const launchTheme = retainTerminalLaunchTheme(launchThemeState, launchThemeInput);
   if (
     launchTheme.generation !== launchThemeState.generation ||
-    launchTheme.theme !== launchThemeState.theme
+    launchTheme.theme !== launchThemeState.theme ||
+    launchTheme.palette !== launchThemeState.palette
   ) {
     setLaunchThemeState(launchTheme);
   }
@@ -1090,6 +1251,7 @@ export function TerminalViewport({
   if (
     attachmentLaunchThemeEntry.targetKey !== attachmentLaunchThemeState.targetKey ||
     attachmentLaunchThemeEntry.theme !== attachmentLaunchThemeState.theme ||
+    attachmentLaunchThemeEntry.palette.key !== attachmentLaunchThemeState.palette.key ||
     attachmentLaunchThemeEntry.pinned !== attachmentLaunchThemeState.pinned
   ) {
     setAttachmentLaunchThemeState(attachmentLaunchThemeEntry);
@@ -1098,6 +1260,10 @@ export function TerminalViewport({
     ? launchTheme.theme
     : resolvedTheme;
   const readEffectiveTerminalTheme = useEffectEvent(() => effectiveTerminalTheme);
+  const readLaunchPalette = useEffectEvent(() => launchTheme.palette);
+  const readAppThemeIsBuiltin = useEffectEvent(
+    () => resolvedThemeId === "light" || resolvedThemeId === "dark",
+  );
   const nativeThemeMismatch =
     hasPersistentWindowsConsoleTheme &&
     terminalStatus === "running" &&
@@ -1262,7 +1428,12 @@ export function TerminalViewport({
       fontSize: 12,
       scrollback: 5_000,
       fontFamily: readTerminalFontFamily(),
-      theme: terminalThemeFromApp(readEffectiveTerminalTheme(), mount),
+      theme: terminalThemeFromApp(
+        readEffectiveTerminalTheme(),
+        mount,
+        readLaunchPalette(),
+        readAppThemeIsBuiltin(),
+      ),
       // OSC 8 activations bypass the link provider, so apply the same activation guard here.
       linkHandler: {
         activate: (event, uri, range) => {
@@ -1317,30 +1488,135 @@ export function TerminalViewport({
     });
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
-    fitTerminalSafely(fitAddon);
-    const sizeClaim = randomUUID();
-    let fittedDimensions = proposeTerminalDimensions(fitAddon);
-    const updateFittedDimensions = () => (fittedDimensions = proposeTerminalDimensions(fitAddon));
+    if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
+    // A paused renderer can move the view by itself; the position it had when drawing
+    // stopped decides whether a resize keeps following the output (#348).
+    const followScreen = mount.querySelector(".xterm-screen");
+    const followOutput = followScreen
+      ? createTerminalFollowOutput(terminal, {
+          observeDrawing: observeTerminalDrawing(followScreen),
+          syncScrollArea: () => syncXtermScrollArea(terminal),
+          observeUserScroll: observeTerminalUserScroll(mount),
+        })
+      : null;
+    const followsOutput = () =>
+      followOutput?.atBottom() ?? terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+    const sizeClaim = viewportSizeClaim;
+    let fittedDimensions = proposeTerminalDimensions(fitAddon, mount);
+    const updateFittedDimensions = () =>
+      (fittedDimensions = proposeTerminalDimensions(fitAddon, mount));
     setRendererAttachmentInput({
       target: terminalTargetKey,
       sizeClaim,
       sizeOwnership,
       dimensions: fittedDimensions,
     });
-    let mirroringSizeVisible = false;
-    const updateMirroringSize = (next: boolean) => {
+    let mirroringSizeVisible: number | null = null;
+    const updateMirroringSize = (next: number | null) => {
       if (mirroringSizeVisible === next) return;
       mirroringSizeVisible = next;
       setMirroringSize(next);
     };
+    let mirrorScale = 1;
+    // A mirror never clips the owner's grid: it scales the whole xterm element down, which
+    // keeps the grid's cells and both renderers intact. A negative bottom margin gives the
+    // element its scaled height for scrolling, so below the floor the box scrolls from the
+    // bottom rows. xterm maps the mouse to cells at full size, so a scaled mirror takes no
+    // pointer input itself: a click reaches the mount, whose pointerdown takes the size.
+    const applyMirrorScale = (fitted: TerminalDimensions | null) => {
+      const element = terminal.element;
+      if (!element) return;
+      const scale = sizeOwnership
+        ? terminalMirrorScale(sizeClaim, appliedSize, fitted, unownedUntilUsed)
+        : 1;
+      if (scale === 1 && mirrorScale === 1) return;
+      const overflows =
+        scale < 1 &&
+        appliedSize !== null &&
+        fitted !== null &&
+        (appliedSize.rows * scale > fitted.rows || appliedSize.cols * scale > fitted.cols);
+      mirrorScale = scale;
+      element.style.transformOrigin = scale < 1 ? "0 0" : "";
+      element.style.transform = scale < 1 ? `scale(${scale})` : "";
+      element.style.marginBottom = scale < 1 ? `${(scale - 1) * element.offsetHeight}px` : "";
+      element.style.pointerEvents = scale < 1 ? "none" : "";
+      mount.style.overflow = overflows ? "auto" : "";
+      if (overflows) mount.scrollTop = mount.scrollHeight;
+    };
     let appliedSize: TerminalSize | null = null;
+    // A server that hands the size over published it un-owned: it waits for use (#348).
+    let unownedUntilUsed = false;
     let claimInFlight: TerminalSize | null = null;
     let layoutChangedWhileClaimPending = false;
+    // Hides the notice only while a claim is pending or waits for its acknowledgement.
     let claimNoticeSuppressed = false;
+    // Automatic claims wait for the mount to hold its size, from its first measurement: a
+    // panel opening creates its terminal mid-transition, and its stream can attach before
+    // the size changes again.
+    let settledMountSize = { width: mount.clientWidth, height: mount.clientHeight };
+    let mountSizeChangedAt = performance.now();
+    // When the mount started changing without a claim since; null while settled.
+    let mountUnsettledSince: number | null = mountSizeChangedAt;
+    let deferredClaimTimer: number | null = null;
+    // An attach claim may take another window's size; a later layout change keeps it pending.
+    let deferredTrigger: "layout" | "attach" | null = null;
+    const mountSettleRemaining = () => {
+      const width = mount.clientWidth;
+      const height = mount.clientHeight;
+      const now = performance.now();
+      if (width !== settledMountSize.width || height !== settledMountSize.height) {
+        settledMountSize = { width, height };
+        mountSizeChangedAt = now;
+        mountUnsettledSince ??= now;
+      }
+      if (mountUnsettledSince === null) return 0;
+      const quiet = mountSizeChangedAt + TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS - now;
+      let remaining = Math.min(
+        quiet,
+        mountUnsettledSince + TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS - now,
+      );
+      // The maximum wait never claims the sizing minimum; only holding still does.
+      if (remaining <= 0 && quiet > 0) {
+        const fitted = proposeTerminalDimensions(fitAddon, mount);
+        if (fitted === null || isTerminalSizingMinimum(fitted)) remaining = quiet;
+      }
+      if (remaining <= 0) mountUnsettledSince = null;
+      return remaining;
+    };
+    let keypressMeasureFrame: number | null = null;
+    // Geometry changes only through ordered size events; the answer names the one to wait for.
+    let awaitedAcknowledgement: TerminalClaimAcknowledgement | null = null;
+    let appliedPosition: TerminalSizePosition = {};
+    // Geometry the server declined, or an older server answered without an acknowledgement,
+    // is not sent again until its state changes.
+    let declinedRequest: TerminalSize | null = null;
+    // The geometry whose held size an older server was last asked for; a published size since
+    // makes the read stale and allows another.
+    let legacyRead: TerminalSize | null = null;
     let oscColorResponderActive = false;
     let disposed = false;
+    let resizeRetryTimer: number | null = null;
+    let resizeRetries = 0;
+    // A failed final resize would otherwise wait for another layout or input
+    // event, leaving the PTY at its old size (#348).
+    const retryFailedResize = () => {
+      if (disposed || resizeRetryTimer !== null) return;
+      const delay = TERMINAL_RESIZE_RETRY_DELAYS_MS[resizeRetries];
+      if (delay === undefined) return;
+      resizeRetries += 1;
+      resizeRetryTimer = window.setTimeout(() => {
+        resizeRetryTimer = null;
+        // Re-measures, so a newer size replaces the failed one, and the ownership
+        // policy decides whether this renderer may still claim.
+        handleSizeTrigger("layout");
+      }, delay);
+    };
+    // An older server ignores `structuredResult` and answers null, which `completeClaim` handles.
     const resizeTerminal = (size: Pick<TerminalResizeInput, "cols" | "rows" | "sizeClaim">) =>
-      runTerminalResize({ environmentId, input: { threadId, terminalId, ...size } });
+      runTerminalResize({
+        environmentId,
+        input: { threadId, terminalId, ...size, structuredResult: true },
+      });
     const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
       if (resizeRendererGenerationRef.current !== rendererGeneration) return;
       const current = lastRequestedSizeRef.current;
@@ -1353,12 +1629,16 @@ export function TerminalViewport({
       lastRequestedSizeRef.current = request;
       void resizeTerminal(dimensions).then((result) => {
         if (
-          result._tag === "Failure" &&
-          resizeRendererGenerationRef.current === rendererGeneration &&
-          lastRequestedSizeRef.current === request
-        ) {
-          lastRequestedSizeRef.current = null;
+          resizeRendererGenerationRef.current !== rendererGeneration ||
+          lastRequestedSizeRef.current !== request
+        )
+          return;
+        if (result._tag === "Success") {
+          resizeRetries = 0;
+          return;
         }
+        lastRequestedSizeRef.current = null;
+        retryFailedResize();
       });
     };
 
@@ -1394,30 +1674,130 @@ export function TerminalViewport({
         write: (data, onParsed) => terminal.write(data, onParsed),
       });
     let outputSink = createOutputSink();
+    // xterm answers a query inside the parse that read it; nothing a user does runs there.
+    let replying = false;
     const replyGuard = installTerminalReplyGuard(
       terminal,
-      () => !sizeOwnership || !hasForeignTerminalSizeOwner(appliedSize, sizeClaim),
+      () => !sizeOwnership || answersTerminalQueries(appliedSize, sizeClaim),
       () => oscColorResponderActive,
+      () => {
+        if (replying) return;
+        replying = true;
+        queueMicrotask(() => {
+          replying = false;
+        });
+      },
     );
     const updateSizeNotice = (fitted = updateFittedDimensions()) => {
+      applyMirrorScale(fitted);
       updateMirroringSize(
         !dismissedTerminalSizes.has(terminalTargetKey) &&
           !claimNoticeSuppressed &&
+          deferredTrigger !== "attach" &&
           sizeOwnership &&
           shouldShowTerminalSizeNotice({
             sizeClaim,
             applied: appliedSize,
             fitted,
             claimInFlight: claimInFlight !== null,
-          }),
+            unownedUntilUsed,
+          })
+          ? mirrorScale
+          : null,
       );
     };
-    const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
+    // The answer says what the server holds. An applied or unchanged claim is acknowledged
+    // by a `resized` on this renderer's stream, behind the output printed before it, and the
+    // ordered size path applies it, so a stale applied size is repaired without a timer
+    // (#348). Any other outcome changed nothing, so xterm keeps the size it has.
+    const completeClaim = (request: TerminalSize, result: TerminalResizeResult | null) => {
+      const accepted = result?.outcome === "applied" || result?.outcome === "unchanged";
+      if (accepted && result.sequence !== null) {
+        // The server kept another size: its PTY refused this one on every retry. The same
+        // geometry is not sent again until the server's state changes (#348).
+        if (result.size !== null && !terminalDimensionsEqual(result.size, request))
+          declinedRequest = request;
+        const acknowledgement = {
+          request,
+          sequence: result.sequence,
+          generation: result.generation,
+        };
+        if (sizePositionReaches(appliedPosition, acknowledgement)) claimNoticeSuppressed = false;
+        else awaitedAcknowledgement = acknowledgement;
+        return;
+      }
+      // Not sent again until the server's state changes. An unregistered claim (a remount
+      // claiming before its stream attached, or a stream reconnecting) is claimed again when
+      // this renderer's stream attaches; a missing session or an ended process is shown by
+      // its own events.
+      declinedRequest = request;
+      // An older server answers null and acknowledges nothing: the size it publishes next
+      // settles the claim. It publishes nothing for an owner's claim of the size it already
+      // holds, nor for a claim it ignored, so one read of the size it holds settles those.
+      if ((result === null || accepted) && !terminalSizesEqual(appliedSize, request)) {
+        reconcileLegacyClaim(request, appliedSize?.sizeClaim === sizeClaim);
+        return;
+      }
+      claimNoticeSuppressed = false;
+    };
+    const endLegacyClaim = () => {
+      claimNoticeSuppressed = false;
+      updateSizeNotice();
+    };
+    const reconcileLegacyClaim = (request: TerminalSize, owned: boolean) => {
+      if (terminalDimensionsEqual(legacyRead, request)) {
+        endLegacyClaim();
+        return;
+      }
+      const read = request;
+      legacyRead = read;
+      void runReadTerminalSize({ environmentId, input: { threadId, terminalId } }).then(
+        (result) => {
+          if (disposed || legacyRead !== read) return;
+          const held = result._tag === "Success" ? result.value : null;
+          outputSink.barrier(() => {
+            if (disposed || legacyRead !== read) return;
+            // A takeover the server applied publishes its owner change, which settles it.
+            if (held?.sizeClaim === sizeClaim && !owned) return;
+            if (held !== null && owned) {
+              applySize(held);
+              // The read's own size does not allow another read of the same geometry.
+              legacyRead = read;
+            } else endLegacyClaim();
+          });
+        },
+      );
+    };
+    const handleSizeTrigger = (requestedTrigger: TerminalSizeTrigger) => {
+      let trigger = requestedTrigger;
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
       if (trigger === "layout" && isCenterPanelResizing(mount)) return;
+      // An automatic claim of a mount still changing size waits until it holds still, then
+      // runs once; the mirror scale still follows every change.
+      const settleRemaining =
+        trigger === "layout" || trigger === "attach" ? mountSettleRemaining() : 0;
+      if ((trigger === "layout" || trigger === "attach") && settleRemaining > 0) {
+        deferredTrigger = deferredTrigger === "attach" ? "attach" : trigger;
+        if (deferredClaimTimer !== null) window.clearTimeout(deferredClaimTimer);
+        deferredClaimTimer = window.setTimeout(() => {
+          const pending = deferredTrigger ?? "layout";
+          deferredClaimTimer = null;
+          deferredTrigger = null;
+          handleSizeTrigger(pending);
+        }, settleRemaining);
+        if (sizeOwnership) updateSizeNotice();
+        return;
+      }
+      // A settled automatic trigger runs a deferred one now; an attach claim keeps its rule.
+      if ((trigger === "layout" || trigger === "attach") && deferredClaimTimer !== null) {
+        window.clearTimeout(deferredClaimTimer);
+        deferredClaimTimer = null;
+        if (deferredTrigger === "attach") trigger = "attach";
+        deferredTrigger = null;
+      }
       if (!sizeOwnership) {
-        if (trigger !== "layout") return;
-        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        if (trigger !== "layout" || !terminalHostHasArea(mount)) return;
+        const wasAtBottom = followsOutput();
         fitTerminalSafely(fitAddon);
         if (wasAtBottom) terminal.scrollToBottom();
         requestTerminalResize(resizeRendererGeneration, {
@@ -1426,19 +1806,35 @@ export function TerminalViewport({
         });
         return;
       }
+      // A claim already answered for this geometry waits for its acknowledgement; sending it
+      // again would only restart that wait.
       const shouldClaim = (fitted: TerminalDimensions | null) =>
         shouldClaimTerminalSize({
           sizeClaim,
           applied: appliedSize,
           fitted,
+          unownedUntilUsed,
           trigger,
           documentFocused: document.hasFocus(),
-          claimInFlight: claimInFlight !== null,
+          // Engines without the API keep the earlier focus-only rule.
+          userActive: navigator.userActivation?.isActive ?? true,
+          claimInFlight:
+            claimInFlight !== null ||
+            terminalDimensionsEqual(declinedRequest, fitted) ||
+            (awaitedAcknowledgement !== null &&
+              terminalDimensionsEqual(awaitedAcknowledgement.request, fitted)),
         });
-      // Use the same policy with cached geometry before measuring on keydown.
-      if (trigger === "keypress" && fittedDimensions !== null && !shouldClaim(fittedDimensions))
-        return;
-      const fitted = updateFittedDimensions();
+      // Typing measures at most once per frame; other keydowns in that frame reuse the fit.
+      let fitted: TerminalDimensions | null;
+      if (trigger === "keypress" && keypressMeasureFrame !== null) fitted = fittedDimensions;
+      else {
+        if (trigger === "keypress") {
+          keypressMeasureFrame = window.requestAnimationFrame(() => {
+            keypressMeasureFrame = null;
+          });
+        }
+        fitted = updateFittedDimensions();
+      }
       if (
         trigger === "layout" &&
         claimInFlight !== null &&
@@ -1450,8 +1846,9 @@ export function TerminalViewport({
       if (fitted && shouldClaim(fitted)) {
         const request = { ...fitted, sizeClaim };
         claimInFlight = request;
+        awaitedAcknowledgement = null;
         claimNoticeSuppressed = true;
-        const finishClaim = (succeeded: boolean) => {
+        const finishClaim = (succeeded: boolean, result: TerminalResizeResult | null = null) => {
           if (
             disposed ||
             resizeRendererGenerationRef.current !== resizeRendererGeneration ||
@@ -1459,32 +1856,58 @@ export function TerminalViewport({
           )
             return;
           claimInFlight = null;
-          if (!succeeded) claimNoticeSuppressed = false;
+          if (succeeded) {
+            resizeRetries = 0;
+            completeClaim(request, result);
+          } else claimNoticeSuppressed = false;
           const refit = layoutChangedWhileClaimPending;
           layoutChangedWhileClaimPending = false;
           if (refit) handleSizeTrigger("layout");
-          else updateSizeNotice();
+          else {
+            updateSizeNotice();
+            // A claim taken from another window's size is not retried.
+            if (!succeeded && !hasForeignTerminalSizeOwner(appliedSize, sizeClaim)) {
+              retryFailedResize();
+            }
+          }
         };
         void resizeTerminal(request).then(
-          (result) => finishClaim(result._tag === "Success"),
+          (result) =>
+            result._tag === "Success"
+              ? finishClaim(true, result.value ?? null)
+              : finishClaim(false),
           () => finishClaim(false),
         );
       }
       updateSizeNotice(fitted);
     };
-    const applySize = (size: TerminalSize | undefined, claimOnAttach = false) => {
+    const applySize = (
+      size: TerminalSize | undefined,
+      claimOnAttach = false,
+      position: TerminalSizePosition = {},
+    ) => {
       if (disposed) return;
-      if (!terminalSizesEqual(appliedSize, size)) claimNoticeSuppressed = false;
+      appliedPosition = position;
+      declinedRequest = null;
+      legacyRead = null;
+      if (awaitedAcknowledgement !== null && sizePositionReaches(position, awaitedAcknowledgement))
+        awaitedAcknowledgement = null;
+      // A claim's outcome is its acknowledgement: an older publication parsed after the answer
+      // keeps the notice suppressed (#348).
+      if (claimInFlight === null && awaitedAcknowledgement === null) claimNoticeSuppressed = false;
       const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
       appliedSize = size ?? null;
+      if (size?.sizeClaim != null) unownedUntilUsed = false;
+      // A window attaching to a size the server left un-owned waits to be used as well.
+      else if (isUnownedUntilUsed(size)) unownedUntilUsed = true;
       if (size && !terminalDimensionsEqual(terminal, size)) {
-        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        const wasAtBottom = followsOutput();
         terminal.resize(size.cols, size.rows);
         if (wasAtBottom) terminal.scrollToBottom();
       }
-      if (size?.sizeClaim === null) handleSizeTrigger("attach");
+      if (size?.sizeClaim === null) handleSizeTrigger(unownedUntilUsed ? "layout" : "attach");
       else if (claimOnAttach)
         handleSizeTrigger(size?.sizeClaim === sizeClaim ? "layout" : "attach");
       else if (size?.sizeClaim === sizeClaim) handleSizeTrigger("layout");
@@ -1497,7 +1920,27 @@ export function TerminalViewport({
         return;
       }
       if (signal.type === "resized") {
-        if (sizeOwnership) outputSink.barrier(() => applySize(signal.size));
+        if (sizeOwnership) {
+          outputSink.barrier(() => {
+            // An older server leaves every released size un-owned; one that hands it over does
+            // so only when no remaining window is known to be in use.
+            unownedUntilUsed = userInputClaim && signal.size.sizeClaim === null;
+            applySize(signal.size, false, signal);
+          });
+        }
+        return;
+      }
+      if (signal.type === "attached") {
+        // This renderer's own stream attached: its claim is registered, so it may claim now.
+        if (sizeOwnership) {
+          outputSink.barrier(() => {
+            claimInFlight = null;
+            awaitedAcknowledgement = null;
+            declinedRequest = null;
+            layoutChangedWhileClaimPending = false;
+            applySize(signal.size, true, signal);
+          });
+        }
         return;
       }
 
@@ -1510,11 +1953,15 @@ export function TerminalViewport({
         // Its late RPC completion is ignored by the request-identity guard.
         if (claimOnAttach) {
           claimInFlight = null;
+          awaitedAcknowledgement = null;
+          declinedRequest = null;
           layoutChangedWhileClaimPending = false;
           claimNoticeSuppressed = false;
+          // A restart ends a pending hand-over: the size the event carries says who owns it now.
+          unownedUntilUsed = false;
         }
         oscColorResponderActive = signal.oscColorResponderActive ?? false;
-        if (sizeOwnership) applySize(signal.size, claimOnAttach);
+        if (sizeOwnership) applySize(signal.size, claimOnAttach, signal);
         else {
           lastRequestedSizeRef.current = null;
           handleSizeTrigger("layout");
@@ -1533,6 +1980,12 @@ export function TerminalViewport({
       sizeClaim,
       render,
       size: handleSizeTrigger,
+      fit() {
+        const pending = claimInFlight;
+        handleSizeTrigger("fit");
+        // The sent claim hides the notice and its button, so focus moves where the keys go.
+        if (claimInFlight !== null && claimInFlight !== pending) terminal.focus();
+      },
       dismissSizeNotice() {
         if (appliedSize) dismissedTerminalSizes.set(terminalTargetKey, appliedSize);
         updateSizeNotice();
@@ -1645,11 +2098,29 @@ export function TerminalViewport({
       Boolean(readWorkspaceUnavailable()) ||
       (inputBinding.ordered && inputBinding.error !== null) ||
       inputBinding.renderer?.owner !== rendererOwner;
+    // Input a user produced here carries this renderer's claim and the terminal's own replies
+    // carry null, so an idle window answering a program is not a window in use (#348). xterm's
+    // onData does not say which is which: a query answer is marked by the reply guard, and
+    // other input is the user's only within a moment of a user event on this mount (composed
+    // text arrives from a timer after compositionend, a mouse report on release), so a focus
+    // report from a window losing focus is not.
+    let lastUserInputAt = Number.NEGATIVE_INFINITY;
+    const noteUserInput = () => {
+      lastUserInputAt = performance.now();
+    };
+    const inputOrigin = (data?: string): TerminalInputSchedulerOrigin => {
+      if (!userInputClaim) return undefined;
+      // xterm reports focus changes, and answers enabling the reports, through onData.
+      if (data === TERMINAL_FOCUS_IN_REPORT || data === TERMINAL_FOCUS_OUT_REPORT) return null;
+      return !replying && performance.now() - lastUserInputAt <= TERMINAL_USER_INPUT_WINDOW_MS
+        ? sizeClaim
+        : null;
+    };
     const sendTerminalInput = (data: string, fallbackError: string) => {
       if (!replyGuard.acceptInput()) return;
       if (inputBlocked() || data.length === 0) return;
       inputBinding.pendingFallbacks.push({ remaining: data.length, message: fallbackError });
-      inputScheduler.enqueue(data);
+      inputScheduler.enqueue(data, inputOrigin(data));
     };
 
     terminal.attachCustomKeyEventHandler((event) => {
@@ -1842,6 +2313,10 @@ export function TerminalViewport({
     };
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
+      // A click outside xterm's element (a scaled mirror takes no pointer input) lands on the
+      // unfocusable mount, whose default would take back the focus pointerdown gave xterm.
+      if (!(event.target instanceof Node && terminal.element?.contains(event.target)))
+        event.preventDefault();
       const tracking = terminal.modes.mouseTrackingMode !== "none";
       if (tracking && event.button === 2 && terminal.hasSelection()) {
         Object.defineProperty(event, forceSelectionKey, { value: true });
@@ -1901,7 +2376,7 @@ export function TerminalViewport({
       const bracketedAtPaste = terminal.modes.bracketedPasteMode;
       const fallback = { remaining: 0, message: "Terminal write failed" };
       inputBinding.pendingFallbacks.push(fallback);
-      const fill = inputScheduler.reserve();
+      const fill = inputScheduler.reserve(inputOrigin());
       pasteAborts.add(abort);
       setImagePastesPending((count) => count + 1);
       void staging.then((result) => {
@@ -1933,6 +2408,8 @@ export function TerminalViewport({
       });
     };
     const ownerDocument = mount.ownerDocument;
+    for (const type of TERMINAL_USER_INPUT_EVENTS)
+      mount.addEventListener(type, noteUserInput, { capture: true, passive: true });
     mount.addEventListener("paste", handlePaste, true);
     mount.addEventListener("mousedown", handleMouseDown, true);
     const screenElement = mount.querySelector<HTMLElement>(".xterm-screen");
@@ -1954,7 +2431,13 @@ export function TerminalViewport({
       // <html> class/style churn (tooltips, scroll locks) fires this observer
       // far more often than the theme changes; a repaint rebuilds the glyph
       // atlas, so skip it unless the resolved theme actually differs.
-      repaintTerminalTheme(activeTerminal, readEffectiveTerminalTheme(), containerRef.current);
+      repaintTerminalTheme(
+        activeTerminal,
+        readEffectiveTerminalTheme(),
+        containerRef.current,
+        readLaunchPalette(),
+        readAppThemeIsBuiltin(),
+      );
     });
     themeObserver.observe(document.documentElement, {
       attributes: true,
@@ -1971,11 +2454,14 @@ export function TerminalViewport({
     return () => {
       if (disposed) return;
       disposed = true;
-      updateMirroringSize(false);
+      updateMirroringSize(null);
 
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
       window.clearTimeout(fitTimer);
+      if (resizeRetryTimer !== null) window.clearTimeout(resizeRetryTimer);
+      if (deferredClaimTimer !== null) window.clearTimeout(deferredClaimTimer);
+      if (keypressMeasureFrame !== null) window.cancelAnimationFrame(keypressMeasureFrame);
       outputSink.dispose();
       replyGuard.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;
@@ -1987,6 +2473,8 @@ export function TerminalViewport({
       clearSelectionAction();
       cancelImagePastesRef.current();
       cancelImagePastesRef.current = () => undefined;
+      for (const type of TERMINAL_USER_INPUT_EVENTS)
+        mount.removeEventListener(type, noteUserInput, true);
       mount.removeEventListener("paste", handlePaste, true);
       mount.removeEventListener("mousedown", handleMouseDown, true);
       screenElement?.removeEventListener("mousemove", handleHover);
@@ -1997,6 +2485,7 @@ export function TerminalViewport({
       mount.removeEventListener("focusin", handleFocus);
       window.removeEventListener("focus", handleWindowFocus);
       themeObserver.disconnect();
+      followOutput?.dispose();
       if (inputBinding.renderer?.owner === rendererOwner) {
         inputBinding.renderer = null;
       }
@@ -2023,6 +2512,7 @@ export function TerminalViewport({
   }, [
     terminalTargetKey,
     runTerminalResize,
+    runReadTerminalSize,
     runResetInput,
     runTerminalWrite,
     canAttachTerminal,
@@ -2033,6 +2523,8 @@ export function TerminalViewport({
     threadId,
     sizeOwnership,
     orderedInput,
+    userInputClaim,
+    viewportSizeClaim,
   ]);
 
   useEffect(() => {
@@ -2058,7 +2550,13 @@ export function TerminalViewport({
   useEffect(() => {
     const activeTerminal = terminalRef.current;
     if (!activeTerminal) return;
-    repaintTerminalTheme(activeTerminal, effectiveTerminalTheme, containerRef.current);
+    repaintTerminalTheme(
+      activeTerminal,
+      effectiveTerminalTheme,
+      containerRef.current,
+      readLaunchPalette(),
+      readAppThemeIsBuiltin(),
+    );
   }, [effectiveTerminalTheme]);
 
   useEffect(() => {
@@ -2353,8 +2851,22 @@ export function TerminalViewport({
     observer.observe(container);
     const workspace = container.closest("[data-center-panel-workspace]");
     workspace?.addEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
+    // xterm rounds row heights in device pixels, so a display scale change alters
+    // how many rows fit an unchanged box, which the ResizeObserver never reports.
+    let pixelRatioQuery: MediaQueryList | null = null;
+    const watchPixelRatio = () => {
+      pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
+      pixelRatioQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      pixelRatioQuery.addEventListener("change", handlePixelRatioChange);
+    };
+    function handlePixelRatioChange() {
+      watchPixelRatio();
+      scheduleResize();
+    }
+    watchPixelRatio();
 
     return () => {
+      pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
       observer.disconnect();
       workspace?.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
       if (frame !== null) {
@@ -2394,14 +2906,20 @@ export function TerminalViewport({
         className="min-h-0 w-full flex-1 overflow-hidden"
         data-terminal-xterm-mount={terminalId}
       />
-      {shouldRender && sizeOwnership && mirroringSize ? (
-        <div className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
-          <span>Sized for another window.</span>
+      {shouldRender && sizeOwnership && mirroringSize !== null ? (
+        <div
+          role="status"
+          className="absolute inset-x-2 top-10 z-20 flex max-w-sm flex-wrap items-center gap-2 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
+        >
+          <span>
+            Sized for another window.
+            {mirroringSize < 1 ? ` Shown at ${Math.floor(mirroringSize * 100)}%.` : ""}
+          </span>
           <Button
             type="button"
             size="xs"
             variant="outline"
-            onClick={() => rendererRef.current?.size("fit")}
+            onClick={() => rendererRef.current?.fit()}
           >
             Fit to this window
           </Button>
@@ -3044,7 +3562,7 @@ export default function ThreadTerminalPanel({
                           type="button"
                           className={`flex w-full items-center rounded px-1 py-0.5 text-xs uppercase tracking-[0.08em] ${
                             isGroupActive
-                              ? "bg-accent/70 text-foreground"
+                              ? "bg-selected/70 text-selected-foreground"
                               : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                           }`}
                           onClick={() => onActiveTerminalChange(groupActiveTerminalId)}
@@ -3066,7 +3584,7 @@ export default function ThreadTerminalPanel({
                               key={terminalId}
                               className={`group flex items-center gap-1 rounded px-1 py-0.5 text-xs ${
                                 isActive
-                                  ? "bg-accent text-foreground"
+                                  ? "bg-selected text-selected-foreground"
                                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
                               }`}
                             >

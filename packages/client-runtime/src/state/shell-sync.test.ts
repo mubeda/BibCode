@@ -57,6 +57,7 @@ const CACHED_PROJECT = {
   repositoryIdentity: null,
   defaultModelSelection: null,
   scripts: [],
+  codeReviewPrompt: "",
   worktreeDiscovery: {
     visibility: "hidden",
     initialPromptDismissedAt: null,
@@ -773,6 +774,7 @@ describe("environment shell synchronization", () => {
               repositoryIdentity: null,
               defaultModelSelection: null,
               scripts: [],
+              codeReviewPrompt: "",
               worktreeDiscovery: {
                 visibility: "hidden",
                 initialPromptDismissedAt: null,

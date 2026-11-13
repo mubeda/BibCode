@@ -8,9 +8,22 @@ import {
 import { terminalInputKey } from "@bibcode/client-runtime/state/terminal";
 import type { TerminalDimensions } from "./terminalSizePolicy";
 
+/**
+ * False for a laid-out host with no area, such as a center column collapsed
+ * behind a maximized right panel: the fit addon would propose its 2-column or
+ * 1-row floor there. A host without a computed size (not laid out) is left to
+ * the addon, which already proposes nothing for it.
+ */
+export function terminalHostHasArea(host: Element): boolean {
+  const style = getComputedStyle(host);
+  return !(Number.parseFloat(style.width) <= 0 || Number.parseFloat(style.height) <= 0);
+}
+
 export function proposeTerminalDimensions(
   fit: Pick<FitAddon, "proposeDimensions">,
+  host?: Element,
 ): TerminalDimensions | null {
+  if (host && !terminalHostHasArea(host)) return null;
   try {
     const size = fit.proposeDimensions();
     return size && Number.isFinite(size.cols) && Number.isFinite(size.rows)
@@ -22,6 +35,21 @@ export function proposeTerminalDimensions(
   } catch {
     return null;
   }
+}
+
+/** The fit addon's own floor (`MINIMUM_COLS`, `MINIMUM_ROWS` in @xterm/addon-fit 0.11). */
+const FIT_MINIMUM_COLS = 2;
+const FIT_MINIMUM_ROWS = 1;
+
+/**
+ * Whether a proposal sits at the sizing minimum: what the fit proposes for a mount a few pixels
+ * wide or tall, which no program can draw in.
+ */
+export function isTerminalSizingMinimum(dimensions: TerminalDimensions): boolean {
+  return (
+    dimensions.cols <= Math.max(TERMINAL_COLS_MIN, FIT_MINIMUM_COLS) ||
+    dimensions.rows <= Math.max(TERMINAL_ROWS_MIN, FIT_MINIMUM_ROWS)
+  );
 }
 
 // Only mounted renderers register a reader. Launch callbacks can use their

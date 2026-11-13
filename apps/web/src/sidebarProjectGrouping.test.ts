@@ -27,6 +27,7 @@ function project(
     },
     defaultModelSelection: null,
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: {
       visibility: "hidden",
       initialPromptDismissedAt: null,

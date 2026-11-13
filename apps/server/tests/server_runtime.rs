@@ -1063,8 +1063,9 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         "media-src 'self' blob:",
         "base-uri 'self'",
         "frame-ancestors 'none'",
-        // Browser mode frames this host's preview gateways, each on its own port.
-        "frame-src 'self' http://127.0.0.1:*",
+        // Browser mode frames this host's preview gateways, each on its own port, and the
+        // PDF preview's own blob.
+        "frame-src 'self' blob: http://127.0.0.1:*",
     ] {
         assert!(csp.contains(directive), "missing {directive} in {csp}");
     }

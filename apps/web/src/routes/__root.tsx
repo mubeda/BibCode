@@ -18,6 +18,7 @@ import { AppStatusBar, SlowRequestsStatusBar } from "../components/status-bar/Ap
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
 import { ExternalUpdateNotice } from "../components/ExternalUpdateNotice";
+import { UnsavedChangesCloseHost } from "../components/files/UnsavedChangesCloseDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
 import { Button } from "../components/ui/button";
 import {
@@ -190,6 +191,7 @@ function RootRouteView() {
       <>
         <DocumentTitleSync />
         <BrowserChromeThemeSync key={pathname} />
+        <UnsavedChangesCloseHost />
         <Outlet />
       </>
     );
@@ -200,6 +202,7 @@ function RootRouteView() {
       <>
         <DocumentTitleSync />
         <BrowserChromeThemeSync key={pathname} />
+        <UnsavedChangesCloseHost />
         <Outlet />
       </>
     );
@@ -223,6 +226,7 @@ function RootRouteView() {
       <AnchoredToastProvider>
         <DocumentTitleSync />
         <BrowserChromeThemeSync key={pathname} />
+        <UnsavedChangesCloseHost />
         {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
         {presentation.showRemoteDeviceControls ? <SshPasswordPromptDialog /> : null}
         <DesktopDeepLinkRouter />
@@ -309,6 +313,7 @@ function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
+      <UnsavedChangesCloseHost />
       <div className="pointer-events-none absolute inset-0 opacity-80">
         <div className="absolute inset-x-0 top-0 h-44 bg-[radial-gradient(44rem_16rem_at_top,color-mix(in_srgb,var(--color-red-500)_16%,transparent),transparent)]" />
         <div className="absolute inset-0 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--background)_90%,var(--color-black))_0%,var(--background)_55%)]" />

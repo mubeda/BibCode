@@ -630,6 +630,108 @@ async fn portable_backend_runs_windows_command_and_powershell_shims() {
     .await;
 }
 
+const REVIEW_ARGV_MARKER: &str = "BIBCODE_REVIEW_ARGV";
+
+/// Sends a review prompt through an npm-style `%*` shim to `node` and checks `process.argv`.
+async fn assert_review_prompt_reaches_node(sample: &str) {
+    let node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .expect("node must be on PATH for the review prompt shim tests");
+    assert!(node.status.success(), "node --version failed: {node:?}");
+
+    let directory = tempfile::tempdir().unwrap();
+    let shim = directory.path().join("review.cmd");
+    std::fs::write(&shim, "@echo off\r\nnode \"%~dp0argv.js\" %*\r\n").unwrap();
+    // The array also goes to a file: a long line wraps in the 80-column terminal.
+    std::fs::write(
+        directory.path().join("argv.js"),
+        format!(
+            "const argv = JSON.stringify(process.argv.slice(2));\nrequire('fs').writeFileSync(process.env.BIBCODE_TEST_ARGV_FILE, argv);\nconsole.log('{REVIEW_ARGV_MARKER}:' + argv);\n"
+        ),
+    )
+    .unwrap();
+    let argv_file = directory.path().join("argv.json");
+    let arguments = [
+        "--permission-mode".to_owned(),
+        "plan".to_owned(),
+        "--".to_owned(),
+        format!("Code review requested from BiBCode. {sample}"),
+    ];
+    assert_shim_output(
+        &shim,
+        &arguments,
+        BTreeMap::from([(
+            "BIBCODE_TEST_ARGV_FILE".to_owned(),
+            argv_file.to_string_lossy().into_owned(),
+        )]),
+        REVIEW_ARGV_MARKER,
+    )
+    .await;
+    let received: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
+    assert_eq!(received, arguments, "node received other arguments");
+    for redirect_target in ["b", "d", "e"] {
+        assert!(
+            !directory.path().join(redirect_target).exists(),
+            "a redirect or second command created {redirect_target}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_quote() {
+    assert_review_prompt_reaches_node(r#"say "hi""#).await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_percent() {
+    assert_review_prompt_reaches_node("100% %PATH%").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_ampersand() {
+    assert_review_prompt_reaches_node("a & b").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_caret() {
+    assert_review_prompt_reaches_node("a ^ b").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_pipe() {
+    assert_review_prompt_reaches_node("a | b").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_redirect() {
+    assert_review_prompt_reaches_node("c < d > e").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_bang() {
+    assert_review_prompt_reaches_node("!x!").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_trailing_backslash() {
+    assert_review_prompt_reaches_node(r"ends with \\\").await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_backslash_before_quote() {
+    assert_review_prompt_reaches_node(r#"back\\"slash"#).await;
+}
+
+#[tokio::test]
+async fn review_prompt_shim_passes_combined() {
+    assert_review_prompt_reaches_node(
+        r#"say "hi" 100% %PATH% a & b a ^ b a | b c < d > e !x! back\\"slash ends with \\\"#,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn killing_a_batch_terminal_terminates_its_descendant_process() {
     let directory = tempfile::tempdir().unwrap();

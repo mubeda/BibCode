@@ -3,12 +3,16 @@
   "requestId": "900719925474099312345",
   "values": [
     {
-      "threadId": "rYgTo1C%Uf",
+      "threadId": "YgTo1C%Uf",
       "terminalId": "BhO\\;e7et^",
       "sequence": 3,
       "type": "exited",
       "exitCode": null,
-      "exitSignal": null
+      "exitSignal": null,
+      "generation": {
+        "boot": "prototype",
+        "process": 293411614987138
+      }
     }
   ]
 }

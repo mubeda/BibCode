@@ -395,6 +395,48 @@ const fixtureActivitySnapshot = {
   updatedAt: "2026-07-22T12:00:01Z",
 } as const;
 
+const fixtureHostMetricsSample = {
+  sampledAt: "2026-07-22T12:00:01.000Z",
+  cpuPercent: 23.5,
+  memoryTotalBytes: 34_359_738_368,
+  memoryUsedBytes: 12_025_908_428,
+  memoryAvailableBytes: 22_333_829_940,
+  volumes: [
+    {
+      mountPoint: "/",
+      name: "",
+      fileSystem: "ext4",
+      totalBytes: 2_147_483_648_000,
+      freeBytes: 671_088_640_000,
+      usedBytes: 1_476_395_008_000,
+      removable: false,
+      readOnly: false,
+      state: "ok",
+    },
+    {
+      mountPoint: "/mnt/slow",
+      name: "",
+      fileSystem: "ext4",
+      totalBytes: null,
+      freeBytes: null,
+      usedBytes: null,
+      removable: false,
+      readOnly: false,
+      state: "notResponding",
+    },
+  ],
+  volumesPaused: false,
+} as const;
+
+// Non-integral numbers, so the Rust round trip re-encodes every float byte-identical.
+const fixtureHostMetricsStatistic = {
+  current: 23.5,
+  minimum: 1.5,
+  average: 11.25,
+  p95: 40.5,
+  maximum: 97.5,
+} as const;
+
 const manualStreamSamples = new Map<string, unknown>([
   ["subscribeActivity:0", { kind: "snapshot", snapshot: fixtureActivitySnapshot }],
   [
@@ -408,6 +450,54 @@ const manualStreamSamples = new Map<string, unknown>([
         changes: [{ kind: "actor-upserted", actor: fixtureActivityActor }],
         updatedAt: "2026-07-22T12:00:02Z",
       },
+    },
+  ],
+  [
+    "server.subscribeHostMetrics:0",
+    {
+      _tag: "Snapshot",
+      host: { os: "linux", arch: "x86_64", cpuCount: 12, memoryTotalBytes: 34_359_738_368 },
+      bootId: "00000000-0000-0000-0000-000000000000",
+      startedAt: "2026-07-22T09:00:00.000Z",
+      statisticsSince: "2026-07-22T09:00:00.000Z",
+      sample: fixtureHostMetricsSample,
+      cpu: fixtureHostMetricsStatistic,
+      memory: fixtureHostMetricsStatistic,
+      recent: [{ sampledAt: "2026-07-22T12:00:01.000Z", cpuPercent: 23.5, memoryPercent: 35.25 }],
+      uptime: [
+        {
+          startedAt: "2026-07-22T11:59:00.000Z",
+          durationMs: 60_000,
+          cpuAverage: 12.5,
+          cpuPeak: 40.5,
+          memoryAverage: 35.25,
+          memoryPeak: 36.5,
+        },
+      ],
+      hiddenVolumes: [
+        { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
+        { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
+      ],
+      volumeStatistics: [{ mountPoint: "/", statistic: fixtureHostMetricsStatistic }],
+    },
+  ],
+  [
+    "server.subscribeHostMetrics:1",
+    {
+      _tag: "Sample",
+      statisticsSince: "2026-07-22T09:00:00.000Z",
+      sample: {
+        ...fixtureHostMetricsSample,
+        volumeListingNotResponding: false,
+        sequence: 3_601,
+        // The chart clock ran ahead of a wall clock moved back.
+        chartAt: "2026-07-22T12:00:01.250Z",
+        ageMs: 120,
+      },
+      cpu: fixtureHostMetricsStatistic,
+      memory: fixtureHostMetricsStatistic,
+      uptime: null,
+      volumeStatistics: [{ mountPoint: "/", statistic: fixtureHostMetricsStatistic }],
     },
   ],
   ["subscribeServerConfig:0", { version: 1, type: "snapshot", config: fixtureServerConfig }],
@@ -1023,16 +1113,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 196) {
-  throw new Error(`Expected 196 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 198) {
+  throw new Error(`Expected 198 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
-if (streamMethodCount !== 29) {
-  throw new Error(`Expected 29 streaming RPC methods, found ${streamMethodCount}.`);
+if (streamMethodCount !== 30) {
+  throw new Error(`Expected 30 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 94) {
+if (topLevelStreamShapeCount !== 96) {
   throw new Error(
-    `Expected 94 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 96 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
@@ -1040,8 +1130,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 413) {
-  throw new Error(`Expected 413 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 415) {
+  throw new Error(`Expected 415 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 27) {
   throw new Error(`Expected 27 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

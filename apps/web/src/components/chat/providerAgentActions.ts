@@ -94,3 +94,21 @@ export function resolveEffectiveProviderAgentAction(
     null
   );
 }
+
+/**
+ * The provider instance a new project's Main opens on: the Default Agent, or
+ * the first ready chat when it is unavailable. It never waits for agents to
+ * load; until then it keeps the Default Agent's instance.
+ */
+export function resolveDefaultAgentInstanceId(
+  providers: ReadonlyArray<ServerProvider>,
+  settings: ProviderAgentSettings,
+  defaultAgent: DefaultAgentSelection,
+): ProviderInstanceEntry["instanceId"] {
+  return (
+    resolveEffectiveProviderAgentAction(
+      buildProviderAgentActions(providers, settings),
+      defaultAgent,
+    )?.entry.instanceId ?? defaultAgent.instanceId
+  );
+}

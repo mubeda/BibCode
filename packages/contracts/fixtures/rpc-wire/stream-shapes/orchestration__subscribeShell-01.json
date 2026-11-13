@@ -6,7 +6,6 @@
       "kind": "project-upserted",
       "sequence": 0,
       "revision": "😀",
-      "engineSequence": 85,
       "project": {
         "id": "😀",
         "title": "Az9",
@@ -97,8 +96,9 @@
           "initialPromptDismissedAt": null,
           "baselinePaths": ["\u0000", "toString", "Xg", "n", "toString"]
         },
-        "createdAt": "",
-        "updatedAt": "�"
+        "codeReviewPrompt": "",
+        "createdAt": "�",
+        "updatedAt": "😀"
       }
     }
   ]

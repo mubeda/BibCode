@@ -1964,8 +1964,12 @@ if (browserRuntime) {
       await renderDialog(root, false, PROJECT_REF);
       await renderDialog(root, true, PROJECT_REF);
 
+      // A new opening starts in Smart mode (#346), with an empty field.
       expect(
-        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
       ).toBe("");
       expect(requiredButton(container, "Create worktree").disabled).toBe(true);
 
@@ -2010,7 +2014,7 @@ if (browserRuntime) {
       container.remove();
     });
 
-    it("selects the branch the field still names when reopening the same scoped project", async () => {
+    it("does not select a picked branch again when reopening the same scoped project (#346)", async () => {
       testState.refs = [{ name: "main", current: false, worktreePath: null }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
 
@@ -2019,19 +2023,24 @@ if (browserRuntime) {
       expect(requiredButton(container, "Create worktree").disabled).toBe(false);
 
       await renderDialog(root, false, PROJECT_REF);
+      // Refs refreshed while closed still name the branch; the new opening must not pick it.
+      testState.refs = [{ name: "main", current: false, worktreePath: null }];
       await renderDialog(root, true, PROJECT_REF);
 
-      // A pick is the field's text, so it is read again from the refreshed refs.
       expect(
-        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
-      ).toBe("main");
-      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
+      ).toBe("");
+      expect(container.textContent).not.toContain("Reuse branch");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
 
       await React.act(async () => root.unmount());
       container.remove();
     });
 
-    it("keeps a stale Smart source invalid after reopening", async () => {
+    it("keeps a stale Smart source invalid within one opening", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
       const sourceInput = requiredElement<HTMLInputElement>(
@@ -2045,8 +2054,7 @@ if (browserRuntime) {
         requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
         "Custom workspace",
       );
-      await renderDialog(root, false, PROJECT_REF);
-      // The branch is gone by the time the dialog opens again.
+      // The branch is gone when the refs refresh while the dialog stays open.
       testState.refs = [];
       await renderDialog(root, true, PROJECT_REF);
 
@@ -2161,6 +2169,432 @@ if (browserRuntime) {
 
       await React.act(async () => root.unmount());
       container.remove();
+    });
+
+    describe("every opening starts fresh (#346)", () => {
+      const SOURCE_PLACEHOLDERS = new Set([
+        "Type #1234 or search branches",
+        "Search branches",
+        "#1234 or a GitHub issue/PR URL",
+      ]);
+      const FRESH_FORM = {
+        name: "",
+        source: "",
+        mode: "Smart",
+        baseOverride: "",
+        advanced: false,
+        createMore: false,
+        reuseShown: false,
+        error: false,
+        createDisabled: true,
+        nameFocused: true,
+      };
+
+      function nameField(container: ParentNode): HTMLInputElement {
+        return requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']");
+      }
+
+      function sourceField(container: ParentNode): HTMLInputElement {
+        const match = Array.from(container.querySelectorAll<HTMLInputElement>("input")).find(
+          (candidate) => SOURCE_PLACEHOLDERS.has(candidate.placeholder),
+        );
+        if (!match) throw new Error("Missing Create From field");
+        return match;
+      }
+
+      function overrideField(container: ParentNode): HTMLInputElement {
+        return requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Defaults to the current branch']",
+        );
+      }
+
+      function formSnapshot(container: HTMLDivElement) {
+        const reuse = Array.from(container.querySelectorAll("label"))
+          .find((label) => label.textContent?.includes("Reuse branch"))
+          ?.querySelector<HTMLInputElement>("input[type='checkbox']");
+        return {
+          name: nameField(container).value,
+          source: sourceField(container).value,
+          mode: container.querySelector("button[aria-pressed='true']")?.textContent ?? null,
+          baseOverride: overrideField(container).value,
+          advanced: captured.collapsibles.at(-1)?.open ?? null,
+          createMore: captured.switches.at(-1)?.checked ?? null,
+          reuseShown: reuse !== undefined,
+          error: container.textContent?.includes("Choose a project and enter a worktree name."),
+          createDisabled: requiredButton(container, "Create worktree").disabled,
+          nameFocused: document.activeElement === nameField(container),
+        };
+      }
+
+      function projectPickerValue(container: ParentNode): string | undefined {
+        return container.querySelectorAll<HTMLElement>("[data-select-value]")[0]?.dataset[
+          "selectValue"
+        ];
+      }
+
+      function agentPickerValue(container: ParentNode): string | undefined {
+        return container.querySelectorAll<HTMLElement>("[data-select-value]")[1]?.dataset[
+          "selectValue"
+        ];
+      }
+
+      async function nextFrame(): Promise<void> {
+        await React.act(async () => new Promise((resolve) => setTimeout(resolve, 32)));
+      }
+
+      async function closeAndReopen(
+        root: Root,
+        defaultProjectRef: ScopedProjectRef | null = PROJECT_REF,
+        closedProjectRef: ScopedProjectRef | null = defaultProjectRef,
+      ): Promise<void> {
+        await renderDialog(root, false, closedProjectRef);
+        await renderDialog(root, true, defaultProjectRef);
+        await nextFrame();
+      }
+
+      async function create(container: HTMLDivElement): Promise<void> {
+        await React.act(async () => requiredButton(container, "Create worktree").click());
+        await React.act(async () => flushPromises());
+      }
+
+      function lastCreateInput(): Record<string, unknown> | undefined {
+        return testState.createWorktree.mock.calls.at(-1)?.[0];
+      }
+
+      /** Branch mode, a picked branch, an edited Name, a base override and a manual agent. */
+      async function fillEveryField(container: HTMLDivElement): Promise<void> {
+        await React.act(async () => requiredButton(container, "Branch").click());
+        await React.act(async () => requiredButton(container, "feature/login").click());
+        await setInputValue(nameField(container), "fresh-dialog-check");
+        await React.act(async () => captured.collapsibles.at(-1)?.onOpenChange?.(true));
+        await setInputValue(overrideField(container), "release/1.0");
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:claudeAgent"));
+      }
+
+      beforeEach(() => {
+        testState.refs = [
+          { name: "main", current: true, worktreePath: "/repo" },
+          { name: "feature/login", isRemote: false, current: false, worktreePath: null },
+        ];
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]),
+        );
+      });
+
+      it("reopens fresh after an ordinary successful creation (A1, A8)", async () => {
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await fillEveryField(container);
+        expect(formSnapshot(container)).toMatchObject({
+          name: "fresh-dialog-check",
+          source: "feature/login",
+          mode: "Branch",
+          baseOverride: "release/1.0",
+          advanced: true,
+        });
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        await create(container);
+        expect(lastCreateInput()).toMatchObject({
+          input: { title: "fresh-dialog-check", refName: "feature/login" },
+        });
+        expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+
+        await closeAndReopen(root);
+
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+        expect(projectPickerValue(container)).toBe(scopedProjectKey(PROJECT_REF));
+        expect(agentPickerValue(container)).toBe("chat:codex");
+
+        // A refresh while the fresh dialog is open does not bring the old source back.
+        await renderDialog(root, true, PROJECT_REF);
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        await setInputValue(nameField(container), "second-one");
+        await create(container);
+        expect(lastCreateInput()).toEqual({
+          environmentId: ENVIRONMENT_ID,
+          input: expect.objectContaining({
+            projectId: PROJECT_ID,
+            title: "second-one",
+            refName: "HEAD",
+            newRefName: "second-one",
+            baseRefName: "HEAD",
+            threadDefaults: expect.objectContaining({
+              modelSelection: expect.objectContaining({ instanceId: "codex" }),
+            }),
+          }),
+        });
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("clears a typed Name in Smart mode after success and reopen", async () => {
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await setInputValue(nameField(container), "typed-only");
+        await create(container);
+        await closeAndReopen(root);
+
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("discards a dismissed draft, Advanced, Create more and an error (A3)", async () => {
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        // A direct submission of an empty form records the form error.
+        await React.act(async () =>
+          captured.buttons
+            .findLast((props) => collectText(props.children).includes("Create worktree"))
+            ?.onClick?.(),
+        );
+        await React.act(async () => flushPromises());
+        expect(formSnapshot(container).error).toBe(true);
+        await fillEveryField(container);
+        await React.act(async () => captured.switches.at(-1)?.onCheckedChange?.(true));
+
+        // Escape or Close asks the caller to close an idle dialog.
+        await React.act(async () => captured.dialogs.at(-1)?.onOpenChange?.(false));
+        expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+        await closeAndReopen(root);
+
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(testState.createWorktree).not.toHaveBeenCalled();
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("clears an automatic, an edited and a GitHub name after success (A2)", async () => {
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+
+        // An untouched suggestion from a free local branch, with Reuse branch on.
+        await React.act(async () => requiredButton(container, "Branch").click());
+        await React.act(async () => requiredButton(container, "feature/login").click());
+        expect(formSnapshot(container)).toMatchObject({ name: "feature/login", reuseShown: true });
+        await create(container);
+        await closeAndReopen(root);
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        // A suggestion the user edited.
+        await React.act(async () => requiredButton(container, "Branch").click());
+        await React.act(async () => requiredButton(container, "feature/login").click());
+        await setInputValue(nameField(container), "feature/login-edited");
+        await create(container);
+        await closeAndReopen(root);
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        // A GitHub work item and its suggested name.
+        await React.act(async () => requiredButton(container, "GitHub").click());
+        await setInputValue(sourceField(container), "#42");
+        expect(formSnapshot(container)).toMatchObject({ name: "pr-42", createDisabled: false });
+        await create(container);
+        await closeAndReopen(root);
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+        expect(testState.createWorktree).toHaveBeenCalledTimes(3);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("opens on the caller's project, else the first one, with none of the last opening's values (A4)", async () => {
+        const secondEnvironmentId = EnvironmentId.make("remote");
+        const secondProjectRef = scopeProjectRef(
+          secondEnvironmentId,
+          ProjectId.make("project-two"),
+        );
+        testState.projects = [
+          project(),
+          project({
+            id: secondProjectRef.projectId,
+            environmentId: secondEnvironmentId,
+            title: "Repo B",
+            workspaceRoot: "/repo-b",
+          }),
+        ];
+        testState.serverConfigs.set(
+          secondEnvironmentId,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]),
+        );
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await fillEveryField(container);
+
+        await closeAndReopen(root, secondProjectRef, PROJECT_REF);
+        expect(projectPickerValue(container)).toBe(scopedProjectKey(secondProjectRef));
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        // Without a caller project the first project is the default, not the last selection.
+        await setInputValue(nameField(container), "typed-for-b");
+        await closeAndReopen(root, null, secondProjectRef);
+        expect(projectPickerValue(container)).toBe(scopedProjectKey(PROJECT_REF));
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+
+        // No projects: nothing is selected and Create stays disabled.
+        testState.projects = [];
+        await closeAndReopen(root, null);
+        expect(projectPickerValue(container)).toBeUndefined();
+        await setInputValue(nameField(container), "late-edit");
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+        // Projects that arrive later supply the default without erasing the edit.
+        testState.projects = [project()];
+        await renderDialog(root, true, null);
+        expect(projectPickerValue(container)).toBe(scopedProjectKey(PROJECT_REF));
+        expect(nameField(container).value).toBe("late-edit");
+        expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("follows the current Settings Default Agent, not the last manual pick (A5)", async () => {
+        function changeDefaultAgent(kind: "chat" | "terminal", instanceId: string): void {
+          setDefaultAgent(kind, instanceId);
+          const config = testState.serverConfigs.get(ENVIRONMENT_ID);
+          if (config) {
+            testState.serverConfigs.set(ENVIRONMENT_ID, {
+              ...config,
+              settings: testState.primarySettings,
+            });
+          }
+        }
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:claudeAgent"));
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        changeDefaultAgent("terminal", "codex");
+        await closeAndReopen(root);
+        expect(agentPickerValue(container)).toBe("terminal:codex");
+
+        // An unavailable default keeps its fallback and the note that explains it.
+        changeDefaultAgent("chat", "cursor");
+        await closeAndReopen(root);
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(container.textContent).toContain(
+          "Your default agent is not available on Local, so Codex is selected.",
+        );
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("keeps the inputs while open through a failure, a pending create and a refresh (A6)", async () => {
+        const filled = {
+          name: "fresh-dialog-check",
+          source: "feature/login",
+          mode: "Branch",
+          baseOverride: "release/1.0",
+          advanced: true,
+          createMore: false,
+          reuseShown: true,
+          error: false,
+          createDisabled: false,
+        };
+        testState.createWorktree.mockResolvedValueOnce(failure(new Error("disk full")));
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await fillEveryField(container);
+
+        await create(container);
+        expect(testState.toastAdd).toHaveBeenCalledWith(
+          expect.objectContaining({ title: "Failed to create worktree", description: "disk full" }),
+        );
+        expect(testState.onOpenChange).not.toHaveBeenCalled();
+        expect(formSnapshot(container)).toMatchObject(filled);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        // Projects, refs and agents refresh while the dialog stays open.
+        testState.projects = [project()];
+        testState.refs = testState.refs.map((ref) => ({ ...ref }));
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]),
+        );
+        await renderDialog(root, true, PROJECT_REF);
+        expect(formSnapshot(container)).toMatchObject(filled);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        // While the retry is pending, dismissal and a second submission are ignored.
+        let resolveCreate: ((result: unknown) => void) | undefined;
+        testState.createWorktree.mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveCreate = resolve;
+          }),
+        );
+        await React.act(async () => requiredButton(container, "Create worktree").click());
+        expect(requiredButton(container, "Creating...").disabled).toBe(true);
+        await React.act(async () => captured.dialogs.at(-1)?.onOpenChange?.(false));
+        await React.act(async () =>
+          requiredElement<HTMLDivElement>(container, "[data-testid='dialog-popup']").dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+          ),
+        );
+        expect(testState.onOpenChange).not.toHaveBeenCalled();
+        expect(testState.createWorktree).toHaveBeenCalledTimes(2);
+        expect(lastCreateInput()).toMatchObject({
+          input: { title: "fresh-dialog-check", refName: "feature/login" },
+        });
+
+        await React.act(async () => {
+          resolveCreate?.(success({ threadId: "thread-created" }));
+          await flushPromises();
+        });
+        expect(testState.onOpenChange).toHaveBeenCalledWith(false);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("keeps a Create more batch's options until the dialog is reopened (A7)", async () => {
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await fillEveryField(container);
+        await React.act(async () => captured.switches.at(-1)?.onCheckedChange?.(true));
+
+        await create(container);
+        await nextFrame();
+        expect(testState.onOpenChange).not.toHaveBeenCalled();
+        expect(testState.navigate).not.toHaveBeenCalled();
+        expect(formSnapshot(container)).toEqual({
+          // Cleared for the next worktree.
+          name: "",
+          source: "",
+          reuseShown: false,
+          error: false,
+          createDisabled: true,
+          nameFocused: true,
+          // Kept for the batch.
+          mode: "Branch",
+          baseOverride: "release/1.0",
+          advanced: true,
+          createMore: true,
+        });
+        expect(projectPickerValue(container)).toBe(scopedProjectKey(PROJECT_REF));
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        await setInputValue(nameField(container), "batch-two");
+        await create(container);
+        expect(lastCreateInput()).toMatchObject({
+          input: {
+            title: "batch-two",
+            refName: "release/1.0",
+            baseRefName: "release/1.0",
+            threadDefaults: {
+              modelSelection: expect.objectContaining({ instanceId: "claudeAgent" }),
+            },
+          },
+        });
+
+        await React.act(async () => captured.dialogs.at(-1)?.onOpenChange?.(false));
+        await closeAndReopen(root);
+        expect(formSnapshot(container)).toEqual(FRESH_FORM);
+        expect(agentPickerValue(container)).toBe("chat:codex");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
     });
 
     describe("Default Agent (#185)", () => {

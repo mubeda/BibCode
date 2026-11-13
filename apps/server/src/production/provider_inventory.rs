@@ -415,6 +415,10 @@ async fn probe_one(
     checks_enabled: bool,
     maintenance: &ProviderMaintenance,
 ) -> ProviderProbeResult {
+    // A driver this build does not ship has no binary to look up or version to advise on.
+    if !definition.available {
+        return unavailable_result(&definition);
+    }
     let target = maintenance_target_from_definition(&definition);
     let mut result = probe_one_snapshot(&definition, cwd, include_slow_capabilities).await;
     maintenance
@@ -486,30 +490,44 @@ pub(crate) async fn probe_maintenance_target_version(
     about.and_then(|about| about.version).or(version)
 }
 
+fn unavailable_result(definition: &ProviderDefinition) -> ProviderProbeResult {
+    ProviderProbeResult::new(
+        snapshot(
+            definition,
+            false,
+            None,
+            "disabled",
+            json!({ "status": "unknown" }),
+            provider_models_without_version(definition),
+            ProviderCapabilities::default(),
+            Some("Provider driver is unavailable in this build."),
+            super::control::now_iso(),
+            "unavailable",
+        ),
+        RichMetadataOutcome::NotRequested,
+    )
+}
+
+/// The configured instances whose driver this build does not ship, as their snapshots. They
+/// need no probe, so a settings change publishes them before the settings themselves (#347).
+pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult> {
+    definitions(settings)
+        .iter()
+        .filter(|definition| !definition.available)
+        .map(unavailable_result)
+        .collect()
+}
+
 async fn probe_one_snapshot(
     definition: &ProviderDefinition,
     cwd: &Path,
     include_slow_capabilities: bool,
 ) -> ProviderProbeResult {
+    if !definition.available {
+        return unavailable_result(definition);
+    }
     let checked_at = super::control::now_iso();
     let default_models = provider_models_without_version(definition);
-    if !definition.available {
-        return ProviderProbeResult::new(
-            snapshot(
-                definition,
-                false,
-                None,
-                "disabled",
-                json!({ "status": "unknown" }),
-                default_models,
-                ProviderCapabilities::default(),
-                Some("Provider driver is unavailable in this build."),
-                checked_at,
-                "unavailable",
-            ),
-            RichMetadataOutcome::NotRequested,
-        );
-    }
     if !definition.enabled {
         return ProviderProbeResult::new(
             snapshot(

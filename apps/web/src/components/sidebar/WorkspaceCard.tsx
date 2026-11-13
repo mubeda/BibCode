@@ -10,6 +10,7 @@ import {
   PinIcon,
   TerminalIcon,
   TriangleAlertIcon,
+  type LucideIcon,
 } from "lucide-react";
 import type * as React from "react";
 import type { ReactNode } from "react";
@@ -126,6 +127,11 @@ export interface WorkspaceCardShellProps {
   readonly className: string;
   readonly idBase: string;
   readonly isActive: boolean;
+  /** Multi-selected. With `isActive` it keys the row state rules of `index.css` (R64). */
+  readonly isSelected: boolean;
+  /** The row's sidebar level in `index.css` (R63). `primary` marks the main checkout. */
+  readonly level: "checkout" | "worktree";
+  readonly primary?: boolean;
   readonly hasFlags: boolean;
   readonly hasBranchLine: boolean;
   readonly hasSessionLine: boolean;
@@ -158,6 +164,10 @@ export function WorkspaceCardShell(props: WorkspaceCardShellProps) {
   return (
     <SidebarMenuSubItem
       className={props.className}
+      data-sidebar-level={props.level}
+      data-primary={props.primary ? "" : undefined}
+      data-selected={props.isSelected ? "true" : undefined}
+      data-active={props.isActive ? "true" : undefined}
       data-thread-item
       data-testid={props.testId}
       onClick={props.onClick}
@@ -190,7 +200,18 @@ export function WorkspaceCardShell(props: WorkspaceCardShellProps) {
   );
 }
 
-/** Line 1: title (bold while unread), primary chip, pin, then trailing controls. */
+/**
+ * The unread mark before a title, the shape of the Agents view's dot. The level rules colour it,
+ * and the card's flags announce it.
+ */
+export function WorkspaceCardUnreadDot() {
+  return <span aria-hidden data-sidebar-unread className="size-1.5 shrink-0 rounded-full" />;
+}
+
+/**
+ * Line 1: title (bold while unread), primary chip, pin, then trailing controls. On a worktree row
+ * that leads with its branch, `chat` draws it as line 2, the chat title.
+ */
 export function WorkspaceCardTitleLine(props: {
   readonly id: string;
   readonly flagsId: string;
@@ -200,6 +221,10 @@ export function WorkspaceCardTitleLine(props: {
   readonly pinned: boolean;
   readonly pinnedTestId?: string;
   readonly primary?: boolean;
+  /** The chat title under a worktree's branch line, at chat level instead of the level label. */
+  readonly chat?: boolean;
+  /** The level's leading icon: a house on the primary checkout, a branch on a worktree. */
+  readonly icon?: LucideIcon | undefined;
   /** Replaces the visible title while renaming inline. */
   readonly renameInput?: ReactNode;
   /** Archive/Confirm, or the ⌘ jump label while the modifier is held. */
@@ -210,8 +235,11 @@ export function WorkspaceCardTitleLine(props: {
   const flags = [props.unread ? "unread" : null, props.pinned ? "pinned" : null]
     .filter((flag) => flag !== null)
     .join(", ");
+  const Icon = props.icon;
   return (
-    <div className="flex h-5 min-w-0 items-center gap-1.5">
+    <div className={cn("flex min-w-0 items-center gap-1.5", props.chat ? "h-[18px]" : "h-5")}>
+      {Icon ? <Icon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" /> : null}
+      {props.unread && !props.renameInput ? <WorkspaceCardUnreadDot /> : null}
       {props.renameInput ? (
         <>
           <span id={props.id} className="sr-only">
@@ -227,9 +255,13 @@ export function WorkspaceCardTitleLine(props: {
                 id={props.id}
                 data-testid={props.titleTestId}
                 data-unread={props.unread ? "true" : undefined}
+                data-sidebar-label={props.chat ? undefined : true}
+                data-sidebar-level={props.chat ? "chat" : undefined}
+                // The level rules colour the title, read or unread, and size the chat title.
                 className={cn(
-                  "pointer-events-auto min-w-0 truncate text-[13px]",
-                  props.unread ? "font-semibold text-foreground" : "text-foreground/80",
+                  "pointer-events-auto min-w-0 truncate",
+                  !props.chat && "text-[13px]",
+                  props.unread && "font-semibold",
                 )}
               />
             }
@@ -242,7 +274,7 @@ export function WorkspaceCardTitleLine(props: {
         </Tooltip>
       )}
       {props.primary ? (
-        <span className="shrink-0 rounded border border-border bg-muted px-1.5 text-xs leading-4 text-muted-foreground">
+        <span data-sidebar-badge className="shrink-0 px-1.5 text-xs leading-4">
           primary
         </span>
       ) : null}
@@ -265,14 +297,47 @@ export function WorkspaceCardTitleLine(props: {
   );
 }
 
-/** Line 2: branch, notice, or spacer, then indicators at the right end. */
+/**
+ * Line 2: branch, notice, or spacer, then indicators at the right end. With `label` it is a
+ * worktree row's line 1: the branch icon and name as the level label, at the label's size.
+ */
 export function WorkspaceCardBranchLine(props: {
   readonly id: string;
   readonly branch: string | null;
   readonly branchTooltip: string | null;
   readonly notice?: { readonly label: string; readonly description: string } | null;
+  /** False on a worktree row, whose title line already leads with the branch icon. */
+  readonly branchIcon?: boolean;
+  readonly label?: boolean;
+  /** With `label`: Archive or the jump label, outside the element the card's description reads. */
+  readonly trailing?: ReactNode;
   readonly children?: ReactNode;
 }) {
+  if (props.label) {
+    return (
+      <div className="flex h-5 min-w-0 items-center gap-1.5">
+        <div id={props.id} className="flex min-w-0 flex-1 items-center gap-1.5">
+          <GitBranchIcon data-sidebar-icon aria-hidden className="size-3.5 shrink-0" />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <span data-sidebar-label className="pointer-events-auto min-w-0 flex-1 truncate" />
+              }
+            >
+              {props.branch}
+            </TooltipTrigger>
+            {props.branchTooltip ? (
+              <TooltipPopup side="top">{props.branchTooltip}</TooltipPopup>
+            ) : null}
+          </Tooltip>
+          <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+            {props.children}
+          </span>
+        </div>
+        {props.trailing}
+      </div>
+    );
+  }
   return (
     <div
       id={props.id}
@@ -293,7 +358,9 @@ export function WorkspaceCardBranchLine(props: {
         </>
       ) : props.branch !== null ? (
         <>
-          <GitBranchIcon aria-hidden className="size-3 shrink-0" />
+          {props.branchIcon === false ? null : (
+            <GitBranchIcon aria-hidden className="size-3 shrink-0" />
+          )}
           <Tooltip>
             <TooltipTrigger
               render={<span className="pointer-events-auto min-w-0 flex-1 truncate" />}
@@ -463,7 +530,7 @@ export function WorkspaceCardMoreChats(props: {
 }) {
   // Spans only: it is the label of the button that lists the chats.
   return (
-    <span className="flex h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+    <span data-sidebar-level="chat" className="flex h-5 min-w-0 items-center gap-1.5">
       <span className="flex w-4 shrink-0 items-center justify-center">
         <WorkspaceCardStatusGlyph status={props.status} />
       </span>

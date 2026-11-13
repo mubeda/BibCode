@@ -259,7 +259,7 @@ When changing terminal attachment, sizing, or query replies, also run:
 
 ```sh
 vp test run packages/contracts/src/terminal.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/rpcRustParity.test.ts packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
-vp test run packages/client-runtime/src/state/terminalTranscriptRuntime.test.ts packages/client-runtime/src/state/terminalAttachAdapter.test.ts
+vp test run packages/client-runtime/src/state/terminalTranscriptRuntime.test.ts packages/client-runtime/src/state/terminalAttachAdapter.test.ts packages/client-runtime/src/state/terminalCommands.test.ts
 vp test run apps/web/src/components/ThreadTerminalPanel apps/web/src/components/terminalSizePolicy.test.ts apps/web/src/components/terminalSizing.test.ts apps/web/src/components/terminalReplyGuard.test.ts apps/web/src/components/terminalOutputSink.test.ts apps/web/src/components/ChatView.hooks.test.tsx apps/web/src/centerTerminalActions.test.ts
 cargo test -p bibcode-server --lib terminal -j 2
 cargo test -p bibcode-server --test production_server_terminal_rpc -j 2
@@ -287,22 +287,44 @@ once, and later windows do not answer them again.
 
 A lone window and an equal-size mirror must show no size notice. A
 different-size mirror explains that it is **Sized for another window** and
-offers **Fit to this window**. Dismiss the notice with its labeled button using
+offers **Fit to this window**. A mirror smaller than the owner shows the whole
+grid scaled down, with the scale in the notice, its last row inside its box;
+under half size it scrolls, pinned to the bottom rows. Its first click takes the
+size and must not reach the program. A larger mirror shows the grid at normal
+size. Refocus an idle mirror window without clicking or typing in it (switch
+to it from the keyboard, or wake the display): it must not take the size. Dismiss the notice with its labeled button using
 pointer and keyboard. It must remain hidden through layout changes, unchanged
 size events, hide/show, tab visibility changes, and panel remounts while
 size/owner remain the same. A changed applied size/owner makes it eligible to
 reappear. Closing the terminal and creating a new one must not inherit its
 dismissal.
 
+With a provider TUI in a center terminal, maximize the right panel and restore
+it: `stty size` in a plain center terminal never reports 2 columns or 1 row
+while it is hidden. Move the window to a display with another scale, or change
+the display scale, without resizing any panel: the TUI's bottom rows stay
+visible.
+
 Resize the mirror's container: it must not resize the program. Focus, click, or
 type in a mirror, including an equal-size mirror, to transfer ownership. After
 a click or keypress, the notice must stay hidden without flashing back while
-the terminal catches up. Try **Fit to this window** on an exited terminal,
+the terminal catches up. As owner, shrink the terminal's box without resizing
+the window (open an AI terminal's Activity panel); then click and type: the
+terminal must end at the rows that fit, with its bottom line visible, without a
+width change. Try **Fit to this window** on an exited terminal,
 then reopen or restart it: the window must remain usable, with the notice and
 fit action available when another window owns a different size.
-Close or disconnect the owner: other windows receive a null claim, immediately
-attempt a claim, and may answer queries while unowned. Repeat through reconnect
-and process restart; a departed stream cannot clear the replacement's claim. An
+Close or disconnect the owner, or hide its tab: a lone other window takes the
+size at once; with several, the one typed in last does, and with none typed in
+the size stays un-owned, every window shows the whole grid with the notice, and
+none claims until a person clicks, types or focuses one; a window reloaded or
+opened meanwhile does not take it, and only one window answers the program's
+queries. The owner gets the size back when it reconnects or is shown
+again before anyone typed elsewhere. A server without `terminalUserInputClaim`
+leaves every released size un-owned, and its windows claim it at once. After a
+process restart the window that owned the size keeps it while it stays open;
+with no owner left, every window claims at once. Repeat through reconnect; a
+departed stream cannot clear the replacement's claim. An
 older attach without `sizeClaim` and the general `subscribeTerminalEvents`
 stream must never receive `resized`.
 
@@ -642,6 +664,15 @@ vp run test:ui:desktop
 Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`
 and, on Linux, for the headless `xvfb-run` invocation and its Wayland-socket
 guard.
+When a worker starts, the harness sends one trivial script to the webview. If
+the driver answers with a dead-session error (the webview crashed in an earlier
+spec; WebKitGTK then answers every script with "Unsupported result type"), it
+ends the app if its process survived (found through `lsof`, which must be
+installed), relaunches it once, and opens a new session. The shared specs run
+in one worker, so a crash in one of them fails the rest of that worker (the
+failure screenshot of the `afterTest` hook fails on the dead webview and Mocha
+skips what follows); only the closing spec's worker starts with the relaunch
+check.
 The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
 `BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
 using the native shell's environment syntax, then clear that selection before
@@ -650,6 +681,17 @@ turn-specific file marker releases it, with a bounded timeout for failed runs.
 The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
+
+The default specs share one app session. `desktop-save-and-close.e2e.ts` ends
+the app, so it runs last, in a worker of its own. Its native close and quit
+cases choose Close Window or Quit from the application menu while the backend is
+still running, so the close dialog can reach the web page; they run on macOS
+only and skip on Linux and Windows, where the export and update-dialog focus
+cases still run. After a case that ended the app, the lifecycle helper
+(`apps/desktop/e2e/support/app-lifecycle.ts`) starts the app again with a new
+WebDriver session, and teardown accepts an app that has already exited. A spec
+that leaves an edit unsaved cannot hang teardown: the helper ends it through
+`desktop_e2e_prepare_for_exit`.
 
 The default suite also includes `chat-side-chat.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/chat-side-chat.e2e.ts`). It starts a `[[slow]]` host
@@ -661,6 +703,24 @@ provider input, transcript and queue are unchanged. The host's `[[slow]]`
 marker is part of the seed, so the side chat's turn is slow too; the scenario
 releases both turns one after the other through the release file. It saves
 `side-chat-reply.png` and `side-chat-host-untouched.png`.
+
+The default suite also includes `source-control-review.e2e.ts` (isolate it with
+`BIBCODE_E2E_SPEC=./specs/source-control-review.e2e.ts`). Run it with the
+Profiler on, as every packaged run should be, and read its findings afterwards.
+It modifies the fixture's `README.md`, clicks **Review changes** in Source
+Control and checks that a **Code review · Codex** tab opens, that Codex's first
+provider input starts with the review lead-in and names the uncommitted scope,
+and that the panel's runtime picker reads **Supervised**. It then picks
+**Claude** under **Review once with** in the review menu: the Claude fixture
+answers a prompt that starts with "Code review requested from BiBCode." with an
+`ExitPlanMode` plan, and the spec checks that the card reads **Review findings**
+with no Implement, Refine or **Implement in a new thread**, and that Enter in
+the empty composer sends nothing, before and after a reload. It saves
+`review-codex-panel.png`, `review-claude-findings.png` and
+`review-claude-findings-after-reload.png`. To prove the flag decides the Claude
+case, build once with `codeReview: false` in the review handler's panel request
+in `apps/web/src/components/ChatView.tsx` and run the spec alone: it must fail at
+the Implement check. Restore the line before the full suite.
 
 The native composer fixture must advertise each user-invocable Claude skill in
 both the `initialize.commands` catalog and `reload_skills.skills`. The server
@@ -716,6 +776,51 @@ typing. It writes a timestamped recorder log per run to
 connection is back. Before the fix, with a read-only composer, its
 offline-before-typing arm lost the text on macOS arm64 in every run. What closed
 the macOS x64 runner's connection in that CI run is not known.
+
+The seeded loop `apps/desktop/e2e/specs/terminal-footer-invariant.e2e.ts` (not
+in the default list; run it with
+`BIBCODE_E2E_SPEC=./specs/terminal-footer-invariant.e2e.ts`) opens a Codex
+Terminal on the fixture TUI, which draws a footer on its last three rows and
+logs each PTY size, and drives random layout actions around it: the right
+panel's toggle, maximize and edge drag, the terminal's Activity panel, a center
+split or unsplit, tab and route switches, the sidebar, window resizes, and
+reloads. The baseline waits for the terminal's Activity dock, which mounts
+after the terminal and shrinks it, and for the refit that follows. Each step is
+measured once it settles and again 1.5 s later; only the
+later measurement fails the run. Then the PTY's rows must equal the
+rows xterm draws and the rows that fit the mount, the last row must sit inside
+every clipping ancestor, and with the DOM renderer the footer must be on the
+last row when the terminal is wide enough for its text. A center column
+collapsed behind a maximized right panel (zero width), or covered by one (what
+is drawn at the mount's corner is not the terminal), counts as not shown.
+`BIBCODE_E2E_FOOTER_LAYOUT=floating` runs a frame drawn in the
+normal buffer and checks instead that the footer appears
+exactly once at the current size. `BIBCODE_E2E_FOOTER_LAYOUT=cli` runs an
+Ink-like program, as Claude's CLI is: a long transcript, and a six-row frame on
+the bottom rows erased line by line and rewritten every 80 to 120 ms; it also
+requires the viewport to stay at the bottom. `BIBCODE_E2E_FOOTER_RENDERER=dom`
+turns the WebGL renderer off so every check reads the text, and
+`BIBCODE_E2E_FOOTER_CHAT=1` adds chat sends and a growing composer to the
+actions. `BIBCODE_E2E_FOOTER_SEED` (default 348)
+replays a run and `BIBCODE_E2E_FOOTER_STEPS` (default 40) lengthens it; the
+case timeout grows with the step count. A window resize the window manager
+does not settle exactly (GTK under Xvfb) is recorded with the size it reached.
+A violation fails with
+the seed, the steps so far, the measurements, and a
+`terminal-footer-<seed>-<step>-<time>.png` screenshot with a `.json` report
+beside it. A passing run writes `terminal-footer-<seed>-passed.json` with its
+steps, the settling checks that disagreed and cleared, and the renderers seen.
+An edge drag that the driver cannot perform is logged as skipped.
+
+A terminal whose view followed its output is returned to the bottom after its
+renderer was paused (#348). The packaged harness has no test for it: the field
+route needs a row shrink from another viewer while the terminal's mount is 0 px
+wide behind the right panel, and the harness has one window. A spec that moved
+the terminal off-screen and shrank the rows from its own window passed on the
+build that had the bug. The unit tests in
+`apps/web/src/components/terminalFollowOutput.test.ts` and the two-machine pair's
+replay (right panel dragged wide so the mount goes to 0 px, a row shrink from
+the other viewer, output, the panel closed) cover it.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
@@ -3463,11 +3568,21 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Create Worktree starts fresh on every opening (#346): choose **Branch**, pick
+  a branch, type a Name, set a base override under **Advanced** and pick an
+  agent by hand, then create with **Create more** off. Reopen it from the same
+  project: Name and Create From are empty, Smart is selected, Advanced is
+  collapsed and empty, Create more is off, the agent is the Default Agent, and
+  Create is disabled. Repeat with edits closed by **Escape**, and confirm that
+  a failed create keeps the input and that **Create more** keeps the project,
+  mode, agent and override for the next worktree until the dialog is closed;
 - Create Worktree and Add Project follow **Settings → Agents → Default Agent**
   (#185). Check each of these:
   - **Primary project:** with the app running, change Default Agent to a Claude
     chat, open Create Worktree, and confirm the Agent picker shows it. Create
-    without touching the picker; the new thread runs Claude. Repeat with an AI
+    without touching the picker; the new thread runs Claude. Before sending a
+    message, open its composer model picker with another provider ready: it
+    lists only that Claude account's models (#347). Repeat with an AI
     terminal; Main becomes that terminal.
   - **Remote project:** on a saved server whose own settings still name the
     built-in default, the picker and the created thread use the Settings
@@ -3602,6 +3717,62 @@ sizes. Cover relevant:
   environment is disconnected and verify the tab reconciles as soon as it
   reconnects. On Windows, repeat the clean-tab reload with a WSL-hosted
   workspace on a Windows path, where read latency sets the poll's cost;
+- Files rich Markdown editing: the packaged `files-rich-markdown` spec opens a
+  fixture `notes.md` (frontmatter, a paragraph, a fenced code block) in the
+  rendered view. It proves that an edit and a heading made there save with the
+  frontmatter and the fence unchanged on disk, that Undo in rendered view removes
+  the heading and that one Undo in source view removes a whole rendered visit,
+  that opening and saving a file without editing leaves it byte-identical, and
+  that an image the file links by a relative path (a placeholder PNG the spec
+  writes) loads in the rendered view. Rerun it alone with `BIBCODE_E2E_SPEC=./specs/files-rich-markdown.e2e.ts`. By
+  hand, also check **Link**, **Image** (the copy lands beside the Markdown file
+  and a second copy with the same name gets a new name), the **More formatting**
+  menu, and that a file with a footnote or an `.mdx` file shows the read-only
+  notice;
+- Appearance themes: the packaged `appearance-themes` spec proves that the left
+  panel marks its repository, checkout and chat levels in Light and in Tokyo
+  Night, that clicking the Matrix Dark row in Light mode switches to Dark and
+  Undo restores Light, that Tokyo Night repaints the app and Dark restores it,
+  that a duplicated theme previews while it is edited and returns to its saved
+  colors on Cancel, and that a saved custom theme is painted again after a
+  reload. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/appearance-themes.e2e.ts`. By hand, open a terminal
+  before changing the theme and verify it keeps its colors while a new terminal
+  uses the theme;
+- Source Control review: the packaged `source-control-review` spec covers a
+  Codex chat review and a Claude review whose findings offer no Implement after
+  a reload. With the Profiler on, also check by hand on macOS and Linux a
+  **Claude Terminal** and a **Codex Terminal** review: the terminal starts with
+  the read-only flags, the review prompt arrives whole as its first message, and
+  the agent's Activity shows as for any AI Terminal. On Windows the terminal
+  reviewers stay disabled with their reason. Check **Review with
+  instructions…**, **Mod+Alt+Shift+R** outside a terminal, and the button's
+  tooltip and disabled reasons in light and dark. Read the Profiler's findings
+  afterwards;
+- Host dashboard: the packaged `host-dashboard` spec opens the status bar's
+  Resource Manager, chooses **Host dashboard**, and checks shapes only: the
+  sheet is titled with the local environment's name, the CPU figure is a
+  percentage, memory reads "… of …, N%", at least one volume is listed, the
+  statistics section starts with "Since" and has a row for a volume, and the
+  CPU reading's sample time changes within 3 s. When the host hides a volume
+  (a container's file mounts, the macOS data volume), it opens **Hidden
+  volumes (N)** and checks each row shows a reason and no size. It then closes
+  the sheet. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/host-dashboard.e2e.ts`. By hand, open the dashboard
+  from the environment menu and from Settings > Remote Servers too, and against
+  an older remote server check it asks to update the server;
+- Desktop export and close: the packaged `desktop-save-and-close` spec proves that
+  **Export** on a custom theme writes the theme JSON through the real Save
+  command (an end-to-end build writes to the path in
+  `BIBCODE_E2E_SAVE_TEXT_PATH`), that a native close request with an unsaved edit
+  shows the dialog, that **Cancel** keeps the window, the server and the edit,
+  that **Save all** writes the edit and exits, that **Discard** exits and leaves
+  the file unchanged, that Quit from the menu with nothing unsaved exits and
+  shuts the server down, that the leave dialog takes focus over the update dialog,
+  and that a close with nothing unsaved exits at once. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/desktop-save-and-close.e2e.ts`. On macOS the Dock
+  Quit and the app switcher's Quit, and on every system an ended OS session, do
+  not ask; do not count that as a failure;
 - Files path-kind changes: replace a file with a directory containing nested
   entries while the tree is open, then select a descendant and replace its
   directory with a file. Exercise automatic refresh and **Refresh**; neither
@@ -3646,7 +3817,7 @@ sizes. Cover relevant:
   reports no tools shows no Tools group. When Claude Code updates itself (or a
   stub `claude` reports a higher version after a refresh), one **Claude updated
   to `<version>`** notice appears per version;
-- with **Settings → General → Theme** on **System**, switch the operating system
+- with **Settings → Appearance → Mode** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
   **Light** or **Dark** selected, the app ignores the switch;

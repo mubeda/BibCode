@@ -319,6 +319,15 @@ describe("DEFAULT_KEYBINDINGS", () => {
     ).toBe(true);
   });
 
+  // Review changes' Mod+Alt+Shift+R is built into the web client (D46, R102): an older client
+  // cannot decode a shipped rule naming sourceControl.review, as for chat.find.
+  it("ships no rule for sourceControl.review and leaves its built-in key and Mod+Shift+R free", () => {
+    expect(DEFAULT_KEYBINDINGS.some((rule) => rule.command === "sourceControl.review")).toBe(false);
+    const keys = DEFAULT_KEYBINDINGS.map((rule) => rule.key);
+    expect(keys).not.toContain("mod+alt+shift+r");
+    expect(keys).not.toContain("mod+shift+r");
+  });
+
   it("compiles every default binding into the resolved defaults", () => {
     expect(DEFAULT_RESOLVED_KEYBINDINGS.length).toBe(DEFAULT_KEYBINDINGS.length);
     expect(DEFAULT_RESOLVED_KEYBINDINGS.every((rule) => rule.shortcut.key.length > 0)).toBe(true);

@@ -50,6 +50,8 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_install_update,
             desktop_bridge_pick_folder,
             desktop_bridge_save_diagnostic_logs,
+            desktop_bridge_save_text_file,
+            desktop_bridge_reply_close_request,
             desktop_bridge_pick_files,
             desktop_bridge_download_to_folder,
             desktop_bridge_upload_file,
@@ -139,6 +141,8 @@ pub fn run() {
         restart_handoff.release();
         // Built here (not from config) so it can route new-window requests;
         // first, so everything below still runs after the main window exists.
+        // The close guard comes before it: the window's close handler asks through it (R62).
+        app.manage(window::close_guard_for_app(app.handle()));
         window::build_main_window(app.handle())?;
         // Remote environments' preview tunnels (#69): each request goes to the renderer.
         let tunnel_requests = app.handle().clone();
@@ -251,6 +255,8 @@ pub fn run() {
         bridge::desktop_bridge_install_update,
         bridge::desktop_bridge_pick_folder,
         bridge::desktop_bridge_save_diagnostic_logs,
+        bridge::desktop_bridge_save_text_file,
+        bridge::desktop_bridge_reply_close_request,
         bridge::desktop_bridge_pick_files,
         bridge::desktop_bridge_download_to_folder,
         bridge::desktop_bridge_upload_file,
@@ -353,6 +359,8 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
 async fn desktop_e2e_prepare_for_exit(
     app_handle: tauri::AppHandle<bridge::DesktopRuntime>,
 ) -> Result<(), String> {
+    // The teardown closes the window next; an edit a spec left unsaved must not hold it (R62).
+    app_handle.state::<window::CloseGuard>().disarm();
     prepare_desktop_runtime_for_exit(&app_handle).await
 }
 
@@ -391,6 +399,10 @@ mod desktop_e2e_page_load;
 #[cfg(target_os = "linux")]
 mod display_loss;
 mod firewall;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod gstreamer_environment;
+#[cfg(target_os = "linux")]
+pub use gstreamer_environment::repair_process_environment as repair_gstreamer_environment;
 #[cfg(target_os = "linux")]
 mod linux_text_rendering;
 #[cfg(target_os = "linux")]

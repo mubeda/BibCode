@@ -1,0 +1,67 @@
+# Phase 4: Remote push guidance
+
+- Goal: A push that fails on a remote server for missing credentials says where Git ran and how to recover, in Git Manager and Source Control, while local sign-in and non-interactive rules stay as they are, with tests against a local authenticated Git host (#343).
+- Round: 3
+- Depends on: 3
+- Owns: `apps/server/src/git/sign_in.rs`, `apps/server/src/git/manager/operations.rs`, `apps/server/src/production/git_vcs.rs`, `apps/server/src/production/git_manager_rpc.rs`, `apps/server/src/production/runtime.rs` (the service construction near line 547 only), `apps/server/tests/support/git_http_auth_host.rs`, `apps/server/tests/remote_push_guidance.rs`, `apps/web/src/components/GitActionsControl.tsx`, `apps/web/src/components/GitActionsControl.test.tsx`, `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.tsx`, `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.test.tsx`, `apps/web/src/components/SourceControlPanel.tsx`, `apps/web/src/components/SourceControlPanel.test.tsx`, `apps/web/src/components/gitManager/GitManagerPanel.tsx`, `apps/web/src/components/gitManager/GitManagerPanel.test.tsx`
+- Must not touch: `apps/server/src/git/status_owner.rs`, `apps/server/src/git/broadcaster.rs` (Phase 3), `packages/contracts/**` (no contract change is needed: the guidance travels in the existing `message` field), `docs/user/workspace-ui.md` (Phase 8 writes the help text for R13), `apps/web/src/index.css`
+- Skills: test-driven-development (the real-runner tests come before the message change)
+- Read first: `spec.md` section C (R8 to R13, D11, D12, D20 on "remote server"); `docs/plans/2026-11-07-git-manager-interactive-sign-in-design.md` (the sign-in eligibility boundary this phase must not move); `AGENTS.md` (Sensitive Data: placeholders only)
+- Checkpoint: `cargo test -p bibcode-server --test remote_push_guidance -j 2` exits 0 and the two web test files pass. On a remote server with no stored credential, a failed push shows the guidance naming the server.
+
+Tests use `example-server`, `test-user`, `gitlab.example.test` and a host on `127.0.0.1`. They never contact a public Git host and never read a real credential store.
+
+## Tasks
+
+### Task 4.1: Server guidance for a remote missing-credentials push
+
+- Satisfies: R8 (known server name; unknown server name), R10 (caller asks for sign-in anyway), R11 (credential manager refusal; missing username on local desktop), R12 (stored credential; unrelated failure)
+- Depends on: none
+- Files: create `apps/server/tests/support/git_http_auth_host.rs`; create `apps/server/tests/remote_push_guidance.rs`; modify `apps/server/src/git/manager/operations/sign_in_tests.rs`; modify `apps/server/src/git/sign_in.rs`; modify `apps/server/src/git/manager/operations.rs`; modify `apps/server/src/production/git_vcs.rs`; modify `apps/server/src/production/git_manager_rpc.rs`; modify `apps/server/src/production/runtime.rs`
+- Interfaces: consumes the service construction in `production/runtime.rs` (near line 547, where only the interactive-sign-in flag reaches the VCS service today), the Git Manager RPC service (`git_manager_rpc.rs` line 115) and the operation entry (`operations.rs` line 999, which receives no server configuration today), `has_gcm_refusal` (sign_in.rs line 92), `CredentialPrompt` (30), `classify_operation_failure` (operations.rs 217), `failure_message` (2280), the stacked failure event built at git_vcs.rs 1784-1805, `ServerConfig.interactive_git_sign_in` (config.rs 81), `ServerConfig.environment_label` (84) and `LOCAL_ENVIRONMENT_LABEL` (124), and `IsolatedGitConfig`; produces in `sign_in.rs`: `pub fn has_missing_username_refusal(detail: &str) -> bool` (true only when the text contains both "could not read Username" and "terminal prompts disabled", case-insensitive), `#[derive(Clone)] pub struct ExecutionPlace { pub remote: bool, pub server_name: Option<String> }` (built once in `runtime.rs` from the server configuration and stored as an immutable field on both the VCS service and the Git Manager RPC service, which passes it into the operation as a new parameter), `pub fn execution_place(config: &ServerConfig) -> ExecutionPlace` (`remote` is `!interactive_git_sign_in`; `server_name` is the trimmed environment label unless it is empty or equals `LOCAL_ENVIRONMENT_LABEL`) and `pub fn remote_push_guidance(server_name: Option<&str>, git_detail: &str) -> String`. The test support module produces `GitHttpAuthHost::start(repo: &Path, user: &str, password: &str) -> GitHttpAuthHost` with `fn url(&self) -> String`.
+- Skills: none
+- Read first: `apps/server/src/git/sign_in.rs`; `apps/server/src/git/manager/operations.rs` lines 209-240, 1330-1400 and 2280-2290; `apps/server/src/production/git_vcs.rs` lines 1700-1810 and 2728-2742; `apps/server/tests/production_git_vcs_rpc.rs` lines 2714-2730 (`stalled_http_remote`, the existing local listener pattern) and 3178-3230 (real Git helpers)
+- Tier: most capable
+- TDD: red-green
+- Done when: `cargo test -p bibcode-server --test remote_push_guidance -j 2` exits 0 with 8 tests passing and `cargo test -p bibcode-server --lib -j 2 sign_in` exits 0
+
+Steps
+
+1. [ ] Create `tests/support/git_http_auth_host.rs`: a listener on `127.0.0.1:0` that answers each request by requiring HTTP Basic credentials (`401` with `WWW-Authenticate: Basic realm="test"` when they are missing or wrong) and otherwise runs `git http-backend` as a CGI process against a bare repository with `http.receivepack` enabled. No new crate: use `std::net` and `std::process`.
+2. [ ] In `tests/remote_push_guidance.rs`, add a fixture that builds a server with the real Git runner, an isolated global Git config whose `credential.helper` is `store --file <temp file>`, and a configurable `interactive_git_sign_in` and `environment_label`.
+3. [ ] Add `remote_push_guidance_known_host_git_manager` and `remote_push_guidance_known_host_stacked_action`: remote mode, label `example-server`, empty credential file. Push through the Git Manager operation and through a stacked action. Assert the failure message starts with exactly `Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run \`git push\` to sign in to Git. Then retry the push in BiBCode.`and ends with Git's own`fatal: could not read Username` line.
+4. [ ] Add `remote_push_guidance_unknown_host`: label `Local` in remote mode. Assert the message starts with `Push ran on the remote server. In a terminal on the remote server, open this repository as the user that runs BiBCode and run \`git push\` to sign in to Git. Then retry the push in BiBCode.` and contains no host name other than the test host inside Git's own line.
+5. [ ] Add `remote_push_never_offers_sign_in`: remote mode, a request whose principal is not the desktop bootstrap subject but which asks for sign-in; with the missing-username text and with the credential-manager refusal text, the failure carries no `signIn` field and the push ran once.
+6. [ ] Add `local_missing_username_keeps_todays_message`: `interactive_git_sign_in` true with the desktop bootstrap principal; the Git Manager message is "Authentication failed. Check the configured credentials and try again.", the text "remote server" does not appear in either caller's failure, and no `signIn` field is present.
+7. [ ] The local sign-in offer needs an HTTPS destination (`sign_in.rs` line 103 rejects every other scheme, and `sign_in_tests.rs` line 234 pins that plain HTTP gets no offer), so it cannot use the HTTP test host. Keep it where it is proven today: in `apps/server/src/git/manager/operations/sign_in_tests.rs`, add `local_gcm_refusal_still_offers_sign_in_after_the_guidance_change` with the existing `RemoteRunner` fake and an `https://gitlab.example.test` destination, asserting the `signIn` offer is unchanged. In `remote_push_guidance.rs`, add `plain_http_never_offers_sign_in` instead.
+8. [ ] Add `stored_credential_push_succeeds_in_both_modes`: write a matching credential line for the host into the credential file; the push exits 0 in remote and local mode and the bare repository has the commit. Add `unrelated_push_failures_keep_their_message`: a refused connection (closed port) and a non-fast-forward rejection each keep their specific message and contain no "Push ran on".
+9. [ ] Run `cargo test -p bibcode-server --test remote_push_guidance -j 2`. Expected: FAIL, the two known-host tests report the message does not start with "Push ran on the remote server".
+10. [ ] Implement `has_missing_username_refusal`, `ExecutionPlace`, `execution_place` and `remote_push_guidance` in `sign_in.rs`, with unit tests for the exact reported stderr `fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled`. `remote_push_guidance` returns the guidance, a blank line, then the Git detail.
+11. [ ] Wire and use them: build `ExecutionPlace` once in `runtime.rs`, store it on the VCS service and on the Git Manager RPC service, and pass it into the Git Manager operation. In `operations.rs`, when a push-family operation is classified `Authentication`, the place is remote and `has_missing_username_refusal` is true, the failure message is the guidance; otherwise unchanged. In `git_vcs.rs`, apply the same rule to the stacked action failure event when the phase is `push`. Do not change `sign_in_eligible`, `credential_prompt` or the prompt guard environment.
+12. [ ] Run `cargo test -p bibcode-server --test remote_push_guidance -j 2`. Expected: PASS, 8 tests.
+13. [ ] Prove the test can fail: make `execution_place` return `remote: false`, run the same command. Expected: FAIL in the known-host tests. Restore and run again. Expected: PASS.
+14. [ ] Run `cargo test -p bibcode-server --lib -j 2 sign_in`, `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: PASS and no errors, with the existing sign-in tests unchanged.
+
+### Task 4.2: Show the guidance and keep Git's line readable in both surfaces
+
+- Satisfies: R9 (Source Control stacked action; Git Manager push)
+- Depends on: 4.1
+- Files: modify `apps/web/src/components/GitActionsControl.tsx`; modify `apps/web/src/components/SourceControlPanel.tsx`; modify `apps/web/src/components/gitManager/GitManagerPanel.tsx`; modify `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.tsx`; test `apps/web/src/components/SourceControlPanel.test.tsx`; test `apps/web/src/components/gitManager/GitManagerPanel.test.tsx`; test `apps/web/src/components/GitActionsControl.test.tsx`; test `apps/web/src/components/gitManager/toolbar/GitManagerOperationBanner.test.tsx`
+- Interfaces: consumes the failure `message` produced by Task 4.1 (guidance, a blank line, then Git's line), the error toast at GitActionsControl.tsx lines 1472-1480 (`description: error.message`) `failureMessage` at GitManagerOperationBanner.tsx line 77, the "Push failed" report of `SourceControlPanel.tsx` (near lines 539, 553 and 1690-1730) and `historyOperationError` in `GitManagerPanel.tsx` (lines 995-998); produces no new props. All four render sites show the message with line breaks preserved and selectable text.
+- Skills: vercel-react-best-practices (AGENTS.md requires it for changed React components); ui-ux-pro-max (keep a two-paragraph error readable in a toast)
+- Read first: `UI.md` (Errors: an error must be actionable and must not hide the original cause)
+- Tier: standard
+- TDD: red-green
+- Done when: from `apps/web`, `node ../../scripts/run-local-vp.mjs test run --project unit src/components/GitActionsControl.test.tsx src/components/gitManager/toolbar/GitManagerOperationBanner.test.tsx src/components/SourceControlPanel.test.tsx src/components/gitManager/GitManagerPanel.test.tsx` exits 0 with the 4 new tests passing
+
+Steps
+
+1. [ ] In `GitActionsControl.test.tsx`, add `a remote push failure shows the guidance and Git's own line`: fail a stacked push with the two-paragraph message for `example-server`; assert the toast description contains the full guidance sentence and, as a separate line, `fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled`, and that the description element preserves line breaks (`whitespace-pre-line`) and allows text selection.
+2. [ ] In `GitManagerOperationBanner.test.tsx`, add `a failed push shows a multi-line message with its lines kept`: a `failed` event with the same message renders both paragraphs.
+3. [ ] In `SourceControlPanel.test.tsx`, add `a failed push from the panel shows the guidance and Git's own line`, and in `GitManagerPanel.test.tsx` add `a failed push in history shows the multi-line message`, each with the same two-paragraph message and the same line-break assertion.
+4. [ ] Run the command under Done when. Expected: FAIL, the line-break assertion fails in all four files.
+5. [ ] Render the failure description in the four render sites with preserved line breaks and selectable text. Change no title, no other toast and no props.
+6. [ ] Run the same command. Expected: PASS.
+7. [ ] Prove the test can fail: remove the line-break class in `GitActionsControl.tsx`, run the same command. Expected: FAIL. Restore and run again. Expected: PASS.
+8. [ ] Review the four components against `vercel-react-best-practices` and `UI.md`, and record the results for the final report.
+9. [ ] Run `vp check` and `vp run typecheck`. Expected: no errors.

@@ -123,7 +123,7 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
     <div
       className={cn(
         "group flex h-[29px] min-w-0 items-center border-b border-border/45",
-        selected && "bg-accent text-accent-foreground",
+        selected && "bg-selected text-selected-foreground",
       )}
       data-stash-sha={row.sha}
       role="option"

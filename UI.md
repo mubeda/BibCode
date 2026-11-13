@@ -170,7 +170,7 @@ Optimize for user control, predictability, and task completion. Every surprise, 
 ### Typography
 
 - The smallest text in the app is `text-xs` (12px). Never write `text-[9px]`, `text-[10px]`, `text-[11px]`, or another arbitrary size below it; badges, key hints, counts, and timestamps use `text-xs`.
-- Navigation rows are 13px medium and thread titles 13px regular, both on `text-foreground/80`; project titles are 13px medium on `text-foreground/90`.
+- Navigation rows are 13px medium on `text-foreground/80`; project titles are 13px medium on `text-foreground/90`. Sidebar chat rows are 12px regular on `sidebar-chat-foreground`, so a chat reads as lighter than the checkout or worktree it belongs to; an unread chat is drawn at `foreground`.
 - `text-muted-foreground` is already the secondary color. Do not alpha-reduce it further for text (`text-muted-foreground/70` and similar); badges, subtitles, timestamps, and empty states use the solid token. Alpha is fine on icon tints.
 - Do not add global letter-spacing to body text; under hinted rendering the fractional advances become uneven letter gaps.
 - A new scrollable reading surface must mark its content wrapper with `data-text-surface`, or its text renders grayscale on Linux (see the architecture overview, Linux webview text rendering).

@@ -2043,6 +2043,30 @@ describe("MessagesTimeline proposed plans", () => {
     expect(markup).toContain('data-item-type="proposed-plan"');
     expect(markup).toContain("Follow the plan steps carefully.");
   });
+
+  it("titles a review thread's plan card Review findings (R96)", async () => {
+    const planEntry = {
+      id: "entry-plan",
+      kind: "proposed-plan" as const,
+      createdAt: MESSAGE_CREATED_AT,
+      proposedPlan: {
+        id: "plan-1",
+        turnId: TURN_ID,
+        planMarkdown: "# Fix the parser\n\n- Low: example finding",
+        implementedAt: null,
+        implementationThreadId: null,
+        createdAt: MESSAGE_CREATED_AT,
+        updatedAt: MESSAGE_CREATED_AT,
+      },
+    };
+    const review = await renderTimeline({ timelineEntries: [planEntry], isCodeReview: true });
+    expect(review).toContain("Review findings");
+    expect(review).not.toContain("Fix the parser");
+    expect(review).toContain("Low: example finding");
+    const plain = await renderTimeline({ timelineEntries: [planEntry] });
+    expect(plain).toContain("Fix the parser");
+    expect(plain).not.toContain("Review findings");
+  });
 });
 
 describe("MessagesTimeline terminal context bodies", () => {

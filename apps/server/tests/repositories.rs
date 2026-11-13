@@ -82,7 +82,41 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
         updated_at: created_at.to_owned(),
         deleted_at: None,
         repository_identity: None,
+        code_review_prompt: String::new(),
     }
+}
+
+#[tokio::test]
+async fn project_code_review_prompt_round_trips() {
+    let repositories = migrated_repositories().await;
+    let mut row = project("p-review", T0);
+    row.code_review_prompt = "Check our test naming. Base is {base}.".to_owned();
+    repositories.upsert_project(row).await.expect("upsert");
+    let stored = repositories
+        .get_project("p-review".to_owned())
+        .await
+        .expect("read")
+        .expect("project exists");
+    assert_eq!(
+        stored.code_review_prompt,
+        "Check our test naming. Base is {base}."
+    );
+    assert_eq!(
+        repositories.list_projects().await.expect("list")[0].code_review_prompt,
+        stored.code_review_prompt
+    );
+    let mut cleared = project("p-review", T1);
+    cleared.code_review_prompt = String::new();
+    repositories.upsert_project(cleared).await.expect("clear");
+    assert_eq!(
+        repositories
+            .get_project("p-review".to_owned())
+            .await
+            .expect("read")
+            .expect("project exists")
+            .code_review_prompt,
+        ""
+    );
 }
 
 #[tokio::test]
@@ -285,6 +319,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 
@@ -452,6 +487,11 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_turn_by_id",
         "verify_prepared_command_receipt",
         "complete_worktree_removal_receipt",
+        "list_incomplete_worktree_removal_paths",
+        "record_worktree_creation",
+        "delete_worktree_creation_record",
+        "reap_worktree_creation_record",
+        "list_worktree_creation_records",
         "register_mcp_oauth_client",
         "get_mcp_oauth_client",
         "create_mcp_oauth_authorization",

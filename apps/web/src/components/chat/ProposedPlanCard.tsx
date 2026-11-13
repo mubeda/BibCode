@@ -45,6 +45,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   onExpandedChange,
   detailsOpen,
   onDetailsOpenChange,
+  isCodeReview = false,
 }: {
   planMarkdown: string;
   environmentId: EnvironmentId;
@@ -57,6 +58,8 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   /** The plan body's `<details>` blocks, when the caller owns their state (see `ChatMarkdown`). */
   detailsOpen?: ReadonlyMap<number, boolean> | undefined;
   onDetailsOpenChange?: ((ordinal: number, open: boolean) => void) | undefined;
+  /** A review thread's findings: the card names them so, whatever heading the agent wrote. */
+  isCodeReview?: boolean | undefined;
 }) {
   const [localExpanded, setLocalExpanded] = useState(false);
   const expanded = controlledExpanded ?? localExpanded;
@@ -86,8 +89,8 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
     },
   });
   const savePathInputId = useId();
-  const authoredTitle = proposedPlanTitle(planMarkdown);
-  const title = authoredTitle ?? "Proposed plan";
+  const authoredTitle = isCodeReview ? null : proposedPlanTitle(planMarkdown);
+  const title = isCodeReview ? "Review findings" : (authoredTitle ?? "Proposed plan");
   const canCollapse = proposedPlanCanCollapse(planMarkdown);
   const displayedPlanMarkdown = stripDisplayedPlanMarkdown(planMarkdown);
   const collapsedPreview = canCollapse
@@ -169,7 +172,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
     <div className="rounded-[24px] border border-border/80 bg-card/70 p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
-          <Badge variant="secondary">Plan</Badge>
+          <Badge variant="secondary">{isCodeReview ? "Review" : "Plan"}</Badge>
           <p
             className="truncate text-sm font-medium text-foreground"
             // The fallback title is chrome; an authored one is the plan's text.

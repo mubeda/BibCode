@@ -303,6 +303,7 @@ import {
   TerminalMetadataStreamEvent,
   TerminalOpenInput,
   TerminalResizeInput,
+  TerminalResizeResult,
   TerminalRestartInput,
   TerminalSessionSnapshot,
   TerminalWriteInput,
@@ -371,6 +372,8 @@ import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
+  ServerHostMetricsEvent,
+  ServerHostMetricsSnapshot,
   ServerSignalProcessInput,
   ServerSignalProcessResult,
   ServerUpsertKeybindingInput,
@@ -475,6 +478,8 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   ),
   /** Opens a side chat of the host (#265). Only for a server that advertises `sideChats`. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** Marks the panel as a code review (#293). Only for a server that advertises `codeReviews`. */
+  codeReview: Schema.optional(Schema.Boolean),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 
@@ -704,6 +709,8 @@ export const WS_METHODS = {
   serverSendDiagnosticLogsRelayItem: "server.sendDiagnosticLogsRelayItem",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
+  serverSubscribeHostMetrics: "server.subscribeHostMetrics",
+  serverGetHostMetrics: "server.getHostMetrics",
   serverGetProfilerStatus: "server.getProfilerStatus",
   serverReportProfilerClientBatch: "server.reportProfilerClientBatch",
   serverSignalProcess: "server.signalProcess",
@@ -930,6 +937,20 @@ export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
     error: EnvironmentRpcError,
   },
 );
+
+export const WsServerSubscribeHostMetricsRpc = Rpc.make(WS_METHODS.serverSubscribeHostMetrics, {
+  payload: Schema.Struct({}),
+  success: ServerHostMetricsEvent,
+  error: EnvironmentRpcError,
+  stream: true,
+});
+
+/** One host Snapshot, for the MCP `host_metrics` tool (R82). */
+export const WsServerGetHostMetricsRpc = Rpc.make(WS_METHODS.serverGetHostMetrics, {
+  payload: Schema.Struct({}),
+  success: ServerHostMetricsSnapshot,
+  error: EnvironmentRpcError,
+});
 
 export const WsServerGetProfilerStatusRpc = Rpc.make(WS_METHODS.serverGetProfilerStatus, {
   payload: Schema.Struct({}),
@@ -1842,6 +1863,9 @@ export const WsTerminalCancelInputRpc = Rpc.make(WS_METHODS.terminalCancelInput,
 
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput,
+  // `null` from older servers, and to a request without `structuredResult`: older clients
+  // decode this result as void, a null-only JSON codec (#348).
+  success: Schema.NullOr(TerminalResizeResult),
   error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });
 
@@ -2357,6 +2381,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerSendDiagnosticLogsRelayItemRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
+  WsServerSubscribeHostMetricsRpc,
+  WsServerGetHostMetricsRpc,
   WsServerGetProfilerStatusRpc,
   WsServerReportProfilerClientBatchRpc,
   WsServerSignalProcessRpc,

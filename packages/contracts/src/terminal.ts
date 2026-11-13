@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
@@ -32,8 +33,27 @@ export const TerminalSize = Schema.Struct({
   cols: TerminalColsSchema,
   rows: TerminalRowsSchema,
   sizeClaim: Schema.NullOr(TerminalSizeClaimSchema),
+  /**
+   * Set while `sizeClaim` is null because the owner left several viewers and none has been
+   * used since: the size stays un-owned until a window is used, and only this claim's viewer
+   * answers the terminal's queries meanwhile. Absent from older servers: every viewer answers.
+   */
+  replyClaim: Schema.optional(TerminalSizeClaimSchema),
 });
 export type TerminalSize = typeof TerminalSize.Type;
+
+/**
+ * The process a terminal's state belongs to. `boot` names the server instance; `process`
+ * grows with every process that instance starts and is never reused, so a client orders
+ * two states of one terminal without trusting pids or per-process sequences.
+ */
+export const TerminalGeneration = Schema.Struct({
+  boot: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(64)),
+  process: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
+    Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+  ),
+});
+export type TerminalGeneration = typeof TerminalGeneration.Type;
 const TerminalEnvKeySchema = Schema.String.check(
   Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/),
 ).check(Schema.isMaxLength(128));
@@ -109,9 +129,18 @@ export const TerminalAttachInput = Schema.Struct({
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;
 
+/**
+ * Who produced terminal input, for the rule that the window last used sizes the terminal
+ * (#348): the size claim of the window a user typed, pasted or clicked in, or `null` for the
+ * terminal's own replies to queries. Absent from older clients, whose input all counts as
+ * use. Sent only to servers advertising `terminalUserInputClaim`.
+ */
+const TerminalUserInputClaim = Schema.optional(Schema.NullOr(TerminalSizeClaimSchema));
+
 export const TerminalWriteInput = Schema.Struct({
   ...TerminalSessionInput.fields,
   data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(65_536)),
+  userInputClaim: TerminalUserInputClaim,
 });
 export type TerminalWriteInput = Schema.Codec.Encoded<typeof TerminalWriteInput>;
 
@@ -133,6 +162,7 @@ export const TerminalWriteInputFrame = Schema.Struct({
   inputId: TrimmedNonEmptyStringSchema,
   sequence: TerminalInputSequence,
   data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(16_384)),
+  userInputClaim: TerminalUserInputClaim,
 });
 export type TerminalWriteInputFrame = typeof TerminalWriteInputFrame.Type;
 
@@ -153,8 +183,62 @@ export const TerminalResizeInput = Schema.Struct({
   cols: TerminalColsSchema,
   rows: TerminalRowsSchema,
   sizeClaim: Schema.optional(TerminalSizeClaimSchema),
+  /**
+   * The caller decodes a `TerminalResizeResult`. Without it the server answers `null`: older
+   * clients decode this method's result as void, which rejects anything else (#348).
+   */
+  structuredResult: Schema.optional(Schema.Boolean),
 });
 export type TerminalResizeInput = Schema.Codec.Encoded<typeof TerminalResizeInput>;
+
+/**
+ * What a resize request did. `applied` and `unchanged` are each answered by a `resized`
+ * event at `sequence` on the requester's claimed attach stream, behind the output already
+ * queued for it; the other outcomes changed nothing and publish nothing. An `unchanged`
+ * answer carries another size than the request when the PTY refused that size on every
+ * retry: then nothing new is published, and `sequence` names the size already published.
+ */
+const CanonicalTerminalResizeOutcome = Schema.Literals([
+  "applied",
+  "unchanged",
+  "sessionMissing",
+  "claimNotRegistered",
+  "processAbsent",
+  "generationInvalidated",
+]);
+const isCanonicalTerminalResizeOutcome = Schema.is(CanonicalTerminalResizeOutcome);
+/**
+ * A newer server's outcome decodes as `claimNotRegistered`: the request changed nothing, so
+ * the client neither waits for an acknowledgement nor sends the same size again until the
+ * server's state changes. Encoding stays strict.
+ */
+export const TerminalResizeOutcome = Schema.String.pipe(
+  Schema.decodeTo(
+    CanonicalTerminalResizeOutcome,
+    SchemaTransformation.transformEffect({
+      decode: (value) =>
+        Effect.succeed(
+          isCanonicalTerminalResizeOutcome(value) ? value : ("claimNotRegistered" as const),
+        ),
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
+export type TerminalResizeOutcome = typeof TerminalResizeOutcome.Type;
+
+/**
+ * The size the server holds after a resize request that set `structuredResult`; older
+ * servers answer `null`.
+ */
+export const TerminalResizeResult = Schema.Struct({
+  outcome: TerminalResizeOutcome,
+  /** Absent only when the session is missing. */
+  size: Schema.NullOr(TerminalSize),
+  generation: Schema.NullOr(TerminalGeneration),
+  /** The sequence of the last size event published, the acknowledgement's when there is one. */
+  sequence: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+});
+export type TerminalResizeResult = typeof TerminalResizeResult.Type;
 
 export const TerminalClearInput = TerminalSessionInput;
 export type TerminalClearInput = Schema.Codec.Encoded<typeof TerminalClearInput>;
@@ -201,6 +285,8 @@ export const TerminalSessionSnapshot = Schema.Struct({
   sequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /** Applied PTY size; absent on older servers. */
   size: Schema.optional(TerminalSize),
+  /** The process this state belongs to, kept after it exits; absent on older servers. */
+  generation: Schema.optional(TerminalGeneration),
   oscColorResponderActive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** First-attachment grant: one startup-history reply pass, issued only before any claim, or a claimed stream surviving a restart, has consumed it. */
   firstAttachmentGrant: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -316,11 +402,19 @@ const TerminalExitedEvent = Schema.Struct({
   type: Schema.Literal("exited"),
   exitCode: Schema.NullOr(Schema.Int),
   exitSignal: Schema.NullOr(Schema.Int),
+  /** The process that exited; absent on older servers. */
+  generation: Schema.optional(TerminalGeneration),
 });
 
 const TerminalClosedEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("closed"),
+  /**
+   * At or above every process the closed session had. A close an attachment reports after
+   * falling behind carries one too, so a client applies it by generation, not by sequence.
+   * Absent on older servers.
+   */
+  generation: Schema.optional(TerminalGeneration),
 });
 
 const TerminalErrorEvent = Schema.Struct({

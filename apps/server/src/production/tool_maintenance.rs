@@ -904,6 +904,7 @@ impl ToolMaintenance {
                 timeout: UPDATE_TIMEOUT,
                 cleanup_timeout: Duration::from_secs(2),
                 max_output_bytes: OUTPUT_LIMIT,
+                stop_policy: crate::process::supervised::StopPolicy::Force,
                 overflow: SupervisedOverflow::Truncate,
             },
             &self.inner.updater_cancellation,

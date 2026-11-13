@@ -67,6 +67,7 @@ const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
 const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
+const decodeOrchestrationThread = Schema.decodeUnknownEffect(OrchestrationThread);
 const decodeTurnDelivery = Schema.decodeUnknownSync(TurnDelivery);
 const decodeThreadTurnDeliveryUpdatedPayload = Schema.decodeUnknownSync(
   ThreadTurnDeliveryUpdatedPayload,
@@ -567,6 +568,53 @@ describe("side chat marker", () => {
         (yield* decodeThreadCreatedPayload({ ...payload, sideChat: true })).sideChat,
         true,
       );
+    }),
+  );
+});
+
+describe("code review marker", () => {
+  it("is absent on a thread from an older server and true on a review panel", () => {
+    expect(decodeShell(baseShellFixture).codeReview).toBeUndefined();
+    expect(
+      decodeShell({
+        ...baseShellFixture,
+        kind: "panel",
+        hostThreadId: "thread-host",
+        codeReview: true,
+      }).codeReview,
+    ).toBe(true);
+  });
+
+  it.effect("is optional on a thread and on thread.created", () =>
+    Effect.gen(function* () {
+      const payload = {
+        threadId: "thread-review",
+        projectId: "project-1",
+        title: "Code review · Codex",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        kind: "panel",
+        hostThreadId: "thread-host",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-11-11T00:00:00.000Z",
+        updatedAt: "2026-11-11T00:00:00.000Z",
+      };
+      assert.strictEqual((yield* decodeThreadCreatedPayload(payload)).codeReview, undefined);
+      assert.strictEqual(
+        (yield* decodeThreadCreatedPayload({ ...payload, codeReview: true })).codeReview,
+        true,
+      );
+      const thread = yield* decodeOrchestrationThread({
+        ...baseShellFixture,
+        deletedAt: null,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      });
+      assert.strictEqual(thread.codeReview, undefined);
     }),
   );
 });
@@ -1180,6 +1228,54 @@ it.effect("defaults missing worktree discovery policy for legacy project represe
       });
     }
     assert.strictEqual(Object.hasOwn(metaUpdated, "worktreeDiscovery"), false);
+    for (const project of [decodedProject, decodedProjectShell, decodedCreated]) {
+      assert.strictEqual(project.codeReviewPrompt, "");
+    }
+    assert.strictEqual(Object.hasOwn(metaUpdated, "codeReviewPrompt"), false);
+  }),
+);
+
+it.effect("carries a client project review prompt and rejects one over the limit", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "project.meta.update",
+      commandId: "project-meta-1",
+      projectId: "project-1",
+      codeReviewPrompt: "Our rules",
+    } as const;
+    const client = yield* decodeClientOrchestrationCommand(command);
+    assert.strictEqual(
+      client.type === "project.meta.update" ? client.codeReviewPrompt : undefined,
+      "Our rules",
+    );
+    const server = yield* decodeOrchestrationCommand(command);
+    assert.strictEqual(
+      server.type === "project.meta.update" ? server.codeReviewPrompt : undefined,
+      "Our rules",
+    );
+    const metaUpdated = yield* decodeProjectMetaUpdatedPayload({
+      projectId: "project-1",
+      codeReviewPrompt: "",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(metaUpdated.codeReviewPrompt, "");
+
+    const oversized = { ...command, codeReviewPrompt: "a".repeat(7_681) };
+    const exits = [
+      yield* Effect.exit(decodeClientOrchestrationCommand(oversized)),
+      yield* Effect.exit(decodeOrchestrationCommand(oversized)),
+      yield* Effect.exit(
+        decodeProjectMetaUpdatedPayload({
+          projectId: "project-1",
+          codeReviewPrompt: "a".repeat(7_681),
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ];
+    assert.deepStrictEqual(
+      exits.map((exit) => exit._tag),
+      ["Failure", "Failure", "Failure"],
+    );
   }),
 );
 

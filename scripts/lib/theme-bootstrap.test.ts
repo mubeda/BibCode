@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
 
+import { UI_COLOR_TOKENS, UI_KEYWORD_TOKENS, UI_LENGTH_TOKENS } from "@bibcode/contracts";
 import {
   assertNoInlineScripts,
   themeBootstrapPlugins,
@@ -109,6 +110,110 @@ describe("web theme bootstrap", () => {
       backgroundColor: "#161616",
       metaContent: "#161616",
     });
+  });
+});
+
+describe("web theme bootstrap paint record", () => {
+  const record = (overrides: Record<string, unknown> = {}) => ({
+    base: "dark",
+    background: "#101820",
+    vars: { "--background": "#101820", "--primary": "#7aa2f7", "--radius": "0.5rem" },
+    stamp: "s1",
+    ...overrides,
+  });
+  const stored = (dark: unknown, paintStamp = "s1") => ({
+    "bibcode:theme": "dark",
+    "bibcode:theme-slots:v1": JSON.stringify({ light: "light", dark: "custom", paintStamp }),
+    "bibcode:theme-paint:v1": JSON.stringify({
+      light: { base: "light", background: "#ffffff", vars: {}, stamp: paintStamp },
+      dark,
+    }),
+  });
+  const builtInDark = { dark: true, backgroundColor: "#161616", vars: {}, attributes: {} };
+
+  it("a stored paint record sets the class, the properties and the background before anything else runs", () => {
+    expect(evaluateBootstrapWithStorage(stored(record()))).toEqual({
+      dark: true,
+      backgroundColor: "#101820",
+      metaContent: "#101820",
+      vars: { "--background": "#101820", "--primary": "#7aa2f7", "--radius": "0.5rem" },
+      attributes: {},
+    });
+  });
+
+  it("sets the focus ring and control shadow attributes from the record", () => {
+    const result = evaluateBootstrapWithStorage(
+      stored(
+        record({
+          vars: {
+            "--focus-ring-width": "2px",
+            "--focus-ring-offset": "2px",
+            "--control-shadow": "none",
+          },
+        }),
+      ),
+    );
+    expect(result.attributes).toEqual({
+      "data-theme-focus-ring": "",
+      "data-theme-control-shadow": "none",
+    });
+  });
+
+  it("a corrupt paint record falls back to the built-in background for the stored mode", () => {
+    const entries = { ...stored(record()), "bibcode:theme-paint:v1": "{not json" };
+    expect(evaluateBootstrapWithStorage(entries)).toMatchObject(builtInDark);
+  });
+
+  it.each([
+    ["a property outside the allowlist", record({ vars: { "--x": "#ffffff" } })],
+    ["a non-custom property", record({ vars: { background: "#ffffff" } })],
+    ["inherit", record({ vars: { "--primary": "inherit" } })],
+    ["url(x)", record({ vars: { "--primary": "url(x)" } })],
+    ["var(--y)", record({ vars: { "--primary": "var(--y)" } })],
+    ["a named color", record({ vars: { "--primary": "red" } })],
+    ["rgb() instead of hex", record({ vars: { "--primary": "rgb(0 0 0)" } })],
+    ["a radius of 9rem", record({ vars: { "--radius": "9rem" } })],
+    ["a focus width of 30px", record({ vars: { "--focus-ring-width": "30px" } })],
+    [
+      "a keyword with a declaration",
+      record({ vars: { "--control-shadow": "default; color: red" } }),
+    ],
+    ["sidebar-card-shadow default", record({ vars: { "--sidebar-card-shadow": "default" } })],
+    ["a background that is not hex", record({ background: "url(x)" })],
+    ["a record for the other base", record({ base: "light" })],
+    ["a missing stamp", record({ stamp: undefined })],
+    ["a record that is not an object", "not an object"],
+  ])("hostile paint records are not applied: %s", (_label, dark) => {
+    expect(evaluateBootstrapWithStorage(stored(dark))).toMatchObject(builtInDark);
+  });
+
+  it("hostile paint records are not applied: a record over 32 KiB", () => {
+    const vars = { "--primary": "#7aa2f7", padding: "x".repeat(33 * 1024) };
+    expect(evaluateBootstrapWithStorage(stored(record({ vars })))).toMatchObject(builtInDark);
+  });
+
+  it("a paint record whose stamp differs from the slots' paintStamp is not applied", () => {
+    expect(evaluateBootstrapWithStorage(stored(record({ stamp: "new" }), "old"))).toMatchObject(
+      builtInDark,
+    );
+  });
+
+  it("the allowlist in the script equals the supported tokens of the contracts module", () => {
+    const source = NodeFS.readFileSync(bootstrapPath, "utf8");
+    const literal = (name: string) => {
+      const match = new RegExp(`const ${name} = ([\\[{][\\s\\S]*?[\\]}]);`).exec(source);
+      if (!match) throw new Error(`theme-bootstrap.js has no ${name}`);
+      return NodeVM.runInNewContext(`(${match[1]})`) as unknown;
+    };
+    expect([...(literal("COLOR_TOKENS") as string[])].toSorted()).toEqual(
+      [...UI_COLOR_TOKENS].toSorted(),
+    );
+    expect(Object.keys(literal("LENGTH_RANGES") as object).toSorted()).toEqual(
+      [...UI_LENGTH_TOKENS].toSorted(),
+    );
+    expect(Object.keys(literal("KEYWORDS") as object).toSorted()).toEqual(
+      [...UI_KEYWORD_TOKENS].toSorted(),
+    );
   });
 });
 
@@ -266,5 +371,59 @@ function evaluateBootstrap(
     dark: classes.has("dark"),
     backgroundColor: style.backgroundColor,
     metaContent: meta.content,
+  };
+}
+
+function evaluateBootstrapWithStorage(entries: Record<string, string>, prefersDark = false) {
+  const classes = new Set<string>();
+  const vars: Record<string, string> = {};
+  const attributes: Record<string, string> = {};
+  const style = {
+    backgroundColor: "",
+    setProperty(name: string, value: string) {
+      vars[name] = value;
+    },
+  };
+  const meta = {
+    content: "",
+    setAttribute(name: string, value: string) {
+      if (name === "content") this.content = value;
+    },
+  };
+  const document = {
+    documentElement: {
+      classList: {
+        toggle(name: string, enabled: boolean) {
+          if (enabled) classes.add(name);
+          else classes.delete(name);
+        },
+        add(name: string) {
+          classes.add(name);
+        },
+      },
+      style,
+      setAttribute(name: string, value: string) {
+        attributes[name] = value;
+      },
+    },
+    querySelector(selector: string) {
+      return selector === 'meta[name="theme-color"]' ? meta : null;
+    },
+  };
+  const window = {
+    localStorage: { getItem: (key: string) => entries[key] ?? null },
+    matchMedia: (query: string) => ({
+      matches: query === "(prefers-color-scheme: dark)" && prefersDark,
+    }),
+  };
+
+  NodeVM.runInNewContext(NodeFS.readFileSync(bootstrapPath, "utf8"), { window, document });
+
+  return {
+    dark: classes.has("dark"),
+    backgroundColor: style.backgroundColor,
+    metaContent: meta.content,
+    vars,
+    attributes,
   };
 }

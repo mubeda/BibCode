@@ -30,6 +30,8 @@ import type {
   CommandId,
   ModelSelection,
   ProjectId,
+  ProviderInteractionMode,
+  RuntimeMode,
   ScopedThreadRef,
   ThreadId,
 } from "@bibcode/contracts";
@@ -77,6 +79,19 @@ export interface CreateSideChatInput extends CreateChatPanelInput {
   readonly submittedText?: string;
 }
 
+/** A chat panel that starts with a prompt and its own modes: a code review (#293). */
+export interface CreatePromptedChatPanelInput extends CreateChatPanelInput {
+  /** The tab label; the thread title is this behind the panel prefix. */
+  readonly label: string;
+  readonly prompt: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+  readonly codeReview: boolean;
+}
+
+export const CODE_REVIEW_SEND_FAILED_TITLE = "Couldn't start the review";
+export const CODE_REVIEW_SEND_FAILED_DESCRIPTION = "The review prompt is in its composer.";
+
 export const SIDE_CHAT_SEND_FAILED_TITLE = "Couldn't send to the side chat";
 export const SIDE_CHAT_SEND_FAILED_DESCRIPTION = "Your question is in its composer.";
 
@@ -85,6 +100,30 @@ export const sideChatLabel = (providerLabel: string) => `Side chat · ${provider
 
 /** Hosts with a side chat being created, so a second Enter on the same `:btw` opens nothing. */
 const pendingSideChatHosts = new Set<string>();
+/** Hosts with a prompted panel (a review) being created, so a double click opens one. */
+const pendingPromptedPanelHosts = new Set<string>();
+
+/** What a new panel thread starts with, and the flags the server keeps on it. */
+interface PanelThreadKind {
+  readonly sideChat: boolean;
+  readonly codeReview: boolean;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+}
+
+const PLAIN_PANEL: PanelThreadKind = {
+  sideChat: false,
+  codeReview: false,
+  runtimeMode: DEFAULT_RUNTIME_MODE,
+  interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+};
+// A side chat asks before it edits the host's checkout; its picker can change it.
+const SIDE_CHAT_PANEL: PanelThreadKind = {
+  sideChat: true,
+  codeReview: false,
+  runtimeMode: "approval-required",
+  interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+};
 
 /**
  * Each creation this page waits on, by scoped thread key: `closed` once its tab closed. The
@@ -154,6 +193,12 @@ export interface CenterPanelActions extends PanelThreadOpener {
    * creation failed and was shown).
    */
   createSideChat: (input: CreateSideChatInput) => Promise<ThreadId | null>;
+  /**
+   * Opens a chat panel of `hostRef` with the given modes and sends `prompt` there. Resolves the
+   * panel's thread, or `null` when none opened (one is already being created for this host, or
+   * the creation failed and was shown).
+   */
+  createPromptedChatPanel: (input: CreatePromptedChatPanelInput) => Promise<ThreadId | null>;
   /**
    * Continues a terminal session in a chat panel of `hostRef`, which becomes the active tab when
    * the panel is `hostRef`'s. Resolves where the session landed, or `null` once a failure was
@@ -330,9 +375,10 @@ export function useCenterPanelActions({
       input: CreateChatPanelInput,
       panelRef: ScopedThreadRef,
       label: string,
-      sideChat: boolean,
+      kind: PanelThreadKind,
     ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
       const { hostRef, modelSelection } = input;
+      const { sideChat, codeReview } = kind;
       const { environmentId, threadId } = panelRef;
       const result = await createPanel({
         environmentId,
@@ -343,11 +389,11 @@ export function useCenterPanelActions({
           title: `Panel: ${label}`,
           threadDefaults: {
             modelSelection,
-            // A side chat asks before it edits the host's checkout; its picker can change it.
-            runtimeMode: sideChat ? "approval-required" : DEFAULT_RUNTIME_MODE,
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: kind.runtimeMode,
+            interactionMode: kind.interactionMode,
           },
           ...(sideChat ? { sideChat: true } : {}),
+          ...(codeReview ? { codeReview: true } : {}),
         },
       });
       const store = useCenterPanelStore.getState();
@@ -384,77 +430,127 @@ export function useCenterPanelActions({
   const createPanelThread = useCallback(
     async (
       input: CreateChatPanelInput,
-      sideChat: boolean,
+      kind: PanelThreadKind,
+      label: string,
       focusComposer = false,
     ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
-      const { hostRef, providerLabel } = input;
+      const { hostRef } = input;
       const environmentId = hostRef.environmentId;
       const threadId = newThreadId();
       const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
-      const label = sideChat ? sideChatLabel(providerLabel) : providerLabel;
       useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
       const key = scopedThreadKey(panelRef);
       creations.set(key, { closed: false });
       if (focusComposer) composerFocusRequests.add(key);
-      return settlePanelCreation(input, panelRef, label, sideChat).finally(() =>
-        creations.delete(key),
-      );
+      return settlePanelCreation(input, panelRef, label, kind).finally(() => creations.delete(key));
     },
     [settlePanelCreation],
   );
 
   const createChatPanel = useCallback(
     async (input: CreateChatPanelInput): Promise<ThreadId | null> =>
-      (await createPanelThread(input, false))?.threadId ?? null,
+      (await createPanelThread(input, PLAIN_PANEL, input.providerLabel))?.threadId ?? null,
     [createPanelThread],
+  );
+
+  /**
+   * Sends a new panel's first message. A refused send puts the text in the panel's composer
+   * and shows `failure`; resolves false only when the outcome is unknown.
+   */
+  const sendFirstPanelMessage = useCallback(
+    async (
+      input: CreateChatPanelInput,
+      panelThreadId: ThreadId,
+      text: string,
+      kind: PanelThreadKind,
+      failure: { readonly title: string; readonly description: string },
+    ): Promise<boolean> => {
+      const panelRef = scopeThreadRef(input.hostRef.environmentId, panelThreadId);
+      // The panel's own draft is never written on success: what the user types or attaches
+      // there meanwhile stays.
+      markChatPanelSent(panelRef);
+      const result = await startTurn({
+        environmentId: input.hostRef.environmentId,
+        input: {
+          threadId: panelThreadId,
+          message: { messageId: newMessageId(), role: "user", text, attachments: [] },
+          modelSelection: input.modelSelection,
+          runtimeMode: kind.runtimeMode,
+          interactionMode: kind.interactionMode,
+        },
+      });
+      if (result._tag === "Failure" && isAtomCommandInterrupted(result)) return false;
+      if (result._tag === "Failure") {
+        const drafts = useComposerDraftStore.getState();
+        const current = drafts.getComposerDraft(panelRef)?.prompt ?? "";
+        drafts.setPrompt(
+          panelRef,
+          current === text ? current : [current, text].filter(Boolean).join("\n\n"),
+        );
+        toastManager.add(stackedThreadToast({ type: "error", ...failure }));
+      }
+      return true;
+    },
+    [startTurn],
   );
 
   const openSideChat = useCallback(
     async (input: CreateSideChatInput): Promise<ThreadId | null> => {
-      const { hostRef, question, submittedText } = input;
+      const { hostRef, question, submittedText, providerLabel } = input;
       // An empty side chat is opened to type in.
-      const panel = await createPanelThread(input, true, question.length === 0);
+      const panel = await createPanelThread(
+        input,
+        SIDE_CHAT_PANEL,
+        sideChatLabel(providerLabel),
+        question.length === 0,
+      );
       // Not created, or closed meanwhile: nothing is sent and the host draft keeps the text.
       if (!panel?.created) return panel?.threadId ?? null;
-      const sideRef = scopeThreadRef(hostRef.environmentId, panel.threadId);
       if (question.length > 0) {
-        // The side chat's own draft is never written on success: what the user types or
-        // attaches there meanwhile stays.
-        markChatPanelSent(sideRef);
-        const result = await startTurn({
-          environmentId: hostRef.environmentId,
-          input: {
-            threadId: panel.threadId,
-            message: { messageId: newMessageId(), role: "user", text: question, attachments: [] },
-            modelSelection: input.modelSelection,
-            runtimeMode: "approval-required",
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          },
-        });
+        const settled = await sendFirstPanelMessage(
+          input,
+          panel.threadId,
+          question,
+          SIDE_CHAT_PANEL,
+          { title: SIDE_CHAT_SEND_FAILED_TITLE, description: SIDE_CHAT_SEND_FAILED_DESCRIPTION },
+        );
         // The send may have landed: the `:btw` text stays in the host draft, nothing is lost.
-        if (result._tag === "Failure" && isAtomCommandInterrupted(result)) {
-          return panel.threadId;
-        }
-        if (result._tag === "Failure") {
-          const drafts = useComposerDraftStore.getState();
-          const current = drafts.getComposerDraft(sideRef)?.prompt ?? "";
-          drafts.setPrompt(
-            sideRef,
-            current === question ? current : [current, question].filter(Boolean).join("\n\n"),
-          );
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: SIDE_CHAT_SEND_FAILED_TITLE,
-              description: SIDE_CHAT_SEND_FAILED_DESCRIPTION,
-            }),
-          );
-        }
+        if (!settled) return panel.threadId;
       }
       if (submittedText !== undefined) clearSubmittedHostDraft(hostRef, submittedText);
       return panel.threadId;
     },
-    [createPanelThread, startTurn],
+    [createPanelThread, sendFirstPanelMessage],
+  );
+
+  const openPromptedChatPanel = useCallback(
+    async (input: CreatePromptedChatPanelInput): Promise<ThreadId | null> => {
+      const kind: PanelThreadKind = {
+        sideChat: false,
+        codeReview: input.codeReview,
+        runtimeMode: input.runtimeMode,
+        interactionMode: input.interactionMode,
+      };
+      const panel = await createPanelThread(input, kind, input.label);
+      // Not created, or closed meanwhile: the prompt is not sent.
+      if (!panel?.created) return panel?.threadId ?? null;
+      await sendFirstPanelMessage(input, panel.threadId, input.prompt, kind, {
+        title: CODE_REVIEW_SEND_FAILED_TITLE,
+        description: CODE_REVIEW_SEND_FAILED_DESCRIPTION,
+      });
+      return panel.threadId;
+    },
+    [createPanelThread, sendFirstPanelMessage],
+  );
+
+  const createPromptedChatPanel = useCallback(
+    async (input: CreatePromptedChatPanelInput): Promise<ThreadId | null> => {
+      const hostKey = scopedThreadKey(input.hostRef);
+      if (pendingPromptedPanelHosts.has(hostKey)) return null;
+      pendingPromptedPanelHosts.add(hostKey);
+      return openPromptedChatPanel(input).finally(() => pendingPromptedPanelHosts.delete(hostKey));
+    },
+    [openPromptedChatPanel],
   );
 
   const createSideChat = useCallback(
@@ -587,6 +683,7 @@ export function useCenterPanelActions({
   return {
     createChatPanel,
     createSideChat,
+    createPromptedChatPanel,
     reopenChatPanel,
     openPanelThread,
     openSessionPanel,

@@ -630,9 +630,10 @@ changes that occur only on an unmounted remote host are outside the native-watch
 boundary and likewise require an explicit invalidation or safety convergence.
 
 Post-fetch remote reconciliation acquires the same worktree epoch before Git
-work and rechecks it around publication. Stream and
-unary pull-request enrichment carry that producing epoch internally through
-their final delivery check; the public status schemas contain no epoch field.
+work and rechecks it around publication. Unary pull-request enrichment carries
+that producing epoch internally through its final delivery check. Stream
+enrichment delivers under the epoch of the newest event its subscriber
+received, as described below. The public status schemas contain no epoch field.
 Cached remote state is reused only with a local snapshot from the same epoch
 and ref identity. A watcher, safety, or explicit local observation of a ref
 change clears server cache,
@@ -656,9 +657,38 @@ Creating a request through the service, every finished Git Manager or VCS
 mutation (pushes included), and every reported local change such as a terminal
 command exiting forget that worktree's entries; a run in flight across such an
 invalidation still answers its waiters but is not stored. At most 64 entries
-are held. `vcs.refreshStatus` keeps its contract and still waits for the
-lookup when nothing current is held, so a refresh more than 10 seconds after
-the last lookup pays one provider round trip. The passive summary, the
+are held.
+
+The broadcaster's cached remote for a worktree owns the open request known for
+its current branch. A remote read never finds a request, so a newer remote or
+snapshot for the same branch keeps the cached one, and a branch change clears
+it with the rest of the remote. A lookup that ends with an open request or with
+none open records its answer there. A failed or cancelled lookup records
+nothing, so the known request stays. Each status stream folds what it sent the
+way the client reducer does. A snapshot or remote update is sent with the
+request known for its branch, so a publication queued before a lookup answered
+does not briefly show an older request. After every event it sends, the stream compares
+the request its subscriber shows with the known one and sends a remote update
+when they differ. That send uses the fence of the newest event the subscriber
+received, so an answer that arrives across an epoch change waits for the next
+event that passes its fence and is delivered once. An event for the same branch
+leaves the stream's lookup running, so repeated events cannot keep a slow
+forge from answering. Any event for the same branch that arrives meanwhile,
+a local update included, asks for one more lookup when the running one ends,
+because it may follow an invalidation that made the running answer outdated.
+That lookup reads the cache unless the invalidation dropped it. A branch change
+stops the lookup.
+
+When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
+most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
+with the known request for the same branch. Only status subscribers need the
+late answer, so the lookup keeps its lease in a task of the worktree's status
+lifecycle. The broadcaster cancels that task when the last status subscriber
+leaves, even while a Git Manager signal subscription keeps the worktree's
+entry, and at shutdown. A workspace loss ends every status stream, so it ends
+the task too. With no status subscriber the lookup is dropped at the bound. When the lookup ends with an answer, that task
+records it and calls `notify_pull_request_change`, so each stream publishes it
+without starting the forge CLI again. The passive summary, the
 pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 
@@ -685,6 +715,22 @@ the outer RPC defect boundary after guard settlement. Empty file lists and
 decode, path, mode, or pull-request resolution failures that have not reached a
 Git effect do not fence status. Stacked actions acquire one guard around the
 complete action and repository calls do not reacquire it.
+
+A push-family operation keeps the guard's write lock to the end but reopens
+status reads once its local writes are finished (#345). A stacked action calls
+`StatusMutationGuard::local_writes_finished` right before its push, or before
+its pull-request step when it does not push. A Git Manager push, branch
+publish, force push or remote branch delete calls it right before the network
+step. The call advances the epoch, so a read started earlier cannot publish,
+reopens the read gate even when other mutations are queued, and requests one
+local refresh. A mutation queued behind that lock closes the gate only when it
+acquires the lock, so background writes that take the guard cannot bring the
+wait back. Every other write still waits for the lock, and the worktree entry
+is never retired while the lock is held. Settlement advances the epoch again
+and publishes a fresh status whatever the gate state. The first local status
+read under a new epoch reaches subscribers even when it equals the cached one,
+because a status stream drops a copy it queued under an older epoch. Pull and fetch keep
+reads waiting to the end, because pull rewrites files at its end.
 
 `sourceControl.publishRepository` likewise validates its provider, repository,
 visibility, remote, and protocol before admission, then owns GitHub repository
@@ -972,7 +1018,9 @@ refs snapshot and hold it through execution, so `vcs.*` writes, which take the
 guard but not the project lock, cannot change the repository between validation
 and execution. Unlike `vcs.*` failures that reach no Git effect, a branch or
 sync operation that ends blocked still fences status reads, because it held the
-guard while validating. The non-waiting acquisition returns the structured
+guard while validating. Push, branch publish, force push and remote branch
+delete reopen status reads right before their network step and keep the guard's
+write lock to the end. Pull and fetch do not. The non-waiting acquisition returns the structured
 `operation-in-flight` blocked reason when either lock is occupied; there is no
 second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state
@@ -2312,6 +2360,30 @@ The client opens a side chat with `createPanel` (`sideChat: true`,
 `approval-required`, the host's model) and then sends its question with
 `thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
 draft stays until the question was handed over.
+
+A **code review panel** (#293) is a panel with `codeReview: true`, carried like
+`sideChat`. Only `worktree.createPanel` sets it, and only on a server that
+advertises `capabilities.codeReviews`; the client sends no review field,
+setting or project prompt to a server without it. The Rust input omits a
+`false` marker when it hashes the command, the engine refuses the flag on a
+thread that is not a `panel` with a host, `thread.created` carries it only when
+true, and the projector stores it in `projection_threads.code_review`
+(migration 74, `ProjectionThreadCodeReview`); replaying older events yields
+`false`. Thread shells and details carry `codeReview: true` only for a review
+panel, and the client offers no Implement, Refine or "Implement in a new thread"
+on such a thread. The client opens a review with `createPanel`
+(`approval-required`; `plan` for Claude, `default` for every other driver; the
+review model when it belongs to the reviewer's instance) and then sends the
+resolved review prompt with `thread.turn.start`. The project's review prompt is
+`codeReviewPrompt` on the project (default `""`), set through
+`project.meta.update` and stored in `projection_projects.code_review_prompt`
+(migration 73, `ProjectCodeReviewPrompt`); `project.meta-updated` writes it with
+`COALESCE`, so an explicit `""` (Reset) survives replay and an older event
+without the key leaves it alone. The user's review agent, model and prompt are
+server settings (`codeReviewAgent`, `codeReviewModelSelection`,
+`codeReviewPrompt`). A terminal review uses no new path: it is an AI Terminal
+opened through the terminal open RPC with the CLI's read-only flags, `--` and
+the prompt as the last argument.
 
 Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): a
 close hides the panel from adoption while this page's own request about it is
@@ -4256,6 +4328,7 @@ projection built from named fields, never the RPC's own reply.
 | `refresh_providers`    | `server.refreshProviders` with no `instanceId`                                                                        | operate |
 | `process_diagnostics`  | `server.getProcessDiagnostics` and `server.getProcessResourceHistory`, without commands, labels or messages           | read    |
 | `trace_diagnostics`    | `server.getTraceDiagnostics`, without paths, causes or log entries                                                    | read    |
+| `host_metrics`         | `server.getHostMetrics` (one host Snapshot), without volume names, non-root mount points or hidden volumes' paths     | read    |
 
 The profiler tools take no RPC admission: they read files in process, as the stdio
 server does. A section of `diagnose_environment` that fails carries its error's tag
@@ -4987,17 +5060,24 @@ during ordinary typing; remote echo still includes network round-trip latency.
 ## Terminal size and reply ownership
 
 `terminalSizeOwnership` is negotiated from the environment capability set and is
-decoded as false when absent. The terminal manager owns PTY dimensions and one
+decoded as false when absent. The rule: the window last used sizes the terminal. Another
+window never clips it: it scales the picture down to fit (floor 0.5, then
+scrolls pinned to the bottom) or shows it at normal size with empty space. An
+unattended window never takes the size by itself; when the sizing window goes
+away, a visible window takes it. The terminal manager owns PTY dimensions and one
 optional attachment owner; renderers mirror that applied state.
 
-| Protocol surface        | Additions and behavior                                                                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `terminal.attach` input | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.              |
-| `terminal.resize` input | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers.                             |
-| Attach snapshot         | Optional `size { cols, rows, sizeClaim }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                          |
-| Attach snapshot         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                   |
-| Attach snapshot         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it. |
-| Attach event            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                         |
+| Protocol surface                        | Additions and behavior                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `terminal.attach` input                 | Optional `sizeClaim`, a fresh random token for each renderer mount; optional fitted `cols`/`rows` initialize a missing PTY and never resize an existing one.                                                                                                                                                                                                         |
+| `terminal.resize` input                 | Optional `sizeClaim`; a registered claim transfers ownership, including at equal dimensions. Omitting it clears ownership for legacy callers. Optional `structuredResult: true`: the caller decodes the result below; current clients always send it.                                                                                                                |
+| `terminal.resize` result                | `{ outcome, size, generation, sequence }`: `applied`, `unchanged`, `sessionMissing`, `claimNotRegistered`, `processAbsent` or `generationInvalidated`, with the size the server holds, only to a request with `structuredResult`. Otherwise `null`: older clients declare a void result, which the JSON RPC codec decodes as null only. Older servers answer `null`. |
+| `terminal.write`, `terminal.writeInput` | Optional `userInputClaim`: the size claim of the window a user produced the input in, or `null` for the terminal's own query replies, which never share a frame with typed input. Absent from older clients, whose input counts as use. Sent only when the server advertises `terminalUserInputClaim`.                                                               |
+| Snapshot, `exited`, `closed`            | Optional `generation { boot, process }`; see the terminal section of the architecture overview.                                                                                                                                                                                                                                                                      |
+| Attach snapshot                         | Optional `size { cols, rows, sizeClaim, replyClaim? }`; the whole object may be absent for older servers and `sizeClaim: null` means an unowned current size.                                                                                                                                                                                                        |
+| Attach snapshot                         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                                                                                                                                                                                                              |
+| Attach snapshot                         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it.                                                                                                                                                                                            |
+| Attach event                            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                                                                                                                                                                                                                    |
 
 First-attachment grant selection and ownership assignment are atomic under the
 PTY generation publication lock. Attach assigns an owner only when unowned; it
@@ -5016,21 +5096,95 @@ Dropping that `Started` event is a known limitation of surviving streams. Later
 and concurrent
 attaches neither renew a consumed grant nor displace a live owner. Claim
 eligibility ends with the exact attachment lifetime; dropping the owner
-publishes a null owner without changing dimensions, and stale resize requests
-cannot reclaim it. Manager shutdown cancels and drains attachment cleanup
+republishes ownership without changing dimensions (a lone remaining claimed
+viewer takes it; among several, the one a user typed in last takes it, and with
+none typed in it stays un-owned; the departed claim gets it back if it attaches
+again before anyone types, where a terminal's own query replies are not
+typing), and stale resize requests cannot
+reclaim it. While a size is left un-owned that way, `size.replyClaim` names one
+remaining viewer (the least claim; another when it leaves) that alone answers
+the terminal's queries, a new attach does not take the size (only the departed
+claim does), and a lone viewer left takes it. The field is absent otherwise and
+from older servers, whose clients keep answering from every window. A query the
+other viewers suppressed is lost if the replier leaves or is frozen before it
+answers, as it is when an owner does; it is not retried under the next replier.
+Manager shutdown cancels and drains attachment cleanup
 workers.
 
 Accepted resize/claim changes publish before subsequent PTY output under the
-same lock; failed resizes preserve state and exact no-ops emit nothing. A
-renderer retains one pending claim until RPC completion, on success or failure.
-The ordered echo updates applied dimensions and reply ownership. Notice
-suppression persists through successful RPC completion until applied size,
-ownership, or generation changes, including when success emits no echo. Input
+same lock; failed resizes preserve state. An exact no-op with a registered
+claim, from a caller that set `structuredResult`, publishes `resized` to that
+claim's attachment only, behind the output already queued for it, so a renderer whose applied size went stale repairs it
+with an ordered event and no timer (#348). A renderer retains one pending claim
+until RPC completion, on success or failure. Resize requests queue per terminal
+and renderer claim, so a result is always that renderer's own latest claim's.
+xterm geometry changes only through ordered size events and snapshots, behind
+the output parsed before them. An `applied` or `unchanged` answer names the
+sequence of its acknowledgement; the claim's outcome is the applied size at or
+after that sequence in the same generation, so an older publication parsed
+after the answer neither applies the claim nor ends notice suppression. When
+the PTY refused the requested size on every retry, the server publishes the
+size the PTY kept, and an owner's later claim of the refused size is answered
+`unchanged` with the kept size and that publication's sequence, publishing
+nothing; the client does not send that geometry again until the server's state
+changes. Any
+other outcome changed nothing: xterm keeps its size and the same geometry is
+not sent again until the server's state changes. A claim the server did not
+know (a remount claiming before its stream attached, or a reconnecting stream)
+is claimed again when the renderer's own stream attaches, even when that
+stream's snapshot is a state the shared runtime already applied; the client
+does not re-attach for it, since an attach can recreate a closed terminal. An
+`unchanged` claim for the geometry still awaiting its acknowledgement is not
+re-sent, so typing sends no repeated requests. With an older server (a `null`
+answer, or one without a sequence) the client waits for no acknowledgement: the
+same geometry is not sent again until the server publishes a size, and the next
+published size is the claim's outcome. Such a server publishes nothing for an
+owner's claim of the size it already holds, nor for a claim it ignored, so one
+read settles those: an attach without `cwd`, claim or restart, whose first
+snapshot alone is taken, which cannot create, restart or claim a session. An
+owner applies the size it reads; a takeover the read shows as applied waits for
+its owner change, and any other result ends notice suppression. Notice suppression
+covers the pending claim and its acknowledgement; after it the notice shows
+whenever another owner's size differs from this renderer's fit.
+A mirror scales its xterm element down to show the owner's whole grid, never
+up, with a 0.5 floor below which it scrolls pinned to the bottom rows; this is
+presentation only and sends no request. Attach and focus claims against a live
+owner also require transient user activation in the page, so an unattended
+window does not take the size; null ownership is still claimed at once.
+Input
 and reply decisions do not treat a pending claim as applied ownership. Null
 ownership permits live replies while attached renderers immediately try to claim
 it; mirrors suppress device/status/palette query replies. OSC 10/11/12 are
 suppressed for all renderers when the server responder is active; otherwise the
 owner can answer. The server continues handling `CSI ? 996 n`.
+
+Each attach stream is in sequence order, but several streams for one terminal
+can feed the same transcript runtime (two mounted viewports of one terminal, or
+a remounted renderer's old attachment until its release, which the atom
+registry defers by one scheduler task). The runtime orders processes by the
+server's generation: a snapshot or restart of an earlier process, or of a
+server instance the runtime has left, is never applied, and a stream's events
+count only once it has delivered the snapshot or restart of the current
+process. Within a process each sequence is applied once: an event at or below
+the highest sequence another stream already applied is skipped, and size
+events keep their own watermark because only claimed streams receive them. A
+snapshot whose transcript another stream already applied still delivers its size
+when it is newer than the last size applied: a no-op acknowledgement reaches
+only its requester, and a requester that fell behind receives it only in its
+catch-up snapshot. While a claimed stream on the current process is live, the
+sequenced events of a stream without a claim are not applied; the claimed
+stream delivers them behind the sizes published before them, so no output is
+parsed at a size the server had already replaced. A stream is released when it
+ends, so an ended one holds nothing back. The panel can mix them only when the
+ownership capability arrives after a claimless attach (a plain terminal may
+attach before the server configuration loads), until the old stream ends. A
+`closed` with a generation is applied by generation (once), not against
+another stream's sequence, and fences that process: a delayed snapshot or
+restart of it is dropped, and only a newer process, which the server issues to
+a re-created terminal, reopens it. With an older server (no generation) the `pid`
+tells processes apart as before, and a snapshot without one belongs to the
+last process. Pointer-down, focus and the first keydown of each frame
+re-measure the mount before deciding a claim.
 
 The transcript runtime delivers the first-attachment grant once to the renderer
 with the matching claim. Its history replay may answer startup DSR/DA; ordinary
@@ -5043,6 +5197,13 @@ workspace-loss fence. An attach carrying `cwd` can still create a missing
 session without that lease/fence, for example when it arrives before open or
 recreates a terminal after a server restart (a known gap). Open and attach send fitted dimensions only when a mounted renderer can
 supply them; new right-panel reservations have none and use server defaults.
+A mount whose computed width or height is zero, such as a center column behind a
+maximized right panel, supplies no fitted dimensions and sends no layout-driven
+resize until it has area again, instead of the fit addon's 2-column or 1-row
+floor. Its attach still carries its `sizeClaim`, so attachment ownership is
+unchanged. A failed layout resize or owner claim is retried by re-measuring
+after 250 ms, 1 s and 4 s; a success restores those attempts, and a renderer
+whose size belongs to another window does not retry its claim.
 
 Against a server without `terminalSizeOwnership`, every replay is guarded;
 startup-history queries are not answered on that transitional path. Live replies
@@ -5530,7 +5691,8 @@ H.264 video does not travel over RPC. The ticket from
   view is read again. SVG goes through `<img>` only, which runs no script
   whatever the file holds. The page policies (`tauri.conf.json` `csp` and
   `devCsp`, and the server's `CONTENT_SECURITY_POLICY_VALUE`) therefore add
-  exactly `media-src 'self' blob:` and `object-src blob:` (was `'none'`), with
+  exactly `media-src 'self' blob:`, `object-src blob:` (was `'none'`) and
+  `blob:` in `frame-src` (Chromium loads a PDF `<embed>` in a frame), with
   `img-src` already allowing `blob:`; an environment origin is deliberately not
   an image, media or object source. `scripts/tauri-hardening.test.ts` and the
   server's `the_ui_may_play_media_and_objects_from_blob_urls_only` pin them. The

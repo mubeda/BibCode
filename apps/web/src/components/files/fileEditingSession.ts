@@ -41,6 +41,8 @@ export interface FileEditingSessionSnapshot {
   readonly conflict: FileDiskConflict | null;
   /** The file is gone and nothing unsaved is left to show. */
   readonly deletedOnDisk: boolean;
+  /** A rendered-view edit waits to be delivered: the file has unsaved changes. */
+  readonly editPending: boolean;
 }
 
 /** The disk snapshot a session's file was read from. */
@@ -149,6 +151,14 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
   /** Set around a disk reload, whose editor change is adopted instead of recorded. */
   private applyingDiskText = false;
   private composing = false;
+  /** Delivers a rendered-view edit that still waits on its debounce. */
+  private pendingEditFlusher: ((whole: boolean) => void) | null = null;
+  /** Rendered-view edits not yet closed into the source editor's history. */
+  private richEditsPending = false;
+  /** The text each closed rendered visit ended with, applied when the source editor attaches. */
+  private closedRichVisits: string[] = [];
+  /** Set around applying closed visits, whose text the coordinator already holds. */
+  private applyingRichText = false;
 
   constructor(private readonly options: FileEditingSessionOptions<A, E>) {
     this.cwd = options.cwd;
@@ -229,14 +239,17 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     const editorOptions: EditorOptions<LAnnotation> = {
       persistState: true,
       onAttach: () => {
-        if (!this.disposed) this.publish();
+        if (this.disposed) return;
+        this.applyClosedRichVisits();
+        this.publish();
       },
       onChange: (file, lineAnnotations) => {
         if (this.disposed) return;
         this.editorChangedDocument = true;
-        // A reload's text is already on disk: adopt it rather than save it back.
+        // A reload's text is already on disk: adopt it rather than save it back. A closed
+        // rendered visit's text is already recorded, saved or not: leave the coordinator alone.
         if (this.applyingDiskText) this.coordinator.adopt(file.contents);
-        else this.coordinator.change(file.contents);
+        else if (!this.applyingRichText) this.coordinator.change(file.contents);
         this.editorChangeHandler?.(file, lineAnnotations);
         this.publish();
       },
@@ -251,6 +264,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
       canRedo: this.editorInstance?.canRedo ?? false,
       conflict: this.conflict?.view ?? null,
       deletedOnDisk: this.deletedOnDisk,
+      editPending: this.pendingEditFlusher !== null,
     };
   }
 
@@ -261,7 +275,8 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
       next.canUndo === this.snapshot.canUndo &&
       next.canRedo === this.snapshot.canRedo &&
       next.conflict === this.snapshot.conflict &&
-      next.deletedOnDisk === this.snapshot.deletedOnDisk
+      next.deletedOnDisk === this.snapshot.deletedOnDisk &&
+      next.editPending === this.snapshot.editPending
     ) {
       return;
     }
@@ -290,11 +305,97 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
   }
 
   async flush(): Promise<FileSaveFlushResult> {
+    // An edit that could not be delivered is not saved, so the caller must not treat it as such.
+    if (!this.deliverPendingEdit()) return "failed";
     return this.coordinator.flush();
   }
 
-  async settle(): Promise<FileSaveSettleResult> {
+  /**
+   * With `lastResort`, for a session about to be disposed, an edit that still cannot be
+   * reconciled is delivered whole rather than lost.
+   */
+  async settle(lastResort = false): Promise<FileSaveSettleResult> {
+    if (!this.deliverPendingEdit() && !(lastResort && this.deliverPendingEdit(true))) {
+      return "failed";
+    }
     return this.coordinator.settle();
+  }
+
+  /**
+   * Registers the rendered view's function that delivers an edit still waiting on its
+   * debounce, or clears it. Every operation that reads or replaces the document calls it first.
+   * Called with `whole`, it delivers the editor's whole serialization instead of a reconcile.
+   */
+  setPendingEditFlusher(flush: ((whole: boolean) => void) | null): void {
+    if (this.disposed) return;
+    this.pendingEditFlusher = flush;
+    this.publish();
+  }
+
+  /** Records a rendered-view edit without touching the source editor or its history. */
+  changeFromRichEditor(contents: string): void {
+    if (this.disposed) return;
+    this.coordinator.change(contents);
+    this.richEditsPending = true;
+    this.publish();
+  }
+
+  /**
+   * Closes a rendered visit: its edits reach the source editor as one undo step, now when the
+   * editor is attached, else when it next attaches. Without a source editor nothing is needed,
+   * because the next one seeds from the session's text.
+   */
+  commitRichEdits(): void {
+    this.deliverPendingEdit();
+    if (this.disposed || !this.richEditsPending) return;
+    this.richEditsPending = false;
+    if (this.editorInstance === null) return;
+    this.closedRichVisits.push(this.localText());
+    this.applyClosedRichVisits();
+    this.publish();
+  }
+
+  /**
+   * Delivers an edit still waiting on the rendered view's debounce. Returns false when the
+   * delivery threw: the flusher stays registered, so the edit stays unsaved and a later call
+   * retries it.
+   */
+  private deliverPendingEdit(whole = false): boolean {
+    const flush = this.pendingEditFlusher;
+    if (flush === null || this.disposed) return true;
+    try {
+      flush(whole);
+    } catch (error) {
+      console.error("[file-editing-session] delivering a rendered edit failed", error);
+      return false;
+    }
+    if (this.pendingEditFlusher === flush) this.pendingEditFlusher = null;
+    this.publish();
+    return true;
+  }
+
+  private applyClosedRichVisits(): void {
+    const editor = this.editorInstance;
+    if (this.closedRichVisits.length === 0 || editor === null || editor.getFile() === undefined) {
+      return;
+    }
+    const visits = this.closedRichVisits;
+    this.closedRichVisits = [];
+    this.applyingRichText = true;
+    let applied = false;
+    try {
+      for (const text of visits) {
+        editor.applyEdits(diskReloadEdits(editor.getText(), text), true, true);
+      }
+      applied = editor.getText() === this.localText();
+    } catch (error) {
+      console.error("[file-editing-session] applying rendered edits to the editor failed", error);
+    } finally {
+      this.applyingRichText = false;
+    }
+    // An editor still holding older text would save it over the rendered edits: lose its
+    // history instead, and the next attach seeds from the session's text.
+    if (!applied) this.discardEditor();
   }
 
   setAutosaveEnabled(enabled: boolean): void {
@@ -326,6 +427,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
   }
 
   rename(relativePath: string): void {
+    this.deliverPendingEdit();
     if (relativePath === this.currentRelativePath) return;
     const previousRelativePath = this.currentRelativePath;
     const pending = this.coordinator.hasPendingWork();
@@ -335,13 +437,6 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     this.currentRelativePath = relativePath;
     if (pending) this.options.onPendingChange(relativePath, true);
     if (conflicted) this.options.onConflictChange?.(relativePath, true);
-  }
-
-  changeOutsideEditor(contents: string): void {
-    if (this.disposed) return;
-    this.discardEditor();
-    this.coordinator.change(contents);
-    this.publish();
   }
 
   /** Asks the disk watcher, when one is attached, to check the file now. */
@@ -362,6 +457,9 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * (no versions, a save in flight, or saving paused by a rename or delete in progress).
    */
   beginDiskCheck(): number | null {
+    // An edit still waiting must count as unsaved, so a disk change becomes a conflict. One
+    // that cannot be delivered blocks the check, so no disk result replaces it.
+    if (!this.deliverPendingEdit()) return null;
     return this.canReconcile() ? this.saveGeneration : null;
   }
 
@@ -371,7 +469,8 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * the base, and the next check re-reads.
    */
   reconcileVersion(token: number, disk: ProjectFileVersion): "settled" | "read" | "stale" {
-    if (!this.isCurrentCheck(token)) return "stale";
+    // An edit that started waiting after the check began must also count as unsaved.
+    if (!this.deliverPendingEdit() || !this.isCurrentCheck(token)) return "stale";
     const base = this.base!;
     switch (disk._tag) {
       case "missing":
@@ -412,7 +511,9 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
 
   /** Reconciles with a disk read made for the check that `token` started. */
   reconcileRead(token: number, read: FileDiskRead): void {
-    if (!this.isCurrentCheck(token) || read.version === undefined) return;
+    if (!this.deliverPendingEdit() || !this.isCurrentCheck(token) || read.version === undefined) {
+      return;
+    }
     const disk = { kind: "present", version: read.version, contents: read.contents } as const;
     if (read.contents === this.localText()) {
       // Our own save, or the same edit made elsewhere.
@@ -433,6 +534,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
    * source editor attached the reload is one undo step, so Undo brings the edits back.
    */
   reloadFromDisk(): void {
+    if (!this.deliverPendingEdit()) return;
     const disk = this.conflict?.disk;
     if (this.disposed || disk == null) return;
     if (disk.kind === "present") this.applyDiskText(disk);
@@ -441,6 +543,7 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
 
   /** Resolves a conflict by saving the document over the disk state the user was shown. */
   overwriteDisk(): void {
+    if (!this.deliverPendingEdit()) return;
     const disk = this.conflict?.disk;
     if (this.disposed || this.conflict === null) return;
     if (disk == null) {
@@ -606,6 +709,8 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     this.editorInstance?.cleanUp();
     this.editorInstance = null;
     this.editorChangedDocument = false;
+    this.closedRichVisits = [];
+    this.richEditsPending = false;
     this.currentCacheKey = createSessionCacheKey(this.cwd);
   }
 }

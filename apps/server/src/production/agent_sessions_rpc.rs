@@ -950,6 +950,7 @@ async fn import_session(
         branch: host.and_then(|host| host.branch.clone()),
         worktree_path: host.and_then(|host| host.worktree_path.clone()),
         created_at: created_at.clone(),
+        code_review: false,
     };
     let ImportTarget::Panel(panel) = request.target else {
         dispatch(
@@ -1389,6 +1390,7 @@ mod tests {
                     branch: None,
                     worktree_path: None,
                     created_at: "2026-10-01T00:00:00Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .unwrap();

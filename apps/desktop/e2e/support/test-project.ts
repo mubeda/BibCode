@@ -35,6 +35,13 @@ const LONG_REPLY_TURN_MARKER = "[[long-reply]]";
 const LONG_REPLY_LINES = 1_000;
 /** Matches the line the Claude shim writes. */
 const longReplyLine = (line: number) => `Fixture long reply line ${line} fills the timeline.`;
+/**
+ * A Claude prompt that starts with the code review lead-in (#293) is answered, as Claude in plan
+ * mode answers, with an `ExitPlanMode` call whose plan holds the findings.
+ */
+const CODE_REVIEW_LEAD_IN = "Code review requested from BiBCode.";
+const CODE_REVIEW_FINDING = "Low: example finding";
+const CODE_REVIEW_PLAN = `## Review findings\n\n- ${CODE_REVIEW_FINDING}`;
 /** An answer line names its prompt without the marker, so each turn's answer is its own. */
 const reasoningAnswerLine = (variant: string, line: number, label: string) =>
   `Fixture ${variant} answer line ${line} (${label}).`;
@@ -358,9 +365,71 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
 // Each size is also appended inside .git, out of the worktree's status, where
 // the packaged scenario reads it: a WebGL terminal has no text in the DOM.
 if (process.stdout.isTTY) {
+  // BIBCODE_E2E_FOOTER_LAYOUT=floating draws a short frame in the normal buffer and redraws it
+  // in place, as Claude's CLI does, instead of pinning a footer to the last row.
+  const floatingFrame = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "floating";
+  let floatingLines = 0;
+  // BIBCODE_E2E_FOOTER_LAYOUT=cli behaves like an Ink CLI such as Claude's: a long transcript in
+  // the normal buffer, a six-row frame on the bottom rows erased line by line (never a full clear)
+  // and rewritten every 80-120 ms, transcript lines streamed above it, lines cut to the width.
+  const cliFrame = process.env.BIBCODE_E2E_FOOTER_LAYOUT === "cli";
+  let cliRows = 0;
+  let cliTick = 0;
+  let cliLine = 0;
+  const drawCliFrame = (transcript) => {
+    const rows = process.stdout.rows;
+    const cols = process.stdout.columns;
+    const size = cols + "x" + rows;
+    const frame = [
+      "|/-\\"[cliTick % 4] + " fixture working " + cliTick,
+      "> " + "draft".padEnd(Math.max(0, Math.min(cols - 3, 40)), "."),
+      "",
+      "fixture-footer-a " + size,
+      "fixture-footer-b",
+      "fixture-footer-z " + rows,
+    ].map((text) => text.slice(0, Math.max(1, cols - 1)));
+    let erase = "";
+    for (let index = 0; index < cliRows; index += 1) erase += "\x1b[2K" + (index < cliRows - 1 ? "\x1b[1A" : "");
+    process.stdout.write(erase + "\r" + transcript.map((text) => text + "\r\n").join("") + frame.join("\r\n"));
+    cliRows = frame.length;
+  };
+  if (cliFrame) {
+    let intro = "";
+    for (; cliLine < 200; cliLine += 1) intro += "transcript " + cliLine + " " + "lorem ipsum ".repeat(4) + "\r\n";
+    process.stdout.write(intro);
+    const redraw = () => {
+      cliTick += 1;
+      drawCliFrame(Math.random() < 0.3 ? ["transcript " + cliLine++ + " streamed while the frame redraws"] : []);
+      setTimeout(redraw, 80 + Math.floor(Math.random() * 41));
+    };
+    setTimeout(redraw, 100);
+  }
   const drawTerminalSize = () => {
-    const size = process.stdout.columns + "x" + process.stdout.rows;
-    process.stdout.write("\x1b[2J\x1b[Hfixture-tui " + size + "\r\n");
+    const rows = process.stdout.rows;
+    const size = process.stdout.columns + "x" + rows;
+    if (cliFrame) {
+      drawCliFrame([]);
+      try {
+        fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
+      } catch {}
+      return;
+    }
+    if (floatingFrame) {
+      const frame = ["fixture-tui " + size, "fixture-footer-a " + size, "fixture-footer-b", "fixture-footer-z " + rows];
+      process.stdout.write((floatingLines > 0 ? "\x1b[" + floatingLines + "A\r\x1b[J" : "") + frame.join("\r\n") + "\r\n");
+      floatingLines = frame.length;
+      try {
+        fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
+      } catch {}
+      return;
+    }
+    // A footer on the last three rows, as an agent CLI draws one, shows a clipped bottom (#348).
+    const footer = rows >= 5
+      ? "\x1b[" + (rows - 2) + ";1Hfixture-footer-a " + size +
+        "\x1b[" + (rows - 1) + ";1Hfixture-footer-b" +
+        "\x1b[" + rows + ";1Hfixture-footer-z " + rows + "\x1b[2;1H"
+      : "";
+    process.stdout.write("\x1b[2J\x1b[Hfixture-tui " + size + "\r\n" + footer);
     try {
       fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
     } catch {}
@@ -773,6 +842,33 @@ reader.on("line", (line) => {
   const prompt = promptTextFromParts(message.message?.content);
   appendProviderInput("claudeAgent", prompt);
   send(message);
+  if (prompt.startsWith(${JSON.stringify(CODE_REVIEW_LEAD_IN)})) {
+    send({
+      type: "assistant",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-review-plan-" + randomUUID(),
+      parent_tool_use_id: null,
+      message: {
+        id: "bibcode-ui-review-" + randomUUID(),
+        content: [{
+          type: "tool_use",
+          id: "bibcode-ui-review-exit-plan-" + randomUUID(),
+          name: "ExitPlanMode",
+          input: { plan: ${JSON.stringify(CODE_REVIEW_PLAN)} }
+        }]
+      }
+    });
+    send({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      errors: [],
+      stop_reason: "end_turn",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-review-result"
+    });
+    return;
+  }
   const slowReasoning = prompt.includes(${JSON.stringify(SLOW_REASONING_TURN_MARKER)});
   if (slowReasoning || prompt.includes(${JSON.stringify(REASONING_TURN_MARKER)})) {
     void streamReasoningTurn(sessionId, slowReasoning, prompt);
@@ -1464,6 +1560,7 @@ export const desktopUiFixture = {
   reasoningTurnMarker: REASONING_TURN_MARKER,
   slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
   longReplyTurnMarker: LONG_REPLY_TURN_MARKER,
+  codeReviewFinding: CODE_REVIEW_FINDING,
   longReplyLastLine: longReplyLine(LONG_REPLY_LINES),
   reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
   /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */

@@ -74,7 +74,8 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useAtomCommand } from "../../state/use-atom-command";
 
 function KeybindingPill({ value }: { value: string }) {
-  const parts = value.split("+");
+  // Split only on a "+" that follows a key, so the "+" key itself ("mod++") stays one part.
+  const parts = value.split(/(?<=[^+])\+/);
   return (
     <KbdGroup className="bg-transparent p-0 shadow-none">
       {parts.map((part) => (
@@ -813,8 +814,8 @@ function KeybindingTableRow({
   };
 
   return (
-    <div className="grid grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] items-center px-4 py-1.5 text-sm even:bg-muted/15 hover:bg-accent/40">
-      <div className="min-w-0 pr-4">
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-y-1.5 px-4 py-1.5 text-sm sm:grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] sm:gap-y-0 even:bg-muted/15 hover:bg-accent/40">
+      <div className="min-w-0 sm:pr-4">
         <div className="flex min-w-0 items-center gap-1.5">
           <Tooltip>
             <TooltipTrigger
@@ -831,7 +832,7 @@ function KeybindingTableRow({
           </Tooltip>
         </div>
       </div>
-      <div className="flex min-w-0 items-center gap-2 pr-4">
+      <div className="col-span-2 flex min-w-0 items-center gap-2 sm:col-span-1 sm:pr-4">
         {showPill ? (
           <button
             type="button"
@@ -871,7 +872,7 @@ function KeybindingTableRow({
           </Button>
         ) : null}
       </div>
-      <div className="pr-4">
+      <div className="col-span-2 sm:col-span-1 sm:pr-4">
         <Popover>
           <PopoverTrigger
             className={cn(
@@ -893,7 +894,7 @@ function KeybindingTableRow({
           </PopoverContent>
         </Popover>
       </div>
-      <div className="flex items-center justify-end gap-1">
+      <div className="col-start-2 row-start-1 flex items-center justify-end gap-1 sm:col-start-auto sm:row-start-auto">
         <KeybindingConflictWarning labels={conflictLabels} />
         {hasRowActions ? (
           <Menu>
@@ -984,8 +985,8 @@ function NewKeybindingTableRow({
   };
 
   return (
-    <div className="grid grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] items-center px-4 py-1.5 text-sm even:bg-muted/15 hover:bg-accent/40">
-      <div className="min-w-0 pr-4">
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-y-1.5 px-4 py-1.5 text-sm sm:grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] sm:gap-y-0 even:bg-muted/15 hover:bg-accent/40">
+      <div className="min-w-0 sm:pr-4">
         <Select
           value={commandDraft}
           onValueChange={(value) => setCommandDraft(value as KeybindingCommand)}
@@ -1009,7 +1010,7 @@ function NewKeybindingTableRow({
           </SelectContent>
         </Select>
       </div>
-      <div className="flex min-w-0 items-center gap-2 pr-4">
+      <div className="col-span-2 flex min-w-0 items-center gap-2 sm:col-span-1 sm:pr-4">
         <Input
           aria-label={`Keybinding for ${commandLabelText}`}
           value={isRecording ? "" : keyDraft}
@@ -1032,7 +1033,7 @@ function NewKeybindingTableRow({
           {isSaving ? "Saving" : "Save"}
         </Button>
       </div>
-      <div className="pr-4">
+      <div className="col-span-2 sm:col-span-1 sm:pr-4">
         <Popover>
           <PopoverTrigger
             className={cn(
@@ -1054,7 +1055,7 @@ function NewKeybindingTableRow({
           </PopoverContent>
         </Popover>
       </div>
-      <div className="flex items-center justify-end gap-1">
+      <div className="col-start-2 row-start-1 flex items-center justify-end gap-1 sm:col-start-auto sm:row-start-auto">
         <KeybindingConflictWarning labels={conflictLabels} />
         <Tooltip>
           <TooltipTrigger
@@ -1293,13 +1294,13 @@ export function KeybindingsSettingsPanel() {
           hideScrollbars
           className="w-full max-w-full rounded-none"
         >
-          <div className="grid min-w-[680px] grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] border-b border-border/70 bg-muted/25 px-4 py-2 text-xs font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+          <div className="hidden sm:grid sm:min-w-[680px] sm:grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] border-b border-border/70 bg-muted/25 px-4 py-2 text-xs font-semibold uppercase tracking-[0.07em] text-muted-foreground">
             <div>Command</div>
             <div>Keybinding</div>
             <div>When</div>
             <div>Status</div>
           </div>
-          <div className="min-w-[680px] divide-y divide-border/60">
+          <div className="sm:min-w-[680px] divide-y divide-border/60">
             {isAddingBinding ? (
               <NewKeybindingTableRow
                 commandOptions={commandOptions}

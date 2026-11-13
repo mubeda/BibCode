@@ -75,6 +75,10 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     /** Renders the real ChatComposer and ThreadErrorBanner behind their capturing mocks. */
     realChildren: false,
+    /** With `realChildren`, also renders the real model picker instead of its stub. */
+    realModelPicker: false,
+    /** With `realChildren`, also renders the real provider status banner and composer banners. */
+    realStatusBanners: false,
     realTimeline: false,
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
@@ -246,9 +250,14 @@ vi.mock("./device/deviceAvailability", () => ({
 }));
 
 // What the real ChatComposer reads when `h.realChildren` renders it; ChatView reads none of it.
-vi.mock("./chat/ProviderModelPicker", () => ({
-  ProviderModelPicker: () => <div data-mock="provider-model-picker" />,
-}));
+vi.mock("./chat/ProviderModelPicker", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ProviderModelPicker")>();
+  const RealPicker = actual.ProviderModelPicker as unknown as (props: object) => ReactNode;
+  return {
+    ProviderModelPicker: (props: Record<string, unknown>) =>
+      h.realModelPicker ? <RealPicker {...props} /> : <div data-mock="provider-model-picker" />,
+  };
+});
 vi.mock("../state/providerCapabilities", () => ({
   useProviderCapabilities: () => ({
     data: { slashCommands: [], skills: [], agents: [], issues: [] },
@@ -399,6 +408,7 @@ vi.mock("../hooks/useSettings", () => ({
   // Read by the real composer's model picker when `h.realChildren` renders it.
   useClientSettings: (selector?: (settings: Record<string, unknown>) => unknown) =>
     selector ? selector(h.settings) : h.settings,
+  useUpdateClientSettings: () => () => undefined,
 }));
 
 vi.mock("../assets/assetUrls", () => ({
@@ -594,12 +604,20 @@ vi.mock("./chat/PanelLayoutControls", () => ({
   },
 }));
 
-vi.mock("./chat/ProviderStatusBanner", () => ({
-  ProviderStatusBanner: (props: Record<string, unknown>) => {
-    h.captured["providerStatusBanner"] = props;
-    return <div data-mock="provider-status-banner" />;
-  },
-}));
+vi.mock("./chat/ProviderStatusBanner", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ProviderStatusBanner")>();
+  const RealBanner = actual.ProviderStatusBanner as unknown as (props: object) => ReactNode;
+  return {
+    ProviderStatusBanner: (props: Record<string, unknown>) => {
+      h.captured["providerStatusBanner"] = props;
+      return h.realStatusBanners ? (
+        <RealBanner {...props} />
+      ) : (
+        <div data-mock="provider-status-banner" />
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ThreadErrorBanner", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./chat/ThreadErrorBanner")>();
@@ -617,12 +635,20 @@ vi.mock("./chat/ThreadErrorBanner", async (importOriginal) => {
   };
 });
 
-vi.mock("./chat/ComposerBannerStack", () => ({
-  ComposerBannerStack: (props: Record<string, unknown>) => {
-    h.captured["composerBannerStack"] = props;
-    return <div data-mock="composer-banner-stack" />;
-  },
-}));
+vi.mock("./chat/ComposerBannerStack", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ComposerBannerStack")>();
+  const RealStack = actual.ComposerBannerStack as unknown as (props: object) => ReactNode;
+  return {
+    ComposerBannerStack: (props: Record<string, unknown>) => {
+      h.captured["composerBannerStack"] = props;
+      return h.realStatusBanners ? (
+        <RealStack {...props} />
+      ) : (
+        <div data-mock="composer-banner-stack" />
+      );
+    },
+  };
+});
 
 vi.mock("./PullRequestThreadDialog", () => ({
   PullRequestThreadDialog: (props: Record<string, unknown>) => {
@@ -749,7 +775,10 @@ vi.mock("./DiffPanel", () => ({
   },
 }));
 vi.mock("./SourceControlPanel", () => ({
-  default: () => <div data-mock="source-control-panel" />,
+  default: (props: Record<string, unknown>) => {
+    h.captured["sourceControlPanel"] = props;
+    return <div data-mock="source-control-panel" />;
+  },
 }));
 vi.mock("./files/FilePreviewPanel", () => {
   let nextInstanceId = 0;
@@ -883,6 +912,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repositoryIdentity: null,
     defaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: now,
     updatedAt: now,
@@ -1084,6 +1114,8 @@ beforeEach(() => {
   h.openThreadFindTargets.length = 0;
   h.captured = {};
   h.realChildren = false;
+  h.realModelPicker = false;
+  h.realStatusBanners = false;
   h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -3873,7 +3905,7 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
     });
 
-    it("updates the pre-start host tab label when the selected provider changes", () => {
+    it("keeps a never-started main chat on its provider when another provider is selected (#347)", () => {
       const claudeInstanceId = ProviderInstanceId.make("claude");
       const claudeProvider: ServerProvider = {
         ...codexProvider,
@@ -3896,7 +3928,7 @@ describe("ChatView", () => {
       renderServerRoute();
       expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
       const initialComposer = capturedProps<Record<string, unknown>>("chatComposer");
-      expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(false);
+      expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(true);
       const initialSurfaces =
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces;
 
@@ -3908,7 +3940,10 @@ describe("ChatView", () => {
       publishSeededStoreState(useComposerDraftStore);
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Claude");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.activeProvider).not.toBe(
+        "claude",
+      );
       expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
@@ -5776,6 +5811,724 @@ describe("ChatView handlers (captured from mocked children)", () => {
     ).toBeUndefined();
   });
 
+  describe("a code review thread (R96)", () => {
+    const reviewTurnId = TurnId.make("turn-review");
+    const planThread = (codeReview: boolean) =>
+      makeThread({
+        interactionMode: "plan",
+        ...(codeReview ? { codeReview: true } : {}),
+        latestTurn: {
+          turnId: reviewTurnId,
+          state: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          assistantMessageId: null,
+        },
+        proposedPlans: [
+          {
+            id: "plan-review" as Thread["proposedPlans"][number]["id"],
+            turnId: reviewTurnId,
+            planMarkdown: "# Fix the parser\n\n- Low: example finding",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
+
+    async function renderPlanThread(codeReview: boolean) {
+      h.realTimeline = true;
+      h.realChildren = true;
+      seedConnectedServerThread(planThread(codeReview));
+      useRightPanelStore.getState().open(threadRef, "plan");
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+        );
+        await Promise.resolve();
+      });
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+      composerRef.current = composerHandle();
+      (composer["promptRef"] as RefObject<string>).current = "";
+      return {
+        container,
+        composer,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    }
+
+    const buttonLabels = (container: HTMLElement) =>
+      [...container.querySelectorAll("button")].map((button) => button.textContent ?? "");
+
+    it("offers no Implement, sends nothing on an empty Enter and titles the card Review findings", async () => {
+      const view = await renderPlanThread(true);
+      try {
+        expect(view.composer["showPlanFollowUpPrompt"]).toBe(false);
+        const labels = buttonLabels(view.container);
+        expect(labels.some((label) => /Implement|Refine/.test(label))).toBe(false);
+        expect(view.container.textContent).toContain("Review findings");
+        expect(view.container.textContent).not.toContain("Fix the parser");
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe(
+          "Review findings",
+        );
+        await act(async () => (view.composer["onSend"] as () => Promise<void>)());
+        expect(commandCallsFor("thread.startTurn")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("keeps the Tasks label for a review without a proposed plan", async () => {
+      h.realTimeline = true;
+      seedConnectedServerThread(makeThread({ codeReview: true }));
+      useRightPanelStore.getState().open(threadRef, "plan");
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Tasks");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("keeps today's plan actions without the flag", async () => {
+      const view = await renderPlanThread(false);
+      try {
+        expect(view.composer["showPlanFollowUpPrompt"]).toBe(true);
+        expect(buttonLabels(view.container)).toContain("Implement");
+        expect(view.container.textContent).toContain("Fix the parser");
+        expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Plan");
+      } finally {
+        await view.unmount();
+      }
+    });
+  });
+
+  describe("Review changes from Source Control (R90, R95, R97, R98)", () => {
+    type ReviewProp = {
+      readonly unavailableReason: string | null;
+      readonly guardLine: string | null;
+      readonly onStart: (scope: { kind: "branch" | "uncommitted"; base: string | null }) => void;
+    };
+    const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+    const cursorInstanceId = ProviderInstanceId.make("cursor");
+    const claudeProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: claudeInstanceId,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models: [{ slug: "opus", name: "Opus", isCustom: false, capabilities: null }],
+    };
+    const cursorProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: cursorInstanceId,
+      driver: ProviderDriverKind.make("cursor"),
+      models: [{ slug: "auto", name: "Auto", isCustom: false, capabilities: null }],
+    };
+    const SCOPE = { kind: "uncommitted", base: "origin/main" } as const;
+    const DRAFT_REASON = "Send a first message in this chat, then review from here.";
+
+    function seedReviewEnvironment(input: {
+      readonly reviewer: { kind: "chat" | "terminal"; instanceId: ProviderInstanceId };
+      readonly os?: string;
+      readonly codeReviews?: boolean;
+      readonly providers?: ReadonlyArray<ServerProvider>;
+      readonly settings?: Record<string, unknown>;
+    }): void {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: input.providers ?? [codexProvider, claudeProvider],
+            environment: {
+              label: "Local",
+              platform: { os: input.os ?? "linux", arch: "x64" },
+              capabilities: {
+                activityProtocolVersion: 2,
+                worktreeCatalog: true,
+                codeReviews: input.codeReviews ?? true,
+              },
+            },
+          },
+        } as never),
+      );
+      seedProject(makeProject());
+      seedGitStatus(true);
+      h.settings = { ...h.settings, codeReviewAgent: input.reviewer, ...input.settings };
+    }
+
+    async function mountReview(route: ReactElement): Promise<{
+      readonly review: () => ReviewProp;
+      readonly unmount: () => Promise<void>;
+    }> {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(route);
+        await Promise.resolve();
+      });
+      await vi.waitFor(() => expect(h.captured["sourceControlPanel"]).toBeDefined());
+      return {
+        review: () =>
+          (h.captured["sourceControlPanel"] as { codeReview: ReviewProp | null }).codeReview!,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    }
+
+    async function mountServerReview() {
+      useRightPanelStore.getState().open(threadRef, "sourceControl");
+      return mountReview(
+        <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+      );
+    }
+
+    it("starts a Codex chat review as a panel of the current thread", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId } });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        expect(view.review().guardLine).toBe(
+          "Runs in Codex's read-only sandbox. Writes ask for your approval.",
+        );
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+        const creations = commandCallsFor("worktree.createPanel");
+        expect(creations).toHaveLength(1);
+        expect(creations[0]!.input).toMatchObject({
+          environmentId,
+          input: {
+            hostThreadId: threadId,
+            title: "Panel: Code review · Codex",
+            threadDefaults: {
+              modelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            },
+            codeReview: true,
+          },
+        });
+        const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+          input: { message: { text: string } };
+        };
+        expect(turn.input.message.text).toMatch(
+          /^Code review requested from BiBCode\. Do not edit files\. Scope: the staged, unstaged and untracked changes in the working tree\.\n\n/,
+        );
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("opens a Claude Terminal review with the review command", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "terminal", instanceId: claudeInstanceId } });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        expect(view.review().guardLine).toBe("Starts in Claude's plan mode.");
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        const opened = commandCallsFor("terminal.open")[0]!.input as {
+          input: { command: { executable: string; args: string[] } };
+        };
+        expect(opened.input.command.executable).toBe("claude");
+        expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+        expect(opened.input.command.args.at(-2)).toBe("--");
+        expect(opened.input.command.args.at(-1)).toMatch(/^Code review requested from BiBCode\./);
+        expect(opened.input.command.args).not.toContain("--dangerously-skip-permissions");
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("opens one terminal review per double click, and again after a failed open", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "terminal", instanceId: claudeInstanceId } });
+      seedServerThread(makeThread());
+      const firstOpen = deferredResult<ReturnType<typeof AsyncResult.success<void>>>();
+      h.commandResults["terminal.open"] = () => firstOpen.promise;
+      const view = await mountServerReview();
+      try {
+        await act(async () => {
+          view.review().onStart(SCOPE);
+          view.review().onStart(SCOPE);
+        });
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        await act(async () => {
+          firstOpen.resolve(AsyncResult.failure(Cause.fail(new Error("spawn failed"))) as never);
+          await firstOpen.promise;
+        });
+        h.commandResults["terminal.open"] = () => AsyncResult.success(undefined);
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(2));
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it.each([
+      ["chat Codex", { kind: "chat" as const, instanceId: codexInstanceId }],
+      ["Claude Terminal", { kind: "terminal" as const, instanceId: claudeInstanceId }],
+    ])("is unavailable in a draft chat for %s", async (_name, reviewer) => {
+      seedReviewEnvironment({ reviewer });
+      const draftId = newDraftId();
+      useComposerDraftStore
+        .getState()
+        .setLogicalProjectDraftThreadId(
+          "logical-project-1",
+          scopeProjectRef(environmentId, projectId),
+          draftId,
+          { threadId, createdAt: now, envMode: "local", worktreePath: null },
+        );
+      useRightPanelStore.getState().open(threadRef, "sourceControl");
+      publishSeededStoreState(useComposerDraftStore);
+      publishSeededStoreState(useRightPanelStore);
+      const view = await mountReview(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="draft"
+          draftId={draftId}
+        />,
+      );
+      try {
+        expect(view.review().unavailableReason).toBe(DRAFT_REASON);
+        await act(async () => view.review().onStart(SCOPE));
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("never falls back from a disabled saved reviewer", async () => {
+      seedReviewEnvironment({
+        reviewer: { kind: "chat", instanceId: claudeInstanceId },
+        providers: [claudeProvider, cursorProvider],
+        settings: {
+          providers: {
+            ...DEFAULT_SERVER_SETTINGS.providers,
+            claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
+          },
+        },
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBe(
+          "Claude is not available. Change the code review agent in Settings → Agents.",
+        );
+        await act(async () => view.review().onStart(SCOPE));
+        expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        expect(commandCallsFor("terminal.open")).toEqual([]);
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it("needs a server that advertises code reviews", async () => {
+      seedReviewEnvironment({
+        reviewer: { kind: "chat", instanceId: codexInstanceId },
+        codeReviews: false,
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBe(
+          "Update the BiBCode server on this environment to use Review.",
+        );
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    it.each(["windows", "darwin", "linux"])("offers a Claude Terminal review on %s", async (os) => {
+      seedReviewEnvironment({
+        reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+        os,
+      });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+      } finally {
+        await view.unmount();
+      }
+    });
+
+    describe("with a one-off reviewer from the menu (R103)", () => {
+      type MenuReviewer = {
+        readonly label: string;
+        readonly selection: { kind: "chat" | "terminal"; instanceId: ProviderInstanceId };
+        readonly guardLine: string | null;
+        readonly disabledReason: string | null;
+      };
+      const reviewers = (view: { review: () => ReviewProp }) =>
+        (view.review() as ReviewProp & { reviewers: ReadonlyArray<MenuReviewer> }).reviewers;
+      const reviewerByLabel = (view: { review: () => ReviewProp }, label: string) =>
+        reviewers(view).find((reviewer) => reviewer.label === label)!;
+      const startWith = (
+        view: { review: () => ReviewProp },
+        selection: MenuReviewer["selection"],
+      ) =>
+        (view.review().onStart as (scope: typeof SCOPE, reviewer: typeof selection) => void)(
+          SCOPE,
+          selection,
+        );
+
+      it("opens a Claude review terminal and leaves the saved chat Codex reviewer alone", async () => {
+        const saved = { kind: "chat" as const, instanceId: codexInstanceId };
+        seedReviewEnvironment({ reviewer: saved });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          expect(reviewers(view).map((reviewer) => reviewer.label)).toEqual([
+            "Codex",
+            "Claude",
+            "Codex Terminal",
+            "Claude Terminal",
+          ]);
+          const claudeTerminal = reviewerByLabel(view, "Claude Terminal");
+          expect(claudeTerminal).toMatchObject({
+            selection: { kind: "terminal", instanceId: claudeInstanceId },
+            guardLine: "Starts in Claude's plan mode.",
+            disabledReason: null,
+          });
+          await act(async () => startWith(view, claudeTerminal.selection));
+          await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+          const opened = commandCallsFor("terminal.open")[0]!.input as {
+            input: { command: { executable: string; args: string[] } };
+          };
+          expect(opened.input.command.executable).toBe("claude");
+          expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(h.commandCalls.filter((call) => /settings/i.test(call.key))).toEqual([]);
+          expect(h.settings["codeReviewAgent"]).toEqual(saved);
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it("names a disabled one-off reviewer's own reason, not the saved reviewer's", async () => {
+        // A listed provider that is not ready yet is a disabled menu item.
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          providers: [codexProvider, { ...claudeProvider, status: "error" }],
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          const claude = reviewerByLabel(view, "Claude");
+          expect(claude.disabledReason).not.toBeNull();
+          expect(claude.disabledReason).not.toContain("code review agent");
+          await act(async () => startWith(view, claude.selection));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(reviewerByLabel(view, "Codex").disabledReason).toBeNull();
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it("starts a one-off chat reviewer while the saved reviewer is unavailable", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: claudeInstanceId },
+          settings: {
+            providers: {
+              ...DEFAULT_SERVER_SETTINGS.providers,
+              claudeAgent: { ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent, enabled: false },
+            },
+          },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          expect(view.review().unavailableReason).toBe(
+            "Claude is not available. Change the code review agent in Settings → Agents.",
+          );
+          const codex = reviewerByLabel(view, "Codex");
+          expect(codex.disabledReason).toBeNull();
+          await act(async () => startWith(view, codex.selection));
+          await vi.waitFor(() => expect(commandCallsFor("worktree.createPanel")).toHaveLength(1));
+          expect(commandCallsFor("worktree.createPanel")[0]!.input).toMatchObject({
+            input: { title: "Panel: Code review · Codex", codeReview: true },
+          });
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it.each(["windows", "darwin", "linux"])(
+        "offers the Claude and Codex Terminals on %s",
+        async (os) => {
+          seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId }, os });
+          seedServerThread(makeThread());
+          const view = await mountServerReview();
+          try {
+            expect(reviewerByLabel(view, "Claude Terminal").disabledReason).toBeNull();
+            expect(reviewerByLabel(view, "Codex Terminal").disabledReason).toBeNull();
+            expect(reviewerByLabel(view, "Codex").disabledReason).toBeNull();
+            await act(async () =>
+              startWith(view, reviewerByLabel(view, "Claude Terminal").selection),
+            );
+            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+          } finally {
+            await view.unmount();
+          }
+        },
+      );
+
+      it("gives every reviewer the environment's reason on a server without code reviews", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          codeReviews: false,
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          for (const reviewer of reviewers(view)) {
+            expect(reviewer.disabledReason).toBe(
+              "Update the BiBCode server on this environment to use Review.",
+            );
+          }
+          await act(async () => startWith(view, reviewerByLabel(view, "Codex").selection));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+        } finally {
+          await view.unmount();
+        }
+      });
+    });
+
+    describe("with one-off instructions (R105)", () => {
+      const EXTRA = "Focus on the parser.";
+      const startWithInstructions = (view: { review: () => ReviewProp }) =>
+        (
+          view.review().onStart as (scope: typeof SCOPE, reviewer: undefined, extra: string) => void
+        )(SCOPE, undefined, EXTRA);
+
+      it("ends the chat panel's first message with them and saves nothing", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "chat", instanceId: codexInstanceId },
+          settings: { codeReviewPrompt: "User rules" },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          await act(async () => startWithInstructions(view));
+          await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+          const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+            input: { message: { text: string } };
+          };
+          expect(turn.input.message.text.endsWith(`\n\nUser rules\n\n${EXTRA}`)).toBe(true);
+          expect(h.settings["codeReviewPrompt"]).toBe("User rules");
+          expect(h.commandCalls.filter((call) => /settings|project\.meta/i.test(call.key))).toEqual(
+            [],
+          );
+        } finally {
+          await view.unmount();
+        }
+      });
+
+      it.each(["darwin", "linux"])(
+        "ends the review terminal's prompt argument with them on %s",
+        async (os) => {
+          seedReviewEnvironment({
+            reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+            os,
+          });
+          seedServerThread(makeThread());
+          const view = await mountServerReview();
+          try {
+            await act(async () => startWithInstructions(view));
+            await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+            const opened = commandCallsFor("terminal.open")[0]!.input as {
+              input: { command: { args: string[] } };
+            };
+            expect(opened.input.command.args.at(-1)!.endsWith(`\n\n${EXTRA}`)).toBe(true);
+          } finally {
+            await view.unmount();
+          }
+        },
+      );
+
+      type StartWith = (scope: typeof SCOPE, reviewer: undefined, extra: string) => unknown;
+      it.each([
+        [
+          "too long",
+          "x".repeat(8_200),
+          "These instructions make the review prompt longer than 8,192 characters. Shorten them to start the review.",
+        ],
+        [
+          "holding a control character",
+          "Look at \u0007 this",
+          "These instructions hold a control character other than tab or a line break. Remove it to start the review.",
+        ],
+      ])(
+        "returns the reason for instructions that are %s, with no toast and no launch",
+        async (_name, instructions, reason) => {
+          seedReviewEnvironment({
+            reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+          });
+          seedServerThread(makeThread());
+          const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+          const view = await mountServerReview();
+          try {
+            let result: unknown;
+            await act(async () => {
+              result = (view.review().onStart as StartWith)(SCOPE, undefined, instructions);
+            });
+            expect(result).toBe(reason);
+            expect(add).not.toHaveBeenCalled();
+            expect(commandCallsFor("terminal.open")).toEqual([]);
+          } finally {
+            add.mockRestore();
+            await view.unmount();
+          }
+        },
+      );
+
+      it("still sends the Settings reason when the saved prompt itself is refused", async () => {
+        seedReviewEnvironment({
+          reviewer: { kind: "terminal", instanceId: claudeInstanceId },
+          settings: { codeReviewPrompt: "y".repeat(8_200) },
+        });
+        seedServerThread(makeThread());
+        const view = await mountServerReview();
+        try {
+          let result: unknown;
+          await act(async () => {
+            result = (view.review().onStart as StartWith)(SCOPE, undefined, EXTRA);
+          });
+          expect(result).toBe(
+            "Review prompt is longer than 8,192 characters. Shorten it in Settings → Agents.",
+          );
+        } finally {
+          await view.unmount();
+        }
+      });
+    });
+
+    describe("from Mod+Alt+Shift+R (R102)", () => {
+      const isMac = () => navigator.platform.toLowerCase().includes("mac");
+      const shortcut = () =>
+        new KeyboardEvent("keydown", {
+          key: "R",
+          code: "KeyR",
+          metaKey: isMac(),
+          ctrlKey: !isMac(),
+          altKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+      const DIRTY_STATUS = {
+        isRepo: true,
+        refName: "feature",
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [] },
+      };
+
+      async function mountWithKeydown(): Promise<{
+        readonly keydown: EventListener;
+        readonly cleanup: () => Promise<void>;
+      }> {
+        // Spy after the globals are restored, as mountReview restores them too.
+        vi.unstubAllGlobals();
+        const addWindowListener = vi.spyOn(window, "addEventListener");
+        const view = await mountServerReview();
+        const keydown = addWindowListener.mock.calls.findLast(
+          ([eventName]) => eventName === "keydown",
+        )?.[1] as EventListener;
+        return {
+          keydown,
+          cleanup: async () => {
+            addWindowListener.mockRestore();
+            await view.unmount();
+          },
+        };
+      }
+
+      it("starts the review the button would start, and nothing from a focused terminal", async () => {
+        seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId } });
+        seedServerThread(makeThread());
+        h.queryDataByKey.set("vcs.status", DIRTY_STATUS);
+        const terminalHost = document.createElement("div");
+        terminalHost.dataset["terminalOwner"] = "center-panel";
+        const terminalInput = document.createElement("textarea");
+        terminalHost.append(terminalInput);
+        document.body.append(terminalHost);
+        const { keydown, cleanup } = await mountWithKeydown();
+        try {
+          terminalInput.focus();
+          await act(async () => keydown(shortcut()));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+
+          terminalInput.blur();
+          const event = shortcut();
+          await act(async () => keydown(event));
+          expect(event.defaultPrevented).toBe(true);
+          await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+          expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+          const turn = commandCallsFor("thread.startTurn")[0]!.input as {
+            input: { message: { text: string } };
+          };
+          expect(turn.input.message.text).toMatch(
+            /^Code review requested from BiBCode\. Do not edit files\. Scope: the staged, unstaged and untracked changes in the working tree\.\n\n/,
+          );
+        } finally {
+          terminalHost.remove();
+          await cleanup();
+        }
+      });
+
+      it.each([
+        ["the server lacks code reviews", { codeReviews: false }, DIRTY_STATUS],
+        ["nothing changed", {}, { ...DIRTY_STATUS, hasWorkingTreeChanges: false }],
+      ])("does nothing when the button is disabled because %s", async (_name, env, status) => {
+        seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: codexInstanceId }, ...env });
+        seedServerThread(makeThread());
+        h.queryDataByKey.set("vcs.status", status);
+        const { keydown, cleanup } = await mountWithKeydown();
+        try {
+          await act(async () => keydown(shortcut()));
+          expect(commandCallsFor("worktree.createPanel")).toEqual([]);
+          expect(commandCallsFor("terminal.open")).toEqual([]);
+        } finally {
+          await cleanup();
+        }
+      });
+    });
+  });
+
   it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {
     const customInstanceId = ProviderInstanceId.make("codex_personal");
     const startedThread = makeThread({
@@ -5792,6 +6545,11 @@ describe("ChatView handlers (captured from mocked children)", () => {
       },
     });
     seedConnectedServerThread(startedThread);
+    // Configured but not reported yet; an instance in neither is removed and blocks Send (#347).
+    h.settings = {
+      ...h.settings,
+      providerInstances: { codex_personal: { driver: "codex", enabled: true } },
+    };
     useComposerDraftStore.getState().setModelSelection(threadRef, {
       instanceId: customInstanceId,
       model: "gpt-5.4",
@@ -7697,5 +8455,370 @@ describe("ChatView long-lived handlers (#204)", () => {
     expect(bannerError()).toBeNull();
     await renderRoute(environmentId, threadId);
     expect(bannerError()).toBe("Compaction refused.");
+  });
+});
+
+describe("ChatView composer model picker provider scope (#347)", () => {
+  const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+  const claudeProvider: ServerProvider = {
+    ...codexProvider,
+    instanceId: claudeInstanceId,
+    driver: ProviderDriverKind.make("claudeAgent"),
+    displayName: "Claude",
+    models: [
+      { slug: "claude-opus-4-6", name: "Claude Opus 4.6", isCustom: false, capabilities: null },
+      { slug: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", isCustom: false, capabilities: null },
+    ],
+  };
+  // A second account of the Claude driver with its own catalog.
+  const claudeWorkProvider: ServerProvider = {
+    ...claudeProvider,
+    instanceId: ProviderInstanceId.make("claude_work"),
+    displayName: "Claude Work",
+    models: [{ slug: "claude-work-only", name: "Work Only", isCustom: false, capabilities: null }],
+  };
+  const codexSelection = { instanceId: codexInstanceId, model: "gpt-5.4" };
+  const claudeSelection = { instanceId: claudeInstanceId, model: "claude-opus-4-6" };
+
+  function enableClaudeWorkInstance(): void {
+    h.settings = {
+      ...h.settings,
+      providerInstances: { claude_work: { driver: "claudeAgent", enabled: true } },
+    };
+  }
+
+  let mounted: { container: HTMLDivElement; root: Root } | null = null;
+
+  afterEach(async () => {
+    if (!mounted) return;
+    const { container, root } = mounted;
+    mounted = null;
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
+  async function mount(element: ReactElement): Promise<HTMLDivElement> {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    h.realChildren = true;
+    h.realModelPicker = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mounted = { container, root };
+    await act(async () => {
+      root.render(element);
+      await Promise.resolve();
+    });
+    return container;
+  }
+
+  /** Opens the real picker from its trigger and returns the instance of every listed model. */
+  async function openPickerAndListInstances(container: HTMLElement): Promise<string[]> {
+    const trigger = container.querySelector<HTMLButtonElement>(
+      "[data-chat-provider-model-picker='true']",
+    );
+    expect(trigger, "model picker trigger").not.toBeNull();
+    await act(async () => {
+      trigger!.click();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() =>
+      expect(document.querySelector("[data-model-picker-content]")).not.toBeNull(),
+    );
+    return [...document.querySelectorAll<HTMLElement>("[data-model-picker-instance-id]")].map(
+      (row) => row.dataset.modelPickerInstanceId ?? "",
+    );
+  }
+
+  function seedTwoReadyProviders(): void {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+  }
+
+  const serverRoute = (
+    <ChatView
+      environmentId={environmentId}
+      threadId={threadId}
+      routeKind="server"
+      reserveTitleBarControlInset
+    />
+  );
+
+  it.each([
+    { label: "Claude", selection: claudeSelection, other: codexInstanceId },
+    { label: "Codex", selection: codexSelection, other: claudeInstanceId },
+  ])(
+    "lists only $label models in a never-started main chat created with $label (A1, A2)",
+    async ({ selection, other }) => {
+      seedTwoReadyProviders();
+      seedProject(makeProject());
+      seedServerThread(makeThread({ modelSelection: selection }));
+
+      const container = await mount(serverRoute);
+      const listed = await openPickerAndListInstances(container);
+
+      expect(listed.length).toBeGreaterThan(0);
+      expect(listed).not.toContain(other);
+      expect(new Set(listed)).toEqual(new Set([selection.instanceId]));
+    },
+  );
+
+  it("leaves out a second account of the same driver in a never-started main chat (A5)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider, claudeWorkProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    enableClaudeWorkInstance();
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+
+    const container = await mount(serverRoute);
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([claudeInstanceId]),
+    );
+  });
+
+  it("rejects a selection for another provider and keeps the chat, model and draft text (A4)", async () => {
+    seedTwoReadyProviders();
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+    useComposerDraftStore.getState().setPrompt(threadRef, "keep this text");
+    publishSeededStoreState(useComposerDraftStore);
+    await mount(serverRoute);
+
+    const select = capturedProps<Record<string, unknown>>("chatComposer")[
+      "onProviderModelSelect"
+    ] as (instanceId: ProviderInstanceId, model: string) => void;
+    await act(async () => select(codexInstanceId, "gpt-5.4"));
+
+    const draft = useComposerDraftStore.getState().getComposerDraft(threadRef);
+    expect(draft?.activeProvider ?? claudeInstanceId).toBe(claudeInstanceId);
+    expect(draft?.modelSelectionByProvider?.[codexInstanceId]).toBeUndefined();
+    expect(draft?.prompt).toBe("keep this text");
+
+    await act(async () => select(claudeInstanceId, "claude-sonnet-4-6"));
+    expect(
+      useComposerDraftStore.getState().getComposerDraft(threadRef)?.modelSelectionByProvider?.[
+        claudeInstanceId
+      ]?.model,
+    ).toBe("claude-sonnet-4-6");
+  });
+
+  const claudeSession = {
+    threadId,
+    status: "ready" as const,
+    providerName: "claudeAgent",
+    providerInstanceId: claudeInstanceId,
+    runtimeMode: "full-access" as const,
+    activeTurnId: null,
+    lastError: null,
+    updatedAt: now,
+  };
+
+  function disableClaudeInSettings(): void {
+    const providerSettings = h.settings["providers"] as Record<string, object>;
+    h.settings = {
+      ...h.settings,
+      providers: {
+        ...providerSettings,
+        claudeAgent: { ...providerSettings["claudeAgent"], enabled: false },
+      },
+    };
+  }
+
+  function sendButton(container: HTMLElement): HTMLButtonElement | undefined {
+    return [...container.querySelectorAll<HTMLButtonElement>("button[type='submit']")].find(
+      (button) => (button.getAttribute("aria-label") ?? button.textContent ?? "").includes("Send"),
+    );
+  }
+
+  it("keeps a not-ready provider's chat on it and lets its status banner explain (A6)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, { ...claudeProvider, status: "error" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection }));
+    h.realStatusBanners = true;
+
+    const container = await mount(serverRoute);
+
+    expect(container.textContent).toContain("Claude provider is unavailable.");
+    expect(
+      container
+        .querySelector("[data-chat-provider-model-picker='true']")
+        ?.getAttribute("aria-label"),
+    ).toBe("Claude · Claude Opus 4.6");
+    expect(await openPickerAndListInstances(container)).toEqual([]);
+  });
+
+  it.each([
+    { label: "a disabled provider in a never-started chat", started: false, removed: false },
+    { label: "a removed provider in a never-started chat", started: false, removed: true },
+    { label: "a disabled provider in a started chat", started: true, removed: false },
+    { label: "a removed provider in a started chat", started: true, removed: true },
+  ])("explains $label and blocks Send with that reason (A6)", async ({ started, removed }) => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: removed
+            ? [codexProvider]
+            : [codexProvider, { ...claudeProvider, enabled: false, status: "disabled" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    if (!removed) disableClaudeInSettings();
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: claudeSelection,
+        ...(started ? { session: claudeSession } : {}),
+      }),
+    );
+    useComposerDraftStore.getState().setPrompt(threadRef, "hello");
+    publishSeededStoreState(useComposerDraftStore);
+    h.realStatusBanners = true;
+
+    const container = await mount(serverRoute);
+
+    expect(container.textContent).toMatch(/is not available/);
+    expect(container.textContent).toContain("Settings → Providers");
+    expect(container.textContent).toContain("+");
+    const send = sendButton(container);
+    expect(send?.getAttribute("aria-label")).toMatch(/^Send unavailable\. .*is not available/);
+    const form = container.querySelector("form");
+    await act(async () => {
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
+    expect(
+      capturedProps<Record<string, unknown>>("chatComposer")["providerBindingInstanceId"],
+    ).toBe(claudeInstanceId);
+  });
+
+  it("explains an enabled provider the server reports unavailable and blocks Send (#347)", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, { ...claudeProvider, availability: "unavailable" as const }],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    seedProject(makeProject());
+    seedServerThread(makeThread({ modelSelection: claudeSelection, session: claudeSession }));
+    useComposerDraftStore.getState().setPrompt(threadRef, "hello");
+    publishSeededStoreState(useComposerDraftStore);
+    h.realStatusBanners = true;
+
+    const container = await mount(serverRoute);
+
+    expect(container.textContent).toMatch(/is not available/);
+    // It is enabled, so the banner asks for its setup to be checked, not for enabling it.
+    expect(container.textContent).toContain("Check its install and sign-in");
+    expect(container.textContent).not.toContain("Enable it in Settings");
+    const send = sendButton(container);
+    expect(send?.getAttribute("aria-label")).toMatch(/^Send unavailable\. .*is not available/);
+    const form = container.querySelector("form");
+    await act(async () => {
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
+  });
+
+  it("still lists every ready provider in a blank new draft, where the picker chooses the provider", async () => {
+    seedTwoReadyProviders();
+    seedProject(makeProject());
+    const draftId = newDraftId();
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId(
+        "logical-project-1",
+        scopeProjectRef(environmentId, projectId),
+        draftId,
+        { threadId, createdAt: now, envMode: "local" },
+      );
+    useComposerDraftStore.getState().setModelSelection(draftId, codexSelection);
+    publishSeededStoreState(useComposerDraftStore);
+    const container = await mount(
+      <ChatView
+        environmentId={environmentId}
+        threadId={threadId}
+        routeKind="draft"
+        draftId={draftId}
+      />,
+    );
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([codexInstanceId, claudeInstanceId]),
+    );
+    const select = capturedProps<Record<string, unknown>>("chatComposer")[
+      "onProviderModelSelect"
+    ] as (instanceId: ProviderInstanceId, model: string) => void;
+    await act(async () => select(claudeInstanceId, "claude-opus-4-6"));
+    expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.activeProvider).toBe(
+      claudeInstanceId,
+    );
+  });
+
+  it("keeps a started chat on its driver, where its own accounts stay switchable", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider, claudeProvider, claudeWorkProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedGitStatus(true);
+    enableClaudeWorkInstance();
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: claudeSelection,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "claudeAgent",
+          providerInstanceId: claudeInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+    );
+
+    const container = await mount(serverRoute);
+
+    expect(new Set(await openPickerAndListInstances(container))).toEqual(
+      new Set([claudeInstanceId, claudeWorkProvider.instanceId]),
+    );
   });
 });

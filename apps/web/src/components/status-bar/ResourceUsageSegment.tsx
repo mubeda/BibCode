@@ -7,7 +7,10 @@ import {
 } from "~/browser/browserSurfaceStore";
 import { isDesktopHost } from "~/env";
 import { isMacPlatform } from "~/lib/utils";
-import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { useActiveEnvironmentId } from "~/state/entities";
+import { useOpenHostDashboard } from "~/state/hostDashboard";
+import { Button } from "../ui/button";
+import { Popover, PopoverClose, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { PROCESS_MEMORY_METRIC_NOTE } from "./statusBarFormat";
 import {
   buildResourceSummaryViewModel,
@@ -59,6 +62,9 @@ export function ResourceUsageSegment({
   iconOnly: boolean;
 }) {
   const previewOcclusionRef = useRef<BrowserSurfaceOcclusionLease | null>(null);
+  // The selected environment, local or remote; the local computer's only entry (D27).
+  const environmentId = useActiveEnvironmentId();
+  const openHostDashboard = useOpenHostDashboard();
   const handleOpenChange = (open: boolean) => {
     if (
       open &&
@@ -134,6 +140,15 @@ export function ResourceUsageSegment({
           <div className="flex items-center gap-1.5 font-medium">
             <MemoryStickIcon className="size-3 text-muted-foreground" />
             <span>Resource Manager</span>
+            {environmentId === null ? null : (
+              <PopoverClose
+                className="ms-auto"
+                render={<Button size="xs" variant="outline" />}
+                onClick={() => openHostDashboard(environmentId)}
+              >
+                Host dashboard
+              </PopoverClose>
+            )}
           </div>
           <p className="text-muted-foreground">
             Combined monitored resources for the selected host, separated by ownership.{" "}

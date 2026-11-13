@@ -15,8 +15,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::git::sign_in::{
-    CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
-    resolve_destination,
+    CredentialPrompt, Destination, ExecutionPlace, SignInDirection, SignInRequired,
+    has_gcm_refusal, resolve_destination,
 };
 use crate::git::{
     GitCommandError, GitManagerBlockedReason, GitManagerInProgressKind, GitManagerRefsSnapshot,
@@ -1002,6 +1002,7 @@ pub async fn run_branch_or_sync_operation(
     catalog: WorktreeCatalogService,
     request: GitManagerOperationRequest,
     prompt: CredentialPrompt,
+    place: ExecutionPlace,
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1021,7 +1022,7 @@ pub async fn run_branch_or_sync_operation(
         .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
             // vcs.* writes take this per-worktree guard but not the project lock, so it is
             // held from the snapshot onward: validation and execution see the same HEAD.
-            let mutation = tokio::select! {
+            let mut mutation = tokio::select! {
                 biased;
                 () = operation_cancellation.cancelled() => {
                     return Err(cancelled_error(operation));
@@ -1055,11 +1056,15 @@ pub async fn run_branch_or_sync_operation(
                 if operation_cancellation.is_cancelled() {
                     return Err(cancelled_error(operation));
                 }
+                if releases_reads_during_transfer(&locked_request) {
+                    mutation.local_writes_finished();
+                }
                 execute_branch_or_sync_operation(
                     &locked_repository,
                     &snapshot,
                     &locked_request,
                     prompt,
+                    &place,
                     &operation_cancellation,
                 )
                 .await
@@ -1270,6 +1275,19 @@ fn network_step(
     }
 }
 
+/// Operations whose only Git effect is a network transfer: status reads resume before it
+/// while the write lock stays held (#345). Pull and fetch keep reads waiting, because pull
+/// rewrites files at its end.
+fn releases_reads_during_transfer(request: &GitManagerOperationRequest) -> bool {
+    matches!(
+        request,
+        GitManagerOperationRequest::Push { .. }
+            | GitManagerOperationRequest::PublishBranch { .. }
+            | GitManagerOperationRequest::ForcePush { .. }
+            | GitManagerOperationRequest::RemoteBranchDelete { .. }
+    )
+}
+
 fn expected_destination_mut(
     request: &mut GitManagerOperationRequest,
 ) -> Option<&mut Option<String>> {
@@ -1312,6 +1330,7 @@ async fn execute_branch_or_sync_operation(
     snapshot: &GitManagerRefsSnapshot,
     request: &GitManagerOperationRequest,
     prompt: CredentialPrompt,
+    place: &ExecutionPlace,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1336,12 +1355,56 @@ async fn execute_branch_or_sync_operation(
         }
     }
     let result = execute_operation_steps(repository, snapshot, request, cancellation).await;
-    match (result, network, prompt) {
+    let result = match (result, network, prompt) {
         (Err(error), Some(step), CredentialPrompt::OfferSignIn) => {
             Err(offer_sign_in(repository, request.cwd(), error, step, cancellation).await)
         }
         (result, ..) => result,
+    };
+    result.map_err(|mut error| {
+        if let Some(guidance) = remote_push_guidance(request, &error, place) {
+            error.message = guidance;
+            if !matches!(request, GitManagerOperationRequest::TagCreate { .. }) {
+                error.code = GitManagerFailureCode::Authentication.as_str().to_owned();
+            }
+        }
+        error
+    })
+}
+
+/// #343: a push that failed on a remote server for a missing username says where to sign in,
+/// whatever a credential helper printed before Git's line (Source Control decides the same way).
+fn remote_push_guidance(
+    request: &GitManagerOperationRequest,
+    error: &GitManagerOperationError,
+    place: &ExecutionPlace,
+) -> Option<String> {
+    use GitManagerOperationRequest as Request;
+    let pushes = matches!(
+        request,
+        Request::Push { .. }
+            | Request::PublishBranch { .. }
+            | Request::ForcePush { .. }
+            | Request::TagPush { .. }
+            | Request::TagCreate {
+                push_remote: Some(_),
+                ..
+            }
+    );
+    if !pushes || error.sign_in.is_some() {
+        return None;
     }
+    let guidance = place.push_guidance(&error.outputs.last()?.stderr)?;
+    Some(match request {
+        Request::TagCreate {
+            name,
+            push_remote: Some(remote),
+            ..
+        } => {
+            format!("Created tag {name} locally, but pushing it to {remote} failed.\n\n{guidance}")
+        }
+        _ => guidance,
+    })
 }
 
 /// Turns a failure whose stderr carries GCM's refusal into `sign-in-required` naming the
@@ -1934,25 +1997,30 @@ async fn execute_operation_steps(
                             outputs.push(pushed);
                             None
                         }
-                        Ok(pushed) => Some(
-                            pushed
+                        Ok(pushed) => {
+                            let detail = pushed
                                 .stderr
                                 .lines()
                                 .map(str::trim)
                                 .find(|line| !line.is_empty())
                                 .unwrap_or("Git could not reach the remote.")
-                                .to_owned(),
-                        ),
+                                .to_owned();
+                            // Kept so the remote push guidance (#343) reads Git's whole text.
+                            outputs.push(pushed);
+                            Some(detail)
+                        }
                         Err(error) => Some(error.to_string()),
                     };
                 if let Some(detail) = failure {
-                    return Err(operation_error(
+                    let mut error = operation_error(
                         operation,
                         "tag-push-failed",
                         &format!(
                             "Created tag {name} locally, but pushing it to {remote} failed: {detail}"
                         ),
-                    ));
+                    );
+                    error.outputs = outputs;
+                    return Err(error);
                 }
             }
             outputs
@@ -4192,6 +4260,7 @@ mod tests {
             &snapshot,
             &request,
             CredentialPrompt::Never,
+            &ExecutionPlace::default(),
             &CancellationToken::new(),
         )
         .await
@@ -6051,6 +6120,7 @@ mod tests {
                     expected_destination: None,
                 },
                 CredentialPrompt::Never,
+                &ExecutionPlace::default(),
                 &token,
             )
             .await
@@ -6062,6 +6132,7 @@ mod tests {
             &snapshot,
             &request,
             CredentialPrompt::Never,
+            &ExecutionPlace::default(),
             &token,
         )
         .await
@@ -6075,5 +6146,313 @@ mod tests {
             "feature\nmain",
             "the local branch stays"
         );
+    }
+}
+
+/// Status reads during a held Git Manager network step (#345, R19, R21).
+#[cfg(test)]
+mod transfer_gate_tests {
+    use std::{path::PathBuf, process::Command, sync::Mutex};
+
+    use serde_json::json;
+    use tokio::sync::{Notify, Semaphore};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{
+        git::{
+            BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessOutput, ProcessRequest,
+            ProcessRunner, sign_in::CredentialPrompt,
+        },
+        persistence::{Database, Repositories, run_migrations},
+        worktree_catalog::{CatalogServiceOptions, WorkspaceAvailabilityRegistry},
+    };
+
+    /// Shorter than any local status read takes to queue, well below the hang budget.
+    const ADMITTED_WITHIN: Duration = Duration::from_secs(3);
+    /// Long enough for a gate that would open to have opened.
+    const STILL_WAITING_AFTER: Duration = Duration::from_millis(300);
+
+    /// Runs local Git for real and holds every fetch, pull and push until released, then
+    /// answers with `outcome` (success when empty). No network is contacted.
+    struct HeldNetworkRunner {
+        started: Notify,
+        release: Semaphore,
+        outcome: Mutex<Option<ProcessError>>,
+    }
+
+    impl GitProcessRunner for HeldNetworkRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            let network = request
+                .args
+                .iter()
+                .any(|arg| matches!(arg.to_str(), Some("fetch" | "pull" | "push")));
+            if !network {
+                return Box::pin(ProcessRunner.run(request, cancellation));
+            }
+            Box::pin(async move {
+                self.started.notify_one();
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(ProcessError::Cancelled { operation: request.operation });
+                    }
+                    permit = self.release.acquire() => permit.expect("release stays open").forget(),
+                }
+                match self.outcome.lock().expect("outcome lock").take() {
+                    Some(error) => Err(error),
+                    None => Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    }),
+                }
+            })
+        }
+    }
+
+    struct Harness {
+        _root: tempfile::TempDir,
+        cwd: PathBuf,
+        runner: Arc<HeldNetworkRunner>,
+        repository: Arc<GitRepository>,
+        broadcaster: StatusBroadcaster,
+        catalog: WorktreeCatalogService,
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git fixture starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn harness() -> Harness {
+        let root = tempfile::tempdir().expect("repository root");
+        let cwd = root.path().canonicalize().expect("canonical root");
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Test User"],
+            &["config", "user.email", "user@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.test/example-group/sample-project.git",
+            ],
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &["update-ref", "refs/remotes/origin/topic", "HEAD"],
+            &["config", "branch.main.remote", "origin"],
+            &["config", "branch.main.merge", "refs/heads/main"],
+        ] {
+            git(&cwd, args);
+        }
+        let runner = Arc::new(HeldNetworkRunner {
+            started: Notify::new(),
+            release: Semaphore::new(0),
+            outcome: Mutex::new(None),
+        });
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let catalog = WorktreeCatalogService::new_with_options_for_test(
+            Arc::new(Repositories::new(database)),
+            repository.clone(),
+            WorkspaceAvailabilityRegistry::new(),
+            CatalogServiceOptions {
+                poll_interval: Duration::from_secs(3_600),
+                ..CatalogServiceOptions::default()
+            },
+        );
+        let broadcaster = StatusBroadcaster::new(repository.clone(), Duration::from_secs(3_600), 8);
+        Harness {
+            _root: root,
+            cwd,
+            runner,
+            repository,
+            broadcaster,
+            catalog,
+        }
+    }
+
+    type Running =
+        tokio::task::JoinHandle<Result<GitManagerOperationOutcome, GitManagerOperationError>>;
+
+    fn start(
+        harness: &Harness,
+        request: serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> Running {
+        let mut request = request;
+        request["cwd"] = json!(harness.cwd);
+        request["projectId"] = json!("project-1");
+        let request: GitManagerOperationRequest =
+            serde_json::from_value(request).expect("operation request");
+        tokio::spawn(run_branch_or_sync_operation(
+            harness.repository.clone(),
+            harness.broadcaster.clone(),
+            harness.catalog.clone(),
+            request,
+            CredentialPrompt::Never,
+            ExecutionPlace::default(),
+            cancellation,
+        ))
+    }
+
+    /// Waits until the operation reaches its network step, or fails with how it ended.
+    async fn wait_for_network_step(harness: &Harness, running: &mut Running, context: &str) {
+        tokio::select! {
+            () = harness.runner.started.notified() => {}
+            ended = &mut *running => panic!("{context}: ended before its network step: {ended:?}"),
+            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                panic!("{context}: never reached its network step")
+            }
+        }
+    }
+
+    async fn read_admitted(harness: &Harness, within: Duration) -> bool {
+        tokio::time::timeout(
+            within,
+            harness
+                .broadcaster
+                .acquire_read_fence(&harness.cwd, &CancellationToken::new()),
+        )
+        .await
+        .is_ok_and(|fence| fence.is_ok())
+    }
+
+    fn push_family() -> Vec<(&'static str, serde_json::Value)> {
+        let push = |tag: &str| json!({"_tag": tag, "remote": "origin", "localBranch": "main", "remoteBranch": null});
+        vec![
+            ("push", push("push")),
+            ("publish-branch", push("publish-branch")),
+            ("force-push", push("force-push")),
+            (
+                "remote-branch-delete",
+                json!({"_tag": "remote-branch-delete", "remote": "origin", "branch": "topic"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn manager_transfer_gate_push_family_delivers_status() {
+        for (name, request) in push_family() {
+            let harness = harness().await;
+            let mut running = start(&harness, request, CancellationToken::new());
+            wait_for_network_step(&harness, &mut running, name).await;
+
+            assert!(
+                read_admitted(&harness, ADMITTED_WITHIN).await,
+                "{name}: a status read waited for the held network step"
+            );
+
+            harness.runner.release.add_permits(1);
+            running.await.expect("operation task").expect(name);
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_transfer_gate_pull_and_fetch_keep_reads_waiting() {
+        for (name, request) in [
+            ("pull", json!({"_tag": "pull", "remote": "origin"})),
+            ("fetch", json!({"_tag": "fetch", "remote": "origin"})),
+        ] {
+            let harness = harness().await;
+            let mut running = start(&harness, request, CancellationToken::new());
+            wait_for_network_step(&harness, &mut running, name).await;
+
+            assert!(
+                !read_admitted(&harness, STILL_WAITING_AFTER).await,
+                "{name}: a status read was admitted while it was held"
+            );
+
+            harness.runner.release.add_permits(1);
+            let _ = running.await.expect("operation task");
+            assert!(
+                read_admitted(&harness, ADMITTED_WITHIN).await,
+                "{name}: no status read was admitted after it ended"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_transfer_gate_every_outcome_releases_readers() {
+        for outcome in [
+            "success",
+            "refusal",
+            "timeout",
+            "cancellation",
+            "cancellation from a lost workspace",
+            "dropped caller",
+        ] {
+            let harness = harness().await;
+            let cancellation = CancellationToken::new();
+            let mut running = start(&harness, push_family().remove(0).1, cancellation.clone());
+            wait_for_network_step(&harness, &mut running, outcome).await;
+            *harness.runner.outcome.lock().expect("outcome lock") = match outcome {
+                "refusal" => Some(ProcessError::NonZeroExit {
+                    operation: "GitManager.push".to_owned(),
+                    exit_code: 128,
+                    stdout_length: 0,
+                    stderr_length: 60,
+                    stdout: String::new().into_boxed_str(),
+                    stderr: "fatal: Authentication failed for 'https://gitlab.example.test/'"
+                        .into(),
+                }),
+                "timeout" => Some(ProcessError::Timeout {
+                    operation: "GitManager.push".to_owned(),
+                    timeout_ms: 600_000,
+                }),
+                _ => None,
+            };
+            match outcome {
+                // The RPC layer cancels and awaits the operation when its workspace is lost.
+                "cancellation" | "cancellation from a lost workspace" => cancellation.cancel(),
+                "dropped caller" => running.abort(),
+                _ => harness.runner.release.add_permits(1),
+            }
+            let ended = running.await;
+            match outcome {
+                "success" => {
+                    ended.expect("operation task").expect("push succeeds");
+                }
+                "dropped caller" => assert!(ended.is_err(), "the operation was dropped"),
+                _ => {
+                    let error = ended.expect("operation task").expect_err("the push fails");
+                    if outcome == "timeout" {
+                        assert_eq!(
+                            error.code,
+                            GitManagerFailureCode::TimedOut.as_str(),
+                            "a timeout is reported as a timeout, not an exit code: {error:?}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                read_admitted(&harness, ADMITTED_WITHIN).await,
+                "{outcome}: no status read was admitted after the push ended"
+            );
+        }
     }
 }

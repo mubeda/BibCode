@@ -4,6 +4,7 @@ import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
+import { NativePreviewOcclusion } from "~/components/ui/useNativePreviewOcclusion";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
 const DialogCreateHandle = DialogPrimitive.createHandle;
@@ -70,6 +71,7 @@ function DialogPopup({
 }) {
   return (
     <DialogPortal>
+      <NativePreviewOcclusion />
       <DialogBackdrop />
       <DialogViewport
         className={cn(bottomStickOnMobile && "max-sm:grid-rows-[1fr_auto] max-sm:p-0 max-sm:pt-12")}

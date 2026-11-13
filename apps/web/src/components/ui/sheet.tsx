@@ -2,11 +2,28 @@
 
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
+import { useState } from "react";
 import { cn } from "~/lib/utils";
+import { useNativePreviewOcclusion } from "~/components/ui/useNativePreviewOcclusion";
 import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
-const Sheet = SheetPrimitive.Root;
+/** While the sheet is open it holds a native-preview occlusion lease. */
+function Sheet({ open, defaultOpen, onOpenChange, ...props }: SheetPrimitive.Root.Props) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen ?? false);
+  const isOpen = open ?? uncontrolledOpen;
+  useNativePreviewOcclusion(isOpen);
+  return (
+    <SheetPrimitive.Root
+      {...props}
+      {...(open === undefined ? { defaultOpen } : { open })}
+      onOpenChange={(next, details) => {
+        setUncontrolledOpen(next);
+        onOpenChange?.(next, details);
+      }}
+    />
+  );
+}
 
 const SheetPortal = SheetPrimitive.Portal;
 

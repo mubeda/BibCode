@@ -1155,6 +1155,7 @@ fn if_none_match_matches(header: &str, etag: &str) -> bool {
 
 /// The UI's policy. Browser mode frames preview gateways on the host the page was
 /// loaded from, one port per target, so `frame-src` allows that host on any port.
+/// `blob:` is there because Chromium loads a PDF `<embed>` of a `blob:` URL in a frame.
 /// An IPv6 host gets none: the gateway lets no IPv6 page frame it.
 fn content_security_policy(headers: &HeaderMap) -> String {
     let gateways = headers
@@ -1169,7 +1170,7 @@ fn content_security_policy(headers: &HeaderMap) -> String {
         })
         .map(|host| format!(" http://{host}:*"))
         .unwrap_or_default();
-    format!("{CONTENT_SECURITY_POLICY_VALUE}; frame-src 'self'{gateways}")
+    format!("{CONTENT_SECURITY_POLICY_VALUE}; frame-src 'self' blob:{gateways}")
 }
 
 async fn stream_file(
@@ -1304,6 +1305,8 @@ mod tests {
         let csp = super::content_security_policy(&HeaderMap::new());
         assert_eq!(directive(&csp, "media-src"), ["'self'", "blob:"]);
         assert_eq!(directive(&csp, "object-src"), ["blob:"]);
+        // Chromium loads a PDF `<embed>` in a frame, so `frame-src` needs `blob:` too.
+        assert_eq!(directive(&csp, "frame-src"), ["'self'", "blob:"]);
         let images = directive(&csp, "img-src");
         assert!(images.contains(&"blob:".to_owned()), "{images:?}");
         for wide in ["http:", "https:", "*"] {
@@ -1318,7 +1321,7 @@ mod tests {
             headers.insert(HOST, HeaderValue::from_str(host).unwrap());
             super::content_security_policy(&headers)
         };
-        assert!(csp("box.lan:3773").ends_with("; frame-src 'self' http://box.lan:*"));
+        assert!(csp("box.lan:3773").ends_with("; frame-src 'self' blob: http://box.lan:*"));
         // The gateway frames no IPv6 host, and a Host that isn't an authority adds nothing.
         for host in [
             "[::1]:3773",
@@ -1326,9 +1329,11 @@ mod tests {
             "a b",
             "box.lan;x:3773",
         ] {
-            assert!(csp(host).ends_with("; frame-src 'self'"), "{host}");
+            assert!(csp(host).ends_with("; frame-src 'self' blob:"), "{host}");
         }
-        assert!(super::content_security_policy(&HeaderMap::new()).ends_with("; frame-src 'self'"));
+        assert!(
+            super::content_security_policy(&HeaderMap::new()).ends_with("; frame-src 'self' blob:")
+        );
     }
 
     use super::*;

@@ -1,6 +1,15 @@
-import { describe, expect, it } from "vite-plus/test";
+// @vitest-environment happy-dom
+import type { DesktopBridge } from "@bibcode/contracts";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+
+const { toastAdd } = vi.hoisted(() => ({ toastAdd: vi.fn() }));
+vi.mock("./components/ui/toast", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./components/ui/toast")>()),
+  toastManager: { add: toastAdd },
+}));
 
 import {
+  downloadPlanAsTextFile,
   buildCollapsedProposedPlanPreviewMarkdown,
   buildPlanImplementationThreadTitle,
   buildPlanImplementationPrompt,
@@ -108,7 +117,71 @@ describe("buildProposedPlanMarkdownFilename", () => {
     );
   });
 
+  it("keeps a long title within what the desktop Save dialog accepts", () => {
+    const filename = buildProposedPlanMarkdownFilename(`# ${"word ".repeat(100)}`);
+    expect(filename.length).toBeLessThanOrEqual(124);
+    expect(filename).toMatch(/^word(-word)*\.md$/);
+  });
+
   it("falls back to a generic filename when the plan has no heading", () => {
     expect(buildProposedPlanMarkdownFilename("- step 1")).toBe("plan.md");
+  });
+});
+
+describe("downloadPlanAsTextFile", () => {
+  const saveTextFile = vi.fn<NonNullable<DesktopBridge["saveTextFile"]>>();
+  afterEach(() => {
+    delete window.desktopBridge;
+    saveTextFile.mockReset();
+    toastAdd.mockReset();
+    vi.restoreAllMocks();
+  });
+  const inDesktop = () => {
+    window.desktopBridge = { saveTextFile } as unknown as DesktopBridge;
+  };
+
+  it("in the desktop app saves through the bridge with the plan filename", async () => {
+    inDesktop();
+    saveTextFile.mockResolvedValue("/chosen/plan.md");
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click");
+    await downloadPlanAsTextFile("integrate-rpc.md", "# Integrate RPC\n");
+    expect(saveTextFile).toHaveBeenCalledWith({
+      suggestedName: "integrate-rpc.md",
+      contents: "# Integrate RPC\n",
+    });
+    expect(anchorClick).not.toHaveBeenCalled();
+    expect(toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled save writes nothing and shows no error", async () => {
+    inDesktop();
+    saveTextFile.mockResolvedValue(null);
+    await downloadPlanAsTextFile("plan.md", "# Plan\n");
+    expect(saveTextFile).toHaveBeenCalledOnce();
+    expect(toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("a failed save shows an error", async () => {
+    inDesktop();
+    saveTextFile.mockRejectedValue(new Error("Could not save the file: disk full"));
+    await downloadPlanAsTextFile("plan.md", "# Plan\n");
+    expect(toastAdd).toHaveBeenCalledOnce();
+    expect(toastAdd.mock.calls[0]![0]).toMatchObject({
+      type: "error",
+      description: "Could not save the file: disk full",
+    });
+  });
+
+  it("in the browser keeps the download link", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:plan");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    let downloaded: string | null = null;
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloaded = this.download;
+    });
+    await downloadPlanAsTextFile("plan.md", "# Plan\n");
+    expect(downloaded).toBe("plan.md");
   });
 });

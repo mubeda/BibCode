@@ -436,6 +436,12 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         worktree_discovery: Option<Value>,
+        #[serde(
+            rename = "codeReviewPrompt",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        code_review_prompt: Option<String>,
     },
     #[serde(rename = "project.repository-identity.set")]
     ProjectRepositoryIdentitySet {
@@ -524,6 +530,14 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "std::ops::Not::not"
         )]
         side_chat: bool,
+        /// A panel started as a code review (#293); only `worktree.createPanel` sets it, and only
+        /// on a panel. Omitted when false so a plain command keeps its digest.
+        #[serde(
+            rename = "codeReview",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        code_review: bool,
         /// Why an outside agent created the thread (untrusted text, at most 200 characters);
         /// shown with the agent's label, never logged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1290,6 +1304,17 @@ struct CommandModel {
     projects: BTreeMap<String, ProjectState>,
     threads: BTreeMap<String, ThreadState>,
     project_roots_canonicalized: bool,
+}
+
+/// Longest review prompt a project or a user may store, in UTF-16 units, as in the contract (#293).
+pub(crate) const CODE_REVIEW_PROMPT_MAX_LENGTH: usize = 7_680;
+
+/// Whether a review prompt holds a C0 control, DEL or a C1 control other than tab, line feed
+/// and carriage return: the web's rule for a prompt it launches in a terminal (#293).
+pub(crate) fn code_review_prompt_has_control_character(prompt: &str) -> bool {
+    prompt
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
 }
 
 #[derive(Clone, Debug)]
@@ -4489,7 +4514,7 @@ async fn plan_command(
                     created_at,
                     command_id,
                     metadata.clone(),
-                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"worktreeDiscovery":default_worktree_discovery(),"createdAt":created_at,"updatedAt":created_at}),
+                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"worktreeDiscovery":default_worktree_discovery(),"codeReviewPrompt":"","createdAt":created_at,"updatedAt":created_at}),
                 ),
                 make_event(
                     "thread.created",
@@ -4510,8 +4535,28 @@ async fn plan_command(
             default_model_selection,
             scripts,
             worktree_discovery,
+            code_review_prompt,
         } => {
             require_project(model, command, project_id)?;
+            if let Some(prompt) = code_review_prompt
+                && prompt.encode_utf16().count() > CODE_REVIEW_PROMPT_MAX_LENGTH
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "The project review prompt is longer than {CODE_REVIEW_PROMPT_MAX_LENGTH} characters."
+                    ),
+                );
+            }
+            if let Some(prompt) = code_review_prompt
+                && code_review_prompt_has_control_character(prompt)
+            {
+                return invariant(
+                    command,
+                    "The project review prompt holds a control character other than tab or a line break."
+                        .to_owned(),
+                );
+            }
             if let Some(workspace_root) = workspace_root
                 && let Some(conflicting_project_id) =
                     model.projects.iter().find_map(|(candidate_id, project)| {
@@ -4547,6 +4592,11 @@ async fn plan_command(
                 &mut payload,
                 "worktreeDiscovery",
                 worktree_discovery.as_ref().map(|value| json!(value)),
+            );
+            insert_optional(
+                &mut payload,
+                "codeReviewPrompt",
+                code_review_prompt.as_ref().map(|value| json!(value)),
             );
             Ok(vec![make_event(
                 "project.meta-updated",
@@ -4860,6 +4910,7 @@ async fn plan_command(
             kind,
             host_thread_id,
             side_chat,
+            code_review,
             purpose,
             model_selection,
             runtime_mode,
@@ -4873,6 +4924,12 @@ async fn plan_command(
                 return invariant(
                     command,
                     "A side chat must be a chat panel with a host thread.".to_owned(),
+                );
+            }
+            if *code_review && (kind.as_deref() != Some("panel") || host_thread_id.is_none()) {
+                return invariant(
+                    command,
+                    "A code review must be a chat panel with a host thread.".to_owned(),
                 );
             }
             if purpose
@@ -4928,6 +4985,7 @@ async fn plan_command(
             );
             insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
             insert_optional(&mut payload, "sideChat", side_chat.then(|| json!(true)));
+            insert_optional(&mut payload, "codeReview", code_review.then(|| json!(true)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -7473,11 +7531,11 @@ fn apply_projects_projector_tx(
     match event.event.event_type.as_str() {
         "project.created" => {
             transaction.execute(
-        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL) \
+        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, code_review_prompt, created_at, updated_at, deleted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) \
          ON CONFLICT (project_id) DO UPDATE SET \
            title = excluded.title, workspace_root = excluded.workspace_root, \
-           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, worktree_discovery_json = excluded.worktree_discovery_json, \
+           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, worktree_discovery_json = excluded.worktree_discovery_json, code_review_prompt = excluded.code_review_prompt, \
            created_at = excluded.created_at, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
         params![
             required_str(payload, "projectId")?,
@@ -7497,6 +7555,7 @@ fn apply_projects_projector_tx(
                     .cloned()
                     .unwrap_or_else(default_worktree_discovery),
             )?,
+            optional_string(payload.get("codeReviewPrompt")).unwrap_or_default(),
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
         ],
@@ -7504,7 +7563,7 @@ fn apply_projects_projector_tx(
         }
         "project.meta-updated" => {
             transaction.execute(
-            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, repository_identity_json = CASE WHEN ? THEN ? ELSE repository_identity_json END, updated_at = ? WHERE project_id = ?",
+            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, code_review_prompt = COALESCE(?, code_review_prompt), repository_identity_json = CASE WHEN ? THEN ? ELSE repository_identity_json END, updated_at = ? WHERE project_id = ?",
             params![
                 optional_string(payload.get("title")),
                 optional_string(payload.get("workspaceRoot")),
@@ -7513,6 +7572,7 @@ fn apply_projects_projector_tx(
                 payload.get("scripts").map(json_string).transpose()?,
                 payload.get("worktreeDiscovery").is_some(),
                 payload.get("worktreeDiscovery").map(json_string).transpose()?,
+                optional_string(payload.get("codeReviewPrompt")),
                 payload.get("repositoryIdentity").is_some(),
                 optional_json_string(payload.get("repositoryIdentity").filter(|value| !value.is_null()))?,
                 required_str(payload, "updatedAt")?,
@@ -7535,10 +7595,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat, code_review) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, code_review = excluded.code_review, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -7572,6 +7632,7 @@ fn apply_threads_projector_tx(
                     ))
                     .transpose()?,
                 payload.get("sideChat").and_then(Value::as_bool) == Some(true),
+                payload.get("codeReview").and_then(Value::as_bool) == Some(true),
             ],
         )?;
     } else {
@@ -9613,6 +9674,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": null,
@@ -9647,6 +9709,7 @@ mod tests {
                     branch: Some("feature/detach".to_owned()),
                     worktree_path: Some(path.to_owned()),
                     created_at: "2026-08-09T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread");
@@ -9912,6 +9975,7 @@ mod tests {
                         branch: None,
                         worktree_path: None,
                         created_at: "2026-10-08T00:00:01Z".to_owned(),
+                        code_review: false,
                     })
                     .await
                     .expect("thread");
@@ -10186,6 +10250,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": "2026-08-09T00:00:00Z",
@@ -10259,6 +10324,7 @@ mod tests {
                     branch: Some("old".to_owned()),
                     worktree_path: Some(worktree_path.to_owned()),
                     created_at: "2026-08-09T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread");
@@ -10351,6 +10417,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility": "shown",
                         "initialPromptDismissedAt": "2026-08-09T00:00:00Z",
@@ -10796,6 +10863,7 @@ mod tests {
                     workspace_root: None,
                     default_model_selection: OptionalNullable::Missing,
                     scripts: None,
+                    code_review_prompt: None,
                     worktree_discovery: Some(json!({
                         "visibility":"shown",
                         "initialPromptDismissedAt":"2026-08-09T00:00:00Z",
@@ -11126,6 +11194,7 @@ mod tests {
                 branch: None,
                 worktree_path: None,
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
+                code_review: false,
             })
             .await
             .expect("panel");
@@ -11212,6 +11281,7 @@ mod tests {
                 branch: None,
                 worktree_path: None,
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
+                code_review: false,
             };
         let refusal = |result: Result<_, OrchestrationError>| match result {
             Err(OrchestrationError::Invariant { detail, .. }) => detail,
@@ -11301,6 +11371,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             created_at: "2026-11-02T00:00:01Z".to_owned(),
+            code_review: false,
         }
     }
 
@@ -11695,6 +11766,111 @@ mod tests {
             .expect("replay threads");
         assert!(side_chat_of("side-chat".to_owned()).await);
         assert!(!side_chat_of(host_id).await);
+    }
+
+    fn code_review_create(
+        command_id: &str,
+        thread_id: &str,
+        kind: Option<&str>,
+        host: Option<&str>,
+    ) -> OrchestrationCommand {
+        let mut command = side_chat_create(command_id, thread_id, kind, host);
+        if let OrchestrationCommand::ThreadCreate {
+            side_chat,
+            code_review,
+            title,
+            ..
+        } = &mut command
+        {
+            *side_chat = false;
+            *code_review = true;
+            *title = "Code review · Codex".to_owned();
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn code_review_thread_flag_is_refused_without_a_host() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for command in [
+            code_review_create("no-kind", "no-kind", None, Some(&host_id)),
+            code_review_create("workspace", "workspace", Some("workspace"), Some(&host_id)),
+            code_review_create("no-host", "no-host", Some("panel"), None),
+        ] {
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "A code review must be a chat panel with a host thread."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_thread_marker_survives_replay() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(code_review_create(
+                "review",
+                "review-panel",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("review panel");
+        engine
+            .dispatch(plain_panel_create("plain", "plain-panel", &host_id))
+            .await
+            .expect("plain panel");
+        let code_review_of = |thread_id: &str| {
+            let repositories = engine.repositories();
+            let thread_id = thread_id.to_owned();
+            async move {
+                repositories
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .expect("thread exists")
+                    .code_review
+            }
+        };
+        assert!(code_review_of("review-panel").await);
+        assert!(!code_review_of("plain-panel").await);
+        assert!(!code_review_of(&host_id).await);
+        // A plain create records no key, like every thread.created before the flag existed.
+        let plain_payload_has_key = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.created' AND json_extract(payload_json, '$.codeReview') IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .expect("count marked events");
+        assert_eq!(
+            plain_payload_has_key, 1,
+            "only the review panel records the key"
+        );
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE projection_threads SET code_review = 0", [])?;
+                connection.execute(
+                    "DELETE FROM projection_state WHERE projector = 'projection.threads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset thread projection");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("replay threads");
+        assert!(code_review_of("review-panel").await);
+        assert!(!code_review_of("plain-panel").await);
+        assert!(!code_review_of(&host_id).await);
     }
 
     #[tokio::test]

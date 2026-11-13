@@ -669,6 +669,7 @@ async fn run_adb(
         timeout,
         cleanup_timeout: ADB_CLEANUP_TIMEOUT,
         max_output_bytes: ADB_MAX_OUTPUT_BYTES,
+        stop_policy: crate::process::supervised::StopPolicy::Force,
         overflow: SupervisedOverflow::Truncate,
     };
     let verb = args.first().copied().unwrap_or_default();

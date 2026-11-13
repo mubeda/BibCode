@@ -75,6 +75,38 @@ removed. A raw `PATH` is never logged. The
 [Claude guide](../providers/claude.md#activity-observation) explains each
 outcome.
 
+When the server stops a Git process because of a timeout, a cancellation or
+shutdown, Linux and macOS first send it `SIGTERM` and kill it only if it is
+still running 2 seconds later. Windows kills it at once. If a killed Git command
+that takes `index.lock` itself (such as `add`, `commit`, `reset` or `merge`, but
+not `push`, `fetch` or `pull`) leaves an `index.lock` that did not exist when
+the command started, and the
+lock stays unchanged for another 2 seconds, the server removes it and writes
+one `warn` line, `removed index.lock left by a Git process BiBCode had to
+force to stop`, with the operation name and the worktree path after the
+Profiler's path redaction. A lock that existed before the command started, or
+that changes during the wait, is never removed. On Linux and macOS, where Git
+removes its own lock when asked to stop, the server removes a lock only if the
+killed Git process still held it open just before the kill, so a lock another
+Git process took meanwhile stays even when it does not change. Windows has no
+such check: there a lock another Git process took while the killed command held
+none, and that stays unchanged for the 2 seconds, is still removed. If deleting the lock fails, the
+server writes one `warn` line, `could not remove index.lock left by a Git
+process BiBCode had to force to stop`, with the same fields and the error kind,
+and the lock stays. At shutdown the server refuses
+new Git writes and stops the running ones this way before the Profiler's
+teardown. If a write is still stopping after the wait, it writes `Git writes
+were still stopping at shutdown` (`error`) with the count, waits once more, and
+reports the shutdown as incomplete if one is still pending. An update then
+waits: the Profiler's session stays open, and a later update request waits for
+those writes again. A final shutdown ends the Profiler's session anyway and
+marks it incomplete. Every shutdown and update request checks each leftover
+lock BiBCode could not delete once more. It forgets a lock that is gone or has
+changed, and it tries to delete an unchanged one again. For each lock still
+there it writes `a leftover index.lock could not be removed` (`error`) with
+the worktree path after the Profiler's path redaction. A leftover lock does not
+block an update, and the Profiler's session is marked incomplete.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
@@ -470,6 +502,22 @@ that takes 500 ms or more writes `slow process diagnostics sample` to
 `server.log` at `warn`, with the process enumeration, UI observer, and
 attribution durations; set `BIBCODE_LOG=info,bibcode_server::diagnostics=debug`
 to log them for every sample.
+
+The host collector behind the Host dashboard (#292) writes four `warn` lines to
+`server.log`. `host metrics sample failed` carries the `error` of a failed CPU
+and memory read; it is written once per distinct error, and the last good
+reading stays. `host volume did not answer` is written once when a volume's
+space read has run past the 2 s limit, with the volume's `file_system` and its
+`position` in the volume list. `host volume listing did not answer` is written
+once when the volume listing has run past the same limit; `host volume listing
+answered again` follows at `info` when it returns. `host disk call panicked`
+carries only `call` (`list` or `space`): the disk thread fails that one job and
+keeps serving, and the panic itself is a `panic` profiler event. No host metrics
+line names a mount point or a volume name, because mount points can contain
+user names. Volume lists and
+space reads run on four dedicated threads named `host-disk-0` to `host-disk-3`;
+a thread held by a hung mount shows in a thread dump under that name, and
+shutdown never waits for it.
 
 A process's memory figure (`rssBytes` on the wire, and every Resource Manager
 and status bar memory total) is its physical footprint on macOS

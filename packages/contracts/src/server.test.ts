@@ -12,6 +12,7 @@ import {
   isProviderAvailable,
   ServerConfig,
   ServerConfigProviderStatusesPayload,
+  ServerHostMetricsEvent,
   ServerProcessDiagnosticsEntry,
   ServerProcessResourceTotals,
   ServerProvider,
@@ -511,5 +512,166 @@ describe("tool update contracts", () => {
     const event = readCompat("new-server-provider-statuses");
     expect(decodeStatusesPayload(event.payload).tools).toHaveLength(1);
     expect(decodeLegacyStatusesPayload(event.payload)).not.toHaveProperty("tools");
+  });
+});
+
+const decodeHostMetricsEvent = Schema.decodeUnknownSync(ServerHostMetricsEvent);
+const encodeHostMetricsEvent = Schema.encodeSync(ServerHostMetricsEvent);
+
+describe("ServerHostMetricsEvent", () => {
+  const decode = decodeHostMetricsEvent;
+  const encode = encodeHostMetricsEvent;
+  const sample = {
+    sampledAt: "2026-11-11T12:00:01.000Z",
+    cpuPercent: 23.5,
+    memoryTotalBytes: 34_359_738_368,
+    memoryUsedBytes: 12_025_908_428,
+    memoryAvailableBytes: 22_333_829_940,
+    volumes: [
+      {
+        mountPoint: "/",
+        name: "",
+        fileSystem: "ext4",
+        totalBytes: 2_147_483_648_000,
+        freeBytes: 671_088_640_000,
+        usedBytes: 1_476_395_008_000,
+        removable: false,
+        readOnly: false,
+        state: "ok",
+      },
+      {
+        mountPoint: "/mnt/slow",
+        name: "",
+        fileSystem: "ext4",
+        totalBytes: null,
+        freeBytes: null,
+        usedBytes: null,
+        removable: false,
+        readOnly: false,
+        state: "notResponding",
+      },
+    ],
+    volumesPaused: false,
+  };
+  const statistic = { current: 23.5, minimum: 1.5, average: 11.25, p95: 40, maximum: 97.5 };
+  const bucket = {
+    startedAt: "2026-11-11T11:59:00.000Z",
+    durationMs: 60_000,
+    cpuAverage: 12.5,
+    cpuPeak: 40.5,
+    memoryAverage: 35.5,
+    memoryPeak: 36.5,
+  };
+  const snapshot = {
+    _tag: "Snapshot",
+    host: { os: "linux", arch: "x86_64", cpuCount: 12, memoryTotalBytes: 34_359_738_368 },
+    bootId: "00000000-0000-0000-0000-000000000000",
+    startedAt: "2026-11-11T09:00:00.000Z",
+    statisticsSince: "2026-11-11T09:00:00.000Z",
+    sample,
+    cpu: statistic,
+    memory: statistic,
+    recent: [{ sampledAt: sample.sampledAt, cpuPercent: 23.5, memoryPercent: 35.5 }],
+    uptime: [bucket],
+    hiddenVolumes: [
+      { mountPoint: "/mnt/share", fileSystem: "nfs4", reason: "network" },
+      { mountPoint: "/srv/same", fileSystem: "ext4", reason: "sameStorage", sameStorageAs: "/" },
+    ],
+    volumeStatistics: [{ mountPoint: "/", statistic }],
+  };
+
+  it("round-trips a snapshot and a sample", () => {
+    expect(encode(decode(snapshot))).toEqual(snapshot);
+    const live = {
+      _tag: "Sample",
+      sample,
+      cpu: statistic,
+      memory: statistic,
+      uptime: null,
+      volumeStatistics: [{ mountPoint: "/", statistic }],
+    };
+    expect(encode(decode(live))).toEqual(live);
+    const withChart = { ...live, uptime: [bucket] };
+    expect(encode(decode(withChart))).toEqual(withChart);
+  });
+
+  it("accepts a server without a boot ID or a first reading", () => {
+    const empty = {
+      ...snapshot,
+      bootId: null,
+      statisticsSince: null,
+      sample: null,
+      cpu: null,
+      memory: null,
+      recent: [],
+      uptime: [],
+    };
+    expect(decode(empty)).toMatchObject({ _tag: "Snapshot", bootId: null, sample: null });
+  });
+
+  it("decodes hidden volumes as none from an older server, and a reason it does not know", () => {
+    const { hiddenVolumes: _, ...older } = snapshot;
+    expect(decode(older)).toMatchObject({ _tag: "Snapshot", hiddenVolumes: [] });
+    const later = {
+      ...snapshot,
+      hiddenVolumes: [{ mountPoint: "/mnt/x", fileSystem: "ext4", reason: "aLaterReason" }],
+    };
+    expect(encode(decode(later))).toEqual(later);
+    const withChart = {
+      _tag: "Sample",
+      sample,
+      cpu: statistic,
+      memory: statistic,
+      uptime: [bucket],
+      hiddenVolumes: snapshot.hiddenVolumes,
+      volumeStatistics: [],
+    };
+    expect(encode(decode(withChart))).toEqual(withChart);
+  });
+
+  it("rejects an unknown item", () => {
+    expect(() => decode({ ...snapshot, _tag: "Delta" })).toThrow();
+  });
+
+  it("decodes a volume state it does not know as ok", () => {
+    const [volume] = sample.volumes;
+    const later = { ...snapshot, sample: { ...sample, volumes: [{ ...volume, state: "later" }] } };
+    expect(decode(later)).toMatchObject({ sample: { volumes: [{ state: "ok" }] } });
+  });
+
+  it("round-trips the order, age, listing and statistics start fields, and accepts their absence", () => {
+    const ordered = {
+      ...sample,
+      volumeListingNotResponding: true,
+      sequence: 42,
+      ageMs: 120,
+    };
+    const live = {
+      _tag: "Sample",
+      statisticsSince: "2026-11-11T09:00:00.000Z",
+      sample: ordered,
+      cpu: statistic,
+      memory: statistic,
+      uptime: null,
+      volumeStatistics: [],
+    };
+    expect(encode(decode(live))).toEqual(live);
+    expect(encode(decode({ ...live, statisticsSince: null }))).toEqual({
+      ...live,
+      statisticsSince: null,
+    });
+    expect(encode(decode({ ...snapshot, sample: ordered }))).toEqual({
+      ...snapshot,
+      sample: ordered,
+    });
+    const old = { _tag: "Sample", sample, cpu: statistic, memory: statistic, uptime: null };
+    expect(decode(old)).not.toHaveProperty("statisticsSince");
+    expect(decode(old)).not.toHaveProperty("sample.sequence");
+    // R83: a server older than the volume statistics sends none.
+    expect(decode(old)).toMatchObject({ volumeStatistics: [] });
+    const { volumeStatistics: _, ...olderSnapshot } = snapshot;
+    expect(decode(olderSnapshot)).toMatchObject({ volumeStatistics: [] });
+    expect(() => decode({ ...live, sample: { ...ordered, sequence: -1 } })).toThrow();
+    expect(() => decode({ ...live, sample: { ...ordered, ageMs: 1.5 } })).toThrow();
   });
 });

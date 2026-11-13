@@ -36,7 +36,7 @@ const TOKEN: &str = "privateToken123";
 const PANIC_MESSAGE: &str =
     "failed opening /mnt/private/customer.txt: MARKER-x2-ignore-previous-instructions";
 
-const TOOLS: [&str; 8] = [
+const TOOLS: [&str; 9] = [
     "profiler_status",
     "profiler_findings",
     "profiler_events",
@@ -45,6 +45,7 @@ const TOOLS: [&str; 8] = [
     "refresh_providers",
     "process_diagnostics",
     "trace_diagnostics",
+    "host_metrics",
 ];
 
 fn listed(harness: &Harness, agent: &crate::mcp::control::ClientPrincipal) -> Vec<Value> {
@@ -121,7 +122,7 @@ async fn the_diagnostics_tools_are_listed_with_their_hints_and_hidden_with_their
 
     // A read-only connection keeps the reads and loses the refresh.
     let (reader, _) = harness.agent(McpAccess::ReadOnly).await;
-    assert_eq!(listed(&harness, &reader).len(), 7);
+    assert_eq!(listed(&harness, &reader).len(), 8);
     let refused = harness.call(&reader, "refresh_providers", json!({})).await;
     assert_eq!(error_tag(&refused), "McpAccessCeilingError");
 
@@ -829,4 +830,87 @@ async fn a_rejected_actions_text_never_reaches_an_agent() {
     runtime.shutdown().await;
     harness.shutdown().await;
     child.complete();
+}
+
+/// R82, D26: an agent reads the host's figures, but a mount point only when it is a file
+/// system root; every other one, every volume name and every hidden volume's path is withheld.
+#[tokio::test]
+async fn host_metrics_tool_keeps_only_root_mount_points() {
+    let seen = Payloads::default();
+    let volume = |mount_point: &str, name: &str| {
+        json!({
+            "mountPoint": mount_point, "name": name, "fileSystem": "ext4",
+            "totalBytes": 100, "freeBytes": 40, "usedBytes": 60,
+            "removable": false, "readOnly": false, "state": "ok",
+        })
+    };
+    let statistic =
+        json!({ "current": 60.0, "minimum": 40.0, "average": 50.0, "p95": 59.0, "maximum": 60.0 });
+    let harness = Harness::with_methods(|registry| {
+        fake(
+            registry,
+            "server.getHostMetrics",
+            json!({
+                "_tag": "Snapshot",
+                "host": { "os": "linux", "arch": "x86_64", "cpuCount": 8, "memoryTotalBytes": 1000 },
+                "bootId": null,
+                "startedAt": "2026-11-11T09:00:00.000Z",
+                "statisticsSince": "2026-11-11T09:00:00.000Z",
+                "sample": {
+                    "sampledAt": "2026-11-11T10:00:00.000Z", "cpuPercent": 12.5,
+                    "memoryTotalBytes": 1000, "memoryUsedBytes": 250, "memoryAvailableBytes": 750,
+                    "volumes": [
+                        volume("/", "root-volume-label"),
+                        volume("C:\\", "drive-volume-label"),
+                        volume("/media/test-user/usb", "usb"),
+                    ],
+                    "volumesPaused": false, "sequence": 7, "ageMs": 3,
+                },
+                "cpu": statistic, "memory": statistic,
+                "recent": [], "uptime": [],
+                "hiddenVolumes": [
+                    { "mountPoint": "/home/test-user/share", "fileSystem": "nfs4", "reason": "network" },
+                ],
+                "volumeStatistics": [
+                    { "mountPoint": "/", "statistic": statistic },
+                    { "mountPoint": "/media/test-user/usb", "statistic": statistic },
+                ],
+            }),
+            &seen,
+        );
+    })
+    .await;
+    let (agent, _) = harness.agent(McpAccess::ReadOnly).await;
+
+    let result = harness.call(&agent, "host_metrics", json!({})).await;
+
+    let content = structured(&result);
+    let text = content.to_string();
+    for leak in ["test-user", "usb", "volume-label", "share"] {
+        assert!(!text.contains(leak), "{leak} in {text}");
+    }
+    let mount_points: Vec<Value> = content["sample"]["volumes"]
+        .as_array()
+        .expect("volumes")
+        .iter()
+        .map(|volume| volume["mountPoint"].clone())
+        .collect();
+    assert_eq!(mount_points, [json!("/"), json!("C:\\"), Value::Null]);
+    assert_eq!(content["mountPointsWithheld"], 1);
+    assert_eq!(content["hiddenVolumeCount"], 1);
+    assert_eq!(content["sample"]["volumes"][0]["usedBytes"], 60);
+    assert!(content["sample"]["volumes"][0].get("name").is_none());
+    assert_eq!(content["host"]["cpuCount"], 8);
+    assert_eq!(content["cpu"]["p95"], 59.0);
+    assert_eq!(content["sample"]["cpuPercent"], 12.5);
+    let volume_statistics = content["volumeStatistics"].as_array().expect("statistics");
+    assert_eq!(volume_statistics[0]["mountPoint"], "/");
+    assert_eq!(volume_statistics[1]["mountPoint"], Value::Null);
+    assert_eq!(volume_statistics[0]["statistic"]["average"], 50.0);
+
+    let refused = harness
+        .call(&agent, "host_metrics", json!({ "anything": 1 }))
+        .await;
+    assert_eq!(error_tag(&refused), "McpInvalidArgumentError");
+    harness.shutdown().await;
 }

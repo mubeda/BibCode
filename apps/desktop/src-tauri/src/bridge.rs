@@ -48,6 +48,7 @@ use crate::tailscale::{
     read_tailscale_status,
 };
 use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
+use crate::window::{CloseGuard, CloseReply};
 
 #[cfg(test)]
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
@@ -1654,6 +1655,92 @@ pub async fn desktop_bridge_save_diagnostic_logs(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// The largest text `desktop_bridge_save_text_file` writes.
+const MAX_SAVED_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Checks the web's suggested name and contents, and returns the name's extension for the
+/// dialog filter. The name cannot carry a directory, so only the dialog picks where it goes.
+fn validate_saved_text(suggested_name: &str, contents: &str) -> Result<String, String> {
+    let plain = !suggested_name.is_empty()
+        && suggested_name.len() <= 255
+        && !suggested_name.contains(['/', '\\'])
+        && !suggested_name.chars().any(char::is_control);
+    let extension = Path::new(suggested_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty());
+    let Some(extension) = extension.filter(|_| plain) else {
+        return Err("The file name must be a plain name with an extension.".to_owned());
+    };
+    if contents.len() > MAX_SAVED_TEXT_BYTES {
+        return Err("The file is larger than the desktop save limit.".to_owned());
+    }
+    Ok(extension.to_owned())
+}
+
+/// Writes `contents` where `choose` says. `None` from `choose` means the person cancelled.
+async fn save_text_to_chosen_path(
+    choose: impl std::future::Future<Output = Result<Option<PathBuf>, String>>,
+    contents: &str,
+) -> Result<Option<String>, String> {
+    let Some(path) = choose.await? else {
+        return Ok(None);
+    };
+    fs::write(&path, contents).map_err(|error| {
+        tracing::warn!(%error, "could not save a text file the person chose");
+        bridge_error("Could not save the file", error)
+    })?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_save_text_file(
+    app: AppHandle<DesktopRuntime>,
+    suggested_name: String,
+    contents: String,
+) -> Result<Option<String>, String> {
+    let extension = validate_saved_text(&suggested_name, &contents)?;
+    // End-to-end builds only: replaces the native picker, which WebDriver cannot drive. A release
+    // build compiles without the feature, so no variable can redirect a write there.
+    #[cfg(feature = "desktop-e2e")]
+    if let Some(path) = std::env::var_os("BIBCODE_E2E_SAVE_TEXT_PATH") {
+        return save_text_to_chosen_path(async { Ok(Some(PathBuf::from(path))) }, &contents).await;
+    }
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Save file")
+        .set_file_name(&suggested_name)
+        .add_filter(extension.to_uppercase(), &[extension.as_str()]);
+    if let Ok(download_dir) = app.path().download_dir() {
+        dialog = dialog.set_directory(download_dir);
+    }
+    save_text_to_chosen_path(
+        async move {
+            let Some(selected) = await_dialog(|answer| dialog.save_file(answer)).await? else {
+                return Ok(None);
+            };
+            selected
+                .simplified()
+                .into_path()
+                .map(Some)
+                .map_err(|error| bridge_error("Could not normalize the chosen path", error))
+        },
+        &contents,
+    )
+    .await
+}
+
+/// The web's answer to a close or quit request (R62).
+#[tauri::command]
+pub fn desktop_bridge_reply_close_request(
+    guard: State<'_, CloseGuard>,
+    request_id: u64,
+    reply: CloseReply,
+) {
+    guard.reply(request_id, reply, std::time::Instant::now());
+}
+
 fn validate_transfer_url(url: &str) -> Result<reqwest::Url, String> {
     let parsed =
         reqwest::Url::parse(url).map_err(|error| bridge_error("Transfer URL is invalid", error))?;
@@ -2212,6 +2299,61 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn save_text_file_writes_the_contents_to_the_chosen_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mine.theme.json");
+        let chosen = path.clone();
+        let saved = save_text_to_chosen_path(async move { Ok(Some(chosen)) }, "{\"id\":\"mine\"}")
+            .await
+            .unwrap();
+        assert_eq!(saved, Some(path.to_string_lossy().into_owned()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"id\":\"mine\"}");
+    }
+
+    #[tokio::test]
+    async fn save_text_file_returns_none_when_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = save_text_to_chosen_path(async { Ok(None) }, "contents")
+            .await
+            .unwrap();
+        assert_eq!(saved, None);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn save_text_file_reports_a_failed_write() {
+        let temp = tempfile::tempdir().unwrap();
+        // A directory cannot be written as a file.
+        let chosen = temp.path().to_path_buf();
+        let error = save_text_to_chosen_path(async move { Ok(Some(chosen)) }, "contents")
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("Could not save the file: "), "{error}");
+    }
+
+    #[test]
+    fn save_text_file_accepts_only_plain_names_with_an_extension() {
+        assert_eq!(
+            validate_saved_text("mine.theme.json", "{}").unwrap(),
+            "json"
+        );
+        assert_eq!(validate_saved_text("plan.md", "# Plan").unwrap(), "md");
+        for name in [
+            "",
+            "../plan.md",
+            "dir/plan.md",
+            "dir\\plan.md",
+            "plan",
+            "plan.",
+            "a\u{7}.md",
+        ] {
+            assert!(validate_saved_text(name, "x").is_err(), "{name:?}");
+        }
+        assert!(validate_saved_text(&format!("{}.md", "a".repeat(253)), "x").is_err());
+        assert!(validate_saved_text("big.md", &"x".repeat(MAX_SAVED_TEXT_BYTES + 1)).is_err());
+    }
 
     #[derive(Default)]
     struct FakeWslOnlyTransitionState {
@@ -4322,6 +4464,8 @@ mod tests {
                 desktop_bridge_install_update,
                 desktop_bridge_pick_folder,
                 desktop_bridge_save_diagnostic_logs,
+                desktop_bridge_save_text_file,
+                desktop_bridge_reply_close_request,
                 desktop_bridge_pick_files,
                 desktop_bridge_download_to_folder,
                 desktop_bridge_upload_file,
@@ -4619,6 +4763,13 @@ mod tests {
             invoke(
                 "desktop_bridge_save_diagnostic_logs",
                 json!({"filename":"../blocked.zip","bytes":[80,75]}),
+            )
+            .is_err()
+        );
+        assert!(
+            invoke(
+                "desktop_bridge_save_text_file",
+                json!({"suggestedName":"../blocked.md","contents":"# Plan"}),
             )
             .is_err()
         );

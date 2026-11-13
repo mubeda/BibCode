@@ -323,6 +323,7 @@ fn project_row(project_id: &str, workspace_root: &Path) -> ProjectionProject {
         updated_at: "2026-10-12T00:00:00Z".to_owned(),
         deleted_at: None,
         repository_identity: None,
+        code_review_prompt: String::new(),
     }
 }
 
@@ -361,6 +362,7 @@ fn thread_row_in(
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 
@@ -467,6 +469,79 @@ async fn write_input_does_not_wait_for_a_busy_database_once_input_begins() {
     );
     assert_eq!(fixture.backend.writes(), ["a", "b"]);
     parked.await.expect("parked call finishes");
+    fixture.shutdown().await;
+}
+
+/// An older client decodes `terminal.resize` as void, a null-only JSON codec: an object
+/// answer would turn every successful resize into a failure there (#348).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_answers_its_outcome_only_to_a_caller_that_reads_it() {
+    let mut fixture = Fixture::start().await;
+    let resize = |cols: u16, structured: Option<bool>| {
+        let mut payload =
+            json!({"threadId": THREAD, "terminalId": TERMINAL, "cols": cols, "rows": 30});
+        if let Some(structured) = structured {
+            payload["structuredResult"] = json!(structured);
+        }
+        payload
+    };
+
+    let older_client = success(fixture.request("terminal.resize", resize(100, None)).await);
+    assert_eq!(
+        older_client,
+        Value::Null,
+        "an older client gets the null it decodes"
+    );
+    let declined = success(
+        fixture
+            .request("terminal.resize", resize(101, Some(false)))
+            .await,
+    );
+    assert_eq!(declined, Value::Null);
+
+    let newer_client = success(
+        fixture
+            .request("terminal.resize", resize(102, Some(true)))
+            .await,
+    );
+    assert_eq!(newer_client["outcome"], "applied");
+    assert_eq!(newer_client["size"]["cols"], 102);
+    assert!(newer_client["sequence"].is_u64());
+    fixture.shutdown().await;
+}
+
+/// A frame or write says who produced it: a window's size claim, or null for the terminal's
+/// own replies (#348). Frames refuse unknown fields, so a client sends this only to servers
+/// advertising `terminalUserInputClaim`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_says_who_produced_it_and_a_malformed_origin_is_refused() {
+    let mut fixture = Fixture::start().await;
+    let input = fixture.begin_input(0).await;
+    let marked = |sequence: u64, claim: Value| {
+        let mut frame = Fixture::frame(&input, sequence, "a");
+        frame["userInputClaim"] = claim;
+        frame
+    };
+    success(
+        fixture
+            .request("terminal.writeInput", marked(0, json!("claim-a")))
+            .await,
+    );
+    success(
+        fixture
+            .request("terminal.writeInput", marked(1, Value::Null))
+            .await,
+    );
+    let write = |claim: Value| json!({"threadId": THREAD, "terminalId": TERMINAL, "data": "b", "userInputClaim": claim});
+    success(fixture.request("terminal.write", write(Value::Null)).await);
+    assert_eq!(fixture.backend.writes(), ["a", "a", "b"]);
+    failure(fixture.request("terminal.write", write(json!(7))).await);
+    failure(
+        fixture
+            .request("terminal.writeInput", marked(2, json!("")))
+            .await,
+    );
+    assert_eq!(fixture.backend.writes(), ["a", "a", "b"]);
     fixture.shutdown().await;
 }
 

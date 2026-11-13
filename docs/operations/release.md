@@ -101,7 +101,10 @@ installers plus standalone server distributions without updater metadata.
 
 `scripts/run-msvc.mjs` selects the requested native MSVC architecture. Linux desktop
 release artifacts use Ubuntu 22.04; standalone server builds use the older compatibility
-baseline described above.
+baseline described above. The AppImage carries an allowlist of the build host's GStreamer
+core, base and good plugins (LGPL), so its build hosts install the base, good and ALSA plugin
+packages; see [AppImage build and inspection](../testing/linux-desktop.md#appimage-build-and-inspection)
+and [`apps/desktop/THIRD_PARTY_NOTICES.md`](../../apps/desktop/THIRD_PARTY_NOTICES.md).
 
 ## Standalone Server Assets
 

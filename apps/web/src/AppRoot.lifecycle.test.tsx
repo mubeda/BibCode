@@ -79,6 +79,9 @@ vi.mock("./components/preview/OpenPromptBanner", () => ({
 vi.mock("./components/settings/UpdateServerDialog", () => ({
   RemoteUpdateConfirmationCoordinator: () => null,
 }));
+vi.mock("./components/hostDashboard/HostDashboardSheet", () => ({
+  HostDashboardCoordinator: () => null,
+}));
 vi.mock("./components/ServerReloadPrompt", () => ({
   ServerReloadPrompt: () => null,
 }));

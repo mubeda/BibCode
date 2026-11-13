@@ -25,6 +25,7 @@ import {
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { runAtomCommand } from "./runtime.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { PRE_VERIFICATION_SUBSCRIPTIONS } from "../rpc/session.ts";
 
 const CONFIG = {
   availableEditors: [],
@@ -72,6 +73,10 @@ describe("server state projection", () => {
 
     expect(Option.getOrThrow(afterReady)).toBe(welcome);
     expect(emitted).toEqual([]);
+  });
+
+  it("sends the host metrics stream before the connection is verified", () => {
+    expect(PRE_VERIFICATION_SUBSCRIPTIONS.has(WS_METHODS.serverSubscribeHostMetrics)).toBe(true);
   });
 });
 

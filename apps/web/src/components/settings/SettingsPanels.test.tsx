@@ -9,6 +9,7 @@ import * as Duration from "effect/Duration";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
+  DEFAULT_CODE_REVIEW_PROMPT,
   DEFAULT_SERVER_SETTINGS,
   type DesktopUpdateState,
   EnvironmentId,
@@ -54,6 +55,8 @@ const h = vi.hoisted(() => {
     sections: [] as Array<Record<string, unknown>>,
     theme: "system" as string,
     setTheme: vi.fn(),
+    slots: { light: "light", dark: "dark" },
+    resetSlots: vi.fn(),
     settings: null as unknown,
     updateSettings: vi.fn(),
     observability: null as unknown,
@@ -116,6 +119,11 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("../../hooks/useTheme", () => ({
   useTheme: () => ({ theme: h.theme, setTheme: h.setTheme, resolvedTheme: "light" }),
+}));
+
+vi.mock("../../themes/customThemes", () => ({
+  useThemeLibrary: () => ({ themes: [], slots: h.slots }),
+  resetSlots: h.resetSlots,
 }));
 
 vi.mock("../../hooks/useSettings", () => ({
@@ -426,6 +434,17 @@ vi.mock("../ui/tooltip", () => ({
   TooltipPopup: (props: AnyProps) => <div data-tooltip-popup>{props.children as ReactNode}</div>,
 }));
 
+vi.mock("../ui/textarea", () => ({
+  Textarea: (props: AnyProps) => {
+    h.controls.push({
+      kind: "textarea",
+      label: (props["aria-label"] as string | undefined) ?? "",
+      props,
+    });
+    return <textarea aria-label={props["aria-label"] as string | undefined} readOnly />;
+  },
+}));
+
 vi.mock("../ui/draft-input", () => ({
   DraftInput: (props: AnyProps) => {
     h.controls.push({
@@ -622,6 +641,8 @@ beforeEach(() => {
   clearRegistries();
   h.theme = "system";
   h.setTheme.mockReset();
+  h.slots = { light: "light", dark: "dark" };
+  h.resetSlots.mockReset();
   h.settings = { ...DEFAULT_UNIFIED_SETTINGS };
   h.updateSettings.mockReset();
   h.observability = null;
@@ -804,18 +825,12 @@ describe("GeneralSettingsPanel", () => {
 
     const markup = renderedText();
 
-    expect(markup).toContain("Theme");
     expect(markup).toContain("Time format");
     expect(renderedText()).toContain(
       'Leave empty to use "~/" for Clone and Create in Add Project.',
     );
     expect(findControls("button", "Reset ")).toHaveLength(0);
     expect(findControls("switch", "Start new worktrees from origin by default")).toHaveLength(0);
-
-    invoke(control("select", "system"), "onValueChange", "dark");
-    expect(h.setTheme).toHaveBeenCalledWith("dark");
-    invoke(control("select", "system"), "onValueChange", "bogus");
-    expect(h.setTheme).toHaveBeenCalledTimes(1);
 
     invoke(control("select", "locale"), "onValueChange", "12-hour");
     expect(h.updateSettings).toHaveBeenCalledWith({ timestampFormat: "12-hour" });
@@ -899,9 +914,6 @@ describe("GeneralSettingsPanel", () => {
 
     expect(markup).toContain("Start from origin");
     expect(findControls("switch", "Start new worktrees from origin by default")).toHaveLength(1);
-
-    invoke(control("button", "Reset theme to default"), "onClick");
-    expect(h.setTheme).toHaveBeenCalledWith("system");
 
     invoke(control("button", "Reset time format to default"), "onClick");
     expect(h.updateSettings).toHaveBeenCalledWith({
@@ -1109,6 +1121,131 @@ describe("AgentsSettingsPanel", () => {
       textGenerationModelSelection: DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
     });
   });
+
+  describe("Code review group (R99)", () => {
+    const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+    const namedSelect = (name: string) => {
+      const found = h.controls.find(
+        (entry) => entry.kind === "select" && entry.props.name === name,
+      );
+      if (!found) throw new Error(`No select named ${name}`);
+      return found;
+    };
+    const itemLabels = (entry: CapturedControl) =>
+      (entry.props.items as Array<{ label: string }>).map((item) => item.label);
+
+    beforeEach(() => {
+      h.serverProviders = [
+        makeServerProvider({ instanceId: "codex", driver: CODEX_DRIVER }),
+        makeServerProvider({ instanceId: "claudeAgent", driver: CLAUDE_DRIVER }),
+        makeServerProvider({ instanceId: "cursor", driver: CURSOR_DRIVER }),
+      ];
+      h.primaryEnvironment = {
+        environmentId: ENVIRONMENT_ID,
+        serverConfig: { environment: { capabilities: { codeReviews: true } } },
+      };
+    });
+
+    it("shows the default prompt unedited, with no Reset", () => {
+      const markup = render(<AgentsSettingsPanel />);
+      expect(markup).toContain('data-section-title="Code review"');
+      expect(control("textarea", "Review prompt").props.value).toBe(DEFAULT_CODE_REVIEW_PROMPT);
+      expect(findControls("button", "Reset review prompt to default")).toHaveLength(0);
+      expect(markup).toContain(
+        `${DEFAULT_CODE_REVIEW_PROMPT.length.toLocaleString("en-US")} / 7,680`,
+      );
+    });
+
+    it("stores an empty prompt on Reset and when the default text is saved", () => {
+      h.settings = { ...DEFAULT_UNIFIED_SETTINGS, codeReviewPrompt: "Mine" };
+      render(<AgentsSettingsPanel />);
+      expect(control("textarea", "Review prompt").props.value).toBe("Mine");
+      invoke(control("button", "Reset review prompt to default"), "onClick");
+      expect(h.updateSettings).toHaveBeenLastCalledWith({ codeReviewPrompt: "" });
+      invoke(control("textarea", "Review prompt"), "onBlur", {
+        target: { value: DEFAULT_CODE_REVIEW_PROMPT },
+      });
+      expect(h.updateSettings).toHaveBeenLastCalledWith({ codeReviewPrompt: "" });
+      invoke(control("textarea", "Review prompt"), "onBlur", { target: { value: "Ours" } });
+      expect(h.updateSettings).toHaveBeenLastCalledWith({ codeReviewPrompt: "Ours" });
+    });
+
+    it("lists the chat agents and only the Claude and Codex terminals", () => {
+      render(<AgentsSettingsPanel />);
+      const labels = itemLabels(namedSelect("codeReviewAgent"));
+      expect(labels).toEqual(
+        expect.arrayContaining(["Codex", "Claude", "Cursor", "Codex Terminal", "Claude Terminal"]),
+      );
+      expect(labels.filter((label) => label.endsWith("Terminal")).toSorted()).toEqual([
+        "Claude Terminal",
+        "Codex Terminal",
+      ]);
+      invoke(namedSelect("codeReviewAgent"), "onValueChange", "chat:cursor");
+      expect(h.updateSettings).toHaveBeenCalledWith({
+        codeReviewAgent: { kind: "chat", instanceId: ProviderInstanceId.make("cursor") },
+      });
+    });
+
+    it("shows the instructed guard line for a Cursor reviewer", () => {
+      h.settings = {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        codeReviewAgent: { kind: "chat", instanceId: ProviderInstanceId.make("cursor") },
+      };
+      const markup = render(<AgentsSettingsPanel />);
+      expect(markup).toContain("Told not to edit. BiBCode cannot block edits for this agent.");
+    });
+
+    it("keeps an unavailable saved reviewer with its reason", () => {
+      h.settings = {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        codeReviewAgent: { kind: "chat", instanceId: ProviderInstanceId.make("missing") },
+      };
+      const markup = render(<AgentsSettingsPanel />);
+      expect(namedSelect("codeReviewAgent").props.value).toBe("chat:missing");
+      expect(markup).toContain(
+        "The code review agent is not available on this environment. Change it in Settings → Agents.",
+      );
+    });
+
+    it("stores no review model for Provider default and a model of the reviewer", () => {
+      render(<AgentsSettingsPanel />);
+      const model = namedSelect("codeReviewModel");
+      expect(model.props.value).toBe("default");
+      expect(itemLabels(model)).toEqual(["Provider default", "Model Alpha", "Model Beta"]);
+      invoke(model, "onValueChange", "model-beta");
+      expect(h.updateSettings).toHaveBeenLastCalledWith({
+        codeReviewModelSelection: { instanceId: CODEX_INSTANCE_ID, model: "model-beta" },
+      });
+      invoke(model, "onValueChange", "default");
+      expect(h.updateSettings).toHaveBeenLastCalledWith({ codeReviewModelSelection: null });
+    });
+
+    it("disables every row on a server without code reviews", () => {
+      h.primaryEnvironment = { environmentId: ENVIRONMENT_ID };
+      // Non-default values, so each Reset would show on a server that supports reviews.
+      h.settings = {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        codeReviewAgent: { kind: "terminal", instanceId: ProviderInstanceId.make("claudeAgent") },
+        codeReviewModelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "model-beta",
+        },
+        codeReviewPrompt: "Mine",
+      };
+      const markup = render(<AgentsSettingsPanel />);
+      for (const label of ["code review agent", "review model", "review prompt"]) {
+        expect(findControls("button", `Reset ${label} to default`)).toHaveLength(0);
+      }
+      invoke(control("textarea", "Review prompt"), "onBlur", { target: { value: "Other" } });
+      expect(h.updateSettings).not.toHaveBeenCalled();
+      expect(
+        markup.match(/Update the BiBCode server on this environment to use Review\./g),
+      ).toHaveLength(3);
+      expect(namedSelect("codeReviewAgent").props.disabled).toBe(true);
+      expect(namedSelect("codeReviewModel").props.disabled).toBe(true);
+      expect(control("textarea", "Review prompt").props.disabled).toBe(true);
+    });
+  });
 });
 
 describe("AboutSettingsPanel", () => {
@@ -1299,6 +1436,31 @@ describe("useGeneralSettingsRestore", () => {
     await restore.restoreDefaults();
     expect(confirmSpy).not.toHaveBeenCalled();
     expect(h.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("General no longer has a theme control", () => {
+    h.theme = "dark";
+    const markup = renderedText();
+
+    expect(markup).not.toContain("Choose how BiBCode looks");
+    expect(findControls("select", "system")).toHaveLength(0);
+    expect(findControls("button", "Reset theme to default")).toHaveLength(0);
+  });
+
+  it("Restore is offered in System mode when only a non-default built-in is selected", () => {
+    h.slots = { light: "light", dark: "tokyo-night" };
+    expect(captureRestore().changedSettingLabels).toEqual(["Theme"]);
+  });
+
+  it("restore defaults sets the mode to System and both slots to the built-ins and keeps custom themes", async () => {
+    h.theme = "dark";
+    h.slots = { light: "light", dark: "mine" };
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    await restore.restoreDefaults();
+    expect(h.setTheme).toHaveBeenCalledWith("system");
+    expect(h.resetSlots).toHaveBeenCalledOnce();
   });
 
   it("lists only changed General setting labels", () => {

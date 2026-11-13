@@ -137,7 +137,7 @@ export const GitManagerOperationBanner = memo(function GitManagerOperationBanner
         ) : null}
       </div>
       {state.failureMessage === null ? null : (
-        <p className="mt-1 text-destructive">
+        <p className="mt-1 select-text whitespace-pre-line text-destructive">
           {state.failureMessage} <code className="font-mono">({state.failureCode})</code>
         </p>
       )}

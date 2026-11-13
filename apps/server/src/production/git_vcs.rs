@@ -20,15 +20,15 @@ use crate::{
     git::{
         ChangeRequest, CloneLeaf, CreateWorktreeInput, GitCommandError, GitProcessRunner,
         GitRepository, GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
-        STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
-        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
+        STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusMutationGuard, StatusReadFence,
+        VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
         clone_policy::{
             ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, DETACH_REFUSED, DETACHED,
             NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
         },
         sign_in::{
-            CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
-            resolve_destination, upstream_remote,
+            CredentialPrompt, Destination, ExecutionPlace, SignInDirection, SignInRequired,
+            has_gcm_refusal, resolve_destination, upstream_remote,
         },
         validate_pathspecs,
     },
@@ -52,6 +52,9 @@ use super::git_manager_rpc::credential_prompt;
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
+/// How long `vcs.refreshStatus` waits for the pull-request lookup, well under the 10 second
+/// hang budget. A slower lookup runs on for the status subscribers, if there are any.
+const REFRESH_PULL_REQUEST_LOOKUP_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub(crate) struct WorktreeRemovalTaskTracker {
@@ -269,6 +272,8 @@ pub struct GitVcsRpcServices {
     /// Set only on the desktop's in-process server: the desktop app's own session may be offered a
     /// Git Credential Manager sign-in (#325).
     interactive_git_sign_in: bool,
+    /// Where this server's Git runs, for a failed push's guidance (#343).
+    place: ExecutionPlace,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -426,6 +431,7 @@ impl GitVcsRpcServices {
             clone_policy: ClonePolicy::default(),
             mcp_settings: None,
             interactive_git_sign_in: false,
+            place: ExecutionPlace::default(),
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
@@ -525,6 +531,13 @@ impl GitVcsRpcServices {
     #[must_use]
     pub fn with_interactive_git_sign_in(mut self, enabled: bool) -> Self {
         self.interactive_git_sign_in = enabled;
+        self
+    }
+
+    /// Where this server's Git runs (#343), built once from the server configuration.
+    #[must_use]
+    pub fn with_execution_place(mut self, place: ExecutionPlace) -> Self {
+        self.place = place;
         self
     }
 
@@ -887,15 +900,66 @@ impl GitVcsRpcServices {
                     .map_err(serialize_error)?;
                 let fence = publication.fence;
                 let mut status = publication.value;
+                let cwd = tokio::fs::canonicalize(&input.cwd)
+                    .await
+                    .unwrap_or_else(|_| input.cwd.clone());
                 let status = finish_fenced_enrichment(&self.broadcaster, fence, async {
-                    enrich_remote_pull_request(
-                        &self.pull_requests,
-                        &input.cwd,
-                        &status.local,
-                        &mut status.remote,
-                        &cancellation,
-                    )
-                    .await;
+                    let ref_name = status.local.ref_name.clone();
+                    // Owned, so the lookup can outlive the refresh with its lease intact.
+                    let mut lookup = Box::pin({
+                        let pull_requests = self.pull_requests.clone();
+                        let lookup_cwd = input.cwd.clone();
+                        let local = status.local.clone();
+                        async move {
+                            let cancellation = CancellationToken::new();
+                            lookup_open_pull_request(
+                                &pull_requests,
+                                &lookup_cwd,
+                                &local,
+                                &cancellation,
+                            )
+                            .await
+                        }
+                    });
+                    let found = tokio::select! {
+                        () = cancellation.cancelled() => Ok(None),
+                        found = tokio::time::timeout(
+                            REFRESH_PULL_REQUEST_LOOKUP_BOUND,
+                            &mut lookup,
+                        ) => found,
+                    };
+                    status.remote.pr = match found {
+                        Ok(Some(pull_request)) => {
+                            self.broadcaster.record_pull_request(
+                                &cwd,
+                                ref_name.as_deref(),
+                                pull_request.clone(),
+                            );
+                            pull_request
+                        }
+                        Ok(None) => self
+                            .broadcaster
+                            .known_pull_request(&cwd, ref_name.as_deref()),
+                        Err(_) => {
+                            // Only subscribers need the late answer, so the lookup keeps its
+                            // lease while the repository has one and then delivers to them.
+                            let broadcaster = self.broadcaster.clone();
+                            let late_cwd = cwd.clone();
+                            let late_ref = ref_name.clone();
+                            self.broadcaster.spawn_for_subscribers(&cwd, async move {
+                                if let Some(pull_request) = lookup.await {
+                                    broadcaster.record_pull_request(
+                                        &late_cwd,
+                                        late_ref.as_deref(),
+                                        pull_request,
+                                    );
+                                    broadcaster.notify_pull_request_change(&late_cwd).await;
+                                }
+                            });
+                            self.broadcaster
+                                .known_pull_request(&cwd, ref_name.as_deref())
+                        }
+                    };
                     status
                 })
                 .await
@@ -1422,9 +1486,37 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let mut enrichment: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
-            // The remote and branch the latest enrichment was started for.
-            let mut enriching: Option<(VcsStatusRemoteResult, Option<String>)> = None;
+            let cwd = tokio::fs::canonicalize(&input.cwd)
+                .await
+                .unwrap_or_else(|_| input.cwd.clone());
+            let start_lookup = |local: VcsStatusLocalResult| {
+                let cancellation = operation_cancellation.child_token();
+                let task_token = cancellation.clone();
+                let task_pull_requests = pull_requests.clone();
+                let task_cwd = input.cwd.clone();
+                let ref_name = local.ref_name.clone();
+                #[cfg(test)]
+                let task_test_hook = enrichment_test_hook.clone();
+                let task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let Some(hook) = &task_test_hook {
+                        hook.block(&task_token).await;
+                    }
+                    if task_token.is_cancelled() {
+                        return None;
+                    }
+                    lookup_open_pull_request(&task_pull_requests, &task_cwd, &local, &task_token)
+                        .await
+                });
+                StatusStreamEnrichment {
+                    cancellation,
+                    task,
+                    ref_name,
+                    look_again: None,
+                }
+            };
+            let mut enrichment: Option<StatusStreamEnrichment> = None;
+            let mut shown = ShownStatus::default();
             loop {
                 tokio::select! {
                     biased;
@@ -1436,6 +1528,22 @@ impl GitVcsRpcServices {
                         break;
                     }
                     _ = cancellation.cancelled() => break,
+                    found = async {
+                        (&mut enrichment.as_mut().expect("lookup in flight").task).await
+                    }, if enrichment.is_some() => {
+                        let finished = enrichment.take().expect("lookup in flight");
+                        if let Ok(Some(pull_request)) = found {
+                            broadcaster.record_pull_request(
+                                &cwd,
+                                finished.ref_name.as_deref(),
+                                pull_request,
+                            );
+                        }
+                        if !shown.reconcile(&sender, &broadcaster, &cwd).await {
+                            break;
+                        }
+                        enrichment = finished.look_again.map(start_lookup);
+                    }
                     publication = subscription.recv_publication() => {
                         let publication = match publication {
                             Some(Ok(publication)) => publication,
@@ -1445,73 +1553,43 @@ impl GitVcsRpcServices {
                             }
                             None => break,
                         };
-                        let interrupted = enrichment
-                            .as_ref()
-                            .is_some_and(|(_, task)| !task.is_finished());
-                        stop_status_stream_enrichment(&mut enrichment).await;
-                        // A local update on the same branch must not lose a lookup still in
-                        // flight: its fence is stale now, so the lookup starts again.
-                        let enrichment_remote = match &publication.value {
-                            VcsStatusStreamEvent::Snapshot { remote, .. }
-                            | VcsStatusStreamEvent::RemoteUpdated { remote } => remote.clone(),
-                            VcsStatusStreamEvent::LocalUpdated { local } => enriching
-                                .as_ref()
-                                .filter(|(_, ref_name)| interrupted && *ref_name == local.ref_name)
-                                .map(|(remote, _)| remote.clone()),
-                        };
-                        if !send_status_stream_event(
-                            &sender,
-                            &broadcaster,
-                            &publication.fence,
-                            publication.value,
+                        // A lookup for the same branch keeps running, so restarting it cannot
+                        // starve a slow forge. Its answer is delivered under the newest fence the
+                        // subscriber received. Any same-branch event may follow an invalidation
+                        // that made that answer outdated, so one more lookup runs once it ends.
+                        let mut looks_up = matches!(
+                            &publication.value,
+                            VcsStatusStreamEvent::Snapshot { remote: Some(_), .. }
+                                | VcsStatusStreamEvent::RemoteUpdated { remote: Some(_) }
                         )
-                        .await
+                        .then(|| publication.local.clone());
+                        match enrichment.as_mut() {
+                            Some(lookup) if lookup.ref_name == publication.local.ref_name => {
+                                looks_up.take();
+                                lookup.look_again = Some(publication.local.clone());
+                            }
+                            _ => stop_status_stream_enrichment(&mut enrichment).await,
+                        }
+                        let mut value = publication.value;
+                        // A queued publication may predate a recorded lookup answer, so it shows
+                        // the request `reconcile` would send next instead of flickering.
+                        if let VcsStatusStreamEvent::Snapshot { remote: Some(remote), .. }
+                        | VcsStatusStreamEvent::RemoteUpdated {
+                            remote: Some(remote),
+                        } = &mut value
+                        {
+                            remote.pr = broadcaster
+                                .known_pull_request(&cwd, publication.local.ref_name.as_deref());
+                        }
+                        if !shown
+                            .send(&sender, &broadcaster, &publication.fence, value)
+                            .await
+                            || !shown.reconcile(&sender, &broadcaster, &cwd).await
                         {
                             break;
                         }
-                        if let Some(remote) = enrichment_remote {
-                            let task_cancellation = operation_cancellation.child_token();
-                            let task_token = task_cancellation.clone();
-                            let task_sender = sender.clone();
-                            let task_broadcaster = broadcaster.clone();
-                            let task_pull_requests = pull_requests.clone();
-                            let task_cwd = input.cwd.clone();
-                            let task_local = publication.local;
-                            let task_fence = publication.fence;
-                            enriching = Some((remote.clone(), task_local.ref_name.clone()));
-                            #[cfg(test)]
-                            let task_test_hook = enrichment_test_hook.clone();
-                            let task = tokio::spawn(async move {
-                                #[cfg(test)]
-                                if let Some(hook) = &task_test_hook {
-                                    hook.block(&task_token).await;
-                                }
-                                if task_token.is_cancelled() {
-                                    return;
-                                }
-                                let mut enriched = remote.clone();
-                                enrich_remote_pull_request(
-                                    &task_pull_requests,
-                                    &task_cwd,
-                                    &task_local,
-                                    &mut enriched,
-                                    &task_token,
-                                )
-                                .await;
-                                if task_token.is_cancelled() || enriched == remote {
-                                    return;
-                                }
-                                let _ = send_status_stream_event(
-                                    &task_sender,
-                                    &task_broadcaster,
-                                    &task_fence,
-                                    VcsStatusStreamEvent::RemoteUpdated {
-                                        remote: Some(enriched),
-                                    },
-                                )
-                                .await;
-                            });
-                            enrichment = Some((task_cancellation, task));
+                        if let Some(local) = looks_up {
+                            enrichment = Some(start_lookup(local));
                         }
                     }
                 }
@@ -1625,6 +1703,7 @@ impl GitVcsRpcServices {
         let availability = self.availability_registry.clone();
         let trace_diagnostics = self.trace_diagnostics.clone();
         let prompt = credential_prompt(self.interactive_git_sign_in, &context);
+        let place = self.place.clone();
         tokio::spawn(async move {
             let started = tokio::time::Instant::now();
             let payload = request.payload.clone();
@@ -1678,12 +1757,13 @@ impl GitVcsRpcServices {
                         workspace_admission.as_ref(),
                         operation_cancellation.clone(),
                         async {
-                            let mutation = broadcaster.begin_mutation(&input.cwd).await;
+                            let mut mutation = broadcaster.begin_mutation(&input.cwd).await;
                             let result = run_stacked_action(
                                 &repository,
                                 &pull_requests,
                                 &input,
                                 &operation_cancellation,
+                                Some(&mut mutation),
                             )
                             .await;
                             mutation.finish().await;
@@ -1733,7 +1813,11 @@ impl GitVcsRpcServices {
                                     Some(Err(note)) => {
                                         wire["detail"] = json!(format!("{detail} {note}"));
                                     }
-                                    None => {}
+                                    None => {
+                                        if let Some(guidance) = place.push_guidance(&detail) {
+                                            wire["detail"] = json!(guidance);
+                                        }
+                                    }
                                 }
                             }
                             result
@@ -2881,19 +2965,30 @@ async fn run_stacked_action(
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
+    mutation: Option<&mut StatusMutationGuard>,
 ) -> Result<StackedActionResult, StackedActionFailure> {
     let mut phase = None;
-    run_stacked_action_steps(repository, pull_requests, input, cancellation, &mut phase)
-        .await
-        .map_err(|failure| StackedActionFailure { phase, ..failure })
+    run_stacked_action_steps(
+        repository,
+        pull_requests,
+        input,
+        cancellation,
+        &mut phase,
+        mutation,
+    )
+    .await
+    .map_err(|failure| StackedActionFailure { phase, ..failure })
 }
 
+/// `mutation`, when given, reopens status reads before the push and the pull-request
+/// step, which wait on the network while the write lock stays held (#345).
 async fn run_stacked_action_steps(
     repository: &GitRepository,
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
     phase: &mut Option<&'static str>,
+    mut mutation: Option<&mut StatusMutationGuard>,
 ) -> Result<StackedActionResult, StackedActionFailure> {
     validate_stacked_action_input(input)?;
     let wants_commit = matches!(
@@ -3117,6 +3212,9 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let push = if wants_push {
+        if let Some(mutation) = &mut mutation {
+            mutation.local_writes_finished();
+        }
         *phase = Some("push");
         // One choice of push: a resumed push validates the very remote it then pushes to.
         let current_push = match selected_head {
@@ -3200,6 +3298,9 @@ async fn run_stacked_action_steps(
         json!({ "status": "skipped_not_requested" })
     };
     let pull_request = if let Some(provider) = pull_request_provider {
+        if let Some(mutation) = &mut mutation {
+            mutation.local_writes_finished();
+        }
         *phase = Some("pr");
         let current_local = repository
             .local_status(&input.cwd, cancellation)
@@ -3405,50 +3506,119 @@ async fn finish_fenced_enrichment<T>(
     broadcaster.publish_if_fence_current(&fence, || value)
 }
 
-async fn send_status_stream_event(
-    sender: &mpsc::Sender<RpcStreamChunk>,
-    broadcaster: &StatusBroadcaster,
-    fence: &StatusReadFence,
-    event: VcsStatusStreamEvent,
-) -> bool {
-    let chunk = serde_json::to_value(event)
-        .map(|event| vec![event])
-        .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
-    let permit = match sender.reserve().await {
-        Ok(permit) => permit,
-        Err(_) => return false,
-    };
-    let _ = broadcaster.publish_if_fence_current(fence, || permit.send(chunk));
-    true
+/// The pull-request lookup a status stream has in flight, and the branch it is for.
+struct StatusStreamEnrichment {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<Option<Option<ChangeRequest>>>,
+    ref_name: Option<String>,
+    /// The newest status whose publication asked for a lookup while this one ran.
+    look_again: Option<VcsStatusLocalResult>,
 }
 
-async fn stop_status_stream_enrichment(
-    enrichment: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
-) {
-    if let Some((cancellation, task)) = enrichment.take() {
-        cancellation.cancel();
-        task.abort();
-        let _ = task.await;
+async fn stop_status_stream_enrichment(enrichment: &mut Option<StatusStreamEnrichment>) {
+    if let Some(enrichment) = enrichment.take() {
+        enrichment.cancellation.cancel();
+        enrichment.task.abort();
+        let _ = enrichment.task.await;
     }
 }
 
-async fn enrich_remote_pull_request(
+/// What one status subscriber shows, folded from the events it received the way the
+/// client's `applyGitStatusStreamEvent` folds them, and the fence of the newest one.
+#[derive(Default)]
+struct ShownStatus {
+    ref_name: Option<Option<String>>,
+    remote: Option<VcsStatusRemoteResult>,
+    fence: Option<StatusReadFence>,
+}
+
+impl ShownStatus {
+    /// Sends `event` while `fence` is current and drops it otherwise. Returns false once the
+    /// stream is closed.
+    async fn send(
+        &mut self,
+        sender: &mpsc::Sender<RpcStreamChunk>,
+        broadcaster: &StatusBroadcaster,
+        fence: &StatusReadFence,
+        event: VcsStatusStreamEvent,
+    ) -> bool {
+        let chunk = serde_json::to_value(&event)
+            .map(|event| vec![event])
+            .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
+        let Ok(permit) = sender.reserve().await else {
+            return false;
+        };
+        if broadcaster
+            .publish_if_fence_current(fence, || permit.send(chunk))
+            .is_ok()
+        {
+            match event {
+                VcsStatusStreamEvent::Snapshot { local, remote } => {
+                    self.ref_name = Some(local.ref_name);
+                    self.remote = remote;
+                }
+                VcsStatusStreamEvent::LocalUpdated { local } => {
+                    if self.ref_name.as_ref() != Some(&local.ref_name) {
+                        self.remote = None;
+                    }
+                    self.ref_name = Some(local.ref_name);
+                }
+                VcsStatusStreamEvent::RemoteUpdated { remote } => self.remote = remote,
+            }
+            self.fence = Some(fence.clone());
+        }
+        true
+    }
+
+    /// Sends the pull request known for the shown branch when the subscriber shows another
+    /// one. A send under an old fence is dropped, so the next received event retries it.
+    async fn reconcile(
+        &mut self,
+        sender: &mpsc::Sender<RpcStreamChunk>,
+        broadcaster: &StatusBroadcaster,
+        cwd: &std::path::Path,
+    ) -> bool {
+        let (Some(ref_name), Some(remote), Some(fence)) =
+            (&self.ref_name, &self.remote, self.fence.clone())
+        else {
+            return true;
+        };
+        let known = broadcaster.known_pull_request(cwd, ref_name.as_deref());
+        if known == remote.pr {
+            return true;
+        }
+        let remote = VcsStatusRemoteResult {
+            pr: known,
+            ..remote.clone()
+        };
+        self.send(
+            sender,
+            broadcaster,
+            &fence,
+            VcsStatusStreamEvent::RemoteUpdated {
+                remote: Some(remote),
+            },
+        )
+        .await
+    }
+}
+
+async fn lookup_open_pull_request(
     pull_requests: &PullRequestService,
     cwd: &std::path::Path,
     local: &VcsStatusLocalResult,
-    remote: &mut VcsStatusRemoteResult,
     cancellation: &CancellationToken,
-) {
+) -> Option<Option<ChangeRequest>> {
     let Some(reference) = local.ref_name.as_deref() else {
-        return;
+        return Some(None);
     };
     let provider = local_provider_kind(local);
     if provider == ProviderKind::Unknown {
-        return;
+        return Some(None);
     }
     // Shared with the status stream and other refreshes for a few seconds;
     // see `PullRequestService::resolve_current_optional_shared`.
-    let Some(pull_request) = pull_requests
+    let pull_request = pull_requests
         .resolve_current_optional_shared(
             ResolvePullRequestInput {
                 cwd: cwd.to_path_buf(),
@@ -3458,20 +3628,19 @@ async fn enrich_remote_pull_request(
             cancellation,
         )
         .await
-        .ok()
-        .flatten()
-        .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
-    else {
-        return;
-    };
-    remote.pr = Some(ChangeRequest {
-        number: pull_request.number,
-        title: pull_request.title,
-        url: pull_request.url,
-        base_ref: pull_request.base_branch,
-        head_ref: pull_request.head_branch,
-        state: "open".to_owned(),
-    });
+        .ok()?;
+    Some(
+        pull_request
+            .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
+            .map(|pull_request| ChangeRequest {
+                number: pull_request.number,
+                title: pull_request.title,
+                url: pull_request.url,
+                base_ref: pull_request.base_branch,
+                head_ref: pull_request.head_branch,
+                state: "open".to_owned(),
+            }),
+    )
 }
 
 async fn local_branch_names(
@@ -3906,6 +4075,9 @@ mod mutation_ownership_tests {
         blocked_operation: Option<&'static str>,
         mutation_started: Notify,
         release_mutation: Semaphore,
+        /// What the blocked operation returns once released, instead of success.
+        blocked_failure: Mutex<Option<ProcessError>>,
+        commits: std::sync::atomic::AtomicUsize,
     }
 
     struct SuccessfulGithubRunner;
@@ -4020,6 +4192,8 @@ mod mutation_ownership_tests {
                 blocked_operation: None,
                 mutation_started: Notify::new(),
                 release_mutation: Semaphore::new(0),
+                blocked_failure: Mutex::new(None),
+                commits: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -4050,6 +4224,8 @@ mod mutation_ownership_tests {
                 "GitVcsDriver.initRepo"
                     | "GitVcsDriver.pushCurrentBranch"
                     | "GitVcsDriver.pushCurrentBranchToRemote"
+                    // Stands in for the commit becoming visible in status.
+                    | "GitVcsDriver.commit"
             );
             Box::pin(async move {
                 if self.blocked_operation == Some(request.operation.as_str()) {
@@ -4064,6 +4240,17 @@ mod mutation_ownership_tests {
                             operation: request.operation,
                         });
                     }
+                    if let Some(failure) = self
+                        .blocked_failure
+                        .lock()
+                        .expect("blocked failure lock")
+                        .take()
+                    {
+                        return Err(failure);
+                    }
+                }
+                if request.operation == "GitVcsDriver.commit" {
+                    self.commits.fetch_add(1, Ordering::SeqCst);
                 }
                 if marks_working_tree_dirty {
                     self.working_tree_dirty.store(true, Ordering::SeqCst);
@@ -4090,6 +4277,10 @@ mod mutation_ownership_tests {
                         (1, String::new())
                     }
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
+                    "GitVcsDriver.prepareCommitContext.stagedSummary" => {
+                        (0, "M\ttracked.txt\n".to_owned())
+                    }
+                    "GitVcsDriver.commit.sha" => (0, "0123abc\n".to_owned()),
                     "GitVcsDriver.defaultRef.candidate" => {
                         let is_main = request
                             .args
@@ -4331,9 +4522,9 @@ mod mutation_ownership_tests {
     }
 
     #[tokio::test]
-    async fn stacked_push_runs_inside_the_shared_mutation_boundary() {
+    async fn stacked_push_keeps_the_write_lock_and_retires_stale_reads() {
         let root = tempfile::tempdir().expect("repository root");
-        let runner = Arc::new(ControlledMutationRunner::new());
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
         let services = GitVcsRpcServices::with_repository(repository, Arc::default());
         let mut subscription = services
@@ -4380,6 +4571,18 @@ mod mutation_ownership_tests {
             },
             CancellationToken::new(),
         );
+        runner.wait_for_mutation_start().await;
+        let mut second_write = services.stacked_action_stream_without_session(
+            stacked_request("3", root.path(), "commit"),
+            CancellationToken::new(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            runner.commits.load(Ordering::SeqCst),
+            0,
+            "a second write ran while the push held the write lock"
+        );
+        runner.release_mutation.add_permits(1);
 
         let started = stream
             .recv()
@@ -4395,6 +4598,11 @@ mod mutation_ownership_tests {
         assert_eq!(finished[0]["kind"], "action_finished");
         assert_eq!(finished[0]["result"]["push"]["status"], "pushed");
         assert!(stale.await.expect("stale read task").is_err());
+        let second = action_end(&mut second_write)
+            .await
+            .expect("second write event");
+        assert_eq!(second["kind"], "action_finished", "{second}");
+        assert_eq!(runner.commits.load(Ordering::SeqCst), 1);
         let trailing = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
                 let event = subscription.recv().await?;
@@ -4966,6 +5174,338 @@ mod mutation_ownership_tests {
                 .await,
             1
         );
+    }
+
+    const HELD_PUSH: &str = "GitVcsDriver.pushCurrentBranch";
+    /// Longer than any local status read and far below the 10 s hang budget.
+    const ANSWER_WHILE_HELD: Duration = Duration::from_secs(5);
+
+    fn stacked_request(id: &str, cwd: &Path, action: &str) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from(id).expect("request id"),
+            tag: "git.runStackedAction".to_owned(),
+            payload: json!({
+                "actionId": format!("action-{id}"),
+                "cwd": cwd,
+                "action": action,
+                "commitMessage": "test: held push",
+            }),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    async fn refresh_within(
+        services: &GitVcsRpcServices,
+        cwd: &Path,
+        within: Duration,
+        context: &str,
+    ) -> RpcResult {
+        tokio::time::timeout(
+            within,
+            services.handle_unary_with_context(
+                request("vcs.refreshStatus", cwd),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{context}: vcs.refreshStatus was not answered in time"))
+    }
+
+    /// The action's terminal event, or the error that ended its stream.
+    async fn action_end(stream: &mut mpsc::Receiver<RpcStreamChunk>) -> Result<Value, Value> {
+        loop {
+            let values = stream
+                .recv()
+                .await
+                .expect("stacked stream ends with an event")?;
+            if let Some(event) = values.into_iter().find(|event| {
+                event["kind"] == "action_finished" || event["kind"] == "action_failed"
+            }) {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn held_push_services(runner: &Arc<ControlledMutationRunner>) -> GitVcsRpcServices {
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        GitVcsRpcServices::with_repository(repository, Arc::default())
+    }
+
+    #[tokio::test]
+    async fn held_push_delivers_status_to_refresh_and_subscribers() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut subscription = services
+            .broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("initial status subscription");
+        subscription.recv().await.expect("initial status snapshot");
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", root.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        let refreshed = refresh_within(
+            &services,
+            root.path(),
+            ANSWER_WHILE_HELD,
+            "held push, same worktree",
+        )
+        .await
+        .expect("refresh succeeds during the held push");
+        assert_eq!(
+            refreshed["hasWorkingTreeChanges"], true,
+            "the refresh reads the tree after the commit: {refreshed}"
+        );
+        let published = tokio::time::timeout(ANSWER_WHILE_HELD, async {
+            loop {
+                if let VcsStatusStreamEvent::LocalUpdated { local } =
+                    subscription.recv().await.expect("subscription stays open")
+                    && local.has_working_tree_changes
+                {
+                    return local;
+                }
+            }
+        })
+        .await;
+        assert!(
+            published.is_ok(),
+            "a subscriber received no post-commit status during the held push"
+        );
+
+        runner.release_mutation.add_permits(1);
+        let ended = action_end(&mut stream).await.expect("action event");
+        assert_eq!(ended["kind"], "action_finished", "{ended}");
+        assert_eq!(ended["result"]["commit"]["status"], "created", "{ended}");
+        assert_eq!(ended["result"]["push"]["status"], "pushed", "{ended}");
+    }
+
+    #[tokio::test]
+    async fn held_push_does_not_gate_another_worktree() {
+        let held = tempfile::tempdir().expect("held repository root");
+        let other = tempfile::tempdir().expect("other repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", held.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        refresh_within(
+            &services,
+            other.path(),
+            ANSWER_WHILE_HELD,
+            "held push, other worktree",
+        )
+        .await
+        .expect("the other worktree's refresh succeeds");
+
+        runner.release_mutation.add_permits(1);
+        action_end(&mut stream).await.expect("action event");
+    }
+
+    #[tokio::test]
+    async fn held_push_keeps_writes_serialized_and_the_commit_saved() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut first = services.stacked_action_stream_without_session(
+            stacked_request("2", root.path(), "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+        let mut second = services.stacked_action_stream_without_session(
+            stacked_request("3", root.path(), "commit"),
+            CancellationToken::new(),
+        );
+        refresh_within(
+            &services,
+            root.path(),
+            ANSWER_WHILE_HELD,
+            "held push with a queued write",
+        )
+        .await
+        .expect("refresh succeeds while a write is queued");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            runner.commits.load(Ordering::SeqCst),
+            1,
+            "the second write started before the held push ended"
+        );
+
+        *runner.blocked_failure.lock().expect("blocked failure lock") =
+            Some(ProcessError::NonZeroExit {
+                operation: HELD_PUSH.to_owned(),
+                exit_code: 1,
+                stdout_length: 0,
+                stderr_length: 13,
+                stdout: String::new().into_boxed_str(),
+                stderr: "push rejected".into(),
+            });
+        runner.release_mutation.add_permits(1);
+        let ended = action_end(&mut first).await.expect("first action event");
+        assert_eq!(ended["kind"], "action_failed", "{ended}");
+        assert_eq!(ended["phase"], "push", "{ended}");
+        let refreshed = refresh_within(&services, root.path(), ANSWER_WHILE_HELD, "after")
+            .await
+            .expect("refresh after the failed push");
+        assert_eq!(refreshed["hasWorkingTreeChanges"], true, "{refreshed}");
+        let second = action_end(&mut second).await.expect("second action event");
+        assert_eq!(second["kind"], "action_finished", "{second}");
+        assert_eq!(runner.commits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn held_push_every_outcome_releases_readers() {
+        for outcome in [
+            "success",
+            "refusal",
+            "timeout",
+            "cancellation",
+            "workspace loss",
+        ] {
+            let root = tempfile::tempdir().expect("repository root");
+            let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+            let registry = WorkspaceAvailabilityRegistry::new();
+            let services = held_push_services(&runner).with_availability_registry(registry.clone());
+            let cancellation = CancellationToken::new();
+            let mut stream = services.stacked_action_stream_without_session(
+                stacked_request("2", root.path(), "commit_push"),
+                cancellation.clone(),
+            );
+            runner.wait_for_mutation_start().await;
+            *runner.blocked_failure.lock().expect("blocked failure lock") = match outcome {
+                "refusal" => Some(ProcessError::NonZeroExit {
+                    operation: HELD_PUSH.to_owned(),
+                    exit_code: 128,
+                    stdout_length: 0,
+                    stderr_length: 60,
+                    stdout: String::new().into_boxed_str(),
+                    stderr: "fatal: Authentication failed for 'https://gitlab.example.test/'"
+                        .into(),
+                }),
+                "timeout" => Some(ProcessError::Timeout {
+                    operation: HELD_PUSH.to_owned(),
+                    timeout_ms: 600_000,
+                }),
+                _ => None,
+            };
+            match outcome {
+                "cancellation" => cancellation.cancel(),
+                "workspace loss" => assert!(
+                    registry
+                        .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                            thread_id: "thread-held-push".to_owned(),
+                            repository_key: "repository-held-push".to_owned(),
+                            generation: 1,
+                            path: root.path().to_path_buf(),
+                            availability:
+                                crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                        })
+                        .await
+                        .expect("physical identity resolves")
+                ),
+                _ => {}
+            }
+            runner.release_mutation.add_permits(1);
+            let ended = action_end(&mut stream).await;
+            match outcome {
+                "success" => assert_eq!(ended.expect("event")["kind"], "action_finished"),
+                "workspace loss" => assert_eq!(
+                    ended.expect_err("workspace loss ends the stream")["_tag"],
+                    "WorkspaceUnavailableError"
+                ),
+                _ => {
+                    let ended = ended.expect("event");
+                    assert_eq!(ended["kind"], "action_failed", "{outcome}: {ended}");
+                    if outcome == "timeout" {
+                        assert_eq!(ended["message"], "Git command timed out.", "{ended}");
+                    }
+                }
+            }
+
+            let refreshed =
+                refresh_within(&services, root.path(), ANSWER_WHILE_HELD, outcome).await;
+            if outcome == "workspace loss" {
+                let error = refreshed.expect_err("a lost workspace refuses the refresh");
+                assert_eq!(error["_tag"], "WorkspaceUnavailableError", "{error}");
+            } else {
+                refreshed.unwrap_or_else(|error| panic!("{outcome}: refresh failed: {error}"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_push_does_not_block_pull_request_lookups() {
+        use crate::pull_requests::{
+            PullRequestsService, host::HostCommandRunner, model::VocabularyKind,
+        };
+
+        let sandbox = crate::test_support::TestSandbox::new("held-push-lookups");
+        let cwd = sandbox.path("checkout");
+        std::fs::create_dir(&cwd).expect("checkout directory");
+        let repository_json = sandbox.path("github-repository.json");
+        std::fs::write(
+            &repository_json,
+            include_str!("../../tests/fixtures/pull_requests/github_repository.json"),
+        )
+        .expect("repository fixture");
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n  '--version ') echo 'gh version 2.97.0' ;;\n  'auth status') echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"test-user\"}}]}}}}' ;;\n  'api user') echo '{{\"login\":\"test-user\",\"name\":\"\"}}' ;;\n  'api repos/example/repository') cat '{}' ;;\n  'api repos/example/repository/labels?per_page=100') echo '[{{\"name\":\"bug\",\"color\":\"d73a4a\",\"description\":\"Bug fix\"}}]' ;;\n  *) echo \"unexpected fixture command $*\" >&2; exit 64 ;;\nesac\n",
+                repository_json.display()
+            ),
+            "",
+        );
+        let host_runner = HostCommandRunner::new(sandbox.path("state")).with_commands(
+            gh,
+            "missing-glab",
+            sandbox.executable_on_path("git"),
+        );
+        let c = CancellationToken::new();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repository.git",
+            ],
+        ] {
+            host_runner.git(&cwd, args, &c).await.expect("fixture git");
+        }
+        let lookups = PullRequestsService::with_runner(host_runner);
+        let runner = Arc::new(ControlledMutationRunner::blocking(HELD_PUSH));
+        let services = held_push_services(&runner);
+        let mut stream = services.stacked_action_stream_without_session(
+            stacked_request("2", &cwd, "commit_push"),
+            CancellationToken::new(),
+        );
+        runner.wait_for_mutation_start().await;
+
+        let (vocabulary, defaults) = tokio::time::timeout(ANSWER_WHILE_HELD, async {
+            tokio::join!(
+                lookups.vocabulary(&cwd, VocabularyKind::Labels, None, &c),
+                lookups.create_defaults(&cwd, &c),
+            )
+        })
+        .await
+        .expect("pull-request lookups answered while the push is held");
+        assert_eq!(vocabulary.expect("vocabulary").entries.len(), 1);
+        defaults.expect("create defaults");
+
+        runner.release_mutation.add_permits(1);
+        action_end(&mut stream).await.expect("action event");
     }
 }
 
@@ -5967,6 +6507,7 @@ esac
                 &services.pull_requests,
                 &invalid_action,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .is_err()
@@ -6091,6 +6632,121 @@ esac
         assert!(
             message.contains("origin") || message.contains("push destination"),
             "Git's own reason reaches the client: {message}"
+        );
+    }
+
+    /// A create_pr action with no push: the provider holds the request creation open and
+    /// status for the worktree is still answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_pull_request_step_without_a_push_delivers_status() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-held-pr-step");
+        let repository = sandbox.root().join("repository");
+        let bare_remote = sandbox.root().join("remote.git");
+        for directory in [&repository, &bare_remote] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .expect("fixture directory");
+        }
+        let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+        git(&sandbox, &bare_remote, &["init", "--bare", "-b", "main"]).await;
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "fixture@example.test"],
+            &["config", "user.name", "Fixture"],
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+            &["remote", "add", "origin", bare_remote_text.as_str()],
+            &["push", "-q", "-u", "origin", "main"],
+            &["switch", "-q", "-c", "feature/held"],
+            &["commit", "-q", "--allow-empty", "-m", "feature"],
+            &["push", "-q", "-u", "origin", "feature/held"],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/name.git",
+            ],
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                bare_remote_text.as_str(),
+            ],
+        ] {
+            git(&sandbox, &repository, args).await;
+        }
+        let creating = sandbox.root().join("pr-create-started");
+        let release = sandbox.root().join("pr-create-release");
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "case \"$1:$2\" in\n  pr:list) printf '[]\\n' ;;\n  pr:create) : > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n",
+                creating.display(),
+                release.display()
+            ),
+            "",
+        );
+        let mut services =
+            GitVcsRpcServices::with_repository(Arc::new(GitRepository::default()), Arc::default());
+        services.pull_requests = PullRequestService::with_provider_commands(
+            gh.to_string_lossy(),
+            "unused-glab",
+            "unused-az",
+        );
+        let mut stream = services.stacked_action_stream_without_session(
+            rpc_request(
+                "git.runStackedAction",
+                json!({
+                    "actionId": "held-pr-step",
+                    "cwd": repository,
+                    "action": "create_pr",
+                    "pullRequestTitle": "feature",
+                    "pullRequestBaseBranch": "main",
+                }),
+            ),
+            CancellationToken::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !creating.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pull-request creation starts");
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            services.handle_unary_with_context(
+                rpc_request("vcs.refreshStatus", json!({ "cwd": repository })),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("vcs.refreshStatus answered while the pull-request step is held")
+        .expect("refresh succeeds");
+        assert_eq!(refreshed["refName"], "feature/held", "{refreshed}");
+
+        std::fs::write(&release, "").expect("release the pull-request creation");
+        let ended = loop {
+            let values = stream
+                .recv()
+                .await
+                .expect("stacked stream ends with an event")
+                .expect("stacked chunk");
+            if let Some(event) = values
+                .into_iter()
+                .find(|event| event["kind"] != "action_started")
+            {
+                break event;
+            }
+        };
+        assert_eq!(ended["kind"], "action_finished", "{ended}");
+        assert_eq!(ended["result"]["pr"]["status"], "created", "{ended}");
+        assert_eq!(
+            ended["result"]["push"]["status"], "skipped_not_requested",
+            "the pull-request step, not a push, released reads: {ended}"
         );
     }
 
@@ -6220,6 +6876,7 @@ esac
                     &pull_requests,
                     &input,
                     &CancellationToken::new(),
+                    None,
                 )
                 .await
                 .expect_err("target required and validated");
@@ -6254,6 +6911,7 @@ esac
             &pull_requests,
             &github_merge_options,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("GitLab-only merge options are refused for GitHub");
@@ -6275,6 +6933,7 @@ esac
             &pull_requests,
             &reviewed,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("reviewed pull request creates");
@@ -6324,6 +6983,7 @@ esac
             &pull_requests,
             &reviewed,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("retry resolves the existing pull request");
@@ -6350,6 +7010,7 @@ esac
             &pull_requests,
             &with_options,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("existing request resolves");
@@ -6400,6 +7061,7 @@ esac
                 &pull_requests,
                 &explicit_current,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .expect("explicit current-source publication");
@@ -6433,6 +7095,7 @@ esac
             &pull_requests,
             &explicit_current,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("an unmapped upstream stays configured");
@@ -6463,6 +7126,7 @@ esac
             &pull_requests,
             &misplaced,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("a target outside a pull request action is rejected");
@@ -6611,9 +7275,10 @@ esac
                 "featureBranch": feature_branch, "commitMessage": "Do not commit",
             }))
             .unwrap();
-            let error = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-                .await
-                .expect_err("invalid source rejected before mutations");
+            let error =
+                run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                    .await
+                    .expect_err("invalid source rejected before mutations");
             assert!(
                 error.wire["detail"].as_str().unwrap().contains("branch"),
                 "{error:?}"
@@ -6638,9 +7303,10 @@ esac
             "pullRequestHeadBranch": "feature/source", "pullRequestBaseBranch": "main",
         }))
         .unwrap();
-        let result = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-            .await
-            .expect("selected branch publishes with a dirty current checkout");
+        let result =
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                .await
+                .expect("selected branch publishes with a dirty current checkout");
         let result = serde_json::to_value(result).unwrap();
         assert_eq!(result["push"]["branch"], "feature/source");
         assert_eq!(result["pr"]["headBranch"], "feature/source");
@@ -6691,7 +7357,7 @@ esac
         )
         .await;
         tokio::fs::write(&calls, "").await.unwrap();
-        run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+        run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
             .await
             .expect_err("a diverged source is never force-pushed");
         assert_eq!(
@@ -6716,9 +7382,10 @@ esac
 
         tokio::fs::write(&existing_marker, "1").await.unwrap();
         tokio::fs::write(&calls, "").await.unwrap();
-        let retried = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
-            .await
-            .expect("existing request resolves by selected head");
+        let retried =
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
+                .await
+                .expect("existing request resolves by selected head");
         assert_eq!(
             serde_json::to_value(retried).unwrap()["pr"]["status"],
             "opened_existing"
@@ -6747,7 +7414,7 @@ esac
         .await;
         tokio::fs::remove_file(&existing_marker).await.unwrap();
         let remote_only =
-            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation, None)
                 .await
                 .expect("origin-only source needs no push or checkout");
         let remote_only = serde_json::to_value(remote_only).unwrap();
@@ -7009,6 +7676,7 @@ esac
             &PullRequestService::with_provider_commands("unused-gh", "unused-glab", "unused-az"),
             &input,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect_err("an unidentified host is refused");
@@ -7558,16 +8226,22 @@ mod open_pull_request_lookup_tests {
     use crate::RequestId;
     use crate::test_support::TestSandbox;
 
-    /// Records the `--head` branch of every `pr list`, then answers from
-    /// marker files: `fail` exits 1, `slow` sleeps its contents in seconds,
-    /// and `open` returns one open PR for the requested branch.
+    /// Answers every `pr list` from marker files read when it starts, then
+    /// records its `--head` branch: `fail` exits 1, `slow` sleeps its contents
+    /// in seconds, and `open` returns one open PR for the requested branch.
+    /// The markers are read before the record, so a test that sees a lookup
+    /// recorded can change a marker without the change reaching that lookup.
     const FAKE_GH: &str = r#"#!/bin/sh
 case "$1:$2" in
   pr:list)
+    fail=''; if [ -f 'STATE/fail' ]; then fail=1; fi
+    open=''; if [ -f 'STATE/open' ]; then open=1; fi
+    slow=''; if [ -f 'STATE/slow' ]; then slow="$(cat 'STATE/slow')"; fi
     printf '%s\n' "$4" >> 'CALLS'
-    if [ -f 'STATE/fail' ]; then echo 'forge unavailable' >&2; exit 1; fi
-    if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
-    if [ -f 'STATE/open' ]; then
+    printf '%s\n' "$$" >> 'PIDS'
+    if [ -n "$fail" ]; then echo 'forge unavailable' >&2; exit 1; fi
+    if [ -n "$slow" ]; then sleep "$slow"; fi
+    if [ -n "$open" ]; then
       printf '[{"number":42,"title":"PR for %s","url":"https://github.com/acme/repo/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
     else
       printf '[]\n'
@@ -7582,6 +8256,8 @@ esac
         repository: PathBuf,
         state: PathBuf,
         calls: PathBuf,
+        pids: PathBuf,
+        registry: WorkspaceAvailabilityRegistry,
         services: GitVcsRpcServices,
     }
 
@@ -7609,25 +8285,79 @@ esac
                 ],
             );
             let calls = sandbox.path("gh-calls");
+            let pids = sandbox.path("gh-pids");
             TestSandbox::write_executable(
                 &bin.join("gh"),
                 &FAKE_GH
                     .replace("CALLS", &calls.to_string_lossy())
+                    .replace("PIDS", &pids.to_string_lossy())
                     .replace("STATE", &state.to_string_lossy()),
             );
             let hosts = Arc::new(ProviderHosts::default());
+            let registry = WorkspaceAvailabilityRegistry::new();
             let services = GitVcsRpcServices::with_repository(
                 Arc::new(GitRepository::default().with_provider_hosts(hosts.clone())),
                 hosts,
             )
-            .with_hosting_executable_dir_for_integration_test(bin);
+            .with_hosting_executable_dir_for_integration_test(bin)
+            .with_availability_registry(registry.clone());
             Self {
                 _sandbox: sandbox,
                 repository,
                 state,
                 calls,
+                pids,
+                registry,
                 services,
             }
+        }
+
+        /// Whether any fake `gh` this fixture started is still running.
+        fn a_forge_cli_is_running(&self) -> bool {
+            std::fs::read_to_string(&self.pids)
+                .unwrap_or_default()
+                .lines()
+                .any(|pid| {
+                    let stat = std::process::Command::new("ps")
+                        .args(["-o", "stat=", "-p", pid])
+                        .output()
+                        .expect("ps runs");
+                    let stat = String::from_utf8_lossy(&stat.stdout);
+                    !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+                })
+        }
+
+        async fn wait_until_no_forge_cli_runs(&self, why: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.a_forge_cli_is_running() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{why}: a gh lookup is still running"));
+        }
+
+        fn subscribe(&self, cancellation: &CancellationToken) -> Subscriber {
+            Subscriber {
+                stream: self
+                    .services
+                    .status_stream(subscribe_request(&self.repository), cancellation.clone()),
+                ref_name: Value::Null,
+                remote: Value::Null,
+                events: Vec::new(),
+            }
+        }
+
+        /// Forgets the remembered lookups without telling any status stream.
+        fn forget_lookups(&self) {
+            self.services
+                .pull_requests
+                .invalidate_open_pull_request_lookups(&self.repository);
+        }
+
+        /// What a finished `gh pr create` or merge from outside BiBCode reports.
+        fn report_pull_request_change(&self) {
+            self.services.pull_request_change_reporter()(&self.repository);
         }
 
         fn set(&self, marker: &str, contents: &str) {
@@ -7669,6 +8399,76 @@ esac
         async fn refresh(&self) -> Value {
             self.unary("vcs.refreshStatus", json!({ "cwd": self.repository }))
                 .await
+        }
+    }
+
+    /// The status a client shows, folded from the stream the way the client's
+    /// `applyGitStatusStreamEvent` folds it.
+    struct Subscriber {
+        stream: mpsc::Receiver<RpcStreamChunk>,
+        ref_name: Value,
+        remote: Value,
+        /// Each event with the pull request shown after it.
+        events: Vec<(Value, Value)>,
+    }
+
+    impl Subscriber {
+        fn pr(&self) -> Value {
+            self.remote.get("pr").cloned().unwrap_or(Value::Null)
+        }
+
+        async fn next(&mut self) {
+            let chunk = self
+                .stream
+                .recv()
+                .await
+                .expect("status stream stays open")
+                .expect("status stream event");
+            for event in chunk {
+                match event["_tag"].as_str() {
+                    Some("snapshot") => {
+                        self.ref_name = event["local"]["refName"].clone();
+                        self.remote = event["remote"].clone();
+                    }
+                    Some("localUpdated") => {
+                        if event["local"]["refName"] != self.ref_name {
+                            self.remote = Value::Null;
+                        }
+                        self.ref_name = event["local"]["refName"].clone();
+                    }
+                    Some("remoteUpdated") => self.remote = event["remote"].clone(),
+                    tag => panic!("unexpected status event {tag:?}"),
+                }
+                self.events.push((event, self.pr()));
+            }
+        }
+
+        async fn until(&mut self, why: &str, done: impl Fn(&Self) -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !done(self) {
+                    self.next().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{why}; events: {:?}", self.events));
+        }
+
+        /// Folds every event that arrives within `window`.
+        async fn drain(&mut self, window: Duration) {
+            let _ = tokio::time::timeout(window, async {
+                loop {
+                    self.next().await;
+                }
+            })
+            .await;
+        }
+
+        /// The pull request shown after each event since event `from`.
+        fn shown_since(&self, from: usize) -> Vec<Value> {
+            self.events[from..]
+                .iter()
+                .map(|(_, pr)| pr["number"].clone())
+                .collect()
         }
     }
 
@@ -7715,7 +8515,7 @@ esac
     async fn concurrent_refreshes_share_one_forge_lookup() {
         let fixture = Fixture::new("pr-lookup-coalesce");
         fixture.set("open", "");
-        fixture.set("slow", "1");
+        fixture.set("slow", "0.5");
         let (first, second, third) =
             tokio::join!(fixture.refresh(), fixture.refresh(), fixture.refresh());
         for status in [first, second, third] {
@@ -8063,6 +8863,435 @@ esac
         let recovered = fixture.refresh().await;
         assert_eq!(recovered["pr"]["number"], 42, "{recovered}");
         assert_eq!(fixture.lookups(), ["main", "main"]);
+    }
+
+    /// Subscribes and waits until the subscriber shows the open pull request.
+    async fn subscriber_showing_the_pull_request(
+        fixture: &Fixture,
+        cancellation: &CancellationToken,
+    ) -> Subscriber {
+        fixture.set("open", "");
+        let mut subscriber = fixture.subscribe(cancellation);
+        subscriber
+            .until("the subscriber shows the open pull request", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        subscriber
+    }
+
+    #[tokio::test]
+    async fn pr_row_same_ref_keeps_the_pull_request_while_a_lookup_runs() {
+        let fixture = Fixture::new("pr-row-same-ref");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        // The forge answers slowly now. A remote publication, a local update and a mutation
+        // that republishes the equal status under new epochs all arrive while it answers.
+        fixture.set("slow", "3");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        fixture
+            .services
+            .broadcaster
+            .begin_mutation(&fixture.repository)
+            .await
+            .finish()
+            .await;
+        subscriber.drain(Duration::from_millis(1500)).await;
+
+        assert!(
+            subscriber.events.len() > from,
+            "the test drove no status event"
+        );
+        assert!(
+            subscriber.shown_since(from).iter().all(|pr| *pr == 42),
+            "the pull request must stay shown while its lookup runs: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_an_open_request_is_shown_when_the_lookup_ends() {
+        let fixture = Fixture::new("pr-row-open");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        assert!(subscriber.pr().is_null(), "{:?}", subscriber.events);
+
+        fixture.set("open", "");
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the open pull request must be shown", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_no_open_request_clears_it_when_the_lookup_ends() {
+        let fixture = Fixture::new("pr-row-none");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        // The request was merged on the web.
+        fixture.clear("open");
+        fixture.set("slow", "1");
+        let reported = tokio::time::Instant::now();
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the subscriber must clear the closed request", |s| {
+                s.pr().is_null()
+            })
+            .await;
+
+        assert!(
+            reported.elapsed() >= Duration::from_millis(900),
+            "only the lookup's own answer clears the request: {:?}",
+            &subscriber.events[from..]
+        );
+        assert_eq!(fixture.lookups(), ["main", "main"]);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_failed_lookup_keeps_the_pull_request() {
+        let fixture = Fixture::new("pr-row-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        fixture.set("fail", "");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        assert!(
+            subscriber.events.len() > from,
+            "the test drove no status event"
+        );
+        assert!(
+            subscriber.shown_since(from).iter().all(|pr| *pr == 42),
+            "a failed lookup must keep the pull request: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_ref_change_clears_the_pull_request_at_once() {
+        let fixture = Fixture::new("pr-row-ref-change");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        fixture.set("slow", "6");
+        git(&fixture.repository, &["switch", "-q", "-c", "feature"]);
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        let started = tokio::time::Instant::now();
+        subscriber
+            .until("the subscriber must see the new branch", |s| {
+                s.ref_name == "feature"
+            })
+            .await;
+        assert!(
+            subscriber.pr().is_null(),
+            "the old branch's request must clear with the branch change: {:?}",
+            subscriber.events
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the clear must not wait for the new branch's lookup"
+        );
+        subscriber
+            .until("the new branch's request must be shown", |s| {
+                s.pr()["headRef"] == "feature"
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_result_across_an_epoch_change_is_delivered_once() {
+        let fixture = Fixture::new("pr-row-epoch");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        assert!(subscriber.pr().is_null(), "{:?}", subscriber.events);
+
+        // The lookup answers while a mutation holds the status gate, so its fence is old.
+        fixture.set("open", "");
+        fixture.set("slow", "1");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        let mutation = fixture
+            .services
+            .broadcaster
+            .begin_mutation(&fixture.repository)
+            .await;
+        subscriber.drain(Duration::from_millis(2000)).await;
+        assert!(
+            subscriber.pr().is_null(),
+            "nothing is published while the gate is closed: {:?}",
+            subscriber.events
+        );
+        let from = subscriber.events.len();
+        mutation.finish().await;
+        subscriber
+            .until("the late result must be delivered", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        let deliveries = subscriber.events[from..]
+            .iter()
+            .filter(|(event, _)| event["remote"]["pr"]["number"] == 42)
+            .count();
+        assert_eq!(deliveries, 1, "delivered once: {:?}", subscriber.events);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_at_its_bound_returns_the_last_known_pull_request() {
+        let fixture = Fixture::new("pr-refresh-bound");
+        let cancellation = CancellationToken::new();
+        let _subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        fixture.set("slow", "6");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert_eq!(status["pr"]["number"], 42, "{status}");
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_reaches_the_subscriber() {
+        let fixture = Fixture::new("pr-refresh-late");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // Nothing tells the stream to look again; only the refresh does.
+        fixture.set("open", "");
+        fixture.set("slow", "6");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert!(status["pr"].is_null(), "{status}");
+        subscriber
+            .until("the subscriber must receive the late lookup", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn refreshes_past_the_bound_do_not_restart_the_subscriber_lookup() {
+        let fixture = Fixture::new("pr-refresh-repeated");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // Each refresh joins the lookup and stops waiting at its bound, again and again,
+        // while the lookup takes twice that bound.
+        fixture.set("open", "");
+        fixture.set("slow", "4");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        let refreshes = async {
+            loop {
+                fixture.refresh().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::select! {
+            () = subscriber.until("the lookup must finish while refreshes repeat", |s| {
+                s.pr()["number"] == 42
+            }) => {}
+            () = refreshes => {}
+        }
+        assert_eq!(
+            fixture.lookups(),
+            ["main", "main"],
+            "the refreshes must not restart the subscriber's lookup"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_change_reported_during_a_lookup_is_looked_up_again() {
+        let fixture = Fixture::new("pr-lookup-again");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // A lookup that started before the request was created answers that none is open.
+        fixture.set("slow", "1");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        fixture.set("open", "");
+        fixture.report_pull_request_change();
+        subscriber
+            .until("the reported request must be looked up again", |s| {
+                s.pr()["number"] == 42
+            })
+            .await;
+        assert_eq!(fixture.lookups(), ["main", "main", "main"]);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_local_change_during_a_lookup_replaces_its_outdated_answer() {
+        let fixture = Fixture::new("pr-lookup-local-again");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        // This lookup reads the open request, then answers slowly.
+        fixture.set("slow", "2");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The request is closed, and a local change on the same branch reports it.
+        fixture.clear("open");
+        std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        subscriber
+            .until(
+                "the closed request must clear after the outdated answer",
+                |s| s.pr().is_null(),
+            )
+            .await;
+        assert_eq!(
+            fixture.lookups(),
+            ["main", "main", "main"],
+            "one follow-up lookup runs after the outdated one"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_queued_publication_shows_the_known_pull_request_at_once() {
+        let fixture = Fixture::new("pr-queued-publication");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+        let from = subscriber.events.len();
+
+        // A remote publication read before the lookup answered carries no request.
+        let mut remote: VcsStatusRemoteResult =
+            serde_json::from_value(subscriber.remote.clone()).expect("shown remote");
+        remote.pr = None;
+        fixture
+            .services
+            .broadcaster
+            .publish_status_event_for_test(
+                &fixture.repository,
+                VcsStatusStreamEvent::RemoteUpdated {
+                    remote: Some(remote),
+                },
+            )
+            .await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        assert_eq!(
+            subscriber.shown_since(from),
+            [json!(42)],
+            "one event that keeps the known request: {:?}",
+            &subscriber.events[from..]
+        );
+        cancellation.cancel();
+    }
+
+    /// A subscriber, then a refresh that stops waiting for a 30 second lookup at its bound.
+    async fn a_refresh_past_its_bound(
+        fixture: &Fixture,
+        cancellation: &CancellationToken,
+    ) -> Subscriber {
+        fixture.set("slow", "30");
+        let mut subscriber = fixture.subscribe(cancellation);
+        subscriber.next().await;
+        wait_for_lookups(fixture, "main", 1).await;
+        tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert!(
+            fixture.a_forge_cli_is_running(),
+            "the subscriber still looks"
+        );
+        subscriber
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_stops_with_the_workspace() {
+        let fixture = Fixture::new("pr-refresh-loss");
+        let cancellation = CancellationToken::new();
+        // An open Git Manager keeps its signal subscription across a workspace loss.
+        let _git_manager = fixture
+            .services
+            .broadcaster
+            .subscribe_git_manager_signal(fixture.repository.clone(), cancellation.clone())
+            .await
+            .expect("Git Manager signal subscription");
+        let _subscriber = a_refresh_past_its_bound(&fixture, &cancellation).await;
+
+        assert!(
+            fixture
+                .registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-lookup".to_owned(),
+                    repository_key: "repository-lookup".to_owned(),
+                    generation: 1,
+                    path: fixture.repository.clone(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+        fixture
+            .wait_until_no_forge_cli_runs("after the workspace was lost")
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_the_refresh_bound_stops_at_quiesce() {
+        let fixture = Fixture::new("pr-refresh-quiesce");
+        let cancellation = CancellationToken::new();
+        let _subscriber = a_refresh_past_its_bound(&fixture, &cancellation).await;
+
+        fixture.services.broadcaster.shutdown().await;
+        fixture
+            .wait_until_no_forge_cli_runs("after the status broadcaster shut down")
+            .await;
+        cancellation.cancel();
     }
 }
 

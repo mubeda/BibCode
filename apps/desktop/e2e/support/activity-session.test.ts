@@ -378,6 +378,22 @@ describe("materializeDesktopActivitySession", () => {
     );
   });
 
+  it("turns the WebGL terminal renderer off in the same settings update when asked", async () => {
+    installHarness();
+
+    await configureDesktopActivityCodexExecutable("/fixture/provider-shims/codex", {
+      webglEnabled: false,
+    });
+
+    expect(sentRequests).toHaveLength(1);
+    expect(sentRequests[0]?.payload).toEqual({
+      patch: expect.objectContaining({
+        enableTerminalAgentActivity: true,
+        terminal: { webglEnabled: false },
+      }),
+    });
+  });
+
   it("synchronizes the activity terminal with the exact configured Codex executable", async () => {
     installHarness();
 

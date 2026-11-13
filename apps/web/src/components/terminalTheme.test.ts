@@ -8,7 +8,10 @@ import {
   retainTerminalLaunchTheme,
   terminalOscColorEnv,
   usesPersistentWindowsConsoleTheme,
+  resolveTerminalPalette,
 } from "./terminalTheme";
+import type { ThemeFile } from "@bibcode/contracts";
+import { BUILTIN_THEMES } from "../themes/builtinThemes";
 
 describe("terminal theme launch values", () => {
   it("maps resolved light and dark themes to exact OSC colors", () => {
@@ -210,5 +213,75 @@ describe("terminal theme launch values", () => {
     }
     expect(terminalAnsiColors("dark").red).toBe("rgb(255, 122, 142)");
     expect(terminalAnsiColors("light").red).toBe("rgb(191, 70, 87)");
+  });
+});
+
+describe("terminal palette from the app theme", () => {
+  const builtin = (id: string) => BUILTIN_THEMES.find((theme) => theme.id === id)!;
+  const custom = (terminal: Record<string, string> = {}): ThemeFile => ({
+    version: 1,
+    id: "mine",
+    name: "Mine",
+    base: "dark",
+    terminal,
+  });
+
+  it("with preference app and Tokyo Night the ANSI green is #9ece6a and the OSC background is 26,27,38", () => {
+    const palette = resolveTerminalPalette("app", builtin("tokyo-night"));
+    expect(terminalAnsiColors(palette).green).toBe("#9ece6a");
+    expect(terminalOscColorEnv(palette).BIBCODE_OSC_BACKGROUND).toBe("26,27,38");
+  });
+
+  it("Matrix Dark gives ANSI green #2d9a48 and OSC background 8,12,9", () => {
+    const palette = resolveTerminalPalette("app", builtin("matrix-dark"));
+    expect(terminalAnsiColors(palette).green).toBe("#2d9a48");
+    expect(terminalOscColorEnv(palette).BIBCODE_OSC_BACKGROUND).toBe("8,12,9");
+  });
+
+  it("Matrix Light gives ANSI green #15803d and OSC background 255,255,255", () => {
+    const palette = resolveTerminalPalette("app", builtin("matrix-light"));
+    expect(palette.mode).toBe("light");
+    expect(terminalAnsiColors(palette).green).toBe("#15803d");
+    expect(terminalOscColorEnv(palette).BIBCODE_OSC_BACKGROUND).toBe("255,255,255");
+  });
+
+  it("Verdant Light gives ANSI green #26734d, ANSI red #b42318 and OSC foreground 48,56,64", () => {
+    const palette = resolveTerminalPalette("app", builtin("verdant-light"));
+    expect(terminalAnsiColors(palette)).toMatchObject({ green: "#26734d", red: "#b42318" });
+    expect(terminalOscColorEnv(palette).BIBCODE_OSC_FOREGROUND).toBe("48,56,64");
+  });
+
+  it("with preference dark the built-in dark palette is used whatever the theme", () => {
+    for (const id of ["tokyo-night", "verdant-light"]) {
+      const palette = resolveTerminalPalette("dark", builtin(id));
+      expect(palette.mode).toBe("dark");
+      expect(terminalOscColorEnv(palette)).toEqual(terminalOscColorEnv("dark"));
+      expect(terminalAnsiColors(palette).green).toBe("#86e795");
+    }
+  });
+
+  it("a theme with no terminal colors uses its base's built-in palette", () => {
+    const palette = resolveTerminalPalette("app", custom());
+    expect(terminalOscColorEnv(palette)).toEqual(terminalOscColorEnv("dark"));
+    expect(terminalAnsiColors(palette).red).toBe("#ff7a8e");
+  });
+
+  it("editing a theme's ANSI red changes the palette key although the id is the same", () => {
+    const before = resolveTerminalPalette("app", custom({ red: "#ff5555" }));
+    const after = resolveTerminalPalette("app", custom({ red: "#ff0000" }));
+    expect(terminalAnsiColors(before).red).toBe("#ff5555");
+    expect(after.key).not.toBe(before.key);
+    expect(resolveTerminalPalette("app", custom({ red: "#ff5555" })).key).toBe(before.key);
+  });
+
+  it("a running session keeps the full palette it was launched with after the theme changes", () => {
+    const launched = resolveTerminalPalette("app", builtin("tokyo-night"));
+    const changed = resolveTerminalPalette("app", builtin("matrix-dark"));
+    const input = { persistentConsoleTheme: false, resolvedTheme: "dark" as const };
+    const first = retainTerminalLaunchTheme(null, { ...input, generation: 1, palette: launched });
+    const same = retainTerminalLaunchTheme(first, { ...input, generation: 1, palette: changed });
+    expect(same.palette).toBe(launched);
+    const next = retainTerminalLaunchTheme(same, { ...input, generation: 2, palette: changed });
+    expect(next.palette).toBe(changed);
   });
 });

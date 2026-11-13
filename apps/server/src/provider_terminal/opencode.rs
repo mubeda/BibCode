@@ -2162,6 +2162,7 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
                     timeout: Duration::from_millis(900),
                     cleanup_timeout: Duration::from_secs(2),
                     max_output_bytes: OPENCODE_PROBE_OUTPUT_LIMIT,
+                    stop_policy: crate::process::supervised::StopPolicy::Force,
                     overflow: SupervisedOverflow::Truncate,
                 },
                 &tokio_util::sync::CancellationToken::new(),

@@ -588,6 +588,18 @@ impl NativeServerControl {
                 "settings patch must be an object",
             ));
         }
+        // Checked on the patch only, so a prompt stored before the rule still loads (#293).
+        if patch
+            .get("codeReviewPrompt")
+            .and_then(Value::as_str)
+            .is_some_and(crate::orchestration::engine::code_review_prompt_has_control_character)
+        {
+            return Err(settings_error(
+                &self.settings_path,
+                "normalize",
+                "codeReviewPrompt holds a control character other than tab or a line break",
+            ));
+        }
         if let Some(raw) = patch.get("worktreeBaseDirectory").and_then(Value::as_str) {
             let normalized = super::worktree_workspace::normalize_worktree_workspace(raw)
                 .await
@@ -722,6 +734,28 @@ impl NativeServerControl {
                 *current = next_mcp_server;
                 true
             });
+            // An instance this build cannot run is known without a probe: publish it first, so
+            // no client sees it in settings with no snapshot, as if still being probed (#347).
+            let unsupported = {
+                let current = commit_control.providers.read().await;
+                provider_inventory::unsupported_instances(&next)
+                    .into_iter()
+                    .filter(|result| {
+                        !current.iter().any(|row| {
+                            row.get("instanceId") == result.snapshot.get("instanceId")
+                                && row.get("availability") == Some(&json!("unavailable"))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if !unsupported.is_empty() {
+                let (providers, changed) = commit_control
+                    .merge_provider_snapshots(unsupported, true)
+                    .await;
+                if changed {
+                    commit_control.publish_provider_snapshots(&providers);
+                }
+            }
             commit_control.publish(json!({
                 "version": 1,
                 "type": "settingsUpdated",
@@ -2196,7 +2230,26 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
         validate_model_selection(selection, "textGenerationModelSelection")?;
     }
     if let Some(default_agent) = object.get("defaultAgent") {
-        validate_default_agent(default_agent)?;
+        validate_default_agent(default_agent, "defaultAgent")?;
+    }
+    if let Some(agent) = object.get("codeReviewAgent") {
+        validate_default_agent(agent, "codeReviewAgent")?;
+    }
+    if let Some(selection) = object.get("codeReviewModelSelection")
+        && !selection.is_null()
+    {
+        validate_model_selection(selection, "codeReviewModelSelection")?;
+    }
+    if let Some(prompt) = object.get("codeReviewPrompt") {
+        let max = crate::orchestration::engine::CODE_REVIEW_PROMPT_MAX_LENGTH;
+        if prompt
+            .as_str()
+            .is_none_or(|prompt| prompt.encode_utf16().count() > max)
+        {
+            return Err(format!(
+                "codeReviewPrompt must be a string of at most {max} characters"
+            ));
+        }
     }
     if let Some(providers) = object.get("providers") {
         validate_legacy_provider_settings(providers)?;
@@ -2404,20 +2457,24 @@ fn validate_model_selection(selection: &Value, field: &str) -> Result<(), String
     Ok(())
 }
 
-fn validate_default_agent(value: &Value) -> Result<(), String> {
+fn validate_default_agent(value: &Value, field: &str) -> Result<(), String> {
     let selection = value
         .as_object()
-        .ok_or_else(|| "defaultAgent must be an object".to_owned())?;
+        .ok_or_else(|| format!("{field} must be an object"))?;
     match selection.get("kind").and_then(Value::as_str) {
         Some("chat" | "terminal") => {}
-        _ => return Err("defaultAgent.kind must be either \"chat\" or \"terminal\"".to_owned()),
+        _ => {
+            return Err(format!(
+                "{field}.kind must be either \"chat\" or \"terminal\""
+            ));
+        }
     }
     validate_slug(
         selection
             .get("instanceId")
             .and_then(Value::as_str)
-            .ok_or_else(|| "defaultAgent.instanceId is required".to_owned())?,
-        "defaultAgent.instanceId",
+            .ok_or_else(|| format!("{field}.instanceId is required"))?,
+        &format!("{field}.instanceId"),
     )
 }
 
@@ -2621,11 +2678,19 @@ fn apply_settings_defaults(settings: &mut Value) {
             "terminal": { "webglEnabled": true },
         }),
     );
-    settings
-        .as_object_mut()
-        .expect("settings object")
+    let object = settings.as_object_mut().expect("settings object");
+    object
         .entry("defaultAgent")
         .or_insert_with(|| json!({ "kind": "chat", "instanceId": "codex" }));
+    object
+        .entry("codeReviewAgent")
+        .or_insert_with(|| json!({ "kind": "chat", "instanceId": "codex" }));
+    object
+        .entry("codeReviewModelSelection")
+        .or_insert(Value::Null);
+    object
+        .entry("codeReviewPrompt")
+        .or_insert_with(|| json!(""));
 }
 
 fn apply_settings_patch(target: &mut Value, patch: Value) {
@@ -2638,6 +2703,8 @@ fn apply_settings_patch(target: &mut Value, patch: Value) {
             || key == "providerSessionDefaults"
             || key == "automaticGitFetchInterval"
             || key == "defaultAgent"
+            || key == "codeReviewAgent"
+            || key == "codeReviewModelSelection"
         {
             target.insert(key.clone(), value.clone());
             continue;
@@ -2833,9 +2900,13 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookBearerToken": true,
         "webhookStatusKinds": true,
         "sideChats": true,
+        "codeReviews": true,
+        "hostMetrics": true,
         "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
+    // Outside the literal above, which is at `json!`'s recursion limit.
+    capabilities["terminalUserInputClaim"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
         json!(crate::production::pipelines_rpc::pipelines_reads_registered());
@@ -4414,6 +4485,65 @@ mod tests {
         assert_stale_manual_refresh_is_replaced_by_settings(true).await;
     }
 
+    /// #347: a chat on an instance whose driver this server does not ship must be explained as
+    /// unavailable, not left looking like an instance still being probed. Its snapshot is
+    /// published before the settings that add it, so no client ever sees it missing.
+    #[tokio::test]
+    async fn an_unsupported_driver_is_published_unavailable_before_the_settings_that_add_it() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let mut events = control.config_events.subscribe();
+        let quick_pause = control.install_next_quick_provider_probe_pause().await;
+        let update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({
+                        "patch": {
+                            "providerInstances": {
+                                "fork_agent": { "driver": "forkAgent", "enabled": true }
+                            }
+                        }
+                    }))
+                    .await
+            })
+        };
+        // The quick probe has not run yet.
+        quick_pause.wait_until_entered().await;
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        let settings_at = published
+            .iter()
+            .position(|event| event["type"] == "settingsUpdated")
+            .expect("settings published");
+        let unavailable = published[..settings_at]
+            .iter()
+            .filter(|event| event["type"] == "providerStatuses")
+            .filter_map(|event| event["payload"]["providers"].as_array())
+            .flatten()
+            .find(|provider| provider["instanceId"] == "fork_agent")
+            .unwrap_or_else(|| panic!("no snapshot before the settings: {published:?}"));
+        assert_eq!(unavailable["availability"], "unavailable", "{unavailable}");
+        assert_eq!(unavailable["enabled"], false, "{unavailable}");
+        assert_eq!(unavailable["installed"], false, "{unavailable}");
+        assert!(
+            unavailable["unavailableReason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{unavailable}"
+        );
+        quick_pause.release();
+        update
+            .await
+            .expect("settings update joins")
+            .expect("settings update");
+        let providers = control.providers.read().await.clone();
+        let after = providers
+            .iter()
+            .find(|provider| provider["instanceId"] == "fork_agent")
+            .expect("still listed after the probe");
+        assert_eq!(after["availability"], "unavailable");
+    }
+
     async fn assert_explicit_provider_refresh_publishes_unchanged_inventory(payload: Value) {
         let temp = tempfile::tempdir().expect("state directory");
         let control = scheduler_control(&temp).await;
@@ -5987,6 +6117,136 @@ mod tests {
         assert!(validate_settings_document(&settings).is_err());
     }
 
+    #[test]
+    fn code_review_settings_default_when_missing() {
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+        assert_eq!(
+            settings["codeReviewAgent"],
+            json!({"kind":"chat","instanceId":"codex"})
+        );
+        assert_eq!(settings["codeReviewModelSelection"], Value::Null);
+        assert_eq!(settings["codeReviewPrompt"], "");
+        assert!(validate_settings_document(&settings).is_ok());
+    }
+
+    #[tokio::test]
+    async fn code_review_settings_patch_replaces_model_whole() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+
+        control
+            .update_settings(json!({"patch":{
+                "codeReviewAgent":{"kind":"terminal","instanceId":"claudeAgent"},
+                "codeReviewModelSelection":{
+                    "instanceId":"claudeAgent","model":"opus",
+                    "options":[{"id":"effort","value":"high"}]
+                },
+                "codeReviewPrompt":"Look at tests."
+            }}))
+            .await
+            .expect("store review settings");
+        let updated = control
+            .update_settings(json!({"patch":{
+                "codeReviewModelSelection":{"instanceId":"codex","model":"gpt-5"}
+            }}))
+            .await
+            .expect("replace review model");
+        assert_eq!(
+            updated["codeReviewModelSelection"],
+            json!({"instanceId":"codex","model":"gpt-5"})
+        );
+        assert_eq!(
+            updated["codeReviewAgent"],
+            json!({"kind":"terminal","instanceId":"claudeAgent"})
+        );
+        assert_eq!(updated["codeReviewPrompt"], "Look at tests.");
+
+        let cleared = control
+            .update_settings(json!({"patch":{"codeReviewModelSelection":null}}))
+            .await
+            .expect("clear review model");
+        assert_eq!(cleared["codeReviewModelSelection"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn code_review_settings_reject_long_prompt_and_bad_agent() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        control
+            .update_settings(json!({"patch":{"codeReviewPrompt":"Kept."}}))
+            .await
+            .expect("store review prompt");
+        let before = control.settings.read().await.clone();
+
+        // 7,680 UTF-16 units is the limit; "é" is one unit, so this is 7,681.
+        let long = format!("{}é", "a".repeat(7_680));
+        for patch in [
+            json!({"codeReviewPrompt": long}),
+            json!({"codeReviewPrompt": 7}),
+            json!({"codeReviewAgent":{"kind":"other"}}),
+            json!({"codeReviewModelSelection":{"instanceId":"codex"}}),
+        ] {
+            assert!(
+                control
+                    .update_settings(json!({ "patch": patch }))
+                    .await
+                    .is_err(),
+                "{patch} must be rejected"
+            );
+            assert_eq!(*control.settings.read().await, before);
+        }
+        control
+            .update_settings(json!({"patch":{"codeReviewPrompt": "😀".repeat(3_840)}}))
+            .await
+            .expect("7,680 UTF-16 units fit");
+    }
+
+    /// #293: the review prompt holds no control character but tab, line feed and carriage
+    /// return (C0, DEL and C1, as the web checks); a stored one from before the rule loads.
+    #[tokio::test]
+    async fn code_review_prompt_rejects_control_characters_on_write_only() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"codeReviewPrompt": "Old\u{1b}text"}),
+        );
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        assert_eq!(
+            control.settings.read().await["codeReviewPrompt"],
+            "Old\u{1b}text",
+            "a stored prompt from before the rule still loads"
+        );
+        control
+            .update_settings(json!({"patch":{"enableProfiler": false}}))
+            .await
+            .expect("an old prompt does not block other updates");
+        for control_character in [
+            '\u{0}', '\u{8}', '\u{b}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}',
+        ] {
+            let error = control
+                .update_settings(json!({
+                    "patch":{"codeReviewPrompt": format!("a{control_character}b")}
+                }))
+                .await
+                .expect_err("a control character is rejected");
+            assert!(
+                error.to_string().contains("control character"),
+                "{control_character:?}: {error}"
+            );
+        }
+        let updated = control
+            .update_settings(json!({"patch":{"codeReviewPrompt": "Kept\tline\r\nnext\u{a0}"}}))
+            .await
+            .expect("tab, line breaks and U+00A0 are allowed");
+        assert_eq!(updated["codeReviewPrompt"], "Kept\tline\r\nnext\u{a0}");
+    }
+
     #[tokio::test]
     async fn default_agent_update_persists_as_a_whole_selection() {
         let temp = tempfile::tempdir().expect("control root");
@@ -7325,6 +7585,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
+        assert_eq!(descriptor["capabilities"]["terminalUserInputClaim"], true);
         assert_eq!(descriptor["capabilities"]["previewTunnels"], true);
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
@@ -7334,6 +7595,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["codeReviews"], true);
+        assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
         // environment's logs only when it says so (#194).

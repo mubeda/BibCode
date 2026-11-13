@@ -396,7 +396,7 @@ Every `worktree.remove` and `worktree.removeFromBibCode` outcome.
 
 ### worktree.audit
 
-One per read-only worktree scan: right after the profiler turns on, then every
+One per worktree scan: right after the profiler turns on, then every
 10 minutes.
 
 - `entries`: catalog entries;

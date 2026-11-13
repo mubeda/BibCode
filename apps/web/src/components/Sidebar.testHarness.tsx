@@ -88,6 +88,9 @@ const h = vi.hoisted(() => {
     showJumpHintModifiers: false,
     terminalSurfaceOpen: false,
     presentationPolicy: null as unknown,
+    // A test that sets this renders the real CreateWorktreeDialog under the Sidebar.
+    realCreateWorktreeDialog: false,
+    primaryDefaultAgent: null as unknown,
     // mock stores
     ui: null,
     selection: null,
@@ -203,6 +206,8 @@ const h = vi.hoisted(() => {
     closestCorners: vi.fn(),
     copyToClipboard: vi.fn(),
     windowConfirm: vi.fn(),
+    askBeforeLeaving: vi.fn(),
+    releaseLeaveHolds: vi.fn(),
     openProjectDataRecovery: vi.fn(async () => undefined),
   };
 
@@ -420,6 +425,7 @@ vi.mock("../state/query", () => ({
       emission: { _tag: "Success" },
       isPending: false,
       refresh: () => {},
+      revalidate: () => {},
     };
   },
 }));
@@ -485,6 +491,7 @@ vi.mock("../state/threads", () => ({
 vi.mock("../state/vcs", () => ({
   vcsEnvironment: {
     status: (args: unknown) => ({ __q: "vcs.status", args }),
+    listRefs: (args: unknown) => ({ __q: "vcs.listRefs", args }),
     summary: (args: unknown) => ({ __q: "vcs.summary", args }),
     pull: { label: "vcs.pull" },
     refreshStatus: { label: "vcs.refreshStatus" },
@@ -510,10 +517,17 @@ vi.mock("../state/worktrees", () => ({
     updatePolicy: { label: "worktree.updatePolicy" },
     addOne: { label: "worktree.addOne" },
     addAll: { label: "worktree.addAll" },
+    createManaged: { label: "worktree.createManaged" },
   },
   useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
     h.state.discoveryFocusRefreshCalls.push([...projects]);
   },
+}));
+
+// The real module reads document.activeElement; these tests run without a DOM.
+vi.mock("./files/unsavedFileEdits", () => ({
+  askBeforeLeaving: h.spies.askBeforeLeaving,
+  releaseLeaveHolds: h.spies.releaseLeaveHolds,
 }));
 
 vi.mock("../state/projectDataSafety", () => ({
@@ -586,6 +600,7 @@ vi.mock("~/hooks/useSettings", () => ({
     selector({ ...h.state.clientSettings }),
   useClientSettings: (selector: (settings: unknown) => unknown) => selector(h.state.clientSettings),
   useUpdateClientSettings: () => h.spies.updateSettings,
+  usePrimaryDefaultAgent: () => h.state.primaryDefaultAgent,
 }));
 
 vi.mock("~/hooks/useCopyToClipboard", () => ({
@@ -683,9 +698,17 @@ vi.mock("./ThreadStatusIndicators", () => ({
 }));
 
 vi.mock("./ProjectFavicon", () => ({ ProjectFavicon: h.mk("ProjectFavicon", "span") }));
-vi.mock("./CreateWorktreeDialog", () => ({
-  CreateWorktreeDialog: h.mk("CreateWorktreeDialog"),
-}));
+vi.mock("./CreateWorktreeDialog", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./CreateWorktreeDialog")>();
+  const Mocked = h.mk("CreateWorktreeDialog");
+  const CreateWorktreeDialog = (props: Parameters<typeof actual.CreateWorktreeDialog>[0]) => {
+    const R = h.state.React as typeof import("react");
+    return h.state.realCreateWorktreeDialog
+      ? R.createElement(actual.CreateWorktreeDialog, props)
+      : R.createElement(Mocked, props as unknown as Record<string, unknown>);
+  };
+  return { CreateWorktreeDialog };
+});
 vi.mock("./settings/SettingsSidebarNav", () => ({
   SettingsSidebarNav: h.mk("SettingsSidebarNav"),
 }));
@@ -752,6 +775,8 @@ vi.mock("./ui/number-field", () => ({
 
 vi.mock("./ui/select", () => ({
   Select: h.mk("Select"),
+  SelectGroup: h.mk("SelectGroup"),
+  SelectGroupLabel: h.mk("SelectGroupLabel"),
   SelectItem: h.mk("SelectItem"),
   SelectPopup: h.mk("SelectPopup"),
   SelectTrigger: h.mk("SelectTrigger", "button"),
@@ -806,6 +831,7 @@ function makeProject(
     repositoryIdentity: null,
     defaultModelSelection: null,
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: iso(600),
     updatedAt: iso(60),
@@ -1213,6 +1239,8 @@ beforeEach(() => {
   h.state.shortcutLabelOptions = [];
   h.state.showJumpHintModifiers = false;
   h.state.terminalSurfaceOpen = false;
+  h.state.realCreateWorktreeDialog = false;
+  h.state.primaryDefaultAgent = null;
   h.state.presentationPolicy = createEnvironmentPresentationPolicy({
     surface: "browser",
     platform: "unknown",
@@ -1228,6 +1256,7 @@ beforeEach(() => {
   h.spies.pointerWithin.mockReturnValue([]);
   h.spies.closestCorners.mockReturnValue([]);
   h.spies.windowConfirm.mockReturnValue(true);
+  h.spies.askBeforeLeaving.mockResolvedValue("proceed");
 
   if (!browserRuntime) {
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {

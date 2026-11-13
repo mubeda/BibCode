@@ -10,7 +10,7 @@ use bibcode_server::remote_update::{
     RemoteUpdateSupportReason,
 };
 use serde_json::Value;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::backend::BackendSupervisor;
 use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager, RemoteUpdateRequest};
@@ -194,14 +194,57 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>, requester: RemoteUpda
             return;
         }
     }
+    if !window_allows_install(&app).await {
+        tracing::warn!(
+            requester_label = requester.label.as_deref().unwrap_or("Another device"),
+            requester_session = requester.session_id_prefix.as_deref().unwrap_or(""),
+            "remote update install stopped because this window kept unsaved Files edits"
+        );
+        return;
+    }
+    install_after_allow(&app, &requester).await;
+}
+
+/// Tells the window when a remote install it allowed ends without restarting the app.
+pub const UPDATE_INSTALL_ENDED_EVENT: &str = "desktop:update-install-ended";
+
+/// Armed once the window allowed the install, which then keeps Files editing blocked. Dropped
+/// on any return before `completed`, it lets the window unblock (R62).
+struct AllowedInstall<R: Runtime> {
+    app: AppHandle<R>,
+    completed: bool,
+}
+
+impl<R: Runtime> Drop for AllowedInstall<R> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Err(error) = self.app.emit_to(
+            crate::window::MAIN_WINDOW_LABEL,
+            UPDATE_INSTALL_ENDED_EVENT,
+            (),
+        ) {
+            tracing::warn!(%error, "failed to tell the window the update install ended");
+        }
+    }
+}
+
+async fn install_after_allow<R: Runtime>(app: &AppHandle<R>, requester: &RemoteUpdateRequester) {
+    let mut allowed = AllowedInstall {
+        app: app.clone(),
+        completed: false,
+    };
+    let updates = app.state::<DesktopUpdateManager>();
     let backend = app.state::<BackendSupervisor>();
     // A successful install restarts the host on Linux and macOS, so a result that comes
     // back without `completed` is a refusal or a failure the host updater has recorded.
     let installed = updates
-        .install_update(&app, backend.inner(), DesktopUpdateInstallInput::default())
+        .install_update(app, backend.inner(), DesktopUpdateInstallInput::default())
         .await;
-    if installed["completed"].as_bool() != Some(true) {
-        updates.note_remote_secondary_protection_failure(&app);
+    allowed.completed = installed["completed"].as_bool() == Some(true);
+    if !allowed.completed {
+        updates.note_remote_secondary_protection_failure(app);
         tracing::warn!(
             requester_label = requester.label.as_deref().unwrap_or("Another device"),
             requester_session = requester.session_id_prefix.as_deref().unwrap_or(""),
@@ -210,6 +253,19 @@ async fn run_remote_install<R: Runtime>(app: AppHandle<R>, requester: RemoteUpda
             message = installed["state"]["message"].as_str().unwrap_or(""),
             "remote update install did not complete"
         );
+    }
+}
+
+/// R62: the install restarts the app, so this window is asked first, the same way as an install
+/// started here. Without the guard (no window in this process) nothing can hold an edit.
+async fn window_allows_install<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let answer = match app.try_state::<crate::window::CloseGuard>() {
+        None => return true,
+        Some(guard) => guard.ask_before_update(std::time::Instant::now()),
+    };
+    match answer {
+        Some(answer) => answer.await.unwrap_or(false),
+        None => false,
     }
 }
 
@@ -316,6 +372,67 @@ mod tests {
             .plugin(tauri_plugin_updater::Builder::new().build())
             .build(context)
             .expect("mock Tauri app")
+    }
+
+    #[tokio::test]
+    async fn close_request_remote_install_asks_the_window_first() {
+        let app = host_app("http://127.0.0.1:9/never".to_owned());
+        // No guard: nothing in this process can hold an edit.
+        assert!(window_allows_install(app.handle()).await);
+
+        app.manage(crate::window::close_guard_for_app(app.handle()));
+        // No main window: the guard allows at once (request 1).
+        assert!(window_allows_install(app.handle()).await);
+
+        // With a main window the install waits for the web: Stay refuses it, Allow lets it run.
+        let _window = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::window::MAIN_WINDOW_LABEL,
+            Default::default(),
+        )
+        .build()
+        .expect("mock webview");
+        let guard = app.state::<crate::window::CloseGuard>();
+        for (request_id, reply, allowed) in [
+            (2, crate::window::CloseReply::Stay, false),
+            (3, crate::window::CloseReply::Allow, true),
+        ] {
+            // `join!` polls the install first, so it has asked before the reply arrives.
+            let (answer, ()) = tokio::join!(window_allows_install(app.handle()), async {
+                guard.reply(request_id, reply, std::time::Instant::now());
+            });
+            assert_eq!(answer, allowed, "{reply:?}");
+        }
+        // Stale ids and a pending close are covered by
+        // `close_request_on_remote_update_proceeds_only_when_the_web_allows_it` in `window.rs`.
+    }
+
+    #[tokio::test]
+    async fn close_request_remote_install_signals_every_end_without_restart_after_allow() {
+        use tauri::Listener as _;
+        let app = host_app("http://127.0.0.1:9/never".to_owned());
+        let (sender, ended) = std::sync::mpsc::channel();
+        app.listen_any(UPDATE_INSTALL_ENDED_EVENT, move |_| {
+            let _ = sender.send(());
+        });
+        let requester = RemoteUpdateRequester::default();
+
+        // Refused, `accepted: false`: nothing was downloaded.
+        install_after_allow(app.handle(), &requester).await;
+        assert_eq!(ended.try_recv(), Ok(()), "a refusal without a download");
+
+        // `completed: true` restarts the app, so the window stays blocked until it goes.
+        drop(AllowedInstall {
+            app: app.handle().clone(),
+            completed: true,
+        });
+        assert!(
+            ended.try_recv().is_err(),
+            "no signal once the install completed"
+        );
+        // The other refusals and `accepted: true, completed: false` (a failed install) need a
+        // backend or a downloaded update this mock cannot provide. They return through the same
+        // guard, and `updates.rs` tests cover those results.
     }
 
     /// Polls `status` the way a remote client does until the background flow settles.

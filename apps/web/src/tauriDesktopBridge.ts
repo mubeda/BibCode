@@ -8,6 +8,7 @@ import type {
   DesktopEnvironmentBootstrap,
   DesktopProjectDataStatusChangedEvent,
   DesktopServerExposureState,
+  DesktopCloseRequest,
   DesktopSshPasswordPromptRequest,
   DesktopUpdateActionResult,
   DesktopUpdateCheckResult,
@@ -36,6 +37,8 @@ const CONNECTION_CATALOG_STORAGE_KEY = "bibcode.connectionCatalog";
 const BACKEND_READY_EVENT = "desktop:backend-ready";
 const PROJECT_DATA_STATUS_CHANGED_EVENT = "desktop:project-data-status-changed";
 const MENU_ACTION_EVENT = "desktop:menu-action";
+const CLOSE_REQUEST_EVENT = "desktop:close-request";
+const UPDATE_INSTALL_ENDED_EVENT = "desktop:update-install-ended";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
 const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
 const UPDATE_STATE_EVENT = "desktop:update-state";
@@ -615,6 +618,11 @@ function createTauriDesktopBridge(
         filename,
         bytes: Array.from(bytes),
       }),
+    saveTextFile: (input) =>
+      tauriInvokeDesktop<string | null>("desktop_bridge_save_text_file", {
+        suggestedName: input.suggestedName,
+        contents: input.contents,
+      }),
     pickFiles: (options) =>
       tauriInvokeOr<readonly string[]>("desktop_bridge_pick_files", { options }, () => []),
     downloadToFolder: (input) =>
@@ -640,6 +648,12 @@ function createTauriDesktopBridge(
     openInFileManager: (path: string, isDirectory: boolean) =>
       tauriInvokeDesktop("desktop_bridge_open_in_file_manager", { path, isDirectory }),
     onMenuAction: (listener: (action: string) => void) => tauriListen(MENU_ACTION_EVENT, listener),
+    onCloseRequest: (listener: (request: DesktopCloseRequest) => void) =>
+      tauriListen(CLOSE_REQUEST_EVENT, listener),
+    replyCloseRequest: (requestId, reply) =>
+      tauriInvokeDesktop("desktop_bridge_reply_close_request", { requestId, reply }),
+    onUpdateInstallEnded: (listener: () => void) =>
+      tauriListen(UPDATE_INSTALL_ENDED_EVENT, () => listener()),
     getUpdateState: () =>
       tauriInvokeOr<DesktopUpdateState>(
         "desktop_bridge_get_update_state",

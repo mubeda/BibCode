@@ -8,7 +8,13 @@ import { installDesktopUiMotionGuard } from "./support/motion-guard.ts";
 import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
-import { isFinalDesktopUiSpec, requestDesktopUiApplicationExit } from "./support/app-lifecycle.ts";
+import {
+  ensureLiveDesktopUiWebview,
+  isDesktopUiApplicationRunning,
+  isFinalDesktopUiSpec,
+  requestDesktopUiApplicationExit,
+  stopRelaunchedDesktopUiApplication,
+} from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
   prepareDesktopUiTestContext,
@@ -28,11 +34,18 @@ const platform: DesktopUiPlatform =
         ? "win"
         : "linux";
 const testContext = prepareDesktopUiTestContext();
+// End-to-end builds write an exported file here instead of opening the Save dialog. The app reads
+// it at launch, so it is set before the launcher starts the app.
+process.env.BIBCODE_E2E_SAVE_TEXT_PATH ??= NodePath.join(
+  testContext.artifactDirectory,
+  "saved-text-file.txt",
+);
 const appBinaryPath = resolveDesktopAppPath({
   platform,
   environment: process.env,
 });
 const requestedSpec = process.env.BIBCODE_E2E_SPEC?.trim();
+const closingSpec = "./specs/desktop-save-and-close.e2e.ts";
 const desktopUiSpecFiles =
   requestedSpec && requestedSpec.length > 0
     ? [requestedSpec]
@@ -51,8 +64,17 @@ const desktopUiSpecFiles =
         "./specs/pierre-diffs.e2e.ts",
         "./specs/mermaid-diagrams.e2e.ts",
         "./specs/files-binary-preview.e2e.ts",
+        "./specs/files-rich-markdown.e2e.ts",
+        "./specs/appearance-themes.e2e.ts",
+        "./specs/source-control-review.e2e.ts",
+        "./specs/host-dashboard.e2e.ts",
+        closingSpec,
       ];
-const desktopUiSpecs = requestedSpec ? desktopUiSpecFiles : [desktopUiSpecFiles];
+// The default specs share one app session. The closing spec ends the app, so it runs last in a
+// worker of its own, and the service starts the app again for it if a shared spec ended it.
+const desktopUiSpecs = requestedSpec
+  ? desktopUiSpecFiles
+  : [desktopUiSpecFiles.filter((spec) => spec !== closingSpec), closingSpec];
 
 if (!NodeFS.existsSync(appBinaryPath)) {
   throw new Error(`Packaged BiBCode application does not exist: ${appBinaryPath}`);
@@ -150,6 +172,8 @@ export const config = {
     timeout: 120_000,
   },
   before: async () => {
+    // A webview that crashed in an earlier spec would fail this one with the same dead session.
+    await ensureLiveDesktopUiWebview();
     const pluginReady = await browser.execute(() => {
       const host = window as Window & {
         readonly wdioTauri?: {
@@ -183,7 +207,8 @@ export const config = {
     _context: unknown,
     result: { readonly passed: boolean },
   ) => {
-    if (!result.passed) {
+    // A closing case may have ended the app; there is no window left to record.
+    if (!result.passed && (await isDesktopUiApplicationRunning())) {
       await browser.saveScreenshot(screenshotPath(`failure-${test.title}`));
       NodeFS.writeFileSync(
         screenshotPath(`failure-source-${test.title}`).replace(/\.png$/, ".html"),
@@ -196,6 +221,8 @@ export const config = {
     // Ask Tauri to run its normal ExitRequested path so the in-process backend and provider
     // children release Windows filesystem handles before the launcher service stops the driver.
     await requestDesktopUiApplicationExit();
+    // The service stops only the app it started; an app a closing case relaunched is stopped here.
+    await stopRelaunchedDesktopUiApplication();
   },
   onComplete: () => {
     // Keep the app's own logs (native page loads, webview process failures, server errors)

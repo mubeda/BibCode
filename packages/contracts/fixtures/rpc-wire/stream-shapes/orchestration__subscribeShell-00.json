@@ -8,1254 +8,762 @@
         "snapshotSequence": 94,
         "projects": [
           {
-            "id": "",
-            "title": "@",
-            "workspaceRoot": "",
-            "repositoryIdentity": {
-              "canonicalKey": "",
-              "locator": {
-                "source": "git-remote",
-                "remoteName": "T#]nCx",
-                "remoteUrl": "!]kgL#Q"
-              },
-              "rootPath": "�",
-              "displayName": "",
-              "provider": "(",
-              "owner": "VPy9d'",
-              "name": "_"
+            "id": "s<Y@@.XQZE",
+            "title": "|!,MlcKm",
+            "workspaceRoot": ": WxD'6?k",
+            "defaultModelSelection": {
+              "instanceId": "MkE",
+              "model": "bjjl^sVAv("
             },
-            "defaultModelSelection": null,
             "scripts": [
               {
-                "id": "!,MlcKmVup",
-                "name": "",
-                "command": "'6?k",
-                "icon": "lint",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "\u0000",
+                "id": "@",
                 "name": "toString",
-                "command": "(abjjl^sVA",
-                "icon": "debug",
+                "command": "toString",
+                "icon": "play",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "#do$]G4|6[",
+                "name": "toString",
+                "command": "+",
+                "icon": "configure",
                 "runOnWorktreeCreate": true
               },
               {
-                "id": "�",
-                "name": "0",
-                "command": "0",
-                "icon": "build",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "("
-              },
-              {
-                "id": "toString",
-                "name": "G4|6[#gxL;",
-                "command": "__proto__",
-                "icon": "debug",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "\u0000",
+                "id": "8",
                 "name": "T",
                 "command": "&Tg_",
                 "icon": "debug",
-                "runOnWorktreeCreate": true,
-                "previewUrl": "toString",
-                "autoOpenPreview": true
-              },
-              {
-                "id": "",
-                "name": "oB44^Su7$S",
-                "command": "__proto__",
-                "icon": "debug",
-                "runOnWorktreeCreate": true,
-                "previewUrl": "g"
+                "runOnWorktreeCreate": true
               }
             ],
             "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": "__proto__",
-              "baselinePaths": ["0", "", "__proto__", "", "I", "0"]
+              "visibility": "hidden",
+              "initialPromptDismissedAt": null,
+              "baselinePaths": []
             },
-            "createdAt": "\n",
-            "updatedAt": "7,{SNg[3(_"
+            "codeReviewPrompt": "?%h'!oB44",
+            "createdAt": "7$SOUyJ;`",
+            "updatedAt": "prototype"
           },
           {
-            "id": ";o_1k'*U/s",
-            "title": "{ks[AkJW",
-            "workspaceRoot": "&X&>L",
+            "id": "\\t\\1?G4@UE",
+            "title": "�",
+            "workspaceRoot": "__proto__",
             "defaultModelSelection": {
-              "instanceId": "sIQ",
-              "model": "\u0000",
-              "options": [
-                {
-                  "id": "Lw+qWuFZ7x",
-                  "value": "Q"
-                },
-                {
-                  "id": "f",
-                  "value": false
-                },
-                {
-                  "id": "",
-                  "value": ""
-                },
-                {
-                  "id": "4294967295",
-                  "value": false
-                },
-                {
-                  "id": "4294967295",
-                  "value": true
-                }
-              ]
+              "instanceId": "c_7XkCeUtL",
+              "model": "\u0000"
             },
             "scripts": [],
             "worktreeDiscovery": {
               "visibility": "shown",
               "initialPromptDismissedAt": null,
-              "baselinePaths": ["4294967295"]
+              "baselinePaths": []
             },
-            "createdAt": "c^p~w7WL9",
-            "updatedAt": "\u0000",
-            "olderThreads": {
-              "count": 16,
-              "chats": [
-                {
-                  "worktreePath": "4LF(X|Z'ds",
-                  "count": 58
-                },
-                {
-                  "worktreePath": null,
-                  "count": 99
-                },
-                {
-                  "worktreePath": "(R1%=Ok{9S",
-                  "count": 3
-                },
-                {
-                  "worktreePath": null,
-                  "count": 5
-                },
-                {
-                  "worktreePath": "Nr&#ihqm$m",
-                  "count": 99
-                },
-                {
-                  "worktreePath": "EOq?sk`.l%",
-                  "count": 6
-                },
-                {
-                  "worktreePath": null,
-                  "count": 88
-                },
-                {
-                  "worktreePath": null,
-                  "count": 85
-                },
-                {
-                  "worktreePath": null,
-                  "count": 53
-                },
-                {
-                  "worktreePath": null,
-                  "count": 99
-                }
-              ]
-            }
+            "codeReviewPrompt": "xwPb",
+            "createdAt": "prototype",
+            "updatedAt": "#QURO"
           },
           {
-            "id": "jW]1~g}",
-            "title": "-1",
-            "workspaceRoot": "",
+            "id": "toString",
+            "title": "4294967295",
+            "workspaceRoot": "SB^(sML_J#",
             "defaultModelSelection": null,
             "scripts": [
               {
-                "id": "😀",
-                "name": "yM^",
-                "command": "",
+                "id": "k'",
+                "name": "__proto__",
+                "command": "�",
                 "icon": "debug",
-                "runOnWorktreeCreate": true,
-                "autoOpenPreview": false
-              },
-              {
-                "id": "�",
-                "name": "",
-                "command": "4294967295",
-                "icon": "play",
                 "runOnWorktreeCreate": false
               },
               {
-                "id": "😀",
-                "name": "{_Qa+",
-                "command": "toString",
-                "icon": "build",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "X",
-                "name": "IdH*c",
-                "command": "o7jF",
-                "icon": "configure",
-                "runOnWorktreeCreate": false,
-                "autoOpenPreview": true
-              },
-              {
-                "id": "",
-                "name": "\u0000",
-                "command": "n",
-                "icon": "play",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "]",
-                "name": "",
-                "command": "-",
-                "icon": "play",
-                "runOnWorktreeCreate": true
+                "id": "AkJWyOF",
+                "name": "__proto__",
+                "command": "0",
+                "icon": "lint",
+                "runOnWorktreeCreate": false
               },
               {
                 "id": "�",
-                "name": "",
-                "command": "prototype",
+                "name": "I98hcR~.-L",
+                "command": "W",
+                "icon": "debug",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "1",
+                "name": "x\"fow!)4B$",
+                "command": "4294967295",
+                "icon": "debug",
+                "runOnWorktreeCreate": false,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "__proto__",
+                "name": "-1PYXs",
+                "command": "~w7WL90?8",
+                "icon": "build",
+                "runOnWorktreeCreate": false,
+                "previewUrl": "L"
+              },
+              {
+                "id": "-1",
+                "name": "__proto__",
+                "command": "d",
+                "icon": "debug",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "u",
+                "name": "R",
+                "command": "",
                 "icon": "test",
                 "runOnWorktreeCreate": true
               },
               {
-                "id": "toString",
-                "name": "toString",
-                "command": "jma{Q2+=4",
-                "icon": "debug",
-                "runOnWorktreeCreate": true
+                "id": "O",
+                "name": "p",
+                "command": "😀",
+                "icon": "lint",
+                "runOnWorktreeCreate": false
               },
               {
-                "id": "TD$U8s'&#7",
-                "name": "1",
-                "command": "8",
+                "id": "",
+                "name": "m$m6lqEu)",
+                "command": "-1",
                 "icon": "configure",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "😀"
+                "runOnWorktreeCreate": true,
+                "previewUrl": ".l%>Nt}"
               },
               {
-                "id": "Wg^}|~4yX\"",
-                "name": "(YXaz)Q~",
-                "command": "ZF%SWDEQnM",
-                "icon": "play",
-                "runOnWorktreeCreate": true
+                "id": "TRRc3hm>V",
+                "name": "W]1~g}/F",
+                "command": "",
+                "icon": "debug",
+                "runOnWorktreeCreate": true,
+                "previewUrl": "",
+                "autoOpenPreview": true
               }
             ],
             "worktreeDiscovery": {
               "visibility": "shown",
               "initialPromptDismissedAt": null,
               "baselinePaths": [
-                "__proto__",
-                "0",
-                "�",
-                "J=-e=",
-                "$qJJ6ik`$",
-                "E",
+                "prototype",
+                "",
+                "'RXJlG'=O'",
+                "SJy`",
+                "_",
+                "1e",
+                "RFVJmXw~",
                 "-1",
-                "`1-?/Y}3lg",
-                "\u0000",
-                ""
+                "c",
+                "o7jF"
               ]
             },
-            "createdAt": "@~n",
-            "updatedAt": "0|1#GyfJ"
+            "codeReviewPrompt": "\"LgI'F=x9_",
+            "createdAt": "",
+            "updatedAt": "21]E$m20-)"
           },
           {
-            "id": "hZpmfi\\/",
-            "title": "gJ^j-)zkkl",
-            "workspaceRoot": "g",
+            "id": "�",
+            "title": "",
+            "workspaceRoot": "prototype",
             "defaultModelSelection": {
-              "instanceId": "u",
-              "model": "__proto__"
+              "instanceId": "G5ksoxB",
+              "model": "0",
+              "options": [
+                {
+                  "id": "\\&=TD$U",
+                  "value": "#7f>I1~4:8"
+                },
+                {
+                  "id": "$",
+                  "value": true
+                },
+                {
+                  "id": "LWg",
+                  "value": false
+                }
+              ]
             },
             "scripts": [
               {
-                "id": "",
-                "name": "",
-                "command": ")SX4C",
-                "icon": "debug",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "toString",
-                "autoOpenPreview": false
+                "id": "X",
+                "name": "Y",
+                "command": ")Q~wc|ZF%S",
+                "icon": "configure",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "k",
+                "name": "j/;?S2AC",
+                "command": "KJ=-e=",
+                "icon": "build",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "6",
+                "name": "$_*/E)D",
+                "command": "`1-?/Y}3lg",
+                "icon": "lint",
+                "runOnWorktreeCreate": true
               },
               {
                 "id": "😀",
-                "name": "",
-                "command": "😀",
-                "icon": "build",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "",
-                "name": "S_)[3j<LdZ",
-                "command": "�",
+                "name": "~",
+                "command": "g0|1#GyfJ!",
                 "icon": "configure",
-                "runOnWorktreeCreate": true,
-                "previewUrl": "__proto__",
-                "autoOpenPreview": false
-              },
-              {
-                "id": "('r",
-                "name": "q6jhXO`=TX",
-                "command": "\u0000",
-                "icon": "lint",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "!",
-                "autoOpenPreview": false
-              },
-              {
-                "id": "Z",
-                "name": "0",
-                "command": "",
-                "icon": "build",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "",
-                "name": "q",
-                "command": ";_`&LV(54s",
-                "icon": "lint",
-                "runOnWorktreeCreate": true,
-                "previewUrl": ")"
-              },
-              {
-                "id": "*OKx&*'N(b",
-                "name": "prototype",
-                "command": "",
-                "icon": "test",
                 "runOnWorktreeCreate": true
               },
               {
-                "id": "\u0000",
-                "name": "WNd[0O}`H\"",
-                "command": "__proto__",
+                "id": "fi\\/_GwgJ",
+                "name": ")z",
+                "command": "gD/gK5$uh",
                 "icon": "debug",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "4294967295",
-                "name": "__proto__",
-                "command": "toString",
-                "icon": "configure",
-                "runOnWorktreeCreate": false,
-                "autoOpenPreview": true
-              },
-              {
-                "id": "",
-                "name": "",
-                "command": "�",
-                "icon": "lint",
                 "runOnWorktreeCreate": false
-              }
-            ],
-            "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": null,
-              "baselinePaths": []
-            },
-            "createdAt": "prototype",
-            "updatedAt": "3o/g5)8q9"
-          },
-          {
-            "id": ",-;9I'Ed\"g",
-            "title": "toString",
-            "workspaceRoot": "😀",
-            "defaultModelSelection": {
-              "instanceId": "W9B0FJb27i",
-              "model": "\u0000"
-            },
-            "scripts": [
+              },
               {
                 "id": "0",
-                "name": "toString",
-                "command": "Js(f(!bgDe",
-                "icon": "build",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "\u0000",
-                "name": "%bKVcC",
-                "command": "LaJ@BM",
-                "icon": "build",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "In)}E[bUQ",
-                "name": "toString",
-                "command": ".",
-                "icon": "configure",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "toString"
-              }
-            ],
-            "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": null,
-              "baselinePaths": ["]", "__proto__", "4294967295", "😀", "w)Iwwl", "-1"]
-            },
-            "createdAt": "r 'L?",
-            "updatedAt": " "
-          },
-          {
-            "id": "b",
-            "title": "toString",
-            "workspaceRoot": "toString",
-            "repositoryIdentity": {
-              "canonicalKey": "Fz7hxC",
-              "locator": {
-                "source": "git-remote",
-                "remoteName": "`r/98+&VI&",
-                "remoteUrl": "Hou8(Lz!ve"
-              },
-              "provider": "[f~ONx8X="
-            },
-            "defaultModelSelection": null,
-            "scripts": [
-              {
-                "id": "]/l'lTA",
                 "name": "",
-                "command": "gtacw\"!;Q&",
-                "icon": "configure",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "�",
-                "name": "RsIRaRo@l",
-                "command": "*d!nrgH",
-                "icon": "lint",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "pr)iL~W1IM",
-                "name": "0",
-                "command": "H",
-                "icon": "test",
-                "runOnWorktreeCreate": true,
-                "previewUrl": "|jZv(`/Wtm",
+                "command": "__proto__",
+                "icon": "debug",
+                "runOnWorktreeCreate": false,
+                "previewUrl": "Cu?",
                 "autoOpenPreview": false
               },
               {
-                "id": "l",
-                "name": "_\"\"kD|byL",
-                "command": "~{r$G&KqgH",
-                "icon": "build",
+                "id": "toString",
+                "name": "",
+                "command": "2",
+                "icon": "debug",
                 "runOnWorktreeCreate": false
               },
               {
-                "id": "__proto__",
-                "name": "4294967295",
-                "command": "6:I]Ot*z!",
+                "id": "&bpuS",
+                "name": "3",
+                "command": "d",
                 "icon": "configure",
-                "runOnWorktreeCreate": true
+                "runOnWorktreeCreate": false
               },
               {
-                "id": "|",
-                "name": "}",
-                "command": "-1",
+                "id": "",
+                "name": "__proto__",
+                "command": "0",
                 "icon": "debug",
                 "runOnWorktreeCreate": true
               },
               {
                 "id": "",
-                "name": "__proto__",
-                "command": "4294967295",
-                "icon": "play",
+                "name": "`q6jh",
+                "command": "=TX;9J:",
+                "icon": "test",
                 "runOnWorktreeCreate": true
-              },
-              {
-                "id": "T",
-                "name": "-1",
-                "command": "CXvFN{]",
-                "icon": "configure",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "OS&C[%@xEZ",
-                "name": "toString",
-                "command": "yO'&b/Z'4K",
-                "icon": "debug",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "C",
-                "name": "",
-                "command": "DAn`Jf",
-                "icon": "build",
-                "runOnWorktreeCreate": false
               }
             ],
             "worktreeDiscovery": {
               "visibility": "hidden",
-              "initialPromptDismissedAt": "j>;P",
-              "baselinePaths": [
-                "prototype",
-                "�",
-                "4dQT {HK(X",
-                "Y=3FZSUrD&",
-                "4294967295",
-                "\u0000",
-                "0",
-                "T[HMe.-W'+",
-                "",
-                ""
-              ]
+              "initialPromptDismissedAt": null,
+              "baselinePaths": []
             },
-            "createdAt": "TNI>\\ N&u]",
-            "updatedAt": "",
-            "olderThreads": {
-              "count": 10,
-              "chats": []
-            }
+            "codeReviewPrompt": "0",
+            "createdAt": "__proto__",
+            "updatedAt": "�"
           },
           {
-            "id": "X",
-            "title": "�",
-            "workspaceRoot": "prototype",
+            "id": "\u0000",
+            "title": "toString",
+            "workspaceRoot": "[>-~%",
             "defaultModelSelection": {
-              "instanceId": "w_QS6arqjM",
-              "model": "IUs6d",
+              "instanceId": "OfT5C",
+              "model": "#",
               "options": []
             },
             "scripts": [
               {
                 "id": "",
-                "name": "KR",
-                "command": "8L!|Izu>@.",
-                "icon": "lint",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "a",
-                "name": "S.X",
-                "command": "toString",
-                "icon": "test",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "ecjDukfQ(P",
-                "name": "0",
-                "command": "-1",
-                "icon": "test",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "*z}qGXX+.[",
-                "name": "",
-                "command": "__proto__",
-                "icon": "configure",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "0",
-                "autoOpenPreview": false
-              },
-              {
-                "id": "prototype",
-                "name": "-",
-                "command": ">;/llGF",
-                "icon": "play",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "$0UC}4fn|L",
-                "name": "",
-                "command": "KH%.hya v0",
-                "icon": "play",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "�",
-                "name": ".$w]Kqw(",
-                "command": "0",
+                "name": "&*'N(b\"] ,",
+                "command": "�",
                 "icon": "play",
                 "runOnWorktreeCreate": true,
-                "previewUrl": "n{}KbFZuh"
+                "previewUrl": "d[0O}",
+                "autoOpenPreview": true
               },
               {
-                "id": "😀",
-                "name": "Fnu#ti~+iG",
-                "command": "�",
+                "id": "",
+                "name": "`F",
+                "command": "4294967295",
+                "icon": "play",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": true
+              },
+              {
+                "id": "4294967295",
+                "name": "",
+                "command": "",
+                "icon": "play",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "::aki",
+                "name": "/",
+                "command": "8q9<TMn,-;",
+                "icon": "test",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "!~9<\"\"AH5/",
+                "name": "\"~8d>fZX%Z",
+                "command": "0",
+                "icon": "build",
+                "runOnWorktreeCreate": true,
+                "previewUrl": "�",
+                "autoOpenPreview": false
+              },
+              {
+                "id": "toString",
+                "name": "Js(f(!bgDe",
+                "command": ";",
+                "icon": "test",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "toString",
+                "name": "__proto__",
+                "command": "o",
+                "icon": "configure",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "4294967295",
+                "name": "esYuI",
+                "command": "E[bUQ)cX7u",
+                "icon": "play",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "toString",
+                "name": "YZDZ]LU,M6",
+                "command": "Qw)Iwwl8I",
                 "icon": "configure",
                 "runOnWorktreeCreate": true
               },
               {
-                "id": "x",
+                "id": "",
                 "name": "0",
-                "command": "toString",
-                "icon": "build",
+                "command": "",
+                "icon": "debug",
                 "runOnWorktreeCreate": true
-              },
-              {
-                "id": "F(",
-                "name": "L",
-                "command": "v(CUPw_",
-                "icon": "play",
-                "runOnWorktreeCreate": false,
-                "autoOpenPreview": false
               }
             ],
             "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": "�",
-              "baselinePaths": [
-                ",4SZ\"f!hm<",
-                "0",
-                "r",
-                "jTX",
-                "KjdaP",
-                "4294967295",
-                "toString",
-                "�",
-                "prototype",
-                "__proto__"
-              ]
+              "visibility": "hidden",
+              "initialPromptDismissedAt": "$cySxM7kk[",
+              "baselinePaths": ["T"]
             },
-            "createdAt": "\u0000",
-            "updatedAt": ""
+            "codeReviewPrompt": "\t",
+            "createdAt": "4294967295",
+            "updatedAt": "prototype"
           },
           {
-            "id": "-EMx4Y",
-            "title": "1W&)xAPk",
-            "workspaceRoot": "}",
+            "id": "\"!;Q&U%Z.?",
+            "title": "oRsIRaRo@l",
+            "workspaceRoot": "*d!nrgH",
             "defaultModelSelection": {
-              "instanceId": "yhGQdr2",
-              "model": "7",
+              "instanceId": "Yq",
+              "model": "L~W1IM=@e:"
+            },
+            "scripts": [
+              {
+                "id": ",U,N|jZv(`",
+                "name": "__proto__",
+                "command": "{&3l",
+                "icon": "debug",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "",
+                "name": "byL^2>~{r$",
+                "command": "",
+                "icon": "lint",
+                "runOnWorktreeCreate": false,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "\u0000",
+                "name": "Smm6:I]Ot*",
+                "command": "S",
+                "icon": "configure",
+                "runOnWorktreeCreate": false,
+                "previewUrl": "😀"
+              },
+              {
+                "id": "😀",
+                "name": "-1",
+                "command": "(",
+                "icon": "play",
+                "runOnWorktreeCreate": true
+              }
+            ],
+            "worktreeDiscovery": {
+              "visibility": "hidden",
+              "initialPromptDismissedAt": null,
+              "baselinePaths": []
+            },
+            "codeReviewPrompt": "toString",
+            "createdAt": "",
+            "updatedAt": "Wd^CXvFN{]"
+          },
+          {
+            "id": "😀",
+            "title": "�",
+            "workspaceRoot": "C",
+            "repositoryIdentity": {
+              "canonicalKey": "�",
+              "locator": {
+                "source": "git-remote",
+                "remoteName": "",
+                "remoteUrl": "4294967295"
+              },
+              "provider": "An`J",
+              "owner": "5DY"
+            },
+            "defaultModelSelection": null,
+            "scripts": [],
+            "worktreeDiscovery": {
+              "visibility": "shown",
+              "initialPromptDismissedAt": "",
+              "baselinePaths": ["😀"]
+            },
+            "codeReviewPrompt": " ",
+            "createdAt": "prototype",
+            "updatedAt": "__proto__"
+          },
+          {
+            "id": "P1 C\\ nl;x",
+            "title": "toString",
+            "workspaceRoot": "{",
+            "defaultModelSelection": {
+              "instanceId": "F",
+              "model": "3FZS"
+            },
+            "scripts": [
+              {
+                "id": "4294967295",
+                "name": "\u0000",
+                "command": "0",
+                "icon": "build",
+                "runOnWorktreeCreate": false,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "toString",
+                "name": "",
+                "command": "I",
+                "icon": "play",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "I>\\ N",
+                "name": "�",
+                "command": "7147^",
+                "icon": "lint",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "z7hxC",
+                "name": "`r/98+&VI&",
+                "command": "Hou8(Lz!ve",
+                "icon": "debug",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "4294967295",
+                "name": "=",
+                "command": "😀",
+                "icon": "play",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": true
+              },
+              {
+                "id": "i![(i",
+                "name": "-1",
+                "command": "😀",
+                "icon": "debug",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "0",
+                "name": "-1",
+                "command": "prototype",
+                "icon": "configure",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "-B~gNIUs",
+                "name": "toString",
+                "command": "0",
+                "icon": "play",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "toString",
+                "name": "R",
+                "command": "8L!|Izu>@.",
+                "icon": "lint",
+                "runOnWorktreeCreate": false
+              }
+            ],
+            "worktreeDiscovery": {
+              "visibility": "hidden",
+              "initialPromptDismissedAt": null,
+              "baselinePaths": []
+            },
+            "codeReviewPrompt": "5S.X7b7",
+            "createdAt": "�",
+            "updatedAt": "{ecjD"
+          },
+          {
+            "id": "=A<G9Ik^kn",
+            "title": "*z}qGXX+.[",
+            "workspaceRoot": "",
+            "defaultModelSelection": {
+              "instanceId": "NA4fI7kJ9",
+              "model": "F'hTq",
               "options": [
                 {
-                  "id": "_",
-                  "value": "4294967295"
+                  "id": "",
+                  "value": false
                 },
                 {
-                  "id": "�",
+                  "id": "n|L;!c$%KH",
+                  "value": "toString"
+                },
+                {
+                  "id": "v",
                   "value": "�"
                 },
                 {
-                  "id": "-1",
-                  "value": "L8kOG"
-                },
-                {
-                  "id": "/M",
-                  "value": true
-                },
-                {
-                  "id": ":",
-                  "value": "�"
-                },
-                {
-                  "id": "6\\[+?{N'$v",
-                  "value": true
-                },
-                {
-                  "id": ".",
-                  "value": true
+                  "id": "/wbyf.$w]K",
+                  "value": false
                 },
                 {
                   "id": "",
+                  "value": "�"
+                },
+                {
+                  "id": "toString",
                   "value": true
+                },
+                {
+                  "id": "KbFZuhzC;A",
+                  "value": false
+                },
+                {
+                  "id": "4294967295",
+                  "value": "t"
+                },
+                {
+                  "id": "iG",
+                  "value": "_5b0Hx<"
+                },
+                {
+                  "id": "",
+                  "value": false
                 }
               ]
             },
             "scripts": [
               {
-                "id": "T",
-                "name": "UY%rI_~",
-                "command": "toString",
-                "icon": "lint",
+                "id": "(",
+                "name": "L",
+                "command": "v(CUPw_",
+                "icon": "play",
+                "runOnWorktreeCreate": false,
+                "previewUrl": "__proto__"
+              },
+              {
+                "id": "�",
+                "name": "�",
+                "command": ",4SZ\"f!hm<",
+                "icon": "test",
                 "runOnWorktreeCreate": true
               },
               {
-                "id": "prototype",
-                "name": "toString",
+                "id": ":jTXRXH",
+                "name": "�",
+                "command": "CR7fGs",
+                "icon": "lint",
+                "runOnWorktreeCreate": true,
+                "previewUrl": "toString",
+                "autoOpenPreview": true
+              },
+              {
+                "id": "4294967295",
+                "name": "-EMx4Y",
+                "command": "1W&)xAPk",
+                "icon": "configure",
+                "runOnWorktreeCreate": false
+              },
+              {
+                "id": "B{Tdd9y",
+                "name": "0",
+                "command": "|$y.P7vmj",
+                "icon": "configure",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "4294967295",
+                "name": "�",
+                "command": "-1",
+                "icon": "build",
+                "runOnWorktreeCreate": true
+              },
+              {
+                "id": "L8kOG",
+                "name": "/M",
+                "command": "-::G.qn'@6",
+                "icon": "configure",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "",
+                "name": "m)c",
                 "command": "�",
+                "icon": "configure",
+                "runOnWorktreeCreate": true,
+                "autoOpenPreview": false
+              },
+              {
+                "id": "c!Tel\\UY%r",
+                "name": "prototype",
+                "command": "Bon*8a#hCp",
                 "icon": "test",
                 "runOnWorktreeCreate": false
               },
               {
-                "id": "�",
+                "id": "u",
                 "name": "Ou",
                 "command": "\"",
                 "icon": "play",
                 "runOnWorktreeCreate": false,
-                "previewUrl": "Q/x8==:pSN",
-                "autoOpenPreview": false
-              },
+                "previewUrl": ">",
+                "autoOpenPreview": true
+              }
+            ],
+            "worktreeDiscovery": {
+              "visibility": "hidden",
+              "initialPromptDismissedAt": null,
+              "baselinePaths": [
+                "\u0000",
+                ">msW0",
+                "EG~gE",
+                "",
+                "\u0000",
+                "prototype",
+                "4294967295",
+                "(ND",
+                "bH",
+                "VCDCgU5Z"
+              ]
+            },
+            "codeReviewPrompt": "2yxiC*h",
+            "createdAt": "",
+            "updatedAt": "#6"
+          },
+          {
+            "id": "",
+            "title": "UOAA",
+            "workspaceRoot": "eSB.dzE^H+",
+            "defaultModelSelection": null,
+            "scripts": [
               {
-                "id": "0x_HEG",
-                "name": "43?6",
-                "command": "prototype",
-                "icon": "lint",
+                "id": "Ax8DF WaWH",
+                "name": "9rGaP1~LV7",
+                "command": "4294967295",
+                "icon": "debug",
                 "runOnWorktreeCreate": true
               },
               {
                 "id": "",
-                "name": "-1",
-                "command": "bH",
+                "name": "A)'*UJL",
+                "command": "",
                 "icon": "configure",
                 "runOnWorktreeCreate": false
-              },
-              {
-                "id": "0",
-                "name": "ZTS",
-                "command": "xiC*h}:~Uc",
-                "icon": "test",
-                "runOnWorktreeCreate": false,
-                "autoOpenPreview": false
-              },
-              {
-                "id": "",
-                "name": "UOAA",
-                "command": "eSB.dzE^H+",
-                "icon": "configure",
-                "runOnWorktreeCreate": true,
-                "autoOpenPreview": true
-              },
-              {
-                "id": "0",
-                "name": "F WaWH|m}9",
-                "command": "P",
-                "icon": "test",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "4294967295",
-                "autoOpenPreview": false
-              },
-              {
-                "id": "-1",
-                "name": "__proto__",
-                "command": ")'*U",
-                "icon": "lint",
-                "runOnWorktreeCreate": true,
-                "autoOpenPreview": false
               },
               {
                 "id": "O",
                 "name": "0",
                 "command": "!4sI$pi/fM",
                 "icon": "debug",
-                "runOnWorktreeCreate": false,
-                "previewUrl": "'b8NWS/feV",
-                "autoOpenPreview": false
+                "runOnWorktreeCreate": false
               }
             ],
             "worktreeDiscovery": {
               "visibility": "hidden",
-              "initialPromptDismissedAt": null,
-              "baselinePaths": ["prototype", "yp4", "q", "x", "-1", "", "�"]
-            },
-            "createdAt": "�",
-            "updatedAt": "0"
-          },
-          {
-            "id": "__proto__",
-            "title": "�",
-            "workspaceRoot": "�",
-            "defaultModelSelection": null,
-            "scripts": [
-              {
-                "id": "",
-                "name": "�",
-                "command": "�",
-                "icon": "debug",
-                "runOnWorktreeCreate": true,
-                "previewUrl": "4pP|<*(S'3",
-                "autoOpenPreview": false
-              },
-              {
-                "id": "G:4Vazl.z{",
-                "name": "\u0000",
-                "command": "__proto__",
-                "icon": "lint",
-                "runOnWorktreeCreate": true
-              },
-              {
-                "id": "9]",
-                "name": "",
-                "command": "",
-                "icon": "play",
-                "runOnWorktreeCreate": false
-              },
-              {
-                "id": "'nf-c:ZE[",
-                "name": "\u0000",
-                "command": "g<,NQ>AEIe",
-                "icon": "test",
-                "runOnWorktreeCreate": false,
-                "autoOpenPreview": false
-              },
-              {
-                "id": "",
-                "name": "�",
-                "command": "yL,/D`Hst",
-                "icon": "play",
-                "runOnWorktreeCreate": true
-              }
-            ],
-            "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": null,
-              "baselinePaths": []
-            },
-            "createdAt": "",
-            "updatedAt": "Z`-qf62{e",
-            "olderThreads": {
-              "count": 2,
-              "chats": []
-            }
-          },
-          {
-            "id": "__proto__",
-            "title": "😀",
-            "workspaceRoot": "kUe6N4G",
-            "defaultModelSelection": null,
-            "scripts": [],
-            "worktreeDiscovery": {
-              "visibility": "shown",
-              "initialPromptDismissedAt": "t#kA>;bu5I",
+              "initialPromptDismissedAt": "__proto__",
               "baselinePaths": [
-                "Qz7N/Shv/c",
-                "^HeuI9._Uy",
+                "toString",
                 "4294967295",
+                "fe",
+                "a^=Z[]7yp4",
+                "q",
+                "x",
+                "-1",
                 "",
-                "#'j0p$X0ow",
-                "IOpWLN+d",
-                "$",
-                "\u0000",
-                "!)0G",
-                ""
+                "�",
+                "�"
               ]
             },
+            "codeReviewPrompt": "0",
             "createdAt": "",
-            "updatedAt": "\t"
+            "updatedAt": "4294967295",
+            "olderThreads": {
+              "count": 42,
+              "chats": [
+                {
+                  "worktreePath": null,
+                  "count": 79
+                },
+                {
+                  "worktreePath": null,
+                  "count": 1
+                },
+                {
+                  "worktreePath": null,
+                  "count": 99
+                },
+                {
+                  "worktreePath": "4294967295",
+                  "count": 1
+                },
+                {
+                  "worktreePath": null,
+                  "count": 98
+                },
+                {
+                  "worktreePath": "",
+                  "count": 8
+                },
+                {
+                  "worktreePath": "�",
+                  "count": 24
+                },
+                {
+                  "worktreePath": null,
+                  "count": 2
+                }
+              ]
+            }
           }
         ],
-        "threads": [
-          {
-            "id": "Ce8*f9Y",
-            "projectId": "L!d/&",
-            "title": "\u0000",
-            "modelSelection": {
-              "instanceId": "W7i0UC8Uy",
-              "model": "MYl8%",
-              "options": [
-                {
-                  "id": "-1",
-                  "value": false
-                },
-                {
-                  "id": "Z[v&]t!~{i",
-                  "value": true
-                },
-                {
-                  "id": ",",
-                  "value": false
-                },
-                {
-                  "id": "1",
-                  "value": "-1"
-                },
-                {
-                  "id": "-1",
-                  "value": "prototype"
-                },
-                {
-                  "id": "y6(s-",
-                  "value": "n}^YXU<"
-                },
-                {
-                  "id": "3IT",
-                  "value": true
-                },
-                {
-                  "id": "6",
-                  "value": false
-                },
-                {
-                  "id": "",
-                  "value": false
-                },
-                {
-                  "id": "�",
-                  "value": "DbF5x"
-                }
-              ]
-            },
-            "runtimeMode": "full-access",
-            "interactionMode": "plan",
-            "branch": null,
-            "worktreePath": null,
-            "latestTurn": {
-              "turnId": "P",
-              "state": "completed",
-              "requestedAt": "w[y",
-              "startedAt": "0",
-              "completedAt": null,
-              "assistantMessageId": "",
-              "sourceProposedPlan": {
-                "threadId": "PeuMk9w",
-                "planId": "tG]JD2zR=9"
-              }
-            },
-            "createdAt": "!zzu{_X 'f",
-            "updatedAt": "k;g)d_bPY",
-            "archivedAt": null,
-            "session": {
-              "threadId": ")nOV",
-              "status": "error",
-              "providerName": "347MNH o?y",
-              "runtimeMode": "full-access",
-              "activeTurnId": "\u0000",
-              "lastError": null,
-              "updatedAt": "dS ?Ghg9IP"
-            },
-            "latestUserMessageAt": "tg",
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": "U",
-            "projectId": "😀",
-            "title": "n?G!+:\"]",
-            "modelSelection": {
-              "instanceId": "q26OK8csDp",
-              "model": ":"
-            },
-            "runtimeMode": "approval-required",
-            "interactionMode": "default",
-            "branch": "�",
-            "worktreePath": "s",
-            "latestTurn": null,
-            "createdAt": "",
-            "updatedAt": "prototype",
-            "archivedAt": null,
-            "session": {
-              "threadId": "prototype",
-              "status": "idle",
-              "providerName": null,
-              "runtimeMode": "full-access",
-              "activeTurnId": "",
-              "lastError": "z",
-              "updatedAt": "4294967295"
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": false,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": "�",
-            "projectId": "Y",
-            "title": "C",
-            "modelSelection": {
-              "instanceId": "w6VzS",
-              "model": "Q@e"
-            },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "default",
-            "branch": null,
-            "worktreePath": "\u0000",
-            "latestTurn": {
-              "turnId": "cp#K\"KACJ^",
-              "state": "completed",
-              "requestedAt": "�",
-              "startedAt": null,
-              "completedAt": "\n",
-              "assistantMessageId": null,
-              "sourceProposedPlan": {
-                "threadId": "I",
-                "planId": "5"
-              }
-            },
-            "createdAt": "4294967295",
-            "updatedAt": "",
-            "archivedAt": null,
-            "session": null,
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": false
-          },
-          {
-            "id": "-1",
-            "projectId": "4294967295",
-            "title": "L}pLR?sQT9",
-            "modelSelection": {
-              "instanceId": "j",
-              "model": "😀",
-              "options": [
-                {
-                  "id": "X7Kp`!O",
-                  "value": true
-                },
-                {
-                  "id": "F)b'",
-                  "value": "😀"
-                },
-                {
-                  "id": "😀",
-                  "value": "Xru%P *R*}"
-                },
-                {
-                  "id": "yh.sN{ip`p",
-                  "value": false
-                },
-                {
-                  "id": "S",
-                  "value": true
-                },
-                {
-                  "id": "4294967295",
-                  "value": false
-                },
-                {
-                  "id": "toString",
-                  "value": false
-                },
-                {
-                  "id": "!$<<RsT$6^",
-                  "value": "ELwTC|)$R`"
-                },
-                {
-                  "id": "l",
-                  "value": false
-                },
-                {
-                  "id": "Kad>Fm.J@4",
-                  "value": "Q"
-                }
-              ]
-            },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "plan",
-            "branch": null,
-            "worktreePath": null,
-            "latestTurn": null,
-            "createdAt": "T?",
-            "updatedAt": "a=Js88kDJ",
-            "archivedAt": null,
-            "session": {
-              "threadId": "__proto__",
-              "status": "starting",
-              "providerName": null,
-              "runtimeMode": "auto-accept-edits",
-              "activeTurnId": null,
-              "lastError": null,
-              "lastErrorClass": "context_limit",
-              "updatedAt": "�"
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": false,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": ".2(2Q",
-            "projectId": "",
-            "title": "�",
-            "modelSelection": {
-              "instanceId": "m",
-              "model": "�",
-              "options": []
-            },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "default",
-            "branch": null,
-            "worktreePath": null,
-            "latestTurn": null,
-            "createdAt": "-1",
-            "updatedAt": "__proto__",
-            "archivedAt": "\u0000",
-            "session": {
-              "threadId": "HgdEhG[;?N",
-              "status": "starting",
-              "providerName": "-1",
-              "runtimeMode": "approval-required",
-              "activeTurnId": "4294967295",
-              "lastError": "😀",
-              "lastErrorClass": "permission_error",
-              "updatedAt": ""
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": false,
-            "hasPendingUserInput": false,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": "vc!Fg]uJpg",
-            "projectId": "[Ku",
-            "title": "Mh@;?X)W^,",
-            "modelSelection": {
-              "instanceId": "O",
-              "model": "Q2"
-            },
-            "runtimeMode": "approval-required",
-            "interactionMode": "plan",
-            "branch": "Z.:",
-            "worktreePath": "😀",
-            "latestTurn": null,
-            "createdAt": "-1",
-            "updatedAt": "\t",
-            "archivedAt": null,
-            "session": null,
-            "latestUserMessageAt": "😀",
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": false,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": "prototype",
-            "projectId": "c",
-            "title": "",
-            "modelSelection": {
-              "instanceId": "AbQ2UHfAsu",
-              "model": "d(O9MuyR[$",
-              "options": [
-                {
-                  "id": "😀",
-                  "value": "#O)t"
-                }
-              ]
-            },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "default",
-            "branch": null,
-            "worktreePath": null,
-            "latestTurn": null,
-            "createdAt": "a2lp#?~a8l",
-            "updatedAt": " ",
-            "archivedAt": " ",
-            "session": null,
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": false
-          },
-          {
-            "id": "-1",
-            "projectId": "�",
-            "title": "4294967295",
-            "modelSelection": {
-              "instanceId": "zwjMGA",
-              "model": "__proto__",
-              "options": [
-                {
-                  "id": "7iL0[yW",
-                  "value": "😀"
-                },
-                {
-                  "id": "1Lger!QHR",
-                  "value": false
-                }
-              ]
-            },
-            "runtimeMode": "auto-accept-edits",
-            "interactionMode": "default",
-            "branch": null,
-            "worktreePath": ">$5d_",
-            "latestTurn": {
-              "turnId": "j",
-              "state": "interrupted",
-              "requestedAt": "wpX?Ar",
-              "startedAt": null,
-              "completedAt": null,
-              "assistantMessageId": "}|ZpI?9AKv"
-            },
-            "createdAt": "\t",
-            "updatedAt": "-1",
-            "archivedAt": "q*]",
-            "session": {
-              "threadId": "😀",
-              "status": "ready",
-              "providerName": null,
-              "providerInstanceId": "SFIsRi1fX",
-              "runtimeMode": "auto-accept-edits",
-              "activeTurnId": null,
-              "lastError": "-1",
-              "updatedAt": ""
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": false,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": true
-          },
-          {
-            "id": "-1",
-            "projectId": "\u0000",
-            "title": "😀",
-            "modelSelection": {
-              "instanceId": "NcV2urKcmL",
-              "model": "__proto__"
-            },
-            "runtimeMode": "full-access",
-            "interactionMode": "default",
-            "branch": null,
-            "worktreePath": "toString",
-            "latestTurn": {
-              "turnId": "QVsGa\\2~=c",
-              "state": "interrupted",
-              "requestedAt": "",
-              "startedAt": null,
-              "completedAt": null,
-              "assistantMessageId": null,
-              "sourceProposedPlan": {
-                "threadId": "__proto__",
-                "planId": "K\"-PqycY{c"
-              }
-            },
-            "createdAt": "\u0000",
-            "updatedAt": "-\\Nh1_",
-            "archivedAt": null,
-            "session": {
-              "threadId": "<9'i%@h6ck",
-              "status": "idle",
-              "providerName": "toString",
-              "runtimeMode": "approval-required",
-              "activeTurnId": "0naMeRRJ",
-              "lastError": null,
-              "updatedAt": "r)"
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": true,
-            "hasPendingUserInput": false,
-            "hasActionableProposedPlan": false
-          },
-          {
-            "id": "�",
-            "projectId": "l",
-            "title": "3Ng,P<",
-            "modelSelection": {
-              "instanceId": "ak8ZkSK7o9",
-              "model": "c8{~~C=OLp"
-            },
-            "runtimeMode": "approval-required",
-            "interactionMode": "default",
-            "branch": "�",
-            "worktreePath": "f;WD}41D#|",
-            "latestTurn": null,
-            "createdAt": "y%`[Znf-Og",
-            "updatedAt": "�",
-            "archivedAt": null,
-            "session": {
-              "threadId": "[xR>G-WsxJ",
-              "status": "starting",
-              "providerName": null,
-              "providerInstanceId": "Ay8Q-DoBVB",
-              "runtimeMode": "full-access",
-              "activeTurnId": null,
-              "lastError": "HMe2N!Rp",
-              "lastErrorClass": "transport_error",
-              "updatedAt": "4294967295"
-            },
-            "latestUserMessageAt": null,
-            "hasPendingApprovals": false,
-            "hasPendingUserInput": true,
-            "hasActionableProposedPlan": true
-          }
-        ],
-        "updatedAt": "\t",
-        "capped": true,
-        "engineSequence": 50
+        "threads": [],
+        "updatedAt": "l.z{<8JXF!"
       }
     }
   ]

@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
+  GSTREAMER_PLUGIN_PIN,
   GTK_PLUGIN_PIN,
   prepareTauriAppImageTools,
   type UpstreamGtkPluginPin,
@@ -20,6 +21,8 @@ const REPOSITORY_ROOT = NodePath.resolve(import.meta.dirname, "..");
 const FIXTURE_PLUGIN = new TextEncoder().encode("#!/usr/bin/env bash\nexit 0\n");
 const LEGACY_UPSTREAM_FILENAME = "linuxdeploy-plugin-gtk-upstream.sh";
 const UPSTREAM_FILENAME = "bibcode-linuxdeploy-gtk-upstream.sh";
+const GSTREAMER_UPSTREAM_FILENAME = "bibcode-linuxdeploy-gstreamer-upstream.sh";
+const PLUGIN_WRAPPERS = ["linuxdeploy-plugin-gstreamer.sh", "linuxdeploy-plugin-gtk.sh"];
 const FIXTURE_PIN = {
   url: "https://example.invalid/linuxdeploy-plugin-gtk.sh",
   sha256: "fb99eae951f1adc14d1a4a9a186c21930db2786b3208c94c7d9af382bd1048e5",
@@ -31,10 +34,12 @@ function makeRepositoryRoot(): string {
   temporaryDirectories.push(root);
   const wrapperDirectory = NodePath.join(root, "scripts/tauri");
   NodeFS.mkdirSync(wrapperDirectory, { recursive: true });
-  NodeFS.copyFileSync(
-    NodePath.join(REPOSITORY_ROOT, "scripts/tauri/linuxdeploy-plugin-gtk.sh"),
-    NodePath.join(wrapperDirectory, "linuxdeploy-plugin-gtk.sh"),
-  );
+  for (const wrapper of PLUGIN_WRAPPERS) {
+    NodeFS.copyFileSync(
+      NodePath.join(REPOSITORY_ROOT, "scripts/tauri", wrapper),
+      NodePath.join(wrapperDirectory, wrapper),
+    );
+  }
   return root;
 }
 
@@ -54,6 +59,10 @@ describe("prepare Tauri AppImage tools", () => {
       url: "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/b5eb8d05b4c0ed40107fe2158c5d8527f94568ef/linuxdeploy-plugin-gtk.sh",
       sha256: "cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a",
     });
+    expect(GSTREAMER_PLUGIN_PIN).toEqual({
+      url: "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/2a2e67491c32995a3f279ad0ecbe77abd512b42a/linuxdeploy-plugin-gstreamer.sh",
+      sha256: "c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94",
+    });
   });
 
   it("does no filesystem or network work on non-Linux platforms", async () => {
@@ -64,6 +73,7 @@ describe("prepare Tauri AppImage tools", () => {
       repositoryRoot,
       platform: "darwin",
       plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
       download: async () => {
         downloads += 1;
         return FIXTURE_PLUGIN;
@@ -75,7 +85,7 @@ describe("prepare Tauri AppImage tools", () => {
     expect(NodeFS.existsSync(NodePath.join(repositoryRoot, "target"))).toBe(false);
   });
 
-  it("downloads, verifies, and publishes both executable tools", async () => {
+  it("downloads, verifies, and publishes every executable tool", async () => {
     const repositoryRoot = makeRepositoryRoot();
     let downloads = 0;
 
@@ -83,6 +93,7 @@ describe("prepare Tauri AppImage tools", () => {
       repositoryRoot,
       platform: "linux",
       plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
       download: async (url) => {
         expect(url).toBe(FIXTURE_PIN.url);
         downloads += 1;
@@ -97,16 +108,21 @@ describe("prepare Tauri AppImage tools", () => {
       toolsDirectory: NodePath.dirname(upstreamPath),
       usedCachedUpstream: false,
     });
-    expect(downloads).toBe(1);
+    expect(downloads).toBe(2);
     expect(NodeFS.readFileSync(upstreamPath)).toEqual(Buffer.from(FIXTURE_PLUGIN));
-    expect(NodeFS.readFileSync(wrapperPath)).toEqual(
-      NodeFS.readFileSync(NodePath.join(repositoryRoot, "scripts/tauri/linuxdeploy-plugin-gtk.sh")),
+    expect(NodeFS.readFileSync(toolPath(repositoryRoot, GSTREAMER_UPSTREAM_FILENAME))).toEqual(
+      Buffer.from(FIXTURE_PLUGIN),
     );
+    for (const wrapper of PLUGIN_WRAPPERS) {
+      expect(NodeFS.readFileSync(toolPath(repositoryRoot, wrapper))).toEqual(
+        NodeFS.readFileSync(NodePath.join(repositoryRoot, "scripts/tauri", wrapper)),
+      );
+    }
     expect(
       NodeFS.readdirSync(NodePath.dirname(upstreamPath)).filter((name) =>
         name.startsWith("linuxdeploy-plugin-"),
       ),
-    ).toEqual(["linuxdeploy-plugin-gtk.sh"]);
+    ).toEqual(PLUGIN_WRAPPERS);
     // oxlint-disable-next-line bibcode/no-global-process-runtime -- These filesystem integration tests assert executable modes on the host platform.
     if (process.platform !== "win32") {
       expect(NodeFS.statSync(upstreamPath).mode & 0o111).not.toBe(0);
@@ -144,6 +160,10 @@ describe("prepare Tauri AppImage tools", () => {
           url: `http://127.0.0.1:${address.port}/linuxdeploy-plugin-gtk.sh`,
           sha256: FIXTURE_PIN.sha256,
         },
+        gstreamerPlugin: {
+          url: `http://127.0.0.1:${address.port}/linuxdeploy-plugin-gstreamer.sh`,
+          sha256: FIXTURE_PIN.sha256,
+        },
       });
 
       expect(result).toMatchObject({ status: "prepared", usedCachedUpstream: false });
@@ -166,11 +186,14 @@ describe("prepare Tauri AppImage tools", () => {
     const upstreamPath = toolPath(repositoryRoot, UPSTREAM_FILENAME);
     NodeFS.mkdirSync(NodePath.dirname(upstreamPath), { recursive: true });
     NodeFS.writeFileSync(upstreamPath, FIXTURE_PLUGIN, { mode: 0o644 });
+    const gstreamerUpstreamPath = toolPath(repositoryRoot, GSTREAMER_UPSTREAM_FILENAME);
+    NodeFS.writeFileSync(gstreamerUpstreamPath, FIXTURE_PLUGIN, { mode: 0o644 });
 
     const result = await prepareTauriAppImageTools({
       repositoryRoot,
       platform: "linux",
       plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
       download: async () => {
         throw new Error("download must not run for a valid cache");
       },
@@ -178,9 +201,11 @@ describe("prepare Tauri AppImage tools", () => {
 
     expect(result).toMatchObject({ status: "prepared", usedCachedUpstream: true });
     expect(NodeFS.readFileSync(upstreamPath)).toEqual(Buffer.from(FIXTURE_PLUGIN));
+    expect(NodeFS.readFileSync(gstreamerUpstreamPath)).toEqual(Buffer.from(FIXTURE_PLUGIN));
     // oxlint-disable-next-line bibcode/no-global-process-runtime -- These filesystem integration tests assert executable modes on the host platform.
     if (process.platform !== "win32") {
       expect(NodeFS.statSync(upstreamPath).mode & 0o111).not.toBe(0);
+      expect(NodeFS.statSync(gstreamerUpstreamPath).mode & 0o111).not.toBe(0);
     }
   });
 
@@ -190,11 +215,13 @@ describe("prepare Tauri AppImage tools", () => {
     const upstreamPath = toolPath(repositoryRoot, UPSTREAM_FILENAME);
     NodeFS.mkdirSync(NodePath.dirname(legacyPath), { recursive: true });
     NodeFS.writeFileSync(legacyPath, FIXTURE_PLUGIN, { mode: 0o755 });
+    NodeFS.writeFileSync(toolPath(repositoryRoot, GSTREAMER_UPSTREAM_FILENAME), FIXTURE_PLUGIN);
 
     const result = await prepareTauriAppImageTools({
       repositoryRoot,
       platform: "linux",
       plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
       download: async () => {
         throw new Error("download must not run for a valid legacy cache");
       },
@@ -207,7 +234,7 @@ describe("prepare Tauri AppImage tools", () => {
       NodeFS.readdirSync(NodePath.dirname(upstreamPath)).filter((name) =>
         name.startsWith("linuxdeploy-plugin-"),
       ),
-    ).toEqual(["linuxdeploy-plugin-gtk.sh"]);
+    ).toEqual(PLUGIN_WRAPPERS);
   });
 
   it("keeps a valid legacy cache when atomic migration publication fails", async () => {
@@ -228,6 +255,7 @@ describe("prepare Tauri AppImage tools", () => {
           repositoryRoot,
           platform: "linux",
           plugin: FIXTURE_PIN,
+          gstreamerPlugin: FIXTURE_PIN,
           download: async () => {
             throw new Error("download must not run for a valid legacy cache");
           },
@@ -252,6 +280,7 @@ describe("prepare Tauri AppImage tools", () => {
         repositoryRoot,
         platform: "linux",
         plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
         download: async () => new TextEncoder().encode("corrupt"),
       }),
     ).rejects.toMatchObject({
@@ -273,6 +302,7 @@ describe("prepare Tauri AppImage tools", () => {
         repositoryRoot,
         platform: "linux",
         plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
         download: async () => new TextEncoder().encode("corrupt"),
       }),
     ).rejects.toMatchObject({
@@ -283,6 +313,48 @@ describe("prepare Tauri AppImage tools", () => {
     expect(NodeFS.existsSync(upstreamPath)).toBe(false);
   });
 
+  it("replaces the unpinned GStreamer plugin the bundler downloads with the wrapper", async () => {
+    const repositoryRoot = makeRepositoryRoot();
+    const pluginPath = toolPath(repositoryRoot, "linuxdeploy-plugin-gstreamer.sh");
+    NodeFS.mkdirSync(NodePath.dirname(pluginPath), { recursive: true });
+    NodeFS.writeFileSync(pluginPath, "unpinned upstream bytes", { mode: 0o755 });
+
+    await prepareTauriAppImageTools({
+      repositoryRoot,
+      platform: "linux",
+      plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
+      download: async () => FIXTURE_PLUGIN,
+    });
+
+    expect(NodeFS.readFileSync(pluginPath)).toEqual(
+      NodeFS.readFileSync(
+        NodePath.join(repositoryRoot, "scripts/tauri/linuxdeploy-plugin-gstreamer.sh"),
+      ),
+    );
+  });
+
+  it("rejects a corrupt GStreamer plugin download without publishing it", async () => {
+    const repositoryRoot = makeRepositoryRoot();
+    const gstreamerUpstreamPath = toolPath(repositoryRoot, GSTREAMER_UPSTREAM_FILENAME);
+    const gstreamerPin = {
+      url: "https://example.invalid/gstreamer.sh",
+      sha256: FIXTURE_PIN.sha256,
+    };
+
+    await expect(
+      prepareTauriAppImageTools({
+        repositoryRoot,
+        platform: "linux",
+        plugin: FIXTURE_PIN,
+        gstreamerPlugin: gstreamerPin,
+        download: async (url) =>
+          url === gstreamerPin.url ? new TextEncoder().encode("corrupt") : FIXTURE_PLUGIN,
+      }),
+    ).rejects.toMatchObject({ boundary: "integrity", targetPath: gstreamerUpstreamPath });
+    expect(NodeFS.existsSync(gstreamerUpstreamPath)).toBe(false);
+  });
+
   it("reports download failures at the network boundary", async () => {
     const repositoryRoot = makeRepositoryRoot();
 
@@ -291,6 +363,7 @@ describe("prepare Tauri AppImage tools", () => {
         repositoryRoot,
         platform: "linux",
         plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
         download: async () => {
           throw new Error("offline");
         },
@@ -312,6 +385,7 @@ describe("prepare Tauri AppImage tools", () => {
         repositoryRoot,
         platform: "linux",
         plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
         download: async () => FIXTURE_PLUGIN,
       }),
     ).rejects.toMatchObject({
@@ -330,6 +404,7 @@ describe("prepare Tauri AppImage tools", () => {
       repositoryRoot,
       platform: "linux",
       plugin: FIXTURE_PIN,
+      gstreamerPlugin: FIXTURE_PIN,
       download: async () => FIXTURE_PLUGIN,
     });
 

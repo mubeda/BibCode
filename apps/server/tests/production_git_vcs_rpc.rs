@@ -129,8 +129,16 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 
 impl GitServerHarness {
     async fn start(temp: &TempDir, parallelism_permit: OwnedSemaphorePermit) -> Self {
+        Self::start_with_services(temp, parallelism_permit, git_vcs_services(temp)).await
+    }
+
+    async fn start_with_services(
+        temp: &TempDir,
+        parallelism_permit: OwnedSemaphorePermit,
+        services: GitVcsRpcServices,
+    ) -> Self {
         let mut registry = RpcRegistry::empty();
-        register_git_vcs_rpc(&mut registry, git_vcs_services(temp));
+        register_git_vcs_rpc(&mut registry, services);
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
             .await
             .expect("server starts");
@@ -2680,6 +2688,590 @@ async fn interrupting_a_clone_stops_git_and_removes_the_destination_it_created()
     assert!(clone_parent.is_dir());
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_real_commit_survives_a_held_and_failed_push() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("a_real_commit_survives_a_held_and_failed_push") {
+        return;
+    }
+
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    // An explicit empty proxy keeps Git on the loopback remote even when the host sets one.
+    run_git(&repository, &["config", "--global", "http.proxy", ""]);
+    initialize_repository(&repository);
+    commit_file(repository.path(), "base.txt", "base\n", "test: base");
+    let (remote, url) = stalled_http_remote().await;
+    run_git(&repository, &["remote", "add", "origin", &url]);
+    fs::write(repository.path().join("held.txt"), "held\n").expect("write held change");
+    let cwd = repository.path().to_string_lossy().into_owned();
+
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+    request(
+        server.socket(),
+        "1",
+        "git.runStackedAction",
+        json!({
+            "actionId": "held-push",
+            "cwd": cwd,
+            "action": "commit_push",
+            "commitMessage": "test: held push",
+        }),
+    )
+    .await;
+    let connection = accept_git(&remote).await;
+    assert_eq!(
+        git_stdout(&repository, &["log", "-1", "--format=%s"]).trim(),
+        "test: held push",
+        "the commit is made before the push connects"
+    );
+
+    request(
+        server.socket(),
+        "2",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let mut action_events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match pump_server_message(
+            server.socket(),
+            deadline,
+            "a status refresh while the push is held",
+            &mut action_events,
+        )
+        .await
+        {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { value },
+            } if request_id.as_str() == "2" => break value.unwrap_or(Value::Null),
+            ServerMessage::Exit { request_id, exit } if request_id.as_str() != "1" => {
+                panic!("the status refresh failed during the held push: {exit:?}")
+            }
+            ServerMessage::Exit { exit, .. } => {
+                panic!("the action ended while the push was held: {exit:?}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(
+        status["hasWorkingTreeChanges"], false,
+        "the refresh shows the committed tree: {status}"
+    );
+
+    drop(connection);
+    drop(remote);
+    let deadline = Instant::now() + STACKED_ACTION_COMPLETION_INTEGRATION_DEADLINE;
+    loop {
+        if let ServerMessage::Exit { request_id, .. } = pump_server_message(
+            server.socket(),
+            deadline,
+            "the failed push ending the action",
+            &mut action_events,
+        )
+        .await
+            && request_id.as_str() == "1"
+        {
+            break;
+        }
+    }
+    let ended = action_events
+        .iter()
+        .find(|event| event["kind"] == "action_failed" || event["kind"] == "action_finished")
+        .unwrap_or_else(|| panic!("no terminal action event in {action_events:?}"));
+    assert_eq!(ended["kind"], "action_failed", "{ended}");
+    assert_eq!(ended["phase"], "push", "{ended}");
+    assert_eq!(
+        git_stdout(&repository, &["log", "-1", "--format=%s"]).trim(),
+        "test: held push",
+        "the commit stays after the push failed"
+    );
+
+    fs::write(repository.path().join("after.txt"), "after\n").expect("write later change");
+    let second = run_stacked_action(
+        server.socket(),
+        "3",
+        json!({
+            "actionId": "after-push",
+            "cwd": cwd,
+            "action": "commit",
+            "commitMessage": "test: after the push",
+        }),
+    )
+    .await;
+    assert_eq!(second["kind"], "action_finished", "{second}");
+    assert_eq!(second["result"]["commit"]["status"], "created", "{second}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_push_leaves_subscribers_with_the_clean_status() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("a_failed_push_leaves_subscribers_with_the_clean_status") {
+        return;
+    }
+
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    run_git(&repository, &["config", "--global", "http.proxy", ""]);
+    initialize_repository(&repository);
+    commit_file(repository.path(), "base.txt", "base\n", "test: base");
+    let (remote, url) = stalled_http_remote().await;
+    run_git(&repository, &["remote", "add", "origin", &url]);
+    fs::write(repository.path().join("dirty.txt"), "dirty\n").expect("write dirty change");
+    let cwd = repository.path().to_string_lossy().into_owned();
+
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+    request(
+        server.socket(),
+        "9",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let snapshot = next_server_message_for(server.socket(), "the subscription snapshot").await;
+    assert!(
+        matches!(&snapshot, ServerMessage::Chunk { request_id, .. } if request_id.as_str() == "9"),
+        "{snapshot:?}"
+    );
+
+    // The snapshot stays unacknowledged, so the next 8 dirty states fill the stream's
+    // channel and the ones after wait in the stream task, as behind a slow client.
+    let mut ignored = Vec::new();
+    for index in 0..10 {
+        fs::write(
+            repository.path().join(format!("dirty-{index}.txt")),
+            "dirty\n",
+        )
+        .expect("write another dirty change");
+        let id = (100 + index).to_string();
+        request(
+            server.socket(),
+            &id,
+            "vcs.refreshStatus",
+            json!({ "cwd": cwd }),
+        )
+        .await;
+        let deadline = Instant::now() + GIT_STATUS_INTEGRATION_DEADLINE;
+        loop {
+            if let ServerMessage::Exit { request_id, exit } = pump_server_message_holding(
+                server.socket(),
+                deadline,
+                "a dirty status refresh",
+                &mut ignored,
+                Some("9"),
+            )
+            .await
+                && request_id.as_str() == id
+            {
+                assert!(matches!(exit, RpcExit::Success { .. }), "{exit:?}");
+                break;
+            }
+        }
+    }
+
+    request(
+        server.socket(),
+        "1",
+        "git.runStackedAction",
+        json!({
+            "actionId": "failed-push",
+            "cwd": cwd,
+            "action": "commit_push",
+            "commitMessage": "test: failed push",
+        }),
+    )
+    .await;
+    let connection = accept_git(&remote).await;
+    request(
+        server.socket(),
+        "2",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let mut action_events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match pump_server_message_holding(
+            server.socket(),
+            deadline,
+            "a status refresh while the push is held",
+            &mut action_events,
+            Some("9"),
+        )
+        .await
+        {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { value },
+            } if request_id.as_str() == "2" => break value.unwrap_or(Value::Null),
+            ServerMessage::Exit { request_id, exit } => {
+                panic!("request {request_id:?} ended while the push was held: {exit:?}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(
+        status["hasWorkingTreeChanges"], false,
+        "the clean status is in the broadcaster cache: {status}"
+    );
+
+    drop(connection);
+    drop(remote);
+    let deadline = Instant::now() + STACKED_ACTION_COMPLETION_INTEGRATION_DEADLINE;
+    loop {
+        if let ServerMessage::Exit { request_id, .. } = pump_server_message_holding(
+            server.socket(),
+            deadline,
+            "the failed push ending the action",
+            &mut action_events,
+            Some("9"),
+        )
+        .await
+            && request_id.as_str() == "1"
+        {
+            break;
+        }
+    }
+    assert!(
+        action_events
+            .iter()
+            .any(|event| event["kind"] == "action_failed" && event["phase"] == "push"),
+        "the push failed: {action_events:?}"
+    );
+    // Time for the settle-time trailing read to finish before forwarding resumes.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    send_json(server.socket(), json!({ "_tag": "Ack", "requestId": "9" })).await;
+    let mut status_events = Vec::new();
+    let latest_has_changes = |events: &[Value]| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| event.get("local"))
+            .map(|local| local["hasWorkingTreeChanges"].clone())
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while latest_has_changes(&status_events) != Some(Value::Bool(false)) {
+        if Instant::now() >= deadline {
+            let delivered = status_events
+                .iter()
+                .filter_map(|event| event.get("local"))
+                .map(|local| local["hasWorkingTreeChanges"].clone())
+                .collect::<Vec<_>>();
+            panic!(
+                "the subscriber kept the dirty status after the failed push; \
+                 hasWorkingTreeChanges per delivered local status: {delivered:?}"
+            );
+        }
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            timeout_at(deadline, next_frame_past_heartbeat(server.socket())).await
+            && let Ok(ServerMessage::Chunk { request_id, values }) =
+                serde_json::from_str::<ServerMessage>(&text)
+        {
+            status_events.extend(values);
+            send_json(
+                server.socket(),
+                json!({ "_tag": "Ack", "requestId": request_id.as_str() }),
+            )
+            .await;
+        }
+    }
+
+    server.shutdown().await;
+}
+
+/// A `gh` that answers `pr list` from marker files in `STATE`. A `slow` file holds a delay
+/// in seconds, and an `open` file makes it report pull request 42 for the branch.
+#[cfg(unix)]
+const MARKER_GH: &str = r#"#!/bin/sh
+case "$1:$2" in
+  pr:list)
+    printf '%s\n' "$4" >> 'STATE/calls'
+    if [ -f 'STATE/slow' ]; then sleep "$(cat 'STATE/slow')"; fi
+    if [ -f 'STATE/open' ]; then
+      printf '[{"number":42,"title":"PR for %s","url":"https://github.example.test/example-org/sample-project/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
+    else
+      printf '[]\n'
+    fi ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// A repository whose `origin` is a loopback host recorded as GitHub, served by `MARKER_GH`.
+#[cfg(unix)]
+struct PullRequestLookupFixture {
+    temp: TempDir,
+    repository: TempDir,
+    bin: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+impl PullRequestLookupFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temporary server directory");
+        let repository = TempDir::new().expect("temporary repository");
+        initialize_repository(&repository);
+        commit_file(repository.path(), "base.txt", "base\n", "test: base");
+        // Nothing listens on port 9, so a fetch fails at once and never leaves the host.
+        run_git(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "http://127.0.0.1:9/example-org/sample-project.git",
+            ],
+        );
+        let bin = temp.path().join("hosting-bin");
+        let state = temp.path().join("gh-state");
+        fs::create_dir(&bin).expect("hosting bin");
+        fs::create_dir(&state).expect("gh state");
+        let gh = bin.join("gh");
+        fs::write(&gh, MARKER_GH.replace("STATE", &state.to_string_lossy()))
+            .expect("write gh stub");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("gh is executable");
+        Self {
+            temp,
+            repository,
+            bin,
+            state,
+        }
+    }
+
+    fn services(&self) -> GitVcsRpcServices {
+        let hosts = Arc::new(bibcode_server::source_control::ProviderHosts::default());
+        hosts.record(
+            "127.0.0.1:9",
+            bibcode_server::source_control::ProviderKind::Github,
+        );
+        let repository = Arc::new(
+            bibcode_server::git::GitRepository::default().with_provider_hosts(hosts.clone()),
+        );
+        GitVcsRpcServices::with_repository(repository, hosts)
+            .with_hosting_executable_dir_for_integration_test(self.bin.clone())
+    }
+
+    fn cwd(&self) -> String {
+        self.repository.path().to_string_lossy().into_owned()
+    }
+
+    fn set(&self, marker: &str, contents: &str) {
+        fs::write(self.state.join(marker), contents).expect("gh marker");
+    }
+
+    fn lookups(&self) -> usize {
+        fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_pull_request_lookup_does_not_delay_the_refresh() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("slow_pull_request_lookup_does_not_delay_the_refresh") {
+        return;
+    }
+    let fixture = PullRequestLookupFixture::new();
+    fixture.set("open", "");
+    fixture.set("slow", "12");
+    let mut server = GitServerHarness::start_with_services(
+        &fixture.temp,
+        parallelism_permit,
+        fixture.services(),
+    )
+    .await;
+
+    request(
+        server.socket(),
+        "1",
+        "vcs.refreshStatus",
+        json!({ "cwd": fixture.cwd() }),
+    )
+    .await;
+    let status = timeout(Duration::from_secs(5), success_value(server.socket(), "1"))
+        .await
+        .expect("the refresh answers within a few seconds while gh takes 12 seconds");
+    assert_eq!(status["isRepo"], true, "{status}");
+    assert_eq!(status["refName"], "main", "{status}");
+    assert!(status["pr"].is_null(), "{status}");
+    assert_eq!(fixture.lookups(), 1, "the refresh asked gh once");
+
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_pull_request_lookup_reaches_subscribers_when_it_finishes() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "slow_pull_request_lookup_reaches_subscribers_when_it_finishes",
+    ) {
+        return;
+    }
+    let fixture = PullRequestLookupFixture::new();
+    let cwd = fixture.cwd();
+    let mut server = GitServerHarness::start_with_services(
+        &fixture.temp,
+        parallelism_permit,
+        fixture.services(),
+    )
+    .await;
+
+    request(
+        server.socket(),
+        "9",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let mut status_events = Vec::new();
+    let deadline = Instant::now() + GIT_STATUS_INTEGRATION_DEADLINE;
+    pump_server_message(
+        server.socket(),
+        deadline,
+        "the subscription snapshot",
+        &mut status_events,
+    )
+    .await;
+    while fixture.lookups() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription never looked up its pull request"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A finished mutation forgets the remembered "no pull request" answer. Waiting for its
+    // trailing status keeps the next refresh from publishing anything new.
+    fs::write(fixture.repository.path().join("staged.txt"), "staged\n").expect("write file");
+    request(
+        server.socket(),
+        "2",
+        "vcs.stageFiles",
+        json!({ "cwd": cwd, "filePaths": ["staged.txt"] }),
+    )
+    .await;
+    let is_staged = |events: &[Value]| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| event.get("local"))
+            .is_some_and(|local| {
+                local["workingTree"]["files"]
+                    .as_array()
+                    .is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|file| file["path"] == "staged.txt" && file["area"] == "staged")
+                    })
+            })
+    };
+    let mut staged = false;
+    while !staged || !is_staged(&status_events) {
+        if let ServerMessage::Exit { request_id, exit } = pump_server_message(
+            server.socket(),
+            deadline,
+            "the staged status reaching the subscriber",
+            &mut status_events,
+        )
+        .await
+        {
+            assert_eq!(request_id.as_str(), "2", "{exit:?}");
+            assert!(matches!(exit, RpcExit::Success { .. }), "{exit:?}");
+            staged = true;
+        }
+    }
+
+    fixture.set("open", "");
+    fixture.set("slow", "12");
+    let lookups_before_refresh = fixture.lookups();
+    request(
+        server.socket(),
+        "3",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let has_pull_request = |events: &[Value]| {
+        events
+            .iter()
+            .any(|event| event["remote"]["pr"]["number"] == 42)
+    };
+    while !has_pull_request(&status_events) {
+        pump_server_message(
+            server.socket(),
+            deadline,
+            "the subscriber receiving the pull request once gh answers",
+            &mut status_events,
+        )
+        .await;
+    }
+    assert_eq!(
+        fixture.lookups(),
+        lookups_before_refresh + 1,
+        "the subscriber reused the refresh's lookup"
+    );
+
+    server.shutdown().await;
+}
+
+/// Reads one message, acknowledging a stream chunk and keeping its values.
+async fn pump_server_message(
+    socket: &mut TestSocket,
+    deadline: Instant,
+    context: &str,
+    chunks: &mut Vec<Value>,
+) -> ServerMessage {
+    pump_server_message_holding(socket, deadline, context, chunks, None).await
+}
+
+/// Like `pump_server_message`, but a chunk of the `held` stream must not arrive, because
+/// its previous chunk is left unacknowledged.
+async fn pump_server_message_holding(
+    socket: &mut TestSocket,
+    deadline: Instant,
+    context: &str,
+    chunks: &mut Vec<Value>,
+    held: Option<&str>,
+) -> ServerMessage {
+    let frame = timeout_at(deadline, next_frame_past_heartbeat(socket))
+        .await
+        .unwrap_or_else(|_| panic!("{context}: no server message before the deadline"))
+        .expect("WebSocket remains open")
+        .expect("valid WebSocket frame");
+    let Message::Text(text) = frame else {
+        panic!("{context}: expected a text WebSocket message, got {frame:?}");
+    };
+    let message: ServerMessage = serde_json::from_str(&text).expect("valid server RPC message");
+    if let ServerMessage::Chunk { request_id, values } = &message {
+        assert_ne!(
+            Some(request_id.as_str()),
+            held,
+            "{context}: the held stream sent a chunk before its Ack"
+        );
+        chunks.extend(values.iter().cloned());
+        send_json(
+            socket,
+            json!({ "_tag": "Ack", "requestId": request_id.as_str() }),
+        )
+        .await;
+    }
+    message
 }
 
 async fn interrupt_clone(socket: &mut TestSocket, id: &str, method: &str) {

@@ -64,6 +64,9 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
   const writes: string[] = [];
   const begins: number[] = [];
   const cancellations: string[] = [];
+  const resizes: Array<{ readonly cols: number; readonly sizeClaim?: string }> = [];
+  const attaches: Array<unknown> = [];
+  let resizeGate: Effect.Effect<void> = Effect.void;
   let failLifecycle = false;
   const lifecycle = () =>
     failLifecycle
@@ -74,7 +77,24 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
       [WS_METHODS.terminalOpen]: lifecycle,
       [WS_METHODS.terminalRestart]: lifecycle,
       [WS_METHODS.terminalClose]: () => Effect.void,
+      [WS_METHODS.terminalResize]: (input: { cols: number; sizeClaim?: string }) =>
+        Effect.suspend(() => {
+          resizes.push({
+            cols: input.cols,
+            ...(input.sizeClaim ? { sizeClaim: input.sizeClaim } : {}),
+          });
+          const gate = resizeGate;
+          resizeGate = Effect.void;
+          return gate;
+        }),
       [WS_METHODS.subscribeTerminalMetadata]: () => Stream.fromIterable(metadataBatch),
+      [WS_METHODS.terminalAttach]: (input: unknown) => {
+        attaches.push(input);
+        return Stream.make({
+          type: "snapshot",
+          snapshot: { ...snapshot, size: { cols: 91, rows: 42, sizeClaim: "owner" } },
+        });
+      },
       [WS_METHODS.terminalBeginInput]: (input: { attachmentSequence: number }) =>
         Effect.sync(() => {
           begins.push(input.attachmentSequence);
@@ -130,12 +150,67 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
     writes,
     begins,
     cancellations,
+    attaches,
+    resizes,
+    holdNextResize: (gate: Effect.Effect<void>) => {
+      resizeGate = gate;
+    },
     session,
     activeSession,
     fail: () => {
       failLifecycle = true;
     },
   };
+});
+
+describe("terminal resize claims", () => {
+  it.effect(
+    "executes every renderer's latest claim, so success is that renderer's own (#348)",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness(false);
+        const release = yield* Deferred.make<void>();
+        h.holdNextResize(Deferred.await(release));
+        const resize = (cols: number, sizeClaim: string) =>
+          h
+            .invoke(h.atoms.resize, {
+              ...target,
+              input: { ...target.input, cols, rows: 24, sizeClaim },
+            })
+            .pipe(Effect.forkChild({ startImmediately: true }));
+        const first = yield* resize(80, "renderer-a");
+        yield* Effect.yieldNow;
+        const second = yield* resize(81, "renderer-a");
+        const other = yield* resize(90, "renderer-b");
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+        yield* Fiber.join(other);
+        expect(h.resizes).toEqual(
+          expect.arrayContaining([
+            { cols: 80, sizeClaim: "renderer-a" },
+            { cols: 81, sizeClaim: "renderer-a" },
+            { cols: 90, sizeClaim: "renderer-b" },
+          ]),
+        );
+        h.registry.dispose();
+      }),
+  );
+
+  it.effect("reads an existing session's size with an attach that cannot create or claim", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness(false);
+      const result = yield* h.invoke(h.atoms.readSize, target);
+      expect(AsyncResult.isSuccess(result) && result.value).toEqual({
+        cols: 91,
+        rows: 42,
+        sizeClaim: "owner",
+      });
+      expect(h.attaches).toEqual([target.input]);
+      h.registry.dispose();
+    }),
+  );
 });
 
 for (const ordered of [false, true]) {

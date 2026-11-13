@@ -29,13 +29,20 @@ function eventChangesMetadata(event: TerminalAttachStreamEvent): boolean {
 export function projectTerminalMetadataStream<E, R>(
   events: Stream.Stream<TerminalAttachStreamEvent, E, R>,
   runtime: TerminalTranscriptRuntime,
+  sizeClaim?: string,
 ): Stream.Stream<TerminalMetadataSnapshot, E, R> {
-  return events.pipe(
-    Stream.filterMap((event) => {
-      runtime.ingest(event);
-      return eventChangesMetadata(event) ? Result.succeed(runtime.metadata()) : Result.failVoid;
-    }),
-  );
+  return Stream.suspend(() => {
+    // One identity per run of the stream: the runtime orders events across streams by it.
+    const source = sizeClaim === undefined ? {} : { sizeClaim };
+    return events.pipe(
+      Stream.filterMap((event) => {
+        runtime.ingest(event, source);
+        return eventChangesMetadata(event) ? Result.succeed(runtime.metadata()) : Result.failVoid;
+      }),
+      // An ended stream must not keep ordering the streams still running.
+      Stream.ensuring(Effect.sync(() => runtime.releaseSource(source))),
+    );
+  });
 }
 
 export interface TerminalTranscriptRuntimeRegistry {
@@ -86,12 +93,13 @@ export function acquireTerminalMetadataStream<E, R>(
   events: Stream.Stream<TerminalAttachStreamEvent, E, R>,
   registry: TerminalTranscriptRuntimeRegistry,
   key: string,
+  sizeClaim?: string,
 ): Stream.Stream<TerminalMetadataSnapshot, E, R> {
   return Stream.unwrap(
     Effect.acquireRelease(
       Effect.sync(() => registry.acquire(key)),
       () => Effect.sync(() => registry.release(key)),
-    ).pipe(Effect.map((runtime) => projectTerminalMetadataStream(events, runtime))),
+    ).pipe(Effect.map((runtime) => projectTerminalMetadataStream(events, runtime, sizeClaim))),
   );
 }
 

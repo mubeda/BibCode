@@ -104,7 +104,7 @@ function CommandInput({
   wrapperClassName?: string | undefined;
 }) {
   return (
-    <div className={cn("px-2.5 py-1.5", wrapperClassName)}>
+    <div className={cn("px-2.5 py-1.5", wrapperClassName)} data-slot="command-input">
       <AutocompleteInput
         autoFocus
         className={cn(

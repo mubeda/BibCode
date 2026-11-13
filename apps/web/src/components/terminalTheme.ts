@@ -1,11 +1,29 @@
+import type { ThemeFile } from "@bibcode/contracts";
 import type { TerminalThemePreference } from "@bibcode/contracts/settings";
+
+import { resolveToken } from "../themes/themeColor";
 
 export type TerminalThemeMode = "light" | "dark";
 
 export interface TerminalLaunchThemeState {
   readonly generation: number;
   readonly theme: TerminalThemeMode;
+  /** The full palette the session was launched with; a running session keeps it (R51). */
+  readonly palette?: TerminalPalette | undefined;
 }
+
+/** Every color a terminal session is drawn and reported with, as hex. */
+export type TerminalPalette = {
+  mode: TerminalThemeMode;
+  /** Changes whenever any color changes, including a saved edit to a theme with the same id. */
+  key: string;
+  background: string;
+  foreground: string;
+  cursor: string;
+  selectionBackground: string;
+  selectionForeground: string;
+  ansi: TerminalAnsiColors;
+};
 
 const TERMINAL_OSC_COLORS = {
   dark: { background: "14,18,24", foreground: "237,241,247", cursor: "180,203,255" },
@@ -109,8 +127,64 @@ const TERMINAL_ANSI_COLORS: Record<TerminalThemeMode, TerminalAnsiColors> = {
  * The terminal's 16 named ANSI colors for a theme. The live terminal and the job log
  * viewer both draw from it, so a log's colors match the terminal in either theme.
  */
-export function terminalAnsiColors(mode: TerminalThemeMode): TerminalAnsiColors {
-  return TERMINAL_ANSI_COLORS[mode];
+export function terminalAnsiColors(
+  source: TerminalThemeMode | TerminalPalette,
+): TerminalAnsiColors {
+  return typeof source === "string" ? TERMINAL_ANSI_COLORS[source] : source.ansi;
+}
+
+/**
+ * The palette a new terminal session uses. With "Follow app theme" the theme's terminal colors
+ * win over its base's built-in palette; with Dark or Light the built-in palette is used (R51).
+ */
+export function resolveTerminalPalette(
+  preference: TerminalThemePreference,
+  theme: ThemeFile,
+): TerminalPalette {
+  const mode = preference === "app" ? theme.base : preference;
+  const source: ThemeFile =
+    preference === "app" ? theme : { version: 1, id: mode, name: mode, base: mode };
+  const color = (token: string) => resolveToken(source, `terminal.${token}`);
+  const ansi = Object.fromEntries(
+    TERMINAL_ANSI_COLOR_NAMES.map((name) => [
+      name,
+      color(name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)),
+    ]),
+  ) as TerminalAnsiColors;
+  const colors = {
+    background: color("background"),
+    foreground: color("foreground"),
+    cursor: color("cursor"),
+    selectionBackground: color("selection-background"),
+    selectionForeground: color("selection-foreground"),
+  };
+  return {
+    mode,
+    key: [mode, ...Object.values(colors), ...Object.values(ansi)].join(","),
+    ...colors,
+    ansi,
+  };
+}
+
+const BUILTIN_PALETTE_KEYS = new Map<TerminalThemeMode, string>();
+
+/** Whether `palette` is the built-in Light or Dark terminal palette. */
+export function isBuiltinTerminalPalette(palette: TerminalPalette): boolean {
+  let key = BUILTIN_PALETTE_KEYS.get(palette.mode);
+  if (key === undefined) {
+    key = resolveTerminalPalette(palette.mode, {
+      version: 1,
+      id: palette.mode,
+      name: palette.mode,
+      base: palette.mode,
+    }).key;
+    BUILTIN_PALETTE_KEYS.set(palette.mode, key);
+  }
+  return palette.key === key;
+}
+
+function oscTriplet(hex: string): string {
+  return [1, 3, 5].map((index) => Number.parseInt(hex.slice(index, index + 2), 16)).join(",");
 }
 
 const XTERM_CUBE_LEVELS = [0, 95, 135, 175, 215, 255] as const;
@@ -155,8 +229,17 @@ export function terminalExtendedAnsiPalette(mode: TerminalThemeMode): Array<stri
   return palette;
 }
 
-export function terminalOscColorEnv(mode: TerminalThemeMode): Record<string, string> {
-  const colors = TERMINAL_OSC_COLORS[mode];
+export function terminalOscColorEnv(
+  source: TerminalThemeMode | TerminalPalette,
+): Record<string, string> {
+  const colors =
+    typeof source === "string"
+      ? TERMINAL_OSC_COLORS[source]
+      : {
+          background: oscTriplet(source.background),
+          foreground: oscTriplet(source.foreground),
+          cursor: oscTriplet(source.cursor),
+        };
   return {
     BIBCODE_OSC_BACKGROUND: colors.background,
     BIBCODE_OSC_FOREGROUND: colors.foreground,
@@ -168,12 +251,15 @@ export function mergeTerminalSpawnEnv(input: {
   readonly commandEnv?: Readonly<Record<string, string>> | undefined;
   readonly runtimeEnv?: Readonly<Record<string, string>> | undefined;
   readonly resolvedTheme: TerminalThemeMode;
+  readonly palette?: TerminalPalette | undefined;
   readonly windowsConsoleTheme: boolean;
 }): Record<string, string> {
   return {
     ...withoutReservedTerminalThemeEnv(input.commandEnv),
     ...withoutReservedTerminalThemeEnv(input.runtimeEnv),
-    ...terminalOscColorEnv(input.resolvedTheme),
+    ...terminalOscColorEnv(
+      input.palette?.mode === input.resolvedTheme ? input.palette : input.resolvedTheme,
+    ),
     ...(input.windowsConsoleTheme ? { [WINDOWS_CONSOLE_THEME]: input.resolvedTheme } : {}),
   };
 }
@@ -197,6 +283,18 @@ export function usesPersistentWindowsConsoleTheme(
 }
 
 export function retainTerminalLaunchTheme(
+  previous: TerminalLaunchThemeState | null,
+  input: Parameters<typeof retainLaunchMode>[1] & { readonly palette?: TerminalPalette },
+): TerminalLaunchThemeState {
+  const next = retainLaunchMode(previous, input);
+  const palette =
+    previous !== null && previous.generation === input.generation && previous.palette
+      ? previous.palette
+      : input.palette;
+  return next.palette === palette ? next : { ...next, palette };
+}
+
+function retainLaunchMode(
   previous: TerminalLaunchThemeState | null,
   input: {
     readonly persistentConsoleTheme: boolean;

@@ -581,6 +581,7 @@ fn project(main: &Path) -> ProjectionProject {
         updated_at: NOW.to_owned(),
         deleted_at: None,
         repository_identity: None,
+        code_review_prompt: String::new(),
     }
 }
 
@@ -611,6 +612,7 @@ fn workspace_thread(path: &Path) -> ProjectionThread {
         deleted_at: None,
         host_thread_id: None,
         compaction: None,
+        code_review: false,
     }
 }
 

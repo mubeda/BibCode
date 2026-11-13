@@ -59,6 +59,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeUiIntents
   | typeof WS_METHODS.subscribeServerConfig
   | typeof WS_METHODS.subscribeServerLifecycle
+  | typeof WS_METHODS.serverSubscribeHostMetrics
   | typeof WS_METHODS.subscribeTerminalEvents
   | typeof WS_METHODS.subscribeTerminalMetadata
   | typeof WS_METHODS.subscribePreviewEvents

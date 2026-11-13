@@ -15,12 +15,17 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use super::model::{TerminalConsoleTheme, terminal_console_theme_from_env};
+#[cfg(unix)]
+use super::history::LossyReplay;
+use super::model::{
+    TerminalConsoleTheme, TerminalGeneration, TerminalInputOrigin, TerminalResizeOutcome,
+    TerminalResizeResult, terminal_console_theme_from_env,
+};
 use super::{
-    PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
-    TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
-    TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
-    TerminalStatus, TerminalSummary,
+    ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
+    TerminalAttachInput, TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent,
+    TerminalOpenInput, TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot,
+    TerminalSize, TerminalStatus, TerminalSummary,
     history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
 use super::{TerminalAgentStatus, TerminalAgentStatusState};
@@ -288,6 +293,24 @@ struct Session {
     cols: u16,
     rows: u16,
     size_owner: Option<SizeOwner>,
+    /// The sequence of the last published size event, reported by resize results.
+    size_sequence: u64,
+    /// The claim whose attachment left while it owned the size: the window last used. It gets
+    /// the size back when it returns, unless the window the size went to was used since.
+    departed_owner: Option<String>,
+    /// The owner received the size when the previous owner left, and nobody typed since.
+    owner_unused_since_handoff: bool,
+    /// When a user last typed in each window, by size claim, on `user_input_clock`: the size
+    /// goes to the one used last when its owner leaves several viewers (#348).
+    user_input_order: HashMap<String, u64>,
+    user_input_clock: u64,
+    /// Set while the size is un-owned because its owner left several viewers and none was used
+    /// since: the hand-over waits for use, so an attach does not take the size, and only this
+    /// viewer answers the terminal's queries meanwhile (#348).
+    handover_replier: Option<String>,
+    /// A size the PTY refused on every retry; the session holds the size it kept instead.
+    /// Asking for it again changes nothing until another size is asked for (#348).
+    refused_size: Option<(u16, u16)>,
     first_attachment_grant_used: bool,
     osc_color_responder_active: bool,
     process: Option<Arc<dyn PtyProcess>>,
@@ -356,10 +379,39 @@ impl SessionAgentStatus {
 /// agent's tool calls do not flood the metadata stream.
 const AGENT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The next size a PTY kept after refusing one on every retry; never for a backend that
+/// does not report them.
+async fn next_exhausted_resize(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Option<ExhaustedResize>>>,
+) -> ExhaustedResize {
+    loop {
+        let Some(current) = receiver.as_mut() else {
+            return std::future::pending().await;
+        };
+        if current.changed().await.is_err() {
+            *receiver = None;
+            continue;
+        }
+        if let Some(report) = *current.borrow_and_update() {
+            return report;
+        }
+    }
+}
+
+/// The windows whose typing a session orders at once; more are not tracked (#348).
+const MAX_USER_INPUT_CLAIMS: usize = 64;
+
+/// The viewer that answers the terminal's queries while the size is un-owned: the least claim,
+/// any one would do, and it stays the same while it is attached (#348).
+fn handover_replier(claims: Option<&HashMap<String, uuid::Uuid>>) -> Option<String> {
+    claims.and_then(|claims| claims.keys().min().cloned())
+}
+
 /// What a replacement process keeps from the session it replaces.
 #[derive(Default)]
 struct SessionCarryOver {
     center_panel: bool,
+    size_owner: Option<SizeOwner>,
 }
 
 type SessionKey = (String, String);
@@ -389,6 +441,7 @@ impl TerminalSessionIdentity {
     pub(super) async fn enqueue_input(
         &self,
         data: &str,
+        origin: TerminalInputOrigin<'_>,
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
     ) -> Result<super::writer::PendingWrite, TerminalError> {
@@ -399,7 +452,7 @@ impl TerminalSessionIdentity {
             () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
             guard = self.generation.publication.lock() => guard,
         };
-        let session = self.session.lock().await;
+        let mut session = self.session.lock().await;
         if cancelled.is_cancelled()
             || connection_closed.is_cancelled()
             || self.generation.is_invalidated()
@@ -419,6 +472,7 @@ impl TerminalSessionIdentity {
                 terminal_id: self.key.1.clone(),
             });
         }
+        session.note_input(origin);
         drop(session);
         let pending = self.generation.writer.enqueue(&self.process, data, true)?;
         self.generation
@@ -1120,6 +1174,7 @@ struct ClosedSessionNotification {
     thread_id: String,
     terminal_id: String,
     sequence: u64,
+    generation: TerminalGeneration,
 }
 
 #[derive(Debug, Default)]
@@ -1200,6 +1255,8 @@ impl Drop for UncommittedPtyProcess {
 
 #[derive(Debug)]
 struct SessionGeneration {
+    /// This process's place in the manager's generation order, kept after it exits.
+    id: TerminalGeneration,
     observation: TerminalObserverGeneration,
     observer: std::sync::Mutex<Option<PreparedObserverHandle>>,
     closing: std::sync::atomic::AtomicBool,
@@ -1223,8 +1280,13 @@ struct SessionGeneration {
 }
 
 impl SessionGeneration {
-    fn new(key: &SessionKey, observer_runtime: Option<tokio::runtime::Handle>) -> Self {
+    fn new(
+        key: &SessionKey,
+        observer_runtime: Option<tokio::runtime::Handle>,
+        id: TerminalGeneration,
+    ) -> Self {
         Self {
+            id,
             observation: TerminalObserverGeneration::new_with_runtime(
                 key.0.clone(),
                 key.1.clone(),
@@ -1341,6 +1403,9 @@ impl SessionGeneration {
 struct SessionGenerationRegistry {
     observer_runtime: Option<tokio::runtime::Handle>,
     current: std::sync::Mutex<HashMap<SessionKey, std::sync::Weak<SessionGeneration>>>,
+    /// Names this manager instance: a restarted server starts its generations over (#348).
+    boot: String,
+    issued: std::sync::atomic::AtomicU64,
 }
 
 impl SessionGenerationRegistry {
@@ -1348,6 +1413,35 @@ impl SessionGenerationRegistry {
         Self {
             observer_runtime,
             current: std::sync::Mutex::new(HashMap::new()),
+            boot: uuid::Uuid::new_v4().simple().to_string(),
+            issued: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn create(&self, key: &SessionKey) -> Arc<SessionGeneration> {
+        let process = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        Arc::new(SessionGeneration::new(
+            key,
+            self.observer_runtime.clone(),
+            TerminalGeneration {
+                boot: self.boot.clone(),
+                process,
+            },
+        ))
+    }
+
+    /// At or above every generation issued so far, for a close an attachment reports after
+    /// it fell behind: it must outrank whatever process that attachment last saw.
+    fn latest(&self) -> TerminalGeneration {
+        TerminalGeneration {
+            boot: self.boot.clone(),
+            process: self
+                .issued
+                .load(std::sync::atomic::Ordering::Acquire)
+                .max(1),
         }
     }
 
@@ -1359,7 +1453,7 @@ impl SessionGenerationRegistry {
         {
             return generation;
         }
-        let generation = Arc::new(SessionGeneration::new(key, self.observer_runtime.clone()));
+        let generation = self.create(key);
         current.insert(key.clone(), Arc::downgrade(&generation));
         generation
     }
@@ -1379,7 +1473,7 @@ impl SessionGenerationRegistry {
         let mut current = self.current.lock().expect("terminal generations lock");
         current.retain(|_, generation| generation.strong_count() > 0);
         let displaced = current.remove(key).and_then(|value| value.upgrade());
-        let generation = Arc::new(SessionGeneration::new(key, self.observer_runtime.clone()));
+        let generation = self.create(key);
         current.insert(key.clone(), Arc::downgrade(&generation));
         (displaced, generation)
     }
@@ -1719,17 +1813,80 @@ impl Session {
             cols: self.cols,
             rows: self.rows,
             size_claim: self.size_owner.as_ref().map(|owner| owner.claim.clone()),
+            reply_claim: self
+                .handover_replier
+                .clone()
+                .filter(|_| self.size_owner.is_none()),
         }
     }
 
     fn resized(&mut self) -> TerminalEvent {
         let sequence = self.advance();
+        self.size_sequence = sequence;
         TerminalEvent::Resized {
             thread_id: self.thread_id.clone(),
             terminal_id: self.terminal_id.clone(),
             sequence,
             size: self.size(),
+            only_for: None,
         }
+    }
+
+    /// Input counts as use of a window unless it is the terminal's own reply: use ends the
+    /// departed owner's claim to the size, and a user's input orders the windows (#348).
+    fn note_input(&mut self, origin: TerminalInputOrigin<'_>) {
+        if origin == TerminalInputOrigin::Automatic {
+            return;
+        }
+        self.departed_owner = None;
+        self.owner_unused_since_handoff = false;
+        if let TerminalInputOrigin::User(claim) = origin {
+            self.user_input_clock += 1;
+            // Departed claims are pruned at each release; past the bound, the window typed in
+            // longest ago is forgotten rather than this one.
+            if let Some(order) = self.user_input_order.get_mut(claim) {
+                *order = self.user_input_clock;
+            } else if self
+                .user_input_order
+                .insert(claim.to_owned(), self.user_input_clock)
+                .is_none()
+                && self.user_input_order.len() > MAX_USER_INPUT_CLAIMS
+                && let Some(oldest) = self
+                    .user_input_order
+                    .iter()
+                    .min_by_key(|(_, typed)| **typed)
+                    .map(|(claim, _)| claim.clone())
+            {
+                self.user_input_order.remove(&oldest);
+            }
+        }
+    }
+
+    /// What this session holds, as a resize request's answer.
+    fn resize_result(&self, outcome: TerminalResizeOutcome) -> TerminalResizeResult {
+        TerminalResizeResult {
+            outcome,
+            size: Some(self.size()),
+            generation: Some(self.generation.id.clone()),
+            sequence: Some(self.size_sequence),
+        }
+    }
+
+    /// The process to ask for a repaint after an attach replayed a lossy history, and why:
+    /// best-effort repaint recovery for Claude terminals that BiBCode starts, not terminal-state
+    /// reconstruction. The Claude CLI repaints in full on `SIGCONT`; other programs are not
+    /// known to, so they get nothing (#348).
+    #[cfg(unix)]
+    fn resume_after_lossy_attach(&self) -> Option<(Arc<dyn PtyProcess>, LossyReplay)> {
+        if self.status != TerminalStatus::Running {
+            return None;
+        }
+        self.command
+            .as_ref()
+            .and_then(|command| command.activity.as_ref())
+            .filter(|activity| activity.driver_kind == CLAUDE_DRIVER_KIND)?;
+        let reason = self.history.lossy_replay()?;
+        Some((self.process.clone()?, reason))
     }
 
     fn snapshot(&self) -> TerminalSessionSnapshot {
@@ -1748,6 +1905,7 @@ impl Session {
             updated_at: self.updated_at.clone(),
             sequence: self.sequence,
             size: Some(self.size()),
+            generation: Some(self.generation.id.clone()),
             osc_color_responder_active: self.osc_color_responder_active,
             // Only attach can issue the first-attachment grant.
             first_attachment_grant: false,
@@ -1777,6 +1935,10 @@ impl Session {
     fn carry_over(&self) -> SessionCarryOver {
         SessionCarryOver {
             center_panel: self.center_panel,
+            size_owner: self.size_owner.as_ref().map(|owner| SizeOwner {
+                claim: owner.claim.clone(),
+                attachment: owner.attachment,
+            }),
         }
     }
 
@@ -1844,6 +2006,8 @@ struct Inner {
     cancellation: CancellationToken,
     #[cfg(test)]
     restart_after_exact_cleanup_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
+    #[cfg(test)]
+    restart_before_register_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
 }
 
 #[derive(Clone)]
@@ -1909,6 +2073,8 @@ impl TerminalManager {
                 cancellation: CancellationToken::new(),
                 #[cfg(test)]
                 restart_after_exact_cleanup_barrier: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                restart_before_register_barrier: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -2577,6 +2743,13 @@ impl TerminalManager {
             cols: input.cols,
             rows: input.rows,
             size_owner: None,
+            size_sequence: 1,
+            departed_owner: None,
+            owner_unused_since_handoff: false,
+            user_input_order: HashMap::new(),
+            user_input_clock: 0,
+            handover_replier: None,
+            refused_size: None,
             first_attachment_grant_used: false,
             osc_color_responder_active: process.osc_color_responder_active(),
             process: Some(process.clone()),
@@ -2641,22 +2814,45 @@ impl TerminalManager {
             }
             return Ok(snapshot);
         }
-        // Only Restarted resets surviving attachments' sequence cursors.
-        // A non-restart reopen leaves the first-attachment grant available.
-        let first_attachment_grant_used = is_restart
-            && self
+        #[cfg(test)]
+        if is_restart {
+            let barrier = self
                 .inner
-                .size_claim_attachments
+                .restart_before_register_barrier
                 .lock()
-                .expect("terminal attachment claims")
-                .get(&key)
-                .is_some_and(|claims| !claims.is_empty());
-        session.lock().await.first_attachment_grant_used = first_attachment_grant_used;
+                .expect("restart barrier lock")
+                .take();
+            if let Some(barrier) = barrier {
+                barrier.started.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+        // Registered before the owner check: an owner whose stream drops after the check finds
+        // this session, and its release waits for this publication lock (#348).
         self.inner
             .sessions
             .write()
             .await
-            .insert(key, session.clone());
+            .insert(key.clone(), session.clone());
+        {
+            let mut session = session.lock().await;
+            let attachments = self
+                .inner
+                .size_claim_attachments
+                .lock()
+                .expect("terminal attachment claims");
+            let claims = attachments.get(&key);
+            // Only Restarted resets surviving attachments' sequence cursors.
+            // A non-restart reopen leaves the first-attachment grant available.
+            session.first_attachment_grant_used =
+                is_restart && claims.is_some_and(|claims| !claims.is_empty());
+            // The window that sized the replaced process sizes the restarted one while it is
+            // still attached; left un-owned, every surviving window would race to claim it.
+            session.size_owner = carry_over.size_owner.take().filter(|owner| {
+                is_restart
+                    && claims.and_then(|claims| claims.get(&owner.claim)) == Some(&owner.attachment)
+            });
+        }
         self.supervise(session.clone(), process, exit, generation.clone());
         uncommitted_process.commit();
         // The installed observer is now visible to the lifecycle snapshot used by disable.
@@ -2830,6 +3026,10 @@ impl TerminalManager {
         let exit_inner = inner.clone();
         let exit_session = session.clone();
         let exit_generation = generation.clone();
+        // This task also publishes the size a PTY kept after refusing one on every retry, so
+        // that ends with the process, its generation, or the manager (#348).
+        let mut exhausted_resizes = process.subscribe_resize_exhausted();
+        let exit_process = process.clone();
         tokio::spawn(async move {
             loop {
                 let observed_exit = exit.borrow().clone();
@@ -2841,6 +3041,16 @@ impl TerminalManager {
                             if result.is_err() {
                                 return;
                             }
+                        }
+                        report = next_exhausted_resize(&mut exhausted_resizes) => {
+                            Self::publish_kept_size(
+                                &exit_inner,
+                                &exit_session,
+                                &exit_generation,
+                                &exit_process,
+                                report,
+                            )
+                            .await;
                         }
                     }
                     continue;
@@ -3144,6 +3354,7 @@ impl TerminalManager {
                     sequence,
                     exit_code: exit.exit_code,
                     exit_signal: exit.signal,
+                    generation: Some(session.generation.id.clone()),
                 },
                 session.summary(),
                 PathBuf::from(
@@ -3379,11 +3590,18 @@ impl TerminalManager {
                 let first_attachment_grant =
                     current.size_owner.is_none() && !current.first_attachment_grant_used;
                 current.first_attachment_grant_used = true;
-                if current.size_owner.is_none() {
+                // A size left un-owned until a window is used is not taken by attaching: an
+                // idle window reloaded or shown again would take it. The window it was taken
+                // from gets it back before anyone uses another (#348).
+                let handover_pending = current.handover_replier.is_some()
+                    && current.departed_owner.as_deref() != Some(claim.as_str());
+                if current.size_owner.is_none() && !handover_pending {
                     current.size_owner = Some(SizeOwner {
                         claim: claim.clone(),
                         attachment: id,
                     });
+                    current.handover_replier = None;
+                    current.departed_owner = None;
                     let _ = self.inner.events.send(current.resized());
                 } else if let Some(owner) = current
                     .size_owner
@@ -3393,6 +3611,18 @@ impl TerminalManager {
                     // A reconnect may reuse a renderer's claim. Its departed stream
                     // must not clear ownership from this replacement attachment.
                     owner.attachment = id;
+                } else if current.owner_unused_since_handoff
+                    && current.departed_owner.as_deref() == Some(claim.as_str())
+                {
+                    // The window last used came back before anyone used the one the size
+                    // went to: an unattended window does not keep the size (#348).
+                    current.size_owner = Some(SizeOwner {
+                        claim: claim.clone(),
+                        attachment: id,
+                    });
+                    current.departed_owner = None;
+                    current.owner_unused_since_handoff = false;
+                    let _ = self.inner.events.send(current.resized());
                 }
                 let dropped = CancellationToken::new();
                 let inner = self.inner.clone();
@@ -3424,9 +3654,19 @@ impl TerminalManager {
             });
         let mut initial = current.snapshot();
         initial.first_attachment_grant = first_attachment_grant;
+        let generation = current.generation.clone();
+        #[cfg(unix)]
+        let resume = current.resume_after_lossy_attach();
+        // The repaint is published under these locks: release them before asking for it.
+        drop(current);
+        drop(_publication);
+        #[cfg(unix)]
+        if let Some((process, reason)) = resume {
+            resume_after_lossy_attach(&input.thread_id, &input.terminal_id, &*process, reason);
+        }
         Ok(TerminalAttachment {
             inner: Arc::downgrade(&self.inner),
-            generation: Some(current.generation.clone()),
+            generation: Some(generation),
             thread_id: input.thread_id,
             terminal_id: input.terminal_id,
             next_sequence: initial.sequence,
@@ -3555,6 +3795,19 @@ impl TerminalManager {
         terminal_id: &str,
         data: &str,
     ) -> Result<(), TerminalError> {
+        self.write_from(thread_id, terminal_id, data, TerminalInputOrigin::Unmarked)
+            .await
+    }
+
+    /// [`Self::write`] from `origin`: only a user's input, or an older client's, counts as use
+    /// of a window for the size rule (#348).
+    pub async fn write_from(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        data: &str,
+        origin: TerminalInputOrigin<'_>,
+    ) -> Result<(), TerminalError> {
         let not_running = || TerminalError::NotRunning {
             thread_id: thread_id.to_owned(),
             terminal_id: terminal_id.to_owned(),
@@ -3564,7 +3817,8 @@ impl TerminalManager {
         let mut pending = {
             let _publication = generation.publication.lock().await;
             let (process, status) = {
-                let session = session.lock().await;
+                let mut session = session.lock().await;
+                session.note_input(origin);
                 (session.process.clone(), session.status)
             };
             // An exit invalidates the generation and then marks the session exited, both under
@@ -3593,6 +3847,9 @@ impl TerminalManager {
         pending.wait().await
     }
 
+    /// Answers with what the session holds afterwards. A claim for the size and owner it
+    /// already holds publishes a `resized` to that claim's attachment alone, in order with
+    /// its output, so a renderer holding a stale size repairs it without a timer (#348).
     pub async fn resize(
         &self,
         thread_id: &str,
@@ -3600,7 +3857,23 @@ impl TerminalManager {
         cols: u16,
         rows: u16,
         size_claim: Option<String>,
-    ) -> Result<(), TerminalError> {
+    ) -> Result<TerminalResizeResult, TerminalError> {
+        self.resize_acknowledging(thread_id, terminal_id, cols, rows, size_claim, true)
+            .await
+    }
+
+    /// [`Self::resize`] for a caller that may predate the acknowledgement: without
+    /// `acknowledge`, a claim of the size and owner already held publishes nothing, as before
+    /// the structured answer (#348).
+    pub async fn resize_acknowledging(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+        size_claim: Option<String>,
+        acknowledge: bool,
+    ) -> Result<TerminalResizeResult, TerminalError> {
         validate_dimensions(cols, rows)?;
         let Some(session) = self
             .inner
@@ -3610,14 +3883,14 @@ impl TerminalManager {
             .get(&(thread_id.to_string(), terminal_id.to_string()))
             .cloned()
         else {
-            return Ok(());
+            return Ok(TerminalResizeResult::session_missing());
         };
         let generation = session.lock().await.generation.clone();
         let _publication = generation.publication.lock().await;
-        if generation.is_invalidated() {
-            return Ok(());
-        }
         let mut session = session.lock().await;
+        if generation.is_invalidated() {
+            return Ok(session.resize_result(TerminalResizeOutcome::GenerationInvalidated));
+        }
         let size_owner = match size_claim {
             Some(claim) => {
                 let attachments = self
@@ -3630,7 +3903,7 @@ impl TerminalManager {
                     .and_then(|claims| claims.get(&claim))
                 else {
                     // A queued resize from a departed renderer must not resurrect its claim.
-                    return Ok(());
+                    return Ok(session.resize_result(TerminalResizeOutcome::ClaimNotRegistered));
                 };
                 Some(SizeOwner {
                     claim,
@@ -3639,14 +3912,23 @@ impl TerminalManager {
             }
             None => None,
         };
-        let Some(process) = session.process.as_ref() else {
-            return Ok(());
+        let Some(process) = session.process.clone() else {
+            return Ok(session.resize_result(TerminalResizeOutcome::ProcessAbsent));
         };
         let size_changed = session.cols != cols || session.rows != rows;
         let owner_changed = session.size_owner.as_ref().map(|owner| &owner.claim)
             != size_owner.as_ref().map(|owner| &owner.claim);
-        if size_changed {
+        // The PTY refused this size on every retry and the session holds the size it kept:
+        // asking for it again sends and publishes nothing, so a renderer that claims its fit
+        // after each publication settles instead of cycling (#348).
+        if !owner_changed && session.refused_size == Some((cols, rows)) {
+            session.first_attachment_grant_used |= size_owner.is_some();
+            return Ok(session.resize_result(TerminalResizeOutcome::Unchanged));
+        }
+        // The PTY refused the size the session records: an equal request sends it again.
+        if size_changed || process.resize_needs_retry() {
             process.resize(cols, rows).map_err(TerminalError::Io)?;
+            session.refused_size = None;
             generation
                 .activity_wake
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3654,13 +3936,63 @@ impl TerminalManager {
         // Applying a claim consumes the grant even if no dimensions changed.
         session.first_attachment_grant_used |= size_owner.is_some();
         if !size_changed && !owner_changed {
-            return Ok(());
+            if let Some(owner) = size_owner.filter(|_| acknowledge) {
+                let mut event = session.resized();
+                if let TerminalEvent::Resized { only_for, .. } = &mut event {
+                    *only_for = Some(owner.attachment);
+                }
+                let _ = self.inner.events.send(event);
+            }
+            return Ok(session.resize_result(TerminalResizeOutcome::Unchanged));
+        }
+        if owner_changed {
+            session.departed_owner = None;
+            session.owner_unused_since_handoff = false;
         }
         session.cols = cols;
         session.rows = rows;
+        if size_owner.is_some() {
+            session.handover_replier = None;
+        }
         session.size_owner = size_owner;
         let _ = self.inner.events.send(session.resized());
-        Ok(())
+        Ok(session.resize_result(TerminalResizeOutcome::Applied))
+    }
+
+    /// The PTY refused the size the session records on every retry and kept the size in
+    /// `report`: publish that size with a new sequence, so every viewer converges on what the
+    /// PTY really has (#348). A report a newer request overtook is left to that request.
+    async fn publish_kept_size(
+        inner: &Inner,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+        process: &Arc<dyn PtyProcess>,
+        report: ExhaustedResize,
+    ) {
+        let _publication = tokio::select! {
+            () = inner.cancellation.cancelled() => return,
+            () = generation.cancellation.cancelled() => return,
+            guard = generation.publication.lock() => guard,
+        };
+        let mut session = session.lock().await;
+        if generation.is_invalidated()
+            || !Arc::ptr_eq(&session.generation, generation)
+            || !session
+                .process
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, process))
+            || report.requests != process.resize_requests_sent()
+        {
+            return;
+        }
+        let refused = (session.cols, session.rows);
+        if refused == (report.cols, report.rows) {
+            return;
+        }
+        session.refused_size = Some(refused);
+        session.cols = report.cols;
+        session.rows = report.rows;
+        let _ = inner.events.send(session.resized());
     }
 
     async fn release_size_claim(inner: &Inner, key: &SessionKey, attachment_id: uuid::Uuid) {
@@ -3682,10 +4014,73 @@ impl TerminalManager {
             return;
         }
         let mut session = session.lock().await;
+        let attachments = inner
+            .size_claim_attachments
+            .lock()
+            .expect("terminal attachment claims");
+        let claims = attachments.get(key);
+        // Every release, not only the owner's: a window hidden and shown again returns under a
+        // new claim, and the ones it left must not fill the bounded typing record.
+        session
+            .user_input_order
+            .retain(|claim, _| claims.is_some_and(|claims| claims.contains_key(claim)));
         if session.size_owner.as_ref().map(|owner| owner.attachment) != Some(attachment_id) {
+            // A pending hand-over: a lone viewer left takes the size, and a replier that left
+            // is replaced so one viewer keeps answering the terminal's queries.
+            let Some(replier) = session.handover_replier.as_deref() else {
+                return;
+            };
+            let remaining = claims.map_or(0, HashMap::len);
+            if remaining > 1 && claims.is_some_and(|claims| claims.contains_key(replier)) {
+                return;
+            }
+            let lone = claims
+                .filter(|claims| claims.len() == 1)
+                .and_then(|claims| claims.iter().next())
+                .map(|(claim, id)| SizeOwner {
+                    claim: claim.clone(),
+                    attachment: *id,
+                });
+            session.handover_replier = handover_replier(claims).filter(|_| remaining > 1);
+            drop(attachments);
+            if remaining == 0 {
+                return;
+            }
+            session.owner_unused_since_handoff = lone.is_some();
+            session.size_owner = lone;
+            let _ = inner.events.send(session.resized());
             return;
         }
-        session.size_owner = None;
+        // The window last used sizes the terminal (#348). A lone remaining viewer takes the
+        // size at once; among several, the one a user typed in last does, and with none typed
+        // in it stays un-owned until one claims it. The departed owner gets it back if it
+        // returns before anyone types.
+        let remaining = {
+            let order = &session.user_input_order;
+            claims
+                .and_then(|claims| {
+                    if claims.len() == 1 {
+                        return claims.iter().next();
+                    }
+                    claims
+                        .iter()
+                        .filter_map(|entry| order.get(entry.0).map(|typed| (typed, entry)))
+                        .max_by_key(|(typed, _)| **typed)
+                        .map(|(_, entry)| entry)
+                })
+                .map(|(claim, id)| SizeOwner {
+                    claim: claim.clone(),
+                    attachment: *id,
+                })
+        };
+        session.handover_replier = remaining
+            .is_none()
+            .then(|| handover_replier(claims))
+            .flatten();
+        drop(attachments);
+        session.departed_owner = session.size_owner.take().map(|owner| owner.claim);
+        session.owner_unused_since_handoff = remaining.is_some();
+        session.size_owner = remaining;
         let _ = inner.events.send(session.resized());
     }
 
@@ -3977,7 +4372,7 @@ impl TerminalManager {
             let Some(session) = removed else {
                 continue;
             };
-            let (process, sequence) = {
+            let (process, sequence, generation) = {
                 let mut session = session.lock().await;
                 session.attribution_registration.take();
                 session.observer.take();
@@ -3986,7 +4381,7 @@ impl TerminalManager {
                 session.pid = None;
                 session.has_running_subprocess = false;
                 session.child_command_label = None;
-                (process, session.advance())
+                (process, session.advance(), session.generation.id.clone())
             };
             if let Some(process) = process {
                 let exit = process.subscribe_exit();
@@ -4014,6 +4409,7 @@ impl TerminalManager {
                 thread_id: key.0,
                 terminal_id: key.1,
                 sequence,
+                generation,
             });
         }
         closed
@@ -4029,6 +4425,7 @@ impl TerminalManager {
                 thread_id: notification.thread_id.clone(),
                 terminal_id: notification.terminal_id.clone(),
                 sequence: notification.sequence,
+                generation: Some(notification.generation.clone()),
             });
             let _ = self.inner.metadata.send(TerminalMetadataEvent::Remove {
                 thread_id: notification.thread_id.clone(),
@@ -4191,6 +4588,36 @@ impl TerminalManager {
                 thread_id: thread_id.to_string(),
                 terminal_id: terminal_id.to_string(),
             })
+    }
+}
+
+/// The provider driver whose terminals get a repaint signal after a lossy attach (#348).
+#[cfg(unix)]
+const CLAUDE_DRIVER_KIND: &str = "claudeAgent";
+
+/// Sends the one repaint signal of a lossy attach; logs no terminal content.
+#[cfg(unix)]
+fn resume_after_lossy_attach(
+    thread_id: &str,
+    terminal_id: &str,
+    process: &dyn PtyProcess,
+    reason: LossyReplay,
+) {
+    match process.resume() {
+        Ok(sent) => tracing::debug!(
+            thread_id,
+            terminal_id,
+            reason = reason.as_str(),
+            sent,
+            "asked a Claude terminal to repaint after a lossy attach"
+        ),
+        Err(error) => tracing::warn!(
+            thread_id,
+            terminal_id,
+            reason = reason.as_str(),
+            %error,
+            "failed to ask a Claude terminal to repaint after a lossy attach"
+        ),
     }
 }
 
@@ -4449,12 +4876,15 @@ impl TerminalAttachment {
     }
 
     /// The session closed and its event was among the lost ones: say so.
+    /// Its sequence is this attachment's own guess, so it carries the latest generation issued:
+    /// a client applies it by generation, never against another stream's sequence (#348).
     fn closed(&mut self) -> AttachmentItem {
         self.next_sequence = self.next_sequence.saturating_add(1);
         AttachmentItem::Event(TerminalEvent::Closed {
             thread_id: self.thread_id.clone(),
             terminal_id: self.terminal_id.clone(),
             sequence: self.next_sequence,
+            generation: self.inner.upgrade().map(|inner| inner.generations.latest()),
         })
     }
 
@@ -4482,6 +4912,15 @@ impl TerminalAttachment {
         }
         if sequence > self.next_sequence {
             self.next_sequence = sequence;
+            // Another claim's acknowledgement: passed over, though its sequence is spent.
+            if let TerminalEvent::Resized {
+                only_for: Some(target),
+                ..
+            } = &event
+                && self._size_claim.as_ref().map(|claim| claim.id) != Some(*target)
+            {
+                return None;
+            }
             return Some(event);
         }
         None
@@ -4583,7 +5022,7 @@ async fn validate_cwd(cwd: &Path) -> Result<(), TerminalError> {
     }
 }
 
-fn validate_dimensions(cols: u16, rows: u16) -> Result<(), TerminalError> {
+pub(super) fn validate_dimensions(cols: u16, rows: u16) -> Result<(), TerminalError> {
     if !(1..=1_000).contains(&cols) || !(1..=500).contains(&rows) {
         return Err(TerminalError::Io(format!(
             "invalid terminal size {cols}x{rows}"
@@ -5084,6 +5523,14 @@ mod tests {
         resize_error: std::sync::Mutex<Option<String>>,
         resizes: std::sync::Mutex<Vec<(u16, u16)>>,
         output_on_resize: std::sync::Mutex<Option<String>>,
+        /// Reports that the PTY refused its last size, as the resize worker does.
+        resize_needs_retry: std::sync::atomic::AtomicBool,
+        /// Sizes asked of this PTY, and the resize worker's report of one it kept refusing.
+        resize_requests: std::sync::atomic::AtomicU64,
+        resize_exhausted: tokio::sync::watch::Sender<Option<ExhaustedResize>>,
+        /// Every resume signal the manager asked of this PTY (#348).
+        #[cfg(unix)]
+        resumes: std::sync::atomic::AtomicUsize,
     }
 
     /// Holds PTY writes until opened. Opening it on drop keeps a failed test from hanging in
@@ -5166,7 +5613,17 @@ mod tests {
                 resize_error: std::sync::Mutex::new(None),
                 resizes: std::sync::Mutex::new(Vec::new()),
                 output_on_resize: std::sync::Mutex::new(None),
+                resize_needs_retry: std::sync::atomic::AtomicBool::new(false),
+                resize_requests: std::sync::atomic::AtomicU64::new(0),
+                resize_exhausted: tokio::sync::watch::channel(None).0,
+                #[cfg(unix)]
+                resumes: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        #[cfg(unix)]
+        fn resumes(&self) -> usize {
+            self.resumes.load(std::sync::atomic::Ordering::Acquire)
         }
 
         fn with_identity(pid: u32) -> Self {
@@ -5267,6 +5724,8 @@ mod tests {
         }
 
         fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            self.resize_requests
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(error) = self.resize_error.lock().unwrap().clone() {
                 return Err(error);
             }
@@ -5275,6 +5734,22 @@ mod tests {
                 self.emit(output);
             }
             Ok(())
+        }
+
+        fn resize_needs_retry(&self) -> bool {
+            self.resize_needs_retry
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn subscribe_resize_exhausted(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<Option<ExhaustedResize>>> {
+            Some(self.resize_exhausted.subscribe())
+        }
+
+        fn resize_requests_sent(&self) -> u64 {
+            self.resize_requests
+                .load(std::sync::atomic::Ordering::Acquire)
         }
 
         fn kill(&self) -> Result<(), String> {
@@ -5293,6 +5768,13 @@ mod tests {
                 }));
             }
             result
+        }
+
+        #[cfg(unix)]
+        fn resume(&self) -> Result<bool, String> {
+            self.resumes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(true)
         }
 
         fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
@@ -5478,6 +5960,268 @@ mod tests {
             AttachmentItem::Event(event) => event,
             AttachmentItem::Resync { .. } => panic!("expected an event, not a resync"),
         }
+    }
+
+    /// A manager for the resume-signal tests (#348): `history_line_limit` lines retained.
+    #[cfg(unix)]
+    fn resume_manager(
+        history_line_limit: usize,
+        event_capacity: usize,
+    ) -> (tempfile::TempDir, Arc<HistoryTestBackend>, TerminalManager) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                history_line_limit,
+                event_capacity,
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        (root, backend, manager)
+    }
+
+    /// A terminal of `thread`, launched as a provider terminal of `driver`, or a shell.
+    #[cfg(unix)]
+    fn resume_terminal(
+        root: &tempfile::TempDir,
+        thread: &str,
+        driver: Option<&str>,
+    ) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new(thread, "term", root.path().to_path_buf(), 80, 24);
+        input.command = driver.map(|driver| TerminalLaunchCommand {
+            executable: "provider-cli".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: driver.to_owned(),
+                provider_instance_id: driver.to_owned(),
+            }),
+            env: None,
+        });
+        input
+    }
+
+    /// Emits `data` and waits until the session's history has taken it in.
+    #[cfg(unix)]
+    async fn emit_into_history(
+        manager: &TerminalManager,
+        pty: &HistoryTestPty,
+        thread: &str,
+        data: &str,
+    ) {
+        let before = manager
+            .read_history(thread, "term", None, 0)
+            .await
+            .unwrap()
+            .total;
+        pty.emit(data);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .read_history(thread, "term", None, 0)
+                .await
+                .unwrap()
+                .total
+                < before + data.len() as u64
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output reached the history");
+    }
+
+    /// Attaches and drops the attachment, as a window that is shown and hidden again.
+    #[cfg(unix)]
+    async fn attach_once(manager: &TerminalManager, thread: &str) {
+        drop(
+            manager
+                .attach(TerminalAttachInput::existing(thread, "term"))
+                .await
+                .expect("attach"),
+        );
+    }
+
+    /// A complete history under the client's cut replays the whole screen: no signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossless_attach_of_a_claude_terminal_sends_no_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "frame\n").await;
+        attach_once(&manager, "claude").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// Each attach after eviction asks the session's own group to repaint once, and the close
+    /// that follows still kills the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_lossy_attach_of_a_claude_terminal_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "one\ntwo\nthree\nfour\n").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 2);
+
+        manager.close("claude", Some("term")).await.unwrap();
+        assert!(pty.is_killed(), "close kills after a resume");
+        manager.shutdown().await;
+    }
+
+    /// Nothing evicted, but more retained than a released client keeps of the snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_over_the_client_cut_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", &"x".repeat(512 * 1024 + 1)).await;
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        manager.shutdown().await;
+    }
+
+    /// A clear discards the program's last paint like eviction does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_after_clear_sends_one_resume() {
+        let (root, backend, manager) = resume_manager(5_000, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "frame\n").await;
+        manager.clear("claude", "term").await.unwrap();
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 1);
+        manager.shutdown().await;
+    }
+
+    /// Only Claude terminals BiBCode starts are signalled: not a shell, not another provider.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lossy_attaches_of_shells_and_other_providers_send_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        for (thread, driver) in [
+            ("shell", None),
+            ("codex", Some("codex")),
+            ("opencode", Some("opencode")),
+        ] {
+            manager
+                .open(resume_terminal(&root, thread, driver))
+                .await
+                .unwrap();
+            let pty = backend.latest();
+            emit_into_history(&manager, &pty, thread, "one\ntwo\nthree\nfour\n").await;
+            attach_once(&manager, thread).await;
+            assert_eq!(pty.resumes(), 0, "{thread}");
+        }
+        manager.shutdown().await;
+    }
+
+    /// An exited session's process is not signalled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossy_attach_of_an_exited_claude_terminal_sends_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        emit_into_history(&manager, &pty, "claude", "one\ntwo\nthree\nfour\n").await;
+        pty.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .read_history("claude", "term", None, 0)
+                .await
+                .unwrap()
+                .status
+                == TerminalStatus::Running
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exit published");
+        attach_once(&manager, "claude").await;
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// History reads and a lagging attachment's resync are not attaches: no signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_reads_and_lag_resyncs_send_no_resume() {
+        let (root, backend, manager) = resume_manager(2, 16);
+        manager
+            .open(resume_terminal(&root, "claude", Some("claudeAgent")))
+            .await
+            .unwrap();
+        let mut attachment = manager
+            .attach(TerminalAttachInput::existing("claude", "term"))
+            .await
+            .unwrap();
+        let pty = backend.latest();
+        for line in 0..100 {
+            pty.emit(&format!("line {line}\n"));
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let item = tokio::time::timeout(Duration::from_secs(2), attachment.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(item, AttachmentItem::Resync { .. }),
+            "a lag resync"
+        );
+        manager
+            .read_history("claude", "term", None, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(pty.resumes(), 0);
+        manager.shutdown().await;
+    }
+
+    /// A restart's new process is the only one a later lossy attach signals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_claude_terminal_resumes_only_its_new_process() {
+        let (root, backend, manager) = resume_manager(2, 512);
+        let input = resume_terminal(&root, "claude", Some("claudeAgent"));
+        manager.open(input.clone()).await.unwrap();
+        let old = backend.latest();
+        emit_into_history(&manager, &old, "claude", "one\ntwo\nthree\nfour\n").await;
+        manager.restart(input).await.unwrap();
+        let new = backend.latest();
+        assert!(!Arc::ptr_eq(&old, &new));
+        attach_once(&manager, "claude").await;
+        assert_eq!(new.resumes(), 0, "a fresh history replays without loss");
+        emit_into_history(&manager, &new, "claude", "one\ntwo\nthree\nfour\n").await;
+        attach_once(&manager, "claude").await;
+        assert_eq!((old.resumes(), new.resumes()), (0, 1));
+        manager.shutdown().await;
     }
 
     /// An attachment that falls further behind than the event channel holds resets its client
@@ -5669,10 +6413,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            item,
-            AttachmentItem::Event(TerminalEvent::Closed { .. })
-        ));
+        // Its sequence is this attachment's guess, so it outranks every process by generation.
+        let AttachmentItem::Event(TerminalEvent::Closed {
+            generation: Some(generation),
+            ..
+        }) = item
+        else {
+            panic!("a close with a generation");
+        };
+        assert_eq!(generation, manager.inner.generations.latest());
+        assert_eq!(
+            Some(&generation),
+            attachment.initial.generation.as_ref(),
+            "no other process was started"
+        );
         manager.shutdown().await;
     }
 
@@ -5796,7 +6550,8 @@ mod tests {
             Some(TerminalSize {
                 cols: 151,
                 rows: 50,
-                size_claim: Some("owner".to_owned())
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
             })
         );
         *backend.latest().output_on_resize.lock().unwrap() = Some("after resize".to_owned());
@@ -5816,10 +6571,383 @@ mod tests {
             .await
             .unwrap();
         backend.latest().emit("after noop");
+        // The no-op is acknowledged to its requester, in order, without resizing the PTY.
+        assert!(
+            matches!(next_attachment_event(&mut attachment).await, TerminalEvent::Resized { ref size, .. } if (size.cols, size.rows) == (91, 42))
+        );
         assert!(
             matches!(next_attachment_event(&mut attachment).await, TerminalEvent::Output { ref data, .. } if data == "after noop")
         );
         assert_eq!(*backend.latest().resizes.lock().unwrap(), [(91, 42)]);
+        manager.shutdown().await;
+    }
+
+    /// Every way a resize request ends is reported with what the server then holds (#348).
+    #[tokio::test]
+    async fn terminal_resize_reports_each_outcome_with_the_held_size() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let generation = owner.initial.generation.clone().expect("a generation");
+
+        let missing = manager
+            .resize("sizing", "missing", 80, 24, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(missing, TerminalResizeResult::session_missing());
+
+        let unregistered = manager
+            .resize("sizing", "term", 91, 42, Some("departed".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            unregistered.outcome,
+            TerminalResizeOutcome::ClaimNotRegistered
+        );
+        assert_eq!(
+            unregistered.size,
+            Some(TerminalSize {
+                cols: 80,
+                rows: 24,
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
+            })
+        );
+        assert_eq!(unregistered.generation.as_ref(), Some(&generation));
+
+        let applied = manager
+            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        let resized = next_attachment_event(&mut owner).await;
+        assert_eq!(applied.outcome, TerminalResizeOutcome::Applied);
+        assert_eq!(applied.sequence, Some(resized.sequence()));
+        assert_eq!(
+            applied.size.as_ref().map(|size| (size.cols, size.rows)),
+            Some((91, 42))
+        );
+
+        let unchanged = manager
+            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        let acknowledged = next_attachment_event(&mut owner).await;
+        assert_eq!(unchanged.outcome, TerminalResizeOutcome::Unchanged);
+        assert_eq!(unchanged.sequence, Some(acknowledged.sequence()));
+        assert!(acknowledged.sequence() > resized.sequence());
+
+        let session = manager.require_session("sizing", "term").await.unwrap();
+        let process = session.lock().await.process.take();
+        let absent = manager
+            .resize("sizing", "term", 70, 20, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(absent.outcome, TerminalResizeOutcome::ProcessAbsent);
+        assert_eq!(
+            absent.size.as_ref().map(|size| (size.cols, size.rows)),
+            Some((91, 42))
+        );
+        session.lock().await.process = process;
+
+        backend.latest().exit(0);
+        loop {
+            if matches!(
+                next_attachment_event(&mut owner).await,
+                TerminalEvent::Exited { .. }
+            ) {
+                break;
+            }
+        }
+        let exited = manager
+            .resize("sizing", "term", 70, 20, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(exited.outcome, TerminalResizeOutcome::GenerationInvalidated);
+        assert_eq!(
+            exited.size.as_ref().map(|size| (size.cols, size.rows)),
+            Some((91, 42))
+        );
+        assert_eq!(exited.generation.as_ref(), Some(&generation));
+        assert_eq!(*backend.latest().resizes.lock().unwrap(), [(91, 42)]);
+        manager.shutdown().await;
+    }
+
+    /// A claim for the size it already holds is answered on the requester's stream alone,
+    /// behind the output published before it, so its renderer can repair a stale size without
+    /// a timer; other viewers get nothing and are not made to resync (#348).
+    #[tokio::test]
+    async fn an_unchanged_claim_is_acknowledged_to_the_requester_alone_in_order() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        let pty = backend.latest();
+        pty.emit("before");
+        for attachment in [&mut owner, &mut mirror] {
+            assert!(
+                matches!(next_attachment_event(attachment).await, TerminalEvent::Output { ref data, .. } if data == "before")
+            );
+        }
+        let result = manager
+            .resize("sizing", "term", 80, 24, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, TerminalResizeOutcome::Unchanged);
+        let acknowledgement = next_attachment_event(&mut owner).await;
+        assert!(
+            matches!(&acknowledgement, TerminalEvent::Resized { size, .. } if (size.cols, size.rows) == (80, 24) && size.size_claim.as_deref() == Some("owner"))
+        );
+        assert_eq!(result.sequence, Some(acknowledgement.sequence()));
+        let wire = serde_json::to_value(&acknowledgement).unwrap();
+        assert!(wire.get("onlyFor").is_none() && wire.get("only_for").is_none());
+
+        pty.emit("after");
+        assert!(
+            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Output { ref data, .. } if data == "after"),
+            "another claim's acknowledgement is not delivered"
+        );
+        assert!(
+            matches!(next_attachment_event(&mut owner).await, TerminalEvent::Output { ref data, .. } if data == "after")
+        );
+        assert!(
+            pty.resizes.lock().unwrap().is_empty(),
+            "a no-op does not resize the PTY"
+        );
+        manager.shutdown().await;
+    }
+
+    /// An owner's equal claim is acknowledged on its own stream only for a caller that reads
+    /// the structured answer; an older client gets nothing, as before that answer (#348).
+    #[tokio::test]
+    async fn an_equal_claim_is_acknowledged_only_to_a_caller_that_reads_the_answer() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        let pty = backend.latest();
+        // Skip what attaching published.
+        pty.emit("attached");
+        for attachment in [&mut owner, &mut mirror] {
+            while !matches!(
+                next_attachment_event(attachment).await,
+                TerminalEvent::Output { .. }
+            ) {}
+        }
+        for acknowledge in [false, true] {
+            let result = manager
+                .resize_acknowledging(
+                    "sizing",
+                    "term",
+                    80,
+                    24,
+                    Some("owner".to_owned()),
+                    acknowledge,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, TerminalResizeOutcome::Unchanged);
+            pty.emit("next");
+            let first = next_attachment_event(&mut owner).await;
+            assert_eq!(
+                matches!(first, TerminalEvent::Resized { .. }),
+                acknowledge,
+                "acknowledge: {acknowledge}, got {first:?}"
+            );
+            if acknowledge {
+                assert!(matches!(
+                    next_attachment_event(&mut owner).await,
+                    TerminalEvent::Output { .. }
+                ));
+            }
+            assert!(matches!(
+                next_attachment_event(&mut mirror).await,
+                TerminalEvent::Output { .. }
+            ));
+        }
+        manager.shutdown().await;
+    }
+
+    /// The PTY refused a size the session records: the next equal request sends it again
+    /// instead of answering it as a no-op (#348).
+    #[tokio::test]
+    async fn an_equal_resize_retries_a_size_the_pty_refused() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let _owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let pty = backend.latest();
+        manager
+            .resize("sizing", "term", 80, 24, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert!(pty.resizes.lock().unwrap().is_empty());
+        pty.resize_needs_retry
+            .store(true, std::sync::atomic::Ordering::Release);
+        let retried = manager
+            .resize("sizing", "term", 80, 24, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(retried.outcome, TerminalResizeOutcome::Unchanged);
+        assert_eq!(*pty.resizes.lock().unwrap(), [(80, 24)]);
+        manager.shutdown().await;
+    }
+
+    /// The PTY kept refusing a size the session published: the size it kept is published
+    /// with a new sequence, so every viewer converges on it. Asking for the refused size again
+    /// then changes nothing, until another size is asked for (#348).
+    #[tokio::test]
+    async fn a_size_the_pty_kept_refusing_is_replaced_by_the_size_it_kept() {
+        let (_root, backend, manager) = size_fixture(80, 24).await;
+        let mut owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
+        let pty = backend.latest();
+        let applied = manager
+            .resize("sizing", "term", 100, 30, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        for attachment in [&mut owner, &mut mirror] {
+            assert!(matches!(
+                next_attachment_event(attachment).await,
+                TerminalEvent::Resized { .. }
+            ));
+        }
+        let report = |requests| ExhaustedResize {
+            requests,
+            cols: 80,
+            rows: 24,
+        };
+        // A report a newer request overtook changes nothing.
+        pty.resize_exhausted.send_replace(Some(report(0)));
+        pty.emit("after a stale report");
+        assert!(matches!(
+            next_attachment_event(&mut mirror).await,
+            TerminalEvent::Output { .. }
+        ));
+        assert!(matches!(
+            next_attachment_event(&mut owner).await,
+            TerminalEvent::Output { .. }
+        ));
+
+        pty.resize_exhausted.send_replace(Some(report(1)));
+        for attachment in [&mut owner, &mut mirror] {
+            match next_attachment_event(attachment).await {
+                TerminalEvent::Resized { size, sequence, .. } => {
+                    assert_eq!((size.cols, size.rows), (80, 24));
+                    assert_eq!(size.size_claim.as_deref(), Some("owner"));
+                    assert!(sequence > applied.sequence.unwrap());
+                }
+                other => panic!("expected the size the PTY kept, got {other:?}"),
+            }
+        }
+
+        let again = manager
+            .resize("sizing", "term", 100, 30, Some("owner".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, TerminalResizeOutcome::Unchanged);
+        assert_eq!(
+            again.size.as_ref().map(|size| (size.cols, size.rows)),
+            Some((80, 24))
+        );
+        assert_eq!(*pty.resizes.lock().unwrap(), [(100, 30)]);
+        pty.emit("nothing published for the refused size");
+        assert!(matches!(
+            next_attachment_event(&mut owner).await,
+            TerminalEvent::Output { .. }
+        ));
+
+        for (cols, rows) in [(90, 30), (100, 30)] {
+            manager
+                .resize("sizing", "term", cols, rows, Some("owner".to_owned()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *pty.resizes.lock().unwrap(),
+            [(100, 30), (90, 30), (100, 30)]
+        );
+        manager.shutdown().await;
+    }
+
+    /// Real-pair case 5 (#348): the client takes the size by a click, the host takes it back
+    /// by a keypress, and the client's next click takes it again, at equal and different sizes.
+    #[tokio::test]
+    async fn each_claim_by_another_window_takes_the_size_back() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        // The host attached first and owns the size.
+        let _host = manager.attach(size_attachment("host")).await.unwrap();
+        let mut client = manager.attach(size_attachment("client")).await.unwrap();
+        for (claim, cols, rows) in [
+            ("client", 80, 24),
+            ("host", 80, 24),
+            ("client", 80, 24),
+            ("host", 120, 50),
+            ("client", 100, 30),
+        ] {
+            let result = manager
+                .resize("sizing", "term", cols, rows, Some(claim.to_owned()))
+                .await
+                .unwrap();
+            assert_eq!(result.outcome, TerminalResizeOutcome::Applied, "{claim}");
+            match next_attachment_event(&mut client).await {
+                TerminalEvent::Resized { size, .. } => {
+                    assert_eq!(size.size_claim.as_deref(), Some(claim));
+                    assert_eq!((size.cols, size.rows), (cols, rows));
+                }
+                other => panic!("expected {claim}'s claim to publish, got {other:?}"),
+            }
+        }
+        manager.shutdown().await;
+    }
+
+    /// Snapshots, restarts, exits and closes name the process they belong to: a counter that
+    /// only grows and survives the process's exit, so a client can order states without pids.
+    #[tokio::test]
+    async fn terminal_states_carry_an_increasing_generation() {
+        let (root, backend, manager) = size_fixture(80, 24).await;
+        let mut attachment = manager.attach(size_attachment("owner")).await.unwrap();
+        let first = attachment.initial.generation.clone().expect("a generation");
+        manager
+            .restart(TerminalOpenInput::new(
+                "sizing",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let restarted = loop {
+            if let TerminalEvent::Restarted { snapshot, .. } =
+                next_attachment_event(&mut attachment).await
+            {
+                break snapshot.generation.expect("a restart's generation");
+            }
+        };
+        assert_eq!(restarted.boot, first.boot);
+        assert!(restarted.process > first.process);
+
+        backend.latest().exit(3);
+        let exited = loop {
+            if let TerminalEvent::Exited { generation, .. } =
+                next_attachment_event(&mut attachment).await
+            {
+                break generation.expect("an exit's generation");
+            }
+        };
+        assert_eq!(exited, restarted);
+        let after_exit = manager
+            .attach(TerminalAttachInput::existing("sizing", "term"))
+            .await
+            .unwrap()
+            .initial;
+        assert_eq!(after_exit.pid, None);
+        assert_eq!(after_exit.generation.as_ref(), Some(&restarted));
+
+        manager.close("sizing", Some("term")).await.unwrap();
+        let closed = loop {
+            if let TerminalEvent::Closed { generation, .. } =
+                next_attachment_event(&mut attachment).await
+            {
+                break generation.expect("a close's generation");
+            }
+        };
+        assert_eq!(closed, restarted);
         manager.shutdown().await;
     }
 
@@ -5845,7 +6973,8 @@ mod tests {
             TerminalSize {
                 cols: 91,
                 rows: 42,
-                size_claim: Some("new-owner".to_owned())
+                size_claim: Some("new-owner".to_owned()),
+                reply_claim: None,
             }
         );
         input.terminal_id = "term".to_owned();
@@ -5894,7 +7023,8 @@ mod tests {
                 TerminalSize {
                     cols: 80,
                     rows: 24,
-                    size_claim: claim.clone()
+                    size_claim: claim.clone(),
+                    reply_claim: None,
                 }
             );
             manager
@@ -5933,7 +7063,8 @@ mod tests {
             TerminalSize {
                 cols: 80,
                 rows: 24,
-                size_claim: Some("owner".to_owned())
+                size_claim: Some("owner".to_owned()),
+                reply_claim: None,
             }
         );
         backend.latest().emit("unchanged");
@@ -6216,7 +7347,8 @@ mod tests {
         let mut mirror = manager.attach(size_attachment("mirror")).await.unwrap();
         drop(owner);
         assert!(
-            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none() && (size.cols, size.rows) == (80, 24))
+            matches!(next_attachment_event(&mut mirror).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("mirror") && (size.cols, size.rows) == (80, 24)),
+            "a lone remaining viewer takes the size at once"
         );
         manager
             .resize("sizing", "term", 91, 42, Some("mirror".to_owned()))
@@ -6244,7 +7376,7 @@ mod tests {
         let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
         drop(replacement);
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))
         );
         manager
             .resize("sizing", "term", 10, 10, Some("reconnect".to_owned()))
@@ -6274,21 +7406,372 @@ mod tests {
             ))
             .await
             .unwrap();
+        // The owner still attached keeps the size, so the surviving windows do not race (#348).
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.is_none())
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.as_deref() == Some("owner"))
         );
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("watcher"))
+        );
+        manager.shutdown().await;
+    }
+
+    /// The owner leaves while a restart is about to register the new session: its release finds
+    /// no session to update, so the restart must not hand the size to the departed owner (#348).
+    #[tokio::test]
+    async fn an_owner_leaving_before_the_restarted_session_registers_does_not_keep_the_size() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut watcher = manager.attach(size_attachment("watcher")).await.unwrap();
+        let barrier = Arc::new(PublisherBarrier {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *manager
+            .inner
+            .restart_before_register_barrier
+            .lock()
+            .expect("restart barrier lock") = Some(barrier.clone());
+        let restarting = manager.clone();
+        let cwd = root.path().to_path_buf();
+        let restart = tokio::spawn(async move {
+            restarting
+                .restart(TerminalOpenInput::new("sizing", "term", cwd, 91, 42))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), barrier.started.notified())
+            .await
+            .expect("restart reaches the registration barrier");
+        let tasks = manager.inner.attachment_tasks.len();
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.inner.attachment_tasks.len() >= tasks {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the owner's release finishes");
+        barrier.release.notify_one();
+        restart.await.expect("restart task").expect("restart");
+        assert!(
+            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Restarted { ref snapshot, .. } if snapshot.size.as_ref().unwrap().size_claim.as_deref() != Some("owner"))
+        );
+        manager.shutdown().await;
+    }
+
+    /// The window last used sizes the terminal (#348): when its stream drops, the lone idle
+    /// viewer takes the size so it keeps working, and the owner gets it back on return without
+    /// a click, unless someone typed in the other window meanwhile. With several viewers
+    /// left, none is assumed to be in use.
+    #[tokio::test]
+    async fn a_returning_owner_takes_the_size_back_from_an_unused_window() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let client = manager.attach(size_attachment("client")).await.unwrap();
+        let mut host = manager.attach(size_attachment("host")).await.unwrap();
+        drop(client);
+        assert!(
+            matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("host"))
+        );
+        // The host fits the size to its own box, which is not use.
         manager
-            .resize("sizing", "term", 91, 42, Some("owner".to_owned()))
+            .resize("sizing", "term", 100, 30, Some("host".to_owned()))
             .await
             .unwrap();
         assert!(matches!(
-            next_attachment_event(&mut watcher).await,
+            next_attachment_event(&mut host).await,
             TerminalEvent::Resized { .. }
         ));
+        let returned = manager.attach(size_attachment("client")).await.unwrap();
+        assert_eq!(
+            returned
+                .initial
+                .size
+                .as_ref()
+                .and_then(|size| size.size_claim.as_deref()),
+            Some("client")
+        );
+        assert!(
+            matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("client"))
+        );
+
+        // Typed in the host while the client was away: the host keeps the size.
+        drop(returned);
+        assert!(matches!(
+            next_attachment_event(&mut host).await,
+            TerminalEvent::Resized { .. }
+        ));
+        manager.write("sizing", "term", "x").await.unwrap();
+        let back = manager.attach(size_attachment("client")).await.unwrap();
+        assert_eq!(
+            back.initial
+                .size
+                .as_ref()
+                .and_then(|size| size.size_claim.as_deref()),
+            Some("host")
+        );
+
+        // Two viewers left: neither is known to be in use.
+        let _third = manager.attach(size_attachment("third")).await.unwrap();
+        drop(host);
+        let mut back = back;
+        assert!(
+            matches!(next_attachment_event(&mut back).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+        );
+        manager.shutdown().await;
+    }
+
+    fn owner_of(attachment: &TerminalAttachment) -> Option<&str> {
+        attachment
+            .initial
+            .size
+            .as_ref()
+            .and_then(|size| size.size_claim.as_deref())
+    }
+
+    async fn ordered_write_from(
+        manager: &TerminalManager,
+        connection: uuid::Uuid,
+        input_id: &str,
+        sequence: u64,
+        data: &str,
+        origin: TerminalInputOrigin<'_>,
+    ) {
+        manager
+            .prepare_input_write(connection, "sizing", "term", input_id, sequence, data)
+            .unwrap()
+            .with_origin(origin)
+            .write()
+            .await
+            .unwrap();
+    }
+
+    /// A terminal's own answer to a status query is input from the window that inherited the
+    /// size, but nobody used that window: the window last used still gets the size back when it
+    /// returns (#348). An older client cannot tell its replies from typing, so all its input
+    /// counts as use, as before.
+    #[tokio::test]
+    async fn an_automatic_reply_does_not_keep_the_size_from_the_returning_owner() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let connection = uuid::Uuid::new_v4();
+        let input = manager
+            .begin_input(
+                connection,
+                CancellationToken::new(),
+                "sizing",
+                "term",
+                0,
+                None,
+            )
+            .await
+            .unwrap()
+            .input_id;
+        let mut sequence = 0;
+        let mut client = manager.attach(size_attachment("client")).await.unwrap();
+        let mut host = manager.attach(size_attachment("host")).await.unwrap();
+        for (path, origin, client_returns) in [
+            ("unary", TerminalInputOrigin::Automatic, true),
+            ("ordered", TerminalInputOrigin::Automatic, true),
+            ("ordered", TerminalInputOrigin::Unmarked, false),
+        ] {
+            drop(client);
+            assert!(
+                matches!(next_attachment_event(&mut host).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("host")),
+                "the idle host inherits the size"
+            );
+            if path == "unary" {
+                manager
+                    .write_from("sizing", "term", "\x1b[0n", origin)
+                    .await
+                    .unwrap();
+            } else {
+                ordered_write_from(&manager, connection, &input, sequence, "\x1b[0n", origin).await;
+                sequence += 1;
+            }
+            client = manager.attach(size_attachment("client")).await.unwrap();
+            let expected = if client_returns { "client" } else { "host" };
+            assert_eq!(owner_of(&client), Some(expected), "{path} {origin:?}");
+            if client_returns {
+                assert!(matches!(
+                    next_attachment_event(&mut host).await,
+                    TerminalEvent::Resized { .. }
+                ));
+            } else {
+                // Give the size back to the client for the next round.
+                manager
+                    .resize("sizing", "term", 80, 24, Some("client".to_owned()))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next_attachment_event(&mut host).await,
+                    TerminalEvent::Resized { .. }
+                ));
+            }
+        }
+        manager.shutdown().await;
+    }
+
+    /// With several viewers left when the window last used goes away, the size goes to the one
+    /// a user typed in last; a terminal's own replies are not typing (#348).
+    #[tokio::test]
+    async fn the_size_goes_to_the_remaining_viewer_typed_in_last() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut left = manager.attach(size_attachment("left")).await.unwrap();
+        let mut right = manager.attach(size_attachment("right")).await.unwrap();
+        for (data, origin) in [
+            ("r", TerminalInputOrigin::User("right")),
+            ("l", TerminalInputOrigin::User("left")),
+            ("\x1b[0n", TerminalInputOrigin::Automatic),
+            ("o", TerminalInputOrigin::User("owner")),
+        ] {
+            manager
+                .write_from("sizing", "term", data, origin)
+                .await
+                .unwrap();
+        }
         drop(owner);
         assert!(
-            matches!(next_attachment_event(&mut watcher).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.is_none())
+            matches!(next_attachment_event(&mut left).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some("left")),
+            "the viewer typed in last takes the size"
         );
+        assert!(matches!(
+            next_attachment_event(&mut right).await,
+            TerminalEvent::Resized { .. }
+        ));
+        // The owner that left gets it back if it returns before anyone types in `left`.
+        let back = manager.attach(size_attachment("owner")).await.unwrap();
+        assert_eq!(owner_of(&back), Some("owner"));
+        manager.shutdown().await;
+    }
+
+    fn resized_size(event: TerminalEvent) -> TerminalSize {
+        match event {
+            TerminalEvent::Resized { size, .. } => size,
+            other => panic!("expected a resize, got {other:?}"),
+        }
+    }
+
+    /// The owner left several viewers, none used: an idle window that attaches (a reload, a
+    /// tab shown again) does not take the size left un-owned, the owner that left does, and a
+    /// lone viewer left takes it (#348).
+    #[tokio::test]
+    async fn an_attach_does_not_take_a_size_left_unowned_until_used() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut left = manager.attach(size_attachment("left")).await.unwrap();
+        let right = manager.attach(size_attachment("right")).await.unwrap();
+        drop(owner);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await).size_claim,
+            None
+        );
+        let reloaded = manager.attach(size_attachment("reloaded")).await.unwrap();
+        assert_eq!(owner_of(&reloaded), None, "an idle window does not take it");
+        drop(reloaded);
+        let back = manager.attach(size_attachment("owner")).await.unwrap();
+        assert_eq!(owner_of(&back), Some("owner"), "the window last used does");
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await)
+                .size_claim
+                .as_deref(),
+            Some("owner")
+        );
+        drop(back);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await).size_claim,
+            None
+        );
+        drop(right);
+        assert_eq!(
+            resized_size(next_attachment_event(&mut left).await)
+                .size_claim
+                .as_deref(),
+            Some("left"),
+            "the lone viewer left takes it"
+        );
+        // A fresh session's first attach and a lone viewer are still granted.
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let first = manager.attach(size_attachment("first")).await.unwrap();
+        assert_eq!(owner_of(&first), Some("first"));
+        manager.shutdown().await;
+    }
+
+    /// While the size is un-owned every viewer would answer the terminal's queries: the server
+    /// names one, and names another when it leaves (#348).
+    #[tokio::test]
+    async fn one_viewer_answers_queries_while_the_size_is_unowned() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let a = manager.attach(size_attachment("a")).await.unwrap();
+        let _b = manager.attach(size_attachment("b")).await.unwrap();
+        let mut c = manager.attach(size_attachment("c")).await.unwrap();
+        assert_eq!(c.initial.size.as_ref().unwrap().reply_claim, None);
+        drop(owner);
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim, size.reply_claim.as_deref()),
+            (None, Some("a"))
+        );
+        drop(a);
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim, size.reply_claim.as_deref()),
+            (None, Some("b"))
+        );
+        // A window that is used claims the size, and the owner answers again.
+        manager
+            .resize("sizing", "term", 90, 30, Some("c".to_owned()))
+            .await
+            .unwrap();
+        let size = resized_size(next_attachment_event(&mut c).await);
+        assert_eq!(
+            (size.size_claim.as_deref(), size.reply_claim),
+            (Some("c"), None)
+        );
+        manager.shutdown().await;
+    }
+
+    /// A window hidden and shown again comes back under a new claim. The claims it left behind
+    /// must not fill the bounded typing record, or the viewer typed in last is not recorded
+    /// and an older one takes the size when the owner leaves (#348).
+    #[tokio::test]
+    async fn departed_viewers_do_not_crowd_out_the_viewer_typed_in_last() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        let owner = manager.attach(size_attachment("owner")).await.unwrap();
+        let mut early = manager.attach(size_attachment("early")).await.unwrap();
+        let type_in = |claim: String| {
+            let manager = &manager;
+            async move {
+                manager
+                    .write_from("sizing", "term", "x", TerminalInputOrigin::User(&claim))
+                    .await
+                    .unwrap();
+            }
+        };
+        type_in("early".to_owned()).await;
+        for round in 0..=MAX_USER_INPUT_CLAIMS + 5 {
+            let shown = manager
+                .attach(size_attachment(&format!("shown-{round}")))
+                .await
+                .unwrap();
+            type_in(format!("shown-{round}")).await;
+            type_in("owner".to_owned()).await;
+            drop(shown);
+            tokio::task::yield_now().await;
+        }
+        let last = format!("shown-{}", MAX_USER_INPUT_CLAIMS + 6);
+        let mut shown = manager.attach(size_attachment(&last)).await.unwrap();
+        type_in(last.clone()).await;
+        drop(owner);
+        assert!(
+            matches!(next_attachment_event(&mut shown).await, TerminalEvent::Resized { ref size, .. } if size.size_claim.as_deref() == Some(last.as_str())),
+            "the viewer typed in last takes the size"
+        );
+        assert!(matches!(
+            next_attachment_event(&mut early).await,
+            TerminalEvent::Resized { .. }
+        ));
         manager.shutdown().await;
     }
 
@@ -10008,6 +11491,90 @@ mod tests {
                 .iter()
                 .all(|(_, reason)| *reason == TerminalRemovalReason::Shutdown)
         );
+    }
+
+    /// Through the real PTY launch path (Unix runs the provider executable as the PTY root, in
+    /// its own session and group): a stand-in for the Claude CLI that reports `SIGCONT` with
+    /// the size it reads from its terminal gets the resume after a lossy attach, at the size it
+    /// started with (#348).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lossy_attach_resumes_a_real_claude_terminal_at_its_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("claude");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\n\
+             trap 'echo \"RESUMED $(stty size)\"' CONT\n\
+             echo \"START $(stty size)\"\n\
+             i=0; while [ $i -lt 20 ]; do echo \"line $i\"; i=$((i+1)); done\n\
+             echo READY\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manager = TerminalManager::new(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                history_line_limit: 5,
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut input =
+            TerminalOpenInput::new("claude", "term", root.path().to_path_buf(), 100, 30);
+        input.command = Some(TerminalLaunchCommand {
+            executable: fixture.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: "claudeAgent".to_owned(),
+                provider_instance_id: "claudeAgent".to_owned(),
+            }),
+            env: None,
+        });
+        manager.open(input).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !manager
+                .read_history("claude", "term", None, 1_000)
+                .await
+                .unwrap()
+                .window
+                .text
+                .contains("READY")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture started");
+
+        let mut attachment = manager
+            .attach(TerminalAttachInput::existing("claude", "term"))
+            .await
+            .unwrap();
+        assert!(!attachment.initial.history.contains("RESUMED"));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut output = String::new();
+            loop {
+                match attachment.recv().await {
+                    Some(AttachmentItem::Event(TerminalEvent::Output { data, .. })) => {
+                        output.push_str(&data);
+                    }
+                    Some(_) => {}
+                    None => panic!("the attachment ended: {output}"),
+                }
+                if let Some(line) = output.lines().find(|line| line.starts_with("RESUMED")) {
+                    break line.trim_end().to_owned();
+                }
+            }
+        })
+        .await
+        .expect("the fixture got SIGCONT after the lossy attach");
+        assert_eq!(resumed, "RESUMED 30 100", "the PTY keeps its size");
+        manager.close("claude", Some("term")).await.unwrap();
+        manager.shutdown().await;
     }
 
     #[tokio::test]

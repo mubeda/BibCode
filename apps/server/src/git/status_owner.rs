@@ -251,6 +251,8 @@ struct WorktreeStatusState {
     epoch: u64,
     mutation_lock: Arc<AsyncMutex<()>>,
     mutation_active: bool,
+    /// True from lock acquisition to settle, also after reads resumed.
+    mutation_lock_held: bool,
     pending_mutations: usize,
     read_gate_closed: bool,
     read_gate: watch::Sender<u64>,
@@ -271,6 +273,7 @@ impl WorktreeStatusState {
             epoch,
             mutation_lock: Arc::new(AsyncMutex::new(())),
             mutation_active: false,
+            mutation_lock_held: false,
             pending_mutations: 0,
             read_gate_closed: false,
             read_gate,
@@ -360,6 +363,7 @@ pub struct StatusMutationGuard {
     owner: StatusReadOwner,
     canonical_cwd: PathBuf,
     mutation_guard: Option<OwnedMutexGuard<()>>,
+    reads_resumed: bool,
 }
 
 impl StatusReadOwner {
@@ -512,7 +516,11 @@ impl StatusReadOwner {
                 .pending_mutations
                 .checked_add(1)
                 .expect("pending status mutation count exhausted");
-            worktree.read_gate_closed = true;
+            // Behind a lock whose local writes are finished, the gate closes
+            // only on acquisition, so background writes cannot stall reads.
+            if !worktree.mutation_lock_held || worktree.mutation_active {
+                worktree.read_gate_closed = true;
+            }
             (
                 Arc::clone(&worktree.mutation_lock),
                 PendingMutation {
@@ -534,6 +542,8 @@ impl StatusReadOwner {
                 .checked_sub(1)
                 .expect("pending status mutation count remains positive");
             worktree.mutation_active = true;
+            worktree.mutation_lock_held = true;
+            worktree.read_gate_closed = true;
             worktree.epoch = worktree.epoch.wrapping_add(1);
             retire_reads(worktree);
         }
@@ -542,6 +552,7 @@ impl StatusReadOwner {
             owner: self.clone(),
             canonical_cwd,
             mutation_guard: Some(mutation_guard),
+            reads_resumed: false,
         }
     }
 
@@ -699,20 +710,25 @@ impl StatusReadOwner {
         let Some(worktree) = state.worktrees.get_mut(canonical_cwd) else {
             return;
         };
-        if worktree.pending_mutations != 0 || worktree.mutation_active {
+        if worktree.pending_mutations != 0
+            || worktree.mutation_active
+            || worktree.mutation_lock_held
+        {
             return;
         }
         if worktree_can_retire(worktree) {
             state.worktrees.remove(canonical_cwd);
             return;
         }
-        if !worktree.read_gate_closed {
-            return;
-        }
+        // The gate is already open when the mutation resumed reads early, but
+        // the trailing refresh is still owed.
         if std::mem::take(&mut worktree.trailing_refresh_pending) {
             worktree
                 .local_refresh_requests
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        if !worktree.read_gate_closed {
+            return;
         }
         worktree.read_gate_closed = false;
         worktree
@@ -1133,6 +1149,33 @@ impl StatusMutationGuard {
         self.settle();
     }
 
+    /// Reopens status reads while the write lock stays held, for a mutation
+    /// that only waits on the network from here on. The epoch advances so a
+    /// read from before this point cannot publish, and `settle` advances it
+    /// again and publishes the trailing refresh.
+    pub fn local_writes_finished(&mut self) {
+        if self.mutation_guard.is_none() || std::mem::replace(&mut self.reads_resumed, true) {
+            return;
+        }
+        {
+            let mut state = self.owner.lock_state();
+            if let Some(worktree) = state.worktrees.get_mut(&self.canonical_cwd) {
+                worktree.epoch = worktree.epoch.wrapping_add(1);
+                retire_reads(worktree);
+                worktree.mutation_active = false;
+                worktree.read_gate_closed = false;
+                worktree
+                    .read_gate
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                worktree
+                    .local_refresh_requests
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+        }
+        #[cfg(test)]
+        self.owner.inner.lease_changed.notify_waiters();
+    }
+
     fn settle(&mut self) {
         let Some(mutation_guard) = self.mutation_guard.take() else {
             return;
@@ -1143,6 +1186,7 @@ impl StatusMutationGuard {
                 worktree.epoch = worktree.epoch.wrapping_add(1);
                 retire_reads(worktree);
                 worktree.mutation_active = false;
+                worktree.mutation_lock_held = false;
                 worktree.trailing_refresh_pending = true;
             }
         }
@@ -1204,6 +1248,7 @@ fn worktree_can_retire(worktree: &WorktreeStatusState) -> bool {
     worktree.retire_when_idle
         && worktree.pending_mutations == 0
         && !worktree.mutation_active
+        && !worktree.mutation_lock_held
         && worktree.physical_reads_active == 0
         && worktree.in_flight.is_empty()
 }
@@ -2163,6 +2208,207 @@ mod tests {
         drop(lease);
 
         assert!(physical_cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn reads_resume_after_local_writes_finish_while_the_lock_is_held() {
+        let owner = StatusReadOwner::new();
+        let key = status_key(StatusOutputKind::Local);
+        let mut mutation = owner.begin_mutation(key.canonical_cwd.clone()).await;
+        assert!(
+            !local_read_is_admitted_and_publishes(&owner, &key).await,
+            "a read was admitted before the local writes finished"
+        );
+
+        mutation.local_writes_finished();
+
+        assert!(
+            local_read_is_admitted_and_publishes(&owner, &key).await,
+            "a read was not published while the lock was held after the local writes"
+        );
+        mutation.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_second_mutation_waits_for_the_whole_first_mutation() {
+        let owner = StatusReadOwner::new();
+        let cwd = PathBuf::from("/repo");
+        let mut first = owner.begin_mutation(cwd.clone()).await;
+        first.local_writes_finished();
+
+        let mut second = Box::pin(owner.begin_mutation(cwd));
+        assert!(matches!(futures_util::poll!(&mut second), Poll::Pending));
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(futures_util::poll!(&mut second), Poll::Pending),
+            "the second mutation started while the first still held the lock"
+        );
+
+        first.finish().await;
+        second.await.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_worktree_with_a_held_lock_is_not_retired() {
+        let owner = StatusReadOwner::new();
+        let cwd = PathBuf::from("/repo");
+        let mut first = owner.begin_mutation(cwd.clone()).await;
+        first.local_writes_finished();
+
+        owner.cancel_reads(&cwd);
+        assert_eq!(
+            owner.worktree_state_count_for_test(),
+            1,
+            "the worktree entry was retired while its write lock was held"
+        );
+        let mut second = Box::pin(owner.begin_mutation(cwd));
+        assert!(
+            matches!(futures_util::poll!(&mut second), Poll::Pending),
+            "a new mutation did not wait on the held lock"
+        );
+
+        first.finish().await;
+        second.await.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_read_started_before_the_mutation_is_not_published_after_reads_resume() {
+        let owner = StatusReadOwner::new();
+        let key = status_key(StatusOutputKind::Local);
+        let cwd = key.canonical_cwd.clone();
+        let old_fence = owner
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("idle worktree admits a fence");
+        let loads = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let old_read = spawn_blocked_local_read(
+            owner.clone(),
+            key.clone(),
+            Arc::clone(&loads),
+            Arc::clone(&release),
+        );
+        wait_for_loads(&loads, 1).await;
+        let mut refreshes = owner.subscribe_local_refresh(&cwd);
+
+        let mut mutation = owner.begin_mutation(cwd).await;
+        mutation.local_writes_finished();
+
+        assert!(
+            old_read.await.expect("old read task").is_err(),
+            "a read admitted before the mutation was published"
+        );
+        assert!(
+            owner.publish_if_fence_current(&old_fence, || ()).is_err(),
+            "a fence taken before the mutation stayed current"
+        );
+        refreshes.borrow_and_update();
+        mutation.finish().await;
+        assert!(
+            refreshes.has_changed().expect("refresh owner remains open"),
+            "no fresh status was requested after the mutation"
+        );
+        assert!(local_read_is_admitted_and_publishes(&owner, &key).await);
+    }
+
+    #[tokio::test]
+    async fn a_mutation_queued_behind_a_released_lock_does_not_close_the_gate_until_it_starts() {
+        let owner = StatusReadOwner::new();
+        let key = status_key(StatusOutputKind::Local);
+        let cwd = key.canonical_cwd.clone();
+        let mut first = owner.begin_mutation(cwd.clone()).await;
+        first.local_writes_finished();
+
+        let mut second = Box::pin(owner.begin_mutation(cwd.clone()));
+        assert!(matches!(futures_util::poll!(&mut second), Poll::Pending));
+        assert!(
+            local_read_is_admitted_and_publishes(&owner, &key).await,
+            "a queued mutation closed the gate before it acquired the lock"
+        );
+
+        first.finish().await;
+        let fence = owner
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("the gate stays open until the queued mutation acquires the lock");
+        let second = second.await;
+        assert!(
+            !local_read_is_admitted_and_publishes(&owner, &key).await,
+            "the gate stayed open after the queued mutation acquired the lock"
+        );
+        assert!(
+            owner.publish_if_fence_current(&fence, || ()).is_err(),
+            "the epoch did not advance when the queued mutation started"
+        );
+        second.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_mutation_queued_before_local_writes_finish_no_longer_blocks_reads_afterwards() {
+        let owner = StatusReadOwner::new();
+        let key = status_key(StatusOutputKind::Local);
+        let cwd = key.canonical_cwd.clone();
+        let mut first = owner.begin_mutation(cwd.clone()).await;
+        let mut second = Box::pin(owner.begin_mutation(cwd));
+        assert!(matches!(futures_util::poll!(&mut second), Poll::Pending));
+        assert!(!local_read_is_admitted_and_publishes(&owner, &key).await);
+
+        first.local_writes_finished();
+
+        assert!(
+            local_read_is_admitted_and_publishes(&owner, &key).await,
+            "a mutation queued earlier kept reads waiting after the local writes"
+        );
+        first.finish().await;
+        second.await.finish().await;
+    }
+
+    #[tokio::test]
+    async fn settling_after_reads_resumed_still_publishes_the_trailing_refresh() {
+        let owner = StatusReadOwner::new();
+        let key = status_key(StatusOutputKind::Local);
+        let cwd = key.canonical_cwd.clone();
+        let mut refreshes = owner.subscribe_local_refresh(&cwd);
+        let mut mutation = owner.begin_mutation(cwd).await;
+
+        mutation.local_writes_finished();
+        mutation.local_writes_finished();
+
+        assert_eq!(
+            *refreshes.borrow_and_update(),
+            1,
+            "reads resuming must queue exactly one refresh"
+        );
+        assert!(local_read_is_admitted_and_publishes(&owner, &key).await);
+        mutation.finish().await;
+        assert!(
+            refreshes.has_changed().expect("refresh owner remains open"),
+            "settling with the gate open did not publish the trailing refresh"
+        );
+        assert_eq!(*refreshes.borrow_and_update(), 2);
+        assert!(local_read_is_admitted_and_publishes(&owner, &key).await);
+    }
+
+    async fn local_read_is_admitted_and_publishes(
+        owner: &StatusReadOwner,
+        key: &StatusReadKey,
+    ) -> bool {
+        let mut load = Some(|_: CancellationToken| async {
+            Ok(StatusReadValue::Local(
+                VcsStatusLocalResult::non_repository(),
+            ))
+        });
+        let ReadAdmission::Lease(lease) = owner.try_acquire(key, &mut load) else {
+            return false;
+        };
+        let Ok((StatusReadValue::Local(value), key, epoch)) =
+            lease.wait(&CancellationToken::new()).await
+        else {
+            return false;
+        };
+        owner
+            .publish_if_current(StatusReadResult { value, key, epoch }, |_| ())
+            .is_ok()
     }
 
     #[tokio::test]

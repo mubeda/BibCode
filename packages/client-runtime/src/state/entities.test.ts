@@ -118,6 +118,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],
+      codeReviewPrompt: "",
       worktreeDiscovery: {
         visibility: "hidden",
         initialPromptDismissedAt: null,
@@ -133,6 +134,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],
+      codeReviewPrompt: "",
       worktreeDiscovery: {
         visibility: "hidden",
         initialPromptDismissedAt: null,

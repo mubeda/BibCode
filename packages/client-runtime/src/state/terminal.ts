@@ -7,6 +7,7 @@ import {
   WS_METHODS,
 } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { Atom } from "effect/reactivity";
 
@@ -179,6 +180,7 @@ export function createTerminalEnvironmentAtoms<R, E>(
             ),
             transcriptRuntimes,
             runtimeKey,
+            target.input.sizeClaim,
           ).pipe(
             Stream.tap((metadata) =>
               Effect.sync(() => {
@@ -276,6 +278,7 @@ export function createTerminalEnvironmentAtoms<R, E>(
           input,
           input.data,
           yield* Effect.context(),
+          input.userInputClaim,
         );
       }),
     }),
@@ -283,7 +286,36 @@ export function createTerminalEnvironmentAtoms<R, E>(
       label: "environment-data:terminal:resize",
       tag: WS_METHODS.terminalResize,
       scheduler: resizeScheduler,
-      concurrency: { mode: "latest", key: terminalSessionKey },
+      // One lane per renderer claim: a superseded request resolves with the result of the one
+      // that ran, so a shared lane could report another renderer's claim as this one's (#348).
+      concurrency: {
+        mode: "latest",
+        key: (target) =>
+          JSON.stringify([terminalSessionKey(target), target.input.sizeClaim ?? null]),
+      },
+    }),
+    /**
+     * The size an existing session holds, or null. An attach without a working directory, a
+     * claim or a restart never creates, restarts or claims a session, so this read changes
+     * nothing; only its first snapshot is taken. For servers that answer resizes with null
+     * (#348).
+     */
+    readSize: createEnvironmentCommand(runtime, {
+      label: "environment-data:terminal:read-size",
+      execute: Effect.fn("terminal.readSize")(function* (input: {
+        readonly threadId: EnvironmentRpcInput<typeof WS_METHODS.terminalAttach>["threadId"];
+        readonly terminalId: string;
+      }) {
+        const first = yield* Stream.runHead(
+          subscribe(WS_METHODS.terminalAttach, {
+            threadId: input.threadId,
+            terminalId: input.terminalId,
+          }),
+        );
+        return Option.isSome(first) && first.value.type === "snapshot"
+          ? (first.value.snapshot.size ?? null)
+          : null;
+      }),
     }),
     clear: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:clear",

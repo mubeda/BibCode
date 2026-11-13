@@ -26,11 +26,19 @@ interface FakeRead {
 
 const fake = vi.hoisted(() => {
   const state = {
+    path: "pierre-edit.ts",
     disk: { contents: "", version: "v0" },
     query: null as FakeRead | null,
     overlay: null as FakeRead | null,
     listeners: new Set<() => void>(),
-    toolbar: null as null | { canUndo?: boolean; savePhase?: string },
+    toolbar: null as null | {
+      canUndo?: boolean;
+      savePhase?: string;
+      markdownView?: { onRenderedChange: (rendered: boolean) => void };
+    },
+    markdown: null as null | {
+      onTaskListChange?: (input: { markerOffset: number; checked: boolean }) => void;
+    },
     /** Resolves a held write; null while writes complete at once. */
     heldWrite: null as null | (() => void),
     holdWrites: false,
@@ -39,7 +47,7 @@ const fake = vi.hoisted(() => {
     },
     readDisk(): FakeRead {
       return {
-        relativePath: "pierre-edit.ts",
+        relativePath: state.path,
         contents: state.disk.contents,
         byteLength: state.disk.contents.length,
         truncated: false,
@@ -54,7 +62,12 @@ vi.mock("~/browser/openFileInPreview", () => ({
   isBrowserPreviewFile: () => false,
   openFileInPreview: vi.fn(),
 }));
-vi.mock("~/components/ChatMarkdown", () => ({ default: () => null }));
+vi.mock("~/components/ChatMarkdown", () => ({
+  default: (props: NonNullable<typeof fake.markdown>) => {
+    fake.markdown = props;
+    return null;
+  },
+}));
 vi.mock("~/components/chat/OpenInPicker", () => ({ OpenInPicker: () => null }));
 vi.mock("~/hooks/useSettings", () => ({
   useClientSettings: (selector: (settings: { wordWrap: boolean }) => unknown) =>
@@ -109,7 +122,7 @@ const rpc = vi.hoisted(() => ({
       return AsyncResult.failure({ failure: "file_changed_on_disk" } as never);
     }
     fake.disk = { contents: input.contents, version: `v:${input.contents}` };
-    return AsyncResult.success({ relativePath: "pierre-edit.ts", version: fake.disk.version });
+    return AsyncResult.success({ relativePath: fake.path, version: fake.disk.version });
   },
   getFileVersion: async () => {
     const { AsyncResult } = await import("effect/reactivity");
@@ -127,7 +140,7 @@ vi.mock("~/state/use-atom-command", () => ({
 vi.mock("~/state/use-atom-query-runner", () => ({ useAtomQueryRunner: () => vi.fn() }));
 vi.mock("./FileBrowserPanel", () => ({ default: () => null }));
 vi.mock("./FileEditorToolbar", () => ({
-  FileEditorToolbar: (props: { canUndo?: boolean; savePhase?: string }) => {
+  FileEditorToolbar: (props: NonNullable<typeof fake.toolbar>) => {
     fake.toolbar = props;
     return null;
   },
@@ -250,7 +263,7 @@ class InThreadDiffsWorker {
     };
     const highlighter = await getSharedHighlighter({
       themes: [options.theme as never],
-      langs: ["typescript"],
+      langs: ["typescript", "markdown"],
     });
     return {
       type: "success",
@@ -319,10 +332,12 @@ describe("FilePreviewPanel across a right-panel tab switch", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
+    fake.path = "pierre-edit.ts";
     fake.disk = { contents: ORIGINAL, version: "v0" };
     fake.query = fake.readDisk();
     fake.overlay = null;
     fake.toolbar = null;
+    fake.markdown = null;
     fake.heldWrite = null;
     fake.holdWrites = false;
     InThreadDiffsWorker.heldHighlights = [];
@@ -441,6 +456,90 @@ describe("FilePreviewPanel across a right-panel tab switch", () => {
       expect(fake.toolbar).toMatchObject({ canUndo: true, savePhase: "clean" });
       await act(async () => session.undo());
       expect(editorText()).toContain("original packaged text");
+    },
+  );
+
+  it.each(["the view toggle", "a line link"])(
+    "ticking a checkbox in a read-only Markdown file keeps the source Undo history (back through %s)",
+    async (way) => {
+      // A footnote keeps the file read-only in rendered view.
+      const original = "- [ ] task\n\nA claim.[^1]\n\n[^1]: The source.\n";
+      fake.path = "notes.md";
+      fake.disk = { contents: original, version: "v0" };
+      fake.query = fake.readDisk();
+      const registry = new FileEditingSessionRegistry<
+        FileEditingSession<FileCommentAnnotationGroup>
+      >();
+      const render = async (revealLine: number | null = null) => {
+        await act(async () => {
+          root.render(
+            <WorkerPoolContextProvider
+              poolOptions={{ workerFactory: () => new InThreadDiffsWorker() as never, poolSize: 1 }}
+              highlighterOptions={{ theme: "pierre-dark", tokenizeMaxLineLength: 1_000 }}
+            >
+              <FilePreviewPanel
+                environmentId={environmentId}
+                cwd="/repo"
+                projectName="repo"
+                relativePath="notes.md"
+                threadRef={threadRef}
+                composerDraftTarget={threadRef}
+                keybindings={[] as ResolvedKeybindingsConfig}
+                availableEditors={[]}
+                revealLine={revealLine}
+                revealRequestId={revealLine === null ? 0 : 1}
+                onOpenFile={vi.fn()}
+                onPendingChange={vi.fn()}
+                onConflictChange={vi.fn()}
+                editingSessions={registry}
+              />
+            </WorkerPoolContextProvider>,
+          );
+          registry.setActivePath("notes.md");
+        });
+      };
+      const settle = async (until: () => boolean) => {
+        for (let attempt = 0; attempt < 100 && !until(); attempt += 1) {
+          releaseHighlights();
+          await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          });
+        }
+        expect(until()).toBe(true);
+      };
+      const toggle = async (rendered: boolean) => {
+        await act(async () => fake.toolbar!.markdownView!.onRenderedChange(rendered));
+      };
+
+      await render();
+      expect(fake.markdown?.onTaskListChange).toBeTypeOf("function");
+      await toggle(false);
+      const session = registry.get("notes.md")!;
+      await settle(() => session.editor.getFile() !== undefined);
+      const insert = (character: number, newText: string) =>
+        session.editor.applyEdits(
+          [{ range: { start: { line: 0, character }, end: { line: 0, character } }, newText }],
+          true,
+          true,
+        );
+      await act(async () => {
+        insert(10, " one");
+        insert(14, " two");
+      });
+      expect(session.editor.getText()).toBe(original.replace("task", "task one two"));
+
+      await toggle(true);
+      await act(async () => fake.markdown!.onTaskListChange!({ markerOffset: 2, checked: true }));
+      if (way === "the view toggle") await toggle(false);
+      else await render(2);
+      await settle(() => session.editor.getText().startsWith("- [x] task one two\n"));
+
+      await act(async () => session.undo());
+      expect(session.editor.getText()).toBe(original.replace("task", "task one two"));
+      await act(async () => session.undo());
+      expect(session.editor.getText()).toBe(original.replace("task", "task one"));
+      await act(async () => session.undo());
+      expect(session.editor.getText()).toBe(original);
     },
   );
 });

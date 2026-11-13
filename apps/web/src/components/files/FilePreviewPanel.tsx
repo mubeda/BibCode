@@ -19,7 +19,6 @@ import {
 import { FolderSearch, FolderTree, Globe2, LoaderCircle } from "lucide-react";
 import * as Schema from "effect/Schema";
 import {
-  type RefObject,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -78,8 +77,19 @@ import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
 import { LocalCommentAnnotation } from "./LocalCommentAnnotation";
 import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
+import { RichMarkdownFormatGroup } from "./richMarkdown/RichMarkdownFormatGroup";
+import { RichMarkdownLinkPopover } from "./richMarkdown/RichMarkdownLinkPopover";
+import { useInsertImage } from "./richMarkdown/useInsertImage";
+import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
-import { filePreviewKind, isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
+import { RichMarkdownView } from "./RichMarkdownView";
+import { explainUndeliveredEdit, saveFile, useFileSaveShortcut } from "./useFileSaveShortcut";
+import {
+  filePreviewKind,
+  isMarkdownPreviewFile,
+  richMarkdownMode,
+  setMarkdownTaskChecked,
+} from "./filePreviewMode";
 import {
   clearProjectFileQueryData,
   confirmProjectFileQueryData,
@@ -119,6 +129,7 @@ const UNAVAILABLE_SESSION_SNAPSHOT: FileEditingSessionSnapshot = {
   canRedo: false,
   conflict: null,
   deletedOnDisk: false,
+  editPending: false,
 };
 
 const subscribeUnavailable = (): (() => void) => () => {};
@@ -415,32 +426,6 @@ function useFileDiskWatch({
 }
 
 /**
- * Wire an explicit Ctrl+S / Cmd+S save onto the file-surface container. The chord
- * flushes the pending debounced write immediately and always preventDefaults so
- * the browser's own save dialog can never open. The listener is scoped to the
- * container (capture phase, so it wins before the Pierre editor's own handlers)
- * and only fires while focus lives inside the surface.
- */
-function useFileSaveShortcut(
-  containerRef: RefObject<HTMLElement | null>,
-  session: { flush(): Promise<unknown> } | null,
-): void {
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !session) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      const isSaveChord =
-        (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "s";
-      if (!isSaveChord) return;
-      event.preventDefault();
-      void session.flush();
-    };
-    container.addEventListener("keydown", handleKeyDown, true);
-    return () => container.removeEventListener("keydown", handleKeyDown, true);
-  }, [containerRef, session]);
-}
-
-/**
  * Drops the worker pool's highlighted lines for a session's `cacheKey` when its editable surface
  * goes away. Pierre caches those lines by `cacheKey` alone, and a highlight still in the worker
  * when the first edit lands is stored after the edit cleared the entry. The next surface for the
@@ -714,27 +699,67 @@ function EditableFileSurface({
   );
 }
 
+/** The formatting group with its image picker, which needs the file's folder. */
+function RichMarkdownFormatting({
+  cwd,
+  environmentId,
+  markdownPath,
+  editor,
+  onLink,
+}: {
+  cwd: string;
+  environmentId: EnvironmentId;
+  markdownPath: string;
+  editor: RichMarkdownEditor | null;
+  onLink: () => void;
+}) {
+  const insertImage = useInsertImage({ cwd, environmentId, markdownPath, editor });
+  return (
+    <>
+      <RichMarkdownFormatGroup editor={editor} onLink={onLink} onImage={insertImage.pick} />
+      <input {...insertImage.inputProps} />
+    </>
+  );
+}
+
+const READ_ONLY_MARKDOWN_NOTICE =
+  "This file uses Markdown that the editor cannot change safely. Edit it in source view.";
+const TOO_LARGE_MARKDOWN_NOTICE =
+  "This file is too large to edit in rendered view. Edit it in source view.";
+
 function RenderedMarkdownSurface({
   session,
   environmentId,
   cwd,
   contents,
   threadRef,
+  notice = null,
 }: {
   session: FileEditingSession<FileCommentAnnotationGroup>;
   environmentId: EnvironmentId;
   cwd: string;
   contents: string;
   threadRef: ScopedThreadRef;
+  notice?: string | null;
 }) {
   const relativePath = session.relativePath;
   const surfaceRef = useRef<HTMLDivElement>(null);
   useFileSaveShortcut(surfaceRef, session);
+  // A line link opens source view without the toggle, so a ticked checkbox closes its visit here.
+  useEffect(() => () => session.commitRichEdits(), [session]);
 
   // Unsaved source edits win over the file; once saved, the file wins, so a
   // change made on disk after the save shows here and a task toggle keeps it.
   return (
     <ScrollArea ref={surfaceRef} className="min-h-0 flex-1">
+      {notice ? (
+        <p
+          className="mx-auto max-w-4xl px-6 pt-4 text-xs text-muted-foreground"
+          data-read-only-markdown-notice
+        >
+          {notice}
+        </p>
+      ) : null}
       <ChatMarkdown
         text={session.unsavedContents ?? contents}
         cwd={cwd}
@@ -748,7 +773,7 @@ function RenderedMarkdownSurface({
           const nextContents = setMarkdownTaskChecked(currentContents, markerOffset, checked);
           if (nextContents === currentContents) return;
           setProjectFileQueryData(environmentId, cwd, relativePath, nextContents);
-          session.changeOutsideEditor(nextContents);
+          session.changeFromRichEditor(nextContents);
         }}
       />
     </ScrollArea>
@@ -833,6 +858,53 @@ export default function FilePreviewPanel({
     session?.subscribe ?? subscribeUnavailable,
     session?.getSnapshot ?? readUnavailable,
     session?.getSnapshot ?? readUnavailable,
+  );
+  const renderedText =
+    renderMarkdown && session && file.data ? (session.unsavedContents ?? file.data.contents) : null;
+  // Decided when the rendered view opens a document; the rich editor's own saves do not reopen it.
+  const richMode = useMemo(
+    () =>
+      relativePath && renderedText !== null ? richMarkdownMode(relativePath, renderedText) : null,
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+    [relativePath, session?.cacheKey, renderedText === null],
+  );
+  // What the rich surface reported for this document: its editor, or null when it cannot edit
+  // the text it opened.
+  const [richEditorState, setRichEditorState] = useState<{
+    key: string | null;
+    editor: RichMarkdownEditor | null;
+    opened: string | null;
+  }>({ key: null, editor: null, opened: null });
+  const richEditorKey = session?.cacheKey ?? "";
+  // A refusal holds only for the text it was made on, so a source edit that repairs the file
+  // reopens it editable however rendered view returns (the toggle or a cleared line link).
+  const richEditor =
+    richEditorState.key === richEditorKey &&
+    (richEditorState.editor !== null || richEditorState.opened === renderedText)
+      ? richEditorState.editor
+      : undefined;
+  const onRichEditorChange = useCallback(
+    (editor: RichMarkdownEditor | null, opened: string) =>
+      setRichEditorState({ key: richEditorKey, editor, opened }),
+    [richEditorKey],
+  );
+  const richEditable = richMode?.editable === true && richEditor !== null;
+  const activeRichEditor = renderMarkdown && richEditable ? (richEditor ?? null) : null;
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  const richMarkdownWorkspace = useMemo(
+    () => ({
+      environmentId,
+      threadId: threadRef.threadId,
+      cwd,
+      markdownPath: relativePath ?? "",
+    }),
+    [cwd, environmentId, relativePath, threadRef.threadId],
+  );
+
+  useSyncExternalStore(
+    activeRichEditor?.subscribe ?? subscribeUnavailable,
+    () => (activeRichEditor ? `${activeRichEditor.canUndo}:${activeRichEditor.canRedo}` : ""),
+    () => "",
   );
   const diskConflict = sessionSnapshot.conflict;
   const deletedOnDisk = sessionSnapshot.deletedOnDisk;
@@ -980,22 +1052,45 @@ export default function FilePreviewPanel({
       ) : null}
       {relativePath !== null && mediaKind === null ? (
         <FileEditorToolbar
-          savePhase={sessionSnapshot.save.phase}
+          savePhase={
+            sessionSnapshot.editPending && sessionSnapshot.save.phase === "clean"
+              ? "pending"
+              : sessionSnapshot.save.phase
+          }
           confirmedRevision={sessionSnapshot.save.confirmedRevision}
-          canSave={sessionSnapshot.save.canSave}
-          canUndo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canUndo}
-          canRedo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canRedo}
+          canSave={sessionSnapshot.save.canSave || sessionSnapshot.editPending}
+          canUndo={
+            !deletedOnDisk &&
+            (renderMarkdown ? (activeRichEditor?.canUndo ?? false) : sessionSnapshot.canUndo)
+          }
+          canRedo={
+            !deletedOnDisk &&
+            (renderMarkdown ? (activeRichEditor?.canRedo ?? false) : sessionSnapshot.canRedo)
+          }
           cleanStatus={
             truncatedPreview || (file.error && file.data === null)
               ? "Editing unavailable"
               : workspaceUnavailable
           }
           saveBlockedReason={diskConflict ? fileDiskConflictSaveReason(diskConflict) : null}
+          formatting={
+            isMarkdown ? (
+              <RichMarkdownFormatting
+                cwd={cwd}
+                environmentId={environmentId}
+                markdownPath={relativePath}
+                editor={activeRichEditor}
+                onLink={() => setLinkDialogOpen(true)}
+              />
+            ) : undefined
+          }
           markdownView={
             isMarkdown
               ? {
                   rendered: renderMarkdown,
                   onRenderedChange: (rendered) => {
+                    // The rendered visit reaches the source editor's history as one step.
+                    if (!rendered) session?.commitRichEdits();
                     setSourceView({
                       path: rendered ? null : relativePath,
                       revealRequestId: rendered ? null : revealRequestId,
@@ -1019,11 +1114,14 @@ export default function FilePreviewPanel({
                 : undefined
           }
           onSave={() => {
-            if (session) void session.flush();
+            if (session) saveFile(session);
           }}
-          onUndo={() => session?.undo()}
-          onRedo={() => session?.redo()}
+          onUndo={() => (activeRichEditor ? activeRichEditor.undo() : session?.undo())}
+          onRedo={() => (activeRichEditor ? activeRichEditor.redo() : session?.redo())}
         />
+      ) : null}
+      {activeRichEditor && linkDialogOpen ? (
+        <RichMarkdownLinkPopover editor={activeRichEditor} open onOpenChange={setLinkDialogOpen} />
       ) : null}
       {session && diskConflict ? (
         <FileDiskConflictBar
@@ -1034,8 +1132,12 @@ export default function FilePreviewPanel({
             // disk text the conflict's read put in the query.
             clearProjectFileQueryData(environmentId, cwd, session.relativePath);
             session.reloadFromDisk();
+            explainUndeliveredEdit(session);
           }}
-          onOverwrite={() => session.overwriteDisk()}
+          onOverwrite={() => {
+            session.overwriteDisk();
+            explainUndeliveredEdit(session);
+          }}
         />
       ) : null}
       {relativePath && file.data && truncatedPreview ? (
@@ -1094,13 +1196,37 @@ export default function FilePreviewPanel({
             </div>
           ) : relativePath && file.data ? (
             isMarkdown && renderMarkdown && session ? (
-              <RenderedMarkdownSurface
-                session={session}
-                environmentId={environmentId}
-                cwd={cwd}
-                threadRef={threadRef}
-                contents={file.data.contents}
-              />
+              richEditable ? (
+                <RichMarkdownView
+                  key={session.cacheKey}
+                  session={session}
+                  contents={session.unsavedContents ?? file.data.contents}
+                  onEditorChange={onRichEditorChange}
+                  workspace={richMarkdownWorkspace}
+                  fallback={
+                    <RenderedMarkdownSurface
+                      session={session}
+                      environmentId={environmentId}
+                      cwd={cwd}
+                      threadRef={threadRef}
+                      contents={file.data.contents}
+                    />
+                  }
+                />
+              ) : (
+                <RenderedMarkdownSurface
+                  session={session}
+                  environmentId={environmentId}
+                  cwd={cwd}
+                  threadRef={threadRef}
+                  contents={file.data.contents}
+                  notice={
+                    richMode?.editable === false && richMode.reason === "too-large"
+                      ? TOO_LARGE_MARKDOWN_NOTICE
+                      : READ_ONLY_MARKDOWN_NOTICE
+                  }
+                />
+              )
             ) : truncatedPreview ? (
               <Virtualizer
                 key={`${relativePath}:${resolvedTheme}:${file.data.byteLength}`}

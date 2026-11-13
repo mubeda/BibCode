@@ -11,6 +11,7 @@ import {
   PanelBottomIcon,
   ServerIcon,
   Settings2Icon,
+  PaletteIcon,
   SmartphoneIcon,
   TerminalIcon,
 } from "lucide-react";
@@ -35,6 +36,7 @@ import type { EnvironmentPresentationPolicy } from "~/connection/environmentPres
 
 export type SettingsSectionPath =
   | "/settings/general"
+  | "/settings/appearance"
   | "/settings/remote-servers"
   | "/settings/local-environment"
   | "/settings/agents"
@@ -56,6 +58,7 @@ export interface SettingsNavItem {
 
 export const BASE_SETTINGS_NAV_ITEMS: ReadonlyArray<SettingsNavItem> = [
   { label: "General", to: "/settings/general", icon: Settings2Icon },
+  { label: "Appearance", to: "/settings/appearance", icon: PaletteIcon },
   { label: "Remote Servers", to: "/settings/remote-servers", icon: ServerIcon },
   { label: "Agents", to: "/settings/agents", icon: BotIcon },
   { label: "Status Bar", to: "/settings/status-bar", icon: PanelBottomIcon },
@@ -80,10 +83,9 @@ export function settingsNavItemsFor(
 ): ReadonlyArray<SettingsNavItem> {
   return policy.showLocalEnvironmentSettings
     ? [
-        BASE_SETTINGS_NAV_ITEMS[0]!,
-        BASE_SETTINGS_NAV_ITEMS[1]!,
+        ...BASE_SETTINGS_NAV_ITEMS.slice(0, 3),
         LOCAL_ENVIRONMENT_NAV_ITEM,
-        ...BASE_SETTINGS_NAV_ITEMS.slice(2),
+        ...BASE_SETTINGS_NAV_ITEMS.slice(3),
       ]
     : BASE_SETTINGS_NAV_ITEMS;
 }

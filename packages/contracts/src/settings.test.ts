@@ -5,11 +5,13 @@ import * as Schema from "effect/Schema";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
   BUNDLED_TERMINAL_FONT_PREFERENCE,
+  CODE_REVIEW_PROMPT_MAX_LENGTH,
   ClientSettingsPatch,
   ClientSettingsSchema,
   CodexSettings,
   CursorSettings,
   DEFAULT_CLIENT_SETTINGS,
+  DEFAULT_CODE_REVIEW_PROMPT,
   DEFAULT_SERVER_SETTINGS,
   DEFAULT_UNIFIED_SETTINGS,
   ProviderSessionDefault,
@@ -270,6 +272,42 @@ describe("ServerSettings default agent", () => {
   ])("rejects malformed default agents", (defaultAgent) => {
     expect(() => decodeServerSettings({ defaultAgent })).toThrow();
     expect(() => decodeServerSettingsPatch({ defaultAgent })).toThrow();
+  });
+});
+
+describe("ServerSettings code review", () => {
+  it("decodes code review settings with their defaults", () => {
+    const settings = decodeServerSettings({});
+    expect(settings.codeReviewAgent).toEqual({ kind: "chat", instanceId: "codex" });
+    expect(settings.codeReviewModelSelection).toBeNull();
+    expect(settings.codeReviewPrompt).toBe("");
+    expect(CODE_REVIEW_PROMPT_MAX_LENGTH).toBe(7_680);
+    expect(DEFAULT_CODE_REVIEW_PROMPT).toContain("{scope}");
+    expect(DEFAULT_CODE_REVIEW_PROMPT).toContain("{base}");
+  });
+
+  it("round-trips code review patch keys", () => {
+    const patch = {
+      codeReviewAgent: { kind: "terminal", instanceId: "claudeAgent" },
+      codeReviewModelSelection: { instanceId: "claudeAgent", model: "opus" },
+      codeReviewPrompt: "Look at tests.",
+    };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+    expect(decodeServerSettingsPatch({ codeReviewModelSelection: null })).toEqual({
+      codeReviewModelSelection: null,
+    });
+    const settings = decodeServerSettings(patch);
+    expect(settings.codeReviewAgent).toEqual(patch.codeReviewAgent);
+    expect(settings.codeReviewModelSelection).toEqual(patch.codeReviewModelSelection);
+    expect(settings.codeReviewPrompt).toBe("Look at tests.");
+  });
+
+  it("rejects a review prompt over 7680 characters", () => {
+    expect(
+      decodeServerSettings({ codeReviewPrompt: "a".repeat(7_680) }).codeReviewPrompt,
+    ).toHaveLength(7_680);
+    expect(() => decodeServerSettings({ codeReviewPrompt: "a".repeat(7_681) })).toThrow();
+    expect(() => decodeServerSettingsPatch({ codeReviewPrompt: "a".repeat(7_681) })).toThrow();
   });
 });
 

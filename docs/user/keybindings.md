@@ -76,6 +76,14 @@ While the find bar is open, Enter and Shift+Enter, Mod+G and Mod+Shift+G, and
 F3 and Shift+F3 move between matches; these keys belong to the bar and are not
 commands.
 
+**Mod+Alt+Shift+R** starts a code review, as **Review changes** in Source
+Control would (see
+[Workspace UI](./workspace-ui.md#review-changes)). It is built in for the same
+reasons as Mod+F, so it is not listed above. It applies when focus is not in a
+terminal, when no rule claims the key, and when no rule names
+`sourceControl.review`; a rule that binds `sourceControl.review` to another key
+replaces it. Mod+Shift+R is left to the browser's hard reload.
+
 The native server validates overrides in
 [`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
 and exposes the resolved file path and configuration issues through
@@ -94,6 +102,16 @@ Each entry supports:
 Invalid rules are ignored. A malformed config file contributes no overrides.
 The server reports both cases as configuration issues so the connected app can
 surface them.
+
+### Clients older than the server
+
+The server sends the resolved rules to every connected client as they are, and
+it cannot tell which commands a client knows. A client released after v0.15.3
+skips a rule whose command it does not have and loads the rest. A v0.15.3 or
+older client cannot decode a server configuration whose rules name a command it
+lacks (for v0.15.3, `sourceControl.review`; for older clients also commands
+such as `chat.find`), so on such a client the server's configuration does not
+load until the rule is removed or the client is updated.
 
 ### Available Commands
 
@@ -125,7 +143,8 @@ surface them.
 - `commandPalette.toggle`: open or close the global command palette
 - `chat.new`: create a new worktree/chat thread preserving the active context where possible
 - `chat.newLocal`: create a new chat thread for the active project in a new environment (local/worktree determined by app settings (default `local`))
-- `chat.find`: open Find in thread in the chat that holds focus, or the host chat. It has no default rule; binding it replaces the built-in Mod+F. A client older than this command cannot decode a server configuration that names it, so on such a client every rule from that server fails to load until the rule is removed; an updated client is unaffected
+- `chat.find`: open Find in thread in the chat that holds focus, or the host chat. It has no default rule; binding it replaces the built-in Mod+F. A client older than this command cannot decode a server configuration that names it (see [Clients older than the server](#clients-older-than-the-server))
+- `sourceControl.review`: start a code review of the active checkout, as Source Control's **Review changes** would; nothing happens while that button is disabled. It has no default rule; binding it replaces the built-in Mod+Alt+Shift+R. A v0.15.3 or older client cannot decode a server configuration that names it (see [Clients older than the server](#clients-older-than-the-server))
 - `modelPicker.toggle`: open/close the model picker
 - `editor.openFavorite`: open current project/worktree in the last-used editor
 - `thread.previous` / `thread.next`: jump through visible left-panel workspace cards

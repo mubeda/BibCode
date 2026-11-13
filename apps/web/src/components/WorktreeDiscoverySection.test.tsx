@@ -85,6 +85,7 @@ vi.mock("./ui/toast", () => ({
   stackedThreadToast: (toast: unknown) => toast,
 }));
 
+import { textColorUtilities } from "./sidebar/sidebarLevels.testSupport";
 import { WorktreeDiscoverySection } from "./WorktreeDiscoverySection";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-main");
@@ -137,6 +138,7 @@ function project(
     repositoryIdentity: null,
     defaultModelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5"),
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: { visibility, initialPromptDismissedAt, baselinePaths },
     createdAt: "2026-08-09T00:00:00.000Z",
     updatedAt: "2026-08-09T00:00:00.000Z",
@@ -823,6 +825,12 @@ describe("WorktreeDiscoverySection", () => {
       },
     });
     expect(document.body.textContent).toContain("Hiding 1 discovered worktree");
+    // The hidden-worktrees row is chat level, painted by the level rule alone (R63).
+    const hiding = button("Hiding 1 discovered worktree");
+    expect(hiding.className.split(/\s+/)).not.toContain("text-muted-foreground");
+    const text = hiding.querySelector('[data-sidebar-level="chat"]');
+    expect(text?.textContent).toBe("Hiding 1 discovered worktree");
+    expect(textColorUtilities(text?.getAttribute("class") ?? "")).toEqual([]);
 
     await act(async () => button("Hiding 1 discovered worktree").click());
     expect(document.body.textContent).toContain("Discovered worktrees");

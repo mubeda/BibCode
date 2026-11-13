@@ -79,7 +79,7 @@ const StashFileRow = memo(function StashFileRow({
       aria-selected={selected}
       className={cn(
         "flex h-[29px] w-full min-w-0 items-center gap-1.5 px-2 text-left text-xs focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
-        selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
+        selected ? "bg-selected text-selected-foreground" : "hover:bg-muted/45",
       )}
       role="option"
       title={file.path}

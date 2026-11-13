@@ -2696,6 +2696,7 @@ fn project_shell(project: &crate::persistence::ProjectionProject) -> Value {
         "defaultModelSelection": project.default_model_selection,
         "scripts": project.scripts,
         "worktreeDiscovery": project.worktree_discovery,
+        "codeReviewPrompt": project.code_review_prompt,
         "repositoryIdentity": project.repository_identity,
         "createdAt": project.created_at,
         "updatedAt": project.updated_at,
@@ -2966,6 +2967,9 @@ fn thread_shell_with_records(
     }
     if thread.side_chat {
         shell["sideChat"] = json!(true);
+    }
+    if thread.code_review {
+        shell["codeReview"] = json!(true);
     }
     if let Some(requester) = &thread.requester {
         shell["requester"] = requester.clone();
@@ -3307,6 +3311,7 @@ mod tests {
                 deleted_at: None,
                 host_thread_id: None,
                 compaction: None,
+                code_review: false,
             }],
             messages: vec![
                 ProjectionThreadMessage {
@@ -3557,6 +3562,22 @@ mod tests {
         thread.side_chat = true;
         assert_eq!(
             thread_shell(&thread, &snapshot, None)["sideChat"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn code_review_thread_shell_marks_only_a_review() {
+        let snapshot = preview_snapshot_fixture("running");
+        let mut thread = snapshot.threads[0].clone();
+        assert!(
+            thread_shell(&thread, &snapshot, None)
+                .get("codeReview")
+                .is_none()
+        );
+        thread.code_review = true;
+        assert_eq!(
+            thread_shell(&thread, &snapshot, None)["codeReview"],
             serde_json::json!(true)
         );
     }
@@ -4221,6 +4242,7 @@ mod tests {
             updated_at: CREATED_AT.to_owned(),
             deleted_at: None,
             repository_identity: None,
+            code_review_prompt: String::new(),
         };
         let mut deleted_project = project.clone();
         deleted_project.project_id = "project-deleted".to_owned();

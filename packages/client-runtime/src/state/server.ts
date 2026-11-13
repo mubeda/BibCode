@@ -26,6 +26,10 @@ import { request } from "../rpc/client.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { applyServerConfigEvent } from "../rpc/sharedServerConfig.ts";
 import { isToolId, toolsAsProviders } from "./serverTools.ts";
+import { accumulateHostMetrics, type HostMetricsView } from "./hostMetrics.ts";
+
+// The web reads the view type through this subpath; the package exports no `state/hostMetrics`.
+export type { HostMetricsSampleExtension, HostMetricsView } from "./hostMetrics.ts";
 
 export const PROVIDER_CAPABILITIES_STALE_TIME_MS = 30_000;
 
@@ -213,6 +217,15 @@ export function createServerEnvironmentAtoms<R, E>(
         stream.pipe(
           Stream.mapAccum(Option.none<ServerLifecycleWelcomePayload>, projectServerWelcome),
         ),
+    }),
+    // `idleTtlMs: 0`: closing the Host dashboard or hiding the document ends the stream at once,
+    // so the server returns to its background rate (R78).
+    hostMetrics: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:host-metrics",
+      tag: WS_METHODS.serverSubscribeHostMetrics,
+      idleTtlMs: 0,
+      transform: (stream) =>
+        stream.pipe(Stream.mapAccum(Option.none<HostMetricsView>, accumulateHostMetrics)),
     }),
     refreshProviders: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:refresh-providers",

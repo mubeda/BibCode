@@ -230,7 +230,7 @@ describe("SourceControlChangesList", () => {
       "Deselect src/file.ts",
     ]);
     expect(harness.buttons).toHaveLength(0);
-    expect(host.innerHTML).toContain("bg-accent/70");
+    expect(host.innerHTML).toContain("bg-selected ");
     trigger(harness.checkboxes[1], "onCheckedChange", true);
     expect(section.onSelect).toHaveBeenCalledWith("README.md", true);
     expect(section.onToggle).not.toHaveBeenCalled();

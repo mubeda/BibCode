@@ -472,6 +472,16 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            // Only a worktree this call created has a rollback, and only it gets a record. The
+            // turn goes on without one: the worktree's `.git` pointer file is the audit's evidence.
+            if result.rollback.is_some()
+                && let Err(error) = self
+                    .repositories
+                    .record_worktree_creation(&input.project_cwd, &result.worktree.path)
+                    .await
+            {
+                tracing::warn!(%error, "a bootstrap worktree has no creation record");
+            }
             let path = PathBuf::from(&result.worktree.path);
             let worktree = BootstrapWorktree {
                 repository_root: input.project_cwd,
@@ -1510,7 +1520,7 @@ pub(crate) async fn ensure_first_turn_baseline(
 }
 
 /// How long cancelled baseline steps may take to stop their Git children and clean up.
-const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
 /// How long a capture waits to remove its temporary index; past this, the removal is left to
 /// finish on its own (a stalled network filesystem) and logged, so no capture waits on it.
 const TEMPORARY_INDEX_REMOVAL_LIMIT: Duration = Duration::from_secs(5);
@@ -4936,6 +4946,7 @@ mod tests {
                 updated_at: "2026-07-16T00:00:00Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("malformed project fixture");
@@ -4952,6 +4963,7 @@ mod tests {
                 updated_at: "2026-07-16T00:00:01Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("empty project fixture");
@@ -4973,6 +4985,7 @@ mod tests {
                 updated_at: "2026-07-16T00:00:02Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("setup project fixture");
@@ -5175,6 +5188,7 @@ mod tests {
                 updated_at: "2026-08-01T00:00:00Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("project");

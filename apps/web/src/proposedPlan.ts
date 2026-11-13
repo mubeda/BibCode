@@ -1,3 +1,5 @@
+import { toastManager } from "./components/ui/toast";
+
 export function proposedPlanTitle(planMarkdown: string): string | null {
   const heading = planMarkdown.match(/^\s{0,3}#{1,6}\s+(.+)$/m)?.[1]?.trim();
   return heading && heading.length > 0 ? heading : null;
@@ -71,6 +73,8 @@ function sanitizePlanFileSegment(input: string): string {
     .toLowerCase()
     .replace(/[`'".,!?()[\]{}]+/g, "")
     .replace(/[^a-z0-9]+/g, "-")
+    // The desktop Save dialog accepts names up to 255 bytes; a title can be any length.
+    .slice(0, 120)
     .replace(/^-+|-+$/g, "");
   return sanitized.length > 0 ? sanitized : "plan";
 }
@@ -114,7 +118,22 @@ export function normalizePlanMarkdownForExport(planMarkdown: string): string {
   return `${planMarkdown.trimEnd()}\n`;
 }
 
-export function downloadPlanAsTextFile(filename: string, contents: string): void {
+/** Never rejects: its callers ignore the result, so a failed desktop save is reported here. */
+export async function downloadPlanAsTextFile(filename: string, contents: string): Promise<void> {
+  const saveTextFile = window.desktopBridge?.saveTextFile;
+  // The desktop webview cancels blob downloads, so the native Save dialog writes the file.
+  if (saveTextFile) {
+    try {
+      await saveTextFile({ suggestedName: filename, contents });
+    } catch (error) {
+      toastManager.add({
+        type: "error",
+        title: "Could not save the plan",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return;
+  }
   const blob = new Blob([contents], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");

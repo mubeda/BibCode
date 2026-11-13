@@ -32,6 +32,36 @@ function deferred(): Deferred {
 const flush = () => Promise.resolve();
 
 describe("createTerminalInputScheduler", () => {
+  it("never puts a terminal's own replies in a frame with a user's input (#348)", async () => {
+    const sent: Array<[string, string | null | undefined]> = [];
+    const scheduler = createTerminalInputScheduler({
+      maxInFlight: 16,
+      send: async (data, origin) => {
+        sent.push([data, origin]);
+        return { ok: true };
+      },
+    });
+    scheduler.enqueue("ab", "claim");
+    scheduler.enqueue("\u001b[0n", null);
+    scheduler.enqueue("\u001b[?1;2c", null);
+    scheduler.enqueue("c", "claim");
+    const fill = scheduler.reserve("claim");
+    scheduler.enqueue("\u001b[0n", null);
+    scheduler.enqueue("unmarked");
+    expect(scheduler.pendingLength()).toBe(14);
+    await flush();
+    fill("/tmp/paste.png");
+    await flush();
+    expect(sent).toEqual([
+      ["ab", "claim"],
+      ["\u001b[0n\u001b[?1;2c", null],
+      ["c", "claim"],
+      ["/tmp/paste.png", "claim"],
+      ["\u001b[0n", null],
+      ["unmarked", undefined],
+    ]);
+  });
+
   it("holds input behind a reservation and releases it in order once filled", async () => {
     const sent: string[] = [];
     const scheduler = createTerminalInputScheduler({

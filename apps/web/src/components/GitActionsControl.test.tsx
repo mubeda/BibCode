@@ -14,7 +14,7 @@ import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
-import type { Dispatch, ReactElement, ReactNode, SetStateAction } from "react";
+import { type Dispatch, type ReactElement, type ReactNode, type SetStateAction } from "react";
 import * as React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -1380,6 +1380,17 @@ staticDescribe("default branch confirmation", () => {
   });
 });
 
+const REMOTE_PUSH_GUIDANCE =
+  "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+const GIT_USERNAME_LINE =
+  "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
+
+/** The failure toast's description is the raw string; the shared toast renders the line breaks. */
+function expectMultiLineDescription(description: unknown): void {
+  expect(description).toBe(REMOTE_PUSH_FAILURE);
+}
+
 staticDescribe("stacked action results", () => {
   async function runPush(): Promise<void> {
     testState.gitStatus = status({ aheadCount: 1 });
@@ -1424,6 +1435,30 @@ staticDescribe("stacked action results", () => {
       "toast-1",
       expect.objectContaining({ type: "error", title: "Push failed", description: gitError }),
     );
+  });
+
+  it("a remote push failure shows the guidance and Git's own line", async () => {
+    testState.stackedAction.run.mockImplementationOnce(async (input: { actionId: string }) =>
+      AsyncResult.failure(
+        Cause.fail(
+          new VcsActionRemoteFailureError({
+            actionId: input.actionId,
+            transportActionId: input.actionId,
+            action: "push",
+            environmentId: ENVIRONMENT_ID,
+            cwd: "/repo",
+            phase: "push",
+            remoteMessage: REMOTE_PUSH_FAILURE,
+          }),
+        ),
+      ),
+    );
+    await runPush();
+    expect(testState.toast.update).toHaveBeenLastCalledWith(
+      "toast-1",
+      expect.objectContaining({ type: "error", title: "Push failed" }),
+    );
+    expectMultiLineDescription(testState.toast.update.mock.calls.at(-1)?.[1].description);
   });
 
   it("closes the toast quietly when interrupted", async () => {

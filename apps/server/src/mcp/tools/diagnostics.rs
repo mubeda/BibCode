@@ -18,6 +18,7 @@ use crate::{
     diagnostics::profiler::{
         mcp::{self as profiler, Producer, Refusal},
         redact::redact_message,
+        worktree_audit::WorktreeEvidence,
     },
     mcp::{
         control::{
@@ -81,6 +82,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec::client("trace_diagnostics", READ, &["server.getTraceDiagnostics"])
         .reads()
         .in_set(DIAGNOSTICS),
+    ToolSpec::client("host_metrics", READ, &["server.getHostMetrics"])
+        .reads()
+        .in_set(DIAGNOSTICS),
 ];
 
 pub(crate) const FAMILY: Family = Family {
@@ -110,6 +114,7 @@ fn call<'a>(
             "refresh_providers" => call.refresh_providers().await,
             "process_diagnostics" => call.process_diagnostics().await,
             "trace_diagnostics" => call.trace_diagnostics().await,
+            "host_metrics" => call.host_metrics().await,
             _ => Err(typed_tool_failure("McpUnknownToolError", "Unknown tool.")),
         }
     })
@@ -152,11 +157,85 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
                 &[],
             ),
         ),
+        "host_metrics" => (
+            "The host this server runs on: its system, architecture, core count and memory; the current CPU, memory and volume sizes; and CPU, memory and per-volume used percent since the server started (current, minimum, average, p95, maximum). A volume's mount point is given only when it is / or a drive root such as C:\\, and null otherwise; volume names and the volumes the dashboard hides are never listed, only counted.",
+            none(),
+        ),
         _ => return None,
     })
 }
 
 impl ToolCall<'_> {
+    async fn host_metrics(&self) -> ToolResult {
+        self.only(&[])?;
+        let snapshot = self.invoke("server.getHostMetrics", json!({})).await?;
+        let mut withheld = 0_u64;
+        let mut root_or_null = |mount_point: &Value| {
+            if mount_point.as_str().is_some_and(is_file_system_root) {
+                mount_point.clone()
+            } else {
+                withheld += 1;
+                Value::Null
+            }
+        };
+        let sample = &snapshot["sample"];
+        let sample = if sample.is_object() {
+            let mut picked = pick(sample, HOST_SAMPLE_FIELDS);
+            let volumes = sample["volumes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|volume| {
+                    let mut picked = pick(volume, HOST_VOLUME_FIELDS);
+                    picked["mountPoint"] = root_or_null(&volume["mountPoint"]);
+                    picked
+                })
+                .collect::<Vec<_>>();
+            picked["volumes"] = Value::Array(volumes);
+            picked
+        } else {
+            Value::Null
+        };
+        // Statistics name the same volumes; a withheld mount point is counted once, above.
+        let volume_statistics = snapshot["volumeStatistics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let mount_point = &entry["mountPoint"];
+                json!({
+                    "mountPoint": if mount_point.as_str().is_some_and(is_file_system_root) {
+                        mount_point.clone()
+                    } else {
+                        Value::Null
+                    },
+                    "statistic": pick(&entry["statistic"], STATISTIC_FIELDS),
+                })
+            })
+            .collect::<Vec<_>>();
+        let statistic = |value: &Value| {
+            if value.is_object() {
+                pick(value, STATISTIC_FIELDS)
+            } else {
+                Value::Null
+            }
+        };
+        Ok(tool_result(
+            json!({
+                "host": pick(&snapshot["host"], &["os", "arch", "cpuCount", "memoryTotalBytes"]),
+                "startedAt": snapshot["startedAt"],
+                "statisticsSince": snapshot["statisticsSince"],
+                "sample": sample,
+                "cpu": statistic(&snapshot["cpu"]),
+                "memory": statistic(&snapshot["memory"]),
+                "volumeStatistics": volume_statistics,
+                "mountPointsWithheld": withheld,
+                "hiddenVolumeCount": snapshot["hiddenVolumes"].as_array().map_or(0, Vec::len),
+            }),
+            &[],
+        ))
+    }
+
     /// Runs a stdio profiler handler over the server's own profiler directory, off the async
     /// workers, then projects its content.
     async fn profiler(&self, produce: Producer, project: fn(&mut Value)) -> ToolResult {
@@ -746,6 +825,33 @@ fn project_crash(content: &mut Value) {
 }
 
 /// The `fields` of `value` that it has; nothing else.
+const HOST_SAMPLE_FIELDS: &[&str] = &[
+    "sampledAt",
+    "cpuPercent",
+    "memoryTotalBytes",
+    "memoryUsedBytes",
+    "memoryAvailableBytes",
+    "volumesPaused",
+];
+/// Never `name`, and `mountPoint` only through [`is_file_system_root`] (D26).
+const HOST_VOLUME_FIELDS: &[&str] = &[
+    "fileSystem",
+    "totalBytes",
+    "freeBytes",
+    "usedBytes",
+    "removable",
+    "readOnly",
+    "state",
+];
+const STATISTIC_FIELDS: &[&str] = &["current", "minimum", "average", "p95", "maximum"];
+
+/// `/` or a drive root such as `C:\`: the only mount points that cannot name a user (D26).
+fn is_file_system_root(mount_point: &str) -> bool {
+    let bytes = mount_point.as_bytes();
+    mount_point == "/"
+        || (bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..] == b":\\")
+}
+
 fn pick(value: &Value, fields: &[&str]) -> Value {
     let mut picked = Map::new();
     for field in fields {
@@ -923,9 +1029,8 @@ fn evidence_fields(kind: &str) -> Vec<&'static str> {
             "cancelled",
             "capacity",
         ]],
-        "worktree.missing" | "worktree.orphan-dir" | "worktree.registration-mismatch" => {
-            &[&["path"]]
-        }
+        "worktree.missing" | "worktree.registration-mismatch" => &[&["path"]],
+        "worktree.orphan-dir" => &[&["path", "name", "reason"]],
         "worktree.stuck-removal" => &[&["path", "minutes"]],
         "worktree.held-open" => &[&["path", "pid"]],
         "git.stacked-action-failed" => &[&[
@@ -976,8 +1081,18 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
         }
     }
     clean_client_fields(&mut evidence);
+    // An orphan's reason is one of the audit's evidence kinds, never free text.
+    if kind == "worktree.orphan-dir"
+        && !evidence
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(WorktreeEvidence::is_reason)
+        && let Some(fields) = evidence.as_object_mut()
+    {
+        fields.remove("reason");
+    }
     // Keep home-relative paths; retain a safe relative path or file name outside home.
-    for field in ["worktree", "path"] {
+    for field in ["worktree", "path", "name"] {
         if let Some(path) = evidence.get(field).and_then(Value::as_str) {
             let inside_home = path == "~" || path.starts_with("~/") || path.starts_with("~\\");
             if !inside_home {
@@ -1085,7 +1200,7 @@ mod tests {
         use crate::diagnostics::profiler::{
             findings::FindingsBook,
             store::{ProfilerStore, StoreConfig},
-            worktree_audit::{AuditFacts, audit},
+            worktree_audit::{AuditFacts, WorktreeEvidence, audit},
         };
 
         let state = tempfile::tempdir().unwrap();
@@ -1097,6 +1212,10 @@ mod tests {
                 "/srv/worktrees/orphan-b".into(),
             ],
             managed_dirs: vec!["/srv/worktrees".into()],
+            evidence: ["/srv/worktrees/orphan-a", "/srv/worktrees/orphan-b"]
+                .into_iter()
+                .map(|dir| (dir.into(), WorktreeEvidence::CreationRecord))
+                .collect(),
             ..AuditFacts::default()
         };
         let now = time::OffsetDateTime::now_utc();
@@ -1112,6 +1231,8 @@ mod tests {
         assert_ne!(first[0]["id"], first[1]["id"]);
         assert_eq!(first[0]["evidence"]["path"], "orphan-a");
         assert_eq!(first[1]["evidence"]["path"], "orphan-b");
+        assert_eq!(first[0]["evidence"]["name"], "orphan-a");
+        assert_eq!(first[0]["evidence"]["reason"], "creation-record");
 
         facts.base_dirs.remove(0);
         let next = audit(&facts);
@@ -1148,6 +1269,38 @@ mod tests {
         let finding =
             json!({ "kind": "worktree.orphan-dir", "evidence": { "path": { "private": "data" } } });
         assert!(project_finding(&finding)["evidence"].get("path").is_none());
+    }
+
+    #[test]
+    fn an_orphan_keeps_its_folder_name_and_a_known_reason_only() {
+        let orphan = |name: Value, reason: Value| {
+            project_finding(&json!({
+                "kind": "worktree.orphan-dir",
+                "evidence": { "path": "/srv/worktrees/a", "name": name, "reason": reason }
+            }))["evidence"]
+                .clone()
+        };
+        for reason in [
+            "creation-record",
+            "incomplete-removal",
+            "git-pointer-file",
+            "removal-marker",
+        ] {
+            assert_eq!(orphan(json!("feature-a"), json!(reason))["reason"], reason);
+        }
+        let kept = orphan(json!("/srv/worktrees/feature-a"), json!("creation-record"));
+        assert_eq!(kept["name"], "feature-a", "a path keeps its file name only");
+        let dropped = orphan(json!({ "private": "data" }), json!("/srv/private/reason"));
+        assert!(dropped.get("name").is_none(), "{dropped}");
+        assert!(dropped.get("reason").is_none(), "{dropped}");
+        assert!(orphan(json!("a"), json!(7)).get("reason").is_none());
+
+        // The other worktree kinds keep only their path.
+        let missing = project_finding(&json!({
+            "kind": "worktree.missing",
+            "evidence": { "path": "/srv/worktrees/a", "name": "a", "reason": "creation-record" }
+        }));
+        assert_eq!(missing["evidence"], json!({ "path": "a" }));
     }
 
     /// An OS crash record names modules by their paths on this host: a finding keeps their

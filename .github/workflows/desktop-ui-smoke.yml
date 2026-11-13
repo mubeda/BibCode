@@ -93,8 +93,12 @@ jobs:
             librsvg2-dev \
             xdg-utils \
             patchelf \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-alsa \
             xvfb \
-            xdotool
+            xdotool \
+            lsof
 
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
@@ -136,6 +140,24 @@ jobs:
           if [[ -n "$forbidden_library" ]]; then
             printf 'Linux AppImage contains a bundled Wayland client: %s\n' \
               "$forbidden_library" >&2
+            exit 1
+          fi
+
+          # Audio in Files needs the bundled GStreamer core to find its own plugins: exactly the
+          # wrapper's allowlist, nothing else, plus the scanner and the AppRun hook.
+          for required in \
+            usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner \
+            apprun-hooks/linuxdeploy-plugin-gstreamer.sh; do
+            if [[ ! -f "$extract_directory/squashfs-root/$required" ]]; then
+              printf 'Linux AppImage is missing GStreamer file: %s\n' "$required" >&2
+              exit 1
+            fi
+          done
+          expected_plugins="$(bash scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins | LC_ALL=C sort)"
+          bundled_plugins="$(ls -1 "$extract_directory/squashfs-root/usr/lib/gstreamer-1.0" | LC_ALL=C sort)"
+          if [[ "$bundled_plugins" != "$expected_plugins" ]]; then
+            printf 'Linux AppImage GStreamer plugins differ from the allowlist:\n' >&2
+            diff <(printf '%s\n' "$expected_plugins") <(printf '%s\n' "$bundled_plugins") >&2 || true
             exit 1
           fi
 

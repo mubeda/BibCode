@@ -15,6 +15,65 @@ the environment it was sent to, and its start time. The warning goes away when
 the requests finish. The hosted web app has no status bar, so there a bar holding
 only this warning appears at the bottom while requests are slow.
 
+## Host dashboard
+
+The Host dashboard shows the computer a BiBCode server runs on: its CPU, its
+memory and its disks. Each environment has one, so you can look at a remote
+server's host as well as this machine. Open it from any of three places:
+
+- the **Environment actions** menu on the environment card in the left panel;
+- **Settings → Remote Servers**, the **Host dashboard** button on a connected
+  server;
+- the **Resource Manager** popover in the status bar, its **Host dashboard**
+  button.
+
+The dashboard opens as a panel on the right. Its sections are:
+
+- **CPU** shows the current use and the number of cores, with a chart of the
+  last 15 minutes.
+- **Memory** shows used and total memory, with the same chart.
+- **Volumes** lists each disk with its used and total size and its free space.
+  A volume can carry a **Removable**, **Read-only** or **Not responding**
+  badge. **Hidden volumes** below the list names each volume that is not shown
+  and why: a network volume, a container layer, a file mount, a system mount
+  (memory-backed system storage such as `/dev/shm` on Linux, or the running
+  AppImage's own image), an empty volume, or the same storage as another
+  volume. Hidden volumes are never sized.
+- **Since** shows the time the server started and how long it has been up, then
+  a table of the current, minimum, average, p95 and maximum use of CPU, memory
+  and each volume, and a chart of the whole run. Each bar is an average, with
+  its peak drawn lighter above it. The figures cover this server process only.
+  They start again when the server restarts.
+
+On macOS and Linux, free space is the free space of the volume itself: a
+per-user quota is not applied. On Windows, total and free space are the
+figures for the user the server runs as, so a quota on that user applies to
+both. BiBCode does not read network volumes, so a disconnected share cannot
+stall the dashboard.
+
+The dashboard updates once a second while you can see it. It stops asking the
+server when the window is hidden and starts again when you return. A reading
+that is more than a few seconds old dims the values and says how old it is.
+
+A notice at the top says when something is off:
+
+- **Disconnected**: the connection to the server dropped. The last values stay
+  on screen until it returns.
+- **This server's version doesn't report host metrics**: the server is too old.
+  Update it, or choose **Open Remote Servers** to find it.
+- **Server restarted at** a time: the server restarted while the dashboard was
+  open. The Since figures start again.
+- An error from the server, with **Retry**.
+
+If a disk stops answering, its volume shows **Not responding** and the
+dashboard says that volume sizes are paused until the earlier reads answer.
+If the list of volumes itself does not answer, the dashboard says so and shows
+the volumes from the last list that did. CPU and memory keep updating.
+
+An agent can read the same figures with the `host_metrics` MCP tool; it
+returns mount points only for a file system root such as `/` or `C:\`. See the
+[MCP reference](../reference/mcp.md).
+
 ## Left Panel
 
 The panel opens 422px wide by default (a 370px projects panel beside the 52px
@@ -250,11 +309,17 @@ Picking a row fills the field with that branch, which closes the list the same
 way; editing the field clears the choice and brings the rows back. In Smart, a
 field that exactly names a branch is that branch even when the name is a number
 such as `2026`; type `#2026` for the GitHub item instead. The field is
-the choice, so it survives reopening the dialog for the same project and
-switching between Smart and Branch; opening the dialog for another project
-clears it. If the chosen remote branch becomes local before submit,
-the server reuses it when free and still suffixes it when another worktree owns
-it.
+the choice, so it survives switching between Smart and Branch, and changing
+Project clears it. Every opening of the dialog starts fresh: Name and Create
+From are empty, Smart is selected, Advanced is collapsed with no base override,
+Create more is off, the Project is the one you opened it from (or the first
+project), and the agent follows Default Agent. This holds after a creation and
+after you close the dialog. While it stays open, your input survives a failed
+create and data refreshes. With **Create more** on, a successful create clears
+Name and Create From for the next worktree and keeps the project, mode, agent,
+base override and Advanced for that batch. If the chosen remote branch becomes
+local before submit, the server reuses it when free and still suffixes it when
+another worktree owns it.
 
 BiBCode's Git follows your system Git settings for line endings, Git LFS,
 symlinks and long paths, so a new worktree and a reverted turn hold the same
@@ -375,6 +440,15 @@ extra Flatpak overrides. Detection runs on the server that owns the
 environment, so a remote environment lists the editors installed on that remote
 host.
 
+The left panel shows five levels, and each one looks different from its
+neighbors even without color. A repository is an outlined card with a larger
+title. Inside it, an environment (a machine) is an inset band with a coloured
+rule on its left edge and a machine icon. The primary checkout leads with a house
+icon, a bold name and a **primary** badge. A worktree has a branch icon, sits
+indented under a thin guide line and has its own outlined surface. A chat is the
+smallest text, below the name of the checkout or worktree it belongs to. Themes
+can restyle each level (see [Appearance](#appearance)).
+
 ### Discovering existing worktrees
 
 When a connected server advertises worktree-catalog support, BiBCode can show
@@ -458,6 +532,12 @@ keystrokes. Check the prompt before typing again. With an updated client and
 server, normal typing no longer waits for each preceding write's reply;
 network latency still affects when remote output appears.
 
+A full-screen program you return to after long output can show missing
+characters, because a terminal is redrawn from its last 1 MiB or 5,000 lines;
+a Claude AI Terminal on a macOS or Linux server is then asked to redraw (and a
+Claude session suspended in it resumes). Other programs, and terminals on a
+Windows server, still need a panel resize.
+
 The active thread's main chat starts as the first center tab. It can be reordered,
 moved between split panes, or closed from the center layout without deleting the
 thread. While present, it remains mounted throughout layout and tab changes. The
@@ -472,6 +552,20 @@ chat header `+` menu contains:
 - enabled provider terminal actions, which launch the selected provider CLI in
   the current worktree using that provider instance's configured binary path
 - Add custom action, which opens the custom action dialog
+
+The composer's model picker lists only the chat's own provider. A worktree's or
+project's chat and a chat panel list the models of the provider account they
+were created with, even before the first message. Once a worktree's or
+project's chat has started, it also lists that provider's other accounts that
+can continue the same session; a chat panel stays on its own account. To use
+another provider, add a chat panel from this `+` menu, or create a worktree with
+that agent. A new chat that has not been sent yet lists every ready provider,
+and choosing a model there also chooses its provider. The picker never lists
+another provider's models in place of the chat's own. When the chat's provider
+is not ready, its status banner says why. When it is disabled or removed, the
+banner above the composer names it, offers **Open Providers** (Settings →
+Providers) on this computer's server, and Send stays unavailable until the
+provider is back.
 
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
@@ -570,6 +664,25 @@ to it; its terminal history or chat messages load when you open the tab.
 Closing a panel closes it on every client: closing a terminal tab ends its
 session, and closing a chat panel archives its thread. A reopened chat panel
 returns to every client. Tab order and splits stay per client.
+
+A terminal's program has one size, so when two windows show the same terminal,
+for example the server host's desktop window and a client on another machine,
+the window you last used sizes it: clicking in it, typing in it, or choosing
+**Fit to this window**. The other window shows the program at that size. If it
+has less room, it shows the whole terminal scaled down to fit, down to half
+size, with a note that it is **Sized for another window** and the scale; below
+half size it keeps the bottom rows in view and scrolls for the rest. Scrolling
+it with the wheel or touchpad keeps it scaled, but pressing its scroll bar
+counts as a click and takes the size. If it has
+more room, it shows the terminal at normal size with empty space around it.
+The first click in a scaled window takes the size and returns it to normal
+size; it is not passed to the program. After that click, or after **Fit to this
+window**, the terminal has keyboard focus, so what you type next reaches the
+program. A window that regains focus without
+anyone clicking or typing in it, such as a server host window after its display
+wakes, does not take the size, where its web view reports recent input (Safari
+16.4 and later on macOS); elsewhere a focused window still takes it. When the window that sized the terminal closes or
+disconnects, the other window takes the size.
 
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
@@ -985,8 +1098,19 @@ finished may already be saved, and a browser tab Git Credential Manager opened s
 The Source Control panel offers the same sign-in for its pull and push, and its progress
 shows **Cancel** while it pulls or pushes. The offer needs an `https://` remote with one URL
 in that direction; SSH remotes, `osxkeychain`-only setups, the browser app, paired devices,
-WSL and remote servers, and agents' Git tools never get it and show the authentication
-error as before.
+WSL and remote servers, and agents' Git tools never get it. They show the authentication
+error, and a push on a remote server adds the guidance below.
+
+**Pushing from a remote server.** Git runs on the server that owns the project, not on
+the device you are looking at. A "remote server" here is any server the desktop app did
+not start inside itself. When a push, publish, force push, tag push or tag creation that
+pushes fails because Git has no stored sign-in and cannot ask for one, BiBCode shows
+"Push ran on the remote server" and names the server when it has a name. The message
+appears in the Git Manager and in the Source Control panel, followed by Git's own text. To
+fix it, open a terminal on that server, go to the same repository as the user that runs
+BiBCode, and run `git push` to sign in. Then retry the push in BiBCode. A server that has
+a stored sign-in needs none of this. BiBCode does not open a sign-in window on a remote
+server, and it does not offer one for a plain credential store.
 
 The manager keeps the chosen tab for the session but does not save it, so it
 opens on **History** after a reload. A reconnect keeps the chosen tab and is not
@@ -2179,6 +2303,85 @@ right-panel Source Control surface; this matches the Orca reference behavior for
 project-scoped Git Manager is a separate centre surface and does provide stash
 operations and amend.
 
+#### Review changes
+
+**Review changes**, the icon button in the Source Control header, starts a code
+review of the checkout the panel shows:
+
+- **Scope.** With commits on the branch that are not on `origin/<default
+  branch>`, the review covers those commits and every staged, unstaged and
+  untracked change. With no such commits, it covers the uncommitted changes
+  alone. The tooltip names the scope ("Review branch vs origin/main and
+  uncommitted changes" or "Review uncommitted changes") and the reviewer's guard
+  line. The scope is read when you start the review; later changes do not alter
+  it. When `origin/<default branch>` is missing, the built-in prompt tells the
+  agent to compare with the local default branch instead.
+- **When it is disabled**, its tooltip says why: "Checking for changes", "No
+  changes to review", a draft chat ("Send a first message in this chat, then
+  review from here."), a workspace that is not available, a server too old for
+  reviews ("Update the BiBCode server on this environment to use Review."), or a
+  code review agent that is not available, which it names along with Settings →
+  Agents. BiBCode never falls back to another agent.
+- **The reviewer** is the **Code review agent** in **Settings → Agents → Code
+  review**: a chat agent, or the Claude or Codex AI Terminal. Its guard line,
+  shown there and in the tooltip, names the mechanism the review starts with,
+  never an outcome:
+
+  | Reviewer                   | Guard line                                                         |
+  | -------------------------- | ------------------------------------------------------------------ |
+  | Claude chat or terminal    | "Starts in Claude's plan mode."                                    |
+  | Codex chat                 | "Runs in Codex's read-only sandbox. Writes ask for your approval." |
+  | Codex terminal             | "Runs in Codex's read-only sandbox."                               |
+  | OpenCode chat              | "Edits and commands ask for your approval."                        |
+  | Cursor, Grok or other chat | "Told not to edit. BiBCode cannot block edits for this agent."     |
+
+  These are the settings BiBCode starts the review with, not a guarantee that
+  nothing is edited. A Claude review loads your user Claude settings and the
+  repository's project and local Claude settings, as every Claude chat does, so
+  a hook that approves leaving plan mode, allow rules for edit tools, or a
+  default mode of `bypassPermissions` in any of them can weaken plan mode. A
+  prompt in the repository can also ask the agent to do more than review.
+
+- **A chat review** opens as a chat panel of the current thread, in a tab named
+  **Code review · \<agent\>**, on the same checkout. It starts with **Supervised**
+  runtime access, and in plan mode for Claude only. The composer's pickers can
+  change both, as in any chat. Its first message is the review prompt. If that
+  message cannot be sent, the panel stays open with the prompt in its composer.
+- **A review's findings offer no Implement.** When a Claude review ends with a
+  plan, its card reads **Review findings**, with copy and download but no
+  Implement, Refine or **Implement in a new thread**, and Enter in an empty
+  composer sends nothing. This holds after a reload and on other devices. To fix
+  something, ask for it in a normal chat.
+- **A terminal review** opens a Claude or Codex AI Terminal in the centre panel
+  with the CLI's read-only flags (`--permission-mode plan` or `--sandbox
+  read-only --ask-for-approval never`) and no bypass flag, and passes the review
+  prompt as its one argument. Like other AI Terminals, it shows the agent's
+  Activity. A double click opens one terminal. A prompt longer than 8,192
+  characters, or one with a control character other than tab and line breaks,
+  is refused with a reason. On Windows, line breaks in the prompt become
+  spaces, because a Windows command line cannot carry them.
+- **The prompt** always starts with a fixed line from BiBCode: "Code review
+  requested from BiBCode. Do not edit files." followed by the scope and, for a
+  branch, the base. The text after it is the project's review prompt, or your
+  own **Review prompt** from Settings → Agents when the project has none, or the
+  built-in prompt when neither is set. `{scope}` and `{base}` in that text are
+  replaced. **Review prompt for this project…** in the button's menu edits the
+  project's prompt, which every review of the project uses, for anyone working on
+  it; **Reset** goes back to your own prompt.
+- **The button's menu** also starts a review once without changing your
+  settings: **Review with instructions…** adds up to 1,000 characters after the
+  prompt for this review only, and **Review once with** lists every reviewer with
+  its guard line, or the reason it cannot start.
+- **Mod+Alt+Shift+R** (Cmd+Option+Shift+R on macOS, Ctrl+Alt+Shift+R elsewhere)
+  starts the review the button would start, when focus is not in a terminal and
+  the button is enabled. Mod+Shift+R stays the browser's hard reload. To use
+  another key, bind the `sourceControl.review` command (see
+  [Keybindings](./keybindings.md)).
+
+Review model in Settings → Agents picks the model of a review; **Provider
+default** uses the agent's own default, and a model saved for another agent is
+ignored. Review settings belong to each environment, as the Default Agent does.
+
 ### Files
 
 The Files surface is a full file manager for the active workspace:
@@ -2210,7 +2413,8 @@ The Files surface is a full file manager for the active workspace:
   cannot run; **View source** opens its XML in the editor, and the editor's
   switch brings the image back. A **PDF** opens in the browser's or webview's own
   viewer, and audio (MP3, M4A, WAV, OGG, OGA, WebM, FLAC) plays in the native
-  player. These previews come from the same size-capped file route as the
+  player. The Linux AppImage plays all of these except M4A, whose AAC decoder
+  it does not carry; an M4A file there says it cannot be shown. These previews come from the same size-capped file route as the
   integrated browser, so a file over 10 MiB, or one the viewer cannot decode,
   explains itself instead of failing: it says the file is too large (or cannot be
   shown) and points at **Open in** in the header, or at the machine the
@@ -2317,6 +2521,126 @@ The Files surface is a full file manager for the active workspace:
     disk.** and reopens if the file comes back. A file that becomes binary, or
     grows past 1 MB, can only be overwritten; the text you were editing stays
     on screen until you choose.
+
+### Editing Markdown in rendered view
+
+A `.md` file opens in its rendered view, and you can edit it there. A formatting
+group sits between **Redo** and the view switch in the file's toolbar:
+
+- Paragraph, Heading 1 to 3, Bold, Italic, Strikethrough, Bullet list, Numbered
+  list, Task list and Quote;
+- **Link**, which opens a small box for the address. An empty address removes the
+  link. With no text selected, the address is inserted as the link text;
+- **Image**, which asks for an image file and copies it next to the Markdown
+  file, then inserts it at the caret. A file that is not an image is refused. If
+  a file with that name is already there, the copy gets a new name such as
+  `diagram-1.png`, and the existing file is never replaced. If the copy fails, you
+  see an error and nothing is inserted;
+- **More formatting**, which adds Heading 4, Heading 5 and a collapsible section.
+
+In source view the group stays visible but disabled, and says that formatting is
+available in rendered view.
+
+Rendered edits use the same Save, autosave and **Changed on disk.** handling as
+source edits. Opening a file and saving it without a change leaves it
+byte-identical, and a frontmatter block at the top is never rewritten. Only the
+parts you edit change.
+
+A ` ```mermaid ` block shows its diagram in rendered view. The diagram is one
+block: click it to select it, and press Delete or Backspace to remove it. Edit
+its source in source view. Its **Show source** shows the source without syntax
+colors. A diagram or code block you cut and paste in the file keeps its source
+and everything written after the opening fence, such as a title. Other code
+blocks show without syntax colors while
+you edit, and clicking a link places the caret in it instead of opening it; the
+read-only rendered view opens a link on a click.
+
+An image the file links by a relative path, such as `images/diagram.png`, is
+read from the project relative to the Markdown file, and the file keeps the path
+as written. An inserted image shows as soon as it is copied. While an image loads,
+its text (or its file name) shows in its place. When it is missing, larger than
+10 MiB, or outside the project, the text stays, and hovering it says why. Images
+from web addresses are not loaded.
+
+Undo and Redo work inside the view you are in. Rendered view starts a fresh
+history each time you enter it. When you switch to source view, everything you
+did in that visit is one Undo step there.
+
+Some files stay read-only in rendered view, because the editor could not write
+them back without changing them. They show "This file uses Markdown that the
+editor cannot change safely. Edit it in source view." The causes are `.mdx`
+files, reference-style links and definitions, footnotes, HTML comments, other raw
+HTML (except a collapsible `<details>` section), and math written with `$`. A
+file over 128 KiB shows "This file is too large to edit in rendered view. Edit it
+in source view." You can still tick a task box in a read-only view. Use source
+view to edit these files.
+
+## Closing with unsaved edits
+
+If a Files tab has edits that are not saved, BiBCode asks before it throws them
+away. In the desktop app the question appears when you close the window, quit,
+restart BiBCode, or install an update. The title says what is about to happen,
+for example **Save your changes before leaving?** or **Save your changes before
+updating?**, and the dialog lists the files:
+
+- **Save all** saves every listed file, then continues. While it runs, the
+  button shows **Saving…**.
+- **Discard** continues without saving. The edits are lost.
+- **Cancel** stays where you were.
+
+If a file cannot be saved, for example because it changed on disk, BiBCode stays
+open and a message lists the files that are still unsaved. Open each one to
+reload, overwrite or retry the save. With nothing unsaved, no question is asked.
+If an update was started from another device, a short **Installing an update**
+message blocks editing until BiBCode restarts.
+
+In a browser, the browser shows its own warning when you leave the page with
+unsaved edits. It cannot offer **Save all**.
+
+BiBCode cannot ask when the operating system ends the session, for example at
+shutdown or logout. It also does not ask for Quit from the Dock or the macOS app
+switcher. Save your files first in those cases.
+
+**Exporting a theme or a plan.** In the desktop app, **Export** on a theme and the
+download of a plan open the system Save dialog. Choose where to save. Cancel
+writes nothing, and a write error is shown as a message. In a browser they use the
+browser's own download.
+
+## Appearance
+
+**Settings → Appearance** sets the colors of the app.
+
+- **Mode** is System, Light or Dark. System follows your operating system. Each
+  mode uses the theme chosen for it: a Light slot and a Dark slot.
+- **Themes** lists Light themes and Dark themes in two groups. Light, Dark,
+  Tokyo Night, Matrix Dark, Matrix Light and Verdant Light are built in. The
+  theme in use in each group is marked **In use**, and the group on screen is
+  marked **Showing now**.
+- Click a theme row, or press Enter or Space on it, to use that theme at once.
+  It goes into the slot for its kind (Light or Dark). If the app is showing the
+  other kind, the mode switches to match, a line under the group says so, and
+  **Undo** restores the earlier mode and theme. Moving between rows with Arrow Up
+  and Arrow Down does not change anything.
+- The **More actions for** menu beside each row offers **Duplicate** for every
+  theme and **Edit**, **Export** and **Delete** for your own themes. These never
+  switch the theme. Delete asks first and puts the built-in theme of that kind
+  back.
+- **New theme** asks for a kind (Light or Dark) and a name of up to 48
+  characters. The editor groups every color and size, with a color picker, a text
+  field and **Reset** for each, and **Reset all** after a question. Changes show
+  as a preview while you edit, and **Cancel** drops them. Save is off until every
+  field is valid. A pair of colors that is hard to read, such as text on its
+  background, is listed with its ratio and a **Low contrast** warning. The
+  warning does not stop you from saving.
+- **Import theme** takes a `.json` file or pasted text. **Validate** lists every
+  problem and stores nothing if there is one. If a theme with the same id exists,
+  you choose **Replace** or **Keep both**. Overrides that make a pair of colors hard to
+  read are removed, and the notice names the pairs. **Export** writes the
+  theme as `<id>.theme.json`.
+- Terminals: a terminal that is already running keeps the colors it started
+  with. New terminals use the theme.
+
+Custom themes are stored on this device only.
 
 ## Current limitations
 

@@ -13,7 +13,10 @@ import { decodeRgbaPng, type DecodedRgbaPng } from "./lib/png-rgba.ts";
 const TauriConfiguration = Schema.fromJsonString(
   Schema.Struct({
     identifier: Schema.String,
-    build: Schema.Struct({ beforeBuildCommand: Schema.String }),
+    build: Schema.Struct({
+      beforeBuildCommand: Schema.String,
+      beforeBundleCommand: Schema.optionalKey(Schema.String),
+    }),
     app: Schema.Struct({
       withGlobalTauri: Schema.Boolean,
       security: Schema.Struct({
@@ -39,6 +42,11 @@ const PlatformToolsTauriConfiguration = Schema.fromJsonString(
   Schema.Struct({
     bundle: Schema.Struct({
       useLocalToolsDir: Schema.Boolean,
+      linux: Schema.optionalKey(
+        Schema.Struct({
+          appimage: Schema.Struct({ bundleMediaFramework: Schema.Boolean }),
+        }),
+      ),
       windows: Schema.optionalKey(
         Schema.Struct({
           nsis: Schema.Struct({ installerHooks: Schema.String }),
@@ -186,6 +194,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
 
       assert.equal(tauri.bundle.useLocalToolsDir, undefined);
       assert.equal(linux.bundle.useLocalToolsDir, true);
+      // The bundled GStreamer core rejects newer distributions' plugins, so it ships its own.
+      assert.equal(linux.bundle.linux?.appimage.bundleMediaFramework, true);
       // Windows keeps NSIS under target/.tauri instead of %LOCALAPPDATA%, so an
       // ARM64 build never depends on a per-account cache that x86 filesystem
       // redirection can make unreachable for the NSIS bootstrapper.
@@ -204,7 +214,13 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(installerHook.includes("Abort"), false);
       assert.equal(
         tauri.build.beforeBuildCommand,
-        "node ../../scripts/prepare-tauri-appimage-tools.ts && vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+        "vp run --filter @bibcode/web build && node ../../scripts/apply-web-brand-assets.ts production apps/web/dist",
+      );
+      // tauri build and a standalone tauri bundle both run this before linuxdeploy, so the
+      // pinned plugins and wrappers replace any copy the bundler would fetch unpinned.
+      assert.equal(
+        tauri.build.beforeBundleCommand,
+        "node ../../scripts/prepare-tauri-appimage-tools.ts",
       );
       assert.equal(
         yield* fs.exists(path.join(repoRoot, "scripts/prepare-tauri-appimage-tools.ts")),
@@ -414,6 +430,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
           (new RegExp(`(?:^|; )${name} ([^;]*)`).exec(policy ?? "")?.[1] ?? "").split(" ");
         assert.deepEqual(directive("media-src"), ["'self'", "blob:"]);
         assert.deepEqual(directive("object-src"), ["blob:"]);
+        // Chromium (WebView2) loads a PDF <embed> in a frame, so frame-src needs blob: too.
+        assert.deepEqual(directive("frame-src"), ["'self'", "blob:"]);
         assert.include(directive("img-src"), "blob:");
         assert.notInclude(directive("img-src"), "http:");
         assert.notInclude(directive("img-src"), "https:");

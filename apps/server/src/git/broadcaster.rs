@@ -16,7 +16,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use super::watcher::test_timeout;
 
 use super::{
-    GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
+    ChangeRequest, GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
     GitWatcherHealth, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult,
     VcsStatusStreamEvent,
     fetch_owner::RepositoryFetchOwner,
@@ -90,6 +90,9 @@ struct RepositoryState {
     fetch_attachment_in_flight: bool,
     fetch_attachment_requested: bool,
     local: VcsStatusLocalResult,
+    /// The fence `local` was last published under. A stream drops a copy queued under an
+    /// older fence, so a read under a newer one publishes even an equal value again.
+    local_fence: Option<StatusReadFence>,
     remote: Option<Option<VcsStatusRemoteResult>>,
     remote_fence: Option<StatusReadFence>,
     remote_ref_name: Option<Option<String>>,
@@ -97,6 +100,9 @@ struct RepositoryState {
     /// The next remote read publishes even when unchanged: a pull request changed, which only
     /// a published remote makes the status streams look up again.
     republish_remote: bool,
+    /// Ends the work run for the status subscribers once the last one leaves, even while a
+    /// Git Manager signal subscriber keeps the entry.
+    status_lookups: CancellationToken,
     remote_refresh_requests: watch::Sender<u64>,
     git_manager_signature: Option<u64>,
     git_manager_signal: watch::Sender<GitManagerSignal>,
@@ -504,11 +510,13 @@ impl StatusBroadcaster {
                         fetch_attachment_in_flight: false,
                         fetch_attachment_requested: false,
                         local: local.clone(),
+                        local_fence: Some(fence.clone()),
                         remote: None,
                         remote_fence: None,
                         remote_ref_name: None,
                         pending_local_reconcile: false,
                         republish_remote: false,
+                        status_lookups: CancellationToken::new(),
                         remote_refresh_requests,
                         git_manager_signature: None,
                         git_manager_signal,
@@ -520,9 +528,10 @@ impl StatusBroadcaster {
                         tasks,
                     }
                 });
-                if entry.local != *local {
+                if entry.local != *local || entry.local_fence.as_ref() != Some(&fence) {
                     let ref_changed = entry.local.ref_name != local.ref_name;
                     previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
+                    entry.local_fence = Some(fence.clone());
                     reconcile_remote_after_local_publication(entry, ref_changed);
                     publish(
                         entry,
@@ -810,9 +819,10 @@ impl StatusBroadcaster {
             .filter(|entry| entry.lifecycle_id == lifecycle_id)
         {
             accepted = true;
-            if entry.local != *local {
+            if entry.local != *local || entry.local_fence.as_ref() != Some(fence) {
                 let ref_changed = entry.local.ref_name != local.ref_name;
                 previous_local = Some(std::mem::replace(&mut entry.local, local.clone()));
+                entry.local_fence = Some(fence.clone());
                 reconcile_remote_after_local_publication(entry, ref_changed);
                 publish(entry, event, fence);
                 remove_repository = entry.subscribers.is_empty();
@@ -905,6 +915,70 @@ impl StatusBroadcaster {
             entry
                 .remote_refresh_requests
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    /// The open pull request last found for `ref_name`, while it is the canonical worktree's
+    /// branch. It lives in the cached remote, so every snapshot and remote update carries it.
+    pub(crate) fn known_pull_request(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+    ) -> Option<ChangeRequest> {
+        let state = self.lock_state();
+        let entry = state.repositories.get(cwd)?;
+        if entry.local.ref_name.as_deref() != ref_name {
+            return None;
+        }
+        entry.remote.clone().flatten()?.pr
+    }
+
+    /// Runs `task` for the repository's status subscribers, until the last one leaves or the
+    /// broadcaster shuts down. With no status subscriber, `task` is dropped at once.
+    pub(crate) fn spawn_for_subscribers(
+        &self,
+        cwd: &Path,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let state = self.lock_state();
+        if state.closed {
+            return;
+        }
+        if let Some(entry) = state.repositories.get(cwd).filter(|entry| {
+            entry
+                .subscribers
+                .values()
+                .any(|subscriber| matches!(subscriber, RepositorySubscriber::Status { .. }))
+        }) {
+            let stop = entry.poller_cancellation.clone();
+            let unsubscribed = entry.status_lookups.clone();
+            entry.tasks.spawn(async move {
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = unsubscribed.cancelled() => {}
+                    () = task => {}
+                }
+            });
+        }
+    }
+
+    /// Remembers a finished lookup's answer for `ref_name`: an open request, or `None` for
+    /// none open. A failed lookup is not recorded, and neither is one for a former branch.
+    pub(crate) fn record_pull_request(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+        pull_request: Option<ChangeRequest>,
+    ) {
+        let mut state = self.lock_state();
+        if let Some(remote) = state
+            .repositories
+            .get_mut(cwd)
+            .filter(|entry| entry.local.ref_name.as_deref() == ref_name)
+            .and_then(|entry| entry.remote.as_mut())
+            .and_then(Option::as_mut)
+        {
+            remote.pr = pull_request;
         }
     }
 
@@ -1242,7 +1316,8 @@ impl StatusBroadcaster {
                     entry.pending_local_reconcile = true;
                     return Some((None, request_local_refresh));
                 }
-                let remote = observed.remote;
+                let mut remote = observed.remote;
+                keep_pull_request(&mut remote, entry);
                 let changed = std::mem::take(&mut entry.republish_remote)
                     || entry.remote.as_ref() != Some(&remote);
                 entry.remote = Some(remote.clone());
@@ -1331,23 +1406,29 @@ impl StatusBroadcaster {
         self.inner
             .fetch_owner
             .update_worktree_ref(cwd, status.local.ref_name.clone());
-        let remote = status.local.is_repo.then(|| status.remote.clone());
-        let event = VcsStatusStreamEvent::Snapshot {
-            local: status.local.clone(),
-            remote: remote.clone(),
-        };
+        let mut remote = status.local.is_repo.then(|| status.remote.clone());
         let mut state = self.lock_state();
         let mut remove_repository = false;
         let mut previous_local = None;
         let mut lifecycle_id = None;
         if let Some(entry) = state.repositories.get_mut(cwd) {
             lifecycle_id = Some(entry.lifecycle_id);
-            let changed = entry.local != status.local || entry.remote.as_ref() != Some(&remote);
+            if entry.local.ref_name == status.local.ref_name {
+                keep_pull_request(&mut remote, entry);
+            }
+            let event = VcsStatusStreamEvent::Snapshot {
+                local: status.local.clone(),
+                remote: remote.clone(),
+            };
+            let changed = entry.local != status.local
+                || entry.local_fence.as_ref() != Some(fence)
+                || entry.remote.as_ref() != Some(&remote);
             previous_local = Some(std::mem::replace(&mut entry.local, status.local.clone()));
             entry.remote = Some(remote);
             entry.remote_fence = Some(fence.clone());
             entry.remote_ref_name = Some(status.local.ref_name.clone());
             if changed {
+                entry.local_fence = Some(fence.clone());
                 publish(entry, event, fence);
             }
             remove_repository = entry.subscribers.is_empty();
@@ -1836,6 +1917,13 @@ impl StatusBroadcaster {
             let mut state = self.lock_state();
             let should_remove = if let Some(entry) = state.repositories.get_mut(cwd) {
                 entry.subscribers.remove(&subscriber_id);
+                if !entry
+                    .subscribers
+                    .values()
+                    .any(|subscriber| matches!(subscriber, RepositorySubscriber::Status { .. }))
+                {
+                    std::mem::take(&mut entry.status_lookups).cancel();
+                }
                 entry.subscribers.is_empty()
             } else {
                 false
@@ -2262,6 +2350,16 @@ fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
     entry
         .remote_refresh_requests
         .send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+/// A remote read never finds the pull request, so a newer remote for the same branch keeps
+/// the one the cache holds.
+fn keep_pull_request(remote: &mut Option<VcsStatusRemoteResult>, entry: &RepositoryState) {
+    if let (Some(remote), Some(Some(cached))) = (remote.as_mut(), entry.remote.as_ref())
+        && remote.pr.is_none()
+    {
+        remote.pr.clone_from(&cached.pr);
+    }
 }
 
 fn reconcile_remote_after_local_publication(entry: &mut RepositoryState, ref_changed: bool) {
@@ -6558,6 +6656,201 @@ mod tests {
         broadcaster.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn an_equal_status_is_published_once_under_each_new_epoch() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let (local, remote) = {
+            let state = broadcaster.lock_state();
+            let entry = state.repositories.get(&cwd).expect("repository entry");
+            (
+                entry.local.clone(),
+                entry.remote.clone().flatten().expect("cached remote"),
+            )
+        };
+        let advance_epoch = || async {
+            broadcaster.begin_mutation(&cwd).await.finish().await;
+            broadcaster
+                .acquire_read_fence(&cwd, &CancellationToken::new())
+                .await
+                .expect("read fence")
+        };
+
+        let fence = broadcaster
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("read fence");
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "an equal status under the same epoch"
+        );
+
+        let fence = advance_epoch().await;
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("an equal status under a new epoch")
+                .value,
+            VcsStatusStreamEvent::LocalUpdated {
+                local: local.clone()
+            }
+        );
+        broadcaster.publish_local(&cwd, 1, &local, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "published twice under one epoch"
+        );
+
+        let fence = advance_epoch().await;
+        let status = VcsStatusResult {
+            local: local.clone(),
+            remote: remote.clone(),
+        };
+        broadcaster.publish_status(&cwd, &status, &fence);
+        assert!(
+            matches!(
+                events
+                    .try_recv()
+                    .expect("an equal snapshot under a new epoch")
+                    .value,
+                VcsStatusStreamEvent::Snapshot { .. }
+            ),
+            "the refresh path republishes too"
+        );
+        broadcaster.publish_status(&cwd, &status, &fence);
+        assert!(
+            events.try_recv().is_err(),
+            "a snapshot twice under one epoch"
+        );
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_under_a_new_epoch_keeps_the_known_pull_request() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let (local, remote) = {
+            let state = broadcaster.lock_state();
+            let entry = state.repositories.get(&cwd).expect("repository entry");
+            (
+                entry.local.clone(),
+                entry.remote.clone().flatten().expect("cached remote"),
+            )
+        };
+        let pull_request = ChangeRequest {
+            number: 7,
+            title: "Feature".to_owned(),
+            url: "https://forge.example.test/pull/7".to_owned(),
+            base_ref: "main".to_owned(),
+            head_ref: "old".to_owned(),
+            state: "open".to_owned(),
+        };
+        broadcaster.record_pull_request(&cwd, Some("old"), Some(pull_request.clone()));
+        broadcaster.begin_mutation(&cwd).await.finish().await;
+        let fence = broadcaster
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("read fence");
+
+        // A status read never finds the pull request.
+        broadcaster.publish_status(&cwd, &VcsStatusResult { local, remote }, &fence);
+        let VcsStatusStreamEvent::Snapshot { remote, .. } = events
+            .try_recv()
+            .expect("an equal snapshot under a new epoch")
+            .value
+        else {
+            panic!("a snapshot");
+        };
+        assert_eq!(remote.expect("remote").pr, Some(pull_request));
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_subscriber_republishes_an_equal_status_once_under_each_new_epoch() {
+        let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
+        let sandbox = TestSandbox::new("git-broadcaster-subscribe-epoch");
+        let command = sandbox.executable_on_path("git");
+        let (_, environment) = isolated_git_environment(&sandbox);
+        let cwd = sandbox.path("repository");
+        fs::create_dir(&cwd).expect("repository directory");
+        let output = Command::new(&command)
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(environment.iter().cloned())
+            .output()
+            .expect("fixture Git");
+        assert!(output.status.success(), "{output:?}");
+        let cwd = fs::canonicalize(cwd).expect("canonical repository");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                IsolatedGitRunner {
+                    command,
+                    environment,
+                },
+            ))),
+            Duration::from_secs(3_600),
+            4,
+        );
+        // An entry without status workers, so only the subscribe path can publish.
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let local = broadcaster
+            .inner
+            .repository
+            .local_status(&cwd, &CancellationToken::new())
+            .await
+            .expect("local status");
+        broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(&cwd)
+            .expect("repository entry")
+            .local = local.clone();
+        let subscribe = || async {
+            broadcaster
+                .subscribe(cwd.clone(), CancellationToken::new())
+                .await
+                .expect("subscription")
+        };
+
+        let _same_epoch = subscribe().await;
+        assert!(
+            events.try_recv().is_err(),
+            "an equal status under the same epoch"
+        );
+        broadcaster.begin_mutation(&cwd).await.finish().await;
+        let _new_epoch = subscribe().await;
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("an equal status under a new epoch")
+                .value,
+            VcsStatusStreamEvent::LocalUpdated {
+                local: local.clone()
+            }
+        );
+        let _again = subscribe().await;
+        assert!(
+            events.try_recv().is_err(),
+            "published twice under one epoch"
+        );
+        broadcaster.shutdown().await;
+    }
+
     fn record_availability_nudges(broadcaster: &StatusBroadcaster) -> Arc<Mutex<Vec<PathBuf>>> {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed_calls = Arc::clone(&calls);
@@ -7312,10 +7605,19 @@ mod tests {
                     ahead_of_default_count: Some(0),
                     pr: None,
                 })),
+                // As if `local` was published under the current epoch.
+                local_fence: futures_util::FutureExt::now_or_never(
+                    broadcaster
+                        .inner
+                        .status_owner
+                        .acquire_read_fence(cwd, &CancellationToken::new()),
+                )
+                .and_then(Result::ok),
                 remote_fence: None,
                 remote_ref_name: None,
                 pending_local_reconcile: false,
                 republish_remote: false,
+                status_lookups: CancellationToken::new(),
                 remote_refresh_requests,
                 git_manager_signature: None,
                 git_manager_signal,

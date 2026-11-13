@@ -729,13 +729,12 @@ async function selectActualTheme(
   threadId: string,
 ): Promise<{ readonly dock: SurfacePresentation; readonly panel: SurfacePresentation }> {
   const origin = await browser.execute(() => window.location.origin);
-  await browser.url(`${origin}/#/settings/general`);
-  const themePreference = browser.$('[aria-label="Theme preference"]');
-  await themePreference.waitForDisplayed();
-  await themePreference.click();
-  const option = browser.$(`//*[@role="option" and normalize-space()="${theme}"]`);
-  await option.waitForDisplayed();
-  await option.click();
+  await browser.url(`${origin}/#/settings/appearance`);
+  const modeButton = browser.$(
+    `//*[@role="group" and @aria-label="Mode"]//button[normalize-space()="${theme}"]`,
+  );
+  await modeButton.waitForDisplayed();
+  await modeButton.click();
   await browser.waitUntil(
     async () => {
       const rootClass = (await browser.$("html").getAttribute("class")) ?? "";
@@ -888,9 +887,9 @@ async function restoreRuntimeMotionEmulation(): Promise<void> {
 async function remountActivityDockWithRuntimeMotionEmulation(threadId: string): Promise<void> {
   await installRuntimeMotionEmulation(false);
   await browser.execute(() => {
-    window.location.hash = "#/settings/general";
+    window.location.hash = "#/settings/appearance";
   });
-  await browser.$('[aria-label="Theme preference"]').waitForDisplayed();
+  await browser.$('[role="group"][aria-label="Mode"]').waitForDisplayed();
   await expectMissing('[data-testid="activity-dock"]');
   await browser.execute((nextThreadId: string) => {
     window.location.hash = `#/primary/${encodeURIComponent(nextThreadId)}`;

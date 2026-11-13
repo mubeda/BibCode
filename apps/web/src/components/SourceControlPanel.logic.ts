@@ -125,6 +125,42 @@ export function resolveVsBaseLabel(status: VcsStatusResult | null | undefined): 
     : `vs ${status.defaultRefName}`;
 }
 
+/** What a code review covers (#293): branch commits plus the tree, or the tree alone. */
+export type CodeReviewScope = {
+  readonly kind: "branch" | "uncommitted";
+  readonly base: string | null;
+};
+
+export function resolveCodeReviewScope(
+  status: VcsStatusResult | null | undefined,
+): CodeReviewScope | null {
+  if (!status?.isRepo) return null;
+  const base = status.defaultRefName ? `origin/${status.defaultRefName}` : null;
+  if (base !== null && (status.aheadOfDefaultCount ?? 0) > 0) return { kind: "branch", base };
+  if (status.hasWorkingTreeChanges || status.workingTree.files.length > 0) {
+    return { kind: "uncommitted", base };
+  }
+  return null;
+}
+
+/** The enabled button's tooltip names what a review covers (R104). */
+export function codeReviewTooltip(scope: CodeReviewScope): string {
+  return scope.kind === "branch"
+    ? `Review branch vs ${scope.base} and uncommitted changes`
+    : "Review uncommitted changes";
+}
+
+export function resolveCodeReviewButtonState(input: {
+  readonly status: VcsStatusResult | null;
+  readonly scope: CodeReviewScope | null;
+  readonly unavailableReason: string | null;
+}): { readonly disabled: boolean; readonly reason: string | null } {
+  if (input.unavailableReason !== null) return { disabled: true, reason: input.unavailableReason };
+  if (input.status === null) return { disabled: true, reason: "Checking for changes" };
+  if (input.scope === null) return { disabled: true, reason: "No changes to review" };
+  return { disabled: false, reason: null };
+}
+
 /**
  * A pending destructive change awaiting the panel's confirm dialog. A single
  * row ("entry") derives its copy from the file's area/status; a section header

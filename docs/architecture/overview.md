@@ -77,6 +77,36 @@ flowchart TB
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
   events implement privileged operations; browser fallbacks are limited to
   explicitly safe capabilities.
+  - **Saving a file.** Wry cancels webview downloads, so the desktop exports
+    text through `desktop_bridge_save_text_file` (`saveTextFile`). The web
+    supplies a plain suggested name with an extension and at most 8 MiB of
+    contents; the host opens the native Save dialog in Downloads, filtered by
+    that extension, and writes only to the path the person picked. Cancel
+    returns `null`, and a failed write rejects with its error text. Only a
+    `desktop-e2e` build lets `BIBCODE_E2E_SAVE_TEXT_PATH` replace the picked
+    path. The browser keeps its blob link.
+  - **Asking before leaving.** The main window's close, the BiBCode Quit menu
+    item (which replaces the predefined Quit so it can wait), and an update
+    install another device requests go through the host's `CloseGuard`. It
+    emits `desktop:close-request` `{ requestId, reason: "close" | "quit" |
+    "update" }` to the main window only, after showing and focusing it, and
+    the web answers through `desktop_bridge_reply_close_request` with
+    `acknowledge`, a `keepalive` every second while its question is open, and
+    then `allow` or `stay`. Nothing irreversible runs before `allow`: close
+    destroys the window, quit calls `app.exit(0)`, whose `ExitRequested`
+    handler runs the usual teardown, and an update installs. `stay` changes
+    nothing. One request is pending at a time, a second close joins it, and a
+    stale reply is dropped. Without an acknowledge or a keepalive for five
+    seconds the host shows a native "Close anyway" or "Keep waiting" prompt.
+    The web asks the same question itself before it restarts the app or
+    installs an update. After it allows an `update` request, the web holds
+    saving and shows a modal "Installing an update" dialog, so no edit made
+    during the backup and install is lost at the restart. If the install ends
+    without restarting (a refusal or a failure), the host emits
+    `desktop:update-install-ended` (`onUpdateInstallEnded`) to the main window,
+    and the web releases the holds, closes the dialog and says the update did
+    not install. Dock Quit on macOS, SIGTERM and session end do not
+    wait. A `desktop-e2e` teardown disarms the guard.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
@@ -131,7 +161,15 @@ flowchart TB
   Local and full reads are shared independently, each caller retains its own
   cancellation lease, and only final-lease release or a lifecycle/mutation
   fence cancels the physical read. A read gate and checked mutation epoch
-  prevent work admitted before or during a mutation from publishing afterward;
+  prevent work admitted before or during a mutation's local writes from
+  publishing afterward. A push-family operation (a stacked push or
+  pull-request step, or a Git Manager push, branch publish, force push or
+  remote branch delete) reopens the gate once its local writes are finished,
+  advances the epoch, and keeps the write lock until it ends, so status is
+  delivered while it waits on the network and every other write still waits.
+  Pull and fetch keep reads waiting to the end, because pull rewrites files.
+  A mutation queued behind such a lock closes the gate only when it acquires
+  the lock;
   post-fetch remote reads and pull-request enrichment carry that same epoch
   through their final internal publication or delivery check without changing
   public status schemas. Stream and unary pull-request enrichment share one
@@ -142,7 +180,9 @@ flowchart TB
   ref identity; an external ref change clears it and resets branch-specific
   client remote fields before reconciliation;
   the final idle transition across a queued mutation burst requests one
-  coalesced trailing local refresh before reopening the gate. The local fallback
+  coalesced trailing local refresh, and reopens the gate if it is still
+  closed, so an operation that resumed reads early still publishes fresh
+  status when it ends. The local fallback
   scheduler remains independent from remote reconciliation, so a slow fetch or
   remote probe cannot delay editor-save status publication.
 
@@ -392,6 +432,16 @@ flowchart TB
   task, runtime shutdown, or a panic) kills its whole process group or Windows
   job while the root is unreaped, without waiting; see the cancellation
   invariants in [RPC and orchestration](./rpc-and-orchestration.md).
+  A Git process the server stops for a timeout, a cancellation or shutdown is
+  asked first: on Linux and macOS it gets `SIGTERM` and is killed only if it
+  still runs 2 seconds later, and on Windows it is killed at once. After a
+  forced stop of a command that takes `index.lock` itself, the server removes a
+  lock that command left only if the lock did not exist before the command and
+  stays unchanged for another 2 seconds; on Linux and macOS the killed process
+  must also have held the lock open just before the kill, which Windows cannot
+  check. Shutdown refuses new Git writes and
+  waits for the running ones to stop before the Profiler's teardown; see
+  [Observability](../operations/observability.md).
 
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
@@ -425,7 +475,18 @@ Git and source-control helpers (including review Git commands), server-launched
 editors/file managers, and desktop-owned SSH, Tailscale, and host
 backend-shutdown `kill` commands. Isolation changes only the selected command.
 The desktop process, WebKitGTK-owned children, and BiBCode's own binaries retain
-the bundled environment; desktop external-backend launches and the generic
+the bundled environment. The AppImage bundles an allowlist of GStreamer core,
+base and good plugins that its own GStreamer core can load (the audio pipeline
+and the decoders for the audio types Files previews), and the launcher points
+`GST_PLUGIN_SYSTEM_PATH_1_0` at them, so WebKitGTK plays audio without the
+system's plugins, which a newer distribution's GStreamer builds for a newer core.
+As a fallback for a build made without plugins, at the top of `main`, before any
+thread starts, the Linux desktop removes `GST_PLUGIN_SYSTEM_PATH_1_0` and
+`GST_PLUGIN_SYSTEM_PATH` only when `APPDIR` is set, the value starts with the
+launcher's plugin folder, and the bundle does not contain it, so WebKitGTK finds
+the system's plugins. Any other value, including one whose folders are all
+missing, may be the user's own and is kept
+(`apps/desktop/src-tauri/src/gstreamer_environment.rs`). Desktop external-backend launches and the generic
 supervised process runner deliberately do not apply this policy. The login-shell
 PATH probe also inherits the original desktop environment: its output hydrates
 the desktop's own PATH before Tauri starts, so stripping bundled entries there
@@ -1227,6 +1288,9 @@ does terminal fitting and its PTY resize RPC. The workspace marks the gesture
 with `data-resizing` and emits `bibcode:center-panel-resize-end` on release or
 cancellation; terminal viewports fit the final dimensions and chats settle
 their live end through the existing follow policy, preserving reader takeover.
+A terminal viewport also refits and repaints when the device pixel ratio
+changes (display scale or zoom), because xterm rounds row heights in device
+pixels and the number of rows that fit can change while the mount keeps its box.
 The timeline clips at the measured composer boundary, and the composer shadow
 fits within its lower padding so split-pane clipping does not cut it off.
 
@@ -1369,7 +1433,9 @@ never renew the grant or displace a live owner.
 
 Restart publishes `Restarted`, which resets surviving streams' sequence cursors.
 Those renderers see the restarted process's startup output live and may answer
-while unowned. Restart without such streams allows one new grant. Reopening an
+while unowned. The owner of the replaced process stays the owner when its
+attachment survived the restart, so the surviving windows do not race for the
+size. Restart without such streams allows one new grant. Reopening an
 exited session through `terminal.open` instead publishes a `Started` event with
 sequence 1. That event does not reset surviving streams' cursors, so they drop
 it and early output (a known limitation of surviving streams). A reopen
@@ -1402,15 +1468,76 @@ After a restart, or one that may have been among the lost events, it is a
 plain `snapshot`, handled as a new attachment. Clients that predate the flag
 handle every resync that way.
 
+An attach replays the raw history tail (1 MiB or 5,000 lines), and a released
+client keeps at most 512 KiB of it (`DEFAULT_MAX_TERMINAL_BUFFER_BYTES`, pinned
+against the server's copy by a test in `terminal/history.rs`). Once a
+program's last full paint has left that tail, the rebuilt screen lacks cells,
+the alternate buffer and the modes, and a program that repaints by cell diff
+shows missing characters until its size changes (#348). As best-effort repaint
+recovery for Claude terminals that BiBCode starts, after a lossy replay, and not
+terminal-state reconstruction: on Unix, when an attach builds its snapshot for
+a running session launched with activity driver `claudeAgent` and the history
+has a discarded prefix (eviction or `terminal.clear`, O(1) from its counters)
+or retains more than 512 KiB, the manager sends `SIGCONT` once to the
+session's own process group, right after the snapshot and its sequence are
+fixed. On Unix the provider executable is the PTY root, its own session and
+group leader. The Claude CLI handles `SIGCONT` by re-entering its alternate
+screen, re-asserting its modes and painting a full frame, which arrives as
+ordinary output after the replay, for every viewer. The signal goes only to the
+group the waiter keeps reserved until it reaps the root, never a foreground
+group; it does not consume that reservation, so close still kills the group,
+and a group being closed is skipped. A Claude session suspended in its own AI
+Terminal resumes when a window re-attaches after a lossy history. Each lossy
+attach sends one signal with no cooldown; the client re-attaches on a remount
+or a reconnect, not on a timer. History reads, MCP reads and lag resyncs send
+none, so a viewer that falls behind until the repaint leaves the history stays
+damaged until its next attach. Other programs and Windows servers are not
+helped; the lasting fix is a server-side screen state. Each signal is a
+`tracing` debug line with the session and reason, and a failed one a warning.
+
 Resize requests publish `resized { size }` after the PTY accepts the size,
-before subsequent output can publish. Claim-only changes publish; exact no-ops
-do not. Failed resizes preserve the prior state. Legacy resizes without a claim
-clear the owner. Open/attach dimensions initialize new PTYs; attaching to an
-existing process preserves its dimensions.
+before subsequent output can publish. Claim-only changes publish; an exact
+no-op with a registered claim publishes `resized` to that claim's attachment
+alone, and a no-op without a claim publishes nothing. `terminal.resize`
+answers with what the session then holds (outcome, size, generation, last size
+sequence; see [Terminal size and reply ownership](rpc-and-orchestration.md#terminal-size-and-reply-ownership)).
+Failed resizes preserve the prior state. The PTY resize worker records a size
+the PTY refused, and the next request for that size sends it again instead of
+treating it as a no-op. It also retries a refused size by itself, after 100 ms,
+500 ms and 2 s, unless a newer request replaces it, since the session has
+already published that size and a renderer holding it asks no more. When the
+retries run out it logs a warning and reports the size the PTY kept (the last
+size it accepted when the size read back is outside the wire bounds); the
+session's exit task publishes that size with a new sequence, so every viewer
+converges on it, unless a request sent since overtook the report. The owner asking for the
+refused size again then sends and publishes nothing until another size is
+asked for, so the owner's renderer, which claims its fit after each
+publication, settles instead of cycling. Legacy resizes without a claim clear
+the owner.
+Open/attach dimensions initialize new PTYs; attaching to an existing process
+preserves its dimensions.
+
+Every process a manager starts gets a generation, `{ boot, process }`: `boot`
+is a random id of this manager instance, `process` a counter that only grows.
+Snapshots (also after exit, without a pid), `exited` and `closed` carry it; a
+`closed` an attachment reports after falling behind carries the latest
+generation issued, since its sequence is that attachment's own guess. The
+fields are optional on the wire, so older servers and clients still decode.
 
 Attachment lifetime owns claim eligibility. Dropping the owner unregisters its
-claim and signals a manager-tracked cleanup worker to publish null ownership
-under the current generation's publication lock, preserving PTY dimensions.
+claim and signals a manager-tracked cleanup worker to republish ownership
+under the current generation's publication lock, preserving PTY dimensions:
+a lone remaining claimed viewer takes the size at once; with several left the
+one a user typed in last takes it, and with none typed in the size is un-owned.
+The departed owner's claim is remembered, and when it attaches again before
+anyone typed into the terminal it takes the size back, so a client whose
+connection dropped is the owner again without a click. Only a user's input
+counts as typing: input and input frames carry `userInputClaim`, the size claim
+of the window a user typed, pasted or clicked in, or `null` for the terminal's
+own answers to a program's queries. Input without the field, from an older
+client, counts as use as before, since such a client cannot tell its replies
+from typing. Clients send it only to servers advertising
+`terminalUserInputClaim`, because input frames refuse unknown fields.
 Attachment identities prevent an old stream from clearing a replacement that
 reuses its claim, including across process restarts. Queued requests from an
 unregistered claim cannot resurrect it. Manager shutdown fences new claim
@@ -1422,26 +1549,71 @@ variant set and resize events are not operational-log records. Attach streams
 also filter it unless their request carried a claim. Older clients therefore
 never receive the new event; optional snapshot fields remain additive.
 
-The window in use owns size. It claims on focused attach; on terminal focus,
-click, or keypress whenever it is a mirror or its fitted size differs; on its
-own layout changes while already owner; and through **Fit to this window**. A
-null-claim snapshot or event prompts an immediate claim even without focus.
+The window in use owns size. It claims on attach or on terminal focus while its
+document is focused and its page has transient user activation
+(`navigator.userActivation.isActive`); on click or keypress, whenever it is
+a mirror or its fitted size differs; on its own layout changes while already
+owner; and through **Fit to this window**. A window refocused or remounted with
+no recent input in its page, such as an unattended server host window after its
+display wakes, therefore does not take a live owner's size; engines without the
+API keep the focus-only rule. The automatic claims (layout changes, the
+creation fit and the attach claim) wait until the mount has held its content
+size for 100 ms (`TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS`), counted from its first
+measurement, and then send one claim at the final size, so a panel opening,
+collapsing or dragged open passes through a few pixels without sizing the
+program to 2 columns; a small panel that holds still claims its size, and a
+mirror's scale follows every change at once. A mount that keeps changing still
+claims at least every 500 ms (`TERMINAL_AUTOMATIC_CLAIM_MAX_WAIT_MS`): an owner
+is not scaled, so during a long drag its box would otherwise cut off the rows
+it no longer fits. At that deadline a proposal at the sizing minimum (the fit's
+2 columns or 1 row, from a mount a few pixels wide or tall) is not claimed; it
+waits for the quiet period like any other.
+Explicit triggers (click, typing, focus, **Fit to this window**) are not
+delayed. A null claim after a restart, or from a server
+without `terminalUserInputClaim` (which releases every size to nobody), prompts
+an immediate claim even without focus, so a visible mirror takes the size as
+soon as the owner's stream ends; a hidden or zero-area mirror does not. A
+`resized` with a null claim from a server advertising `terminalUserInputClaim`
+is an intentional hand-over to nobody: windows treat it like another window's
+size (scaled whole, with the notice) and claim it only through the same use
+triggers. A viewport keeps one claim for every renderer it creates, so a window
+hidden and shown is the same claim and gets a departed owner's size back.
+Focus reports (`CSI I`, `CSI O`), which xterm sends through `onData`, carry a
+`null` input claim.
 While ownership is null, renderers permit live replies until a claim wins. Each
 renderer keeps at most one claim pending until its resize RPC completes, whether
 successfully or with failure; the echo updates the applied size. A layout change
 deferred during a pending claim is reconsidered on completion; a new
 attachment/process snapshot retires the prior generation's request.
 
-The notice stays hidden while claiming and after success until applied size,
-ownership, or generation changes, avoiding a flash before xterm parses the echo.
-Failure releases that suppression immediately. Mirrors resize xterm to the PTY
-dimensions instead of fitting their container; only a different-size mirror
-shows **Sized for another window** with fit and dismiss actions. Manual
+The notice stays hidden while claiming and until the claim's outcome is known
+(the acknowledgement the answer names, applied in stream order behind the output
+xterm has not parsed yet; for an older server, which acknowledges nothing, the next
+size it publishes or one read of the size it holds), avoiding a flash. No timer
+settles a claim. Failure
+releases that suppression immediately. A successful claim for a size this
+renderer already owned settles as the applied size even when the server, already
+holding it, sends no echo; a successful takeover without an echo leaves the other
+owner's size and the notice in place. Mirrors resize xterm to the PTY
+dimensions instead of fitting their container. A mirror whose box is smaller
+than the owner's grid scales the xterm element with a CSS transform by
+`min(fit cols / cols, fit rows / rows)`, its fit measured at full size, so the
+whole grid stays visible and the claimable fit is unaffected; it never scales
+up. The floor is 0.5: below it the mount scrolls and is pinned to the bottom
+rows, with a negative bottom margin giving the element its scaled scroll
+height. xterm maps the mouse to cells at full size, so a scaled element has
+`pointer-events: none`: clicks, hover, wheel and mouse reports reach the mount,
+whose pointerdown claims and focuses xterm, and never xterm's cells. The mount
+cancels a mousedown outside xterm's element, whose default would move focus off
+xterm, and **Fit to this window** focuses the terminal when it sends a claim,
+since that hides its button. Only a
+different-size mirror shows **Sized for another window** (with the scale when
+below 100%) and fit and dismiss actions. Manual
 dismissal is retained by terminal identity and applied dimensions/owner across
 renderer and component remounts. It is cleared by a changed applied size/owner
 or terminal retirement, alongside the retained input resources. Equal-size
-mirrors and the owner show no notice. Clipping or extra space is intentional;
-all windows render at the program's width.
+mirrors and the owner show no notice. Scaling or extra space is intentional;
+all windows render the program's grid.
 
 The viewport measures before subscribing and includes available fitted
 `cols`/`rows` on attach. UI creation uses `terminal.open` with its workspace
@@ -1462,6 +1634,21 @@ output. Resize signals do not publish lifecycle metadata or allocate a new
 transcript. The runtime consumes the first-attachment grant once for the
 matching renderer claim; cached remounts cannot reuse it. Raw bounded transcript
 replay is retained.
+
+A resize keeps the view at the bottom when the view followed the output. While
+xterm's renderer is paused (its screen does not intersect the viewport, under
+`display: none` or off-screen), xterm 6 clamps its scroll position with the
+canvas height it had before a resize, so a row shrink followed by scrolling
+output moves the view up by itself. Nobody can scroll a terminal that is not
+drawn, so `terminalFollowOutput.ts` records the normal buffer's position when
+its own IntersectionObserver on `.xterm-screen` sees drawing stop; resizes use
+that record while paused instead of the live position, and once drawing
+resumes (after xterm's next render, or two frames when it renders nothing) a
+deferred, coalesced repair scrolls a view that followed back to the bottom. A
+view scrolled up before the pause is kept. Alternate-screen scrolling never
+changes the record, and a repair waits for the normal buffer to return. The
+record belongs to the xterm instance, so it survives a snapshot reset and a
+WebGL-to-DOM fallback; a hidden pane or document disposes the instance.
 
 During ordinary reset/history writes, a replay guard drops xterm `onData` until
 the final write callback; input typed during this brief interval is also
@@ -1498,11 +1685,27 @@ answered by those clients.
 
 See the [AppImage child environment policy](#appimage-child-environments).
 
-The desktop build's `beforeBuildCommand` runs
+The desktop's `beforeBundleCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
-plugin wrapper in `target/.tauri` alongside the upstream plugin pinned by URL
-and SHA-256. Linux Tauri configuration uses that project-local tools directory
-for local, release, and packaged UI builds.
+and GStreamer plugin wrappers in `target/.tauri` alongside the upstream plugins
+pinned by URL and SHA-256. Tauri runs that hook in both `tauri build` and a
+standalone `tauri bundle`, before linuxdeploy, so the bundler never fetches or
+runs an unpinned plugin copy. Linux Tauri configuration uses that project-local
+tools directory for local, release, and packaged UI builds, and turns on
+`bundle.linux.appimage.bundleMediaFramework`, which adds linuxdeploy's GStreamer
+plugin. `scripts/tauri/linuxdeploy-plugin-gstreamer.sh` holds the plugin
+allowlist: it copies exactly those plugin files from the host into a private
+folder, after checking that `dpkg-query` names exactly one owning package for
+each exact path and that the package's source is `gstreamer1.0`,
+`gst-plugins-base1.0` or `gst-plugins-good1.0`, and points the pinned plugin
+there. It then removes the Wayland client the nested linuxdeploy run
+redeploys, and requires the plugin scanner, the AppRun hook and a bundled
+plugin folder equal to the allowlist. Other plugins on the build host never
+reach the bundle. The upstream AppRun hook builds its GStreamer paths from
+`$APPDIR`, which is unset when the extracted `AppRun` runs and names another
+AppDir when inherited from another AppImage; the wrapper checks the hook's four
+expected lines and rewrites them to the AppDir the hook file itself lives in,
+failing the build if the upstream hook drifts.
 
 `scripts/tauri/linuxdeploy-plugin-gtk.sh` delegates to the pinned plugin and
 preserves discovery calls without an AppDir. After a successful deployment it
@@ -1988,7 +2191,9 @@ it.
   matching core dump record is looked up in the background for up to about 5 s
   and attached when found. Providers and the tunnel connector count signals and non-zero exits,
   supervised commands such as git only signals, and terminals only signals
-  people do not type (not `Ctrl-\` or `kill -9`). SIGTERM, SIGHUP, and SIGINT (on
+  people do not type (not `Ctrl-\` or `kill -9`). Git's stop sequence (ask,
+  wait 2 seconds, force, then the `index.lock` cleanup) and its log lines are
+  in [Observability](../operations/observability.md). SIGTERM, SIGHUP, and SIGINT (on
   Windows the Ctrl-C status), and a provider's exit codes 129, 130, and 143,
   are deliberate and never count. A stop that BiBCode or the user requested in
   the last minute, after the process started, is not reported; the comparison
@@ -3327,6 +3532,24 @@ durations at `debug`, and a sample that takes 500 ms or more logs them at `warn`
 (`slow process diagnostics sample`): process enumeration, which includes waiting
 for the blocking pool, the desktop UI observer, and attribution.
 
+The host collector (`diagnostics/host_metrics`, #292) is the one diagnostics
+reader that samples while nobody watches: the production runtime starts it with
+the server, and it reads the host's CPU and memory every 60 seconds, and volume
+space every fifth reading, so the Host dashboard can show statistics since the
+server started. It never walks the process table. While at least one
+`server.subscribeHostMetrics` stream is open it reads once a second, shared by
+every subscriber through one watch channel, and it drops back to 60 seconds
+when the last stream closes. Volume lists and space reads run on four dedicated
+`host-disk-<n>` threads, never on the Tokio blocking pool; a read that runs
+past 2 seconds shows its volume as not responding, and when all four threads
+are held, disk reads pause and CPU and memory keep their pace. Statistics and
+chart tiers live in memory, in a size that does not grow with uptime. The
+stream needs `orchestration:read`, sends a snapshot and then one sample per
+live reading, and builds each item only when its subscriber's queue has room.
+Runtime quiesce stops the collector right after the process monitor
+(`host-metrics`), before the Profiler's teardown; it never joins a disk thread,
+so a hung mount cannot delay exit.
+
 On Linux the server and the desktop host allocate through glibc malloc, which
 keeps freed memory in the per-thread arena that served it and returns only the
 free space at the top of a heap. A large transient allocation, such as a
@@ -3388,9 +3611,10 @@ The unit tests compare every streamed prefix with one.
 #### Mermaid diagrams
 
 A fenced block whose language is exactly `mermaid` draws as a diagram in every
-`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and the
-rendered Markdown file view) once its own closing fence has arrived, so the
-renderer never sees partial source:
+`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and a
+read-only rendered Markdown file view) and in the editable rendered view of a
+Markdown file, once its own closing fence has arrived, so the renderer never
+sees partial source:
 
 - **Gate.** `components/markdown/mermaidFence.ts` reads what the parser decided
   rather than parsing CommonMark again. The block's source slice must start
@@ -3425,6 +3649,36 @@ renderer never sees partial source:
   is cancelled only when its last waiting block leaves, and a result shows only
   in a block that still holds its source. A failed renderer import is cleared
   so **Retry** can try again.
+- **Editable file view.** The rendered view of an editable `.md` file is a
+  TipTap editor, not `ChatMarkdown`. There,
+  `components/files/richMarkdown/mermaidDiagramExtension.ts` turns each fence
+  that passes the same gate into one non-editable atom node, which a click
+  selects and Delete or Backspace removes whole (Undo brings it back). The
+  node keeps the fence's body and info string and serializes exactly as the
+  code block it replaces, so the save reconcile sees the same document and an
+  untouched fence keeps its bytes. Its node view is an empty element that
+  `RichMarkdownSurface` fills through a React portal with the same
+  `MarkdownMermaidBlock` (`RichMarkdownMermaid.tsx`, memoized on the source),
+  so drawing, refusals, the sanitizer, the cache and theme recoloring are
+  chat's. Typing elsewhere renders nothing in the block: the surface's list of
+  diagram views changes only when a diagram block is added or removed. The
+  diagram's source is edited in source view, and the block says so. There,
+  **Show source** shows plain, unhighlighted source, and copy goes through the
+  node's text and HTML serializers instead of `markdown-clipboard.ts`: the
+  copied text is the fenced source, and the copied HTML carries the whole info
+  string in `data-fence-info` (a `language-` class keeps only its first word),
+  so a diagram or code block pasted back keeps its fence's info string, and a
+  diagram comes back as a diagram. A fence title is not shown. Other
+  fenced code in the editable view has no syntax colors, and a click on a link
+  places the caret instead of opening it. Images use the same node-view and
+  portal pattern (`richMarkdownExtensions.ts`, `RichMarkdownImage.tsx`): the
+  editor never renders an `<img>` with the file's `src`, which would resolve
+  against the page. `richMarkdownImageSource.ts` resolves a relative `src`
+  against the Markdown file's folder and refuses other schemes, absolute paths
+  and any path that leaves the workspace before a request; the image is then
+  read through a `workspace-file` asset URL (which the server confines to the
+  project root again) and shown from a `blob:` URL by `FileMediaPreview`'s
+  loader, as the CSP allows. The document keeps the `src` as written.
 - **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)
   and `data-markdown-atomic`, so `markdown-clipboard.ts` copies a selection
   inside or across a diagram as its source, and the HTML flavor as an escaped

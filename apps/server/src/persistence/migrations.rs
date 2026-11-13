@@ -65,6 +65,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (62, "mcp_oauth_authorizations"),
     (62, "mcp_oauth_refresh_tokens"),
     (70, "mcp_named_clients"),
+    (72, "worktree_creation_records"),
 ];
 
 #[derive(Debug, Error)]
@@ -671,6 +672,9 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(69, "ProjectionThreadMessagesQueuedIndex", migration_069),
     Migration::new(70, "McpNamedClients", migration_070),
     Migration::new(71, "McpNamedClientTakeOver", migration_071),
+    Migration::new(72, "WorktreeCreationRecords", migration_072),
+    Migration::new(73, "ProjectCodeReviewPrompt", migration_073),
+    Migration::new(74, "ProjectionThreadCodeReview", migration_074),
 ];
 
 impl Migration {
@@ -3049,6 +3053,50 @@ fn migration_071(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_073(transaction: &Transaction<'_>) -> Result<()> {
+    // A project's own review prompt (#293); "" falls through to the user's prompt. Guarded like
+    // 052: a trusted-ledger restore may not carry this rebuildable projection table.
+    if table_exists(transaction, "projection_projects")?
+        && !table_has_column(transaction, "projection_projects", "code_review_prompt")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_projects ADD COLUMN code_review_prompt TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
+}
+
+fn migration_074(transaction: &Transaction<'_>) -> Result<()> {
+    // A chat panel started as a code review (#293), kept like `side_chat`. Guarded like 067: a
+    // trusted-ledger restore may not carry this rebuildable projection table.
+    if table_exists(transaction, "projection_threads")?
+        && !table_has_column(transaction, "projection_threads", "code_review")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_threads ADD COLUMN code_review INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migration_072(transaction: &Transaction<'_>) -> Result<()> {
+    // The worktrees BiBCode created (#344): the orphan audit warns only for a leftover with
+    // worktree evidence, and a record ends when its folder is gone. One record per path, and
+    // each creation gets a new `record_id`, never reused, so the audit's reap of a record it
+    // read cannot delete a later creation's.
+    // Guarded like the migrations before it: a ledger rolled back below 72 runs it again.
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worktree_creation_records (
+          record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          worktree_path TEXT NOT NULL UNIQUE,
+          project_cwd TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        "#,
+    )
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3278,7 +3326,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [
+                59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+            ]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3311,7 +3361,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68, 69, 70, 71]
+            [65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3347,7 +3397,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3389,7 +3439,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68, 69, 70, 71]
+            [66, 67, 68, 69, 70, 71, 72, 73, 74]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3420,7 +3470,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [69, 70, 71]
+            [69, 70, 71, 72, 73, 74]
         );
         let index_sql: String = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
@@ -3465,7 +3515,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [70, 71]
+            [70, 71, 72, 73, 74]
         );
         let unnamed: (Option<String>, Option<String>) = connection.query_row(
             "SELECT (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = 'l'), (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = 's')",
@@ -3514,7 +3564,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [71]
+            [71, 72, 73, 74]
         );
         let taken_over: Option<String> = connection.query_row(
             "SELECT taken_over_at FROM mcp_named_clients WHERE client_id = 'nc_1'",
@@ -3524,6 +3574,124 @@ mod tests {
         assert_eq!(taken_over, None, "an existing identity is not taken over");
         let transaction = connection.transaction()?;
         super::migration_071(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_73_adds_code_review_prompt_defaulting_empty() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(72))?;
+        connection.execute(
+            "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) VALUES ('p', 'P', '/repo', NULL, '[]', '{}', '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z', NULL)",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [73, 74]
+        );
+        let prompt: String = connection.query_row(
+            "SELECT code_review_prompt FROM projection_projects WHERE project_id = 'p'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(prompt, "");
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_073(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_74_adds_code_review_defaulting_false() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(73))?;
+        connection.execute(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z', NULL, NULL)",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [74]
+        );
+        let code_review: i64 = connection.query_row(
+            "SELECT code_review FROM projection_threads WHERE thread_id = 't'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(code_review, 0);
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_074(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_72_adds_worktree_creation_records() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(71))?;
+        connection.execute(
+            "INSERT INTO worktree_removal_receipts (owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at) \
+             VALUES ('thread-1', '/repo', '/worktrees/a', 'nonce', 'prepared', '2026-11-09T00:00:00Z', '2026-11-09T00:00:00Z')",
+            [],
+        )?;
+        assert!(!table_exists(&connection, "worktree_creation_records")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [72, 73, 74]
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(worktree_creation_records)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            columns,
+            [
+                ("record_id".to_owned(), false, 1),
+                ("worktree_path".to_owned(), true, 0),
+                ("project_cwd".to_owned(), true, 0),
+                ("created_at".to_owned(), true, 0),
+            ],
+            "a record id, and three required columns"
+        );
+        let receipts: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM worktree_removal_receipts",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(receipts, 1, "existing rows are kept");
+        let insert = "INSERT INTO worktree_creation_records (project_cwd, worktree_path, created_at) VALUES (?, ?, '2026-11-09T00:00:00Z')";
+        connection.execute(insert, ["/repo", "/worktrees/a"])?;
+        connection.execute(insert, ["/repo", "/worktrees/b"])?;
+        assert!(
+            connection
+                .execute(insert, ["/other", "/worktrees/a"])
+                .is_err(),
+            "one record per worktree path, whatever the project"
+        );
+        // A ledger rolled back below 72 runs it again over the existing table.
+        let transaction = connection.transaction()?;
+        super::migration_072(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3542,7 +3710,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68, 69, 70, 71]
+            [68, 69, 70, 71, 72, 73, 74]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3570,7 +3738,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68, 69, 70, 71]
+            [67, 68, 69, 70, 71, 72, 73, 74]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -3596,7 +3764,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3651,7 +3819,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3697,7 +3865,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+                55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
             ]
         );
         connection.execute(
@@ -3740,7 +3908,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(71));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(74));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4472,7 +4640,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=71).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=74).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4548,6 +4716,9 @@ mod tests {
                 (69, "ProjectionThreadMessagesQueuedIndex"),
                 (70, "McpNamedClients"),
                 (71, "McpNamedClientTakeOver"),
+                (72, "WorktreeCreationRecords"),
+                (73, "ProjectCodeReviewPrompt"),
+                (74, "ProjectionThreadCodeReview"),
             ],
         );
         assert_eq!(
@@ -4698,7 +4869,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 55);
+        assert_eq!(second.len(), 58);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4721,7 +4892,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 40);
+        assert_eq!(application_table_count, 41);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -4818,7 +4989,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
             ]
         );
         let policy = connection.query_row(
@@ -4858,7 +5029,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
             ]
         );
         let pin = connection.query_row(
@@ -4889,7 +5060,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65, 66, 67, 68, 69, 70, 71
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
             ]
         );
         let pin = connection.query_row(
@@ -5032,7 +5203,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-                69, 70, 71
+                69, 70, 71, 72, 73, 74
             ]
         );
         assert_eq!(
@@ -5062,7 +5233,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 38);
+        assert_eq!(applied.len(), 41);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);

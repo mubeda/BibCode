@@ -43,7 +43,10 @@ so any desktop that produces `hintfull` exercises it.
 Check WebKitGTK, Tauri/AppImage, FUSE, graphics, and display dependencies
 against current CI and release workflows. Use Xvfb for packaged E2E when the
 host has no suitable interactive display. Do not install system packages
-without permission.
+without permission. A bare container also needs the host libraries the
+AppImage does not carry, listed in
+[System libraries](../user/linux-desktop.md#system-libraries); a bare Ubuntu
+24.04 container lacks them with or without the bundled GStreamer plugins.
 
 Linux AppImages bundle WebKitGTK from their build host. Isolate XDG config,
 cache, and data roots when running locally built AppImages on a newer
@@ -131,6 +134,23 @@ forced theme selection, user theme overrides, missing and drifted hooks failing
 without post-processing mutations, discovery passthrough, and upstream failure
 propagation.
 
+Run the AppImage GStreamer wrapper regression too:
+
+```sh
+vp test scripts/tauri-linuxdeploy-plugin-gstreamer.test.ts
+```
+
+It covers bundling exactly the allowlist while other host plugins stay out, a
+missing allowlisted plugin, ownership answers that fail closed before the AppDir
+changes (no owner, another path, several lines, several packages, a source
+package outside core, base and good), escaping of glob characters in the
+ownership lookup, a bundled plugin folder that differs from the allowlist,
+Wayland library removal after the upstream plugin re-runs linuxdeploy, the
+required plugin scanner, the AppRun hook rewrite (sourced with the AppImage's
+own, no, and another AppImage's `APPDIR`, every exported path stays in its own
+AppDir; a drifted upstream hook fails the build unrewritten), and discovery
+passthrough. It runs on Linux and macOS and is skipped on Windows.
+
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
 
@@ -172,6 +192,26 @@ directory, downgrade desktop libraries, or bypass the pinned plugin to make
 packaging pass. `--plugin-api-version` discovery does not require GTK metadata.
 Successful local DEB/RPM packaging does not qualify the AppImage; its release
 build and artifact checks must still pass on the documented baseline.
+
+The AppImage also bundles GStreamer plugins
+(`bundle.linux.appimage.bundleMediaFramework` in `tauri.linux.conf.json`): the
+bundled GStreamer core, from the Ubuntu 22.04 build host, rejects the plugins
+of newer distributions, so without its own it finds no audio sink. Only the
+plugins in `allowed_plugins` in `scripts/tauri/linuxdeploy-plugin-gstreamer.sh`
+are bundled: WebKitGTK's audio pipeline and the decoders for the audio types
+Files previews (WAV, MP3, Ogg Vorbis and Opus, WebM audio, FLAC; not M4A, whose
+AAC decoders are outside the core, base and good sets). Every AppImage build
+host installs `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good` (which
+carries the PulseAudio sink on Ubuntu 22.04) and `gstreamer1.0-alsa`; the
+plugin scanner comes with `libgstreamer1.0-0`. Other plugins on the host, such
+as the bad, ugly or libav sets, do not reach the bundle. The wrapper copies each
+allowlisted file into a private folder after `dpkg-query` names exactly one
+owning package for its exact path whose source is `gstreamer1.0`,
+`gst-plugins-base1.0` or `gst-plugins-good1.0`; a missing file or any other
+answer fails the build with the plugin's name. Install the reported package
+instead of bypassing the check. Licences, sources and the libraries bundled for
+these plugins are in
+[`apps/desktop/THIRD_PARTY_NOTICES.md`](../../apps/desktop/THIRD_PARTY_NOTICES.md).
 
 ### User-facing child environment isolation
 
@@ -290,6 +330,9 @@ verify it is nonempty and executable, and inspect version/architecture without
 modifying the artifact. Record whether FUSE is available or the AppImage needs
 its supported extraction fallback for testing.
 
+Packaged E2E also needs `lsof`: the harness finds the running app through it
+when it relaunches the app after a webview crash.
+
 Build and run packaged E2E with:
 
 ```sh
@@ -390,6 +433,14 @@ contain no `gsettings get org.gnome.desktop.interface gtk-theme` line, no
 if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi
 ```
 
+In the same extracted copy, `usr/lib/gstreamer-1.0/` must hold exactly the
+files that `bash scripts/tauri/linuxdeploy-plugin-gstreamer.sh --list-plugins`
+prints and nothing else, beside the scanner at
+`usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner` and
+`apprun-hooks/linuxdeploy-plugin-gstreamer.sh`. The Desktop UI smoke workflow
+checks these files. That hook must contain no `APPDIR`: its paths start with
+`${bibcode_gstreamer_appdir}`, which it sets from its own location.
+
 Record the backend actually used by the packaged BiBCode window, alongside the
 desktop session, monitor scale, `GDK_SCALE`, `GDK_DPI_SCALE`, and any
 `BIBCODE_GDK_BACKEND` override:
@@ -472,7 +523,7 @@ Record its `org.freedesktop.appearance` `color-scheme` and GTK theme name;
 Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
 `APPIMAGE_GTK_THEME` unset for the system-following checks:
 
-- With **Settings → General → Theme** on **System**, launch once with a dark
+- With **Settings → Appearance → Mode** on **System**, launch once with a dark
   system scheme and once with a light scheme. Switch both ways while each
   instance runs. The webview, native menubar, and native dialogs must match at
   launch and after every switch.

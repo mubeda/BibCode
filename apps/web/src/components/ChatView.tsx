@@ -4,6 +4,7 @@ import {
   type AgentSessionOpenMode,
   type ApprovalRequestId,
   type CheckpointRevertMode,
+  type DefaultAgentSelection,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -168,8 +169,10 @@ import {
   type TurnDiffSummary,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
+import { slotTheme } from "../themes/customThemes";
 import {
   mergeTerminalSpawnEnv,
+  resolveTerminalPalette,
   resolveTerminalThemeMode,
   usesPersistentWindowsConsoleTheme,
   type TerminalThemeMode,
@@ -208,7 +211,11 @@ import {
   type CenterPanelDropRequest,
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
-import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
+import {
+  CODE_REVIEW_SEND_FAILED_TITLE,
+  takeComposerFocusRequest,
+  useCenterPanelActions,
+} from "../centerPanelActions";
 import { markChatPanelSent } from "../centerPanelClose";
 import {
   applyProviderInstanceSettings,
@@ -247,6 +254,7 @@ import {
   resolveShortcutCommand,
   shortcutLabelForCommand,
   shouldOpenChatFind,
+  shouldStartCodeReview,
 } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalPanel, {
@@ -333,7 +341,28 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline, type TimelineOlderHistory } from "./chat/MessagesTimeline";
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
-import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
+import {
+  type ProviderTerminalAction,
+  describeInstructionsRefusal,
+  resolveProviderReviewTerminalAction,
+} from "./chat/providerTerminalActions";
+import { buildProviderAgentActions } from "./chat/providerAgentActions";
+import {
+  CODE_REVIEW_DRAFT_REASON,
+  CODE_REVIEW_SERVER_UPDATE_REASON,
+  CODE_REVIEW_UNLISTED_REASON,
+  buildCodeReviewMenuReviewers,
+  codeReviewGuardLine,
+  resolveCodeReviewChatModes,
+  resolveCodeReviewModelSelection,
+  resolveCodeReviewPrompt,
+  resolveSavedCodeReviewer,
+} from "../codeReview";
+import {
+  type CodeReviewScope,
+  resolveCodeReviewButtonState,
+  resolveCodeReviewScope,
+} from "./SourceControlPanel.logic";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { ChatPanelOpeningState, NoActiveThreadState } from "./NoActiveThreadState";
@@ -403,6 +432,8 @@ const PreviewPanel = lazy(() =>
 );
 const DiffPanel = lazy(() => import("./DiffPanel"));
 const SourceControlPanel = lazy(() => import("./SourceControlPanel"));
+/** Hosts with a terminal review being opened, so a double click opens one (#293). */
+const pendingTerminalReviewHosts = new Set<string>();
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
@@ -2145,8 +2176,34 @@ function ChatViewContent(props: ChatViewProps) {
     projectDefaultModelSelection: activeProject?.defaultModelSelection,
     selectedProviderInstanceId: selectedProviderByThreadId,
     providers: providerStatuses,
+    providerChosen: isServerThread,
   });
   const providerBindingConflictReason = providerBinding.conflict?.reason ?? null;
+  // A chat keeps its provider when that provider is disabled or removed: name it and refuse
+  // Send instead of submitting an instance the server rejects (#347).
+  const boundProviderEntry = providerInstanceEntries.find(
+    (entry) => entry.instanceId === providerBinding.instanceId,
+  );
+  const boundInstanceSettings = settings.providerInstances?.[providerBinding.instanceId];
+  // An instance the server has not reported but settings still configure is only not known yet.
+  const boundProviderUnavailable = boundProviderEntry
+    ? !boundProviderEntry.enabled || !boundProviderEntry.isAvailable
+    : boundInstanceSettings
+      ? boundInstanceSettings.enabled === false
+      : providerStatuses.length > 0;
+  const unavailableProviderName =
+    isServerThread &&
+    serverConfig !== null &&
+    activeEnvironmentUnavailableState === null &&
+    providerBinding.conflict === null &&
+    boundProviderUnavailable
+      ? (boundProviderEntry?.displayName ?? formatProviderSlugLabel(providerBinding.instanceId))
+      : null;
+  const unavailableProviderReason =
+    unavailableProviderName === null ? null : `${unavailableProviderName} is not available`;
+  const unavailableProviderNeedsSetup = boundProviderEntry?.enabled === true;
+  const unavailableProviderOnPrimary =
+    activeThread !== undefined && activeThread.environmentId === primaryEnvironment?.environmentId;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -2235,6 +2292,32 @@ function ChatViewContent(props: ChatViewProps) {
         description: providerBinding.conflict.reason,
       });
     }
+    if (unavailableProviderReason) {
+      items.push({
+        id: `provider-unavailable:${providerBinding.instanceId}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: unavailableProviderReason,
+        // An agent that is enabled but not usable (not installed, not signed in) needs its setup
+        // checked, not enabling.
+        description: unavailableProviderOnPrimary
+          ? unavailableProviderNeedsSetup
+            ? "This chat stays on it. Check its install and sign-in in Settings → Providers, or add a chat with another agent from the + menu."
+            : "This chat stays on it. Enable it in Settings → Providers, or add a chat with another agent from the + menu."
+          : unavailableProviderNeedsSetup
+            ? "This chat stays on it. Check its install and sign-in on this chat's server, or add a chat with another agent from the + menu."
+            : "This chat stays on it. Enable it on this chat's server, or add a chat with another agent from the + menu.",
+        ...(unavailableProviderOnPrimary
+          ? {
+              actions: (
+                <Button size="xs" onClick={() => void navigate({ to: "/settings/providers" })}>
+                  Open Providers
+                </Button>
+              ),
+            }
+          : {}),
+      });
+    }
     if (showVersionMismatchBanner && versionMismatch && versionMismatchDismissKey) {
       items.push({
         id: `version-mismatch:${versionMismatchDismissKey}`,
@@ -2263,6 +2346,10 @@ function ChatViewContent(props: ChatViewProps) {
     navigate,
     presentation,
     providerBinding.conflict,
+    providerBinding.instanceId,
+    unavailableProviderNeedsSetup,
+    unavailableProviderOnPrimary,
+    unavailableProviderReason,
     setDismissedVersionMismatchKey,
     showVersionMismatchBanner,
     versionMismatch,
@@ -2353,8 +2440,16 @@ function ChatViewContent(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
-  const planSidebarLabel = sidebarProposedPlan || interactionMode === "plan" ? "Plan" : "Tasks";
+  // A review panel reports findings; implementing them is not a review's job (D42).
+  const isCodeReviewThread = activeThread?.codeReview === true;
+  const planSidebarLabel =
+    isCodeReviewThread && sidebarProposedPlan
+      ? "Review findings"
+      : sidebarProposedPlan || interactionMode === "plan"
+        ? "Plan"
+        : "Tasks";
   const showPlanFollowUpPrompt =
+    !isCodeReviewThread &&
     pendingUserInputs.length === 0 &&
     interactionMode === "plan" &&
     latestTurnSettled &&
@@ -4678,6 +4773,10 @@ function ChatViewContent(props: ChatViewProps) {
               runtimeEnv: baseLaunch.env,
               commandEnv: launchCommand?.env,
               resolvedTheme: terminalTheme,
+              palette: resolveTerminalPalette(
+                settings.terminalThemePreference,
+                slotTheme(resolvedTheme === "dark" ? "dark" : "light"),
+              ),
               windowsConsoleTheme: usesPersistentWindowsConsoleTheme(launchCommand),
             }),
             ...(options?.label !== undefined ? { label: options.label } : {}),
@@ -4799,11 +4898,201 @@ function ChatViewContent(props: ChatViewProps) {
     const focusedGroup = selectFocusedCenterPanelGroup(
       selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, activeThreadRef),
     );
-    void openCenterTerminal(
+    return openCenterTerminal(
       { type: "tab", groupId: focusedGroup.id },
       { label: action.label, command: action.command },
     );
   });
+  // Review changes (#293): the saved reviewer exactly as saved (D48), with this environment's
+  // settings (D49). The prompt and the launch are resolved only on click.
+  const codeReviewAgentActions = useMemo(
+    () => buildProviderAgentActions(providerStatuses, settings),
+    [providerStatuses, settings],
+  );
+  const savedCodeReviewer = useMemo(
+    () =>
+      resolveSavedCodeReviewer(
+        codeReviewAgentActions,
+        settings.codeReviewAgent,
+        providerInstanceEntries,
+      ),
+    [codeReviewAgentActions, providerInstanceEntries, settings.codeReviewAgent],
+  );
+  const codeReviewPlatformOs = serverConfig?.environment.platform.os ?? null;
+  const codeReviewsSupported = serverConfig?.environment.capabilities?.codeReviews === true;
+  const hasCodeReviewLaunchContext = isServerThread && centerPanelLaunchContext !== null;
+  // Reasons that hold for every reviewer on this thread and environment.
+  const codeReviewEnvironmentReason = !codeReviewsSupported
+    ? CODE_REVIEW_SERVER_UPDATE_REASON
+    : (workspaceUnavailable ??
+      // A draft has no panel host and no terminal launch context (D40).
+      (hasCodeReviewLaunchContext ? null : CODE_REVIEW_DRAFT_REASON));
+  // A resolved reviewer's own reason; a terminal also takes this environment's terminal reason.
+  const codeReviewerReason = useCallback(
+    (resolved: ReturnType<typeof resolveSavedCodeReviewer>): string | null => {
+      if (resolved.reason !== null) return resolved.reason;
+      const reviewer = resolved.action;
+      if (reviewer.kind !== "terminal") return null;
+      const terminal = resolveProviderReviewTerminalAction(reviewer.entry, settings, {
+        prompt: "",
+        platformOs: codeReviewPlatformOs,
+        modelSelection: null,
+      });
+      return terminal === null ? CODE_REVIEW_UNLISTED_REASON : terminal.disabledReason;
+    },
+    [codeReviewPlatformOs, settings],
+  );
+  const codeReviewUnavailableReason = useMemo(
+    () => codeReviewEnvironmentReason ?? codeReviewerReason(savedCodeReviewer),
+    [codeReviewEnvironmentReason, codeReviewerReason, savedCodeReviewer],
+  );
+  // The one-off reviewers of the review menu (R103), each with its own reason.
+  const codeReviewMenuReviewers = useMemo(
+    () =>
+      buildCodeReviewMenuReviewers(
+        codeReviewAgentActions,
+        // A menu item names its own reason, not the saved reviewer's "change it in Settings".
+        (action) =>
+          codeReviewEnvironmentReason ??
+          (action.disabled
+            ? (action.disabledReason ?? `${action.label} is not available.`)
+            : codeReviewerReason({ action, reason: null })),
+      ),
+    [codeReviewAgentActions, codeReviewEnvironmentReason, codeReviewerReason],
+  );
+  const codeReviewGuard = savedCodeReviewer.action
+    ? codeReviewGuardLine({
+        kind: savedCodeReviewer.action.kind,
+        driver: savedCodeReviewer.action.entry.driverKind,
+      })
+    : null;
+  // `selection` is a one-off reviewer from the menu; the saved reviewer stays as saved (R103).
+  // `instructions` are added to this review only, in both the chat and the terminal (R105).
+  const handleStartCodeReview = useLatestHandler(
+    (
+      scope: CodeReviewScope,
+      selection?: DefaultAgentSelection,
+      instructions?: string,
+    ): string | null => {
+      const resolved =
+        selection === undefined
+          ? savedCodeReviewer
+          : resolveSavedCodeReviewer(codeReviewAgentActions, selection, providerInstanceEntries);
+      const reviewer = resolved.action;
+      if (reviewer === null) return null;
+      if ((codeReviewEnvironmentReason ?? codeReviewerReason(resolved)) !== null) return null;
+      if (!activeThread || !centerPanelLaunchContext) return null;
+      const { entry } = reviewer;
+      const prompt = resolveCodeReviewPrompt({
+        project: activeProject?.codeReviewPrompt ?? "",
+        user: settings.codeReviewPrompt,
+        scope,
+        ...(instructions === undefined ? {} : { extra: instructions }),
+      });
+      const modelSelection = resolveCodeReviewModelSelection(
+        settings.codeReviewModelSelection,
+        entry.instanceId,
+      );
+      if (reviewer.kind === "terminal") {
+        const action = resolveProviderReviewTerminalAction(entry, settings, {
+          prompt,
+          platformOs: codeReviewPlatformOs,
+          modelSelection,
+        });
+        if (action === null || action.command === null) {
+          const reason = action?.disabledReason ?? CODE_REVIEW_UNLISTED_REASON;
+          if (instructions !== undefined) {
+            // Give the reason back to the instructions dialog, which stays open with the text,
+            // instead of closing it on a toast. When the prompt is refused even without the
+            // instructions, the reason is the saved prompt's and still points at Settings.
+            const withoutInstructions = resolveProviderReviewTerminalAction(entry, settings, {
+              prompt: resolveCodeReviewPrompt({
+                project: activeProject?.codeReviewPrompt ?? "",
+                user: settings.codeReviewPrompt,
+                scope,
+              }),
+              platformOs: codeReviewPlatformOs,
+              modelSelection,
+            });
+            return withoutInstructions?.command ? describeInstructionsRefusal(reason) : reason;
+          }
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: CODE_REVIEW_SEND_FAILED_TITLE,
+              description: reason,
+            }),
+          );
+          return null;
+        }
+        // Terminal ids are distinct per open, so only this guard stops a double click (as chat
+        // reviews are guarded in centerPanelActions); it is released however the open settles.
+        const hostKey = `${activeThread.environmentId}:${activeThread.hostThreadId ?? activeThread.id}`;
+        if (pendingTerminalReviewHosts.has(hostKey)) return null;
+        pendingTerminalReviewHosts.add(hostKey);
+        void handleOpenProviderTerminalPanel(action).finally(() =>
+          pendingTerminalReviewHosts.delete(hostKey),
+        );
+        return null;
+      }
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+        explicitSelection: modelSelection,
+      });
+      void centerPanelActions.createPromptedChatPanel({
+        // A panel cannot host a panel: a review from one is hosted by its host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+        label: `Code review · ${entry.displayName}`,
+        prompt,
+        ...resolveCodeReviewChatModes(entry.driverKind),
+        codeReview: true,
+      });
+      return null;
+    },
+  );
+  // The shortcut does what the button would do now, from the status the header already reads
+  // for the same checkout (R102).
+  const handleCodeReviewShortcut = useLatestHandler(() => {
+    const status = gitStatusQuery.data ?? null;
+    const scope = resolveCodeReviewScope(status);
+    const button = resolveCodeReviewButtonState({
+      status,
+      scope,
+      unavailableReason: codeReviewUnavailableReason,
+    });
+    if (!button.disabled && scope) handleStartCodeReview(scope);
+  });
+  const sourceControlCodeReview = useMemo(
+    () => ({
+      unavailableReason: codeReviewUnavailableReason,
+      guardLine: codeReviewGuard,
+      onStart: handleStartCodeReview,
+      reviewers: codeReviewMenuReviewers,
+      projectId: activeProject?.id ?? null,
+      projectPrompt: activeProject?.codeReviewPrompt ?? "",
+      userPrompt: settings.codeReviewPrompt,
+    }),
+    [
+      activeProject?.codeReviewPrompt,
+      activeProject?.id,
+      codeReviewGuard,
+      codeReviewMenuReviewers,
+      codeReviewUnavailableReason,
+      handleStartCodeReview,
+      settings.codeReviewPrompt,
+    ],
+  );
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -4863,6 +5152,10 @@ function ChatViewContent(props: ChatViewProps) {
         const scriptSpawnEnv = mergeTerminalSpawnEnv({
           runtimeEnv,
           resolvedTheme: scriptTerminalTheme,
+          palette: resolveTerminalPalette(
+            settings.terminalThemePreference,
+            slotTheme(resolvedTheme === "dark" ? "dark" : "light"),
+          ),
           windowsConsoleTheme: false,
         });
         const dimensions = readTerminalFittedSize(
@@ -5010,6 +5303,12 @@ function ChatViewContent(props: ChatViewProps) {
         openThreadFindForTarget(event.target);
         return;
       }
+      if (shouldStartCodeReview(command, event, keybindings, shortcutContext)) {
+        event.preventDefault();
+        event.stopPropagation();
+        handleCodeReviewShortcut();
+        return;
+      }
       if (!command) return;
 
       if (command === "terminal.newCenter") {
@@ -5151,6 +5450,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeThreadId,
     closeCenterPanelSurface,
     closePanelTerminal,
+    handleCodeReviewShortcut,
     hasTerminalSurface,
     openCenterTerminal,
     runProjectScript,
@@ -5560,6 +5860,7 @@ function ChatViewContent(props: ChatViewProps) {
       isConnecting ||
       workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
+      unavailableProviderReason !== null ||
       stoppingQueueRef.current ||
       sendInFlightRef.current
     )
@@ -7243,6 +7544,7 @@ function ChatViewContent(props: ChatViewProps) {
           gitCwd={gitCwd}
           projectRef={activeProjectRef}
           workspaceUnavailable={workspaceUnavailable}
+          codeReview={sourceControlCodeReview}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "device" ? (
@@ -7408,6 +7710,7 @@ function ChatViewContent(props: ChatViewProps) {
                       verboseChat={settings.verboseChat}
                       workspaceRoot={activeWorkspaceRoot}
                       skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
+                      isCodeReview={isCodeReviewThread}
                       anchorMessageId={timelineAnchorMessageId}
                       onAnchorReady={onTimelineAnchorReady}
                       onAnchorSizeChanged={onTimelineAnchorSizeChanged}
@@ -7524,7 +7827,9 @@ function ChatViewContent(props: ChatViewProps) {
                             providerBindingInstanceId={providerBinding.instanceId}
                             lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
                             providerBindingConflictReason={
-                              workspaceUnavailable ?? providerBindingConflictReason
+                              workspaceUnavailable ??
+                              providerBindingConflictReason ??
+                              unavailableProviderReason
                             }
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={

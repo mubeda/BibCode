@@ -17,11 +17,13 @@ use crate::{
     cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
     diagnostics::{
         AttributedProcess, AttributionConfidence, AttributionKind, AttributionScope, BucketMetric,
-        CurrentProcessDiagnostics, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionRegistry, ProcessAttributionTotals, ProcessIdentity,
-        ProcessResourceHistory, ProcessResourceTotals, ProcessRow, ProcessSignal,
-        RuntimeProcessOwnership, SplitMetric, UiCoverage, UiCoverageStatus,
-        bound_diagnostic_string, process_tree_metadata,
+        CurrentProcessDiagnostics, DiagnosticsMonitor, HostMetricsCollector, HostMetricsIdentity,
+        HostMetricsRates, NativeProcessSampler, NativeResourceSampler, ProcessAttributionRegistry,
+        ProcessAttributionTotals, ProcessIdentity, ProcessResourceHistory, ProcessResourceTotals,
+        ProcessRow, ProcessSignal, RuntimeProcessOwnership, SplitMetric, UiCoverage,
+        UiCoverageStatus, bound_diagnostic_string,
+        host_metrics::{NativeHostMetricsSource, encode_snapshot, send_host_metrics},
+        process_tree_metadata,
         profiler::{client::ingest_client_batch, runtime::ProfilerRuntime},
     },
     persistence::{OrchestrationEvent, Repositories},
@@ -34,8 +36,8 @@ use crate::{
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
         AttachmentItem, InputReadmissionScope, TerminalAttachInput, TerminalError, TerminalEvent,
-        TerminalInputAdmission, TerminalLaunchCommand, TerminalManager, TerminalMetadataEvent,
-        TerminalOpenInput, TerminalSessionIdentity,
+        TerminalInputAdmission, TerminalInputOrigin, TerminalLaunchCommand, TerminalManager,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalSessionIdentity,
     },
     worktree_catalog::{
         WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
@@ -108,6 +110,8 @@ pub struct ServerTerminalServices {
     profiler: Option<Weak<ProfilerRuntime>>,
     /// Tags client profiler reports; empty when the host sets none.
     environment_id: Arc<str>,
+    /// The host collector behind `server.subscribeHostMetrics`; idle until started or watched.
+    host_metrics: Arc<HostMetricsCollector>,
 }
 
 impl ServerTerminalServices {
@@ -168,12 +172,27 @@ impl ServerTerminalServices {
             workspace_watch: CancellationToken::new(),
             profiler: None,
             environment_id: Arc::from(""),
+            host_metrics: Arc::new(HostMetricsCollector::new(
+                Arc::new(NativeHostMetricsSource::new()),
+                HostMetricsRates::default(),
+                HostMetricsIdentity {
+                    boot_id: None,
+                    started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+                },
+            )),
         }
     }
 
     #[must_use]
     pub(crate) fn with_profiler(mut self, profiler: &Arc<ProfilerRuntime>) -> Self {
         self.profiler = Some(Arc::downgrade(profiler));
+        self
+    }
+
+    /// Serves this collector instead of the idle default.
+    #[must_use]
+    pub fn with_host_metrics(mut self, collector: Arc<HostMetricsCollector>) -> Self {
+        self.host_metrics = collector;
         self
     }
 
@@ -617,6 +636,25 @@ async fn send_discovered_local_servers(
 }
 
 fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
+    let collector = services.host_metrics.clone();
+    registry.register_stream(
+        "server.subscribeHostMetrics",
+        move |_request, cancellation| {
+            let collector = collector.clone();
+            spawn_stream(cancellation, move |sender, cancellation| {
+                send_host_metrics(collector, sender, cancellation)
+            })
+        },
+    );
+
+    // One Snapshot for the MCP `host_metrics` tool; it answers from memory and never switches
+    // the collector to the live rate.
+    let collector = services.host_metrics.clone();
+    registry.register_unary("server.getHostMetrics", move |_request, _cancellation| {
+        let collector = collector.clone();
+        async move { Ok(encode_snapshot(&collector.snapshot().await)) }
+    });
+
     let monitor = services.process_monitor.clone();
     registry.register_unary(
         "server.getProcessDiagnostics",
@@ -945,10 +983,11 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         let availability = availability.clone();
         async move {
             let input: TerminalWritePayload = decode_payload(&request.payload)?;
+            let origin = terminal_input_origin(request.payload.get("userInputClaim"))?;
             let _workspace_admission =
                 acquire_terminal_thread(availability.as_ref(), &input.thread_id).await?;
             terminal
-                .write(&input.thread_id, &input.terminal_id, &input.data)
+                .write_from(&input.thread_id, &input.terminal_id, &input.data, origin)
                 .await
                 .map_err(terminal_error)?;
             Ok(Value::Null)
@@ -962,17 +1001,23 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         |terminal, payload| {
             Box::pin(async move {
                 let input: TerminalResizePayload = decode_payload(&payload)?;
-                terminal
-                    .resize(
+                let result = terminal
+                    .resize_acknowledging(
                         &input.thread_id,
                         &input.terminal_id,
                         input.cols,
                         input.rows,
                         validate_terminal_size_claim(payload.get("sizeClaim"))?,
+                        input.structured_result,
                     )
                     .await
                     .map_err(terminal_error)?;
-                Ok(Value::Null)
+                // An older client decodes this result as void, which accepts only null (#348).
+                Ok(if input.structured_result {
+                    serde_json::to_value(result).expect("terminal resize result serializes")
+                } else {
+                    Value::Null
+                })
             })
         },
     );
@@ -1221,9 +1266,10 @@ fn register_ordered_input_rpcs(registry: &mut RpcRegistry, services: &ServerTerm
                     return Err(json!({"_tag":"TerminalInputError", "code":"capacity", "message":"Terminal input exceeded its frame limit. Reconnect input before typing again."}));
                 }
                 let input: TerminalInputFramePayload = decode_payload(&request.payload)?;
+                let origin = terminal_input_origin(request.payload.get("userInputClaim"))?;
                 // In memory only: the session's lease already holds the workspace admission
                 // `terminal.beginInput` took, so a keystroke never waits for the database.
-                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?;
+                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?.with_origin(origin);
                 // Loss of the session's current admission seals it, which fails this frame
                 // wherever it waits; report that loss rather than the sealed session.
                 let seal = frame.seal();
@@ -1490,6 +1536,23 @@ fn validate_terminal_size_claim(value: Option<&Value>) -> Result<Option<String>,
     Ok(Some(claim.to_owned()))
 }
 
+/// `userInputClaim`: absent from an older client, `null` for the terminal's own replies, else
+/// the size claim of the window a user typed in (#348).
+fn terminal_input_origin(value: Option<&Value>) -> Result<TerminalInputOrigin<'_>, Value> {
+    match value {
+        None => Ok(TerminalInputOrigin::Unmarked),
+        Some(Value::Null) => Ok(TerminalInputOrigin::Automatic),
+        Some(Value::String(claim)) => {
+            let claim = trim_ecmascript(claim);
+            if claim.is_empty() || claim.encode_utf16().count() > TERMINAL_SIZE_CLAIM_MAX_LENGTH {
+                return Err(invalid_request("userInputClaim must be a size claim"));
+            }
+            Ok(TerminalInputOrigin::User(claim))
+        }
+        Some(_) => Err(invalid_request("userInputClaim must be a string or null")),
+    }
+}
+
 fn validate_terminal_launch_command(
     command: Option<TerminalLaunchCommand>,
 ) -> Result<Option<TerminalLaunchCommand>, Value> {
@@ -1677,6 +1740,9 @@ struct TerminalInputFramePayload {
     input_id: String,
     sequence: u64,
     data: String,
+    /// Read from the payload by [`terminal_input_origin`], which tells null from absent.
+    #[serde(default, rename = "userInputClaim")]
+    _user_input_claim: serde::de::IgnoredAny,
 }
 
 #[derive(Deserialize)]
@@ -1693,6 +1759,8 @@ struct TerminalResizePayload {
     terminal_id: String,
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    structured_result: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

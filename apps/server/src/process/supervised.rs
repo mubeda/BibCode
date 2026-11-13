@@ -4,6 +4,7 @@ use std::{
     io,
     path::Path,
     process::ExitStatus,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,6 +20,65 @@ use crate::diagnostics::profiler::exits::{self, Exited, Watch};
 
 const PROCESS_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
+/// How long a process asked to stop gets before it is forced (R15, D13).
+pub(crate) const GRACEFUL_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// How a run that must end early is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopPolicy {
+    /// Kill the ownership unit at once.
+    Force,
+    /// Send `SIGTERM` to the process group, wait up to [`GRACEFUL_STOP_WAIT`], then kill.
+    /// Git removes its own `index.lock` on `SIGTERM`. Windows offers no dependable request
+    /// to a process without a console (plan decision P4), so there it is [`Self::Force`].
+    AskThenForce,
+}
+
+/// How a run's process ended, sent once per spawned process after it has exited or the
+/// cleanup gave up on it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminationReport {
+    /// The run ended early and the server stopped the process.
+    pub(crate) requested: bool,
+    /// The process was killed rather than stopping when asked.
+    pub(crate) forced: bool,
+    /// The process has exited.
+    pub(crate) exited: bool,
+    /// The [`TerminationReports::before_force`] answer, taken while the root still ran just
+    /// before it was forced to stop. `None` when nothing was checked.
+    pub(crate) before_force: Option<bool>,
+}
+
+/// Where a run sends its [`TerminationReport`].
+#[derive(Clone)]
+pub(crate) struct TerminationReports {
+    sender: tokio::sync::mpsc::UnboundedSender<TerminationReport>,
+    /// Asked about the root's process id just before a forced stop, while the root still runs.
+    before_force: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
+}
+
+impl TerminationReports {
+    pub(crate) fn new(sender: tokio::sync::mpsc::UnboundedSender<TerminationReport>) -> Self {
+        Self {
+            sender,
+            before_force: None,
+        }
+    }
+
+    pub(crate) fn checking_before_force(
+        mut self,
+        check: impl Fn(u32) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.before_force = Some(Arc::new(check));
+        self
+    }
+}
+
+fn send_report(reports: Option<&TerminationReports>, report: TerminationReport) {
+    if let Some(reports) = reports {
+        let _ = reports.sender.send(report);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SupervisedOverflow {
@@ -37,6 +97,7 @@ pub(crate) struct SupervisedRunRequest {
     pub(crate) cleanup_timeout: Duration,
     pub(crate) max_output_bytes: usize,
     pub(crate) overflow: SupervisedOverflow,
+    pub(crate) stop_policy: StopPolicy,
 }
 
 #[derive(Debug)]
@@ -83,7 +144,18 @@ pub(crate) async fn run_supervised(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    run_supervised_with_observer(request, cancellation, None, |_| {}).await
+    run_supervised_with_observer(request, cancellation, None, None, |_| {}).await
+}
+
+/// [`run_supervised`] that sends `reports` one [`TerminationReport`] for the process it spawns,
+/// also when the run's future is dropped (then after the background stop has finished). A
+/// run that spawns nothing sends nothing.
+pub(crate) async fn run_supervised_reporting(
+    request: SupervisedRunRequest,
+    cancellation: &CancellationToken,
+    reports: Option<TerminationReports>,
+) -> Result<SupervisedRunOutput, SupervisedRunError> {
+    run_supervised_with_observer(request, cancellation, None, reports, |_| {}).await
 }
 
 pub(crate) async fn run_supervised_with_spawn_observer<F>(
@@ -94,7 +166,7 @@ pub(crate) async fn run_supervised_with_spawn_observer<F>(
 where
     F: FnOnce(Option<u32>) + Send,
 {
-    run_supervised_with_observer(request, cancellation, None, observer).await
+    run_supervised_with_observer(request, cancellation, None, None, observer).await
 }
 
 #[cfg(test)]
@@ -107,13 +179,14 @@ pub(crate) async fn run_supervised_with_spawn_observer_until<F>(
 where
     F: FnOnce(Option<u32>) + Send,
 {
-    run_supervised_with_observer(request, cancellation, Some(deadline), observer).await
+    run_supervised_with_observer(request, cancellation, Some(deadline), None, observer).await
 }
 
 async fn run_supervised_with_observer<F>(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
+    reports: Option<TerminationReports>,
     observer: F,
 ) -> Result<SupervisedRunOutput, SupervisedRunError>
 where
@@ -129,6 +202,7 @@ where
         cleanup_timeout,
         max_output_bytes,
         overflow,
+        stop_policy,
     } = request;
     let execution = SupervisedExecution {
         stdin,
@@ -162,8 +236,14 @@ where
                 // eventually produces so a late child never runs unsupervised.
                 tokio::spawn(async move {
                     if let Ok(Ok(child)) = spawn.await {
-                        terminate_and_wait_owned(child, cleanup_timeout, "late supervised spawn")
-                            .await;
+                        terminate_and_wait_owned(
+                            child,
+                            cleanup_timeout,
+                            "late supervised spawn",
+                            false,
+                            reports,
+                        )
+                        .await;
                     }
                 });
                 return Err(SupervisedRunError::Timeout);
@@ -174,7 +254,7 @@ where
     let child = spawn_retrying_busy_executable(&mut command, overall_deadline)
         .await
         .map_err(SupervisedRunError::Spawn)?;
-    let mut guard = SupervisedChildGuard::arm(child);
+    let mut guard = SupervisedChildGuard::arm_with(child, stop_policy, reports.clone());
     let pid = guard.child().id();
     observer(pid);
 
@@ -185,6 +265,8 @@ where
         Some(overall_deadline),
     )
     .await;
+    // Asked while the guard is armed, so a run dropped during the wait still stops the group.
+    let stopped_when_asked = outcome.is_err() && ask_to_stop(&mut guard, stop_policy).await;
     let child = guard.disarm();
     if outcome.is_err() {
         // A failed run may already have reaped its root while a descendant
@@ -192,7 +274,24 @@ where
         // descendant in the group keeps the group's id reserved, so the kill
         // reaches exactly the stragglers. Only a group with no members left
         // could have its id reused, which takes a PID wrap-around in between.
-        terminate_and_wait_owned(child, cleanup_timeout, "supervised process").await;
+        terminate_and_wait_owned(
+            child,
+            cleanup_timeout,
+            "supervised process",
+            stopped_when_asked,
+            reports,
+        )
+        .await;
+    } else {
+        send_report(
+            reports.as_ref(),
+            TerminationReport {
+                requested: false,
+                forced: false,
+                exited: true,
+                before_force: None,
+            },
+        );
     }
     // A run that timed out, was cancelled or failed was stopped on request.
     if let (Some((program, spawned)), Some(pid), Ok(output)) = (&watched, pid, &outcome) {
@@ -239,17 +338,40 @@ fn report_command_exit(program: &OsStr, pid: u32, status: &ExitStatus, started: 
 /// reused. A run dropped after the root was reaped (while a descendant still
 /// holds the output pipes) is therefore not signalled.
 ///
-/// `Drop` never waits, spawns, or blocks. The dropped child hands its root to
-/// tokio's orphan reaper, and whichever process adopts the killed descendants
-/// reaps them. Callers that must wait for cleanup to finish cancel the run's
-/// token instead.
+/// Under [`StopPolicy::Force`] without reports, `Drop` never waits, spawns, or
+/// blocks. The dropped child hands its root to tokio's orphan reaper, and
+/// whichever process adopts the killed descendants reaps them. Callers that
+/// must wait for cleanup to finish cancel the run's token instead.
+///
+/// Under [`StopPolicy::AskThenForce`], or when the run sends reports, `Drop`
+/// sends `SIGTERM` at once and hands the wait, the forced stop and the report
+/// to a background task on the current Tokio runtime. That task holds the
+/// child in a `Force` guard, so it still kills the group if the runtime drops
+/// it. Without a runtime, `Drop` kills at once as above.
 struct SupervisedChildGuard {
     child: Option<Box<dyn ChildWrapper>>,
+    stop_policy: StopPolicy,
+    reports: Option<TerminationReports>,
+    /// When the stop already requested ends in a forced stop; set once `SIGTERM` was sent.
+    asked_until: Option<tokio::time::Instant>,
 }
 
 impl SupervisedChildGuard {
     fn arm(child: Box<dyn ChildWrapper>) -> Self {
-        Self { child: Some(child) }
+        Self::arm_with(child, StopPolicy::Force, None)
+    }
+
+    fn arm_with(
+        child: Box<dyn ChildWrapper>,
+        stop_policy: StopPolicy,
+        reports: Option<TerminationReports>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            stop_policy,
+            reports,
+            asked_until: None,
+        }
     }
 
     fn child(&self) -> &dyn ChildWrapper {
@@ -266,6 +388,7 @@ impl SupervisedChildGuard {
 
     /// Hands the child to its next owner once the run has settled.
     fn disarm(mut self) -> Box<dyn ChildWrapper> {
+        self.reports = None;
         self.child
             .take()
             .expect("an armed supervised child guard owns its child")
@@ -274,10 +397,99 @@ impl SupervisedChildGuard {
 
 impl Drop for SupervisedChildGuard {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_deref_mut() {
-            terminate_dropped_child(child);
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let reports = self.reports.take();
+        if child.id().is_none() {
+            // Reaped already: nothing to stop.
+            send_report(
+                reports.as_ref(),
+                TerminationReport {
+                    requested: false,
+                    forced: false,
+                    exited: true,
+                    before_force: None,
+                },
+            );
+            return;
+        }
+        let ask = self.stop_policy == StopPolicy::AskThenForce && cfg!(unix);
+        if (ask || reports.is_some())
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            // A stop already requested keeps its deadline instead of asking again.
+            let asked_until = self.asked_until.or_else(|| {
+                (ask && signal_stop_request(&*child))
+                    .then(|| tokio::time::Instant::now() + GRACEFUL_STOP_WAIT)
+            });
+            // Armed here, not in the task: a task dropped unpolled still kills the group.
+            runtime.spawn(stop_dropped_child(
+                SupervisedChildGuard::arm(child),
+                asked_until,
+                reports,
+            ));
+            return;
+        }
+        terminate_dropped_child(&mut *child);
+    }
+}
+
+/// The background half of a dropped [`StopPolicy::AskThenForce`] or reporting run.
+async fn stop_dropped_child(
+    mut guard: SupervisedChildGuard,
+    asked_until: Option<tokio::time::Instant>,
+    reports: Option<TerminationReports>,
+) {
+    let stopped_when_asked = match asked_until {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            wait_for_exit(guard.child_mut(), left).await
+        }
+        None => false,
+    };
+    terminate_and_wait_owned(
+        guard.disarm(),
+        PROCESS_CLEANUP_WAIT_TIMEOUT,
+        "dropped supervised process",
+        stopped_when_asked,
+        reports,
+    )
+    .await;
+}
+
+/// Under [`StopPolicy::AskThenForce`] on Unix, asks the process group to stop and waits up to
+/// [`GRACEFUL_STOP_WAIT`]. `true` when the root exited in time.
+async fn ask_to_stop(guard: &mut SupervisedChildGuard, stop_policy: StopPolicy) -> bool {
+    if !(stop_policy == StopPolicy::AskThenForce
+        && cfg!(unix)
+        && signal_stop_request(guard.child()))
+    {
+        return false;
+    }
+    guard.asked_until = Some(tokio::time::Instant::now() + GRACEFUL_STOP_WAIT);
+    wait_for_exit(guard.child_mut(), GRACEFUL_STOP_WAIT).await
+}
+
+/// Sends `SIGTERM` to the ownership unit. `false` when nothing could be asked.
+fn signal_stop_request(child: &dyn ChildWrapper) -> bool {
+    #[cfg(unix)]
+    {
+        match child.signal(libc::SIGTERM) {
+            Ok(()) => true,
+            // The group is gone, so the root has exited: waiting reads its status at once.
+            Err(error) => kill_target_is_gone(&error),
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        false
+    }
+}
+
+async fn wait_for_exit(child: &mut dyn ChildWrapper, limit: Duration) -> bool {
+    matches!(tokio::time::timeout(limit, child.wait()).await, Ok(Ok(_)))
 }
 
 fn terminate_dropped_child(child: &mut dyn ChildWrapper) {
@@ -487,16 +699,42 @@ async fn terminate_and_wait_with_timeout(
     report
 }
 
+/// Kills the ownership unit and waits for the root, then sends `reports` one
+/// [`TerminationReport`]. The kill also sweeps a group whose root already stopped when asked
+/// (`stopped_when_asked`), for descendants that ignored the request. A root that outlives
+/// the wait is reaped in the background, and the report follows that reap.
 async fn terminate_and_wait_owned(
     mut child: Box<dyn ChildWrapper>,
     wait_timeout: Duration,
     operation: &'static str,
+    stopped_when_asked: bool,
+    reports: Option<TerminationReports>,
 ) {
+    let before_force = if stopped_when_asked {
+        None
+    } else {
+        reports
+            .as_ref()
+            .and_then(|reports| reports.before_force.as_ref())
+            .and_then(|check| child.id().map(|pid| check(pid)))
+    };
     let mut report = ProcessCleanupReport::default();
     request_termination(&mut *child, &mut report);
+    let stopped = move |exited| TerminationReport {
+        requested: true,
+        forced: !stopped_when_asked,
+        exited,
+        before_force,
+    };
     match tokio::time::timeout(wait_timeout, child.wait()).await {
-        Ok(Ok(_)) => report.record_success(),
-        Ok(Err(error)) => report.record_failure(format!("wait: {error}")),
+        Ok(Ok(_)) => {
+            report.record_success();
+            send_report(reports.as_ref(), stopped(true));
+        }
+        Ok(Err(error)) => {
+            report.record_failure(format!("wait: {error}"));
+            send_report(reports.as_ref(), stopped(false));
+        }
         Err(_) => {
             report.record_failure(format!(
                 "wait timed out after {} ms",
@@ -506,8 +744,14 @@ async fn terminate_and_wait_owned(
             tokio::spawn(async move {
                 let mut final_report = ProcessCleanupReport::default();
                 match child.wait().await {
-                    Ok(_) => final_report.record_success(),
-                    Err(error) => final_report.record_failure(format!("wait: {error}")),
+                    Ok(_) => {
+                        final_report.record_success();
+                        send_report(reports.as_ref(), stopped(true));
+                    }
+                    Err(error) => {
+                        final_report.record_failure(format!("wait: {error}"));
+                        send_report(reports.as_ref(), stopped(false));
+                    }
                 }
                 if final_report.failure_count > 0 {
                     log_cleanup_failures(operation, &final_report);
@@ -1002,6 +1246,7 @@ mod tests {
             timeout,
             cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
             max_output_bytes: 1024,
+            stop_policy: StopPolicy::Force,
             overflow: SupervisedOverflow::Error,
         }
     }
@@ -1068,6 +1313,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
                 max_output_bytes: 1024,
+                stop_policy: StopPolicy::Force,
                 overflow: SupervisedOverflow::Error,
             },
             &cancellation,
@@ -1352,7 +1598,14 @@ mod tests {
             .await
             .expect("reap the root and its process group");
 
-        terminate_and_wait_owned(child, PROCESS_CLEANUP_WAIT_TIMEOUT, "supervised process").await;
+        terminate_and_wait_owned(
+            child,
+            PROCESS_CLEANUP_WAIT_TIMEOUT,
+            "supervised process",
+            false,
+            None,
+        )
+        .await;
 
         let text =
             || String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8 log");
@@ -1423,6 +1676,8 @@ mod tests {
             child,
             Duration::from_millis(10),
             "delayed-reap test process",
+            false,
+            None,
         )
         .await;
 
@@ -1487,6 +1742,29 @@ mod tests {
         assert_eq!(kill_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// The background stop of a dropped ask-first run may never be polled, when its runtime
+    /// ends first. The group must still be killed then, as a plain dropped run is.
+    #[cfg(unix)]
+    #[test]
+    fn git_stop_a_dropped_run_is_killed_even_if_its_background_stop_never_runs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (child, kill_calls, _wait_calls) = runtime.block_on(async { tracking_child(false) });
+
+        runtime.block_on(async {
+            drop(SupervisedChildGuard::arm_with(
+                child,
+                StopPolicy::AskThenForce,
+                None,
+            ));
+        });
+        drop(runtime);
+
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_guard_without_a_root_id_is_not_signalled() {
         let (child, kill_calls, wait_calls) = pending_child(None);
@@ -1549,6 +1827,7 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
                 max_output_bytes: 1024,
+                stop_policy: StopPolicy::Force,
                 overflow: SupervisedOverflow::Error,
             };
             let cancellation = CancellationToken::new();
@@ -1691,6 +1970,7 @@ mod tests {
             timeout,
             cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
             max_output_bytes: 1024,
+            stop_policy: StopPolicy::Force,
             overflow: SupervisedOverflow::Truncate,
         }
     }
@@ -1741,6 +2021,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
                 max_output_bytes: 1024,
+                stop_policy: StopPolicy::Force,
                 overflow: SupervisedOverflow::Error,
             },
             &cancellation,
@@ -1748,5 +2029,237 @@ mod tests {
         .await
         .expect_err("closed stdin should fail");
         assert!(matches!(error, SupervisedRunError::Stdin(_)));
+    }
+
+    /// Runs `request` with its stop report and cancels it once `ready` exists. Returns the
+    /// outcome, the report and the time from the cancellation to the outcome.
+    async fn cancel_when_ready(
+        request: SupervisedRunRequest,
+        ready: &std::path::Path,
+    ) -> (
+        Result<SupervisedRunOutput, SupervisedRunError>,
+        TerminationReport,
+        Duration,
+    ) {
+        let cancellation = CancellationToken::new();
+        let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let run = run_supervised_reporting(
+            request,
+            &cancellation,
+            Some(TerminationReports::new(report_sender)),
+        );
+        tokio::pin!(run);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::select! {
+            () = async {
+                while !ready.exists() {
+                    assert!(tokio::time::Instant::now() < deadline, "the child never started");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            result = &mut run => panic!("the child must still be running, got {result:?}"),
+        }
+        let cancelled = Instant::now();
+        cancellation.cancel();
+        let outcome = run.await;
+        let elapsed = cancelled.elapsed();
+        let report = tokio::time::timeout(Duration::from_secs(10), report.recv())
+            .await
+            .expect("the report arrives")
+            .expect("the report is sent");
+        (outcome, report, elapsed)
+    }
+
+    #[cfg(unix)]
+    fn stop_policy_request(
+        script: &str,
+        marker: &std::path::Path,
+        policy: StopPolicy,
+    ) -> SupervisedRunRequest {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script, "fixture"])
+            .arg(marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+            max_output_bytes: 1024,
+            overflow: SupervisedOverflow::Truncate,
+            stop_policy: policy,
+        }
+    }
+
+    /// Stops when asked: the trap removes the marker, as Git removes its lock. Git cleans up on
+    /// `SIGPIPE` too, and so does this shell: a cancelled run has closed the output pipes, and
+    /// the shell's notice about its killed `sleep` would otherwise end it before the trap ran.
+    #[cfg(unix)]
+    const STOPS_WHEN_ASKED: &str =
+        "trap 'rm -f \"$1\"; exit 0' TERM PIPE; touch \"$1\"; while :; do sleep 0.05; done";
+    /// Ignores the request: the group ignores TERM, and only a forced stop ends it.
+    #[cfg(unix)]
+    const IGNORES_THE_REQUEST: &str = "trap '' TERM; echo $$ > \"$1\"; exec sleep 30";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_asks_first_and_the_child_exits_cleanly() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("lock");
+
+        let (outcome, _, elapsed) = cancel_when_ready(
+            stop_policy_request(STOPS_WHEN_ASKED, &marker, StopPolicy::AskThenForce),
+            &marker,
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(!marker.exists(), "the child removed its marker when asked");
+        assert!(elapsed < GRACEFUL_STOP_WAIT, "stopped in {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_forces_after_two_seconds_when_ignored() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("pid");
+
+        let (outcome, _, elapsed) = cancel_when_ready(
+            stop_policy_request(IGNORES_THE_REQUEST, &marker, StopPolicy::AskThenForce),
+            &marker,
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(elapsed >= GRACEFUL_STOP_WAIT, "forced after {elapsed:?}");
+        let pid = std::fs::read_to_string(&marker)
+            .expect("child PID")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("numeric PID");
+        // SAFETY: signal 0 only checks whether the reaped fixture PID still names a process.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the ignoring child is gone");
+    }
+
+    #[tokio::test]
+    async fn git_stop_default_policy_still_forces_at_once() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("ready");
+        #[cfg(unix)]
+        let request = stop_policy_request(STOPS_WHEN_ASKED, &marker, StopPolicy::Force);
+        #[cfg(windows)]
+        let request = {
+            let mut command = Command::new("cmd");
+            command
+                .arg("/C")
+                .raw_arg(format!(
+                    "type nul > \"{}\" & ping -n 30 127.0.0.1 > nul",
+                    marker.display()
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            SupervisedRunRequest {
+                command,
+                stdin: None,
+                timeout: Duration::from_secs(30),
+                cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+                max_output_bytes: 1024,
+                overflow: SupervisedOverflow::Truncate,
+                stop_policy: StopPolicy::Force,
+            }
+        };
+
+        let (outcome, report, elapsed) = cancel_when_ready(request, &marker).await;
+
+        assert!(matches!(outcome, Err(SupervisedRunError::Cancelled)));
+        assert!(elapsed < GRACEFUL_STOP_WAIT, "forced in {elapsed:?}");
+        assert!(report.forced, "{report:?}");
+    }
+
+    /// A run dropped while it waits for an asked child keeps the first deadline: the forced
+    /// stop comes 2 seconds after the first request, not 2 seconds after the drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_a_run_dropped_while_asking_keeps_the_first_deadline() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let marker = directory.path().join("pid");
+        let cancellation = CancellationToken::new();
+        let (report_sender, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let mut run = Box::pin(run_supervised_reporting(
+            stop_policy_request(IGNORES_THE_REQUEST, &marker, StopPolicy::AskThenForce),
+            &cancellation,
+            Some(TerminationReports::new(report_sender)),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::select! {
+            () = async {
+                while !marker.exists() {
+                    assert!(tokio::time::Instant::now() < deadline, "the child never started");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            result = &mut run => panic!("the child must still be running, got {result:?}"),
+        }
+
+        let cancelled = Instant::now();
+        cancellation.cancel();
+        let waiting = tokio::time::timeout(Duration::from_millis(1500), &mut run).await;
+        drop(run);
+        let report = tokio::time::timeout(Duration::from_secs(10), report.recv())
+            .await
+            .expect("the report arrives")
+            .expect("the report is sent");
+        let elapsed = cancelled.elapsed();
+
+        assert!(waiting.is_err(), "the run was still asking when dropped");
+        assert!(report.forced, "{report:?}");
+        // 1 second of margin for the kill and the reap; a fresh wait after the drop takes 3.5 s.
+        assert!(
+            elapsed < GRACEFUL_STOP_WAIT + Duration::from_secs(1),
+            "forced {elapsed:?} after the first request"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stop_reports_whether_the_stop_was_forced() {
+        let directory = tempfile::tempdir().expect("marker folder");
+        let asked = directory.path().join("asked");
+        let ignored = directory.path().join("ignored");
+
+        let (_, stopped_when_asked, _) = cancel_when_ready(
+            stop_policy_request(STOPS_WHEN_ASKED, &asked, StopPolicy::AskThenForce),
+            &asked,
+        )
+        .await;
+        let (_, forced, _) = cancel_when_ready(
+            stop_policy_request(IGNORES_THE_REQUEST, &ignored, StopPolicy::AskThenForce),
+            &ignored,
+        )
+        .await;
+
+        assert_eq!(
+            stopped_when_asked,
+            TerminationReport {
+                requested: true,
+                forced: false,
+                exited: true,
+                before_force: None
+            }
+        );
+        assert_eq!(
+            forced,
+            TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true,
+                before_force: None
+            }
+        );
     }
 }

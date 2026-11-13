@@ -43,6 +43,7 @@ const BINDABLE_COMMANDS_WITHOUT_DEFAULTS: ReadonlyArray<KeybindingCommand> = [
   "chat.find",
   "diff.nextChange",
   "diff.previousChange",
+  "sourceControl.review",
 ];
 
 const DEFAULT_WHEN_VARIABLES = new Set<string>(CORE_WHEN_VARIABLES);

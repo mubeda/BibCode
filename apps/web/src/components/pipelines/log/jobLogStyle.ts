@@ -3,6 +3,8 @@ import {
   TERMINAL_ANSI_COLOR_NAMES,
   terminalAnsiColors,
   terminalExtendedAnsiPalette,
+  isBuiltinTerminalPalette,
+  type TerminalPalette,
   type TerminalThemeMode,
 } from "../../terminalTheme";
 import {
@@ -23,21 +25,29 @@ export interface LogPalette {
   readonly extended: readonly string[];
 }
 
-const palettes = new Map<TerminalThemeMode, LogPalette>();
+const palettes = new Map<string, LogPalette>();
 
-/** The terminal's palette for a theme, as the log root's variables and the 256-color table. */
-export function logPalette(mode: TerminalThemeMode): LogPalette {
-  const known = palettes.get(mode);
+/**
+ * The terminal's palette, as the log root's variables and the 256-color table. A built-in
+ * palette keeps the mode's own values; a theme's palette is cached by its key, so a saved edit
+ * to a theme with the same id is not served from the cache.
+ */
+export function logPalette(source: TerminalThemeMode | TerminalPalette): LogPalette {
+  const named =
+    typeof source !== "string" && isBuiltinTerminalPalette(source) ? source.mode : source;
+  const mode = typeof named === "string" ? named : named.mode;
+  const cacheKey = typeof named === "string" ? named : named.key;
+  const known = palettes.get(cacheKey);
   if (known) return known;
-  const named = terminalAnsiColors(mode);
+  const ansi = terminalAnsiColors(named);
   const variables: Record<string, string> = {};
   for (const [index, name] of TERMINAL_ANSI_COLOR_NAMES.entries())
-    variables[`--log-ansi-${index}`] = named[name];
+    variables[`--log-ansi-${index}`] = ansi[name];
   const palette = {
     variables: variables as CSSProperties,
     extended: terminalExtendedAnsiPalette(mode),
   };
-  palettes.set(mode, palette);
+  palettes.set(cacheKey, palette);
   return palette;
 }
 

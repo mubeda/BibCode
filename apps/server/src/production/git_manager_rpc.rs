@@ -36,8 +36,8 @@ use crate::{
             tags::{self, GitManagerTagError},
         },
         sign_in::{
-            CredentialPrompt, Destination, SIGN_IN_TIMEOUT, SignInDirection, SignInOutcome,
-            SignInRefusal, SignInSlot, resolve_destination,
+            CredentialPrompt, Destination, ExecutionPlace, SIGN_IN_TIMEOUT, SignInDirection,
+            SignInOutcome, SignInRefusal, SignInSlot, resolve_destination,
         },
         validate_pathspecs,
     },
@@ -107,6 +107,7 @@ impl GitManagerRpcServices {
             trash,
             pull_requests: PullRequestService::default(),
             sign_in: None,
+            place: ExecutionPlace::default(),
         }
     }
 }
@@ -122,6 +123,8 @@ pub struct ConfiguredGitManagerRpcServices {
     pull_requests: PullRequestService,
     /// Set only on the desktop's in-process server (#325).
     sign_in: Option<InteractiveSignIn>,
+    /// Where this server's Git runs, for a failed push's guidance (#343).
+    place: ExecutionPlace,
 }
 
 /// `git.signIn`'s server state: where its neutral repositories go, the single slot, the cap.
@@ -168,6 +171,7 @@ impl Default for ConfiguredGitManagerRpcServices {
             trash: Arc::new(NativeFileTrash::default()),
             pull_requests: PullRequestService::default(),
             sign_in: None,
+            place: ExecutionPlace::default(),
         }
     }
 }
@@ -182,6 +186,13 @@ impl ConfiguredGitManagerRpcServices {
     #[must_use]
     pub fn with_pull_request_service(mut self, pull_requests: PullRequestService) -> Self {
         self.pull_requests = pull_requests;
+        self
+    }
+
+    /// Where this server's Git runs (#343), built once from the server configuration.
+    #[must_use]
+    pub fn with_execution_place(mut self, place: ExecutionPlace) -> Self {
+        self.place = place;
         self
     }
 
@@ -469,6 +480,7 @@ impl ConfiguredGitManagerRpcServices {
                 catalog,
                 input,
                 prompt,
+                services.place.clone(),
                 operation_cancellation.clone(),
             );
             tokio::pin!(operation_future);
@@ -2439,6 +2451,7 @@ mod tests {
                 updated_at: "2026-08-31T00:00:00Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("project projection");
@@ -2534,6 +2547,7 @@ mod tests {
                 updated_at: "2026-08-31T00:00:00Z".to_owned(),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .expect("project projection");

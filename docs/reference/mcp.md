@@ -704,7 +704,7 @@ refuses the next call.
 | `workspace`     | Threads and worktrees            | on      | threads (except `git_status`), worktrees, chat panels and UI suggestions, browser and device previews, clone |
 | `sourceControl` | Source Control and pull requests | on      | `git_status`, every `git_*` tool, pull requests                                                              |
 | `files`         | Files                            | on      | `files_*`                                                                                                    |
-| `diagnostics`   | Diagnostics                      | on      | profiler, environment, process and trace tools                                                               |
+| `diagnostics`   | Diagnostics                      | on      | profiler, environment, process, trace and host tools                                                         |
 | `terminals`     | Terminals                        | off     | `terminal_*`                                                                                                 |
 | (none)          | always on                        | —       | `server_capabilities`, `changes_since`                                                                       |
 
@@ -1144,6 +1144,7 @@ destructive, I idempotent, O open-world. **Keyed** is how a repeat behaves (see
 | `refresh_providers`           | Diagnostics                  | `diagnostics`   | operate              | I     | no             |
 | `process_diagnostics`         | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
 | `trace_diagnostics`           | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
+| `host_metrics`                | Diagnostics                  | `diagnostics`   | read                 | RI    | no             |
 | `server_capabilities`         | Change feed and capabilities | `(none)`        | read                 | RI    | no             |
 | `changes_since`               | Change feed and capabilities | `(none)`        | read                 | RI    | no             |
 | `create_chat_panel`           | Chat panels                  | `workspace`     | operate              | —     | receipt-backed |
@@ -4229,28 +4230,29 @@ The four `profiler_*` tools run the same handlers as the stdio `bibcode profiler
 
 **Finding evidence kept per kind.** Every finding may keep `eventIds`, `crashId`, `crashIds` (citations of the events or crash records that explain it) in addition to the fields below. A kind not listed keeps only the citations.
 
-| Finding kind                                                                | Evidence fields kept                                                                                                                                                      |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crash.native`                                                              | `pid`, `version`, `startedAt`, plus the crash-record fields (see below)                                                                                                   |
-| `crash.unclean-exit`, `shutdown.incomplete`                                 | `pid`, `version`, `startedAt`, `facility`, `exitCause`, `exitNotedAt`, `goneAt`                                                                                           |
-| `crash.oom`, `crash.system`                                                 | `pid`, `version`, `startedAt`                                                                                                                                             |
-| `crash.webview`                                                             | `reason`, `kind`, `exitCode`, `dump`, plus the crash-record fields                                                                                                        |
-| `crash.panic`                                                               | `thread`, `location`                                                                                                                                                      |
-| `subprocess.crash`                                                          | `pid`, `processKind`, `label`, `outcome`, `uptimeMs`, `likelyOom`, `lastRssBytes`, `lastPrivateBytes`, `sampledAgoMs`, plus the crash-record fields                       |
-| `provider.turn-failed`                                                      | `provider`, `terminalReason`, `errorClass`                                                                                                                                |
-| `provider.compaction-failed`                                                | `provider`, `trigger`, `outcome`, `reason`, `durationMs`                                                                                                                  |
-| `memory.leak-suspect`, `memory.leak-likely`                                 | `pid`, `processKind`, `label`, `slopeMbPerH`, `privateBytes`, `metric`, `r2`                                                                                              |
-| `cpu.sustained`                                                             | `pid`, `processKind`, `label`                                                                                                                                             |
-| `rpc.slow`                                                                  | `method`, `outcome`, `slowPart`, `count`, `maxMs`, `tier`, `envId`, `clientId` (aliased), `joinedBy`, `rttMs`, `renderMs`, `serverMs`, `networkMs`, `queuedMs`, `totalMs` |
-| `rpc.hang`                                                                  | `method`, `slowPart`, `elapsedSecs`                                                                                                                                       |
-| `rpc.saturation`                                                            | `slowPart`, `methods` (items keep `method`, `outcome`, `count`, `maxMs`)                                                                                                  |
-| `client.stall`                                                              | `envId`, `clientId` (aliased), `capabilities` (filtered), `windowMs`, `stalls`                                                                                            |
-| `client.interaction`                                                        | `envId`, `clientId` (aliased), `capabilities` (filtered), `windowMs`, `interactions`                                                                                      |
-| `worktree.removal-failed`                                                   | `mode`, `reason`, `durationMs`, `drainTimedOut`, `cancelled`, `capacity`                                                                                                  |
-| `worktree.missing`, `worktree.orphan-dir`, `worktree.registration-mismatch` | `path` (home-relative, relative, or file name)                                                                                                                            |
-| `worktree.stuck-removal`                                                    | `path` (home-relative, relative, or file name), `minutes`                                                                                                                 |
-| `worktree.held-open`                                                        | `path` (home-relative, relative, or file name), `pid`                                                                                                                     |
-| `git.stacked-action-failed`                                                 | `action`, `featureBranch`, `phase`, `reason`, `operation`, `message`, `worktree` (see path policy above), `repeatsInWindow`, `windowMinutes`, `durationMs`                |
+| Finding kind                                         | Evidence fields kept                                                                                                                                                       |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crash.native`                                       | `pid`, `version`, `startedAt`, plus the crash-record fields (see below)                                                                                                    |
+| `crash.unclean-exit`, `shutdown.incomplete`          | `pid`, `version`, `startedAt`, `facility`, `exitCause`, `exitNotedAt`, `goneAt`                                                                                            |
+| `crash.oom`, `crash.system`                          | `pid`, `version`, `startedAt`                                                                                                                                              |
+| `crash.webview`                                      | `reason`, `kind`, `exitCode`, `dump`, plus the crash-record fields                                                                                                         |
+| `crash.panic`                                        | `thread`, `location`                                                                                                                                                       |
+| `subprocess.crash`                                   | `pid`, `processKind`, `label`, `outcome`, `uptimeMs`, `likelyOom`, `lastRssBytes`, `lastPrivateBytes`, `sampledAgoMs`, plus the crash-record fields                        |
+| `provider.turn-failed`                               | `provider`, `terminalReason`, `errorClass`                                                                                                                                 |
+| `provider.compaction-failed`                         | `provider`, `trigger`, `outcome`, `reason`, `durationMs`                                                                                                                   |
+| `memory.leak-suspect`, `memory.leak-likely`          | `pid`, `processKind`, `label`, `slopeMbPerH`, `privateBytes`, `metric`, `r2`                                                                                               |
+| `cpu.sustained`                                      | `pid`, `processKind`, `label`                                                                                                                                              |
+| `rpc.slow`                                           | `method`, `outcome`, `slowPart`, `count`, `maxMs`, `tier`, `envId`, `clientId` (aliased), `joinedBy`, `rttMs`, `renderMs`, `serverMs`, `networkMs`, `queuedMs`, `totalMs`  |
+| `rpc.hang`                                           | `method`, `slowPart`, `elapsedSecs`                                                                                                                                        |
+| `rpc.saturation`                                     | `slowPart`, `methods` (items keep `method`, `outcome`, `count`, `maxMs`)                                                                                                   |
+| `client.stall`                                       | `envId`, `clientId` (aliased), `capabilities` (filtered), `windowMs`, `stalls`                                                                                             |
+| `client.interaction`                                 | `envId`, `clientId` (aliased), `capabilities` (filtered), `windowMs`, `interactions`                                                                                       |
+| `worktree.removal-failed`                            | `mode`, `reason`, `durationMs`, `drainTimedOut`, `cancelled`, `capacity`                                                                                                   |
+| `worktree.missing`, `worktree.registration-mismatch` | `path` (home-relative, relative, or file name)                                                                                                                             |
+| `worktree.orphan-dir`                                | `path` and `name` (home-relative, relative, or file name), `reason` (kept only when it is `creation-record`, `incomplete-removal`, `git-pointer-file` or `removal-marker`) |
+| `worktree.stuck-removal`                             | `path` (home-relative, relative, or file name), `minutes`                                                                                                                  |
+| `worktree.held-open`                                 | `path` (home-relative, relative, or file name), `pid`                                                                                                                      |
+| `git.stacked-action-failed`                          | `action`, `featureBranch`, `phase`, `reason`, `operation`, `message`, `worktree` (see path policy above), `repeatsInWindow`, `windowMinutes`, `durationMs`                 |
 
 The crash-record fields, kept for `crash.native`, `crash.webview` and `subprocess.crash`, are: `source`, `processKind`, `createdAt`, `crashReason`, `faultModule`, `faultOffset`, `recordSource`, `signalOrCode`, `module`, `frames`, `rawRef`, `signal`, `exe`, `crashedAt` (with the path reductions above; `frames` is a list of strings).
 
@@ -4476,6 +4478,35 @@ A summary of the server's local trace: record and failure counts, log counts per
 
 - `McpInvalidArgumentError` - `limit` outside 1 to 20, not an integer, or an unknown argument.
 - Errors of `server.getTraceDiagnostics` are passed through under their own `_tag`.
+
+#### `host_metrics`
+
+The host this server runs on, as the Host dashboard shows it: its system, architecture, core count and memory; the current CPU, memory and volume sizes; and CPU, memory and each volume's used percent since the server started. A mount point is returned only when it is `/` or a drive root such as `C:\`, because any other one can name a user (`/media/<user>/<label>`). Use it to see whether the host is short of CPU, memory or disk space.
+
+- **Set / scope:** Diagnostics · `orchestration:read`
+- **Access:** any level
+- **Annotations:** `readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false`
+- **Retries:** no `clientRequestId` (read-only)
+
+| Argument | Type | Required | Limits and default       | Meaning |
+| -------- | ---- | -------- | ------------------------ | ------- |
+| (none)   |      |          | Any argument is refused. |         |
+
+**Result** (`structuredContent`):
+
+- `host`: `{ os, arch, cpuCount, memoryTotalBytes }`.
+- `startedAt`, `statisticsSince` (string or null).
+- `sample` (null before the first reading): `{ sampledAt, cpuPercent, memoryTotalBytes, memoryUsedBytes, memoryAvailableBytes, volumesPaused, volumes }`; each volume is `{ mountPoint, fileSystem, totalBytes, freeBytes, usedBytes, removable, readOnly, state ("ok"|"notResponding") }`, with `mountPoint` `null` unless it is a file system root.
+- `cpu`, `memory` (null before the first reading): `{ current, minimum, average, p95, maximum }`, in percent.
+- `volumeStatistics[]`: `{ mountPoint, statistic }`, each volume's used percent since start, with `mountPoint` kept by the same rule.
+- `mountPointsWithheld` (integer): how many of `sample.volumes` had their mount point replaced by `null`.
+- `hiddenVolumeCount` (integer): how many volumes the dashboard's filter hid (reasons `network`, `overlay` (container layer), `fileMount`, `system` (system mount), `empty`, `sameStorage`); they are counted, never listed.
+- Not included: volume names, non-root mount points, hidden volumes' paths, the recent and since-start charts, the boot ID.
+
+**Errors:**
+
+- `McpInvalidArgumentError` - any argument.
+- Errors of `server.getHostMetrics` are passed through under their own `_tag`.
 
 #### Example: diagnostics
 

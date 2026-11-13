@@ -459,6 +459,7 @@ impl EmulatorLauncher {
             timeout: ADB_TIMEOUT,
             cleanup_timeout: ADB_CLEANUP_TIMEOUT,
             max_output_bytes: ADB_MAX_OUTPUT_BYTES,
+            stop_policy: crate::process::supervised::StopPolicy::Force,
             overflow: SupervisedOverflow::Truncate,
         };
         match run_supervised(request, cancel).await {

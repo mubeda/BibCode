@@ -1347,6 +1347,28 @@ async fn create_managed_worktree_locked(
                 None,
             ))
         })?;
+        let repositories = services.orchestration.repositories();
+        if let Err(error) = repositories
+            .record_worktree_creation(&project.workspace_root, &created.worktree.path)
+            .await
+        {
+            tracing::error!(%error, "managed worktree creation could not record the worktree");
+            let rollback = repository
+                .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
+                .await;
+            let detail = match rollback {
+                Ok(()) => format!("The worktree creation could not be recorded: {error}"),
+                Err(rollback) => format!(
+                    "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
+                    rollback.detail
+                ),
+            };
+            return Err(encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                detail,
+                None,
+            )));
+        }
         let terminal_cancellation = CancellationToken::new();
         let dispatch = services
             .orchestration
@@ -1366,6 +1388,7 @@ async fn create_managed_worktree_locked(
                     branch: Some(created.worktree.ref_name.clone()),
                     worktree_path: Some(created.worktree.path.clone()),
                     created_at: now_iso(),
+                    code_review: false,
                 },
                 CommandAdmission {
                     payload_digest,
@@ -1380,6 +1403,13 @@ async fn create_managed_worktree_locked(
             let rollback = repository
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
                 .await;
+            if rollback.is_ok()
+                && let Err(error) = repositories
+                    .delete_worktree_creation_record(&created.worktree.path)
+                    .await
+            {
+                tracing::warn!(%error, "a rolled-back worktree kept its creation record");
+            }
             let detail = match rollback {
                 Ok(()) => error.to_string(),
                 Err(rollback) => format!(
@@ -1513,6 +1543,7 @@ async fn create_worktree_panel(
                                     kind: Some("panel".to_owned()),
                                     host_thread_id: Some(host.thread_id),
                                     side_chat: input.side_chat,
+                                    code_review: input.code_review,
                                     purpose: input.purpose,
                                     model_selection: input.thread_defaults.model_selection,
                                     runtime_mode: input.thread_defaults.runtime_mode,
@@ -1805,6 +1836,8 @@ struct ResolvedRemovalPlan {
 struct ResolvedRemovalThread {
     path: PathBuf,
     known_thread_ids: Vec<String>,
+    /// The worktree path as stored, the key of the worktree's creation record.
+    creation_record: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -2375,6 +2408,15 @@ async fn remove_worktree_owned(
                 .map_err(encode)?;
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
+                // The folder is gone. A failed delete is reaped by the next worktree audit.
+                if let Err(error) = services
+                    .orchestration
+                    .repositories()
+                    .delete_worktree_creation_record(&resolved.creation_record)
+                    .await
+                {
+                    tracing::warn!(%error, "a removed worktree kept its creation record");
+                }
                 services
                     .catalog
                     .invalidate_repository_after_mutation(&input.project_id)
@@ -2510,6 +2552,7 @@ async fn resolve_removal_thread(
     Ok(ResolvedRemovalThread {
         path,
         known_thread_ids,
+        creation_record: persisted_path.to_string_lossy().into_owned(),
     })
 }
 
@@ -3375,6 +3418,7 @@ async fn update_discovery_policy_locked(
         workspace_root: None,
         default_model_selection: OptionalNullable::Missing,
         scripts: None,
+        code_review_prompt: None,
         worktree_discovery: Some(policy_value.clone()),
     };
     if legacy_receipt {
@@ -3499,6 +3543,10 @@ struct WorktreeCreatePanelInput {
     /// digest of a receipt stored before side chats existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     side_chat: bool,
+    /// A code review panel (#293). Omitted when false, so a plain panel request keeps the
+    /// digest of a receipt stored before code reviews existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    code_review: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4193,6 +4241,7 @@ mod mutation_invalidation_tests {
                     branch: Some("feature/remove".to_owned()),
                     worktree_path: Some(self.linked.to_string_lossy().into_owned()),
                     created_at: "2026-08-23T00:00:01Z".to_owned(),
+                    code_review: false,
                 })
                 .await
                 .expect("thread created");
@@ -5344,6 +5393,251 @@ mod mutation_invalidation_tests {
         fixture.shutdown().await;
     }
 
+    fn managed_create_payload(command_id: &str, ref_name: &str) -> serde_json::Value {
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "threadId":format!("{command_id}-thread"),
+            "title":"Managed",
+            "refName":ref_name,
+            "newRefName":null,
+            "baseRefName":null,
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        })
+    }
+
+    async fn create_managed(
+        fixture: &HandlerFixture,
+        command_id: &str,
+        ref_name: &str,
+    ) -> super::RpcResult {
+        create_managed_worktree(
+            &fixture.services,
+            request(
+                "worktree.createManaged",
+                managed_create_payload(command_id, ref_name),
+            ),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn creation_records(fixture: &HandlerFixture) -> Vec<String> {
+        fixture
+            .engine
+            .repositories()
+            .list_worktree_creation_records()
+            .await
+            .expect("creation records")
+            .into_iter()
+            .map(|record| record.worktree_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn worktree_creation_record_follows_create_and_remove() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/recorded"]);
+        let created = create_managed(&fixture, "create-recorded", "feature/recorded")
+            .await
+            .expect("managed creation succeeds");
+        let path = created["path"].as_str().expect("created path").to_owned();
+        assert_eq!(
+            creation_records(&fixture).await,
+            std::slice::from_ref(&path)
+        );
+
+        create_managed(&fixture, "create-missing", "feature/does-not-exist")
+            .await
+            .expect_err("a missing ref fails the creation");
+        assert_eq!(
+            creation_records(&fixture).await,
+            std::slice::from_ref(&path),
+            "a failed creation writes no record"
+        );
+
+        fixture
+            .catalog
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("catalog includes the created worktree");
+        let plan = get_removal_plan(
+            &fixture.services,
+            request(
+                "worktree.getRemovalPlan",
+                json!({"projectId":"project-1","threadId":"create-recorded-thread"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal plan");
+        remove_worktree(
+            &fixture.services,
+            request(
+                "worktree.remove",
+                json!({
+                    "commandId":"remove-recorded", "projectId":"project-1",
+                    "threadId":"create-recorded-thread", "mode":"delete-git-worktree",
+                    "expectedGeneration":plan["generation"], "planToken":plan["planToken"],
+                    "forceDirty":false, "confirmRepositoryWidePrune":false
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal succeeds");
+        assert!(!Path::new(&path).exists(), "the worktree folder is gone");
+        assert!(
+            creation_records(&fixture).await.is_empty(),
+            "the record ends with the worktree"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_worktree_record_ends_with_its_catalog_removal() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        // As a turn's bootstrap creates a worktree: the record keeps the project root the
+        // client sent, here with a trailing separator, and the thread the created path.
+        let created = GitRepository::default()
+            .ensure_worktree(
+                crate::git::CreateWorktreeInput {
+                    cwd: fixture.main.clone(),
+                    ref_name: "main".to_owned(),
+                    new_ref_name: Some("bibcode/bootstrap".to_owned()),
+                    base_ref_name: None,
+                    path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("bootstrap worktree");
+        let path = created.worktree.path.clone();
+        fixture
+            .engine
+            .repositories()
+            .record_worktree_creation(&format!("{}/", fixture.main.to_string_lossy()), &path)
+            .await
+            .expect("creation record");
+        fixture
+            .engine
+            .dispatch(OrchestrationCommand::ThreadCreate {
+                command_id: "bootstrap-create".to_owned(),
+                thread_id: "bootstrap-thread".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Bootstrap".to_owned(),
+                kind: Some("workspace".to_owned()),
+                host_thread_id: None,
+                side_chat: false,
+                purpose: None,
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: Some(created.worktree.ref_name.clone()),
+                worktree_path: Some(path.clone()),
+                created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
+            })
+            .await
+            .expect("thread created");
+        fixture
+            .catalog
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("catalog includes the bootstrap worktree");
+        let plan = get_removal_plan(
+            &fixture.services,
+            request(
+                "worktree.getRemovalPlan",
+                json!({"projectId":"project-1","threadId":"bootstrap-thread"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal plan");
+        remove_worktree(
+            &fixture.services,
+            request(
+                "worktree.remove",
+                json!({
+                    "commandId":"remove-bootstrap", "projectId":"project-1",
+                    "threadId":"bootstrap-thread", "mode":"delete-git-worktree",
+                    "expectedGeneration":plan["generation"], "planToken":plan["planToken"],
+                    "forceDirty":false, "confirmRepositoryWidePrune":false
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("removal succeeds");
+        assert!(!Path::new(&path).exists(), "the worktree folder is gone");
+        assert!(
+            creation_records(&fixture).await.is_empty(),
+            "the record ends with the worktree, whatever the project spelling"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_creation_whose_record_cannot_be_written_fails_and_leaves_no_worktree() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/unrecorded"]);
+        fixture
+            .engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute_batch("DROP TABLE worktree_creation_records")?;
+                Ok(())
+            })
+            .await
+            .expect("records table removed");
+        let managed = GitRepository::default()
+            .managed_worktree_parent(&fixture.main)
+            .await
+            .expect("managed worktree directory");
+
+        create_managed(&fixture, "create-unrecorded", "feature/unrecorded")
+            .await
+            .expect_err("an unwritable record fails the creation");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&managed)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "no worktree folder: {leftovers:?}");
+        let inventory = GitRepository::default()
+            .worktree_inventory(&fixture.main, &CancellationToken::new())
+            .await
+            .expect("repository remains readable");
+        assert_eq!(
+            inventory.records.len(),
+            1,
+            "Git lists only the primary checkout: {:?}",
+            inventory.records
+        );
+        assert!(
+            fixture
+                .engine
+                .repositories()
+                .get_thread("create-unrecorded-thread".to_owned())
+                .await
+                .expect("thread read")
+                .is_none(),
+            "no workspace thread owns the path"
+        );
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn removal_invalidates_only_after_accepted_terminal_receipt() {
         let entered = Arc::new(Semaphore::new(0));
@@ -5381,6 +5675,7 @@ mod mutation_invalidation_tests {
                 branch: Some("feature/remove".to_owned()),
                 worktree_path: Some(linked.to_string_lossy().into_owned()),
                 created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
             })
             .await
             .expect("thread created");
@@ -5545,6 +5840,52 @@ mod mutation_invalidation_tests {
                 .side_chat
         );
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_thread_panel_is_marked_and_survives_replay() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        create_host(&fixture).await;
+        let mut review = panel_request("review", None);
+        review["codeReview"] = json!(true);
+        let created = create_panel(&fixture, review.clone())
+            .await
+            .expect("review panel created");
+        assert_eq!(created["threadId"], "review-thread");
+        let thread = fixture
+            .engine
+            .repositories()
+            .get_thread("review-thread".to_owned())
+            .await
+            .expect("review panel read")
+            .expect("review panel exists");
+        assert_eq!(thread.kind, "panel");
+        assert!(thread.code_review);
+        assert!(!thread.side_chat);
+        assert_eq!(thread.host_thread_id.as_deref(), Some("host-thread"));
+        // The same command id replays the same thread; dropping the marker is another request.
+        assert_eq!(
+            create_panel(&fixture, review).await.expect("replay")["threadId"],
+            "review-thread"
+        );
+        let conflict = create_panel(&fixture, panel_request("review", None))
+            .await
+            .expect_err("a changed marker conflicts");
+        assert_eq!(conflict["reason"], "command-conflict");
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn code_review_thread_plain_panel_keeps_its_receipt_digest() {
+        let old_format = panel_request("old", None);
+        let mut explicit_false = panel_request("old", None);
+        explicit_false["codeReview"] = json!(false);
+        let decoded: super::WorktreeCreatePanelInput =
+            serde_json::from_value(explicit_false).expect("decode");
+        assert_eq!(
+            crate::orchestration::canonical_command_digest(&decoded).expect("digest"),
+            crate::orchestration::canonical_command_digest(&old_format).expect("old digest"),
+        );
     }
 
     #[tokio::test]

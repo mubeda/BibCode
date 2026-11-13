@@ -24,8 +24,10 @@ use crate::{
     crypto::sha256_hex,
     diagnostic_bundle::{DiagnosticBundleIdentity, DiagnosticBundleService},
     diagnostics::{
-        DesktopUiProcessObserver, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionRegistry, TraceDiagnosticsStore, bound_diagnostic_string,
+        DesktopUiProcessObserver, DiagnosticsMonitor, HostMetricsCollector, HostMetricsIdentity,
+        HostMetricsRates, NativeProcessSampler, NativeResourceSampler, ProcessAttributionRegistry,
+        TraceDiagnosticsStore, bound_diagnostic_string,
+        host_metrics::NativeHostMetricsSource,
         profiler::{
             crash::MonitorDetector,
             latency::LatencyDetector,
@@ -144,12 +146,17 @@ pub struct ProductionRuntime {
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
     clone_operations: CloneRuntime,
+    /// The server's repository, whose Git writes shutdown stops (R17).
+    git_repository: Arc<GitRepository>,
     status_broadcaster: crate::git::StatusBroadcaster,
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
+    /// The host collector behind the Host dashboard (#292): always on from the start (D22).
+    host_metrics: Arc<HostMetricsCollector>,
     profiler: Arc<ProfilerRuntime>,
-    update_quiesced: tokio::sync::Mutex<bool>,
+    /// Whether an earlier quiesce stopped the services; later calls only settle the Git writes.
+    services_stopped: tokio::sync::Mutex<bool>,
 }
 
 pub fn finalize_rpc_registry(
@@ -529,6 +536,8 @@ impl ProductionRuntime {
             catalog: worktree_catalog.clone(),
             repositories: repositories.clone(),
         });
+        // Where Git runs, named by a failed push (#343).
+        let execution_place = crate::git::sign_in::execution_place(config);
         let pull_requests = PullRequestsRpcServices::with_dependencies(
             config.state_dir(),
             repositories.clone(),
@@ -544,7 +553,8 @@ impl ProductionRuntime {
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone())
         .with_mcp_settings(control.mcp_server_signal())
-        .with_interactive_git_sign_in(config.interactive_git_sign_in);
+        .with_interactive_git_sign_in(config.interactive_git_sign_in)
+        .with_execution_place(execution_place.clone());
         let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
             git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
         } else {
@@ -611,6 +621,14 @@ impl ProductionRuntime {
             resource_sampler.clone(),
             Duration::from_secs(2),
         ));
+        let host_metrics = Arc::new(HostMetricsCollector::new(
+            Arc::new(NativeHostMetricsSource::new()),
+            HostMetricsRates::default(),
+            HostMetricsIdentity {
+                boot_id: config.boot_id.map(|id| id.to_string()),
+                started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+            },
+        ));
         let provider_usage =
             ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
         let relay = relay_client_service(config.state_dir());
@@ -637,7 +655,8 @@ impl ProductionRuntime {
         )
         .with_workspace_admission(workspace_availability.clone(), repositories.clone())
         .with_profiler(&profiler)
-        .with_environment_id(&config.environment_id);
+        .with_environment_id(&config.environment_id)
+        .with_host_metrics(host_metrics.clone());
         terminal_services.watch_workspace_changes(orchestration.subscribe_events());
         let worktree_runtime = WorktreeRuntime::start(
             orchestration.clone(),
@@ -723,7 +742,8 @@ impl ProductionRuntime {
             repositories.clone(),
             workspace_availability.clone(),
             file_trash,
-        );
+        )
+        .with_execution_place(execution_place);
         let git_manager = if config.interactive_git_sign_in {
             git_manager.with_interactive_git_sign_in(&config.state_dir())
         } else {
@@ -794,6 +814,8 @@ impl ProductionRuntime {
         );
         mcp_control.attach_terminals(mcp_terminals);
 
+        // Last before the runtime exists, so a failed start leaves no collector running.
+        host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,
@@ -825,12 +847,14 @@ impl ProductionRuntime {
             worktree_runtime,
             worktree_removal_tasks,
             clone_operations,
+            git_repository,
             status_broadcaster,
             workspace,
             _resource_sampler: resource_sampler,
             process_monitor,
+            host_metrics,
             profiler,
-            update_quiesced: tokio::sync::Mutex::new(false),
+            services_stopped: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -960,10 +984,19 @@ impl ProductionRuntime {
         })
     }
 
+    /// `Err` while a Git write is still stopping; a leftover `index.lock` BiBCode could not
+    /// delete is logged and does not block the update. Each call decides from the current
+    /// writes and locks.
     pub async fn quiesce_for_update(&self) -> Result<(), String> {
-        let mut quiesced = self.update_quiesced.lock().await;
-        if *quiesced {
-            return Ok(());
+        let mut services_stopped = self.services_stopped.lock().await;
+        if *services_stopped {
+            // The services stopped on an earlier call: only the Git writes and their leftover
+            // locks are checked again.
+            let writes = self.stop_git_writes().await;
+            self.end_profiler_session(&writes).await;
+            return writes
+                .map(drop)
+                .map_err(|pending| format!("{pending} Git writes had not stopped"));
         }
         // Each step is timed, so a slow stop names the step that took the time (#303).
         let mut steps = StopSteps::start("quiesce");
@@ -983,6 +1016,9 @@ impl ProductionRuntime {
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
+        // Never waits for a disk read: the disk threads are not joined (D32).
+        self.host_metrics.shutdown().await;
+        steps.mark("host-metrics");
         // Waits for a running tool update, which must not be killed mid-replacement, and
         // before the profiler's teardown.
         self.server_control.shutdown_tool_updates().await;
@@ -1037,6 +1073,16 @@ impl ProductionRuntime {
             first_error = Some(error);
         }
         steps.mark("provider-runtime");
+        // After every owner above that starts Git writes (worktree, clone, turn, checkpoint
+        // and provider work), and before terminal ownership cleanup and the profiler's
+        // teardown: later writes are refused, and each running write is stopped and its
+        // leftover `index.lock` removed (R17). On Windows, where the stop is forced, only this
+        // cleanup removes the lock.
+        let writes = self.stop_git_writes().await;
+        if let Err(pending) = writes {
+            first_error.get_or_insert_with(|| format!("{pending} Git writes had not stopped"));
+        }
+        steps.mark("git-writes");
         self.terminal_services
             .shutdown_with_process_ownership(process_ownership)
             .await;
@@ -1052,19 +1098,53 @@ impl ProductionRuntime {
         steps.mark("orchestration");
         // Recorded while the profiler still runs; its own teardown below is logged only.
         steps.emit();
+        *services_stopped = true;
         // Last, so the events and panics of every other service's shutdown are recorded, and a
         // crash anywhere in the shutdown still reads as a crash on the next start.
-        self.profiler.end_session().await;
+        self.end_profiler_session(&writes).await;
         steps.mark("profiler-end-session");
-        *quiesced = true;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
+    /// Stops every Git write, waiting twice, and logs each leftover lock still there.
+    async fn stop_git_writes(&self) -> Result<Vec<String>, usize> {
+        let mut writes = self.git_repository.stop_writes().await;
+        if let Err(pending) = writes {
+            tracing::error!(pending, "Git writes were still stopping at shutdown");
+            writes = self.git_repository.stop_writes().await;
+        }
+        match &writes {
+            Err(pending) => tracing::error!(
+                pending,
+                "Git writes were still stopping after a second wait"
+            ),
+            Ok(worktrees) => {
+                for worktree in worktrees {
+                    tracing::error!(%worktree, "a leftover index.lock could not be removed");
+                }
+            }
+        }
+        writes
+    }
+
+    /// While a write is still stopping the Profiler keeps running, so a later call can still
+    /// record its end. A leftover lock ends the session as an incomplete shutdown.
+    async fn end_profiler_session(&self, writes: &Result<Vec<String>, usize>) {
+        match writes {
+            Err(_) => {}
+            Ok(worktrees) if worktrees.is_empty() => self.profiler.end_session().await,
+            Ok(_) => self.profiler.shutdown().await,
+        }
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.quiesce_for_update().await;
+        // Releases the Profiler even when a Git write never stopped; its session then reads
+        // as an incomplete shutdown on the next start.
+        self.profiler.shutdown().await;
     }
 }
 
@@ -2899,6 +2979,55 @@ mod tests {
             .expect("thread moved");
         readmission_after(&terminal, created).await;
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn host_metrics_start_with_the_runtime_and_stop_in_quiesce() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+
+        // Always on (D22, option c): a first background reading without any stream.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.host_metrics.snapshot().await.current.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collector took no reading within 2 s of the runtime start"
+            );
+        }
+        assert_eq!(runtime.host_metrics.live_subscribers(), 0);
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        let mut subscription = runtime.host_metrics.subscribe();
+        let changed = timeout(
+            std::time::Duration::from_secs(2),
+            subscription.receiver().changed(),
+        )
+        .await
+        .expect("a stopped collector answers at once");
+        assert!(
+            changed.is_err(),
+            "the collector still publishes after quiesce"
+        );
+        assert!(subscription.receiver().borrow().is_none());
     }
 
     #[tokio::test]
@@ -5430,5 +5559,234 @@ mod tests {
         };
         quiesce_leaves_open_diff_apps_running(ProcessTreeCleanup::StandaloneServer).await;
         isolated.complete();
+    }
+
+    /// R17: a Git write still running at shutdown is stopped, and its `index.lock` is gone when
+    /// quiescence returns. The write is a `git add` whose clean filter never finishes.
+    async fn start_quiesce_runtime(state: &TempDir) -> ProductionRuntime {
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime")
+    }
+
+    /// A write whose stop outlasts both shutdown waits keeps quiescence incomplete: a later
+    /// call waits for it again and succeeds only once it has settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_never_succeeds_while_a_write_is_pending() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let write = runtime.git_repository.hold_write_for_test();
+
+        let first = runtime.quiesce_for_update().await;
+        let second = runtime.quiesce_for_update().await;
+
+        assert!(
+            first.is_err(),
+            "the first quiesce reports the pending write"
+        );
+        assert!(
+            second.is_err(),
+            "a second quiesce must not succeed while the write is pending"
+        );
+        drop(write);
+        runtime
+            .quiesce_for_update()
+            .await
+            .expect("quiesced once the write settled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_stops_a_running_git_write() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+
+        let git_config = crate::test_support::isolated_git_config::IsolatedGitConfig::new();
+        let repository = state.path().join("repository");
+        let started = state.path().join("filter-started");
+        std::fs::create_dir(&repository).expect("repository");
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            git_config.apply_to_command(&mut command);
+            let output = command
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "config",
+            "filter.slow.clean",
+            &format!(
+                "touch '{}'; sleep 30; cat",
+                started.to_string_lossy().replace('\\', "/")
+            ),
+        ]);
+        std::fs::write(repository.join(".gitattributes"), "held.txt filter=slow\n")
+            .expect(".gitattributes");
+        std::fs::write(repository.join("held.txt"), "held\n").expect("held.txt");
+        let lock = repository.join(".git").join("index.lock");
+
+        let write = tokio::spawn({
+            let (git_repository, repository) = (runtime.git_repository.clone(), repository.clone());
+            async move {
+                git_repository
+                    .stage_files(
+                        &repository,
+                        &["held.txt".to_owned()],
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.exists() {
+            assert!(std::time::Instant::now() < deadline, "the write started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(lock.exists(), "the write holds index.lock");
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        assert!(!lock.exists(), "no index.lock remains after quiescence");
+        assert_eq!(session_state(&state), "clean");
+        let staged = timeout(std::time::Duration::from_secs(1), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(staged.is_err(), "the stopped write failed: {staged:?}");
+    }
+
+    /// The Profiler session's recorded state: `clean`, or `stopping` for an incomplete
+    /// shutdown.
+    fn session_state(state: &TempDir) -> String {
+        let session = crate::diagnostics::profiler::profiler_dir(
+            &ServerConfig::new(state.path()).state_dir(),
+        )
+        .join("session.json");
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(session).expect("session record"))
+                .expect("session JSON");
+        record["state"].as_str().expect("session state").to_owned()
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A leftover lock BiBCode could not delete does not block an update. Quiescence succeeds,
+    /// logs an error naming the worktree, and a later quiesce checks the lock again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_quiesce_succeeds_with_a_leftover_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return;
+        }
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let worktree = state.path().join("worktree");
+        let git_dir = worktree.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("Git directory");
+        let lock = git_dir.join("index.lock");
+        std::fs::write(&lock, "").expect("the leftover lock");
+        runtime.git_repository.leave_lock_for_test(&lock, &worktree);
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
+        let log = CapturedLog::default();
+        let logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let first = runtime.quiesce_for_update().await;
+        let second = runtime.quiesce_for_update().await;
+
+        drop(logging);
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("writable Git directory");
+        assert_eq!(first, Ok(()), "a leftover lock does not block the update");
+        assert_eq!(second, Ok(()), "a later quiesce still succeeds");
+        assert!(lock.exists(), "the lock could not be removed");
+        assert_eq!(
+            session_state(&state),
+            "stopping",
+            "the shutdown was incomplete"
+        );
+        let log = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("utf8");
+        let named = crate::diagnostics::profiler::redact::redact_path(&worktree.to_string_lossy());
+        assert_eq!(
+            log.matches(named.as_str()).count(),
+            2,
+            "each quiesce names the worktree in an error:\n{log}"
+        );
+    }
+
+    /// A plain shutdown whose Git write never stops still releases the Profiler, so the next
+    /// server can record to the same state directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_shutdown_with_a_pending_write_releases_the_profiler() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let _write = runtime.git_repository.hold_write_for_test();
+
+        runtime.shutdown().await;
+
+        assert_eq!(
+            session_state(&state),
+            "stopping",
+            "the shutdown was incomplete"
+        );
+        let state_dir = ServerConfig::new(state.path()).state_dir();
+        let status = tokio::task::spawn_blocking(move || {
+            ProfilerRuntime::start(&state_dir, tokio::sync::watch::channel(false).1, Vec::new())
+                .status()
+        })
+        .await
+        .expect("the next Profiler starts");
+        assert_eq!(status["capabilities"]["storage"], "ok", "{status}");
     }
 }

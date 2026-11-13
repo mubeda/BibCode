@@ -24,7 +24,7 @@ pub const DEFAULT_PORT: u16 = 3773;
 
 /// The label desktop-owned servers declare, and the default for embedders that
 /// build a [`ServerConfig`] directly.
-const LOCAL_ENVIRONMENT_LABEL: &str = "Local";
+pub(crate) const LOCAL_ENVIRONMENT_LABEL: &str = "Local";
 
 /// This machine's hostname, trimmed, or `None` when the host reports none.
 pub(crate) fn machine_host_name() -> Option<String> {

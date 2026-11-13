@@ -25,6 +25,10 @@ import {
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 
+/** Longest stored review prompt (user or project), in UTF-16 units (#293). */
+export const CODE_REVIEW_PROMPT_MAX_LENGTH = 7_680;
+const CodeReviewPrompt = Schema.String.check(Schema.isMaxLength(CODE_REVIEW_PROMPT_MAX_LENGTH));
+
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",
@@ -308,6 +312,8 @@ export const OrchestrationProject = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),
@@ -624,6 +630,8 @@ export const OrchestrationThread = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293): it offers no Implement; sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** The outside agent that created the thread and why; absent for a person's thread. */
   requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -675,6 +683,8 @@ export const OrchestrationProjectShell = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   /**
@@ -720,6 +730,8 @@ export const OrchestrationThreadShell = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293): it offers no Implement; sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** The outside agent that created the thread and why; absent for a person's thread. */
   requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -963,6 +975,7 @@ const ProjectMetaUpdateCommand = Schema.Struct({
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
   worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
 });
 
 const ClientProjectMetaUpdateCommand = Schema.Struct({
@@ -973,6 +986,7 @@ const ClientProjectMetaUpdateCommand = Schema.Struct({
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
 });
 
 const ProjectDeleteCommand = Schema.Struct({
@@ -1509,6 +1523,8 @@ export const ProjectCreatedPayload = Schema.Struct({
       }),
     ),
   ),
+  /** The project's review prompt; `""` falls through to the user's and the built-in one. */
+  codeReviewPrompt: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1521,6 +1537,7 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
   worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
+  codeReviewPrompt: Schema.optional(CodeReviewPrompt),
   updatedAt: IsoDateTime,
 });
 
@@ -1542,6 +1559,8 @@ export const ThreadCreatedPayload = Schema.Struct({
   hostThreadId: Schema.optional(ThreadId),
   /** A `panel` that is a side chat of its host (#265); sent only when true. */
   sideChat: Schema.optional(Schema.Boolean),
+  /** A `panel` started as a code review (#293); sent only when true. */
+  codeReview: Schema.optional(Schema.Boolean),
   /** Why an outside agent created the thread; its actor is in the event's metadata. */
   purpose: Schema.optional(Schema.String),
   branch: Schema.NullOr(TrimmedNonEmptyString),

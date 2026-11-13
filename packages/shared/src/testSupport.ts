@@ -8,6 +8,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     repositoryIdentity: false,
     terminalOrderedInput: false,
     terminalSizeOwnership: false,
+    terminalUserInputClaim: false,
     terminalImagePaste: false,
     pullRequestCreateOptions: false,
     worktreeCatalog: false,
@@ -44,8 +45,10 @@ export function makeTestExecutionEnvironmentCapabilities(
     webhookBearerToken: false,
     webhookStatusKinds: false,
     sideChats: false,
+    codeReviews: false,
     conversationOnlyRewind: false,
     threadDeleteOnlyIfUnused: false,
+    hostMetrics: false,
     ...overrides,
   };
 }

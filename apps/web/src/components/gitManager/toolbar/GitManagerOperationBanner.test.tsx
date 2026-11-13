@@ -30,7 +30,34 @@ afterEach(async () => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
 });
 
+const REMOTE_PUSH_GUIDANCE =
+  "Push ran on the remote server example-server. In a terminal on example-server, open this repository as the user that runs BiBCode and run `git push` to sign in to Git. Then retry the push in BiBCode.";
+const GIT_USERNAME_LINE =
+  "fatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled";
+const REMOTE_PUSH_FAILURE = `${REMOTE_PUSH_GUIDANCE}\n\n${GIT_USERNAME_LINE}`;
+
+/** The element showing the failure keeps both paragraphs on their own lines. */
+function expectMultiLineFailure(root: ParentNode): void {
+  const shown = [...root.querySelectorAll("p")].find((element) =>
+    element.textContent?.includes(REMOTE_PUSH_GUIDANCE),
+  );
+  expect(shown?.textContent).toContain(REMOTE_PUSH_FAILURE);
+  expect(shown?.classList).toContain("whitespace-pre-line");
+  expect(shown?.classList).toContain("select-text");
+}
+
 describe("GitManagerOperationBanner", () => {
+  it("a failed push shows a multi-line message with its lines kept", async () => {
+    await emit({
+      _tag: "failed",
+      operation: "push",
+      code: "authentication",
+      message: REMOTE_PUSH_FAILURE,
+      blocked: null,
+    });
+    expectMultiLineFailure(document);
+  });
+
   it("tracks started, chunked output, finished and failed events", async () => {
     await emit({ _tag: "started", operation: "fetch" });
     expect(document.querySelector('[role="status"]')?.textContent).toContain("fetch");

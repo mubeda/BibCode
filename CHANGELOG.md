@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Diagnostics
+
+- Each environment has a Host dashboard (the environment card's menu, Settings > Remote Servers, and the status bar's Resource Manager) with its host's CPU, memory and volumes, live and since the server started. It lists the volumes it hides and why, shows per-volume statistics, never reads network volumes, and says when the volume list is not answering. Agents can read the same figures with the `host_metrics` MCP tool. (#292)
+
+### Pipelines
+
+- Stage, layer and Jobs headers in the pipeline detail view now read as group labels on their own strip, apart from the job rows below them, in the wide and the stacked layout; each is still one heading with its status, name and job count. (#340)
+
+### Git
+
+- A push that fails for missing credentials on a remote server now says that Git ran on that server, names it, and tells you to run `git push` in a terminal there; Source Control and the Git Manager show the same guidance. (#343)
+- Background status reads no longer take Git's index lock, so your own `git add` or `git commit` in a terminal no longer fails with "index.lock: File exists" while BiBCode is open. On Linux and macOS BiBCode asks Git to stop before it forces it; on Windows it forces it as before. Either way it then removes an `index.lock` that its own stopped process left and that nothing else is using, including when it quits. (#341)
+- Local status for a worktree is delivered while a stacked action or a Git Manager push, publish, force push or remote branch delete waits on the network. Writes stay one at a time; pull and fetch still wait. (#345)
+- The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
+- Create worktree starts fresh every time it opens, after a creation or a close: the last Name, Create From, mode, base override, Advanced, Create more and agent pick no longer come back. Input stays while the dialog is open, and Create more still keeps the project, mode, agent and base override for its batch. (#346)
+- Source Control has a **Review changes** button that starts a code review of your branch and its uncommitted changes in a chat panel beside the thread or in an AI Terminal. A Claude review starts in Claude's plan mode, a Codex review runs in Codex's read-only sandbox, other chat agents ask before edits or are only told not to edit, and Settings → Agents and the button's tooltip say which applies. A review's findings offer no Implement. The review prompt can be set per user in Settings → Agents and per project from the button's menu, which also starts a review once with another agent or with added instructions. Mod+Alt+Shift+R starts a review from the keyboard. On Windows, a terminal review gets the prompt with its line breaks as spaces. (#293)
+
+### Chats
+
+- A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. A chat whose provider is disabled or removed now says so above the composer and keeps Send unavailable, and **Add as project** in Files opens the new Main on your Default Agent instead of Codex. (#347)
+
+### Files
+
+- Markdown opens editable in rendered view, with a formatting group in the Files toolbar (paragraph, headings 1 to 5, bold, italic, strikethrough, bullet, numbered and task lists, block quote, a link dialog, Insert image next to the file, collapsible section). Undo and Redo work in both views and a save changes only what you edited; frontmatter and constructs the editor cannot represent stay as written or read-only. (#342)
+- Images a Markdown file links by a relative path show in the editable rendered view, read from the project relative to the file, in the desktop app, the browser and remote environments; an inserted image shows at once, and a path outside the project is not read. (#345)
+- Ticking a task checkbox in a read-only Markdown or `.mdx` file keeps the file's source Undo history. (#342)
+- Mermaid diagrams in an editable rendered Markdown file are drawn again, as one block that is not edited in place; the file's source is kept as written. (#342)
+- The Linux AppImage now carries its own GStreamer plugins for the audio Files previews in WAV, MP3, Ogg, WebM and FLAC files, instead of relying on the system's plugins, which its bundled GStreamer cannot load on newer distributions. M4A is not covered: its AAC decoder is not bundled.
+- A PDF preview in the Files panel is no longer blocked by the page's content security policy in Chromium-based webviews and browsers: the Windows desktop app, and browser mode in Chrome or Edge.
+
+### Appearance
+
+- Settings > Appearance lists six built-in themes (Tokyo Night, Matrix Dark, Matrix Light, Verdant Light and the existing Light and Dark) and lets you duplicate, edit with a live preview, import, export and delete custom themes, with contrast warnings. New terminal sessions and the pipeline job log can follow the theme's terminal colors, and a theme can also set scrollbars, focus rings, control shadows and selected rows. (#290)
+- Clicking a theme row applies it and, when the theme's base differs from the mode on screen, switches the mode with an Undo that restores the previous mode and theme. (#290)
+- The left panel draws its repository, environment, primary checkout, worktree and chat rows as five visually distinct levels in every built-in theme, and a theme can style each level. (#290)
+- On the desktop app, exporting a theme or plan opens the native Save dialog, and closing, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel. (#290, #342)
+
+### Terminals
+
+- When you return to a Claude AI Terminal on a macOS or Linux server after it printed more than BiBCode keeps for a redraw (1 MiB or 5,000 lines, or 512 KiB in the client), BiBCode asks Claude to redraw its screen, the way it does when resumed, so characters missing from the replay come back. This is a best-effort repaint for Claude terminals BiBCode starts, not a rebuild of the terminal's state; other programs and Windows servers still need a panel resize, and a Claude session you suspended in that terminal resumes. (#348)
+- A terminal that kept an old row count, so an AI CLI lost its bottom lines or footer until you changed the panel's width, now corrects itself: the server confirms each size in order with the output, a size it did not apply never resizes the view, and a window whose connection dropped gets the terminal's size back when it reconnects, unless someone typed in the other window meanwhile. (#348)
+- A terminal laid out with no width or height, such as a center terminal behind a maximized right panel, keeps its size instead of resizing its program to 2 columns or 1 row. (#348)
+- A terminal refits when the display scale changes, for example after moving the window to another display, so a bottom row clipped by the new scale's row height no longer stays cut off until a panel is resized. (#348)
+- When resizing a terminal's program fails, BiBCode retries it a few times, so the program no longer keeps its old size, with its bottom rows cut off, until the next panel resize or keypress. (#348)
+- Opening, collapsing or dragging a panel no longer resizes its terminal's program to 2 or 5 columns on the way: a terminal takes a new size once its panel holds still for a moment, and a small panel that holds still still sizes it. (#348)
+- A terminal that was off-screen or hidden while its program kept printing after its rows shrank comes back showing its last lines and footer, instead of a view stuck rows above them until you changed a panel's size; a terminal you had scrolled up to read stays where you left it. (#348)
+- When two windows, for example on two machines, show the same terminal, the window you last used sizes it and the other one shows the whole terminal scaled down to fit instead of cutting off its bottom rows; a window nobody is clicking or typing in, such as an idle server host window, no longer takes the size back when it regains focus, where its web view reports recent input. A click or **Fit to this window** that takes the size leaves the terminal focused, so the first keys you type reach the program. (#348)
+
 ## [v0.15.3] - 2026-11-08
 
 BiBCode v0.15.3 guards checkpoint restores in shared checkouts, offers Git Credential Manager sign-in on the desktop, keeps named MCP clients across runs, reworks the Pipelines and Files views, loads pipelines for self-hosted GitLab on any port, and hardens load-sensitive tests and secret scanning. This release includes PR #337 since v0.15.2.

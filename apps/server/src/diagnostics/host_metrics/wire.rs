@@ -1,0 +1,774 @@
+//! `server.subscribeHostMetrics` on the wire: serde mirrors of `ServerHostMetricsEvent` in
+//! `packages/contracts/src/server.ts`, the two encoders, and the subscriber loop (R72, R85).
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    ChartBucket, ChartPoint, HiddenReason, HiddenVolume, HostFacts, HostMetricsCollector,
+    HostMetricsSnapshot, HostMetricsUpdate, HostReading, MeasureStatistics, VolumeReading,
+    VolumeState,
+};
+use crate::rpc::RpcStreamChunk;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag")]
+pub(crate) enum HostMetricsEventWire {
+    Snapshot(SnapshotWire),
+    Sample(SampleWire),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostFactsWire {
+    os: String,
+    arch: String,
+    cpu_count: u64,
+    memory_total_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum VolumeStateWire {
+    Ok,
+    NotResponding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VolumeWire {
+    mount_point: String,
+    name: String,
+    file_system: String,
+    total_bytes: Option<u64>,
+    free_bytes: Option<u64>,
+    used_bytes: Option<u64>,
+    removable: bool,
+    read_only: bool,
+    state: VolumeStateWire,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostSampleWire {
+    sampled_at: String,
+    cpu_percent: f64,
+    memory_total_bytes: u64,
+    memory_used_bytes: u64,
+    memory_available_bytes: u64,
+    volumes: Vec<VolumeWire>,
+    volumes_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume_listing_not_responding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    /// The chart clock's time for this reading; older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chart_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StatisticWire {
+    current: f64,
+    minimum: f64,
+    average: f64,
+    p95: f64,
+    maximum: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ChartPointWire {
+    sampled_at: String,
+    cpu_percent: f64,
+    memory_percent: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ChartBucketWire {
+    started_at: String,
+    duration_ms: u64,
+    cpu_average: f64,
+    cpu_peak: f64,
+    memory_average: f64,
+    memory_peak: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SnapshotWire {
+    host: HostFactsWire,
+    boot_id: Option<String>,
+    started_at: String,
+    statistics_since: Option<String>,
+    sample: Option<HostSampleWire>,
+    cpu: Option<StatisticWire>,
+    memory: Option<StatisticWire>,
+    recent: Vec<ChartPointWire>,
+    uptime: Vec<ChartBucketWire>,
+    /// Older servers leave it out.
+    #[serde(default)]
+    hidden_volumes: Vec<HiddenVolumeWire>,
+    /// Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volume_statistics: Vec<VolumeStatisticWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VolumeStatisticWire {
+    mount_point: String,
+    statistic: StatisticWire,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HiddenVolumeWire {
+    mount_point: String,
+    file_system: String,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    same_storage_as: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SampleWire {
+    /// As on the snapshot; older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statistics_since: Option<String>,
+    sample: HostSampleWire,
+    cpu: StatisticWire,
+    memory: StatisticWire,
+    /// The latest chart when the subscriber has not been sent it yet; `null` otherwise.
+    uptime: Option<Vec<ChartBucketWire>>,
+    /// Sent with `uptime`, as part of the same chart state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hidden_volumes: Option<Vec<HiddenVolumeWire>>,
+    /// Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volume_statistics: Vec<VolumeStatisticWire>,
+}
+
+fn volume_statistics(
+    statistics: &[(std::path::PathBuf, MeasureStatistics)],
+) -> Vec<VolumeStatisticWire> {
+    statistics
+        .iter()
+        .map(|(mount_point, value)| VolumeStatisticWire {
+            mount_point: mount_point.to_string_lossy().into_owned(),
+            statistic: statistic(value),
+        })
+        .collect()
+}
+
+fn hidden_volume(hidden: &HiddenVolume) -> HiddenVolumeWire {
+    let (reason, same_storage_as) = match &hidden.reason {
+        HiddenReason::Network => ("network", None),
+        HiddenReason::Overlay => ("overlay", None),
+        HiddenReason::FileMount => ("fileMount", None),
+        HiddenReason::System => ("system", None),
+        HiddenReason::Empty => ("empty", None),
+        HiddenReason::SameStorage { as_mount } => {
+            ("sameStorage", Some(as_mount.to_string_lossy().into_owned()))
+        }
+    };
+    HiddenVolumeWire {
+        mount_point: hidden.descriptor.mount_point.to_string_lossy().into_owned(),
+        file_system: hidden.descriptor.file_system.clone(),
+        reason: reason.to_owned(),
+        same_storage_as,
+    }
+}
+
+fn format_ms(ms: i128) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(ms.saturating_mul(1_000_000))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}
+
+fn facts(facts: &HostFacts) -> HostFactsWire {
+    HostFactsWire {
+        os: facts.os.to_owned(),
+        arch: facts.arch.to_owned(),
+        cpu_count: facts.cpu_count as u64,
+        memory_total_bytes: facts.memory_total_bytes,
+    }
+}
+
+fn volume(volume: &VolumeReading) -> VolumeWire {
+    VolumeWire {
+        mount_point: volume.descriptor.mount_point.to_string_lossy().into_owned(),
+        name: volume.descriptor.name.clone(),
+        file_system: volume.descriptor.file_system.clone(),
+        total_bytes: volume.total_bytes,
+        free_bytes: volume.free_bytes,
+        used_bytes: volume.used_bytes(),
+        removable: volume.descriptor.removable,
+        read_only: volume.descriptor.read_only,
+        state: match volume.state {
+            VolumeState::Ok => VolumeStateWire::Ok,
+            VolumeState::NotResponding => VolumeStateWire::NotResponding,
+        },
+    }
+}
+
+fn sample(reading: &HostReading) -> HostSampleWire {
+    HostSampleWire {
+        sampled_at: format_ms(reading.sampled_at_ms),
+        cpu_percent: reading.cpu_percent,
+        memory_total_bytes: reading.memory_total_bytes,
+        memory_used_bytes: reading.memory_used_bytes,
+        memory_available_bytes: reading.memory_available_bytes,
+        volumes: reading.volumes.iter().map(volume).collect(),
+        volumes_paused: reading.volumes_paused,
+        volume_listing_not_responding: Some(reading.volume_listing_not_responding),
+        sequence: Some(reading.sequence),
+        chart_at: Some(format_ms(reading.chart_ms)),
+        age_ms: Some(u64::try_from(reading.taken_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+    }
+}
+
+fn statistic(statistic: &MeasureStatistics) -> StatisticWire {
+    StatisticWire {
+        current: statistic.current,
+        minimum: statistic.minimum,
+        average: statistic.average,
+        p95: statistic.p95,
+        maximum: statistic.maximum,
+    }
+}
+
+fn point(point: &ChartPoint) -> ChartPointWire {
+    ChartPointWire {
+        sampled_at: format_ms(point.sampled_at_ms),
+        cpu_percent: point.cpu_percent,
+        memory_percent: point.memory_percent,
+    }
+}
+
+fn bucket(bucket: &ChartBucket) -> ChartBucketWire {
+    ChartBucketWire {
+        started_at: format_ms(bucket.started_at_ms),
+        duration_ms: bucket.duration_ms,
+        cpu_average: bucket.cpu_average,
+        cpu_peak: bucket.cpu_peak,
+        memory_average: bucket.memory_average,
+        memory_peak: bucket.memory_peak,
+    }
+}
+
+fn to_value(event: &HostMetricsEventWire) -> Value {
+    serde_json::to_value(event).unwrap_or(Value::Null)
+}
+
+pub(crate) fn encode_snapshot(snapshot: &HostMetricsSnapshot) -> Value {
+    to_value(&HostMetricsEventWire::Snapshot(SnapshotWire {
+        host: facts(&snapshot.facts),
+        boot_id: snapshot.identity.boot_id.clone(),
+        started_at: format_ms(snapshot.identity.started_at_ms),
+        statistics_since: snapshot.statistics_since_ms.map(format_ms),
+        sample: snapshot.current.as_ref().map(sample),
+        cpu: snapshot.cpu.as_ref().map(statistic),
+        memory: snapshot.memory.as_ref().map(statistic),
+        recent: snapshot.recent.iter().map(point).collect(),
+        uptime: snapshot.chart.uptime.iter().map(bucket).collect(),
+        hidden_volumes: snapshot
+            .chart
+            .hidden_volumes
+            .iter()
+            .map(hidden_volume)
+            .collect(),
+        volume_statistics: volume_statistics(&snapshot.volume_statistics),
+    }))
+}
+
+pub(crate) fn encode_update(update: &HostMetricsUpdate, include_chart: bool) -> Value {
+    to_value(&HostMetricsEventWire::Sample(SampleWire {
+        statistics_since: update.statistics_since_ms.map(format_ms),
+        sample: sample(&update.reading),
+        cpu: statistic(&update.cpu),
+        memory: statistic(&update.memory),
+        uptime: include_chart.then(|| update.chart.uptime.iter().map(bucket).collect()),
+        hidden_volumes: include_chart.then(|| {
+            update
+                .chart
+                .hidden_volumes
+                .iter()
+                .map(hidden_volume)
+                .collect()
+        }),
+        volume_statistics: volume_statistics(&update.volume_statistics),
+    }))
+}
+
+/// Sends a snapshot, then one sample per live reading, for as long as the subscriber stays.
+/// Each item is built only once a slot in the subscriber's queue is free, from the latest
+/// reading and chart at that moment, so a slow subscriber skips readings but never misses a
+/// chart (R85).
+pub(crate) async fn send_host_metrics(
+    collector: Arc<HostMetricsCollector>,
+    sender: mpsc::Sender<RpcStreamChunk>,
+    cancellation: CancellationToken,
+) {
+    let mut subscription = collector.subscribe();
+    let Ok(permit) = reserve(&sender, &cancellation).await else {
+        return;
+    };
+    let snapshot = tokio::select! {
+        () = cancellation.cancelled() => return,
+        snapshot = collector.snapshot() => snapshot,
+    };
+    // Whatever the snapshot already shows is not sent again.
+    subscription.receiver().borrow_and_update();
+    let mut sent_revision = snapshot.chart.revision;
+    let mut sent_sequence = snapshot.current.as_ref().map(|reading| reading.sequence);
+    permit.send(Ok(vec![encode_snapshot(&snapshot)]));
+    loop {
+        let Ok(permit) = reserve(&sender, &cancellation).await else {
+            return;
+        };
+        let update = loop {
+            let latest = subscription.receiver().borrow_and_update().clone();
+            if let Some(update) = latest
+                && Some(update.reading.sequence) != sent_sequence
+            {
+                break update;
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = sender.closed() => return,
+                changed = subscription.receiver().changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+        let include_chart = update.chart.revision != sent_revision;
+        permit.send(Ok(vec![encode_update(&update, include_chart)]));
+        sent_revision = update.chart.revision;
+        sent_sequence = Some(update.reading.sequence);
+    }
+}
+
+async fn reserve<'a>(
+    sender: &'a mpsc::Sender<RpcStreamChunk>,
+    cancellation: &CancellationToken,
+) -> Result<mpsc::Permit<'a, RpcStreamChunk>, ()> {
+    tokio::select! {
+        () = cancellation.cancelled() => Err(()),
+        permit = sender.reserve() => permit.map_err(|_| ()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use super::*;
+    use crate::diagnostics::host_metrics::{
+        ChartState, HostMetricsIdentity, HostMetricsRates, VolumeDescriptor,
+        tests::{FakeHostMetricsSource, run_for},
+    };
+
+    fn parse_ms(value: &Value) -> i128 {
+        let text = value.as_str().expect("a timestamp");
+        OffsetDateTime::parse(text, &Rfc3339)
+            .expect("an RFC 3339 timestamp")
+            .unix_timestamp_nanos()
+            / 1_000_000
+    }
+
+    fn fixture(name: &str) -> Value {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/contracts/fixtures/rpc-wire/stream-shapes")
+            .join(name);
+        let text = std::fs::read_to_string(path).expect("stream shape fixture");
+        let fixture: Value = serde_json::from_str(&text).expect("fixture JSON");
+        fixture["values"][0].clone()
+    }
+
+    /// #292 review: every hidden reason's wire string is pinned, and the web sheet's labels and
+    /// the MCP reference name the same strings, so a rename cannot pass silently.
+    #[test]
+    fn every_hidden_reason_has_a_pinned_wire_string() {
+        let reasons = [
+            HiddenReason::Network,
+            HiddenReason::Overlay,
+            HiddenReason::FileMount,
+            HiddenReason::System,
+            HiddenReason::Empty,
+            HiddenReason::SameStorage {
+                as_mount: PathBuf::from("/"),
+            },
+        ];
+        // No wildcard: a new variant fails to compile here until it is pinned too.
+        let expected = |reason: &HiddenReason| match reason {
+            HiddenReason::Network => "network",
+            HiddenReason::Overlay => "overlay",
+            HiddenReason::FileMount => "fileMount",
+            HiddenReason::System => "system",
+            HiddenReason::Empty => "empty",
+            HiddenReason::SameStorage { .. } => "sameStorage",
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
+        let web = read("apps/web/src/components/hostDashboard/hostDashboard.logic.ts");
+        let mcp = read("docs/reference/mcp.md");
+        let mcp_line = mcp
+            .lines()
+            .find(|line| line.contains("`hiddenVolumeCount`"))
+            .expect("the MCP reference documents hiddenVolumeCount");
+        for reason in reasons {
+            let wire = hidden_volume(&HiddenVolume {
+                descriptor: VolumeDescriptor {
+                    mount_point: PathBuf::from("/mnt/x"),
+                    name: String::new(),
+                    file_system: "ext4".to_owned(),
+                    removable: false,
+                    read_only: false,
+                    is_file: false,
+                },
+                reason: reason.clone(),
+            });
+            let string = expected(&reason);
+            assert_eq!(wire.reason, string, "{reason:?}");
+            let labelled = if string == "sameStorage" {
+                web.contains("volume.reason === \"sameStorage\"")
+            } else {
+                web.contains(&format!("  {string}: \""))
+            };
+            assert!(labelled, "the web sheet labels `{string}`");
+            assert!(
+                mcp_line.contains(&format!("`{string}`")),
+                "docs/reference/mcp.md names `{string}`"
+            );
+        }
+    }
+
+    #[test]
+    fn host_metrics_stream_fixtures_round_trip() {
+        for name in [
+            "server__subscribeHostMetrics-00.json",
+            "server__subscribeHostMetrics-01.json",
+        ] {
+            let wire = fixture(name);
+            let event: HostMetricsEventWire =
+                serde_json::from_value(wire.clone()).expect("the Rust mirror decodes the TS shape");
+            assert_eq!(
+                serde_json::to_value(&event).expect("re-encodes"),
+                wire,
+                "{name} must stay byte-identical to the TypeScript contract"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_snapshot_stays_under_128_kib() {
+        let reading = HostReading {
+            sampled_at_ms: 1_700_000_000_123,
+            chart_ms: 1_700_000_000_123,
+            sequence: 3_601,
+            taken_at: tokio::time::Instant::now(),
+            volume_listing_not_responding: false,
+            cpu_percent: 23.456_789,
+            memory_total_bytes: 34_359_738_368,
+            memory_used_bytes: 12_025_908_428,
+            memory_available_bytes: 22_333_829_940,
+            volumes: (0..20)
+                .map(|index| VolumeReading {
+                    descriptor: VolumeDescriptor {
+                        mount_point: PathBuf::from(format!("/mnt/volume-with-a-long-name-{index}")),
+                        name: format!("Volume with a long name {index}"),
+                        file_system: "ext4".to_owned(),
+                        removable: index % 2 == 0,
+                        read_only: false,
+                        is_file: false,
+                    },
+                    total_bytes: Some(2_147_483_648_000),
+                    free_bytes: Some(671_088_640_000),
+                    state: VolumeState::Ok,
+                })
+                .collect(),
+            volumes_paused: false,
+        };
+        let statistic = MeasureStatistics {
+            current: 23.456_789,
+            minimum: 1.234_567,
+            maximum: 97.654_321,
+            average: 11.111_111,
+            p95: 40.0,
+        };
+        let snapshot = HostMetricsSnapshot {
+            identity: HostMetricsIdentity {
+                boot_id: Some("00000000-0000-0000-0000-000000000000".to_owned()),
+                started_at_ms: 1_700_000_000_000,
+            },
+            facts: HostFacts {
+                os: "linux",
+                arch: "x86_64",
+                cpu_count: 128,
+                memory_total_bytes: 34_359_738_368,
+            },
+            statistics_since_ms: Some(1_700_000_000_000),
+            current: Some(reading),
+            cpu: Some(statistic),
+            memory: Some(statistic),
+            recent: (0..900)
+                .map(|index| ChartPoint {
+                    sampled_at_ms: 1_700_000_000_123 + index * 1_000,
+                    cpu_percent: 23.456_789,
+                    memory_percent: 35.123_456,
+                })
+                .collect(),
+            chart: Arc::new(ChartState {
+                revision: 1,
+                uptime: (0..240)
+                    .map(|index| ChartBucket {
+                        started_at_ms: 1_700_000_000_000 + i128::from(index) * 60_000,
+                        duration_ms: 60_000,
+                        cpu_average: 12.345_678,
+                        cpu_peak: 98.765_432,
+                        memory_average: 35.123_456,
+                        memory_peak: 36.543_21,
+                    })
+                    .collect(),
+                hidden_volumes: Vec::new(),
+            }),
+            volume_statistics: (0..20)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("/mnt/volume-with-a-long-name-{index}")),
+                        statistic,
+                    )
+                })
+                .collect(),
+        };
+
+        let bytes = serde_json::to_vec(&encode_snapshot(&snapshot)).expect("encodes");
+
+        assert!(bytes.len() < 128 * 1_024, "{} bytes", bytes.len());
+    }
+
+    /// #292 review: a Sample written by an older server, without the order, age, listing and
+    /// statistics start fields, still decodes.
+    #[test]
+    fn a_sample_without_the_newer_fields_decodes() {
+        let mut wire = fixture("server__subscribeHostMetrics-01.json");
+        let object = wire.as_object_mut().expect("a Sample");
+        object
+            .remove("statisticsSince")
+            .expect("the fixture is the new shape");
+        let sample = object["sample"].as_object_mut().expect("a sample");
+        for field in ["sequence", "chartAt", "ageMs", "volumeListingNotResponding"] {
+            sample.remove(field).expect("the fixture is the new shape");
+        }
+
+        let event: HostMetricsEventWire =
+            serde_json::from_value(wire.clone()).expect("the old shape decodes");
+
+        assert_eq!(serde_json::to_value(&event).expect("re-encodes"), wire);
+    }
+
+    /// R81: a Snapshot from a server older than the hidden volumes still decodes.
+    #[test]
+    fn a_snapshot_without_hidden_volumes_decodes() {
+        let mut wire = fixture("server__subscribeHostMetrics-00.json");
+        let hidden = wire
+            .as_object_mut()
+            .expect("a Snapshot")
+            .remove("hiddenVolumes")
+            .expect("the fixture is the new shape");
+        assert_eq!(hidden[1]["sameStorageAs"], "/");
+
+        let event: HostMetricsEventWire =
+            serde_json::from_value(wire).expect("the old shape decodes");
+        let HostMetricsEventWire::Snapshot(snapshot) = event else {
+            panic!("a Snapshot");
+        };
+        assert!(snapshot.hidden_volumes.is_empty());
+    }
+
+    /// #292 review: every reading says its order and age, and every Sample says when the
+    /// statistics started, so a stream that began before the first reading learns it.
+    #[tokio::test(start_paused = true)]
+    async fn items_carry_order_age_and_the_statistics_start() {
+        let collector = Arc::new(HostMetricsCollector::new(
+            Arc::new(FakeHostMetricsSource::new(vec![])),
+            HostMetricsRates::default(),
+            HostMetricsIdentity {
+                boot_id: None,
+                started_at_ms: 1_700_000_000_000,
+            },
+        ));
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(send_host_metrics(
+            collector.clone(),
+            sender,
+            cancellation.clone(),
+        ));
+
+        run_for(
+            &collector,
+            Duration::from_secs(4),
+            Duration::from_millis(500),
+        )
+        .await;
+        let mut items = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            items.extend(chunk.expect("a value"));
+        }
+        let since = collector
+            .snapshot()
+            .await
+            .statistics_since_ms
+            .map(format_ms)
+            .expect("statistics started");
+
+        assert_eq!(items[0]["_tag"], "Snapshot");
+        // A snapshot taken before the first live reading leaves the start to the Samples.
+        let mut sequence = match items[0]["sample"]["sequence"].as_u64() {
+            Some(sequence) => sequence,
+            None => {
+                assert!(items[0]["statisticsSince"].is_null(), "{}", items[0]);
+                0
+            }
+        };
+        let later = encode_snapshot(&collector.snapshot().await);
+        assert!(later["sample"]["sequence"].is_u64(), "{later}");
+        assert!(later["sample"]["ageMs"].is_u64(), "{later}");
+        assert!(items.len() >= 3, "{items:?}");
+        for item in &items[1..] {
+            assert_eq!(item["statisticsSince"], since.as_str());
+            assert_eq!(item["sample"]["ageMs"], 0, "encoded as soon as it was read");
+            assert_eq!(item["sample"]["volumeListingNotResponding"], false);
+            let next = item["sample"]["sequence"].as_u64().expect("a sequence");
+            assert!(next > sequence, "{next} after {sequence}");
+            sequence = next;
+        }
+        cancellation.cancel();
+        task.await.expect("the subscriber loop ends");
+        collector.shutdown().await;
+    }
+
+    /// #292: a sample says its chart time, which the recent points use, apart from its wall time.
+    #[test]
+    fn a_sample_carries_its_chart_time() {
+        let mut reading = HostReading {
+            sampled_at_ms: 1_700_000_000_000,
+            chart_ms: 1_700_000_005_000,
+            sequence: 1,
+            taken_at: tokio::time::Instant::now(),
+            volume_listing_not_responding: false,
+            cpu_percent: 1.5,
+            memory_total_bytes: 2,
+            memory_used_bytes: 1,
+            memory_available_bytes: 1,
+            volumes: Vec::new(),
+            volumes_paused: false,
+        };
+        let encoded = serde_json::to_value(sample(&reading)).expect("encodes");
+        assert_eq!(parse_ms(&encoded["chartAt"]), 1_700_000_005_000);
+        assert_eq!(parse_ms(&encoded["sampledAt"]), 1_700_000_000_000);
+        reading.chart_ms = reading.sampled_at_ms;
+        let encoded = serde_json::to_value(sample(&reading)).expect("encodes");
+        assert_eq!(encoded["chartAt"], encoded["sampledAt"]);
+    }
+
+    /// R85: a subscriber that stops reading while a minute bucket closes still holds that
+    /// bucket once its queue drains, and no item is built while its queue is full.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_subscriber_holds_the_latest_chart_after_the_queue_drains() {
+        let collector = Arc::new(HostMetricsCollector::new(
+            Arc::new(FakeHostMetricsSource::new(vec![])),
+            HostMetricsRates::default(),
+            HostMetricsIdentity {
+                boot_id: None,
+                started_at_ms: 1_700_000_000_000,
+            },
+        ));
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(send_host_metrics(
+            collector.clone(),
+            sender,
+            cancellation.clone(),
+        ));
+
+        // The queue fills about 64 s in; the minute that closes at about 121 s closes while it
+        // is full, and nothing is read until 130 s.
+        run_for(&collector, Duration::from_secs(130), Duration::from_secs(1)).await;
+        let resumed_at = collector.shared.now_ms();
+        let mut items = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            items.extend(chunk.expect("a value"));
+        }
+        assert_eq!(items.len(), 64, "the queue was full");
+        let queued = items[1..]
+            .iter()
+            .map(|item| parse_ms(&item["sample"]["sampledAt"]))
+            .collect::<Vec<_>>();
+        run_for(&collector, Duration::from_secs(3), Duration::from_secs(1)).await;
+        while let Ok(chunk) = receiver.try_recv() {
+            items.extend(chunk.expect("a value"));
+        }
+
+        let mut chart = items[0]["uptime"].clone();
+        assert_eq!(items[0]["_tag"], "Snapshot");
+        for item in &items[1..] {
+            assert_eq!(item["_tag"], "Sample");
+            if !item["uptime"].is_null() {
+                chart = item["uptime"].clone();
+            }
+        }
+        let started = chart
+            .as_array()
+            .expect("uptime bars")
+            .iter()
+            .map(|bar| bar["startedAt"].as_str().expect("startedAt").to_owned())
+            .collect::<Vec<_>>();
+        let first = collector
+            .snapshot()
+            .await
+            .statistics_since_ms
+            .expect("statistics started");
+        assert!(
+            started.contains(&format_ms(first + 60_000)),
+            "the bucket closed while the queue was full is held: {started:?}"
+        );
+        let after = &items[64..];
+        assert!(!after.is_empty());
+        for item in after {
+            let sampled_at = parse_ms(&item["sample"]["sampledAt"]);
+            assert!(
+                sampled_at >= resumed_at - 1_500,
+                "an item sent after the resume carries a reading from {sampled_at}, before {resumed_at}"
+            );
+        }
+        // Nothing was built between the queue filling and the resume.
+        let full_at = queued.iter().copied().max().expect("queued samples");
+        assert!(
+            full_at < first + 70_000,
+            "the last queued item was built at {full_at}"
+        );
+        // The chart was sent once; later items that bring nothing new carry no chart.
+        assert!(after.len() >= 2);
+        assert!(after[after.len() - 1]["uptime"].is_null());
+
+        cancellation.cancel();
+        task.await.expect("the subscriber loop ends");
+        collector.shutdown().await;
+    }
+}

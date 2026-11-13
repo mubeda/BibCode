@@ -8,6 +8,9 @@ fn main() {
     }
     // Once, before WebKit installs its signal handlers, so they chain real crashes down to it.
     bibcode_server::diagnostics::profiler::crash::attach();
+    // Still single-threaded: before any thread, Tauri or WebKit, whose web processes inherit it.
+    #[cfg(target_os = "linux")]
+    bibcode_desktop_lib::repair_gstreamer_environment();
     // The open-url shim, or the Windows `bibcode-open-url.exe` alias: no Tauri, no window,
     // and the single-instance plugin never sees it.
     if let Some(url) = bibcode_server::open_url::current_open_url_invocation() {

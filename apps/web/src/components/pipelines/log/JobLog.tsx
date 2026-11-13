@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { createContext, memo, use, useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { useTheme } from "../../../hooks/useTheme";
+import { useThemeLibrary } from "../../../themes/customThemes";
+import { resolveTerminalPalette } from "../../terminalTheme";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
@@ -399,7 +401,7 @@ const JobLogRow = memo(function JobLogRow({
         highlighted
           ? "bg-amber-100 dark:bg-amber-500/20"
           : active
-            ? "bg-accent"
+            ? "bg-selected text-selected-foreground"
             : kind === LINE_ERROR
               ? "bg-red-50 dark:bg-red-500/10"
               : ""
@@ -467,8 +469,17 @@ function Lines() {
     actions: { toggleSection, linkLine, requestSpans, setAtBottom, scrollToBottom, loadLater },
     meta: { styles, listRef, logRef, initialOffset, source, canLoadLater },
   } = useJobLog();
-  const { resolvedTheme } = useTheme();
-  const palette = logPalette(resolvedTheme);
+  const { resolvedTheme, resolvedThemeId } = useTheme();
+  const { themes } = useThemeLibrary();
+  // The log is drawn on the app's surface, so it follows the app theme's terminal palette
+  // whatever the terminal preference.
+  const activeTheme =
+    themes.find((theme) => theme.id === (resolvedThemeId ?? resolvedTheme)) ??
+    themes.find((theme) => theme.id === resolvedTheme)!;
+  const palette = useMemo(
+    () => logPalette(resolveTerminalPalette("app", activeTheme)),
+    [activeTheme],
+  );
   const rows = useMemo(() => (layout === null ? [] : Array.from(layout.rows)), [layout]);
   const sectionsByHeader = useMemo(() => {
     const byHeader = new Map<number, LogSection>();

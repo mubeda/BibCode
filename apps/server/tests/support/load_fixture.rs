@@ -182,6 +182,7 @@ fn thread_row(
         last_activity_at: Some(LONG_AGO.to_owned()),
         requester: None,
         side_chat: false,
+        code_review: false,
     }
 }
 
@@ -492,6 +493,7 @@ pub async fn seed(repositories: &Repositories, workspace_parent: &Path) {
                 updated_at: timestamp(project, 0),
                 deleted_at: None,
                 repository_identity: None,
+                code_review_prompt: String::new(),
             })
             .await
             .unwrap();

@@ -393,6 +393,12 @@ vi.mock("~/state/entities", () => ({
   useThreadShells: () => h.threadShells,
 }));
 
+const openHostDashboard = vi.hoisted(() => ({ calls: [] as unknown[] }));
+vi.mock("~/state/hostDashboard", () => ({
+  useOpenHostDashboard: () => (environmentId: unknown) =>
+    openHostDashboard.calls.push(environmentId),
+}));
+
 vi.mock("~/state/relay", () => ({
   relayEnvironmentDiscovery: { refresh: h.atoms.relayRefresh },
 }));
@@ -1603,6 +1609,40 @@ describe("Remote Servers tabs", () => {
       await flush();
     });
     expect(h.commands.remove).toHaveBeenCalledWith(EnvironmentId.make("env-1"));
+  });
+
+  it("offers Host dashboard on a connected row only", () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    openHostDashboard.calls.length = 0;
+    h.environments = [
+      environment({
+        id: "example-server",
+        label: "example-server",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "connected" },
+      }),
+      environment({
+        id: "env-available",
+        label: "AI-AVAILABLE",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "available" },
+      }),
+      environment({
+        id: "env-offline",
+        label: "AI-OFFLINE",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "offline" },
+      }),
+    ];
+
+    render(<ConnectTab />);
+    const buttons = findControls("button", "Host dashboard").filter(
+      (entry) => entry.label === "Host dashboard",
+    );
+    expect(buttons).toHaveLength(1);
+    invoke(buttons[0]!, "onClick");
+    expect(openHostDashboard.calls).toEqual([EnvironmentId.make("example-server")]);
   });
 
   it("renders a latched available environment as Disconnected with a Connect action", () => {

@@ -151,6 +151,80 @@ describe("projectTerminalMetadataStream", () => {
   );
 });
 
+describe("two attach producers sharing one transcript runtime (#348)", () => {
+  it.effect("a late stream cannot roll back the size or repeat the output of an earlier one", () =>
+    Effect.gen(function* () {
+      const registry = createTerminalTranscriptRuntimeRegistry();
+      const key = terminalTranscriptRuntimeKey("environment", { threadId: "thread-1" });
+      const runtime = registry.acquire(key);
+      const sized = (sequence: number, rows: number): TerminalAttachStreamEvent => ({
+        type: "resized",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence,
+        size: { cols: 80, rows, sizeClaim: "owner" },
+      });
+      const attachedAt = (sequence: number): TerminalAttachStreamEvent => ({
+        type: "snapshot",
+        snapshot: {
+          ...snapshotData("h"),
+          sequence,
+          size: { cols: 80, rows: 30, sizeClaim: "owner" },
+        },
+      });
+      const printed = (sequence: number): TerminalAttachStreamEvent => ({
+        type: "output",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence,
+        data: "x",
+      });
+      const rows: Array<number> = [];
+      runtime.attachRenderer((signal) => {
+        if (signal.type === "resized") rows.push(signal.size.rows);
+      });
+      // Producer A delivers its whole stream first; producer B, attached at the same
+      // point, delivers the same events late.
+      yield* Stream.runDrain(
+        acquireTerminalMetadataStream(
+          Stream.make(attachedAt(10), sized(11, 30), sized(12, 20), printed(13)),
+          registry,
+          key,
+        ),
+      );
+      yield* Stream.runDrain(
+        acquireTerminalMetadataStream(
+          Stream.make(attachedAt(10), sized(11, 30), printed(13)),
+          registry,
+          key,
+        ),
+      );
+      expect(rows).toEqual([30, 20]);
+      expect(runtime.snapshot()).toBe("hx");
+    }),
+  );
+
+  it.effect("a claimed stream that ended no longer holds back a stream without sizes", () =>
+    Effect.gen(function* () {
+      const runtime = createTerminalTranscriptRuntime();
+      const attached: TerminalAttachStreamEvent = {
+        type: "snapshot",
+        snapshot: { ...snapshotData("h"), sequence: 10 },
+      };
+      yield* Stream.runDrain(
+        projectTerminalMetadataStream(Stream.make(attached), runtime, "claimed"),
+      );
+      yield* Stream.runDrain(
+        projectTerminalMetadataStream(
+          Stream.make(attached, { ...output("!"), sequence: 11 }),
+          runtime,
+        ),
+      );
+      expect(runtime.snapshot()).toBe("h!");
+    }),
+  );
+});
+
 describe("createTerminalTranscriptRuntimeRegistry", () => {
   it("shares exact identity per key and cleans up only after the final balanced release", () => {
     const registry = createTerminalTranscriptRuntimeRegistry();
@@ -292,7 +366,8 @@ describe("acquireTerminalMetadataStream", () => {
       yield* secondStarted.await;
       expect(registry.size()).toBe(1);
       const shared = registry.get("key");
-      expect(shared?.snapshot()).toBe("xx");
+      // Both leases delivered the same sequenced output: it is applied once (#348).
+      expect(shared?.snapshot()).toBe("x");
 
       yield* Fiber.interrupt(first);
       expect(registry.get("key")).toBe(shared);

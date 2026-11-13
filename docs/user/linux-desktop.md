@@ -5,6 +5,15 @@ Download the `.AppImage` matching your architecture (ARM64 or x64) from
 and launch it. See [Provider setup](../providers/README.md) to connect a coding
 agent.
 
+## System libraries
+
+The AppImage carries most of what it needs but uses three libraries from your
+system: `libGLESv2.so.2`, `libfontconfig.so.1` and `libfribidi.so.0`. Desktop
+installations have them; a minimal system or container may not. On Ubuntu and
+Debian they come from the `libgles2`, `libfontconfig1` and `libfribidi0`
+packages. Audio playback also uses the system's `libasound.so.2` (ALSA) and,
+where one runs, the PulseAudio or PipeWire sound server.
+
 ## Wayland and fractional scaling
 
 The AppImage prefers native Wayland on Wayland sessions and falls back to X11

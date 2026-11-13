@@ -24,6 +24,7 @@ export * from "./keybindings.ts";
 export * from "./server.ts";
 export * from "./profiler.ts";
 export * from "./settings.ts";
+export * from "./theme.ts";
 export * from "./git.ts";
 export * from "./gitManager.ts";
 export * from "./pullRequests.ts";

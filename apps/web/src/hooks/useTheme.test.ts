@@ -169,6 +169,9 @@ describe("theme failure handling", () => {
     vi.stubGlobal("document", {
       documentElement: {
         classList: { toggle: vi.fn() },
+        style: { removeProperty: vi.fn(), setProperty: vi.fn() },
+        setAttribute: vi.fn(),
+        removeAttribute: vi.fn(),
       },
     });
 
@@ -182,9 +185,11 @@ describe("theme failure handling", () => {
         errorTag: "ThemeStorageError",
       }),
     );
-    const attributes = errorLog.mock.calls[0]?.[1];
-    expect(attributes).not.toHaveProperty("cause");
-    expect(JSON.stringify(attributes)).not.toContain(cause.message);
+    // The theme library logs its own read failure; neither log carries the raw cause.
+    for (const [, attributes] of errorLog.mock.calls) {
+      expect(attributes).not.toHaveProperty("cause");
+      expect(JSON.stringify(attributes)).not.toContain(cause.message);
+    }
   });
 
   it("retries a failed storage read only after a relevant storage event", async () => {
@@ -218,26 +223,35 @@ describe("theme failure handling", () => {
     vi.stubGlobal("document", {
       documentElement: {
         classList: { toggle: vi.fn() },
+        style: { removeProperty: vi.fn(), setProperty: vi.fn() },
+        setAttribute: vi.fn(),
+        removeAttribute: vi.fn(),
       },
     });
 
+    // The theme library reads its own keys; only reads and logs of the mode count here.
+    const modeReads = () =>
+      getItem.mock.calls.filter((call) => (call as unknown[])[0] === "bibcode:theme").length;
+    const modeLogs = () =>
+      errorLog.mock.calls.filter(([message]) => String(message).includes("theme preference"))
+        .length;
     const { useTheme } = await import("./useTheme");
     useTheme();
     readSnapshot?.();
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(1);
-    expect(errorLog).toHaveBeenCalledTimes(1);
+    expect(modeReads()).toBe(1);
+    expect(modeLogs()).toBe(1);
 
     storageHandler?.({ key: "unrelated" } as StorageEvent);
     readSnapshot?.();
-    expect(getItem).toHaveBeenCalledTimes(1);
+    expect(modeReads()).toBe(1);
 
     storageHandler?.({ key: "bibcode:theme" } as StorageEvent);
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(2);
-    expect(errorLog).toHaveBeenCalledTimes(2);
+    expect(modeReads()).toBe(2);
+    expect(modeLogs()).toBe(2);
   });
 
   it("preserves desktop sync causes and retries after a failed cosmetic sync", async () => {
@@ -475,5 +489,233 @@ describe("app-wide theme subscription", () => {
     for (const unsubscribe of unsubscribers) unsubscribe();
     browser.switchOs(true);
     expect(browser.isDark()).toBe(true);
+  });
+});
+
+describe("theme slots and overrides", () => {
+  function seed(
+    browser: ReturnType<typeof installThemeBrowser>,
+    slots: { light?: string; dark?: string },
+    library: unknown[] = [],
+  ) {
+    browser.storage.setItem(
+      "bibcode:theme-slots:v1",
+      JSON.stringify({ light: "light", dark: "dark", ...slots, paintStamp: "seed" }),
+    );
+    browser.storage.setItem("bibcode:themes:v1", JSON.stringify(library));
+  }
+  const rootStyle = (browser: ReturnType<typeof installThemeBrowser>) =>
+    browser.browserWindow.document.documentElement.style;
+  function customProperties(browser: ReturnType<typeof installThemeBrowser>): string[] {
+    const style = rootStyle(browser);
+    return Array.from({ length: style.length }, (_, index) => style.item(index)).filter((name) =>
+      name.startsWith("--"),
+    );
+  }
+  function withDesktopBridge(browser: ReturnType<typeof installThemeBrowser>) {
+    const setTheme = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(browser.browserWindow, "desktopBridge", {
+      configurable: true,
+      value: { setTheme },
+    });
+    return setTheme;
+  }
+  const mine = {
+    version: 1,
+    id: "mine",
+    name: "Mine",
+    base: "dark",
+    ui: { primary: "#3b82f6" },
+  };
+
+  it("with no stored slots nothing but the dark class changes", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(customProperties(browser)).toEqual([]);
+    expect(browser.storage.getItem("bibcode:theme-paint:v1")).toBeNull();
+  });
+
+  it('Tokyo Night sets the dark class and --background #1a1b26, --primary #7aa2f7 and --border #414868 and calls setTheme("dark")', async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    const setTheme = withDesktopBridge(browser);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("#1a1b26");
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#7aa2f7");
+    expect(rootStyle(browser).getPropertyValue("--border")).toBe("#414868");
+    expect(setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("switching from Matrix Dark to Dark removes every Matrix Dark property", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "matrix-dark" });
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    expect(customProperties(browser).length).toBeGreaterThan(10);
+
+    store.setSlot("dark", "dark");
+    expect(customProperties(browser)).toEqual([]);
+    expect(browser.isDark()).toBe(true);
+  });
+
+  it('Matrix Light leaves the dark class off, sets --input #16a34a and calls setTheme("light")', async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "matrix-light" });
+    const setTheme = withDesktopBridge(browser);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(false);
+    expect(rootStyle(browser).getPropertyValue("--input")).toBe("#16a34a");
+    expect(setTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("Verdant Light sets --foreground #303840, --placeholder #667078, --selected #eaf5ef, --selected-foreground #065f46 and --panel-separator #dee3e6", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const style = rootStyle(browser);
+    expect(style.getPropertyValue("--foreground")).toBe("#303840");
+    expect(style.getPropertyValue("--placeholder")).toBe("#667078");
+    expect(style.getPropertyValue("--selected")).toBe("#eaf5ef");
+    expect(style.getPropertyValue("--selected-foreground")).toBe("#065f46");
+    expect(style.getPropertyValue("--panel-separator")).toBe("#dee3e6");
+  });
+
+  it("in System mode an operating-system change to light applies the light slot and clears the dark theme's properties", async () => {
+    const browser = installThemeBrowser({ stored: "system", prefersDark: true });
+    seed(browser, { dark: "mine" }, [mine]);
+    await import("./useTheme");
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#3b82f6");
+
+    browser.switchOs(false);
+    expect(browser.isDark()).toBe(false);
+    expect(customProperties(browser)).toEqual([]);
+  });
+
+  it('a custom theme on a dark base resolves to "dark" and its id', async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "mine" }, [mine]);
+    mockReactForHookCalls(() => {});
+    const { useTheme } = await import("./useTheme");
+    expect(useTheme()).toMatchObject({ resolvedTheme: "dark", resolvedThemeId: "mine" });
+  });
+
+  it("the theme-color meta uses the theme's background", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    await import("./useTheme");
+    expect(
+      browser.browserWindow.document
+        .querySelector('meta[name="theme-color"]')
+        ?.getAttribute("content"),
+    ).toBe("#1a1b26");
+  });
+
+  it("subscribeAppliedTheme fires on a mode change, a System change, a slot change and a same-id saved edit, and stops after unsubscribing", async () => {
+    const browser = installThemeBrowser({ stored: "system", prefersDark: false });
+    seed(browser, {}, [mine]);
+    mockReactForHookCalls(() => {});
+    const { subscribeAppliedTheme, useTheme } = await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const listener = vi.fn();
+    const unsubscribe = subscribeAppliedTheme(listener);
+
+    browser.switchOs(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    store.setSlot("dark", "mine");
+    expect(listener).toHaveBeenCalledTimes(2);
+    store.saveCustomTheme({ ...mine, ui: { primary: "#ff0000" } } as never);
+    expect(listener).toHaveBeenCalledTimes(3);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#ff0000");
+    useTheme().setTheme("light");
+    expect(listener).toHaveBeenCalledTimes(4);
+
+    unsubscribe();
+    useTheme().setTheme("dark");
+    expect(listener).toHaveBeenCalledTimes(4);
+  });
+
+  it("a custom dark theme that sets muted and border derives the scrollbar thumb from its border and the sidebar card text from its muted-foreground, and Dark keeps today's values", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    const outlined = {
+      version: 1,
+      id: "outlined",
+      name: "Outlined",
+      base: "dark",
+      ui: { muted: "#222833", "muted-foreground": "#9aa5b8", border: "#3a4252" },
+    };
+    seed(browser, { dark: "outlined" }, [outlined, mine]);
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const style = rootStyle(browser);
+    expect(style.getPropertyValue("--scrollbar-thumb")).toBe(
+      "color-mix(in srgb, var(--border) 80%, transparent)",
+    );
+    expect(style.getPropertyValue("--scrollbar-thumb-hover")).toBe("var(--border)");
+    expect(style.getPropertyValue("--scrollbar-thumb-subtle")).toBe(
+      "color-mix(in srgb, var(--border) 60%, transparent)",
+    );
+    expect(style.getPropertyValue("--scrollbar-thumb-subtle-hover")).toBe(
+      "color-mix(in srgb, var(--border) 80%, transparent)",
+    );
+    expect(style.getPropertyValue("--sidebar-card-muted-foreground")).toBe(
+      "var(--muted-foreground)",
+    );
+
+    // A theme that leaves border and muted-foreground unset keeps the stylesheet's values.
+    store.setSlot("dark", "mine");
+    expect(customProperties(browser)).toEqual(["--primary"]);
+    store.setSlot("dark", "dark");
+    expect(customProperties(browser)).toEqual([]);
+  });
+
+  it("Verdant Light sets the focus ring attribute, --focus-ring-width 2px and --focus-ring-offset 2px, and the control-shadow attribute", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const root = browser.browserWindow.document.documentElement;
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(true);
+    expect(root.style.getPropertyValue("--focus-ring-width")).toBe("2px");
+    expect(root.style.getPropertyValue("--focus-ring-offset")).toBe("2px");
+    expect(root.getAttribute("data-theme-control-shadow")).toBe("none");
+  });
+
+  it("Light and Dark set neither attribute", async () => {
+    const browser = installThemeBrowser({ stored: "light" });
+    seed(browser, { light: "verdant-light" });
+    await import("./useTheme");
+    const store = await import("../themes/customThemes");
+    const root = browser.browserWindow.document.documentElement;
+    store.setSlot("light", "light");
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(false);
+    expect(root.hasAttribute("data-theme-control-shadow")).toBe(false);
+    browser.storage.setItem("bibcode:theme", "dark");
+    browser.fireStorage("bibcode:theme");
+    expect(browser.isDark()).toBe(true);
+    expect(root.hasAttribute("data-theme-focus-ring")).toBe(false);
+    expect(root.hasAttribute("data-theme-control-shadow")).toBe(false);
+  });
+
+  it("a preview applies over the active theme and null restores the stored theme", async () => {
+    const browser = installThemeBrowser({ stored: "dark" });
+    seed(browser, { dark: "tokyo-night" });
+    const { setThemePreview, subscribeAppliedTheme } = await import("./useTheme");
+    const listener = vi.fn();
+    subscribeAppliedTheme(listener);
+
+    setThemePreview({ version: 1, id: "draft", name: "Draft", base: "dark", ui: mine.ui });
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#3b82f6");
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("");
+    setThemePreview({ version: 1, id: "draft", name: "Draft", base: "light" });
+    expect(browser.isDark()).toBe(false);
+    expect(customProperties(browser)).toEqual([]);
+
+    setThemePreview(null);
+    expect(browser.isDark()).toBe(true);
+    expect(rootStyle(browser).getPropertyValue("--primary")).toBe("#7aa2f7");
+    expect(rootStyle(browser).getPropertyValue("--background")).toBe("#1a1b26");
+    expect(listener).toHaveBeenCalledTimes(3);
   });
 });

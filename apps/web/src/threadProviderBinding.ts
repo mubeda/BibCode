@@ -31,6 +31,14 @@ interface ResolveThreadProviderBindingInput {
   readonly projectDefaultModelSelection: ModelSelection | null | undefined;
   readonly selectedProviderInstanceId: ProviderInstanceId | null;
   readonly providers: ReadonlyArray<ServerProvider>;
+  /**
+   * True when the thread already exists on the server: it was created with a
+   * provider (the agent picked for a worktree, project Main or chat panel, or
+   * the project default for an adopted worktree or pull request), so it keeps
+   * that exact instance before its first turn. False for a local draft, whose
+   * composer picker is where the provider is still chosen.
+   */
+  readonly providerChosen: boolean;
 }
 
 function findProvider(
@@ -81,6 +89,22 @@ export function resolveThreadProviderBinding(
   const projectDefaultInstanceId = input.projectDefaultModelSelection?.instanceId ?? null;
 
   if (!threadHasStarted(input.thread)) {
+    if (input.providerChosen && threadModelInstanceId) {
+      // Never fall back to another provider: an unavailable one stays shown as unavailable (#347).
+      const instanceId =
+        [input.selectedProviderInstanceId, threadModelInstanceId].find(
+          (candidate) => findProvider(input.providers, candidate)?.enabled,
+        ) ?? threadModelInstanceId;
+      const status = findProvider(input.providers, instanceId);
+      return {
+        instanceId,
+        driver: status?.driver ?? null,
+        status,
+        lockedProvider: null,
+        lockedProviderInstanceId: instanceId,
+        conflict: null,
+      };
+    }
     const candidates = [
       input.selectedProviderInstanceId,
       threadModelInstanceId,

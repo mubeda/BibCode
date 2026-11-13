@@ -4,7 +4,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import { DiffContextLines, TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { DEFAULT_GIT_TEXT_GENERATION_MODEL, ProviderOptionSelections } from "./model.ts";
-import { ModelSelection } from "./orchestration.ts";
+import { CODE_REVIEW_PROMPT_MAX_LENGTH, ModelSelection } from "./orchestration.ts";
 import { ReviewDiffToolId } from "./review.ts";
 import {
   ProviderDriverKind,
@@ -573,6 +573,22 @@ export type ProviderSessionDefaultsMap = typeof ProviderSessionDefaultsMap.Type;
 
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.minutes(3);
 
+// Defined beside the project prompt in orchestration.ts, which this module already imports.
+export { CODE_REVIEW_PROMPT_MAX_LENGTH };
+
+/** Built-in review prompt (#293); `{scope}` and `{base}` are replaced when a review starts. */
+export const DEFAULT_CODE_REVIEW_PROMPT = `Review the code changes in this repository. The scope is {scope}. Run git yourself to read the changes. For example, run git status, git diff, git diff --staged, and git diff {base}...HEAD for branch commits. Read untracked files directly. If {base} does not exist, use the local branch with the same name. Open the surrounding code when the diff alone is not enough.
+
+Look for these problems.
+- Bugs and logic errors, including edge cases, error handling and concurrency.
+- Risk, such as breaking changes, data loss, migrations and performance.
+- Tests that are missing or too weak for the changed behavior.
+- Security, such as injection, secrets, auth and permission checks, and unsafe input handling.
+
+Do not edit any files. Report findings grouped by severity, from Critical to High, Medium and Low. For each finding, give file:line, the problem and a suggested fix. Leave out a severity that has no findings. End with a one-line overall verdict.`;
+
+const CodeReviewPrompt = Schema.String.check(Schema.isMaxLength(CODE_REVIEW_PROMPT_MAX_LENGTH));
+
 export const ServerSettings = Schema.Struct({
   enableAssistantStreaming: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableProviderUpdateChecks: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -613,6 +629,15 @@ export const ServerSettings = Schema.Struct({
   defaultAgent: DefaultAgentSelection.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_DEFAULT_AGENT_SELECTION)),
   ),
+  codeReviewAgent: DefaultAgentSelection.pipe(
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_DEFAULT_AGENT_SELECTION)),
+  ),
+  /** `null` uses the provider's session default. */
+  codeReviewModelSelection: Schema.NullOr(ModelSelection).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** `""` uses `DEFAULT_CODE_REVIEW_PROMPT`. */
+  codeReviewPrompt: CodeReviewPrompt.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
 
   // Legacy single-instance-per-driver settings. Continues to be the source
   // of truth until `providerInstances` (below) lands per-driver migration
@@ -767,6 +792,9 @@ export const ServerSettingsPatch = Schema.Struct({
   addProjectBaseDirectory: Schema.optionalKey(TrimmedString),
   textGenerationModelSelection: Schema.optionalKey(ModelSelectionPatch),
   defaultAgent: Schema.optionalKey(DefaultAgentSelection),
+  codeReviewAgent: Schema.optionalKey(DefaultAgentSelection),
+  codeReviewModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+  codeReviewPrompt: Schema.optionalKey(CodeReviewPrompt),
   terminal: Schema.optionalKey(
     Schema.Struct({
       webglEnabled: Schema.optionalKey(Schema.Boolean),

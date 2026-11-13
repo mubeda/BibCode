@@ -733,7 +733,14 @@ impl ClaudeTerminalObserverFactory {
         &self,
         input: ProviderTerminalObserverFactoryInput,
     ) -> Option<PreparedTerminalLaunch> {
-        if unsafe_interactive_settings_args(&input.launch.args) {
+        // A review ends its options with `--`: what follows is the prompt, never an option.
+        let end_of_options = input
+            .launch
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(input.launch.args.len());
+        if unsafe_interactive_settings_args(&input.launch.args[..end_of_options]) {
             note_pass_through("unsafe_settings_args");
             return None;
         }
@@ -848,8 +855,13 @@ impl ClaudeTerminalObserverFactory {
             }),
         };
         let mut args = input.launch.args;
-        args.push("--settings".to_owned());
-        args.push(overlay_path.to_string_lossy().into_owned());
+        args.splice(
+            end_of_options..end_of_options,
+            [
+                "--settings".to_owned(),
+                overlay_path.to_string_lossy().into_owned(),
+            ],
+        );
         Some(PreparedTerminalLaunch {
             executable: pinned_executable.to_string_lossy().into_owned(),
             args,
@@ -2313,6 +2325,7 @@ async fn run_attributed_helper(
             timeout,
             cleanup_timeout: Duration::from_millis(500),
             max_output_bytes,
+            stop_policy: crate::process::supervised::StopPolicy::Force,
             overflow: SupervisedOverflow::Error,
         },
         &CancellationToken::new(),
@@ -2773,6 +2786,7 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
                 timeout: self.timeout,
                 cleanup_timeout: Duration::from_secs(1),
                 max_output_bytes: CLAUDE_PROBE_OUTPUT_LIMIT,
+                stop_policy: crate::process::supervised::StopPolicy::Force,
                 overflow: SupervisedOverflow::Truncate,
             };
             #[cfg(test)]

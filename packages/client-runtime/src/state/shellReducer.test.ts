@@ -19,6 +19,7 @@ const stubProject = {
   repositoryIdentity: null,
   defaultModelSelection: null,
   scripts: [],
+  codeReviewPrompt: "",
   worktreeDiscovery: {
     visibility: "hidden",
     initialPromptDismissedAt: null,

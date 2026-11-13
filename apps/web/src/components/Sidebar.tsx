@@ -7,6 +7,7 @@ import {
   FolderPlusIcon,
   GitBranchIcon,
   GitPullRequestIcon,
+  HouseIcon,
   LoaderIcon,
   PlusIcon,
   SearchIcon,
@@ -1174,6 +1175,29 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
       <TooltipPopup side="top">Archive</TooltipPopup>
     </Tooltip>
   );
+  // A worktree row leads with its branch, as the primary card leads with its checkout, and
+  // shows the chat title below it. A branch equal to the title stays one line.
+  const leadsWithBranch = thread.worktreePath !== null && showBranchText;
+  const branchTooltip = showBranchText
+    ? resolveWorkspaceCardBranchTooltip({
+        branch: branchLabel,
+        worktreePath: thread.worktreePath,
+        checkoutPath: gitCwd,
+      })
+    : null;
+  const indicators = (
+    <>
+      {prStatus ? <WorkspaceCardPrButton indicator={prStatus} onClick={handlePrClick} /> : null}
+      {dirty ? <WorkspaceCardDirtyDot /> : null}
+      {terminalStatus ? (
+        <WorkspaceCardTerminalIcon
+          label={terminalStatus.label}
+          colorClass={terminalStatus.colorClass}
+        />
+      ) : null}
+      <WorkspaceCardPortsButton ports={discoveredPorts} onClick={handleOpenDiscoveredPort} />
+    </>
+  );
 
   return (
     <WorkspaceCardShell
@@ -1182,6 +1206,8 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
       className={resolveWorkspaceCardClassName({ isActive, isSelected })}
       idBase={idBase}
       isActive={isActive}
+      isSelected={isSelected}
+      level={thread.worktreePath !== null ? "worktree" : "checkout"}
       hasFlags={isUnread || isPinned}
       hasBranchLine={hasBranchLine}
       hasSessionLine={hasSessionLine}
@@ -1220,11 +1246,24 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         ) : null
       }
     >
+      {leadsWithBranch ? (
+        <WorkspaceCardBranchLine
+          id={cardIds.branch}
+          branch={branchLabel}
+          branchTooltip={branchTooltip}
+          label
+          trailing={trailing}
+        >
+          {indicators}
+        </WorkspaceCardBranchLine>
+      ) : null}
       <WorkspaceCardTitleLine
         id={cardIds.title}
         flagsId={cardIds.flags}
         title={thread.title}
         titleTestId={`thread-title-${thread.id}`}
+        icon={thread.worktreePath !== null && !leadsWithBranch ? GitBranchIcon : undefined}
+        chat={leadsWithBranch}
         unread={isUnread}
         pinned={isPinned}
         pinnedTestId={`thread-pinned-${thread.id}`}
@@ -1244,7 +1283,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
             />
           ) : undefined
         }
-        trailing={trailing}
+        trailing={leadsWithBranch ? undefined : trailing}
         badge={
           thread.requester ? (
             <AgentActorChip
@@ -1256,29 +1295,14 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           ) : undefined
         }
       />
-      {hasBranchLine ? (
+      {hasBranchLine && !leadsWithBranch ? (
         <WorkspaceCardBranchLine
           id={cardIds.branch}
           branch={showBranchText ? branchLabel : null}
-          branchTooltip={
-            showBranchText
-              ? resolveWorkspaceCardBranchTooltip({
-                  branch: branchLabel,
-                  worktreePath: thread.worktreePath,
-                  checkoutPath: gitCwd,
-                })
-              : null
-          }
+          branchIcon={thread.worktreePath === null}
+          branchTooltip={branchTooltip}
         >
-          {prStatus ? <WorkspaceCardPrButton indicator={prStatus} onClick={handlePrClick} /> : null}
-          {dirty ? <WorkspaceCardDirtyDot /> : null}
-          {terminalStatus ? (
-            <WorkspaceCardTerminalIcon
-              label={terminalStatus.label}
-              colorClass={terminalStatus.colorClass}
-            />
-          ) : null}
-          <WorkspaceCardPortsButton ports={discoveredPorts} onClick={handleOpenDiscoveredPort} />
+          {indicators}
         </WorkspaceCardBranchLine>
       ) : null}
       {hasSessionLine ? (
@@ -1530,6 +1554,9 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
       className={resolveWorkspaceCardClassName({ isActive, isSelected: false })}
       idBase={idBase}
       isActive={isActive}
+      isSelected={false}
+      level="checkout"
+      primary
       hasFlags={isUnread || isPinned}
       hasBranchLine={hasBranchLine}
       hasSessionLine={hasSessionLine}
@@ -1543,6 +1570,7 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
         flagsId={cardIds.flags}
         title={title}
         titleTestId={`primary-card-title-${project.id}`}
+        icon={HouseIcon}
         unread={isUnread}
         pinned={isPinned}
         primary
@@ -1770,12 +1798,12 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
         })}
 
       {projectExpanded && hasOverflowingThreads && !isThreadListExpanded && (
-        <SidebarMenuSubItem className="w-full">
+        <SidebarMenuSubItem className="w-full" data-sidebar-level="chat">
           <SidebarMenuSubButton
             render={showMoreButtonRender}
             data-thread-selection-safe
             size="sm"
-            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-inherit hover:bg-accent hover:text-foreground"
             onClick={() => {
               expandThreadListForProject(projectKey);
             }}
@@ -1788,12 +1816,12 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
         </SidebarMenuSubItem>
       )}
       {projectExpanded && hasOverflowingThreads && isThreadListExpanded && (
-        <SidebarMenuSubItem className="w-full">
+        <SidebarMenuSubItem className="w-full" data-sidebar-level="chat">
           <SidebarMenuSubButton
             render={showLessButtonRender}
             data-thread-selection-safe
             size="sm"
-            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+            className="h-6 w-full translate-x-0 justify-start px-2 text-left text-xs text-inherit hover:bg-accent hover:text-foreground"
             onClick={() => {
               collapseThreadListForProject(projectKey);
             }}
@@ -3381,13 +3409,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   return (
     <>
-      <div
-        className={cn(
-          "group/project-header relative",
-          environmentCard && "rounded-md bg-sidebar-env-band",
-          environmentCard && !environmentCard.available && "opacity-60",
-        )}
-      >
+      <div className="group/project-header relative">
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
@@ -3841,12 +3863,17 @@ const SidebarRepositoryPipelinesButton = memo(function SidebarRepositoryPipeline
 });
 
 const SidebarProjectListRow = memo(function SidebarProjectListRow(props: SidebarProjectItemProps) {
-  // Inside a repository card an environment checkout is a band, not a nested card.
+  // Inside a repository card an environment checkout is a band holding its rows, not a nested card.
   const isCard = !props.environmentCard;
   return (
     <SidebarMenuItem
-      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "rounded-md"}
+      // ps-1 keeps the band's 3px leading rule clear of the header; pb-1 lifts its last row off its edge.
+      // An unavailable environment weakens its band through data-unavailable (index.css); no opacity,
+      // so the rows stay readable and keep their focus ring. Only the header dims.
+      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "ps-1 pb-1"}
+      data-unavailable={props.environmentCard?.available === false ? "true" : undefined}
       data-sidebar-card={isCard ? "true" : undefined}
+      data-sidebar-level={isCard ? "repo" : "environment"}
     >
       <SidebarProjectItem {...props} />
     </SidebarMenuItem>
@@ -4204,6 +4231,7 @@ function SortableProjectItem({
         isOver && !isDragging && "ring-1 ring-primary/40",
       )}
       data-sidebar-card="true"
+      data-sidebar-level="repo"
       data-sidebar="menu-item"
       data-slot="sidebar-menu-item"
     >

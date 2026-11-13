@@ -245,6 +245,7 @@ impl ProcessRunner {
                         timeout: input.timeout,
                         cleanup_timeout: Duration::from_secs(2),
                         max_output_bytes: input.max_output_bytes,
+                        stop_policy: crate::process::supervised::StopPolicy::Force,
                         overflow: match input.output_mode {
                             OutputMode::Error => SupervisedOverflow::Error,
                             OutputMode::Truncate => SupervisedOverflow::Truncate,

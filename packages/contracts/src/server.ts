@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import { ServerAuthDescriptor } from "./auth.ts";
 import {
@@ -536,6 +537,152 @@ export const ServerProcessResourceHistoryResult = Schema.Struct({
   ),
 });
 export type ServerProcessResourceHistoryResult = typeof ServerProcessResourceHistoryResult.Type;
+
+/** Facts about the host a server runs on (#292). */
+export const ServerHostFacts = Schema.Struct({
+  os: Schema.String,
+  arch: Schema.String,
+  cpuCount: NonNegativeInt,
+  memoryTotalBytes: NonNegativeInt,
+});
+export type ServerHostFacts = typeof ServerHostFacts.Type;
+
+const ServerHostMetricsVolumeState = Schema.Literals(["ok", "notResponding"]);
+const isServerHostMetricsVolumeState = Schema.is(ServerHostMetricsVolumeState);
+
+/** A volume's total and free bytes are relative to the user the server runs as. */
+export const ServerHostMetricsVolume = Schema.Struct({
+  mountPoint: Schema.String,
+  name: Schema.String,
+  fileSystem: Schema.String,
+  totalBytes: Schema.NullOr(NonNegativeInt),
+  freeBytes: Schema.NullOr(NonNegativeInt),
+  usedBytes: Schema.NullOr(NonNegativeInt),
+  removable: Schema.Boolean,
+  readOnly: Schema.Boolean,
+  /** A newer server's state decodes as `ok`: the values shown are the ones it sent. */
+  state: Schema.String.pipe(
+    Schema.decodeTo(
+      ServerHostMetricsVolumeState,
+      SchemaTransformation.transformEffect({
+        decode: (value) =>
+          Effect.succeed(isServerHostMetricsVolumeState(value) ? value : ("ok" as const)),
+        encode: (value) => Effect.succeed(value),
+      }),
+    ),
+  ),
+});
+export type ServerHostMetricsVolume = typeof ServerHostMetricsVolume.Type;
+
+export const ServerHostMetricsSample = Schema.Struct({
+  sampledAt: IsoDateTime,
+  cpuPercent: Schema.Finite,
+  memoryTotalBytes: NonNegativeInt,
+  memoryUsedBytes: NonNegativeInt,
+  memoryAvailableBytes: NonNegativeInt,
+  volumes: Schema.Array(ServerHostMetricsVolume),
+  volumesPaused: Schema.Boolean,
+  /** The volume listing has run past the limit without answering, apart from any volume. */
+  volumeListingNotResponding: Schema.optionalKey(Schema.Boolean),
+  /** Rises by one per CPU and memory reading within one server run, whatever the wall clock does. */
+  sequence: Schema.optionalKey(NonNegativeInt),
+  /** The reading's time on the server's chart clock, which never runs backwards; `recent` points use it. */
+  chartAt: Schema.optionalKey(IsoDateTime),
+  /** How old the reading was, on the server's monotonic clock, when the item was encoded. */
+  ageMs: Schema.optionalKey(NonNegativeInt),
+});
+export type ServerHostMetricsSample = typeof ServerHostMetricsSample.Type;
+
+/** Since the server started: CPU percent or memory used percent. */
+export const ServerHostMetricsStatistic = Schema.Struct({
+  current: Schema.Finite,
+  minimum: Schema.Finite,
+  average: Schema.Finite,
+  p95: Schema.Finite,
+  maximum: Schema.Finite,
+});
+export type ServerHostMetricsStatistic = typeof ServerHostMetricsStatistic.Type;
+
+/** A volume's used percent since the server started (R83), by mount point. */
+export const ServerHostMetricsVolumeStatistic = Schema.Struct({
+  mountPoint: Schema.String,
+  statistic: ServerHostMetricsStatistic,
+});
+export type ServerHostMetricsVolumeStatistic = typeof ServerHostMetricsVolumeStatistic.Type;
+
+const VolumeStatistics = Schema.Array(ServerHostMetricsVolumeStatistic).pipe(
+  Schema.withDecodingDefault(Effect.succeed([])),
+);
+
+export const ServerHostMetricsChartPoint = Schema.Struct({
+  sampledAt: IsoDateTime,
+  cpuPercent: Schema.Finite,
+  memoryPercent: Schema.Finite,
+});
+export type ServerHostMetricsChartPoint = typeof ServerHostMetricsChartPoint.Type;
+
+export const ServerHostMetricsChartBucket = Schema.Struct({
+  startedAt: IsoDateTime,
+  durationMs: NonNegativeInt,
+  cpuAverage: Schema.Finite,
+  cpuPeak: Schema.Finite,
+  memoryAverage: Schema.Finite,
+  memoryPeak: Schema.Finite,
+});
+export type ServerHostMetricsChartBucket = typeof ServerHostMetricsChartBucket.Type;
+
+/**
+ * A volume the filter hid (R81). `reason` is `network`, `overlay`, `fileMount`, `system`, `empty`
+ * or `sameStorage`; it is an open string so a reason a newer server adds cannot fail an older
+ * client's whole snapshot. `sameStorageAs` names the shown volume a `sameStorage` one shares.
+ */
+export const ServerHostMetricsHiddenVolume = Schema.Struct({
+  mountPoint: Schema.String,
+  fileSystem: Schema.String,
+  reason: Schema.String,
+  sameStorageAs: Schema.optionalKey(Schema.String),
+});
+export type ServerHostMetricsHiddenVolume = typeof ServerHostMetricsHiddenVolume.Type;
+
+/**
+ * An item of `server.subscribeHostMetrics`: a `Snapshot` first, then one `Sample` per live
+ * reading. A Sample carries `uptime` only when the subscriber has not been sent that chart yet.
+ */
+/** The host's state at once: the stream's first item, and `server.getHostMetrics` (R82). */
+export const ServerHostMetricsSnapshot = Schema.TaggedStruct("Snapshot", {
+  host: ServerHostFacts,
+  bootId: Schema.NullOr(Schema.String),
+  startedAt: IsoDateTime,
+  statisticsSince: Schema.NullOr(IsoDateTime),
+  sample: Schema.NullOr(ServerHostMetricsSample),
+  cpu: Schema.NullOr(ServerHostMetricsStatistic),
+  memory: Schema.NullOr(ServerHostMetricsStatistic),
+  recent: Schema.Array(ServerHostMetricsChartPoint),
+  uptime: Schema.Array(ServerHostMetricsChartBucket),
+  hiddenVolumes: Schema.Array(ServerHostMetricsHiddenVolume).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+  /** Absent from older servers. */
+  volumeStatistics: VolumeStatistics,
+});
+export type ServerHostMetricsSnapshot = typeof ServerHostMetricsSnapshot.Type;
+
+export const ServerHostMetricsEvent = Schema.Union([
+  ServerHostMetricsSnapshot,
+  Schema.TaggedStruct("Sample", {
+    /** The snapshot's `statisticsSince`, so a stream that began before the first reading learns it. */
+    statisticsSince: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+    sample: ServerHostMetricsSample,
+    cpu: ServerHostMetricsStatistic,
+    memory: ServerHostMetricsStatistic,
+    uptime: Schema.NullOr(Schema.Array(ServerHostMetricsChartBucket)),
+    /** Sent with `uptime`, as part of the same chart state; absent means unchanged. */
+    hiddenVolumes: Schema.optionalKey(Schema.Array(ServerHostMetricsHiddenVolume)),
+    /** Every Sample carries them; absent from older servers. */
+    volumeStatistics: VolumeStatistics,
+  }),
+]);
+export type ServerHostMetricsEvent = typeof ServerHostMetricsEvent.Type;
 
 export const ServerSignalProcessInput = Schema.Struct({
   pid: PositiveInt,

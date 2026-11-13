@@ -8,8 +8,11 @@ import {
   resolveTerminalDocumentVisibility,
   resolveTerminalSelectionActionPosition,
   runtimeEnvSignature,
+  terminalThemeFromApp,
 } from "./ThreadTerminalPanel";
+import { resolveTerminalPalette } from "./terminalTheme";
 import { writeTerminalBuffer } from "./terminalReplyGuard";
+import { BUILTIN_THEMES } from "../themes/builtinThemes";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -212,5 +215,50 @@ describe("quoteTerminalPastePath", () => {
     ],
   ])("pastes %s on %s as one token", (path, os, expected) => {
     expect(quoteTerminalPastePath(path, os)).toBe(expected);
+  });
+});
+
+describe("terminal theme from the app (#290, R51)", () => {
+  const tokyoNight = BUILTIN_THEMES.find((theme) => theme.id === "tokyo-night")!;
+  // A dark document painted with Tokyo Night surfaces.
+  function stubDarkDocument() {
+    vi.stubGlobal("document", {
+      documentElement: { classList: { contains: (name: string) => name === "dark" } },
+      querySelector: () => null,
+      body: {},
+    });
+    vi.stubGlobal("getComputedStyle", () => ({
+      backgroundColor: "rgb(26, 27, 38)",
+      color: "rgb(169, 177, 214)",
+    }));
+  }
+
+  it("a running session launched under Tokyo Night keeps its palette after the app turns light", () => {
+    stubDarkDocument();
+    const launched = resolveTerminalPalette("app", tokyoNight);
+    const theme = terminalThemeFromApp("light", null, launched, false);
+    expect(theme.background).toBe("#1a1b26");
+    expect(theme.green).toBe("#9ece6a");
+    expect(theme.scrollbarSliderBackground).toBe("rgba(255, 255, 255, 0.1)");
+  });
+
+  it("the Dark preference under a custom app theme paints the built-in dark palette, not the app surfaces", () => {
+    stubDarkDocument();
+    const theme = terminalThemeFromApp(
+      "dark",
+      null,
+      resolveTerminalPalette("dark", tokyoNight),
+      false,
+    );
+    expect(theme.background).toBe("rgb(14, 18, 24)");
+    expect(theme.foreground).toBe("rgb(237, 241, 247)");
+  });
+
+  it("under built-in Dark the terminal keeps today's app surface colors", () => {
+    stubDarkDocument();
+    const dark = BUILTIN_THEMES.find((theme) => theme.id === "dark")!;
+    const theme = terminalThemeFromApp("dark", null, resolveTerminalPalette("app", dark), true);
+    expect(theme.background).toBe("rgb(26, 27, 38)");
+    expect(theme.foreground).toBe("rgb(169, 177, 214)");
   });
 });

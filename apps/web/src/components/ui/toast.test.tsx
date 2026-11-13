@@ -315,6 +315,45 @@ describe("ToastProvider rendering", () => {
     expect(renderProvider(<ToastProvider />)).not.toContain("line-clamp-4");
   });
 
+  it("keeps line breaks, Copy, and a bounded keyboard-reachable region for multi-line failures", () => {
+    const copy = vi.fn();
+    testState.copyToClipboard = copy;
+    const raw = "Sign in first.\n\nfatal: could not read Username ".concat("x".repeat(200));
+    testState.toasts = [makeToast({ type: "error", description: raw })];
+    const markup = renderProvider(<ToastProvider />);
+    const [description] = ui.filter("Description") as [Record<string, unknown>];
+    expect(String(description["className"])).toContain("whitespace-pre-line");
+    expect(String(description["className"])).not.toContain("line-clamp-4");
+    // The label sits on a wrapper so the toast's aria-describedby still reads the text itself.
+    expect(description["aria-label"]).toBeUndefined();
+    const region = /<div[^>]*role="group"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(region).toContain('aria-label="Error details"');
+    expect(region).toContain('tabindex="0"');
+    expect(region).toContain("max-h-32");
+    expect(region).toContain("overflow-y-auto");
+    expect(region).toContain("focus-visible:ring-2");
+    expect(region).toContain("focus-visible:ring-ring");
+    expect(markup).toContain('aria-label="Copy error"');
+    (findHostByAria("Copy error")!["onClick"] as () => void)();
+    expect(copy).toHaveBeenCalledWith(raw);
+  });
+
+  it("leaves single-line descriptions out of the scroll region", () => {
+    testState.toasts = [makeToast({ type: "error", description: "one line" })];
+    const markup = renderProvider(<ToastProvider />);
+    const [description] = ui.filter("Description") as [Record<string, unknown>];
+    expect(String(description["className"])).not.toContain("whitespace-pre-line");
+    expect(description["tabIndex"]).toBeUndefined();
+    expect(markup).not.toContain('role="group"');
+  });
+
+  it("names a multi-line region by what it holds when the toast is not an error", () => {
+    testState.toasts = [makeToast({ type: "info", description: "first\nsecond" })];
+    const markup = renderProvider(<ToastProvider />);
+    const region = /<div[^>]*role="group"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(region).toContain('aria-label="Details"');
+  });
+
   it("shows the copy-error control and tighter padding for string error descriptions", () => {
     testState.toasts = [makeToast({ type: "error", description: "boom" })];
     const markup = renderProvider(<ToastProvider />);

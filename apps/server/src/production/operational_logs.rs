@@ -258,6 +258,7 @@ impl TerminalOperationalLog {
                 sequence,
                 exit_code,
                 exit_signal,
+                ..
             } => serde_json::json!({
                 "timestamp": timestamp,
                 "eventType": "exit",
@@ -272,6 +273,7 @@ impl TerminalOperationalLog {
                 thread_id,
                 terminal_id,
                 sequence,
+                ..
             } => serde_json::json!({
                 "timestamp": timestamp,
                 "eventType": "close",
@@ -629,6 +631,7 @@ mod tests {
         .expect("terminal log starts");
         let snapshot = TerminalSessionSnapshot {
             size: None,
+            generation: None,
             osc_color_responder_active: false,
             first_attachment_grant: false,
             thread_id: "thread-1".to_owned(),
@@ -686,6 +689,7 @@ mod tests {
         .expect("terminal log starts");
         let snapshot = TerminalSessionSnapshot {
             size: None,
+            generation: None,
             osc_color_responder_active: false,
             first_attachment_grant: false,
             thread_id: "thread-1".to_owned(),
@@ -723,11 +727,13 @@ mod tests {
                 sequence: 4,
                 exit_code: Some(7),
                 exit_signal: None,
+                generation: None,
             },
             TerminalEvent::Closed {
                 thread_id: "thread-1".to_owned(),
                 terminal_id: "terminal-1".to_owned(),
                 sequence: 5,
+                generation: None,
             },
             TerminalEvent::Error {
                 thread_id: "thread-1".to_owned(),
@@ -748,7 +754,9 @@ mod tests {
                     cols: 91,
                     rows: 42,
                     size_claim: Some("PRIVATE_CLAIM".to_owned()),
+                    reply_claim: None,
                 },
+                only_for: None,
             },
         ] {
             assert!(log.record(&event));

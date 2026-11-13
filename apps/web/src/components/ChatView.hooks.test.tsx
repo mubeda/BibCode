@@ -385,6 +385,7 @@ vi.mock("../keybindings", () => ({
   shortcutLabelForCommand: () => h.shortcutLabel,
   // Find in thread opens only for a resolved chat.find here; its fallback has its own tests.
   shouldOpenChatFind: (command: string | null) => command === "chat.find",
+  shouldStartCodeReview: (command: string | null) => command === "sourceControl.review",
 }));
 
 vi.mock("../commandPaletteContext", () => ({
@@ -759,6 +760,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repositoryIdentity: null,
     defaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     scripts: [],
+    codeReviewPrompt: "",
     worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: now,
     updatedAt: now,

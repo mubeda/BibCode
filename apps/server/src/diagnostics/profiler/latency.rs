@@ -1141,6 +1141,24 @@ mod tests {
     }
 
     #[test]
+    fn a_status_refresh_blocked_past_ten_seconds_is_still_a_hang() {
+        assert!(
+            !is_long_running("vcs.refreshStatus"),
+            "a status refresh must keep the 10 s hang budget (#345)"
+        );
+        let now = Instant::now();
+        let mut in_flight = HashMap::from([(
+            1,
+            InFlight::new("vcs.refreshStatus", now - Duration::from_secs(11)),
+        )]);
+        let hung = overdue(&mut in_flight, now);
+        assert_eq!(hung.len(), 1);
+        let finding = hang_finding(&hung[0].0, hung[0].1);
+        assert_eq!(finding.kind, "rpc.hang");
+        assert_eq!(finding.fingerprint_fields, ["vcs.refreshStatus", "server"]);
+    }
+
+    #[test]
     fn a_dropped_timer_leaves_the_in_flight_registry_and_off_registers_nothing() {
         let _profiling = PinnedProfiling::new(true);
         let timer = RequestTimer::unary("test.latency.dropped", &[]).expect("profiling");

@@ -161,6 +161,9 @@ pub(crate) fn wrap_windows_batch_command(
     })
 }
 
+/// The longest command line `cmd.exe` accepts, in UTF-16 units.
+pub(crate) const WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS: usize = 8_191;
+
 fn make_windows_batch_command_line(
     script: &Path,
     arguments: &[OsString],
@@ -181,7 +184,28 @@ fn make_windows_batch_command_line(
         append_windows_batch_argument(&mut command, &argument.to_string_lossy())?;
     }
     command.push('"');
+    // Counted after quoting, backslash doubling and the `%` guard: what cmd.exe receives.
+    let length = command.encode_utf16().count();
+    if length > WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS {
+        return Err(format!(
+            "The command is too long for a Windows terminal ({} of {} characters). Shorten the review prompt or pick a chat reviewer.",
+            with_thousands_separators(length),
+            with_thousands_separators(WINDOWS_BATCH_COMMAND_LINE_MAX_CHARS)
+        ));
+    }
     Ok(command.into())
+}
+
+fn with_thousands_separators(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn append_windows_batch_argument(command: &mut String, argument: &str) -> Result<(), String> {
@@ -214,8 +238,9 @@ fn append_windows_batch_argument(command: &mut String, argument: &str) -> Result
                 command.push('"');
             } else if character == '%' {
                 // Prevent `%VAR%` expansion with the same zero-length `%cd%`
-                // substring used by Rust's hardened batch launcher.
-                command.push_str("%%cd:~,%");
+                // substring used by Rust's hardened batch launcher: `%%cd:~,` before
+                // the `%` itself reads back as one `%`.
+                command.push_str("%%cd:~,");
             }
             backslashes = 0;
         }
@@ -392,6 +417,65 @@ impl SpawnPlan {
             }
             (result, _) => result,
         }
+    }
+}
+
+#[cfg(test)]
+mod windows_batch_command_line_tests {
+    use std::{ffi::OsString, path::Path};
+
+    use super::make_windows_batch_command_line;
+
+    const SCRIPT: &str = r"C:\tools\review.cmd";
+
+    fn encode(arguments: &[String]) -> Result<String, String> {
+        let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+        make_windows_batch_command_line(Path::new(SCRIPT), &arguments)
+            .map(|line| line.into_string().expect("UTF-8 command line"))
+    }
+
+    #[test]
+    fn windows_batch_command_line_refuses_over_8191_chars() {
+        // About 4,240 characters raw; a quoted argument doubles its trailing backslashes.
+        let prompt = format!("Code review requested from BiBCode. {}", "\\".repeat(4_200));
+        let arguments = ["--permission-mode", "plan", "--", &prompt].map(str::to_owned);
+        let encoded = format!(
+            r#"/e:ON /v:OFF /d /c ""{SCRIPT}" --permission-mode plan -- "Code review requested from BiBCode. {}"""#,
+            "\\".repeat(8_400)
+        );
+        let length = encoded.encode_utf16().count();
+        assert!(prompt.chars().count() < 8_191 && length > 8_191);
+        let thousands = length / 1_000;
+        let units = length % 1_000;
+        assert_eq!(
+            encode(&arguments),
+            Err(format!(
+                "The command is too long for a Windows terminal ({thousands},{units:03} of 8,191 characters). Shorten the review prompt or pick a chat reviewer."
+            ))
+        );
+    }
+
+    /// `%%cd:~,%` reads back as one `%` on the `cmd /c` line, so `%PATH%` is never expanded.
+    #[test]
+    fn windows_batch_percent_is_escaped_once() {
+        assert_eq!(
+            encode(&["100% %PATH%".to_owned()]),
+            Ok(format!(
+                r#"/e:ON /v:OFF /d /c ""{SCRIPT}" "100%%cd:~,% %%cd:~,%PATH%%cd:~,%"""#
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_batch_command_line_accepts_exactly_8191_chars() {
+        let fixed = format!(r#"/e:ON /v:OFF /d /c ""{SCRIPT}" "#).len() + 1;
+        let fits = "a".repeat(8_191 - fixed);
+        assert_eq!(
+            encode(std::slice::from_ref(&fits)).map(|line| line.len()),
+            Ok(8_191)
+        );
+        let over = format!("{fits}a");
+        assert!(encode(&[over]).is_err());
     }
 }
 

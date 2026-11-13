@@ -3,9 +3,19 @@ export interface TerminalInputSendResult {
   readonly error?: unknown;
 }
 
+/**
+ * Who produced a piece of input: a renderer's size claim for a user's input, `null` for the
+ * terminal's own replies, `undefined` for unmarked input. Input of different origins never
+ * shares a frame (#348).
+ */
+export type TerminalInputSchedulerOrigin = string | null | undefined;
+
 export interface TerminalInputSchedulerOptions {
   /** Sends one payload to the PTY. Resolves ok:false or rejects to signal failure. */
-  readonly send: (data: string) => Promise<TerminalInputSendResult>;
+  readonly send: (
+    data: string,
+    origin: TerminalInputSchedulerOrigin,
+  ) => Promise<TerminalInputSendResult>;
   /**
    * Invoked once when a current-generation write fails, after dependent input is
    * dropped. Observer exceptions are isolated from the scheduler.
@@ -22,14 +32,14 @@ export interface TerminalInputSchedulerOptions {
 
 export interface TerminalInputScheduler {
   /** Appends input in arrival order and schedules a drain. Empty strings are ignored. */
-  enqueue(data: string): void;
+  enqueue(data: string, origin?: TerminalInputSchedulerOrigin): void;
   /**
    * Reserves the current end of the queue for input that is not ready yet. Later
    * input waits behind the reservation, within the pending limit, until the returned
    * function fills it (`null` leaves nothing). A reservation from before a reset or
    * failure is ignored.
    */
-  reserve(): (data: string | null) => void;
+  reserve(origin?: TerminalInputSchedulerOrigin): (data: string | null) => void;
   /** Drops pending input and invalidates in-flight results for the old generation. */
   reset(): void;
   pendingLength(): number;
@@ -45,7 +55,12 @@ export function createTerminalInputScheduler(
   const maxFrameLength = Number.isFinite(requestedMaxFrameLength)
     ? Math.max(1, Math.floor(requestedMaxFrameLength))
     : DEFAULT_MAX_INPUT_FRAME_LENGTH;
-  let pending = "";
+  interface Segment {
+    data: string;
+    readonly origin: TerminalInputSchedulerOrigin;
+  }
+  // Pending input in arrival order; adjacent input of one origin shares a segment.
+  let pending: Segment[] = [];
   const maxInFlight = () =>
     Math.max(
       1,
@@ -74,15 +89,23 @@ export function createTerminalInputScheduler(
   interface Reservation {
     data: string | null;
     filled: boolean;
+    readonly origin: TerminalInputSchedulerOrigin;
   }
   // Input waiting behind the first unfilled reservation, in arrival order.
-  let held: Array<string | Reservation> = [];
+  let held: Array<Segment | Reservation> = [];
   let reservationEpoch = 0;
 
-  const takeFrame = (): string => {
+  const append = (data: string, origin: TerminalInputSchedulerOrigin) => {
+    const last = pending.at(-1);
+    if (last !== undefined && last.origin === origin) last.data += data;
+    else pending.push({ data, origin });
+  };
+
+  const takeFrame = (): Segment => {
+    const head = pending[0]!;
     let end = 0;
     let bytes = 0;
-    for (const character of pending) {
+    for (const character of head.data) {
       const size = terminalInputCharacterBytes(character);
       if (end > 0 && (end + character.length > maxFrameLength || bytes + size > maxFrameBytes))
         break;
@@ -90,8 +113,9 @@ export function createTerminalInputScheduler(
       bytes += size;
     }
 
-    const frame = pending.slice(0, end);
-    pending = pending.slice(end);
+    const frame = { data: head.data.slice(0, end), origin: head.origin };
+    head.data = head.data.slice(end);
+    if (head.data.length === 0) pending.shift();
     return frame;
   };
 
@@ -112,7 +136,7 @@ export function createTerminalInputScheduler(
   };
 
   const fail = (error: unknown): void => {
-    pending = "";
+    pending = [];
     held = [];
     reservationEpoch += 1;
     if (typeof options.stopOnError === "function" ? options.stopOnError() : options.stopOnError) {
@@ -131,7 +155,7 @@ export function createTerminalInputScheduler(
       inFlight.add(token);
       void (async () => {
         try {
-          const result = await options.send(frame);
+          const result = await options.send(frame.data, frame.origin);
           if (frameGeneration === generation && !result.ok && !stopped) fail(result.error);
         } catch (error) {
           if (frameGeneration === generation && !stopped) fail(error);
@@ -153,10 +177,9 @@ export function createTerminalInputScheduler(
     });
   };
 
-  const heldText = () =>
-    held.map((item) => (typeof item === "string" ? item : (item.data ?? ""))).join("");
+  const queuedText = () => [...pending, ...held].map((item) => item.data ?? "").join("");
   const exceedsPending = (data: string) =>
-    encoder.encode(pending + heldText() + data).length > maxPendingBytes;
+    encoder.encode(queuedText() + data).length > maxPendingBytes;
   const failOverflow = () =>
     fail(
       new Error("Terminal input exceeded the 1 MiB pending limit. Reattach before typing again."),
@@ -165,29 +188,29 @@ export function createTerminalInputScheduler(
   const releaseFilled = () => {
     while (held.length > 0) {
       const head = held[0]!;
-      if (typeof head !== "string" && !head.filled) break;
+      if ("filled" in head && !head.filled) break;
       held.shift();
-      pending += typeof head === "string" ? head : (head.data ?? "");
+      if (head.data) append(head.data, head.origin);
     }
     if (pending.length > 0) scheduleDrain();
   };
 
   return {
-    enqueue(data) {
+    enqueue(data, origin) {
       if (data.length === 0 || stopped) return;
       if (exceedsPending(data)) {
         failOverflow();
         return;
       }
       if (held.length > 0) {
-        held.push(data);
+        held.push({ data, origin });
         return;
       }
-      pending += data;
+      append(data, origin);
       scheduleDrain();
     },
-    reserve() {
-      const reservation: Reservation = { data: null, filled: false };
+    reserve(origin) {
+      const reservation: Reservation = { data: null, filled: false, origin };
       const epoch = reservationEpoch;
       held.push(reservation);
       return (data) => {
@@ -203,7 +226,7 @@ export function createTerminalInputScheduler(
     },
     reset() {
       generation += 1;
-      pending = "";
+      pending = [];
       held = [];
       reservationEpoch += 1;
       stopped = false;
@@ -211,7 +234,7 @@ export function createTerminalInputScheduler(
       notifyReset();
     },
     pendingLength() {
-      return pending.length;
+      return pending.reduce((length, segment) => length + segment.data.length, 0);
     },
     isDraining() {
       return inFlight.size > 0;

@@ -34,6 +34,7 @@ import {
   WorkspaceCardStatusGlyph,
   WorkspaceCardTitleLine,
 } from "./WorkspaceCard";
+import { classOf, levelTextTags, textColorUtilities } from "./sidebarLevels.testSupport";
 
 const noop = () => {};
 
@@ -88,6 +89,8 @@ describe("WorkspaceCardShell", () => {
             className=""
             idBase="controls"
             isActive={false}
+            isSelected={false}
+            level="worktree"
             hasFlags={false}
             hasBranchLine
             hasSessionLine={false}
@@ -144,6 +147,9 @@ describe("WorkspaceCardShell", () => {
         className="card-surface"
         idBase="card"
         isActive
+        isSelected
+        level="checkout"
+        primary
         hasFlags
         hasBranchLine
         hasSessionLine={false}
@@ -157,6 +163,9 @@ describe("WorkspaceCardShell", () => {
     );
     expect(markup).toContain('data-testid="thread-row-a"');
     expect(markup).toContain('data-thread-item="true"');
+    expect(markup).toContain(
+      'data-sidebar-level="checkout" data-primary="" data-selected="true" data-active="true"',
+    );
     expect(markup).toContain('data-testid="thread-card-button-a"');
     expect(markup).toContain('type="button"');
     expect(markup).toContain('aria-labelledby="card-status card-title card-flags"');
@@ -175,6 +184,8 @@ describe("WorkspaceCardShell", () => {
         className=""
         idBase="card"
         isActive={false}
+        isSelected={false}
+        level="worktree"
         hasFlags={false}
         hasBranchLine={false}
         hasSessionLine={false}
@@ -186,6 +197,8 @@ describe("WorkspaceCardShell", () => {
         {null}
       </WorkspaceCardShell>,
     );
+    expect(markup).toContain('data-sidebar-level="worktree"');
+    expect(markup).not.toMatch(/data-(primary|selected|active)=/);
     expect(markup).toContain('aria-labelledby="card-status card-title"');
     expect(markup).not.toContain("aria-describedby");
     expect(markup).not.toContain("aria-current");
@@ -240,13 +253,74 @@ describe("card lines", () => {
         pinnedTestId="thread-pinned-a"
       />,
     );
-    expect(markup).toContain("font-semibold text-foreground");
-    expect(markup).toContain('data-unread="true"');
+    const label = markup.match(/<span[^>]*data-sidebar-label[^>]*>/)?.[0] ?? "";
+    expect(label).toContain('data-unread="true"');
+    expect(classOf(label)).toContain("font-semibold");
+    // A shape marks unread, so a primary label at weight 600 still differs from a read one (R63).
+    const dot = markup.match(/<span[^>]*data-sidebar-unread[^>]*>/)?.[0] ?? "";
+    expect(dot).toContain('aria-hidden="true"');
+    expect(classOf(dot)).toMatch(/\brounded-full\b/);
+    expect(markup.indexOf(dot)).toBeLessThan(markup.indexOf(label));
     expect(markup).toContain('id="f" class="sr-only">unread, pinned</span>');
     expect(markup).toContain('data-testid="thread-pinned-a"');
   });
 
-  it("shows a read title muted with the primary chip", () => {
+  it("draws no unread dot on a read title", () => {
+    const markup = renderToStaticMarkup(
+      <WorkspaceCardTitleLine
+        id="t"
+        flagsId="f"
+        title="Fix the build"
+        titleTestId="thread-title-t"
+        unread={false}
+        pinned={false}
+        primary
+      />,
+    );
+    expect(markup).not.toContain("data-sidebar-unread");
+  });
+
+  it("gives no label or chat title a colour utility, read or unread (R63)", () => {
+    for (const unread of [false, true]) {
+      for (const variant of [{ primary: true }, {}, { chat: true }]) {
+        const markup = renderToStaticMarkup(
+          <WorkspaceCardTitleLine
+            id="t"
+            flagsId="f"
+            title="Fix the build"
+            titleTestId="thread-title-t"
+            unread={unread}
+            pinned={false}
+            {...variant}
+          />,
+        );
+        const tags = levelTextTags(markup);
+        expect(tags, JSON.stringify(variant)).toHaveLength(1);
+        for (const tag of tags) expect(textColorUtilities(classOf(tag)), tag).toEqual([]);
+      }
+    }
+  });
+
+  it("draws a chat title line at chat level, without the label marker or a 13px size", () => {
+    const markup = renderToStaticMarkup(
+      <WorkspaceCardTitleLine
+        id="t"
+        flagsId="f"
+        title="Fix the build"
+        titleTestId="thread-title-t"
+        unread={false}
+        pinned={false}
+        chat
+      />,
+    );
+    const title = markup.match(/<span[^>]*data-testid="thread-title-t"[^>]*>/)?.[0] ?? "";
+    expect(title).toContain('data-sidebar-level="chat"');
+    expect(title).not.toContain("data-sidebar-label");
+    expect(classOf(title)).not.toContain("text-[13px]");
+    expect(title).toContain('id="t"');
+  });
+
+  it("leaves a read primary title and its chip to the level rules (R63)", () => {
     const markup = renderToStaticMarkup(
       <WorkspaceCardTitleLine
         id="t"
@@ -258,9 +332,57 @@ describe("card lines", () => {
         primary
       />,
     );
-    expect(markup).toContain("text-[13px] text-foreground/80");
-    expect(markup).toContain(">primary<");
+    expect(markup).toMatch(
+      /data-sidebar-label="true" class="pointer-events-auto min-w-0 truncate text-\[13px\]"/,
+    );
+    expect(markup).toMatch(
+      /<span data-sidebar-badge="true" class="shrink-0 px-1.5 text-xs leading-4">primary</,
+    );
     expect(markup).not.toContain("sr-only");
+  });
+
+  it("leaves a read non-primary title's colour to the level rules", () => {
+    const markup = renderToStaticMarkup(
+      <WorkspaceCardTitleLine
+        id="t"
+        flagsId="f"
+        title="Fix the build"
+        titleTestId="thread-title-t"
+        unread={false}
+        pinned={false}
+      />,
+    );
+    expect(markup).toMatch(/data-sidebar-label="true" class="[^"]*text-\[13px\]"/);
+    expect(markup).not.toContain("text-foreground/80");
+    expect(markup).not.toContain("data-sidebar-badge");
+  });
+
+  it("leads a worktree row with the branch as its level label", () => {
+    const markup = renderToStaticMarkup(
+      <WorkspaceCardBranchLine
+        id="b"
+        branch="feat/x"
+        branchTooltip="/wt/x"
+        label
+        trailing={<button type="button">Archive</button>}
+      >
+        <span>indicator</span>
+      </WorkspaceCardBranchLine>,
+    );
+    // The description reads the branch and its indicators, never the Archive control.
+    const host = document.createElement("div");
+    host.innerHTML = markup;
+    const described = host.querySelector("#b")!;
+    expect(described.textContent).toContain("indicator");
+    expect(described.querySelector("button")).toBeNull();
+    expect(host.querySelector("button")?.textContent).toBe("Archive");
+    const label = markup.match(/<span[^>]*data-sidebar-label[^>]*>([^<]*)</);
+    expect(label?.[1]).toBe("feat/x");
+    expect(textColorUtilities(classOf(label?.[0] ?? ""))).toEqual([]);
+    expect(markup.match(/<svg[^>]*data-sidebar-icon[^>]*>/g)).toHaveLength(1);
+    // The line keeps the branch id the card's description points at.
+    expect(markup.match(/<div id="b" class="([^"]*)"/)?.[1]).not.toMatch(/\btext-xs\b/);
+    expect(markup).toContain("indicator");
   });
 
   it("keeps the indicators right-aligned when the branch text is hidden", () => {

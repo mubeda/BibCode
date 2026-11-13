@@ -105,7 +105,7 @@ export const AgentsRow = memo(
           size="lg"
           isActive={selected}
           className={cn(
-            "h-auto items-stretch gap-0 rounded-md px-3 py-2.5 hover:bg-accent/60 data-[active=true]:bg-accent data-[active=true]:font-normal",
+            "h-auto items-stretch gap-0 rounded-md px-3 py-2.5 hover:bg-accent/60 data-[active=true]:bg-selected data-[active=true]:text-selected-foreground data-[active=true]:font-normal",
             // Room for the Jump to workspace action, only where the host shows it.
             onJumpToWorkspace !== undefined && "pr-9",
           )}

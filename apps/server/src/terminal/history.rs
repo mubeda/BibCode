@@ -7,6 +7,32 @@ const DEQUE_SHRINK_OCCUPANCY_DENOMINATOR: usize = 4;
 /// ample replay headroom above the 512 KiB client transcript cap.
 const DEFAULT_BYTE_LIMIT: usize = 1_048_576;
 
+/// The cut a released client applies to an attach snapshot: `DEFAULT_MAX_TERMINAL_BUFFER_BYTES`
+/// in `packages/client-runtime/src/state/terminalTranscript.ts` (pinned by a test). A history
+/// retaining more replays only its last this-many bytes in that client.
+#[cfg(unix)]
+const CLIENT_TRANSCRIPT_CUT_BYTES: usize = 512 * 1024;
+
+/// Why replaying a history may not rebuild the program's screen (#348).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LossyReplay {
+    /// Output before the retained bytes was evicted or cleared.
+    DiscardedPrefix,
+    /// Everything is retained, but more than a released client keeps of a snapshot.
+    OverClientCut,
+}
+
+#[cfg(unix)]
+impl LossyReplay {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscardedPrefix => "discarded prefix",
+            Self::OverClientCut => "over the client cut",
+        }
+    }
+}
+
 /// Bounded, chunked terminal scrollback.
 ///
 /// Each push scans only the new data for line boundaries. Eviction advances an
@@ -171,6 +197,24 @@ impl TerminalHistory {
 
     pub(crate) fn total_bytes_written(&self) -> u64 {
         self.total_bytes_written
+    }
+
+    /// Whether output before the retained bytes is gone: evicted by a limit, or cleared.
+    #[cfg(unix)]
+    pub(crate) fn has_discarded_prefix(&self) -> bool {
+        self.total_bytes_written > self.total_bytes as u64
+    }
+
+    /// Whether a client replaying this history misses output, and why. O(1): counters only.
+    #[cfg(unix)]
+    pub(crate) fn lossy_replay(&self) -> Option<LossyReplay> {
+        if self.has_discarded_prefix() {
+            Some(LossyReplay::DiscardedPrefix)
+        } else if self.total_bytes > CLIENT_TRANSCRIPT_CUT_BYTES {
+            Some(LossyReplay::OverClientCut)
+        } else {
+            None
+        }
     }
 
     /// The offset of the oldest retained byte.
@@ -380,6 +424,8 @@ fn byte_index_after_nth_newline(data: &str, count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{CLIENT_TRANSCRIPT_CUT_BYTES, LossyReplay};
     use super::{HistoryCursor, TerminalHistory};
 
     fn legacy_push(history: &mut String, data: &str, line_limit: usize) {
@@ -509,6 +555,59 @@ mod tests {
         history.push("ignored\nprompt");
         assert!(history.snapshot().is_empty());
         assert_eq!(history.line_limit(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_complete_history_under_the_client_cut_replays_without_loss() {
+        let mut history = TerminalHistory::new(5_000);
+        assert_eq!(history.lossy_replay(), None);
+        history.push(&"x".repeat(CLIENT_TRANSCRIPT_CUT_BYTES));
+        assert!(!history.has_discarded_prefix());
+        assert_eq!(history.lossy_replay(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_and_clearing_leave_a_discarded_prefix() {
+        let mut evicted = TerminalHistory::new(2);
+        evicted.push("one\ntwo\nthree\n");
+        assert!(evicted.has_discarded_prefix());
+        assert_eq!(evicted.lossy_replay(), Some(LossyReplay::DiscardedPrefix));
+
+        let mut by_bytes = TerminalHistory::with_byte_limit(5_000, 4);
+        by_bytes.push("abcdef");
+        assert_eq!(by_bytes.lossy_replay(), Some(LossyReplay::DiscardedPrefix));
+
+        let mut cleared = TerminalHistory::new(5_000);
+        cleared.clear();
+        assert_eq!(cleared.lossy_replay(), None, "nothing was ever written");
+        cleared.push("prompt");
+        cleared.clear();
+        cleared.push("fresh");
+        assert_eq!(cleared.lossy_replay(), Some(LossyReplay::DiscardedPrefix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_complete_history_over_the_client_cut_is_lossy_for_a_released_client() {
+        let mut history = TerminalHistory::new(5_000);
+        history.push(&"x".repeat(CLIENT_TRANSCRIPT_CUT_BYTES + 1));
+        assert!(!history.has_discarded_prefix());
+        assert_eq!(history.lossy_replay(), Some(LossyReplay::OverClientCut));
+    }
+
+    /// The server's cut must track the client's: a change to either breaks this.
+    #[cfg(unix)]
+    #[test]
+    fn the_client_cut_matches_the_client_transcript_default() {
+        let client =
+            include_str!("../../../../packages/client-runtime/src/state/terminalTranscript.ts");
+        assert!(
+            client.contains("export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 512 * 1024;"),
+            "the client transcript default changed; update CLIENT_TRANSCRIPT_CUT_BYTES"
+        );
+        assert_eq!(CLIENT_TRANSCRIPT_CUT_BYTES, 512 * 1024);
     }
 
     #[test]

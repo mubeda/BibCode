@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 
 import { FileEditingSession } from "./fileEditingSession";
 import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
+import { windowUnsavedFiles } from "./unsavedFileEdits";
 
 function fakeSession(relativePath: string) {
   return {
@@ -17,7 +19,23 @@ function fakeSession(relativePath: string) {
       this.relativePath = next;
     }),
     dispose: vi.fn(),
+    unsavedContents: null as string | null,
+    getSnapshot: () => ({ editPending: false }),
   };
+}
+
+function realSession(
+  relativePath: string,
+  persist = vi.fn(async () => AsyncResult.success(undefined)),
+) {
+  return new FileEditingSession<never, void, never>({
+    cwd: "/repo",
+    relativePath,
+    debounceMs: 500,
+    persist,
+    onPendingChange: vi.fn(),
+    onConfirmed: vi.fn(),
+  });
 }
 
 function deferredResult<T>() {
@@ -155,7 +173,7 @@ describe("FileEditingSessionRegistry", () => {
       toRelativePath: "src/renamed.ts",
     });
 
-    session.changeOutsideEditor("paused draft");
+    session.changeFromRichEditor("paused draft");
     registry.setActivePath(null);
     expect(persist).not.toHaveBeenCalled();
 
@@ -189,7 +207,7 @@ describe("FileEditingSessionRegistry", () => {
       toRelativePath: "src/renamed.ts",
     });
 
-    session.changeOutsideEditor("paused draft");
+    session.changeFromRichEditor("paused draft");
     const flush = vi.spyOn(session, "flush");
     registry.setActivePath(null);
     const pausedFlush = flush.mock.results[0]!.value;
@@ -235,7 +253,7 @@ describe("FileEditingSessionRegistry", () => {
         toRelativePath: "src/renamed.ts",
       });
 
-      session.changeOutsideEditor("paused draft");
+      session.changeFromRichEditor("paused draft");
       registry.setActivePath(null);
       lease!.release();
       await vi.advanceTimersByTimeAsync(0);
@@ -813,5 +831,113 @@ describe("FileEditingSessionRegistry", () => {
     } finally {
       reportError.mockRestore();
     }
+  });
+
+  describe("unsaved sessions", () => {
+    it("lists a source edit, an edit inside the rendered-view delay and an undelivered edit", () => {
+      vi.useFakeTimers();
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      const source = registry.getOrCreate("a.md", () => realSession("a.md"));
+      const waiting = registry.getOrCreate("b.md", () => realSession("b.md"));
+      const undelivered = registry.getOrCreate("c.md", () => realSession("c.md"));
+      registry.getOrCreate("clean.md", () => realSession("clean.md"));
+
+      source.changeFromRichEditor("source edit");
+      waiting.setPendingEditFlusher(() => {});
+      undelivered.setPendingEditFlusher(() => {
+        throw new Error("the rendered view could not serialize");
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      void undelivered.flush();
+
+      expect(registry.unsavedSessions()).toEqual([
+        { path: "a.md" },
+        { path: "b.md" },
+        { path: "c.md" },
+      ]);
+    });
+
+    it("Save all writes every unsaved session and reports saved", async () => {
+      const persist = vi.fn(async () => AsyncResult.success(undefined));
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      const rendered = registry.getOrCreate("a.md", () => realSession("a.md", persist));
+      const source = registry.getOrCreate("b.md", () => realSession("b.md", persist));
+      rendered.setPendingEditFlusher(() => rendered.changeFromRichEditor("rendered edit"));
+      source.changeFromRichEditor("source edit");
+
+      await expect(registry.saveAll()).resolves.toBe("saved");
+
+      expect(persist).toHaveBeenCalledWith("a.md", "rendered edit", null);
+      expect(persist).toHaveBeenCalledWith("b.md", "source edit", null);
+      expect(registry.unsavedSessions()).toEqual([]);
+    });
+
+    it("Save all reports blocked and keeps the edit when a save fails", async () => {
+      const persist = vi.fn(async () => AsyncResult.failure(Cause.fail("disk full")));
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      const session = registry.getOrCreate("a.md", () => realSession("a.md", persist as never));
+      session.changeFromRichEditor("edit");
+
+      await expect(registry.saveAll()).resolves.toBe("blocked");
+      expect(registry.unsavedSessions()).toEqual([{ path: "a.md" }]);
+    });
+
+    it("a leave hold stops every write until it is released, even when saving is enabled again", async () => {
+      vi.useFakeTimers();
+      const persist = vi.fn(async () => AsyncResult.success(undefined));
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      const session = registry.getOrCreate("a.md", () => realSession("a.md", persist));
+      session.changeFromRichEditor("discarded edit");
+
+      const release = registry.holdSavingForLeave();
+      registry.setSavingEnabled(false);
+      registry.setSavingEnabled(true);
+      const added = registry.getOrCreate("b.md", () => realSession("b.md", persist));
+      added.changeFromRichEditor("another discarded edit");
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(persist).not.toHaveBeenCalled();
+
+      release();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(persist).toHaveBeenCalledTimes(2);
+    });
+
+    it("joins the window-wide set with its first session and leaves it when its dispose finishes", async () => {
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      expect(windowUnsavedFiles()).not.toContainEqual({ path: "joined.md" });
+      const session = registry.getOrCreate("joined.md", () => realSession("joined.md"));
+      session.changeFromRichEditor("edit");
+      expect(windowUnsavedFiles()).toContainEqual({ path: "joined.md" });
+
+      await registry.dispose();
+      expect(windowUnsavedFiles()).not.toContainEqual({ path: "joined.md" });
+    });
+
+    it("a disposing registry lists a session until its settle ends, and Save all waits for it", async () => {
+      const write = deferredResult<ReturnType<typeof AsyncResult.success<undefined>>>();
+      const persist = vi.fn(() => write.promise);
+      const registry = new FileEditingSessionRegistry<FileEditingSession<never, void, never>>();
+      const session = registry.getOrCreate("leaving.md", () =>
+        realSession("leaving.md", persist as never),
+      );
+      session.changeFromRichEditor("edit");
+
+      const disposed = registry.dispose();
+      await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+      expect(registry.unsavedSessions()).toEqual([{ path: "leaving.md" }]);
+      expect(windowUnsavedFiles()).toContainEqual({ path: "leaving.md" });
+
+      let saved: string | null = null;
+      void registry.saveAll().then((result) => {
+        saved = result;
+      });
+      await Promise.resolve();
+      expect(saved).toBeNull();
+
+      write.resolve(AsyncResult.success(undefined));
+      await disposed;
+      await vi.waitFor(() => expect(saved).toBe("saved"));
+      expect(windowUnsavedFiles()).not.toContainEqual({ path: "leaving.md" });
+    });
   });
 });

@@ -1,12 +1,20 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
+use crate::diagnostics::profiler::redact::redact_path;
 use crate::process::supervised::{
-    SupervisedOverflow, SupervisedRunError, SupervisedRunOutput, SupervisedRunRequest,
-    SupervisedStreamOutput, run_supervised,
+    StopPolicy, SupervisedOverflow, SupervisedRunError, SupervisedRunOutput, SupervisedRunRequest,
+    SupervisedStreamOutput, TerminationReport, TerminationReports, run_supervised_reporting,
 };
 use crate::process::{ChildCommand, EnvironmentInheritance, SpawnPlan};
 
@@ -249,7 +257,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit, None)
             .await
     }
 
@@ -261,9 +269,14 @@ impl ProcessRunner {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, EnvironmentInheritance::Inherit)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, EnvironmentInheritance::Inherit, cancellation)
-            .await
-            .map_err(|error| map_supervised_error(error, &request, command_label))?;
+        let output = run_request(
+            &request,
+            EnvironmentInheritance::Inherit,
+            cancellation,
+            None,
+        )
+        .await
+        .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
         let exit_code = output
             .status
@@ -306,7 +319,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared, None)
             .await
     }
 
@@ -316,7 +329,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared, None)
             .await
     }
 
@@ -325,11 +338,12 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
         inheritance: EnvironmentInheritance,
+        reports: Option<TerminationReports>,
     ) -> Result<ProcessOutput, ProcessError> {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, inheritance)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, inheritance, cancellation)
+        let output = run_request(&request, inheritance, cancellation, reports)
             .await
             .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
@@ -417,15 +431,17 @@ async fn run_request(
     request: &ProcessRequest,
     inheritance: EnvironmentInheritance,
     cancellation: &CancellationToken,
+    reports: Option<TerminationReports>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
     SpawnPlan::new(&request.command, |program| {
         process_command(request, inheritance, program)
     })
     .start(
         |command| {
-            Box::pin(run_supervised(
+            Box::pin(run_supervised_reporting(
                 supervised_request(request, command),
                 cancellation,
+                reports.clone(),
             ))
         },
         |error| match error {
@@ -434,6 +450,460 @@ async fn run_request(
         },
     )
     .await
+}
+
+impl ProcessRunner {
+    /// [`Self::run`] for a Git command that may write the index. `registry` admits it, its
+    /// shutdown stops it, and a stop that had to be forced is followed by
+    /// [`IndexLockWatch::after_forced_stop`] before the write is released (R16, R17). A write
+    /// refused because shutdown closed admission fails as cancelled.
+    pub(crate) async fn run_write(
+        &self,
+        request: ProcessRequest,
+        registry: &GitWriteRegistry,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        let Some(ticket) = registry.track() else {
+            return Err(ProcessError::Cancelled {
+                operation: request.operation,
+            });
+        };
+        // shortcut: one `rev-parse` per write; cache the Git directory per worktree if writes
+        // become a measured hot spot.
+        let watch = if runs_git(&request.command) && takes_index_lock(&request.args) {
+            self.resolve_git_dir(&request, cancellation)
+                .await
+                .map(|git_dir| IndexLockWatch::before_spawn(&git_dir))
+        } else {
+            None
+        };
+        let stop = ticket.cancellation.clone();
+        let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+        let mut reports = TerminationReports::new(sender);
+        if let Some(watch) = &watch
+            && !watch.existed
+        {
+            let lock = watch.lock.clone();
+            reports = reports.checking_before_force(move |pid| holds_open(pid, &lock));
+        }
+        // Owns the release: a dropped run still settles it in the background.
+        let mut settlement = PendingSettlement(Some(WriteSettlement {
+            _ticket: ticket,
+            watch,
+            received,
+            operation: request.operation.clone(),
+            cwd: request.cwd.clone(),
+        }));
+        let output = tokio::select! {
+            output = self.run_with_environment(
+                request,
+                &stop,
+                EnvironmentInheritance::Inherit,
+                Some(reports),
+            ) => output,
+            () = async {
+                cancellation.cancelled().await;
+                stop.cancel();
+                std::future::pending::<()>().await;
+            } => unreachable!("the forwarding branch never completes"),
+        };
+        if let Some(settlement) = settlement.0.take() {
+            settlement.settle_now_or_later().await;
+        }
+        output
+    }
+
+    /// The command's own Git directory, which for a linked worktree is
+    /// `<common-dir>/worktrees/<name>`. `None` where there is none yet (`init`, `clone`).
+    pub(crate) async fn resolve_git_dir(
+        &self,
+        request: &ProcessRequest,
+        cancellation: &CancellationToken,
+    ) -> Option<PathBuf> {
+        let mut probe = request.clone();
+        probe.operation = format!("{}.gitDir", request.operation);
+        probe.args = ["rev-parse", "--absolute-git-dir"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        probe.stdin = None;
+        probe.env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+        probe.allow_non_zero_exit = false;
+        let output = self.run(probe, cancellation).await.ok()?;
+        let git_dir = output.stdout.trim_end_matches(['\r', '\n']);
+        (!git_dir.is_empty()).then(|| PathBuf::from(git_dir))
+    }
+}
+
+/// What a write still owes after its process ends: the lock cleanup, then its release.
+struct WriteSettlement {
+    _ticket: GitWriteTicket,
+    watch: Option<IndexLockWatch>,
+    received: tokio::sync::mpsc::UnboundedReceiver<TerminationReport>,
+    operation: String,
+    cwd: PathBuf,
+}
+
+impl WriteSettlement {
+    /// Awaited when the report is in; in the background while a reap is still running, so the
+    /// caller gets its outcome as before. Either way a spawned task owns the cleanup and the
+    /// ticket, so a caller dropped during the wait cannot release the write early.
+    async fn settle_now_or_later(mut self) {
+        match self.received.try_recv() {
+            Ok(report) => {
+                let _ = tokio::spawn(self.clean_up(report)).await;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                tokio::spawn(self.settle());
+            }
+            // No process started, so there is nothing to clean up.
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    async fn settle(mut self) {
+        if let Some(report) = self.received.recv().await {
+            self.clean_up(report).await;
+        }
+    }
+
+    /// A stop Git honoured needs nothing: Git removed its own lock.
+    async fn clean_up(self, report: TerminationReport) {
+        let Some(watch) = self.watch else {
+            return;
+        };
+        if !(report.requested && report.forced && report.exited) {
+            return;
+        }
+        // Linux and macOS ask Git to stop first, and Git removes its own lock then, so a forced
+        // stop leaves one only when Git could not act on the request. Its lock is ours only if
+        // the root still held it open just before the kill: a lock nobody of ours held is
+        // another Git process's, even one that stays unchanged during the wait.
+        if cfg!(any(target_os = "linux", target_os = "macos")) && report.before_force != Some(true)
+        {
+            return;
+        }
+        let worktree = redact_path(&self.cwd.to_string_lossy());
+        let lock = watch.lock.clone();
+        match watch.after_forced_stop().await {
+            LockCleanup::Removed => tracing::warn!(
+                operation = %self.operation,
+                %worktree,
+                "removed index.lock left by a Git process BiBCode had to force to stop"
+            ),
+            LockCleanup::RemoveFailed { kind, state } => {
+                self._ticket.lock_left(lock, state, worktree.clone());
+                tracing::warn!(
+                    operation = %self.operation,
+                    %worktree,
+                    error = %kind,
+                    "could not remove index.lock left by a Git process BiBCode had to force to stop"
+                );
+            }
+            LockCleanup::NotOurs | LockCleanup::Changed => {}
+        }
+    }
+}
+
+/// Settles a write whose run future was dropped, on the current runtime.
+struct PendingSettlement(Option<WriteSettlement>);
+
+impl Drop for PendingSettlement {
+    fn drop(&mut self) {
+        if let Some(settlement) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(settlement.settle());
+        }
+    }
+}
+
+/// How long a lock left by a forced stop must stay unchanged before BiBCode removes it
+/// (R16, D13).
+pub(crate) const LOCK_UNCHANGED_WAIT: Duration = Duration::from_secs(2);
+
+/// What [`IndexLockWatch::after_forced_stop`] did with `index.lock`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LockCleanup {
+    /// The lock existed before the process started, or there is none: not BiBCode's.
+    NotOurs,
+    /// The lock changed or went away during the wait: another Git process has it now.
+    Changed,
+    Removed,
+    /// The lock stayed unchanged but deleting it failed, so it is still there. `state` is the
+    /// one that passed the unchanged check.
+    RemoveFailed {
+        kind: std::io::ErrorKind,
+        state: LockState,
+    },
+}
+
+/// Whether a Git command's `index.lock` existed before the command started, so a lock its
+/// forced stop leaves behind can be told apart from someone else's.
+#[derive(Debug)]
+pub(crate) struct IndexLockWatch {
+    lock: PathBuf,
+    existed: bool,
+}
+
+impl IndexLockWatch {
+    /// `git_dir` is the command's own Git directory (see [`ProcessRunner::resolve_git_dir`]).
+    pub(crate) fn before_spawn(git_dir: &Path) -> Self {
+        let lock = git_dir.join("index.lock");
+        Self {
+            existed: lock.symlink_metadata().is_ok(),
+            lock,
+        }
+    }
+
+    /// Removes a lock that appeared during the command and stayed unchanged for
+    /// [`LOCK_UNCHANGED_WAIT`]. A lock that existed before the command is never removed.
+    ///
+    /// Time alone cannot tell whose lock this is. On Linux and macOS the settlement calls this
+    /// only when the killed Git process held the lock open just before the kill
+    /// ([`holds_open`]). Windows offers no such check here and every stop there is forced, so
+    /// a lock another Git process took while the killed command held none, and kept unchanged
+    /// for the wait, is still removed there.
+    pub(crate) async fn after_forced_stop(self) -> LockCleanup {
+        if self.existed {
+            return LockCleanup::NotOurs;
+        }
+        let Some(before) = lock_state(&self.lock) else {
+            return LockCleanup::NotOurs;
+        };
+        tokio::time::sleep(LOCK_UNCHANGED_WAIT).await;
+        if lock_state(&self.lock) != Some(before) {
+            return LockCleanup::Changed;
+        }
+        match std::fs::remove_file(&self.lock) {
+            Ok(()) => LockCleanup::Removed,
+            // Gone between the check and the delete: another Git process took and released it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockCleanup::Changed,
+            Err(error) => LockCleanup::RemoveFailed {
+                kind: error.kind(),
+                state: before,
+            },
+        }
+    }
+}
+
+/// Whether process `pid` has `file` open. Git keeps `index.lock` open while it writes the
+/// index, but closes it while a hook or the editor runs; there it removes the lock on
+/// `SIGTERM`, so such a lock is never left by a forced stop.
+#[cfg(target_os = "linux")]
+fn holds_open(pid: u32, file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = file.symlink_metadata() else {
+        return false;
+    };
+    let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    descriptors.flatten().any(|descriptor| {
+        std::fs::metadata(descriptor.path())
+            .is_ok_and(|open| open.dev() == target.dev() && open.ino() == target.ino())
+    })
+}
+
+/// See the Linux version. The root leads its own process group, which the search is limited to.
+#[cfg(target_os = "macos")]
+fn holds_open(pid: u32, file: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        // libproc, part of libSystem: the processes that have `path` open.
+        fn proc_listpidspath(
+            kind: u32,
+            info: u32,
+            path: *const libc::c_char,
+            flags: u32,
+            buffer: *mut libc::c_void,
+            size: libc::c_int,
+        ) -> libc::c_int;
+    }
+    const PROC_PGRP_ONLY: u32 = 2;
+    let Ok(path) = std::ffi::CString::new(file.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // shortcut: a group of more than 64 processes may hide the root, which keeps the lock.
+    let mut pids = [0 as libc::pid_t; 64];
+    // SAFETY: `path` is a NUL-terminated string and `pids` is writable for the size given.
+    let bytes = unsafe {
+        proc_listpidspath(
+            PROC_PGRP_ONLY,
+            pid,
+            path.as_ptr(),
+            0,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    let found = usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<libc::pid_t>();
+    pids[..found.min(pids.len())]
+        .iter()
+        .any(|&found| u32::try_from(found) == Ok(pid))
+}
+
+/// No check on other platforms; the settlement does not ask for one there.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn holds_open(_pid: u32, _file: &Path) -> bool {
+    false
+}
+
+/// A lock's length and modification time.
+type LockState = (u64, Option<std::time::SystemTime>);
+
+/// The lock's length and modification time, read without following a link.
+fn lock_state(lock: &Path) -> Option<LockState> {
+    let metadata = lock.symlink_metadata().ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+/// The Git commands that may write the index, one registry per server runtime, so shutdown
+/// can stop each running write and wait until its lock cleanup is done (plan decisions P15
+/// and P20).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GitWriteRegistry {
+    state: Arc<GitWriteRegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct GitWriteRegistryState {
+    closed: std::sync::Mutex<bool>,
+    writes: TaskTracker,
+    stop: CancellationToken,
+    /// Leftover locks of forced writes that could not be deleted, checked again on every stop.
+    locks_left: LeftLocks,
+}
+
+type LeftLocks = Arc<std::sync::Mutex<Vec<LeftLock>>>;
+
+/// A lock BiBCode owns but could not delete: its path, its state when the delete failed, and
+/// the redacted worktree a log names.
+#[derive(Debug)]
+struct LeftLock {
+    lock: PathBuf,
+    state: LockState,
+    worktree: String,
+}
+
+impl LeftLock {
+    /// Deletes the lock if it is still the one BiBCode left. `false` once it is gone or
+    /// changed (another Git process has it now, so it is not BiBCode's to delete). A lock
+    /// that cannot be inspected is kept and reported: only `NotFound` means gone.
+    fn still_left(&self) -> bool {
+        let metadata = match self.lock.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+        };
+        (metadata.len(), metadata.modified().ok()) == self.state
+            && std::fs::remove_file(&self.lock)
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+    }
+}
+
+/// One admitted write. Dropping it, after the write's outcome and lock cleanup, releases it.
+#[derive(Debug)]
+pub(crate) struct GitWriteTicket {
+    _write: TaskTrackerToken,
+    cancellation: CancellationToken,
+    locks_left: LeftLocks,
+}
+
+impl GitWriteTicket {
+    /// Records that this write's leftover `lock` in `worktree` (redacted) could not be removed.
+    /// `state` is the one that passed the unchanged check: the file is not read again, because
+    /// another Git process may have replaced it since.
+    fn lock_left(&self, lock: PathBuf, state: LockState, worktree: String) {
+        record_left_lock(
+            &self.locks_left,
+            LeftLock {
+                lock,
+                state,
+                worktree,
+            },
+        );
+    }
+}
+
+fn record_left_lock(locks: &LeftLocks, left: LeftLock) {
+    locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(left);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuiesceOutcome {
+    Clean,
+    /// This many writes had not finished their stop and cleanup within the limit.
+    Pending(usize),
+    /// Every write finished, but the leftover locks of these worktrees (redacted) are still
+    /// there after one more delete.
+    LocksLeft(Vec<String>),
+}
+
+impl GitWriteRegistry {
+    /// Admits one write, or `None` once shutdown closed admission.
+    pub(crate) fn track(&self) -> Option<GitWriteTicket> {
+        let closed = self
+            .state
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!*closed).then(|| GitWriteTicket {
+            _write: self.state.writes.token(),
+            cancellation: self.state.stop.child_token(),
+            locks_left: self.state.locks_left.clone(),
+        })
+    }
+
+    pub(crate) fn close_admission(&self) {
+        *self
+            .state
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.writes.close();
+    }
+
+    /// Closes admission, cancels every admitted write and waits up to `limit` until each has
+    /// exited and finished its lock cleanup, then checks every leftover lock again. Safe to
+    /// call again: each call reports from the current files.
+    pub(crate) async fn stop_all_and_wait(&self, limit: Duration) -> QuiesceOutcome {
+        self.close_admission();
+        self.state.stop.cancel();
+        if tokio::time::timeout(limit, self.state.writes.wait())
+            .await
+            .is_err()
+        {
+            return QuiesceOutcome::Pending(self.state.writes.len());
+        }
+        let mut locks = self
+            .state
+            .locks_left
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(LeftLock::still_left);
+        if locks.is_empty() {
+            QuiesceOutcome::Clean
+        } else {
+            QuiesceOutcome::LocksLeft(locks.iter().map(|left| left.worktree.clone()).collect())
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl GitWriteRegistry {
+    pub(crate) fn record_left_lock_for_test(&self, lock: &Path, worktree: &Path) {
+        record_left_lock(
+            &self.state.locks_left,
+            LeftLock {
+                lock: lock.to_path_buf(),
+                state: lock_state(lock).expect("the leftover lock exists"),
+                worktree: redact_path(&worktree.to_string_lossy()),
+            },
+        );
+    }
 }
 
 fn process_command(
@@ -471,7 +941,69 @@ fn supervised_request(request: &ProcessRequest, command: Command) -> SupervisedR
             OutputPolicy::Error => SupervisedOverflow::Error,
             OutputPolicy::Tail => SupervisedOverflow::Tail,
         },
+        // Git removes its own `index.lock` when asked to stop (R15); other programs this
+        // runner starts keep the immediate stop.
+        stop_policy: if runs_git(&request.command) {
+            StopPolicy::AskThenForce
+        } else {
+            StopPolicy::Force
+        },
     }
+}
+
+fn runs_git(command: &std::path::Path) -> bool {
+    command
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
+}
+
+/// Whether the Git command takes `index.lock` itself, so a lock its forced stop leaves can be
+/// its own. A command not listed never has a lock removed, because a lock that appears while
+/// it runs belongs to someone else: a leftover lock is a nuisance, a deleted foreign lock can
+/// break a person's commit. `index_lock_cleanup_lists_only_commands_that_take_the_lock` checks
+/// every entry against the lock events of a real Git.
+fn takes_index_lock(args: &[OsString]) -> bool {
+    let mut words = args.iter().map(|arg| arg.to_str().unwrap_or_default());
+    let subcommand = loop {
+        match words.next() {
+            Some("-c" | "-C") => {
+                words.next();
+            }
+            Some(option) if option.starts_with('-') => {}
+            Some(subcommand) => break subcommand,
+            None => return false,
+        }
+    };
+    // Options end at `--`: what follows are paths, however they look.
+    let rest = words.take_while(|word| *word != "--").collect::<Vec<_>>();
+    let has = |flag: &str| rest.contains(&flag);
+    match subcommand {
+        "add" | "cherry-pick" | "commit" | "merge" | "rebase" | "restore" | "revert" | "rm" => true,
+        "reset" => !has("--soft"),
+        "checkout" | "switch" => checkout_takes_index_lock(&rest),
+        "apply" => has("--cached"),
+        "stash" => matches!(rest.first(), Some(&("push" | "apply" | "pop"))),
+        // `pull` holds no lock while it fetches, which is where it waits.
+        _ => false,
+    }
+}
+
+/// Creating a branch with no start point leaves the index alone. Any other checkout, including
+/// a new branch at a start point, merges a tree into the index under the lock.
+fn checkout_takes_index_lock(options: &[&str]) -> bool {
+    let (mut new_branch, mut start_point) = (false, false);
+    let mut words = options.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "-b" | "-B" | "-c" | "-C" | "--orphan" => {
+                new_branch = true;
+                words.next();
+            }
+            option if option.starts_with('-') => {}
+            _ => start_point = true,
+        }
+    }
+    !new_branch || start_point
 }
 
 /// Windows answers a missing working directory with `ERROR_DIRECTORY` ("not a directory"); it is
@@ -543,7 +1075,1055 @@ fn render_bytes(output: SupervisedStreamOutput, append_marker: bool) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::supervised::GRACEFUL_STOP_WAIT;
     use crate::test_support::TestSandbox;
+    use crate::test_support::isolated_git_config::IsolatedGitConfig;
+
+    fn git_environment(config: &IsolatedGitConfig) -> Vec<(OsString, OsString)> {
+        [
+            ("GIT_CONFIG_GLOBAL", config.path().into_os_string()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("GIT_AUTHOR_NAME", "test-user".into()),
+            ("GIT_AUTHOR_EMAIL", "user@example.test".into()),
+            ("GIT_COMMITTER_NAME", "test-user".into()),
+            ("GIT_COMMITTER_EMAIL", "user@example.test".into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect()
+    }
+
+    fn fixture_git(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) {
+        let mut command = std::process::Command::new("git");
+        config.apply_to_command(&mut command);
+        let output = command
+            .args(args)
+            .current_dir(cwd)
+            .envs(git_environment(config))
+            .output()
+            .expect("fixture Git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_request(config: &IsolatedGitConfig, cwd: &Path, args: &[&str]) -> ProcessRequest {
+        ProcessRequest {
+            operation: "fixture-write".to_owned(),
+            command: PathBuf::from("git"),
+            args: args.iter().map(OsString::from).collect(),
+            cwd: cwd.to_path_buf(),
+            env: git_environment(config),
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 64 * 1024,
+            output_policy: OutputPolicy::Truncate,
+            append_truncation_marker: false,
+            allow_non_zero_exit: false,
+        }
+    }
+
+    /// A `git add` that holds `index.lock` and never finishes: the clean filter of the added
+    /// file marks that it started and then sleeps.
+    struct HeldWrite {
+        request: ProcessRequest,
+        started: PathBuf,
+        lock: PathBuf,
+    }
+
+    fn held_write(sandbox: &TestSandbox, config: &IsolatedGitConfig) -> HeldWrite {
+        let repository = sandbox.path("repository");
+        std::fs::create_dir_all(&repository).expect("repository folder");
+        let started = sandbox.path("filter-started");
+        fixture_git(config, &repository, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            config,
+            &repository,
+            &[
+                "config",
+                "filter.slow.clean",
+                &format!(
+                    "touch '{}'; sleep 30; cat",
+                    started.to_string_lossy().replace('\\', "/")
+                ),
+            ],
+        );
+        std::fs::write(repository.join(".gitattributes"), "held.txt filter=slow\n")
+            .expect(".gitattributes");
+        std::fs::write(repository.join("held.txt"), "held\n").expect("held.txt");
+        HeldWrite {
+            request: git_request(config, &repository, &["add", "--", "held.txt"]),
+            started,
+            lock: repository.join(".git").join("index.lock"),
+        }
+    }
+
+    async fn wait_until_exists(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_removes_a_lock_our_forced_stop_left() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the stopped write's lock");
+
+        assert_eq!(watch.after_forced_stop().await, LockCleanup::Removed);
+        assert!(!lock.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_lock_that_existed_before_spawn() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        std::fs::write(&lock, "").expect("someone else's lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+
+        assert_eq!(watch.after_forced_stop().await, LockCleanup::NotOurs);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_lock_that_changes_during_the_wait() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the stopped write's lock");
+
+        let cleanup = tokio::spawn(watch.after_forced_stop());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::fs::write(&lock, "another Git process took it").expect("a new lock");
+
+        assert_eq!(cleanup.await.expect("cleanup"), LockCleanup::Changed);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_shutdown_stops_a_running_write_and_leaves_no_lock() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-shutdown");
+        let config = IsolatedGitConfig::new();
+        let held = held_write(&sandbox, &config);
+        let registry = GitWriteRegistry::default();
+        let write = tokio::spawn({
+            let (registry, request) = (registry.clone(), held.request.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &CancellationToken::new())
+                    .await
+            }
+        });
+        wait_until_exists(&held.started).await;
+        assert!(held.lock.exists(), "the write holds index.lock");
+
+        let outcome = registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(1))
+            .await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!held.lock.exists(), "no index.lock remains");
+        let result = tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A push never takes `index.lock`, so a lock that appears while it runs is someone else's,
+    /// such as a person's `git commit` waiting for its editor. A forced stop of the push, as
+    /// every stop is on Windows, must leave that lock alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_keeps_a_lock_taken_during_a_forced_push() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-forced-push");
+        let config = IsolatedGitConfig::new();
+        let repository = sandbox.path("repository");
+        let remote = sandbox.path("remote.git");
+        let hooks = sandbox.path("hooks");
+        let started = sandbox.path("hook-started");
+        let bin = sandbox.path("bin");
+        for folder in [&repository, &hooks, &bin] {
+            std::fs::create_dir_all(folder).expect("fixture folder");
+        }
+        fixture_git(
+            &config,
+            sandbox.root(),
+            &["init", "-q", "--bare", &remote.to_string_lossy()],
+        );
+        fixture_git(&config, &repository, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
+        fixture_git(
+            &config,
+            &repository,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        TestSandbox::write_executable(
+            &hooks.join("pre-push"),
+            &format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
+        );
+        let real_git = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate Git");
+        let real_git = String::from_utf8(real_git.stdout).expect("Git path");
+        // The wrapper ignores the request to stop and outlives Git, so the stop is forced, as
+        // every stop is on Windows.
+        let git = bin.join("git");
+        TestSandbox::write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM\n'{}' \"$@\"\nstatus=$?\n[ \"$1\" = push ] && exec sleep 30\nexit $status\n",
+                real_git.trim()
+            ),
+        );
+        let mut request = git_request(
+            &config,
+            &repository,
+            &["push", "-q", &remote.to_string_lossy(), "main"],
+        );
+        request.command = git;
+        let cancellation = CancellationToken::new();
+        let registry = GitWriteRegistry::default();
+        let push = tokio::spawn({
+            let (cancellation, registry) = (cancellation.clone(), registry.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &cancellation)
+                    .await
+            }
+        });
+        wait_until_exists(&started).await;
+        let lock = repository.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("a person's commit takes the lock");
+
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(20), push)
+            .await
+            .expect("the push has returned")
+            .expect("push task");
+        // Waits for the push's settlement, which may finish in the background.
+        let settled = registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(5))
+            .await;
+
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(lock.exists(), "the person's index.lock is kept");
+    }
+
+    /// A `git add` behind a wrapper that ignores the request to stop, so the stop is forced. It
+    /// marks `started` once running and, with `holds_lock`, first opens `index.lock` itself and
+    /// keeps it open, as a Git process killed while writing the index does.
+    #[cfg(unix)]
+    fn forced_add(
+        sandbox: &TestSandbox,
+        config: &IsolatedGitConfig,
+        holds_lock: bool,
+    ) -> HeldWrite {
+        let repository = sandbox.path("repository");
+        let bin = sandbox.path("bin");
+        let started = sandbox.path("add-started");
+        for folder in [&repository, &bin] {
+            std::fs::create_dir_all(folder).expect("fixture folder");
+        }
+        fixture_git(config, &repository, &["init", "-q", "-b", "main"]);
+        let lock = repository.join(".git").join("index.lock");
+        let real_git = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate Git");
+        let real_git = String::from_utf8(real_git.stdout).expect("Git path");
+        let open_lock = if holds_lock {
+            format!("exec 3>'{}'\n", lock.display())
+        } else {
+            String::new()
+        };
+        let git = bin.join("git");
+        TestSandbox::write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = add ]; then\ntrap '' TERM\n{open_lock}touch '{}'\nexec sleep 30\nfi\nexec '{}' \"$@\"\n",
+                started.display(),
+                real_git.trim()
+            ),
+        );
+        let mut request = git_request(config, &repository, &["add", "--", "file.txt"]);
+        request.command = git;
+        HeldWrite {
+            request,
+            started,
+            lock,
+        }
+    }
+
+    /// Cancels the write once it has started (after `meanwhile`), waits for its settlement and
+    /// returns the settled outcome.
+    #[cfg(unix)]
+    async fn cancel_forced_write(held: &HeldWrite, meanwhile: impl FnOnce()) -> QuiesceOutcome {
+        let cancellation = CancellationToken::new();
+        let registry = GitWriteRegistry::default();
+        let write = tokio::spawn({
+            let (cancellation, registry, request) =
+                (cancellation.clone(), registry.clone(), held.request.clone());
+            async move {
+                ProcessRunner
+                    .run_write(request, &registry, &cancellation)
+                    .await
+            }
+        });
+        wait_until_exists(&held.started).await;
+        meanwhile();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(20), write)
+            .await
+            .expect("the write has returned")
+            .expect("write task");
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled { .. })),
+            "{result:?}"
+        );
+        registry
+            .stop_all_and_wait(GRACEFUL_STOP_WAIT + LOCK_UNCHANGED_WAIT + Duration::from_secs(5))
+            .await
+    }
+
+    /// PR review of #341: a write that takes the lock can still be stopped while it holds none
+    /// (in a hook, at a prompt), and another Git process can take the lock meanwhile and keep
+    /// it unchanged for longer than the wait, such as a person's large `git add`. The forced
+    /// stop must leave that lock alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_keeps_a_lock_another_git_took_during_a_forced_write() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-foreign-during-write");
+        let config = IsolatedGitConfig::new();
+        let held = forced_add(&sandbox, &config, false);
+
+        let settled = cancel_forced_write(&held, || {
+            std::fs::write(&held.lock, "").expect("another Git process takes the lock");
+        })
+        .await;
+
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(
+            held.lock.exists(),
+            "the other Git process's index.lock is kept"
+        );
+    }
+
+    /// R16: a lock the forced write itself held is removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_lock_cleanup_removes_the_lock_a_forced_write_held() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-own-forced-write");
+        let config = IsolatedGitConfig::new();
+        let held = forced_add(&sandbox, &config, true);
+
+        let settled = cancel_forced_write(&held, || {
+            assert!(held.lock.exists(), "the write holds index.lock");
+        })
+        .await;
+
+        assert_eq!(settled, QuiesceOutcome::Clean);
+        assert!(
+            !held.lock.exists(),
+            "the forced write's index.lock is removed"
+        );
+    }
+
+    /// Every command shape the server runs as a write, with whether a real Git took
+    /// `index.lock` for it. [`takes_index_lock`] may list only commands a real Git took the
+    /// lock for, and must list each `Locks` row, a shape it once misread.
+    #[test]
+    fn index_lock_cleanup_lists_only_commands_that_take_the_lock() {
+        use notify::Watcher;
+        enum Step {
+            Write(&'static str, &'static str),
+            Setup(&'static [&'static str]),
+            /// A setup that may fail, such as a merge that stops on a conflict.
+            Conflict(&'static [&'static str]),
+            Watch(&'static [&'static str]),
+            /// Takes the lock on every Git CI runs; listing it is checked too.
+            Locks(&'static [&'static str]),
+        }
+        use Step::{Conflict, Locks, Setup, Watch, Write};
+        let sandbox = TestSandbox::new("index-lock-cleanup-allowlist");
+        let config = IsolatedGitConfig::new();
+        let work = sandbox.path("work");
+        let remote = sandbox.path("remote.git");
+        std::fs::create_dir_all(&work).expect("work folder");
+        fixture_git(
+            &config,
+            sandbox.root(),
+            &["init", "-q", "--bare", &remote.to_string_lossy()],
+        );
+        fixture_git(&config, &work, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &work,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let steps = [
+            Write("a.txt", "1\n"),
+            Setup(&["add", "a.txt"]),
+            Setup(&["commit", "-q", "-m", "one"]),
+            Setup(&["switch", "-q", "-c", "topic"]),
+            Write("b.txt", "b\n"),
+            Setup(&["add", "b.txt"]),
+            Setup(&["commit", "-q", "-m", "topic"]),
+            Setup(&["switch", "-q", "-c", "side", "main"]),
+            Write("s.txt", "s\n"),
+            Setup(&["add", "s.txt"]),
+            Setup(&["commit", "-q", "-m", "side"]),
+            Setup(&["switch", "-q", "main"]),
+            Setup(&["push", "-q", "origin", "main", "topic"]),
+            Write("a.txt", "2\n"),
+            Watch(&["add", "--", "a.txt"]),
+            Watch(&["--literal-pathspecs", "restore", "--staged", "--", "a.txt"]),
+            Watch(&[
+                "--literal-pathspecs",
+                "restore",
+                "--worktree",
+                "--",
+                "a.txt",
+            ]),
+            Write("a.txt", "2\n"),
+            Setup(&["add", "a.txt"]),
+            Watch(&["commit", "--no-edit", "-q", "-m", "two"]),
+            Watch(&["reset", "--soft", "HEAD~1"]),
+            Watch(&["reset", "--", "a.txt"]),
+            Watch(&["stash", "push"]),
+            Watch(&["stash", "list", "--format=%H"]),
+            Watch(&["stash", "show", "--name-only", "stash@{0}"]),
+            Watch(&["stash", "apply", "--quiet", "stash@{0}"]),
+            Watch(&["--literal-pathspecs", "checkout", "HEAD", "--", "a.txt"]),
+            Watch(&["stash", "pop", "--quiet"]),
+            Setup(&["checkout", "HEAD", "--", "a.txt"]),
+            Write("a.txt", "3\n"),
+            Setup(&["stash", "push"]),
+            Watch(&["stash", "drop", "stash@{0}"]),
+            Watch(&["checkout", "-b", "fresh"]),
+            Watch(&["switch", "main"]),
+            Watch(&["switch", "-c", "fresh2"]),
+            Setup(&["switch", "-q", "main"]),
+            Watch(&["merge", "--no-edit", "topic"]),
+            Watch(&["revert", "--no-edit", "HEAD"]),
+            Watch(&["cherry-pick", "--empty=keep", "topic"]),
+            Watch(&["rm", "--cached", "-r", "--ignore-unmatch", "--", "b.txt"]),
+            Setup(&["reset", "-q", "--", "b.txt"]),
+            Write(
+                "../new.patch",
+                "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n\
+                 +++ b/new.txt\n@@ -0,0 +1 @@\n+new\n",
+            ),
+            Watch(&["apply", "--cached", "--whitespace=nowarn", "../new.patch"]),
+            Setup(&["reset", "-q", "--", "new.txt"]),
+            Watch(&["apply", "--whitespace=nowarn", "../new.patch"]),
+            Watch(&["reset", "--mixed", "HEAD"]),
+            Watch(&["-c", "rebase.backend=merge", "rebase", "main", "side"]),
+            Setup(&["switch", "-q", "main"]),
+            Watch(&["push", "-q", "origin", "main"]),
+            Watch(&["fetch", "-q", "origin"]),
+            Watch(&["pull", "--ff-only", "origin", "main"]),
+            Watch(&["update-ref", "refs/heads/extra", "HEAD"]),
+            Watch(&["tag", "probe-tag"]),
+            Watch(&["config", "probe.key", "value"]),
+            // A new branch at a start point other than HEAD, and at HEAD itself.
+            Locks(&["switch", "-c", "from-topic", "topic", "--no-track"]),
+            Setup(&["switch", "-q", "main"]),
+            Locks(&["switch", "-c", "from-main", "main", "--no-track"]),
+            Setup(&["switch", "-q", "main"]),
+            Locks(&["switch", "-c", "tracked", "--track", "origin/topic"]),
+            Setup(&["switch", "-q", "main"]),
+            // Paths that look like options after `--`.
+            Write("--soft", "soft\n"),
+            Write("-b", "b\n"),
+            Setup(&["add", "--", "--soft", "-b"]),
+            Setup(&["commit", "-q", "-m", "dashes"]),
+            Write("--soft", "soft 2\n"),
+            Setup(&["add", "--", "--soft"]),
+            Locks(&["reset", "--", "--soft"]),
+            Write("-b", "b 2\n"),
+            Locks(&["checkout", "HEAD", "--", "-b"]),
+            Setup(&["checkout", "HEAD", "--", "--soft"]),
+            // Conflicts to continue, skip and abort.
+            Write("c.txt", "base\n"),
+            Setup(&["add", "c.txt"]),
+            Setup(&["commit", "-q", "-m", "base"]),
+            Setup(&["tag", "base"]),
+            Setup(&["switch", "-q", "-c", "theirs"]),
+            Write("c.txt", "theirs\n"),
+            Setup(&["commit", "-q", "-a", "-m", "theirs"]),
+            Setup(&["switch", "-q", "-c", "theirs2", "base"]),
+            Write("c.txt", "theirs 2\n"),
+            Setup(&["commit", "-q", "-a", "-m", "theirs 2"]),
+            Setup(&["switch", "-q", "-c", "replay", "base"]),
+            Write("d.txt", "d\n"),
+            Setup(&["add", "d.txt"]),
+            Setup(&["commit", "-q", "-m", "replay"]),
+            Setup(&["switch", "-q", "main"]),
+            Write("c.txt", "ours\n"),
+            Setup(&["commit", "-q", "-a", "-m", "ours"]),
+            Setup(&["tag", "ours"]),
+            Conflict(&["merge", "--no-edit", "theirs"]),
+            Locks(&["merge", "--abort"]),
+            Conflict(&["cherry-pick", "theirs"]),
+            Locks(&["cherry-pick", "--abort"]),
+            Conflict(&["cherry-pick", "theirs"]),
+            Write("c.txt", "picked\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&["-c", "core.editor=:", "cherry-pick", "--continue"]),
+            Conflict(&["revert", "--no-edit", "ours"]),
+            Locks(&["revert", "--abort"]),
+            Conflict(&["revert", "--no-edit", "ours"]),
+            Write("c.txt", "reverted\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&["-c", "core.editor=:", "revert", "--continue"]),
+            Setup(&["switch", "-q", "theirs"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Locks(&["-c", "rebase.backend=merge", "rebase", "--abort"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Locks(&["-c", "rebase.backend=merge", "rebase", "--skip"]),
+            Setup(&["switch", "-q", "theirs2"]),
+            Conflict(&["-c", "rebase.backend=merge", "rebase", "main"]),
+            Write("c.txt", "rebased\n"),
+            Setup(&["add", "c.txt"]),
+            Locks(&[
+                "-c",
+                "core.editor=:",
+                "-c",
+                "rebase.backend=merge",
+                "rebase",
+                "--continue",
+            ]),
+            Setup(&["switch", "-q", "replay"]),
+            Locks(&[
+                "-c",
+                "rebase.backend=merge",
+                "-c",
+                "sequence.editor=:",
+                "rebase",
+                "-i",
+                "main",
+            ]),
+            Setup(&["switch", "-q", "main"]),
+        ];
+        let (events, received) = std::sync::mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                            let _ = events.send(name.to_owned());
+                        }
+                    }
+                }
+            })
+            .expect("Git directory watcher");
+        watcher
+            .watch(&work.join(".git"), notify::RecursiveMode::NonRecursive)
+            .expect("watch the Git directory");
+
+        let mut mismatches = Vec::new();
+        for (row, step) in steps.iter().enumerate() {
+            let watched = match step {
+                Write(file, contents) => {
+                    std::fs::write(work.join(file), contents).expect("fixture file");
+                    None
+                }
+                Setup(args) => {
+                    fixture_git(&config, &work, args);
+                    None
+                }
+                Conflict(args) => {
+                    let mut command = std::process::Command::new("git");
+                    config.apply_to_command(&mut command);
+                    command
+                        .args(*args)
+                        .current_dir(&work)
+                        .envs(git_environment(&config))
+                        .output()
+                        .expect("fixture Git starts");
+                    None
+                }
+                Watch(args) => {
+                    fixture_git(&config, &work, args);
+                    Some((args, false))
+                }
+                Locks(args) => {
+                    fixture_git(&config, &work, args);
+                    Some((args, true))
+                }
+            };
+            // Events arrive in order, so the sentinel's event closes this step's events.
+            let sentinel = format!("row-{row}-done");
+            let sentinel_path = work.join(".git").join(&sentinel);
+            std::fs::write(&sentinel_path, "").expect("sentinel file");
+            let mut took_lock = false;
+            loop {
+                let name = received
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the watcher reports the sentinel file");
+                took_lock |= name == "index.lock";
+                if name == sentinel {
+                    break;
+                }
+            }
+            std::fs::remove_file(&sentinel_path).expect("remove sentinel file");
+            let Some((args, must_list)) = watched else {
+                continue;
+            };
+            let listed = takes_index_lock(&args.iter().map(OsString::from).collect::<Vec<_>>());
+            // Only a listed command that took no lock is unsafe; leaving one out is a nuisance.
+            if listed && !took_lock {
+                mismatches.push(format!(
+                    "git {args:?} is listed, but Git took no index.lock"
+                ));
+            }
+            if must_list && !(took_lock && listed) {
+                mismatches.push(format!(
+                    "git {args:?} took index.lock {took_lock}, listed {listed}"
+                ));
+            }
+        }
+
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_resolves_the_lock_of_a_linked_worktree() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-linked");
+        let config = IsolatedGitConfig::new();
+        let main = sandbox.path("main");
+        let linked = sandbox.path("linked");
+        std::fs::create_dir_all(&main).expect("main worktree");
+        fixture_git(&config, &main, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &config,
+            &main,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
+        fixture_git(
+            &config,
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        let git_dir = ProcessRunner
+            .resolve_git_dir(
+                &git_request(&config, &linked, &["add", "--", "file.txt"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the linked worktree's Git directory");
+
+        assert_eq!(
+            std::fs::canonicalize(&git_dir).expect("resolved Git directory"),
+            std::fs::canonicalize(main.join(".git").join("worktrees").join("linked"))
+                .expect("linked worktree Git directory")
+        );
+        assert_eq!(
+            IndexLockWatch::before_spawn(&git_dir).lock,
+            git_dir.join("index.lock")
+        );
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_shutdown_with_nothing_running_returns_at_once() {
+        let started = std::time::Instant::now();
+
+        let outcome = GitWriteRegistry::default()
+            .stop_all_and_wait(Duration::from_secs(10))
+            .await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_two_runtimes_do_not_share_writes() {
+        let stopping = GitWriteRegistry::default();
+        let running = GitWriteRegistry::default();
+        let write = running.track().expect("the other runtime admits a write");
+
+        let outcome = stopping.stop_all_and_wait(Duration::from_secs(10)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!write.cancellation.is_cancelled());
+        assert!(running.track().is_some());
+    }
+
+    #[tokio::test]
+    async fn index_lock_cleanup_refuses_a_write_after_admission_closed() {
+        let sandbox = TestSandbox::new("index-lock-cleanup-refused");
+        let config = IsolatedGitConfig::new();
+        let registry = GitWriteRegistry::default();
+        registry.close_admission();
+
+        assert!(registry.track().is_none());
+        let refused = ProcessRunner
+            .run_write(
+                git_request(&config, sandbox.root(), &["init", "-q"]),
+                &registry,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ProcessError::Cancelled { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            !sandbox.path(".git").exists(),
+            "the refused write never ran"
+        );
+    }
+
+    /// The write's settlement removes the lock only after a forced stop, and releases the write
+    /// either way. On Linux and macOS a real Git write stops when asked, so only this test
+    /// reaches the forced branch there.
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_settles_only_a_forced_stop() {
+        for (report, lock_remains) in [
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: true,
+                    exited: true,
+                    before_force: Some(true),
+                },
+                false,
+            ),
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: false,
+                    exited: true,
+                    before_force: None,
+                },
+                true,
+            ),
+            // A forced stop whose root did not hold the lock: another Git process's lock on
+            // Linux and macOS, where that can be checked.
+            (
+                TerminationReport {
+                    requested: true,
+                    forced: true,
+                    exited: true,
+                    before_force: Some(false),
+                },
+                cfg!(any(target_os = "linux", target_os = "macos")),
+            ),
+        ] {
+            let git_dir = tempfile::tempdir().expect("Git directory");
+            let lock = git_dir.path().join("index.lock");
+            let registry = GitWriteRegistry::default();
+            let watch = IndexLockWatch::before_spawn(git_dir.path());
+            std::fs::write(&lock, "").expect("the write's lock");
+            let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+            reports.send(report).expect("the stop report");
+
+            WriteSettlement {
+                _ticket: registry.track().expect("an admitted write"),
+                watch: Some(watch),
+                received,
+                operation: "fixture-write".to_owned(),
+                cwd: git_dir.path().to_path_buf(),
+            }
+            .settle_now_or_later()
+            .await;
+
+            assert_eq!(lock.exists(), lock_remains, "{report:?}");
+            assert_eq!(
+                registry.stop_all_and_wait(Duration::from_secs(1)).await,
+                QuiesceOutcome::Clean,
+                "the settled write is released"
+            );
+        }
+    }
+
+    /// A caller dropped during the lock-unchanged wait must not release the write while its
+    /// lock remains: the cleanup finishes on its own and shutdown waits for it.
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_survives_a_caller_dropped_during_the_wait() {
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let registry = GitWriteRegistry::default();
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        reports
+            .send(TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true,
+                before_force: Some(true),
+            })
+            .expect("the stop report");
+        let settlement = WriteSettlement {
+            _ticket: registry.track().expect("an admitted write"),
+            watch: Some(watch),
+            received,
+            operation: "fixture-write".to_owned(),
+            cwd: git_dir.path().to_path_buf(),
+        }
+        .settle_now_or_later();
+
+        let dropped = tokio::time::timeout(Duration::from_secs(1), settlement).await;
+
+        assert!(dropped.is_err(), "the caller left during the wait");
+        assert!(lock.exists(), "the lock is not yet two seconds old");
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_millis(500)).await,
+            QuiesceOutcome::Pending(1),
+            "the write is held while its cleanup runs"
+        );
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(5)).await,
+            QuiesceOutcome::Clean
+        );
+        assert!(!lock.exists(), "the cleanup still removed the lock");
+    }
+
+    /// Leaves an unchanged lock that a forced write could not delete, because its Git
+    /// directory is read-only. The directory stays read-only; `writable` undoes that.
+    #[cfg(unix)]
+    async fn leave_an_undeletable_lock(
+        registry: &GitWriteRegistry,
+    ) -> Option<(tempfile::TempDir, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return None;
+        }
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        reports
+            .send(TerminationReport {
+                requested: true,
+                forced: true,
+                exited: true,
+                before_force: Some(true),
+            })
+            .expect("the stop report");
+        WriteSettlement {
+            _ticket: registry.track().expect("an admitted write"),
+            watch: Some(watch),
+            received,
+            operation: "fixture-write".to_owned(),
+            cwd: git_dir.path().to_path_buf(),
+        }
+        .settle_now_or_later()
+        .await;
+        Some((git_dir, lock))
+    }
+
+    #[cfg(unix)]
+    fn writable(git_dir: &tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("writable Git directory");
+    }
+
+    /// A lock that stayed unchanged but could not be deleted is not someone else's: every stop
+    /// reports it while it is still there.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_reports_a_lock_it_could_not_remove() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+
+        let cleanup = IndexLockWatch {
+            lock: lock.clone(),
+            existed: false,
+        }
+        .after_forced_stop()
+        .await;
+        let first = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+        let second = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        writable(&git_dir);
+        assert!(
+            matches!(
+                cleanup,
+                LockCleanup::RemoveFailed {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    ..
+                }
+            ),
+            "{cleanup:?}"
+        );
+        assert!(lock.exists(), "the lock could not be removed");
+        let reported =
+            QuiesceOutcome::LocksLeft(vec![redact_path(&git_dir.path().to_string_lossy())]);
+        assert_eq!(first, reported);
+        assert_eq!(second, reported, "a later stop still reports the lock");
+    }
+
+    /// Codex review finding 3: a leftover lock someone else deleted is no longer reported.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_forgets_a_leftover_lock_someone_removed() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+        std::fs::remove_file(&lock).expect("someone deletes the lock");
+
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Clean
+        );
+    }
+
+    /// Each stop tries once more to delete a leftover lock, so a lock left by a passing
+    /// permission problem goes away.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_retries_a_leftover_lock_on_the_next_stop() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(!lock.exists(), "the retry deleted the leftover lock");
+    }
+
+    /// A leftover lock that changed since it was recorded belongs to another Git process now,
+    /// so the retry forgets it and leaves it alone.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_a_leftover_lock_that_changed() {
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        writable(&git_dir);
+        std::fs::write(&lock, "another Git process").expect("another Git takes the lock");
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(lock.exists(), "a lock that changed is never deleted");
+    }
+
+    /// Codex review: the record keeps the lock that passed the unchanged check, so a lock
+    /// another Git process put there before the record was made is never deleted later.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_records_the_lock_that_passed_the_check() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root deletes from a read-only folder");
+            return;
+        }
+        let registry = GitWriteRegistry::default();
+        let git_dir = tempfile::tempdir().expect("Git directory");
+        let lock = git_dir.path().join("index.lock");
+        let watch = IndexLockWatch::before_spawn(git_dir.path());
+        std::fs::write(&lock, "").expect("the forced write's lock");
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("read-only Git directory");
+        let cleanup = watch.after_forced_stop().await;
+        let LockCleanup::RemoveFailed { state, .. } = cleanup else {
+            panic!("the delete fails: {cleanup:?}");
+        };
+        std::fs::write(&lock, "another Git process").expect("another Git takes the lock");
+        let ticket = registry.track().expect("an admitted write");
+
+        ticket.lock_left(lock.clone(), state, "worktree".to_owned());
+        drop(ticket);
+        writable(&git_dir);
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, QuiesceOutcome::Clean);
+        assert!(
+            lock.exists(),
+            "the other Git process's lock is never deleted"
+        );
+    }
+
+    /// Codex review: a leftover lock that cannot be inspected is not gone, so it stays
+    /// reported.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_keeps_reporting_a_lock_it_cannot_inspect() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = GitWriteRegistry::default();
+        let Some((git_dir, lock)) = leave_an_undeletable_lock(&registry).await else {
+            return;
+        };
+        std::fs::set_permissions(git_dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable Git directory");
+
+        let outcome = registry.stop_all_and_wait(Duration::from_secs(1)).await;
+
+        writable(&git_dir);
+        assert_eq!(
+            outcome,
+            QuiesceOutcome::LocksLeft(vec![redact_path(&git_dir.path().to_string_lossy())])
+        );
+        assert!(lock.exists(), "the lock is still there");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_lock_cleanup_reports_pending_when_a_reap_outlasts_the_limit() {
+        let registry = GitWriteRegistry::default();
+        let write = registry.track().expect("an admitted write");
+
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Pending(1)
+        );
+        assert!(
+            write.cancellation.is_cancelled(),
+            "the write was told to stop"
+        );
+        drop(write);
+        assert_eq!(
+            registry.stop_all_and_wait(Duration::from_secs(1)).await,
+            QuiesceOutcome::Clean
+        );
+    }
 
     #[test]
     fn safe_spawn_failure_preserves_category_without_private_launch_data() {
@@ -702,6 +2282,25 @@ mod tests {
             append_truncation_marker: false,
             allow_non_zero_exit: false,
         }
+    }
+
+    #[test]
+    fn git_stop_only_git_gets_the_ask_first_policy() {
+        let sandbox = TestSandbox::new("git-stop-policy");
+        let policy = |command: &str| {
+            let request = fixture_request(&sandbox, "fixture-policy", PathBuf::from(command));
+            supervised_request(&request, Command::new(command)).stop_policy
+        };
+
+        assert_eq!(policy("git"), StopPolicy::AskThenForce);
+        assert_eq!(policy("/usr/bin/git"), StopPolicy::AskThenForce);
+        #[cfg(windows)]
+        assert_eq!(
+            policy("C:\\Program Files\\Git\\cmd\\git.exe"),
+            StopPolicy::AskThenForce
+        );
+        assert_eq!(policy("trash"), StopPolicy::Force);
+        assert_eq!(policy("gitk"), StopPolicy::Force);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
