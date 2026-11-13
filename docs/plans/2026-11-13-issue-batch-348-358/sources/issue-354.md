@@ -7,5 +7,3 @@ Small leftovers from the #341 and #343 work in #349. Not verified by a run: foun
 - `has_missing_username_refusal` in `apps/server/src/git/sign_in.rs` accepts any text that contains both "could not read username" and "terminal prompts disabled". A commit message or a hook's output that contains both phrases triggers the sign-in guidance. Anchor it to Git's own `fatal:` line.
 - `docs/skills/bibcode-profiler/references/events.md` does not list the `git-writes` step among the `server.stop` quiesce steps.
 - `docs/testing/cross-platform-validation.md` does not list the `background_status_`, `git_stop_` and `index_lock_cleanup_` test filters.
-
-

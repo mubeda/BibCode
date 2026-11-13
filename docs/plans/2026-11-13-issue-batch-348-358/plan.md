@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 6ee666bd1646)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 65ea96913129)
 Repository: this repository
 Base: main
 
@@ -57,98 +57,98 @@ Base: main
 
 ## Phases
 
-| Phase | File | Goal | Round | Depends on | Tier |
-|---|---|---|---|---|---|
-| 1 | phases/PHASE-01-terminal-panel-fixes.md | Terminal panel: late font and late creation repaint, size record, Fit feedback, hand-over capability, WebGL retry, Unicode 11 widths, two decide-by-test items | 1 | none | most capable |
-| 2 | phases/PHASE-02-git-and-pull-request-lookups.md | Git lock limits, sign-in detector, lookup teardown, backoff and expiry | 1 | none | most capable |
-| 3 | phases/PHASE-03-worktree-records-and-removal-test.md | Creation records by id, audited rollbacks, unmounted-volume gate, deterministic drain test | 1 | none | most capable |
-| 4 | phases/PHASE-04-update-install-guard.md | Update install guard across reload, lost event and late sources; event-name guard | 1 | none | standard |
-| 5 | phases/PHASE-05-reasoning-row-scroll-and-dashboard.md | Reasoning row keeps its place; Host dashboard values view stops re-rendering | 1 | none | most capable |
-| 6 | phases/PHASE-06-popups-picker-and-markdown-images.md | Popup occlusion by rectangle, model picker reopen, read-only Markdown images | 1 | none | standard |
-| 7 | phases/PHASE-07-server-odds-and-e2e-harness.md | AppImage mounts hidden, per-test webview probe, flaky hint test, pairing refusal logs | 1 | none | standard |
-| 8 | phases/PHASE-08-labs-and-probes.md | Linux lab, Windows VM, mixed-version probe and load runs, with the Profiler on | 2 | 1, 2, 3, 4, 5, 6, 7 | most capable |
-| 9 | phases/PHASE-09-docs-gates-and-pull-request.md | Living docs, final gates, reviews and the pull request | 3 | 1, 2, 3, 4, 5, 6, 7, 8 | most capable |
+| Phase | File                                                  | Goal                                                                                                                                                           | Round | Depends on             | Tier         |
+| ----- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ---------------------- | ------------ |
+| 1     | phases/PHASE-01-terminal-panel-fixes.md               | Terminal panel: late font and late creation repaint, size record, Fit feedback, hand-over capability, WebGL retry, Unicode 11 widths, two decide-by-test items | 1     | none                   | most capable |
+| 2     | phases/PHASE-02-git-and-pull-request-lookups.md       | Git lock limits, sign-in detector, lookup teardown, backoff and expiry                                                                                         | 1     | none                   | most capable |
+| 3     | phases/PHASE-03-worktree-records-and-removal-test.md  | Creation records by id, audited rollbacks, unmounted-volume gate, deterministic drain test                                                                     | 1     | none                   | most capable |
+| 4     | phases/PHASE-04-update-install-guard.md               | Update install guard across reload, lost event and late sources; event-name guard                                                                              | 1     | none                   | standard     |
+| 5     | phases/PHASE-05-reasoning-row-scroll-and-dashboard.md | Reasoning row keeps its place; Host dashboard values view stops re-rendering                                                                                   | 1     | none                   | most capable |
+| 6     | phases/PHASE-06-popups-picker-and-markdown-images.md  | Popup occlusion by rectangle, model picker reopen, read-only Markdown images                                                                                   | 1     | none                   | standard     |
+| 7     | phases/PHASE-07-server-odds-and-e2e-harness.md        | AppImage mounts hidden, per-test webview probe, flaky hint test, pairing refusal logs                                                                          | 1     | none                   | standard     |
+| 8     | phases/PHASE-08-labs-and-probes.md                    | Linux lab, Windows VM, mixed-version probe and load runs, with the Profiler on                                                                                 | 2     | 1, 2, 3, 4, 5, 6, 7    | most capable |
+| 9     | phases/PHASE-09-docs-gates-and-pull-request.md        | Living docs, final gates, reviews and the pull request                                                                                                         | 3     | 1, 2, 3, 4, 5, 6, 7, 8 | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds.
 
 ## File map
 
-| Path or external change | Action | Phase | Verification |
-|---|---|---|---|
-| `apps/web/src/components/ThreadTerminalPanel.tsx` and `ThreadTerminalPanel.interactions.test.tsx` | modify | 1 | from `apps/web`: `vp test run --project unit src/components/ThreadTerminalPanel.interactions.test.tsx` |
-| `apps/web/src/components/terminalSizeDiagnostics.ts` and its test | create | 1 | same command with the new test path |
-| `apps/web/src/components/terminalSizing.ts` (re-measure helper) and a new `terminalSizing.xterm.test.ts`; `terminalSizePolicy.ts`, `apps/web/src/lib/terminalFont.ts` (only if a task needs it) | modify | 1 | their existing tests |
-| `apps/web/package.json` (dependency `@xterm/addon-unicode11` 0.9.0) | modify | 1 | `vp install`, then the R5 xterm test |
-| `packages/contracts/src/environment.ts`, `packages/contracts/fixtures/**`, `packages/shared/src/testSupport.ts` | modify | 1 | `vp run check:contracts` |
-| `apps/server/src/lifecycle.rs`, `apps/server/src/production/control.rs` | modify | 1 | `cargo test -p bibcode-server --lib lifecycle` |
-| `apps/server/src/git/process.rs`, `apps/server/src/git/sign_in.rs` | modify | 2 | `cargo test -p bibcode-server --lib -- sign_in:: index_lock_cleanup_` |
-| `apps/server/src/source_control/open_pull_request_lookups.rs`, `apps/server/src/source_control/pull_request.rs` | modify | 2 | `cargo test -p bibcode-server --lib open_pull_request_lookups::` |
-| `apps/server/src/git/broadcaster.rs`, `apps/server/src/production/git_vcs.rs`, `apps/server/src/production/runtime.rs` | modify | 2 | Phase 2 checkpoint |
-| `apps/server/src/production/worktree_catalog_rpc.rs`, `apps/server/src/diagnostics/profiler/worktree_audit.rs` | modify | 3 | `cargo test -p bibcode-server --lib worktree` |
-| `apps/server/src/persistence/repositories.rs`, `apps/server/tests/repositories.rs`, `apps/server/src/production/orchestration_effects.rs`, `apps/server/tests/profiler_worktree_audit.rs`, `apps/server/src/mcp/tools/worktrees.rs` | modify | 3 | `cargo test -p bibcode-server --test repositories` and `--test profiler_worktree_audit` |
-| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/tauriDesktopBridge.ts` (the `getUpdateState` entry) and its test | modify | 4 | Phase 4 checkpoint |
-| `scripts/desktop-event-names.test.ts` | create | 4 | `vp test run scripts/desktop-event-names.test.ts` |
-| `apps/web/src/components/ChatView.tsx` and `ChatView.test.tsx`; `apps/web/src/components/chat/timelineScrollAnchoring.ts`, `MessagesTimeline.logic.ts`, `MessagesTimeline.tsx` and their tests | modify | 5 | Phase 5 checkpoint |
-| `apps/web/src/components/hostDashboard/HostDashboardSheet.tsx` and its test | modify | 5 | Phase 5 checkpoint |
-| `apps/web/src/browser/browserSurfaceStore.ts`, `browserSurfaceSync.ts` and their tests | modify | 6 | from `apps/web`: `vp test run --project unit src/browser` |
-| `apps/web/src/components/ui/useNativePreviewOcclusion.ts`, `popover.tsx`, `menu.tsx`, `select.tsx`, `combobox.tsx`, `autocomplete.tsx` | modify | 6 | the new popup occlusion DOM test |
-| `apps/web/src/components/ui/usePopupOcclusion.ts` and its DOM test | create | 6 | the new popup occlusion DOM test |
-| `apps/web/src/components/chat/ProviderModelPicker.tsx`, its test and a new `ProviderModelPicker.real.test.tsx`; `apps/web/src/components/ChatMarkdown.tsx` and its test; `apps/web/src/components/files/FilePreviewPanel.tsx` and its test | modify | 6 | Phase 6 checkpoint |
-| `apps/server/src/diagnostics/host_metrics/volumes.rs`; `apps/server/src/auth/http.rs`, `apps/server/src/auth/service.rs` | modify | 7 | Phase 7 checkpoint |
-| `apps/server/tests/production_server_terminal_rpc.rs` (only if the R44 runs fail there) | modify | 7 | the 50-run loop of Task 7.3 |
-| `apps/desktop/e2e/wdio.conf.ts`, `apps/desktop/e2e/support/app-lifecycle.ts` and its test | modify | 7 | `vp test run apps/desktop/e2e/support/app-lifecycle.test.ts` |
-| Lab images, VM runs, probe scripts (session scratch only) | external | 8 | log lines in `progress.md` |
-| `docs/skills/bibcode-profiler/references/events.md`, `docs/testing/**` (living runbooks), `docs/architecture/overview.md`, `docs/architecture/rpc-and-orchestration.md`, `CHANGELOG.md` | modify | 9 | `vp run check:markdown-links` |
+| Path or external change                                                                                                                                                                                                                    | Action   | Phase | Verification                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ----- | ------------------------------------------------------------------------------------------------------ |
+| `apps/web/src/components/ThreadTerminalPanel.tsx` and `ThreadTerminalPanel.interactions.test.tsx`                                                                                                                                          | modify   | 1     | from `apps/web`: `vp test run --project unit src/components/ThreadTerminalPanel.interactions.test.tsx` |
+| `apps/web/src/components/terminalSizeDiagnostics.ts` and its test                                                                                                                                                                          | create   | 1     | same command with the new test path                                                                    |
+| `apps/web/src/components/terminalSizing.ts` (re-measure helper) and a new `terminalSizing.xterm.test.ts`; `terminalSizePolicy.ts`, `apps/web/src/lib/terminalFont.ts` (only if a task needs it)                                            | modify   | 1     | their existing tests                                                                                   |
+| `apps/web/package.json` (dependency `@xterm/addon-unicode11` 0.9.0)                                                                                                                                                                        | modify   | 1     | `vp install`, then the R5 xterm test                                                                   |
+| `packages/contracts/src/environment.ts`, `packages/contracts/fixtures/**`, `packages/shared/src/testSupport.ts`                                                                                                                            | modify   | 1     | `vp run check:contracts`                                                                               |
+| `apps/server/src/lifecycle.rs`, `apps/server/src/production/control.rs`                                                                                                                                                                    | modify   | 1     | `cargo test -p bibcode-server --lib lifecycle`                                                         |
+| `apps/server/src/git/process.rs`, `apps/server/src/git/sign_in.rs`                                                                                                                                                                         | modify   | 2     | `cargo test -p bibcode-server --lib -- sign_in:: index_lock_cleanup_`                                  |
+| `apps/server/src/source_control/open_pull_request_lookups.rs`, `apps/server/src/source_control/pull_request.rs`                                                                                                                            | modify   | 2     | `cargo test -p bibcode-server --lib open_pull_request_lookups::`                                       |
+| `apps/server/src/git/broadcaster.rs`, `apps/server/src/production/git_vcs.rs`, `apps/server/src/production/runtime.rs`                                                                                                                     | modify   | 2     | Phase 2 checkpoint                                                                                     |
+| `apps/server/src/production/worktree_catalog_rpc.rs`, `apps/server/src/diagnostics/profiler/worktree_audit.rs`                                                                                                                             | modify   | 3     | `cargo test -p bibcode-server --lib worktree`                                                          |
+| `apps/server/src/persistence/repositories.rs`, `apps/server/tests/repositories.rs`, `apps/server/src/production/orchestration_effects.rs`, `apps/server/tests/profiler_worktree_audit.rs`, `apps/server/src/mcp/tools/worktrees.rs`        | modify   | 3     | `cargo test -p bibcode-server --test repositories` and `--test profiler_worktree_audit`                |
+| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/tauriDesktopBridge.ts` (the `getUpdateState` entry) and its test                                                       | modify   | 4     | Phase 4 checkpoint                                                                                     |
+| `scripts/desktop-event-names.test.ts`                                                                                                                                                                                                      | create   | 4     | `vp test run scripts/desktop-event-names.test.ts`                                                      |
+| `apps/web/src/components/ChatView.tsx` and `ChatView.test.tsx`; `apps/web/src/components/chat/timelineScrollAnchoring.ts`, `MessagesTimeline.logic.ts`, `MessagesTimeline.tsx` and their tests                                             | modify   | 5     | Phase 5 checkpoint                                                                                     |
+| `apps/web/src/components/hostDashboard/HostDashboardSheet.tsx` and its test                                                                                                                                                                | modify   | 5     | Phase 5 checkpoint                                                                                     |
+| `apps/web/src/browser/browserSurfaceStore.ts`, `browserSurfaceSync.ts` and their tests                                                                                                                                                     | modify   | 6     | from `apps/web`: `vp test run --project unit src/browser`                                              |
+| `apps/web/src/components/ui/useNativePreviewOcclusion.ts`, `popover.tsx`, `menu.tsx`, `select.tsx`, `combobox.tsx`, `autocomplete.tsx`                                                                                                     | modify   | 6     | the new popup occlusion DOM test                                                                       |
+| `apps/web/src/components/ui/usePopupOcclusion.ts` and its DOM test                                                                                                                                                                         | create   | 6     | the new popup occlusion DOM test                                                                       |
+| `apps/web/src/components/chat/ProviderModelPicker.tsx`, its test and a new `ProviderModelPicker.real.test.tsx`; `apps/web/src/components/ChatMarkdown.tsx` and its test; `apps/web/src/components/files/FilePreviewPanel.tsx` and its test | modify   | 6     | Phase 6 checkpoint                                                                                     |
+| `apps/server/src/diagnostics/host_metrics/volumes.rs`; `apps/server/src/auth/http.rs`, `apps/server/src/auth/service.rs`                                                                                                                   | modify   | 7     | Phase 7 checkpoint                                                                                     |
+| `apps/server/tests/production_server_terminal_rpc.rs` (only if the R44 runs fail there)                                                                                                                                                    | modify   | 7     | the 50-run loop of Task 7.3                                                                            |
+| `apps/desktop/e2e/wdio.conf.ts`, `apps/desktop/e2e/support/app-lifecycle.ts` and its test                                                                                                                                                  | modify   | 7     | `vp test run apps/desktop/e2e/support/app-lifecycle.test.ts`                                           |
+| Lab images, VM runs, probe scripts (session scratch only)                                                                                                                                                                                  | external | 8     | log lines in `progress.md`                                                                             |
+| `docs/skills/bibcode-profiler/references/events.md`, `docs/testing/**` (living runbooks), `docs/architecture/overview.md`, `docs/architecture/rpc-and-orchestration.md`, `CHANGELOG.md`                                                    | modify   | 9     | `vp run check:markdown-links`                                                                          |
 
 Shared files reserved for the executor: `pnpm-lock.yaml`, `Cargo.lock`, `CHANGELOG.md` (written in Phase 9 only), the docs listed for Phase 9, `progress.md`.
 Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points to keep apart: Phase 1 alone edits `apps/server/src/lifecycle.rs` and `production/control.rs`; Phase 6 edits `components/ui/**` and Phase 4 must not. Phases 2, 3 and 7 and the two Rust tasks of Phase 1 are the Rust writers (4 at most at once).
 
 ## Traceability
 
-| Requirement | Tasks |
-|---|---|
-| R1 | 1.1 |
-| R2 | 1.2 |
-| R3 | 1.3 |
-| R4 | 1.4 |
-| R5 | 1.10, 9.2 |
-| R6 to R11 | not planned: withdrawn from the spec, own folder for #350 (D2) |
-| R12 | 5.1, 5.2, 8.3 (8.1 guards Linux) |
-| R13 | 3.1, 8.3, 8.4 |
-| R14 | 7.1 |
-| R15 | 7.2, 8.1 |
-| R16 | 1.8 |
-| R17 | 1.5 |
-| R18 | 5.3 |
-| R19 | 8.2 |
-| R20 | 8.1 |
-| R21 | 2.1 |
-| R22 | 2.2 |
-| R23 | 2.3 |
-| R24 | 9.1 |
-| R25 | 9.1 |
-| R26 | 2.4, 9.1 |
-| R27 | 2.5 |
-| R28 | 2.6 |
-| R29 | 2.7 |
-| R30 | 2.8 |
-| R31 | 3.2 |
-| R32 | 3.3, 9.1 |
-| R33 | 3.4 |
-| R34 | 3.5 |
-| R35 | 4.2, 8.1 |
-| R36 | 4.3 |
-| R37 | 4.1 |
-| R38 | 4.5 |
-| R39 | 4.4 |
-| R40 | 6.1, 6.2 |
-| R41 | 1.6, 9.2 |
-| R42 | 1.7 |
-| R43 | 1.9 |
-| R44 | 7.3 |
-| R45 | 7.4 |
-| R46 | 6.3 |
-| R47 | 6.4 |
+| Requirement | Tasks                                                          |
+| ----------- | -------------------------------------------------------------- |
+| R1          | 1.1                                                            |
+| R2          | 1.2                                                            |
+| R3          | 1.3                                                            |
+| R4          | 1.4                                                            |
+| R5          | 1.10, 9.2                                                      |
+| R6 to R11   | not planned: withdrawn from the spec, own folder for #350 (D2) |
+| R12         | 5.1, 5.2, 8.3 (8.1 guards Linux)                               |
+| R13         | 3.1, 8.3, 8.4                                                  |
+| R14         | 7.1                                                            |
+| R15         | 7.2, 8.1                                                       |
+| R16         | 1.8                                                            |
+| R17         | 1.5                                                            |
+| R18         | 5.3                                                            |
+| R19         | 8.2                                                            |
+| R20         | 8.1                                                            |
+| R21         | 2.1                                                            |
+| R22         | 2.2                                                            |
+| R23         | 2.3                                                            |
+| R24         | 9.1                                                            |
+| R25         | 9.1                                                            |
+| R26         | 2.4, 9.1                                                       |
+| R27         | 2.5                                                            |
+| R28         | 2.6                                                            |
+| R29         | 2.7                                                            |
+| R30         | 2.8                                                            |
+| R31         | 3.2                                                            |
+| R32         | 3.3, 9.1                                                       |
+| R33         | 3.4                                                            |
+| R34         | 3.5                                                            |
+| R35         | 4.2, 8.1                                                       |
+| R36         | 4.3                                                            |
+| R37         | 4.1                                                            |
+| R38         | 4.5                                                            |
+| R39         | 4.4                                                            |
+| R40         | 6.1, 6.2                                                       |
+| R41         | 1.6, 9.2                                                       |
+| R42         | 1.7                                                            |
+| R43         | 1.9                                                            |
+| R44         | 7.3                                                            |
+| R45         | 7.4                                                            |
+| R46         | 6.3                                                            |
+| R47         | 6.4                                                            |
 
 ## End-to-end verification
 

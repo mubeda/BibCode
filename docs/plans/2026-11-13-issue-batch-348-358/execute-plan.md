@@ -87,6 +87,7 @@ After a phase's last task, run its Checkpoint and log the result. A failing chec
      codex exec -m <model> --config model_reasoning_effort="<effort>" --sandbox read-only -C <repository root> - \
        < <tmp>/review-prompt.md 2> <tmp>/codex-review.err > <tmp>/codex-review.md
      ```
+
    - Codex (Claude reviews, through the `claude-review` skill of the agent-bridges `claude` plugin; it needs network and writes under the home folder, so run it as an approved command):
 
      ```bash
@@ -94,7 +95,9 @@ After a phase's last task, run its Checkpoint and log the result. A failing chec
        --cwd <repository root> --base <base> --scope branch \
        --model <model> --effort <effort> </dev/null > <tmp>/claude-review.md 2> <tmp>/claude-review.err
      ```
+
      This review reads the diff, not the spec, so check every requirement against the spec yourself.
+
    - An empty output or a non-zero exit is never a clean review. Read the end of the `.err` file, fix the cause (a rejected model: use the other model offered in question 2), and rerun once. If it still fails, or this host's reviewer is not installed, warn the user that the review will be same-vendor, and run the same review prompt through a fresh, read-only subagent of this host (in Claude Code the `Agent` tool with the model and effort of `opus`, effort medium; in Codex a separate `codex exec -m <fallback model> --config model_reasoning_effort="<fallback effort>" --sandbox read-only -C <repository root> - < <tmp>/review-prompt.md`, where those two are the model and effort of `gpt-6-astra`, effort medium, with the prompt above written to that file, as an approved command because it needs network). Log it as a same-vendor review, and say so in the final report. Never wait on the user for it.
 3. Process the review with the `mstack-receive-review` skill, without asking the user anything. Verify every finding against the code and reproduce it before accepting it. Fix each real finding with a test you saw fail and then pass. Send an unclear finding back to the reviewer once. Reject a finding that is wrong, cannot be verified, or contradicts a decision the user already made, with the reason. Log every finding and its outcome in `progress.md`.
 4. Report to the user: the goal and the outcome in the first line, then the final `progress.md` table, the end-to-end results, every Ruling, every review finding with what happened to it (fixed, rejected and why, deferred), and what was not run and why. Offer to open a pull request. Do not push without the user's request.

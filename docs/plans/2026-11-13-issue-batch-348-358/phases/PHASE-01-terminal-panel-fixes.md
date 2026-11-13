@@ -14,6 +14,7 @@ Every task edits `ThreadTerminalPanel.tsx` or its interaction test, so tasks run
 Rust commands use the pinned toolchain (1.98.1) first on PATH, with `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_BUILD_JOBS=3`, from the repository root. Every `vp test run --project unit` command below runs from `apps/web`. Contract and `cargo` commands run from the repository root.
 
 The interaction test (`ThreadTerminalPanel.interactions.test.tsx`) replaces these modules at file level:
+
 - `@xterm/xterm`, with a fake `Terminal` (24 × 80, recording `loadAddon`, `refresh`, `clearTextureAtlas`, `resize`);
 - `@xterm/addon-fit`, whose `fit` resizes the fake grid only while `xtermState.fitAppliesProposal` is `true` (default `false`) and whose `proposeDimensions` returns `xtermState.proposedDimensions`;
 - `@xterm/addon-webgl` and the loader in `./terminalWebgl`;
@@ -21,6 +22,7 @@ The interaction test (`ThreadTerminalPanel.interactions.test.tsx`) replaces thes
 - `./activity/ActivityPaneBinding`, `../state/terminal` and other state modules.
 
 `TerminalViewport` itself and `terminalSizing`/`terminalSizePolicy` stay real. The file controls time in three ways:
+
 - animation frames are queued and run by `view.flushFrame()`;
 - 30 ms component timers are captured and run by `view.flushMountFit()`;
 - `performance.now` is offset by `settleClockOffset` (`elapseMountSettle()`).
@@ -30,6 +32,7 @@ Other timers are real unless a test calls `vi.useFakeTimers({ toFake: ["setTimeo
 Every new async test waits on an explicit signal: a promise the test resolves, a write callback, or a captured timer handler. It also carries `{ timeout: 30_000 }`, a bound that only a hang reaches. No new test waits in a yield loop.
 
 Real boundaries and where each is proven:
+
 - xterm caches its cell size in `CharSizeService`, and `FitAddon.proposeDimensions` reads it from `_renderService.dimensions.css.cell`. A repaint (`clearTextureAtlas`, `refresh`) measures nothing (`RenderService.clearTextureAtlas` only clears and refreshes). Setting an option to its current value fires nothing (`OptionsService`'s setter skips equal values). Tasks 1.1 and 1.2 cross this boundary in a new real-xterm test (`terminalSizing.xterm.test.ts`, real `Terminal` and real `FitAddon`). The interaction harness then proves the panel calls the measurement first.
 - The browser's `FontFaceSet` firing `loadingdone` is a platform event. happy-dom has no font loading, so the tests dispatch the event on a stub. No automated step in this plan fires it from a real font load; this is reported as a residual risk in the phase report.
 - The real WebGL addon and a real GPU context loss (Task 1.7) cannot run under happy-dom. The task proves the panel's own retry flag and warning; no step in this plan loses a real context. This is reported as a residual risk.
@@ -70,6 +73,7 @@ Profiler coverage line for the final report: none applies. This phase adds no ch
   - With ownership, it only recomputes the proposal through `updateFittedDimensions` (`proposeTerminalDimensions`, which does not resize xterm). An owner then claims, and xterm is resized by `applySize` from the ordered `resized` signal. A mirror only updates its scale through `updateSizeNotice`.
 
   Re-measuring changes only the cell size, never the grid, so a mirror's columns and rows stay the server's; its scale follows the new proposal through `updateSizeNotice`. The listener is added in the mount-observer effect and removed in its cleanup.
+
 - Skills: tdd (red-green for the measurement and the listener); vercel-react-best-practices (effect cleanup and dependency review)
 - Read first:
   - `ThreadTerminalPanel.tsx` (the mount-observer effect and `handleSizeTrigger`); `terminalFollowOutput.ts` (`syncXtermScrollArea`) and `terminalFollowOutput.xterm.test.ts` (the private-member pin);
@@ -113,6 +117,7 @@ Steps
    The fake `Terminal` in `vi.mock("@xterm/xterm", …)` has no `_core`. Give the fake class the field `readonly _core = { _charSizeService: { measure: vi.fn() } }`, so every fake terminal has one; existing tests do not read it. The real `remeasureTerminalCharSize` then calls into it. In every mode, assert `measure` was called once and that its `mock.invocationCallOrder[0]` is lower than that of the first `proposeDimensions` call after the dispatch: the measurement comes before any size is proposed. For the mirror, also assert `terminal.cols` and `terminal.rows` are unchanged.
 
    Write `it("does nothing when a font finishes loading after unmount")`: mount, flush, `await unmount(view.mounted)`, clear the spies, dispatch `loadingdone`, flush, and assert that `measure`, `fit`, `clearTextureAtlas`, `refresh` and `resizeSpy` were not called. Both tests carry `{ timeout: 30_000 }`.
+
 4. [ ] Run the second Done-when command. Expected: FAIL in the three mode cases, with `measure` and `clearTextureAtlas` called 0 times. The mirror case must not fail on `fit`; a failure on `fit` means the setup differs from the pixel-ratio test. The unmount test passes.
 5. [ ] Implement `remeasureTerminalCharSize` in `terminalSizing.ts` as in Interfaces. In the mount-observer effect, add `handleFontLoadingDone`, register it with `document.fonts?.addEventListener("loadingdone", handleFontLoadingDone)` and remove it in the cleanup. Guard with `typeof document.fonts?.addEventListener === "function"`. Do not call `fitAddon.fit()` or `fitTerminalSafely` from the listener.
 6. [ ] Run both Done-when commands. Expected: PASS, 2 and 4 tests.
@@ -134,6 +139,7 @@ Steps
   Font writers: the creation effect passes `fontFamily: readTerminalFontFamily()`, and the font effect assigns `terminal.options.fontFamily`. The effect's existing `.then` runs `clearTextureAtlas`, `size("layout")` and `refresh`, but it never re-measures. On a new renderer its `fontFamily` assignment repeats the value the constructor set, and xterm's `OptionsService` setter fires nothing for an equal value. On a family change, xterm measures at the assignment, before the font has loaded. Either way, the fit addon then reads stale cell dimensions.
 
   Produces a font effect whose dependency list is `[shouldRender, terminalFontFamily, rendererEpoch]`, with the early return `rendererEpoch !== rendererEpochRef.current` (the guard the WebGL effect already uses). Its `.then` calls `remeasureTerminalCharSize(terminal)` (Task 1.1) before `clearTextureAtlas`, `size("layout")` and `refresh`. The real-xterm proof that this helper refreshes the cached cell size is Task 1.1's `terminalSizing.xterm.test.ts`.
+
 - Skills: tdd (red-green for the new dependency); vercel-react-best-practices (effect dependency and stale-closure review)
 - Read first: `ThreadTerminalPanel.tsx` (the font effect, the creation effect and the WebGL effect's epoch guard); the tests "waits for authoritative host config before attaching Codex" and "issues one resize for the initial geometry and skips unchanged fits from either path"
 - Tier: standard
@@ -150,6 +156,7 @@ Steps
    - `it("ignores a host config font load that resolves after its renderer was disposed")`: deliver the config, then `await view.setVisible(false)` and wait for it to settle (the hide disposes the terminal; assert `terminal.dispose` was called). Then resolve the font promise inside `act`, and assert `measure`, `clearTextureAtlas` and `refresh` were not called on that disposed terminal.
 
    Also extend the existing `it.each([false, true])("updates the font without recreating the terminal (WebGL: %s)")` (it sets `{ mode: "custom", family: "Maple Mono" }` and asserts `clearTextureAtlas` once): assert `_core._charSizeService.measure` ran once, before its `fit` call.
+
 2. [ ] Run the first Done-when command, and the same command with `-t "updates the font without recreating the terminal"`. Expected: FAIL. The first new test sees `measure` and `clearTextureAtlas` called 0 times; the font-change test sees `measure` called 0 times. The disposed test passes.
 3. [ ] Add `rendererEpoch` to the font effect's dependency list and return early when `rendererEpoch !== rendererEpochRef.current`. Add the `remeasureTerminalCharSize(terminal)` call at the start of the `.then` work, after the existing `cancelled`, generation and identity checks.
 4. [ ] Run both Done-when commands and the `-t "updates the font without recreating the terminal"` command. Expected: PASS.
@@ -202,6 +209,7 @@ Steps
   - the 50 ms timer of `scheduleResize` (`repaint: "scheduled"` when set, `"done"` when run);
   - the font effect's repaint (`"font"`);
   - `handlePixelRatioChange` (`"pixel-ratio"`).
+
 - Skills: tdd (ring and panel recording are red first); vercel-react-best-practices (recording must not add renders or effect dependencies)
 - Read first: `ThreadTerminalPanel.tsx`: `handleSizeTrigger` and its 12 call sites (`rg -n "handleSizeTrigger\(" ThreadTerminalPanel.tsx`), `completeClaim`, `finishClaim`, `requestTerminalResize`, `scheduleResize`, the font effect and `handlePixelRatioChange`. Also `AGENTS.md`, section Sensitive Data.
 - Tier: standard
@@ -222,6 +230,7 @@ Steps
    - `it("records no size diagnostics while disabled")`.
 
    Each test disables and clears the ring in `afterEach`.
+
 3. [ ] Run the Done-when command. Expected: FAIL, `./terminalSizeDiagnostics` cannot be resolved.
 4. [ ] Create the module with the exports above, as a fixed-size array with a write index. Add the panel call sites listed in Interfaces. Read the values from:
    - `mount.clientWidth` and `mount.clientHeight`;
@@ -230,6 +239,7 @@ Steps
    - the renderer kind, `webglLifecycleRef.current !== null`.
 
    Wrap each call site in `if (terminalSizeDiagnosticsEnabled())`, so nothing is measured when diagnostics are off.
+
 5. [ ] Run the Done-when command. Expected: PASS, 5 tests.
 6. [ ] Prove the test can fail, in two parts:
    1. Revert this task's `ThreadTerminalPanel.tsx` edits by hand, keeping the new module, and rerun. Expected: FAIL in "records size diagnostics without terminal content" (no records). Restore them and rerun. Expected: PASS.
@@ -248,6 +258,7 @@ Steps
   - `applySize` sets it to `false` when `!terminalSizesEqual(appliedSize, size)`; its four callers are the `resized` and `attached` branches of `render`, the reset branch and `reconcileLegacyClaim`;
   - `handleSizeTrigger` sets it to `false` when it sends a claim (`claimInFlight = request`);
   - the creation effect's cleanup sets it to `false`, next to `updateMirroringSize(null)`.
+
 - Skills: tdd (red-green for the new text); vercel-react-best-practices (one new state, set only from event paths); better-writing (UI.md review of the new sentence)
 - Read first: `UI.md` (disabled and refused actions explain themselves); in the two-machine describe ("TerminalViewport shared by windows on two machines (#348)"), the helpers `serverHostOwnsTallerGrid`, `fitButton`, `view`, and the tests "keeps focus on Fit to this window when no claim is sent" and "leaves the terminal focused after Fit to this window takes the size"
 - Tier: standard
@@ -284,6 +295,7 @@ Steps
   2. The `resized` branch of `render`: `unownedUntilUsed = userInputClaim && signal.size.sizeClaim === null` becomes `sizeHandOver && …`.
 
   The writers that set it `false` (in `applySize` when `size.sizeClaim != null`, and in the reset branch) are unchanged. `answersTerminalQueries` also reads `replyClaim`, but it decides only which window answers queries, a rule the server states by naming the replier; it is not the hand-over state and stays ungated.
+
 - Skills: tdd (red-green for decoding, advertising and the panel rule); vercel-react-best-practices (the dependency list change)
 - Read first:
   - `rg -n "unownedUntilUsed|isUnownedUntilUsed|userInputClaim|replyClaim" apps/web/src/components/ThreadTerminalPanel.tsx apps/web/src/components/terminalSizePolicy.ts`, for every reader and writer;
@@ -307,6 +319,7 @@ Steps
      3. Clear the spy. Ingest `resized` with `{ cols: 151, rows: 50, sizeClaim: null, replyClaim: "other-window" }` and assert a claim was sent.
 
      Flush frames with `view.flushFrame()` after each signal, and call `elapseMountSettle()` before the first, so the settle wait is not what holds a claim.
+
    - Add `it("applies the hand-over rule with the hand-over capability: reset, attached and resized")`, with the same steps and `terminalSizeHandOver: true`. After each signal, assert `resizeSpy` was not called and "Fit to this window" is shown.
 2. [ ] Run the first four Done-when commands. Expected: each FAILS on a new assertion. The Rust one fails with `left: Null, right: true`. The "absent" and "false" panel cases fail at step 1, because today `isUnownedUntilUsed` enters the hand-over state from `replyClaim`.
 3. [ ] Make the changes:
@@ -335,6 +348,7 @@ Steps
   - `recordWebglDiagnosticOnce(stage: WebglFailureStage, error?: unknown): void`, which calls `console.warn("[terminal] WebGL renderer unavailable; using the standard renderer.", { cause: stage, error: error instanceof Error ? error.name : error === undefined ? undefined : typeof error })`.
 
   The WebGL effect keeps a local `let stage: WebglFailureStage = "import failed"`. It becomes `"addon creation failed"` before `new WebglAddon()` and `"addon load failed"` before `terminal.loadAddon(addon)`, and stays so through the canvas observer and `onContextLoss` registration. Both refs are set to `false` next to `rendererEpochRef.current += 1`.
+
 - Skills: tdd (red-green for the retry and the cause); vercel-react-best-practices (callback signature change)
 - Read first: the WebGL effect (`loadTerminalWebglAddon`, `new WebglAddon()`, `terminal.loadAddon(addon)`, `addon.onContextLoss`, the `catch`). In the test file:
   - the fakes `vi.mock("@xterm/addon-webgl")` (`triggerContextLoss`, `constructorShouldThrow`, `activateShouldThrow`, `listenerShouldThrow`), `xtermState.loadWebglShouldThrow` and `vi.mock("./terminalWebgl")` (`importGate`, `rejectWebglImport`);
@@ -355,6 +369,7 @@ Steps
    - nothing beyond `toHaveBeenCalledOnce()` for the import rejection test.
 
    In each of the three, add the `JSON.stringify(...)` check. They toggle the setting without a new terminal, so they still expect no retry.
+
 2. [ ] Run both Done-when commands. Expected: FAIL. The first test sees 1 instance instead of 2. The cause tests see the message with no second argument.
 3. [ ] Implement as in Interfaces.
 4. [ ] Run both Done-when commands. Expected: PASS. Also run `-t "allows a fresh viewport component to retry"`. Expected: PASS.
@@ -372,6 +387,7 @@ Steps
   - `deferredClaimTimer` and `deferredTrigger`, written only inside `handleSizeTrigger` and the creation effect's cleanup.
 
   Produces the test and a verdict line in `progress.md`; no product code.
+
 - Skills: mstack-diagnose (decide by test; the test is the deliverable)
 - Read first: `ThreadTerminalPanel.tsx` (`mountSettleRemaining`, `handleSizeTrigger`, the deferred claim timer). In the describe "automatic claims wait for a settled mount (#348)": its `clientWidth`/`clientHeight` overrides (`mountSizes`), `resizeMount`, `settle`, `claimsOf` and the test "sends one claim at the final size after a mount passes through a few pixels". Also "mounts a correlated provider dock in the exact terminal viewport".
 - Tier: most capable
@@ -394,6 +410,7 @@ Steps
    4. `await settle()` twice.
    5. Assert `claimsOf(owner).slice(before)` contains no row sequence that goes to 33 and back to 30. Assert its last entry, if any, is `"85x30"`. Assert the `request` rows in `readTerminalSizeDiagnostics()` agree.
    6. Disable diagnostics in `finally`.
+
 2. [ ] Prove the test can see a transient before trusting a pass. Temporarily make `mountSettleRemaining` return `0` and rerun the Done-when command. It is the only gate that holds an automatic claim, so the font step's 33 rows are then claimed at once, before the dock's 30. Expected: FAIL with a `33` then `30` sequence. Restore it by hand.
 3. [ ] Run the Done-when command. Expected: PASS for verdict "no defect", or FAIL with claims such as `["85x33", "85x30"]` for verdict "defect".
    - Verdict "no defect": the test stays as proof. Log "R16: no transient; claims …" with the recorded sequence in `progress.md`.
@@ -438,6 +455,7 @@ Steps
   The panel's `new Terminal({...})` spreads `TERMINAL_BASE_OPTIONS` in place of its five literal options, keeps `fontFamily`, `theme` and `linkHandler`, and calls `activateTerminalUnicode(terminal)` right after `terminal.loadAddon(fitAddon)` and before `terminal.open(mount)`.
 
   Why `allowProposedApi: true`: in xterm 6.0.0, `node_modules/@xterm/xterm/src/browser/public/Terminal.ts` calls `_checkProposedApi()` in the `unicode` getter. That throws "You must set the allowProposedApi option to true to use proposed API" unless the option is set, and the addon's `activate` registers its provider through `terminal.unicode`. The same option unlocks only four other public members, and changes no behavior by itself: the `markers` getter, `registerCharacterJoiner`, `deregisterCharacterJoiner` and `registerDecoration`. The panel calls none of them. `OptionsService` defaults it to `false`, and nothing else in xterm's sources reads it.
+
 - Skills: tdd (red-green with a real xterm); vercel-react-best-practices (options moved out of the render path, no new effect)
 - Read first:
   - `apps/web/src/components/terminalFollowOutput.xterm.test.ts`, which already builds a real `Terminal` with `allowProposedApi: true` under `// @vitest-environment happy-dom` and mocks nothing;
@@ -468,6 +486,7 @@ Steps
    - with WebGL on, after `view.settleWebgl()`, `loadAddon` also received `view.webglAddon`.
 
    Run `-t "Unicode 11"`. Expected: FAIL, `activeVersion` is `"6"`.
+
 6. [ ] In `ThreadTerminalPanel.tsx`, spread `TERMINAL_BASE_OPTIONS` and call `activateTerminalUnicode(terminal)` as in Interfaces. Run `-t "Unicode 11"`. Expected: PASS.
 7. [ ] Check that the renderer and font paths are unchanged: run the interaction test with `-t "WebGL"` and with `-t "font"`, and run `src/components/ThreadTerminalPanel.test.tsx`. Expected: PASS. That covers the context-loss, fallback and DPR=2 WebGL correction tests and the font-change tests for both renderers.
 8. [ ] Prove the test can fail: revert this task's change to `ThreadTerminalPanel.tsx` by hand (the spread and the call) and rerun `-t "Unicode 11"`. Expected: FAIL. Restore it and rerun. Expected: PASS. Then revert the `activeVersion` line in `activateTerminalUnicode` by hand and rerun the step 3 command. Expected: FAIL with `cursorX` 1. Restore it and rerun. Expected: PASS.

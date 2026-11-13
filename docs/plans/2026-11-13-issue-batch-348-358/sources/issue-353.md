@@ -10,5 +10,3 @@ Small follow-ups found while validating #349, none blocking:
 - Mixed versions: terminal resize, attach and keybindings were not run against a real older server build (covered by contract tests and test doubles only).
 - Linux packaged run: main-thread stalls up to 2.7 s on the settings to thread route change and WebKitWebProcess memory growing to about 1.0 to 1.26 GiB over a full run, both present before #349 (seen with the Profiler on under software rendering).
 - xterm.js 6.0.0 counts emoji as one column (Unicode 6 widths) while programs such as the Claude CLI assume modern widths; loading the unicode11 or graphemes addon is also a prerequisite for a server-side screen.
-
-

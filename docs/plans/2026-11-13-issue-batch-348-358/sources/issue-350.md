@@ -13,6 +13,7 @@ The server keeps an emulated terminal screen per session and a snapshot becomes 
 ## Results of a crate spike (standalone project, compared cell by cell against xterm.js 6.0.0)
 
 Verdict
+
 - No crate produces the checkpoint as is.
 - avt 0.20.0 (Apache-2.0, 1 dependency, 0 unsafe) is the only workable base: with a wrapper of about 260 lines it passed every continuation case, every split-sequence position and streams 1, 2, 3, 5, 6 with 0 differing cells. Stream 4 (feature mix) differs in 36 cells: underline styles, `58;5;n`, OSC 8.
 - vt100 0.18.1: not usable (no reflow, no DEC line drawing, no custom tab stops, no insert mode, no ?7, saved cursor not exposed).
@@ -26,7 +27,6 @@ Restoration order that passed: title; scrollback; primary paint; tab stops; prim
 Numbers (release, one thread): avt alone 199 MiB/s (TUI) and 173 MiB/s (shell); with wrapper and hold-back 71 and 67 MiB/s (upper bound of the hold-back cost). Checkpoint time 0.14 ms for a TUI, 1.5 ms at 1,000 scrollback lines, 8.8 ms at 5,000. Memory at 120x40 with 5,000 scrollback lines: 13.3 MiB; empty scrollback 0.2 to 0.3 MiB. Checkpoint size: TUI about 4 KB; 1,000 lines about 161 KB (naive serializer).
 
 Accepted losses unless more work: OSC 8 links, underline style and colour, `?2026` state, DCS/OSC prefixes over 64 KiB. Not tested: the real Claude CLI stream, ConPTY output, images, kitty keyboard flags, width growth, resize on the alt screen, invalid UTF-8.
-
 
 ## Requirements from the design review
 
@@ -105,9 +105,6 @@ The first design was reviewed and deferred. Its findings are the requirements fo
 16. **Sound — Keeping operational history separate, and absent-format fallback.** `apps/server/src/terminal/manager.rs:4434`; `apps/server/src/mcp/tools/terminals.rs:522`; `packages/contracts/src/terminal.ts:270`. Keeping raw history preserves MCP raw/stripped reads, byte cursors, epochs and dropped-window reporting. An absent `historyFormat` can preserve this client’s current behavior with older servers, including its known replay limitation.
 
 Read-only verification used source inspection and two in-memory Node probes (`node -e …` and `node --experimental-strip-types --input-type=module -e …`). No files changed; the pre-existing untracked file remains. No Rust spike, full suites, native E2E or real-machine reproduction ran. CodeGraph sync was skipped because this review prohibited writes.
-
-
-
 
 ## Comment 2026-11-13T04:00:51Z
 

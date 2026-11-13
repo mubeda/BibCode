@@ -7,5 +7,3 @@ Follow-ups to the unsaved-edits guard around a remote update install in #349. Fo
 - A Files source registered during the install is not held. `blockForUpdateInstall` holds a snapshot of the sources, and `registerUnsavedSource` adds a source without taking a hold.
 - Nothing ties the event name in `apps/web/src/tauriDesktopBridge.ts` to the one in `apps/desktop/src-tauri/src/remote_update_delegate.rs`. Add a test or a shared constant.
 - Not decided: whether the always-open installing dialog makes the Manage devices toast unreachable.
-
-

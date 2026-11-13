@@ -79,6 +79,7 @@ The dispatch-failure arm is by id for the same reason. Its end state (no record 
 - Done when: `cargo test -p bibcode-server --lib -- create_rollback` and `cargo test -p bibcode-server --test profiler_worktree_audit` exit 0.
 
 Settled before writing:
+
 - No existing test forces the dispatch-failure arm. The record-write arm is forced by `a_creation_whose_record_cannot_be_written_fails_and_leaves_no_worktree` (it drops the `worktree_creation_records` table).
 - The profiler is process-global, so `tests/profiler_worktree_audit.rs` keeps all scenarios in the one test `the_audit_and_removal_outcomes_reach_the_profiler`. Do not add a second test there. Extend it.
 - The harness is real, not stubbed: `Fixture::new` builds `WorktreeCatalogRpcServices::new(catalog, engine)`, which takes its creation Git from `catalog.git_repository()` (a real `GitRepository::default()`), and `register_worktree_catalog_rpc` registers `worktree.createManaged`. So the test can send that RPC over the existing socket.

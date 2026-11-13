@@ -7,5 +7,3 @@ Follow-ups to the worktree creation records (#344) in #349. Found by reading the
 - `reap_gone_records` in `apps/server/src/diagnostics/profiler/worktree_audit.rs` treats NotFound as gone. A record on an unmounted volume is deleted although the folder still exists.
 - A record can outlive its worktree if an unrelated folder is created at the same path later, which warns for that folder. A crash between Git's success and the record write leaves a worktree with no record.
 - The tests for the `.git` pointer read pin the no-follow and non-blocking flags, not the ordering between the check and the open. The read is also not contained to a directory handle.
-
-

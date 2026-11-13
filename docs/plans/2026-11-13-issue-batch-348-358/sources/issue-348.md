@@ -129,5 +129,3 @@
 - (measured) The owner explicitly requested filing; the task requires a static investigation and no interview. Those instructions supersede the skill's interview/approval workflow. This issue is not an approved implementation design.
 - (inferred; agent's call) Use ISSUE form with ranked hypotheses, EARS requirements, Given/When/Then scenarios, and bounded non-goals; retain uncertainties rather than inventing the visual symptom or a deterministic reproduction.
 - (measured) Source was read from the fetched `origin/main` only. CodeGraph was not used because database access was prohibited. Production data and processes were not accessed.
-
-
