@@ -46,6 +46,7 @@ interface FakeTerminalInstance {
   readonly scrollToBottom: ReturnType<typeof vi.fn>;
   readonly clearTextureAtlas: ReturnType<typeof vi.fn>;
   readonly _core: { readonly _charSizeService: { readonly measure: ReturnType<typeof vi.fn> } };
+  readonly unicode: { activeVersion: string };
   readonly dispose: ReturnType<typeof vi.fn>;
   readonly loadAddon: ReturnType<typeof vi.fn>;
   readonly clearSelection: ReturnType<typeof vi.fn>;
@@ -311,6 +312,14 @@ vi.mock("@xterm/addon-webgl", () => {
   return { WebglAddon };
 });
 
+vi.mock("@xterm/addon-unicode11", () => ({
+  Unicode11Addon: class Unicode11Addon {
+    readonly kind = "unicode11" as const;
+    activate() {}
+    dispose() {}
+  },
+}));
+
 // Only the loader is faked; `webglContextFrom`/`webglCanvasFrom` stay real so
 // the addon plumbing under test is the code that actually ships.
 vi.mock("./terminalWebgl", async (importOriginal) => ({
@@ -374,6 +383,7 @@ vi.mock("@xterm/xterm", () => ({
     readonly clearTextureAtlas = vi.fn();
     // xterm 6.0.0's private cell measurement, which a late font load re-runs (#348).
     readonly _core = { _charSizeService: { measure: vi.fn() } };
+    readonly unicode = { activeVersion: "6" };
     readonly loadedAddons: Array<{ dispose?: () => void }> = [];
     readonly dispose = vi.fn(() => {
       this.disposed = true;
@@ -2406,7 +2416,10 @@ describe("TerminalViewport mounted lifecycle", () => {
       const mount = view.mounted.container.querySelector<HTMLElement>(
         "[data-terminal-xterm-mount]",
       )!;
-      const fitted = proposeTerminalDimensions(xtermState.fitAddons.at(-1)!, mount);
+      const fitted = proposeTerminalDimensions(
+        xtermState.fitAddons.at(-1)! as unknown as Parameters<typeof proposeTerminalDimensions>[0],
+        mount,
+      );
       expect(
         terminal.rows,
         JSON.stringify({ rows: terminal.rows, mountHeight: mount.clientHeight, fitted }),
@@ -5229,6 +5242,21 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(webglState.instances).toHaveLength(1);
     expect(view.fakeTerminal).not.toBeNull();
   });
+
+  it.each([false, true])(
+    "activates Unicode 11 on every terminal (WebGL %s)",
+    async (webglEnabled) => {
+      const view = await mountViewport({ visible: true, webglEnabled });
+      const terminal = view.fakeTerminal!;
+      const loaded = () => terminal.loadAddon.mock.calls.map(([addon]) => addon);
+      expect(loaded()).toContainEqual(expect.objectContaining({ kind: "unicode11" }));
+      expect(terminal.unicode.activeVersion).toBe("11");
+      if (webglEnabled) {
+        await view.settleWebgl();
+        expect(loaded()).toContain(view.webglAddon);
+      }
+    },
+  );
 
   it("tries WebGL again in a new terminal after a context loss in the same viewport", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);

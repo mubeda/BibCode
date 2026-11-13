@@ -103,6 +103,7 @@ import {
   remeasureTerminalCharSize,
   terminalHostHasArea,
 } from "./terminalSizing";
+import { activateTerminalUnicode, TERMINAL_BASE_OPTIONS } from "./terminalUnicode";
 import {
   readTerminalSizeDiagnostics,
   recordTerminalSizeDiagnostic,
@@ -1459,11 +1460,7 @@ export function TerminalViewport({
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
-      cursorBlink: true,
-      macOptionClickForcesSelection: true,
-      lineHeight: 1,
-      fontSize: 12,
-      scrollback: 5_000,
+      ...TERMINAL_BASE_OPTIONS,
       fontFamily: readTerminalFontFamily(),
       theme: terminalThemeFromApp(
         readEffectiveTerminalTheme(),
@@ -1524,6 +1521,7 @@ export function TerminalViewport({
       },
     });
     terminal.loadAddon(fitAddon);
+    activateTerminalUnicode(terminal);
     terminal.open(mount);
     if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
     // A paused renderer can move the view by itself; the position it had when drawing
