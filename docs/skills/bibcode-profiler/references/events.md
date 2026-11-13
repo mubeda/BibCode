@@ -384,9 +384,16 @@ backup was published.
 
 ### worktree.removal
 
-Every `worktree.remove` and `worktree.removeFromBibCode` outcome.
+Every `worktree.remove` and `worktree.removeFromBibCode` outcome, and the
+rollback of a failed worktree creation.
 
-- `mode`: `detach-only`, `delete-git-worktree` or `cleanup-stale-registration`;
+- `mode`: `detach-only`, `delete-git-worktree`, `cleanup-stale-registration`
+  or `create-rollback`. `create-rollback` comes from the two rollback paths of
+  `worktree.createManaged` (also reached by the MCP `create_worktree` tool).
+  It has `ok: true` and no `reason` when the rollback worked. When it failed,
+  `ok` is `false`, `reason` is `internal`, and an Error
+  `worktree.removal-failed` finding cites the event. `drainTimedOut` is always
+  `false` and `durationMs` times the rollback alone;
 - `ok`;
 - `reason`: the kebab-case removal error reason, or `null`;
 - `durationMs`;
@@ -466,7 +473,20 @@ before it. A stop with no slow step records nothing.
 - `durationMs`: the stage so far;
 - `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
   name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
-  `operational-logs` or `orchestration`.
+  `git-writes`, `operational-logs` or `orchestration`.
+
+The `quiesce` steps run in this order: `profiler-begin-stopping`,
+`mcp-control`, `webhooks`, `process-monitor`, `host-metrics`, `tool-updates`,
+`capability-discovery`, `preview-gateway`, `device-manager`,
+`diff-tool-launcher`, `preview-tunnels`, `freeze-process-ownership`,
+`managed-endpoint`, `workspace`, `status-broadcaster`,
+`pull-request-lookups` (running open pull-request lookups end here),
+`worktree-catalog-operations`, `worktree-catalog`, `worktree-runtime`,
+`worktree-removals`, `clone-operations`, `provider-update-checks`,
+`turn-delivery`, `upload-sweeper`, `attachment-uploads`,
+`orchestration-effects`, `provider-runtime`, `git-writes` (running Git writes
+stop and a leftover `index.lock` is checked), `terminal-services`,
+`operational-logs`, `orchestration` and `profiler-end-session`.
 
 The profiler's own teardown is the last quiesce step, and the server's join
 closes the database after it, so a slow `profiler-end-session`,
