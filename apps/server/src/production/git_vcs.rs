@@ -588,6 +588,12 @@ impl GitVcsRpcServices {
     pub(crate) fn status_broadcaster(&self) -> StatusBroadcaster {
         self.broadcaster.clone()
     }
+
+    /// The service whose shared lookups quiesce ends; take it after the last builder call,
+    /// which may replace it.
+    pub(crate) fn pull_requests(&self) -> PullRequestService {
+        self.pull_requests.clone()
+    }
 }
 
 impl WorkspaceMutationObserver for GitVcsRpcServices {
@@ -9291,6 +9297,39 @@ esac
         fixture
             .wait_until_no_forge_cli_runs("after the status broadcaster shut down")
             .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pull_request_lookup_shutdown_reaps_the_forge_cli() {
+        let fixture = Fixture::new("pr-lookup-shutdown");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = fixture.subscribe(&cancellation);
+        wait_for_lookups(&fixture, "main", 1).await;
+        subscriber.drain(Duration::from_millis(300)).await;
+
+        // The refresh answers at its bound and hands the lookup to the subscriber.
+        fixture.set("slow", "30");
+        fixture.forget_lookups();
+        tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        wait_for_lookups(&fixture, "main", 2).await;
+        assert!(fixture.a_forge_cli_is_running(), "the late lookup runs");
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            fixture
+                .services
+                .pull_requests()
+                .shutdown_open_pull_request_lookups(),
+        )
+        .await
+        .expect("shutdown ends the lookups");
+        assert!(
+            !fixture.a_forge_cli_is_running(),
+            "shutdown returned while the forge CLI still ran"
+        );
         cancellation.cancel();
     }
 }

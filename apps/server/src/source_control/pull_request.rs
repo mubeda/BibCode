@@ -654,6 +654,11 @@ impl PullRequestService {
         self.open_lookups.invalidate(path);
     }
 
+    /// Ends every shared open pull-request lookup and refuses new ones, for quiesce (R26).
+    pub async fn shutdown_open_pull_request_lookups(&self) {
+        self.open_lookups.shutdown().await;
+    }
+
     pub(crate) fn current_provider_command(
         &self,
         provider: ProviderKind,
