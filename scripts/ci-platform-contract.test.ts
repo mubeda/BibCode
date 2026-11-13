@@ -345,8 +345,9 @@ describe("cross-platform CI contract", () => {
     expect(probe?.if).toBe("matrix.platform == 'mac'");
     expect(probe?.run).toContain("cargo run --release");
     expect(probe?.run).toContain("-p bibcode-objc-exception-probe");
-    // The shipped profile: an example of bibcode-desktop, or the symbol
-    // profile, would compile the desktop and server graph a second time.
+    // An example of bibcode-desktop would compile the desktop and server
+    // graph a second time. No profile overrides: the probe tests the shipped
+    // release profile.
     expect(probe?.run).not.toContain("bibcode-desktop");
     expect(probe?.env).toBeUndefined();
     const manifest = NodeFS.readFileSync(

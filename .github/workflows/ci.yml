@@ -290,9 +290,9 @@ jobs:
   native_desktop:
     name: Native desktop - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    # Host tests, the optimized example (with dev features), and the native
-    # bundle have distinct Cargo builds. Budget the complete cold sequence;
-    # Intel needs additional headroom without shortening any validation phase.
+    # Host tests and the native bundle are distinct Cargo builds of the desktop
+    # and server graph. Budget the complete cold sequence without shortening
+    # any validation phase.
     timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
       fail-fast: false
