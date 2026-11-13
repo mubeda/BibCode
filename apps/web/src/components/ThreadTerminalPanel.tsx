@@ -2689,7 +2689,7 @@ export function TerminalViewport({
       }
 
       // xterm measured the cell before the font loaded, or not at all for an equal family.
-      remeasureTerminalCharSize(terminal);
+      if (remeasureTerminalCharSize(terminal)) rendererRef.current?.cellChanged();
       terminal.clearTextureAtlas();
       rendererRef.current?.size("layout");
       terminal.refresh(0, terminal.rows - 1);
@@ -2980,6 +2980,8 @@ export function TerminalViewport({
     function handlePixelRatioChange() {
       watchPixelRatio();
       if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("pixel-ratio", "none");
+      // Rounded rows change the fit as a box change does, so the claim waits as well (#348).
+      rendererRef.current?.cellChanged();
       scheduleResize();
     }
     watchPixelRatio();
