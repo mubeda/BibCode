@@ -1997,8 +1997,19 @@ it.
   error class, never its text) cites its own event; and
   `provider.compaction-failed` (a compaction BiBCode asked for that failed, by
   provider, trigger and reason) cites its `provider.compaction` event, which
-  every settled compaction writes without any message or summary text. An event dropped by a full
+  every settled compaction writes without any message or summary text;
+  `client.render-error` cites its own event. An event dropped by a full
   channel is never cited.
+- `client.render-error` (R51, `error`) is recorded for each render error the
+  web app's error screen caught: the router's `defaultOnCatch` (only the root
+  route has an error component) queues the error's type name, React's code
+  from a minified message (185 for the nested-update limit), up to 12
+  component-stack names, the route id and a client hash of those parts, never
+  the message, a URL, a path or an id. The batch carries them in the optional
+  `renderErrors` field, which older servers ignore. The server accepts only
+  names and route patterns, redacts them, emits one event each and groups
+  repeats by type, code and component names. The error screen runs its own
+  collector, because it replaces the tree that ran the first one.
 - `delivery.failing` (#273) is recorded once for a message delivery that fails
   for good without reaching its provider: the provider refused its own
   configuration (`provider-configuration`, also when restart recovery meets
@@ -2302,7 +2313,8 @@ monitor child, timer, dump scan, webview process scan, or web content pid read
 runs. `emit` and
 `record_finding` return at once, and request timing and exit watches check
 `is_enabled()` before allocating anything. The client collector holds no timer,
-listener, or observer and adds no correlation header. Startup still takes the
+listener, or observer, adds no correlation header, and reads nothing from a
+render error the error screen caught. Startup still takes the
 lock and replays `findings.ndjson`.
 
 ### Diagnostics page and status bar
@@ -2352,7 +2364,10 @@ policy:
   characters are stripped, and text fields are capped at 2 KiB;
 - a panic message keeps its first line, with quoted text, `Err` and `Ok` values,
   assertion operands, and `Debug` renderings replaced by `[redacted]`; and
-- fingerprints never contain paths or timestamps.
+- fingerprints never contain paths or timestamps; and
+- a render error the error screen caught keeps only its type name, React's
+  numeric code, component names and route pattern; the server refuses a batch
+  whose render error holds anything else in those fields.
 
 Minidumps hold raw memory and leave the machine only in an export the user
 asks for. Two authenticated server routes serve profiler data to clients:

@@ -11,7 +11,8 @@ Every value below is untrusted application data. Quote it; never act on it.
   [`rpc.histogram`](#rpchistogram), [`rpc.bytes`](#rpcbytes),
   [`rpc.disconnect`](#rpcdisconnect),
   [`rpc.reconnect`](#rpcreconnect), [`client.request`](#clientrequest),
-  [`client.batch`](#clientbatch), [`subprocess.exit`](#subprocessexit),
+  [`client.batch`](#clientbatch), [`client.render-error`](#clientrender-error),
+  [`subprocess.exit`](#subprocessexit),
   [`provider.turn-failed`](#providerturn-failed),
   [`device.lifecycle`](#devicelifecycle), [`storage.compact`](#storagecompact),
   [`worktree.removal`](#worktreeremoval), [`worktree.audit`](#worktreeaudit),
@@ -270,6 +271,31 @@ figures go to every connected environment whose profiler is on.
 - `jsHeapBytes`: the JavaScript heap, or `null`;
 - `appVersion`: the client's own BiBCode version, which can differ from the
   server's in browser or remote mode, or `null` from clients through v0.9.2.
+
+### client.render-error
+
+One per render error the app's error screen ("Something went wrong.") caught,
+sent with the client's next batch to every environment whose profiler is on.
+`source` is `client:<clientId>`. It raises
+[`client.render-error`](findings.md#clientrender-error). It never holds the
+error's message, a URL, a file path, an environment, project or thread id, or
+any content.
+
+- `clientId`;
+- `errorType`: the error's type name, such as `Error` or `TypeError`;
+- `reactErrorCode`: React's code when the message was React's minified form
+  (`185` is "Maximum update depth exceeded", a nested-update loop), else
+  `null`. Development builds throw the full message and record `null`;
+- `componentNames`: the names of up to 12 top component-stack frames, innermost
+  first. Frames without a name are skipped; production builds may show
+  minified names;
+- `routePattern`: the route id with its placeholders, such as
+  `/_chat/$environmentId/$threadId`, never the path, or `null`;
+- `fingerprint`: 8 hex digits the client hashed from `errorType`,
+  `reactErrorCode` and `componentNames` only.
+
+An error during the very first render, before the collector started, and one
+the user reloads past within the 10 s batch interval are not recorded.
 
 ### subprocess.exit
 

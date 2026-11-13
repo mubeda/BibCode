@@ -1,5 +1,6 @@
 import {
   type ProfilerClientBatch,
+  type ProfilerClientRenderError,
   PROFILER_CLIENT_BATCH_LIMITS,
   WS_METHODS,
 } from "@bibcode/contracts";
@@ -51,6 +52,15 @@ export interface ClientCollector {
     method: string,
   ): { correlationId: string | null; complete: () => void };
   setEnabledEnvironments(ids: ReadonlySet<string>): void;
+  /**
+   * Queues a render error the error screen caught for the next batch; never throws. Reads
+   * nothing while no environment is profiled. `routePattern` is read only then.
+   */
+  recordRenderError(
+    error: unknown,
+    componentStack: string | null | undefined,
+    routePattern: () => string | undefined,
+  ): void;
   flush(): Promise<void>;
   dispose(): void;
 }
@@ -107,6 +117,53 @@ function jsHeapBytes(): number | null {
   return memory?.usedJSHeapSize ?? null;
 }
 
+/** A JavaScript name: never a message, a URL or a path. The server checks the same. */
+const NAME = /^[A-Za-z_$][\w$.]{0,63}$/;
+const MINIFIED_REACT_ERROR = /^Minified React error #(\d{1,4})\b/;
+
+/** The names of the top component-stack frames: `at Name (url)` (V8) or `Name@url` (WebKit). */
+function componentNames(componentStack: string | null | undefined): string[] {
+  const names: string[] = [];
+  for (const line of (componentStack ?? "").split("\n")) {
+    const frame = line.trim();
+    const name = frame.startsWith("at ") ? frame.slice(3).split(" ")[0] : frame.split("@")[0];
+    // An anonymous frame has a URL where its name would be.
+    if (name !== undefined && NAME.test(name)) names.push(name);
+    if (names.length === PROFILER_CLIENT_BATCH_LIMITS.componentNames) break;
+  }
+  return names;
+}
+
+/** FNV-1a over the parts: stable across builds of the same names, and synchronous. */
+function fingerprintOf(parts: readonly string[]): string {
+  let hash = 0x811c9dc5;
+  for (const char of parts.join("\u0000")) {
+    hash = Math.imul(hash ^ (char.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function describeRenderError(
+  error: unknown,
+  componentStack: string | null | undefined,
+  routePattern: string | undefined,
+): ProfilerClientRenderError {
+  const isError = error instanceof Error;
+  const name = isError ? error.name : typeof error;
+  const errorType = NAME.test(name) ? name : "Error";
+  // The message is read only to find React's code in it; it is never kept.
+  const code = isError ? MINIFIED_REACT_ERROR.exec(error.message)?.[1] : undefined;
+  const reactErrorCode = code === undefined ? null : Number(code);
+  const names = componentNames(componentStack);
+  return {
+    errorType,
+    reactErrorCode,
+    componentNames: names,
+    routePattern: routePattern ?? null,
+    fingerprint: fingerprintOf([errorType, String(reactErrorCode ?? ""), ...names]),
+  };
+}
+
 function isRefusal(error: unknown): boolean {
   if (isProfilerUnsupported(error)) return true;
   const tag = (error as { _tag?: unknown } | null)?._tag;
@@ -155,6 +212,11 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   let stalls = { count: 0, totalMs: 0, maxMs: 0 };
   let interactions = { count: 0, maxMs: 0 };
   let lastInteractionId = 0;
+  /**
+   * Client-wide like the stalls, and kept across a restart: the error screen replaces the
+   * tree that ran the collector, and its own run sends what the old one caught.
+   */
+  let renderErrors: ProfilerClientRenderError[] = [];
   let running = false;
   let flushTimer: ReturnType<typeof setInterval> | undefined;
   let heartbeat: ReturnType<typeof setTimeout> | undefined;
@@ -362,7 +424,9 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     };
     stalls = { count: 0, totalMs: 0, maxMs: 0 };
     interactions = { count: 0, maxMs: 0 };
-    const quiet = clientWide.stalls.count === 0 && clientWide.interactions.count === 0;
+    const caught = renderErrors;
+    const quiet =
+      clientWide.stalls.count === 0 && clientWide.interactions.count === 0 && caught.length === 0;
     const heap = jsHeapBytes();
     const reports: Promise<void>[] = [];
     for (const [environmentId, window] of windows) {
@@ -407,9 +471,12 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
           interactions: clientWide.interactions,
           jsHeapBytes: heap,
           appVersion: APP_VERSION,
+          ...(caught.length === 0 ? {} : { renderErrors: caught }),
         }),
       );
     }
+    // Kept for a later batch while every environment still has one on the wire.
+    if (reports.length > 0 && caught.length > 0) renderErrors = [];
     if (windows.size === 0) stop();
     await Promise.all(reports);
   };
@@ -467,9 +534,20 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
       if (windows.size > 0) start();
       else stop();
     },
+    recordRenderError(error, componentStack, routePattern) {
+      if (windows.size === 0 || renderErrors.length >= PROFILER_CLIENT_BATCH_LIMITS.renderErrors) {
+        return;
+      }
+      try {
+        renderErrors.push(describeRenderError(error, componentStack, routePattern()));
+      } catch {
+        // A hostile error (a throwing getter) goes unrecorded; the error screen still shows.
+      }
+    },
     flush,
     dispose() {
       windows.clear();
+      renderErrors = [];
       stop();
     },
   };
