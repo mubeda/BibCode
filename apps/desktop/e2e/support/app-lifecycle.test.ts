@@ -1,10 +1,21 @@
-import { describe, expect, it, vi } from "vite-plus/test";
+// @effect-diagnostics nodeBuiltinImport:off - The hook-order test reads the WDIO configuration as text.
+// @effect-diagnostics globalTimers:off - The deadline tests time their steps with fake timers.
+import * as NodeFS from "node:fs";
+
+import { parseSync } from "vite-plus";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  DESKTOP_UI_RECOVERY_DEADLINE_MS,
+  DESKTOP_UI_TEST_TIMEOUT_MS,
+  type RecoveryDeadline,
   dispatchDesktopUiApplicationExit,
   isDeadDesktopUiWebviewError,
   isFinalDesktopUiSpec,
   recoverDeadDesktopUiWebview,
+  startRecoveryDeadline,
+  tolerateDeadDesktopUiWebview,
+  withinRecoveryDeadline,
 } from "./app-lifecycle.ts";
 
 describe("dispatchDesktopUiApplicationExit", () => {
@@ -80,7 +91,7 @@ describe("recoverDeadDesktopUiWebview", () => {
     probe: vi.fn(probe),
     isRunning: vi.fn(async () => running),
     stopApplication: vi.fn(async () => undefined),
-    relaunch: vi.fn(async () => undefined),
+    relaunch: vi.fn(async (_deadline: RecoveryDeadline) => undefined),
   });
 
   it("does nothing when the probe answers", async () => {
@@ -117,5 +128,198 @@ describe("recoverDeadDesktopUiWebview", () => {
     dead.relaunch.mockRejectedValue(new Error("never served WebDriver"));
     await expect(recoverDeadDesktopUiWebview(dead)).rejects.toThrow("never served WebDriver");
     expect(dead.relaunch).toHaveBeenCalledOnce();
+  });
+});
+
+describe("recovery deadline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const after = <T>(ms: number, value: T): Promise<T> =>
+    new Promise((resolve) => setTimeout(() => resolve(value), ms));
+  const dead = () => Promise.reject(new Error("invalid session id"));
+
+  it("a probe that never answers fails at the deadline and relaunches nothing", async () => {
+    const relaunch = vi.fn(async (_deadline: RecoveryDeadline) => undefined);
+    const recovery = recoverDeadDesktopUiWebview({
+      probe: () => new Promise(() => undefined),
+      isRunning: async () => true,
+      stopApplication: async () => undefined,
+      relaunch,
+    });
+    const outcome = expect(recovery).rejects.toThrow(
+      "The webview recovery ran out of its 100000 ms during probe.",
+    );
+    await vi.advanceTimersByTimeAsync(100_000);
+    await outcome;
+    expect(relaunch).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("the stop and the relaunch share one deadline", async () => {
+    let remainingAtRelaunch = -1;
+    const recovery = recoverDeadDesktopUiWebview({
+      probe: dead,
+      isRunning: async () => true,
+      stopApplication: () => after(60_000, undefined),
+      relaunch: (deadline) => {
+        remainingAtRelaunch = deadline.remainingMs();
+        return after(50_000, undefined);
+      },
+    });
+    const outcome = expect(recovery).rejects.toThrow(
+      "The webview recovery ran out of its 100000 ms during relaunch.",
+    );
+    await vi.advanceTimersByTimeAsync(100_000);
+    await outcome;
+    expect(remainingAtRelaunch).toBeGreaterThanOrEqual(39_000);
+    expect(remainingAtRelaunch).toBeLessThanOrEqual(40_000);
+    // The abandoned relaunch settles at 110 s.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a recovery whose steps fit completes", async () => {
+    const recovery = recoverDeadDesktopUiWebview({
+      probe: dead,
+      isRunning: async () => true,
+      stopApplication: () => after(10_000, undefined),
+      relaunch: () => after(30_000, undefined),
+    });
+    await vi.advanceTimersByTimeAsync(40_000);
+    await expect(recovery).resolves.toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an operation that settles first clears its timer", async () => {
+    await expect(
+      withinRecoveryDeadline(startRecoveryDeadline(1_000), "step", async () => 7),
+    ).resolves.toBe(7);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("the recovery deadline leaves room in the test allowance", () => {
+    expect(DESKTOP_UI_RECOVERY_DEADLINE_MS).toBeLessThanOrEqual(
+      DESKTOP_UI_TEST_TIMEOUT_MS - 20_000,
+    );
+  });
+
+  it("relaunches again when the webview dies a second time in the same worker", async () => {
+    const relaunch = vi.fn(async (_deadline: RecoveryDeadline) => undefined);
+    const deps = {
+      probe: dead,
+      isRunning: async () => false,
+      stopApplication: async () => undefined,
+      relaunch,
+    };
+    await expect(recoverDeadDesktopUiWebview(deps, startRecoveryDeadline())).resolves.toBe(true);
+    await expect(recoverDeadDesktopUiWebview(deps, startRecoveryDeadline())).resolves.toBe(true);
+    expect(relaunch).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("tolerateDeadDesktopUiWebview", () => {
+  it("failure evidence tolerates a dead webview", async () => {
+    await expect(
+      tolerateDeadDesktopUiWebview(() => Promise.reject(new Error("Unsupported result type"))),
+    ).resolves.toBeUndefined();
+    await expect(
+      tolerateDeadDesktopUiWebview(() => Promise.reject(new Error("boom"))),
+    ).rejects.toThrow("boom");
+    await expect(tolerateDeadDesktopUiWebview(async () => 7)).resolves.toBe(7);
+  });
+});
+
+describe("wdio.conf.ts hooks", () => {
+  // Read as text: importing the configuration throws without a packaged binary. The installed
+  // TypeScript 7 has no compiler API, so the oxc parser Vite+ ships reads it.
+  const text = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+  const parsed = parseSync("wdio.conf.ts", text, { lang: "ts" });
+
+  interface AstNode {
+    readonly type: string;
+    readonly start: number;
+    readonly end: number;
+    readonly [key: string]: unknown;
+  }
+  const isNode = (value: unknown): value is AstNode =>
+    typeof value === "object" && value !== null && typeof (value as AstNode).type === "string";
+  const children = (node: AstNode): AstNode[] =>
+    Object.values(node).flatMap((value) =>
+      Array.isArray(value) ? value.filter(isNode) : isNode(value) ? [value] : [],
+    );
+  // Visits every node with its ancestors, nearest last.
+  const walk = (node: AstNode, visit: (node: AstNode, ancestors: AstNode[]) => void) => {
+    const go = (current: AstNode, ancestors: AstNode[]): void => {
+      visit(current, ancestors);
+      for (const child of children(current)) go(child, [...ancestors, current]);
+    };
+    go(node, []);
+  };
+  const sourceOf = (node: AstNode): string => text.slice(node.start, node.end);
+
+  const hookBody = (name: string): AstNode => {
+    let body: AstNode | undefined;
+    walk(parsed.program as unknown as AstNode, (node, ancestors) => {
+      const declarator = ancestors.at(-2);
+      if (
+        node.type === "Property" &&
+        sourceOf(node.key as AstNode) === name &&
+        isNode(node.value) &&
+        node.value.type === "ArrowFunctionExpression" &&
+        isNode(node.value.body) &&
+        node.value.body.type === "BlockStatement" &&
+        declarator?.type === "VariableDeclarator" &&
+        sourceOf(declarator.id as AstNode) === "config"
+      ) {
+        body = node.value.body;
+      }
+    });
+    if (body === undefined) throw new Error(`The exported config has no ${name} hook.`);
+    return body;
+  };
+  const callee = (call: AstNode): string => sourceOf(call.callee as AstNode);
+
+  it("parses the configuration", () => {
+    expect(parsed.errors).toEqual([]);
+  });
+
+  it.each(["beforeTest", "before"])(
+    "the %s hook registers the probe before any browser command",
+    (name) => {
+      const first = (hookBody(name).body as AstNode[])[0];
+      expect(first?.type).toBe("ExpressionStatement");
+      expect(first === undefined ? undefined : sourceOf(first)).toBe(
+        "await ensureLiveDesktopUiWebview();",
+      );
+    },
+  );
+
+  it("the afterTest hook collects failure evidence through the tolerance", () => {
+    const evidence: { readonly call: string; readonly tolerated: boolean }[] = [];
+    walk(hookBody("afterTest"), (node, ancestors) => {
+      if (
+        node.type === "CallExpression" &&
+        ["browser.saveScreenshot", "browser.getPageSource"].includes(callee(node))
+      ) {
+        evidence.push({
+          call: callee(node),
+          tolerated: ancestors.some(
+            (ancestor) =>
+              ancestor.type === "CallExpression" &&
+              callee(ancestor) === "tolerateDeadDesktopUiWebview",
+          ),
+        });
+      }
+    });
+    expect(evidence.toSorted((a, b) => a.call.localeCompare(b.call))).toEqual([
+      { call: "browser.getPageSource", tolerated: true },
+      { call: "browser.saveScreenshot", tolerated: true },
+    ]);
   });
 });
