@@ -491,7 +491,7 @@ describe("UnsavedChangesCloseHost", () => {
         },
         getUpdateState: getUpdateState ? vi.fn(getUpdateState) : undefined,
       };
-      if (!getUpdateState) delete bridge.getUpdateState;
+      if (!getUpdateState) Reflect.deleteProperty(bridge, "getUpdateState");
       return bridge;
     }
 

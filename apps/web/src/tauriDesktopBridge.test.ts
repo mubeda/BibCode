@@ -246,8 +246,11 @@ function rejectCommand(
   error: unknown,
 ) {
   const original = harness.invoke.getMockImplementation()!;
-  harness.invoke.mockImplementation((name: string, args?: Record<string, unknown>) =>
-    name === command ? Promise.reject(error) : original(name, args),
+  harness.invoke.mockImplementation(
+    (name: string, args?: Record<string, unknown>) =>
+      (name === command ? Promise.reject(error) : original(name, args)) as ReturnType<
+        typeof original
+      >,
   );
 }
 
