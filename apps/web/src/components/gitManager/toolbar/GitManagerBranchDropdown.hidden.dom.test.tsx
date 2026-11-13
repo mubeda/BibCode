@@ -44,6 +44,35 @@ let root: Root | null;
 let uncaught: unknown[];
 let onSelectBranch = vi.fn();
 
+/** An exit transition the test finishes by hand; Base UI waits on its `finished` promise. */
+let exitTransition: { finish: () => void; animation: Animation } | null = null;
+const originalGetAnimations = Object.getOwnPropertyDescriptor(Element.prototype, "getAnimations");
+
+function startExitTransition() {
+  let finish = () => undefined as void;
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const animation = {
+    finished,
+    pending: false,
+    playState: "running",
+    effect: { getTiming: () => ({ duration: 150, iterations: 1 }) },
+  } as unknown as Animation;
+  exitTransition = { finish, animation };
+}
+
+function stubAnimations() {
+  Object.defineProperty(Element.prototype, "getAnimations", {
+    configurable: true,
+    value(this: Element) {
+      return exitTransition !== null && this.matches('[data-slot="popover-popup"]')
+        ? [exitTransition.animation]
+        : [];
+    },
+  });
+}
+
 function stubMeasurements() {
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
     if (this.closest("[hidden]") !== null) {
@@ -197,6 +226,8 @@ beforeEach(() => {
   observed.clear();
   uncaught = [];
   stubMeasurements();
+  exitTransition = null;
+  stubAnimations();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container, {
@@ -212,6 +243,11 @@ afterEach(async () => {
   document.body.replaceChildren();
   HTMLElement.prototype.getBoundingClientRect = originalRect;
   Error.stackTraceLimit = originalStackTraceLimit;
+  if (originalGetAnimations) {
+    Object.defineProperty(Element.prototype, "getAnimations", originalGetAnimations);
+  } else {
+    Reflect.deleteProperty(Element.prototype, "getAnimations");
+  }
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
 });
 
@@ -268,6 +304,30 @@ describe("GitManagerBranchDropdown with the real list and popover (#360)", () =>
     expect(onSelectBranch).toHaveBeenCalledTimes(1);
     expect(onSelectBranch.mock.calls[0]?.[0]).toMatchObject({ name: "branch-039-new" });
     expect(positioner().hidden).toBe(true);
+    expect(uncaught).toEqual([]);
+  });
+
+  it("keeps the rows through the closing transition and drops them once it has finished", async () => {
+    await renderDropdown(branches(4_000, 1), "branch-00001");
+    await toggle();
+    const rowsWhileOpen = renderedRows();
+    expect(rowsWhileOpen).toBeGreaterThan(0);
+
+    startExitTransition();
+    await toggle();
+    // The popup is still fading out: its rows stay so it does not empty first.
+    expect(positioner().hidden).toBe(false);
+    expect(renderedRows()).toBe(rowsWhileOpen);
+
+    await act(async () => exitTransition?.finish());
+    await settle();
+    expect(positioner().hidden).toBe(true);
+    expect(renderedRows()).toBe(0);
+
+    hiddenMeasurements = 0;
+    await renderDropdown(branches(4_000, 2), "branch-00002");
+    expect(renderedRows()).toBe(0);
+    expect(hiddenMeasurements).toBe(0);
     expect(uncaught).toEqual([]);
   });
 });
