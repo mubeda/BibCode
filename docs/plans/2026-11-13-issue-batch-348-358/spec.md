@@ -355,14 +355,14 @@ WHEN a code is generated on Windows and the firewall rule cannot be created for 
 
 - Given a desktop without administrator rights, When the person generates a code and approves the prompt, Then a code for the chosen address is shown.
 - Given the person declines, Then the server is verified local-only, with no rule added and no wide listener.
-- Given the default-route adapter's network profile is Public, Then the dialog warns that other devices may still be blocked.
+- On Windows the dialog notes that the rule covers networks marked Private or Domain, and that on a network marked Public other devices may still be blocked. The network's type is not detected.
 
 ### R54. The safety guarantees stay
 
 Rollback to local-only on any failed switch, fail-closed firewall cleanup, no automatic choice of a public address and the WSL-only exclusion SHALL stay as they are. A string rejection from the desktop bridge SHALL keep a sanitized reason instead of "Could not enable remote access."
 
-- Changed by D18, on Windows without administrator rights only: when turning sharing off finds the rule and Windows refuses to delete it for lack of permission, that is reported (`firewall-rule-left`) and tolerated. The listener SHALL still be verified local-only; any other failure to delete stays a failed safeguard. The prompt appears only for a person's own Generate or Retry, never for recovery or automatic narrowing. Only the firewall command runs with administrator rights, built from fixed text and the app's own program path.
-- An existing rule for the same program is kept on the next widening, with no prompt. A changed program path is replaced with one prompt.
+- Changed by D18, on Windows without administrator rights only: when turning sharing off finds the rule and Windows refuses to delete it for lack of permission, that is reported (`firewall-rule-left`) and tolerated. The listener SHALL still be verified local-only; any other failure to delete stays a failed safeguard. The prompt appears only when the person chooses Generate pairing offer, Retry or Resume legacy remote access in Share this host; automatic widening, narrowing and recovery never prompt. It comes before any restart, so a refusal changes nothing. Only Windows' own firewall command runs with administrator rights: it is started directly by its full path from the Windows system directory, with no script, and the program path is passed as one quoted argument.
+- An existing rule for the same program is kept on the next widening, with no prompt. A changed program path is replaced with two prompts, one to remove the old rule and one to add the new one.
 - A prompt that is declined, dismissed or left unanswered is a refusal. A late approval can leave a rule; the docs say how to remove it by hand.
 
 ## Verification
