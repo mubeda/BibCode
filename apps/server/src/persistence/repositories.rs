@@ -308,12 +308,12 @@ impl Repositories {
     }
 
     /// Records that BiBCode created a worktree at `worktree_path`. A creation at a path that
-    /// still has a record replaces it with a new `record_id`.
+    /// still has a record replaces it with a new `record_id`, which is returned.
     pub async fn record_worktree_creation(
         &self,
         project_cwd: &str,
         worktree_path: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
         self.database
             .call(move |connection| {
@@ -322,21 +322,25 @@ impl Repositories {
                      VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                     params![worktree_path, project_cwd],
                 )?;
-                Ok(())
+                Ok(connection.last_insert_rowid())
             })
             .await
     }
 
-    /// Deletes the creation record of a removed worktree, written under any project spelling.
-    pub async fn delete_worktree_creation_record(&self, worktree_path: &str) -> Result<()> {
+    /// The `record_id` of the current creation record at `worktree_path`, written under any
+    /// project spelling.
+    pub async fn worktree_creation_record_id(&self, worktree_path: &str) -> Result<Option<i64>> {
         let worktree_path = worktree_path.to_owned();
         self.database
             .call(move |connection| {
-                connection.execute(
-                    "DELETE FROM worktree_creation_records WHERE worktree_path = ?",
-                    [worktree_path],
-                )?;
-                Ok(())
+                connection
+                    .query_row(
+                        "SELECT record_id FROM worktree_creation_records WHERE worktree_path = ?",
+                        [worktree_path],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
             })
             .await
     }
@@ -5771,25 +5775,46 @@ mod worktree_creation_record_tests {
     }
 
     #[tokio::test]
-    async fn worktree_creation_record_delete_removes_only_that_path() {
+    async fn worktree_creation_record_id_names_the_current_record() {
         let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
-        for (project, path) in [
-            ("/repo/", "/worktrees/feature-a"),
-            ("/repo", "/worktrees/feature-b"),
-        ] {
+        let first = repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_eq!(
             repositories
-                .record_worktree_creation(project, path)
+                .worktree_creation_record_id("/worktrees/feature-a")
                 .await
-                .unwrap();
-        }
-        // The worktree path alone names the record, however the project root is spelled.
+                .unwrap(),
+            Some(first)
+        );
+        let second = repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_ne!(first, second, "a recreation is a new record");
+        assert_eq!(
+            repositories
+                .worktree_creation_record_id("/worktrees/feature-a")
+                .await
+                .unwrap(),
+            Some(second)
+        );
         repositories
-            .delete_worktree_creation_record("/worktrees/feature-a")
+            .reap_worktree_creation_record(first)
             .await
             .unwrap();
         assert_eq!(
             recorded_paths(&repositories).await,
-            ["/worktrees/feature-b"]
+            ["/worktrees/feature-a"],
+            "reaping the old id keeps the later record"
+        );
+        assert_eq!(
+            repositories
+                .worktree_creation_record_id("/worktrees/other")
+                .await
+                .unwrap(),
+            None
         );
     }
 

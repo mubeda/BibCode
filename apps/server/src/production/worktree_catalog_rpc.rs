@@ -1348,10 +1348,12 @@ async fn create_managed_worktree_locked(
             ))
         })?;
         let repositories = services.orchestration.repositories();
-        if let Err(error) = repositories
+        let record_id = match repositories
             .record_worktree_creation(&project.workspace_root, &created.worktree.path)
             .await
         {
+            Ok(record_id) => record_id,
+            Err(error) => {
             tracing::error!(%error, "managed worktree creation could not record the worktree");
             let rollback = repository
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
@@ -1368,7 +1370,8 @@ async fn create_managed_worktree_locked(
                 detail,
                 None,
             )));
-        }
+            }
+        };
         let terminal_cancellation = CancellationToken::new();
         let dispatch = services
             .orchestration
@@ -1404,9 +1407,7 @@ async fn create_managed_worktree_locked(
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
                 .await;
             if rollback.is_ok()
-                && let Err(error) = repositories
-                    .delete_worktree_creation_record(&created.worktree.path)
-                    .await
+                && let Err(error) = repositories.reap_worktree_creation_record(record_id).await
             {
                 tracing::warn!(%error, "a rolled-back worktree kept its creation record");
             }
@@ -1836,8 +1837,9 @@ struct ResolvedRemovalPlan {
 struct ResolvedRemovalThread {
     path: PathBuf,
     known_thread_ids: Vec<String>,
-    /// The worktree path as stored, the key of the worktree's creation record.
-    creation_record: String,
+    /// The worktree's creation record when resolved, deleted by id so that a worktree
+    /// recreated at the same path meanwhile keeps its own record.
+    creation_record_id: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2409,11 +2411,12 @@ async fn remove_worktree_owned(
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
                 // The folder is gone. A failed delete is reaped by the next worktree audit.
-                if let Err(error) = services
-                    .orchestration
-                    .repositories()
-                    .delete_worktree_creation_record(&resolved.creation_record)
-                    .await
+                if let Some(record_id) = resolved.creation_record_id
+                    && let Err(error) = services
+                        .orchestration
+                        .repositories()
+                        .reap_worktree_creation_record(record_id)
+                        .await
                 {
                     tracing::warn!(%error, "a removed worktree kept its creation record");
                 }
@@ -2549,10 +2552,17 @@ async fn resolve_removal_thread(
     known_thread_ids.push(thread_id.to_owned());
     known_thread_ids.sort();
     known_thread_ids.dedup();
+    // An unreadable record never refuses a removal; the next worktree audit reaps it.
+    let creation_record_id = repositories
+        .worktree_creation_record_id(&persisted_path.to_string_lossy())
+        .await
+        .inspect_err(|error| tracing::warn!(%error, "a removal could not read its creation record"))
+        .ok()
+        .flatten();
     Ok(ResolvedRemovalThread {
         path,
         known_thread_ids,
-        creation_record: persisted_path.to_string_lossy().into_owned(),
+        creation_record_id,
     })
 }
 
@@ -5515,6 +5525,65 @@ mod mutation_invalidation_tests {
             "the record ends with the worktree"
         );
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_keeps_a_record_created_while_it_drains() {
+        let mut fixture = RemovalFixture::new().await;
+        // Long enough that only a real hang, not a loaded machine, refuses the removal.
+        fixture.handler.services.removal_admission_timeout = Duration::from_secs(30);
+        let entered = Arc::new(Semaphore::new(0));
+        fixture.handler.services.removal_drain_entered = Some(Arc::clone(&entered));
+        let repositories = fixture.handler.engine.repositories();
+        let linked = fixture.linked.to_string_lossy().into_owned();
+        repositories
+            .record_worktree_creation(&fixture.handler.main.to_string_lossy(), &linked)
+            .await
+            .expect("first creation record");
+        let payload = fixture.payload().await;
+        let registry = fixture.handler.catalog.availability_registry();
+        let admission = registry
+            .acquire_admission("removed-thread", [fixture.linked.as_path()])
+            .await
+            .expect("held admission");
+        let services = fixture.handler.services.clone();
+        let removal = tokio::spawn(async move {
+            remove_worktree(
+                &services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+            .await
+            .expect("removal reaches the admission drain")
+            .expect("drain signal")
+            .forget();
+        // A worktree recreated at the same path after the removal resolved its record.
+        let recreated = repositories
+            .record_worktree_creation(&fixture.handler.main.to_string_lossy(), &linked)
+            .await
+            .expect("second creation record");
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(30), removal)
+            .await
+            .expect("removal ends")
+            .expect("removal joins")
+            .expect("removal succeeds");
+        let records = repositories
+            .list_worktree_creation_records()
+            .await
+            .expect("creation records");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.record_id)
+                .collect::<Vec<_>>(),
+            [recreated],
+            "the recreated worktree keeps its record: {records:?}"
+        );
+        fixture.handler.shutdown().await;
     }
 
     #[tokio::test]
