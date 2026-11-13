@@ -5193,9 +5193,39 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(diagnosticSpy).toHaveBeenCalledOnce();
     expect(diagnosticSpy).toHaveBeenCalledWith(
       "[terminal] WebGL renderer unavailable; using the standard renderer.",
+      { cause: "context lost", error: undefined },
     );
+    expect(JSON.stringify(diagnosticSpy.mock.calls)).not.toContain("sensitive");
     expect(webglState.instances).toHaveLength(1);
     expect(view.fakeTerminal).not.toBeNull();
+  });
+
+  it("tries WebGL again in a new terminal after a context loss in the same viewport", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const view = await mountViewport({ visible: true, webglEnabled: true });
+    await view.settleWebgl();
+    view.webglAddon!.triggerContextLoss();
+    const terminals = xtermState.terminals.length;
+
+    await view.setVisible(false);
+    await view.setVisible(true);
+    expect(xtermState.terminals).toHaveLength(terminals + 1);
+    await view.settleWebgl();
+
+    expect(webglState.instances).toHaveLength(2);
+  });
+
+  it("names the WebGL fallback cause without raw error text", async () => {
+    const diagnosticSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const view = await mountViewport({ visible: true, webglEnabled: true, deferWebglImport: true });
+    await view.rejectWebglImport();
+
+    expect(diagnosticSpy).toHaveBeenCalledOnce();
+    expect(diagnosticSpy).toHaveBeenCalledWith(
+      "[terminal] WebGL renderer unavailable; using the standard renderer.",
+      { cause: "import failed", error: "Error" },
+    );
+    expect(JSON.stringify(diagnosticSpy.mock.calls)).not.toContain("sensitive");
   });
 
   it("contains synchronous context loss even when late listener cleanup throws", async () => {
@@ -5310,28 +5340,32 @@ describe("TerminalViewport mounted lifecycle", () => {
       () => {
         webglState.constructorShouldThrow = true;
       },
+      "addon creation failed",
     ],
     [
       "xterm load",
       () => {
         xtermState.loadWebglShouldThrow = true;
       },
+      "addon load failed",
     ],
     [
       "activation",
       () => {
         webglState.activateShouldThrow = true;
       },
+      "addon load failed",
     ],
     [
       "context-listener registration",
       () => {
         webglState.listenerShouldThrow = true;
       },
+      "addon load failed",
     ],
   ])(
     "falls back after a %s failure, diagnoses without raw errors, and does not retry",
-    async (_failure, configureFailure) => {
+    async (_failure, configureFailure, cause) => {
       const diagnosticSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
       configureFailure();
       const view = await mountViewport({ visible: true, webglEnabled: true });
@@ -5349,8 +5383,10 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(diagnosticSpy).toHaveBeenCalledOnce();
       expect(diagnosticSpy).toHaveBeenCalledWith(
         "[terminal] WebGL renderer unavailable; using the standard renderer.",
+        { cause, error: "Error" },
       );
       expect(diagnosticSpy.mock.calls.flat().join(" ")).not.toContain("sensitive");
+      expect(JSON.stringify(diagnosticSpy.mock.calls)).not.toContain("sensitive");
     },
   );
 
@@ -5373,6 +5409,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(webglState.instances).toHaveLength(0);
     expect(diagnosticSpy).toHaveBeenCalledOnce();
     expect(diagnosticSpy.mock.calls.flat().join(" ")).not.toContain("sensitive");
+    expect(JSON.stringify(diagnosticSpy.mock.calls)).not.toContain("sensitive");
   });
 
   it("allows a fresh viewport component to retry after a prior component failed", async () => {

@@ -157,6 +157,11 @@ const terminalInputBindings = new Map<string, TerminalInputBinding>();
 // releases it alongside the retained input resources below.
 const dismissedTerminalSizes = new Map<string, TerminalSize>();
 const TERMINAL_WRITE_INTERRUPTED = Symbol("terminal-write-interrupted");
+type WebglFailureStage =
+  | "context lost"
+  | "import failed"
+  | "addon creation failed"
+  | "addon load failed";
 // A developer turns the size record on and reads it from the console (#348).
 if (import.meta.env.DEV && typeof window !== "undefined") {
   (window as { __bibcodeTerminalSizeDiagnostics?: unknown }).__bibcodeTerminalSizeDiagnostics = {
@@ -1151,10 +1156,14 @@ export function TerminalViewport({
     () => ({ cwd, worktreePath, command, runtimeEnvKey }),
     [cwd, worktreePath, command, runtimeEnvKey],
   );
-  const recordWebglDiagnosticOnce = useCallback(() => {
+  // The stage and the error's type name only: raw error text can hold paths (#348).
+  const recordWebglDiagnosticOnce = useCallback((stage: WebglFailureStage, error?: unknown) => {
     if (webglDiagnosticRecordedRef.current) return;
     webglDiagnosticRecordedRef.current = true;
-    console.warn("[terminal] WebGL renderer unavailable; using the standard renderer.");
+    console.warn("[terminal] WebGL renderer unavailable; using the standard renderer.", {
+      cause: stage,
+      error: error instanceof Error ? error.name : error === undefined ? undefined : typeof error,
+    });
   }, []);
   const handleSessionExited = useEffectEvent(() => {
     onSessionExited();
@@ -1707,6 +1716,9 @@ export function TerminalViewport({
     fitAddonRef.current = fitAddon;
     rendererEpochRef.current += 1;
     setRendererEpoch(rendererEpochRef.current);
+    // A new terminal tries WebGL again, and reports its own failure (#348).
+    webglFailedRef.current = false;
+    webglDiagnosticRecordedRef.current = false;
     const rendererOwner = {};
     const { binding: inputBinding, scheduler: inputScheduler } =
       acquireTerminalInputBinding(terminalTargetKey);
@@ -2708,13 +2720,16 @@ export function TerminalViewport({
     const isCurrent = () =>
       !cleanedUp && webglGenerationRef.current === generation && terminalRef.current === terminal;
 
+    let stage: WebglFailureStage = "import failed";
     void (async () => {
       try {
         const { WebglAddon } = await loadTerminalWebglAddon();
         if (!isCurrent()) return;
 
+        stage = "addon creation failed";
         const addon = new WebglAddon();
         lifecycle = createWebglLifecycle(addon, terminal);
+        stage = "addon load failed";
         terminal.loadAddon(addon);
         if (!isCurrent()) {
           lifecycle.dispose();
@@ -2743,7 +2758,7 @@ export function TerminalViewport({
           if (webglLifecycleRef.current === activeLifecycle) {
             webglLifecycleRef.current = null;
           }
-          recordWebglDiagnosticOnce();
+          recordWebglDiagnosticOnce("context lost");
         });
         lifecycle.setContextLossDisposable(contextLossDisposable);
         if (!isCurrent() || lifecycle.disposed) {
@@ -2752,7 +2767,7 @@ export function TerminalViewport({
         }
 
         webglLifecycleRef.current = lifecycle;
-      } catch {
+      } catch (error) {
         lifecycle?.dispose();
         if (!isCurrent()) return;
 
@@ -2760,7 +2775,7 @@ export function TerminalViewport({
         if (webglLifecycleRef.current === lifecycle) {
           webglLifecycleRef.current = null;
         }
-        recordWebglDiagnosticOnce();
+        recordWebglDiagnosticOnce(stage, error);
       }
     })();
 
