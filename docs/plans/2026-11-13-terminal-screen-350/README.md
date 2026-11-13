@@ -27,4 +27,4 @@ Findings 11, 12 and 13 were about the other issues' spec and are fixed there (`.
 2. Revise the design's protocol sections (client refetch, startup queries, generation-fenced catch-up, budgets) and get a second Codex review plus the advisor's.
 3. Only then write `spec.md` and `plan.md` here and implement the wire and client phases.
 
-If the harness is still red after two fix rounds, the question goes to the user: keep going, or choose a different base for the emulator.
+The user decided on 2026-11-13 that the pull request waits for this work and closes #350 with the other nine issues. If the harness is still red after two fix rounds, the question goes to the user: keep going, or choose a different base for the emulator.

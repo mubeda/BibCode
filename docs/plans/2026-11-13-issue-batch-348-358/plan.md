@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 be2ccd2fab22)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 6ee666bd1646)
 Repository: this repository
 Base: main
 
@@ -171,7 +171,7 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 
 ## Decisions
 
-- P1. #350 leaves this plan (spec D2). Alternatives: keep its seven phases here (blocks nine issues on a design that failed review). Decided by: agent's call, to confirm with the user before the push.
+- P1. #350 is planned and built in its own folder, in parallel with this plan, and Task 9.4 (the push and the pull request) waits for it: the pull request closes all ten issues. Alternatives: open the pull request for nine issues first (rejected by the user). Decided by: user, 2026-11-13.
 - P2. One plan folder for nine issues, one phase per file-ownership area rather than per issue, so that seven lanes can run at once without sharing a file. Alternatives: one phase per issue (three issues share `ThreadTerminalPanel.tsx`). Decided by: agent's call.
 - P3. The baseline for Task 5.1 was taken during planning and is in the log: the harness sets a 1000x720 viewport itself and `chat-reasoning-rows` passes on Linux, so the live trace comes from Chromium at device pixel ratio 2 or from the Windows VM (Task 8.3 step 1, which runs as soon as Task 5.1 asks, ahead of the rest of Phase 8). Decided by: agent's call.
 - P4. Skills were named from the session's installed list by the planner (`tdd`, `vercel-react-best-practices`, `better-interface`, `better-writing`, `mstack-diagnose`, `bibcode-profiler`); `mstack-find-skills` was not run for a wider search. A task runs without a specialist where its Skills line says "none". Decided by: agent's call.
