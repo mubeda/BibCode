@@ -89,6 +89,26 @@ export function resolveShareAddressOptions(input: {
   const seen = new Set(
     canOfferAutomaticLan && automaticEndpoint !== null ? [automaticEndpoint] : [],
   );
+  // Widening needs the private default route Automatic needs, so these share its gate.
+  if (nativeManaged && input.exposureState?.mode === "local-only" && canOfferAutomaticLan) {
+    for (const endpoint of offHostEndpoints) {
+      if (
+        endpoint.status !== "unavailable" ||
+        endpoint.unavailableReason !== "local-only" ||
+        (endpoint.reachability !== "lan" && endpoint.reachability !== "private-network") ||
+        seen.has(endpoint.httpBaseUrl)
+      ) {
+        continue;
+      }
+      seen.add(endpoint.httpBaseUrl);
+      options.push({
+        id: endpoint.id,
+        label: `${new URL(endpoint.httpBaseUrl).hostname} (enables remote access)`,
+        httpBaseUrl: endpoint.httpBaseUrl,
+        description: "BiBCode will enable remote access, then use this address.",
+      });
+    }
+  }
   for (const endpoint of selectableOffHostEndpoints) {
     if (seen.has(endpoint.httpBaseUrl)) {
       continue;

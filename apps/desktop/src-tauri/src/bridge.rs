@@ -664,7 +664,7 @@ fn advertised_endpoints_for_config(
                 address.interface_name
             )
         };
-        endpoints.push(advertised_endpoint(
+        let mut endpoint = advertised_endpoint(
             format!("desktop-network:{socket}"),
             classification.label_kind.as_str(),
             format!("http://{socket}"),
@@ -672,7 +672,13 @@ fn advertised_endpoints_for_config(
             network_status,
             Some(is_default),
             &description,
-        )?);
+        )?;
+        if network_status == "unavailable"
+            && classification.reachability != AdvertisedAddressReachability::Public
+        {
+            endpoint["unavailableReason"] = json!("local-only");
+        }
+        endpoints.push(endpoint);
     }
 
     Ok(endpoints)
@@ -700,14 +706,18 @@ fn tailscale_endpoints_for_status(
         } else {
             "unavailable"
         };
-        endpoints.push(tailscale_advertised_endpoint(
+        let mut endpoint = tailscale_advertised_endpoint(
             format!("tailscale-ip:{http_base_url}"),
             "Tailscale IP",
             http_base_url,
             status,
             "mixed-content-blocked",
             "Reachable from devices on the same Tailnet.",
-        )?);
+        )?;
+        if status == "unavailable" {
+            endpoint["unavailableReason"] = json!("local-only");
+        }
+        endpoints.push(endpoint);
     }
 
     let Some(magic_dns_name) = &status.magic_dns_name else {
@@ -742,17 +752,29 @@ fn tailscale_endpoints_for_status(
 async fn tailscale_advertised_endpoints_for_config(
     config: &BackendRunConfig,
 ) -> Result<Vec<Value>, String> {
-    if config.server_exposure_mode != "network-accessible" && !config.tailscale_serve_enabled {
-        return Ok(Vec::new());
-    }
+    tailscale_advertised_endpoints_with(config, read_tailscale_status).await
+}
 
-    let status = match read_tailscale_status().await {
+async fn tailscale_advertised_endpoints_with<F, Fut>(
+    config: &BackendRunConfig,
+    read_status: F,
+) -> Result<Vec<Value>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<TailscaleStatus, String>>,
+{
+    // `tailscale status --json` only reads, so local-only hosts can list their tailnet address.
+    let mut status = match read_status().await {
         Ok(status) => status,
         Err(error) => {
             tracing::debug!("Tailscale advertised endpoint discovery skipped: {error}");
             return Ok(Vec::new());
         }
     };
+    if config.server_exposure_mode != "network-accessible" && !config.tailscale_serve_enabled {
+        // Keep the Tailscale HTTPS row hidden as before; only tailnet IPs feed the share list.
+        status.magic_dns_name = None;
+    }
     let magic_dns_reachable = if config.tailscale_serve_enabled {
         match status.magic_dns_name.as_ref() {
             Some(magic_dns_name) => {
@@ -3401,11 +3423,35 @@ mod tests {
         config.server_exposure_mode = "local-only".to_string();
         config.tailscale_serve_enabled = false;
         assert!(
-            tailscale_advertised_endpoints_for_config(&config)
-                .await
-                .expect("disabled Tailscale discovery should succeed")
-                .is_empty()
+            tailscale_advertised_endpoints_with(&config, || async {
+                Err("tailscale is not installed".to_string())
+            })
+            .await
+            .expect("missing Tailscale discovery should succeed")
+            .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoints_read_tailscale_addresses_while_local_only() {
+        let mut config = test_run_config();
+        config.server_exposure_mode = "local-only".to_string();
+        config.tailscale_serve_enabled = false;
+
+        let endpoints = tailscale_advertised_endpoints_with(&config, || async {
+            Ok(TailscaleStatus {
+                magic_dns_name: Some("desktop.tail.example.test".to_string()),
+                tailnet_ipv4_addresses: vec!["100.64.0.7".to_string()],
+            })
+        })
+        .await
+        .expect("local-only Tailscale discovery should succeed");
+
+        // Serve is off, so the HTTPS row stays hidden as before; only the tailnet IP is listed.
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["httpBaseUrl"], "http://100.64.0.7:13773/");
+        assert_eq!(endpoints[0]["status"], "unavailable");
+        assert_eq!(endpoints[0]["unavailableReason"], "local-only");
     }
 
     #[test]
@@ -3791,6 +3837,54 @@ mod tests {
         assert_eq!(endpoints[1]["reachability"], "public");
         assert_eq!(endpoints[1]["status"], "unavailable");
         assert_eq!(endpoints[1]["isDefault"], false);
+    }
+
+    #[test]
+    fn advertised_endpoints_say_local_only_is_why_private_addresses_are_unavailable() {
+        let config = test_run_config();
+        let addresses = [
+            NetworkAddress {
+                interface_name: "Ethernet".to_string(),
+                ip: "192.168.0.10".parse().expect("LAN fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
+                interface_name: "Overlay".to_string(),
+                ip: "10.20.0.5".parse().expect("overlay fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Tailnet".to_string(),
+                ip: "100.64.0.7".parse().expect("CGNAT fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Internet".to_string(),
+                ip: "8.8.8.8".parse().expect("public fixture"),
+                is_default_route: false,
+            },
+        ];
+
+        let local = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoints should build");
+        assert_eq!(local.len(), 5);
+        assert!(local[0].get("unavailableReason").is_none());
+        for endpoint in &local[1..4] {
+            assert_eq!(endpoint["status"], "unavailable");
+            assert_eq!(endpoint["unavailableReason"], "local-only");
+        }
+        // Native sharing never uses a public address, so widening is not why it is unavailable.
+        assert_eq!(local[4]["reachability"], "public");
+        assert!(local[4].get("unavailableReason").is_none());
+
+        let mut wide_config = config;
+        wide_config.server_exposure_mode = "network-accessible".to_string();
+        let wide = advertised_endpoints_for_config(&wide_config, &addresses)
+            .expect("network-accessible endpoints should build");
+        assert!(
+            wide.iter()
+                .all(|endpoint| endpoint.get("unavailableReason").is_none())
+        );
     }
 
     #[test]

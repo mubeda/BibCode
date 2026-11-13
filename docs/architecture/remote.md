@@ -96,10 +96,20 @@ deduplicates by address, and ranks a usable private default-route address before
 CGNAT/Tailscale and other private addresses. The native bridge publishes usable
 interface observations even while its listener is loopback-only; those
 off-host observations report `status: unavailable` until the native listener is
-wide. This lets the renderer distinguish a private default route from a
-public-only or non-default topology before it requests privileged mutation.
-Native-managed automatic sharing accepts only a private or CGNAT default-route
-observation. Public interface observations are never actionable in a
+wide. A private or CGNAT observation, including a Tailscale IPv4 address, also
+carries `unavailableReason: local-only`, meaning that enabling native remote
+access would make it reachable. The bridge reads Tailscale status (the
+read-only `tailscale status --json`, under its existing timeout) while
+local-only too, but leaves out the Tailscale HTTPS row unless Serve is enabled
+or the listener is wide. This lets the renderer distinguish a private default
+route from a public-only or non-default topology before it requests privileged
+mutation. Native-managed automatic sharing accepts only a private or CGNAT
+default-route observation. While a native-managed host is local-only and has
+that default route, the Share this host Address list offers "Automatic (LAN)"
+and each address marked `local-only`, labelled "(enables remote access)";
+choosing one widens exposure first, exactly as Automatic does, and the code
+uses that address, which stays valid because the widening rebind keeps the
+port. An address unavailable for any other reason is not offered. Public interface observations are never actionable in a
 native-managed topology, including after an unrelated transition has made the
 listener wide. A public-only host must use a custom address backed by an
 externally managed `bibcode serve` listener or reverse proxy rather than asking
