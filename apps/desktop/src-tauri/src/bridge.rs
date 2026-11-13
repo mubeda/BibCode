@@ -1349,6 +1349,8 @@ pub fn desktop_bridge_get_server_exposure_state(
 struct DesktopExposureOperations<'a> {
     app: &'a AppHandle<DesktopRuntime>,
     backend: &'a BackendSupervisor,
+    /// Only a widen the person started in Share this host may raise the Windows prompt.
+    allow_elevation_prompt: bool,
 }
 
 impl ExposureOperations for DesktopExposureOperations<'_> {
@@ -1385,7 +1387,10 @@ impl ExposureOperations for DesktopExposureOperations<'_> {
     }
 
     fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(crate::firewall::sync_remote_access_rule(enabled))
+        Box::pin(crate::firewall::sync_remote_access_rule(
+            enabled,
+            enabled && self.allow_elevation_prompt,
+        ))
     }
 
     fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
@@ -1441,10 +1446,12 @@ pub async fn desktop_bridge_apply_server_exposure(
     backend: State<'_, BackendSupervisor>,
     coordinator: State<'_, ServerExposureCoordinator>,
     desired: String,
+    allow_elevation_prompt: Option<bool>,
 ) -> Result<Value, String> {
     let operations = DesktopExposureOperations {
         app: &app,
         backend: backend.inner(),
+        allow_elevation_prompt: allow_elevation_prompt == Some(true),
     };
     let transition = apply_exposure(coordinator.inner(), &operations, &desired).await?;
     let settings = read_desktop_settings(&app)?;
@@ -1546,6 +1553,7 @@ pub async fn desktop_bridge_set_wsl_only(
             let operations = DesktopExposureOperations {
                 app: &app,
                 backend: backend.inner(),
+                allow_elevation_prompt: false,
             };
             transition_wsl_only(&operations, enabled).await?;
             let settings = read_desktop_settings(&app)?;

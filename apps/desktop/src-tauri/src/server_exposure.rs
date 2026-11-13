@@ -173,8 +173,15 @@ async fn recover_local_steps(operations: &impl ExposureOperations) -> LocalRecov
             None
         }
     };
-    if let Err(error) = operations.sync_firewall(false).await {
-        errors.push(format!("close remote-access firewall rule: {error}"));
+    match operations.sync_firewall(false).await {
+        Ok(()) => {}
+        // Windows keeps a rule an unelevated desktop cannot delete; the program-scoped rule
+        // admits nothing once the listener below is verified loopback-only.
+        Err(error) if error == crate::firewall::FIREWALL_RULE_LEFT_TOKEN => tracing::warn!(
+            reason = %error,
+            "remote-access firewall rule left in place without administrator permission"
+        ),
+        Err(error) => errors.push(format!("close remote-access firewall rule: {error}")),
     }
     let current_config = operations.current_config().or(restarted);
     let verified_local = is_verified_local(current_config.as_ref());
@@ -680,6 +687,57 @@ mod tests {
                 "verify:local-only",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_firewall_rule_windows_refuses_to_delete_is_tolerated_once_local_is_verified() {
+        let coordinator = ServerExposureCoordinator::default();
+        let refused = FakeExposureOperations::with_persisted_mode("local-only");
+        {
+            let mut state = refused.state.lock().expect("fake state");
+            state
+                .firewall_results
+                .push_back(Err("firewall-elevation-required".to_owned()));
+            state
+                .firewall_results
+                .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        }
+        let error = apply_exposure(&coordinator, &refused, "network-accessible")
+            .await
+            .expect_err("a refused widen recovers local");
+        assert_eq!(
+            error,
+            "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. Restored local-only safeguards."
+        );
+
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        narrowing
+            .state
+            .lock()
+            .expect("fake state")
+            .firewall_results
+            .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        apply_exposure(&coordinator, &narrowing, "local-only")
+            .await
+            .expect("a rule left in place does not fail a verified local-only narrowing");
+
+        // The listener check stays a hard requirement even then.
+        let unverified = FakeExposureOperations::with_persisted_mode("network-accessible");
+        unverified.set_current_config(Some(config_for_mode("network-accessible")));
+        {
+            let mut state = unverified.state.lock().expect("fake state");
+            state
+                .restart_results
+                .push_back(Ok(Some(config_for_mode("network-accessible"))));
+            state
+                .firewall_results
+                .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        }
+        let error = apply_exposure(&coordinator, &unverified, "local-only")
+            .await
+            .expect_err("an unverified listener still fails");
+        assert!(error.contains("not verified local-only"), "{error}");
+        assert!(!error.contains("firewall-rule-left"), "{error}");
     }
 
     #[tokio::test]
