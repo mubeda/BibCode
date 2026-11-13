@@ -246,6 +246,13 @@ export function withinRecoveryDeadline<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    // A zero-delay timer loses to the operation's microtasks, so a spent deadline starts nothing.
+    if (deadline.remainingMs() <= 0) {
+      reject(
+        new Error(`The webview recovery ran out of its ${deadline.budgetMs} ms during ${step}.`),
+      );
+      return;
+    }
     const timer = setTimeout(
       () =>
         reject(
@@ -300,6 +307,11 @@ export async function relaunchDesktopUiApplication(
   });
   const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
   if (!artifactDirectory) throw new Error("BIBCODE_E2E_ARTIFACT_DIR is required.");
+  if (deadline.remainingMs() <= 0) {
+    throw new Error(
+      `The webview recovery ran out of its ${deadline.budgetMs} ms before the relaunch started.`,
+    );
+  }
   relaunchCount += 1;
   // A file, not a pipe: an unread pipe would stall the app's debug logging.
   const log = NodeFS.openSync(

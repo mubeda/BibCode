@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - The hook-order test reads the WDIO configuration as text.
 // @effect-diagnostics globalTimers:off - The deadline tests time their steps with fake timers.
+// @effect-diagnostics globalDate:off - A deadline test moves the faked clock past its budget.
 import * as NodeFS from "node:fs";
 
 import { parseSync } from "vite-plus";
@@ -310,6 +311,33 @@ describe("prepareRelaunchedDesktopUiSession", () => {
     );
     await vi.advanceTimersByTimeAsync(31_000);
     await outcome;
+    expect(steps.restoreMocks).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a deadline that has already run out admits no step", async () => {
+    const steps = session([]);
+    await expect(
+      prepareRelaunchedDesktopUiSession(steps, startRecoveryDeadline(0)),
+    ).rejects.toThrow("The webview recovery ran out of its 0 ms during reloadSession.");
+    expect(steps.reloadSession).not.toHaveBeenCalled();
+    expect(steps.probe).not.toHaveBeenCalled();
+    expect(steps.restoreMocks).not.toHaveBeenCalled();
+    expect(steps.waitForPlugin).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a deadline that runs out between two steps starts no later step", async () => {
+    const steps = session([]);
+    // The step settles at once, but the clock has passed the deadline by then.
+    steps.reloadSession.mockImplementation(async () => {
+      vi.setSystemTime(Date.now() + 2_000);
+    });
+    await expect(
+      prepareRelaunchedDesktopUiSession(steps, startRecoveryDeadline(1_000)),
+    ).rejects.toThrow("The webview recovery ran out of its 1000 ms during webview answer.");
+    expect(steps.reloadSession).toHaveBeenCalledOnce();
+    expect(steps.probe).not.toHaveBeenCalled();
     expect(steps.restoreMocks).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
