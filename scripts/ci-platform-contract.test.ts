@@ -336,6 +336,31 @@ describe("cross-platform CI contract", () => {
     }
   });
 
+  it("runs the macOS server tests off the native desktop job, without saving a cache", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const job = requireJob(workflow, "server_tests_macos");
+    expect(job.if).toBe(FULL_CI);
+    const steps = job.steps ?? [];
+    const runs = steps.map((step) => String(step.run ?? "")).join("\n");
+    for (const command of [
+      "cargo test -p bibcode-server --test git_system_config",
+      "-- background_status_ git_stop_ index_lock_cleanup_",
+      "-- host_metrics::",
+      "--test host_metrics_exit",
+      "host_metrics_start_with_the_runtime_and_stop_in_quiesce",
+    ]) {
+      expect(runs, command).toContain(command);
+    }
+    const cache = steps.find((step) => String(step.uses ?? "").startsWith("Swatinem/rust-cache@"));
+    expect(cache?.with?.["save-if"]).toBe("false");
+    // The server's test build is what pushed the macOS rows past their budget.
+    const native = (requireJob(workflow, "native_desktop_macos").steps ?? [])
+      .filter((step) => step.if === "matrix.platform == 'mac'")
+      .map((step) => String(step.run ?? ""))
+      .join("\n");
+    expect(native).not.toContain("cargo test -p bibcode-server");
+  });
+
   it("builds native desktop bundles on every supported runner and architecture", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
     const matrix = nativeDesktopRows(workflow);
