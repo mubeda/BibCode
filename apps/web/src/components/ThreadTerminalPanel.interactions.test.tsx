@@ -3851,6 +3851,9 @@ describe("TerminalViewport mounted lifecycle", () => {
       try {
         await act(async () => fonts.dispatchEvent(new Event("loadingdone")));
         await view.flushFrame();
+        // New cell metrics wait for the mount to settle, as a box change does (R16).
+        elapseMountSettle();
+        await act(async () => vi.advanceTimersByTime(TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS));
         if (mode === "legacy") {
           expect(fit).toHaveBeenCalledOnce();
           expect(terminal.rows).toBe(23);
@@ -3894,7 +3897,9 @@ describe("TerminalViewport mounted lifecycle", () => {
         }
         await act(async () => vi.advanceTimersByTime(50));
         expect(terminal.clearTextureAtlas).toHaveBeenCalledOnce();
-        expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+        // The repaint runs at 50 ms, on the grid before the settled claim; xterm redraws a resize.
+        expect(terminal.refresh).toHaveBeenCalledOnce();
+        expect(terminal.refresh).toHaveBeenCalledWith(0, 23);
       } finally {
         vi.useRealTimers();
       }

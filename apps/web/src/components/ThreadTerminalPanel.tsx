@@ -1024,6 +1024,8 @@ export function TerminalViewport({
       repaint: TerminalSizeDiagnosticRecord["repaint"],
     ): void;
     fit(): void;
+    /** The cell was measured again: automatic claims wait for it to settle. */
+    cellChanged(): void;
     render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
@@ -2085,6 +2087,12 @@ export function TerminalViewport({
       ) {
         diagnose(trigger, fittedDimensions, null, repaint);
       },
+      cellChanged() {
+        // New cell metrics change the fit as a box change does, so the claim waits as well:
+        // a dock opening next must not follow a claim it reverts (#348).
+        mountSizeChangedAt = performance.now();
+        mountUnsettledSince ??= mountSizeChangedAt;
+      },
     };
     rendererRef.current = renderer;
 
@@ -2981,7 +2989,7 @@ export function TerminalViewport({
     const fonts = typeof document.fonts?.addEventListener === "function" ? document.fonts : null;
     const handleFontLoadingDone = () => {
       const terminal = terminalRef.current;
-      if (terminal) remeasureTerminalCharSize(terminal);
+      if (terminal && remeasureTerminalCharSize(terminal)) rendererRef.current?.cellChanged();
       scheduleResize();
     };
     fonts?.addEventListener("loadingdone", handleFontLoadingDone);
