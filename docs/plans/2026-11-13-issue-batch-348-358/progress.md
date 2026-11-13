@@ -1,7 +1,7 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 07f82ba4371c)
+Spec: spec.md (sha256 2298fd3a827c)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: inline
@@ -63,6 +63,7 @@ Branch: claude/open-issues-pr-dc3c33
 | 11.1 | List usable private addresses while local-only                                                          | 11    | In progress | lane 11     |                                  |
 | 11.2 | Find out why generating a code fails on Windows                                                         | 11    | In progress | coordinator |                                  |
 | 11.3 | On Windows, obtain the firewall rule with an elevation prompt, or say exactly what is missing           | 11    | Open        |             |                                  |
+| 11.4 | BiBCode no longer manages Tailscale Serve                                                               | 11    | Open        | lane 11     | queued behind the review fixes   |
 
 ## Log
 
@@ -108,3 +109,5 @@ Branch: claude/open-issues-pr-dc3c33
 - 2026-11-13 13:50 Codex review of the event fixes and #361 (`gpt-6-astra`, effort high): eight findings, all accepted after a triage with the advisor. Two block the push: the program path was interpolated into an elevated PowerShell script (a curly quote in a folder name could inject a command), and the programs were started by name. Others: any failed unelevated delete was tolerated; a chosen address kept the pre-restart port; the 120-second prompt held the exposure lock; the Public-network warning was missing; pacing discarded regular measurements; a pending record could be dropped without acceptance.
 - 2026-11-13 13:57 Event regressions fixed (lane 10b, 965e729c9): measurements are kept while pacing holds a batch back; a pending record is settled only on `accepted: true`, and dropped on purpose only on the server's "profiler off" answer. Of the six answer cases only "no answer" was wrong before.
 - 2026-11-13 14:11 #361 review fixes (lane 11, 7e30d15b2), integrated: elevation now calls `ShellExecuteExW` with the `runas` verb on `netsh.exe` directly (no PowerShell, no script), every program is started from the `GetSystemDirectoryW` directory, arguments follow the Windows command-line rules and a double quote or NUL is refused; the prompt runs before the exposure lock and before any restart; a left rule is tolerated only when the delete ran and exited, the process is not elevated and a read-back still lists the rule; the chosen host keeps its host and takes the port of the completed widen (the wide listener binds every address); a Windows note about networks marked Public. Evidence: `cargo test -p bibcode-desktop` 543 passed, web 316 passed, fmt and Clippy clean. Still not compiled for Windows; a VM probe that sends hostile paths through the same call to a stand-in program is prepared. Spec R53 and R54 amended to what was built.
+- 2026-11-13 14:25 Ruling (user): "we should not have this, tailscale is not managed from Bibcode", about the "Tailscale HTTPS" row in Share this host. Spec R55 and D19 added; Task 11.4 added. Reading Tailscale's addresses stays (agent's reading, to confirm).
+- 2026-11-13 14:19 Codex's final pass on the elevation fix: both security blockers fixed; five P2 findings (the port fix changed a Tailscale HTTPS port; a second check rejected a non-ASCII read-back; prompt ownership released on timeout; a declined second prompt leaves the old rule removed; one discard path in the collector). The collector one is deliberate and now documented (46955bbaf); the four others are in progress in lane 11.

@@ -65,6 +65,7 @@ Names used throughout:
 - D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error screen catches) is part of #360 here as R51 ("follow-up, do it as part of 360", user, 2026-11-13).
 - D17. #361 is added to this pull request. Decided by: user, 2026-11-13.
 - D18. For the Windows firewall rule (R53): BiBCode asks through Windows' own permission prompt when a person generates a code. Decided by: user, 2026-11-13 ("Windows permission prompt"), after being told the cost: without administrator rights the rule cannot be removed later, so it stays after sharing is turned off while the listener goes back to local-only, and a test cannot click the prompt. The other options were a message only, and a rule created by the installer.
+- D19. The "Tailscale HTTPS" row and BiBCode's set-up and disable of Tailscale Serve are removed (R55). Decided by: user, 2026-11-13 ("we should not have this, tailscale is not managed from BiBCode"). Reading Tailscale's addresses stays: agent's reading of the decision, to confirm.
 
 ## Requirements
 
@@ -364,6 +365,14 @@ Rollback to local-only on any failed switch, fail-closed firewall cleanup, no au
 - Changed by D18, on Windows without administrator rights only: when turning sharing off finds the rule and Windows refuses to delete it for lack of permission, that is reported (`firewall-rule-left`) and tolerated. The listener SHALL still be verified local-only; any other failure to delete stays a failed safeguard. The prompt appears only when the person chooses Generate pairing offer, Retry or Resume legacy remote access in Share this host; automatic widening, narrowing and recovery never prompt. It comes before any restart, so a refusal changes nothing. Only Windows' own firewall command runs with administrator rights: it is started directly by its full path from the Windows system directory, with no script, and the program path is passed as one quoted argument.
 - An existing rule for the same program is kept on the next widening, with no prompt. A changed program path is replaced with two prompts, one to remove the old rule and one to add the new one.
 - A prompt that is declined, dismissed or left unanswered is a refusal. A late approval can leave a rule; the docs say how to remove it by hand.
+
+### R55. BiBCode does not manage Tailscale
+
+BiBCode SHALL NOT start, change or stop Tailscale Serve, and the Share this host section SHALL have no "Tailscale HTTPS" row or switch. BiBCode MAY read Tailscale's addresses, read-only, to offer them in the Address list, including an HTTPS address a person set up in Tailscale themselves that already answers BiBCode.
+
+- Given Share this host is open, Then there is no "Tailscale HTTPS" row.
+- Given any action in BiBCode, Then no `tailscale serve` change is run.
+- Given a person who enabled Serve through an earlier BiBCode version, When they upgrade, Then Tailscale's own state is untouched and settings load without error.
 
 ## Verification
 

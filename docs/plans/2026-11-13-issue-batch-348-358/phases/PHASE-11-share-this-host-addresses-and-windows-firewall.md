@@ -72,3 +72,24 @@ Steps
 4. [ ] Write the failing web test and then the message: when the reason is the missing permission, the dialog says that Windows needs administrator permission to open the firewall for BiBCode, that nothing was changed, and offers Retry; a string rejection from the bridge keeps a sanitized reason instead of the generic "Could not enable remote access."; when the adapter's network profile is Public, a warning says other devices may still be blocked. Expected: FAIL, then PASS.
 5. [ ] Prove the tests can fail: undo the classification by hand and rerun. Expected: FAIL. Restore it. Expected: PASS.
 6. [ ] Update `docs/architecture/remote.md` and the firewall step of `docs/testing/windows-desktop.md`; run the phase Checkpoint. Expected: exit 0.
+
+### Task 11.4: BiBCode no longer manages Tailscale Serve
+
+- Satisfies: R55
+- Depends on: 11.3
+- Files: modify `apps/web/src/components/settings/remote-servers/ShareTab.tsx` and its tests; modify the desktop bridge and `apps/desktop/src-tauri/src/tailscale.rs` where they configure Tailscale Serve, with their tests; modify the contracts that carry those commands; modify `docs/user/remote-access.md` and `docs/architecture/remote.md`
+- Interfaces: consumes the read-only Tailscale address read built in Task 11.1; produces a Share this host section with no "Tailscale HTTPS" row and no code path that runs a `tailscale serve` change
+- Skills: tdd (a test that the command runner never receives a Tailscale Serve change); better-interface (the section reads well without the row)
+- Read first: `docs/user/remote-access.md` (what it tells people about Tailscale today); the bridge commands that set up and disable Serve and every caller of them
+- Tier: standard
+- TDD: red-green
+- Done when: from `apps/web`, `vp test run --project unit src/components/settings/remote-servers` exits 0, `cargo test -p bibcode-desktop` exits 0, and `rg -n "Tailscale HTTPS" apps/web/src/components/settings/remote-servers/ShareTab.tsx` prints nothing
+
+Steps
+
+1. [ ] List every caller of the Serve setup and disable commands and every stored setting that remembers BiBCode enabled Serve. Expected: the list is in the task's first commit message.
+2. [ ] Write the failing tests: the section renders no "Tailscale HTTPS" row and no Serve switch; the runner never receives a `tailscale serve` change; an HTTPS address that a person set up in Tailscale themselves and that answers BiBCode's well-known endpoint is still listed. Expected: the first two FAIL on current code.
+3. [ ] Remove the row, its actions, the bridge commands and the Rust code that change Tailscale Serve; keep the read-only reads. A stored preference from an earlier version is ignored without failing to load settings, and Tailscale's own state is left untouched on upgrade. Expected: the tests PASS.
+4. [ ] Prove the tests can fail: restore the row by hand and rerun. Expected: FAIL. Remove it again. Expected: PASS.
+5. [ ] Update the two docs so they say that BiBCode reads Tailscale's addresses and does not manage Tailscale; run `vp run check:markdown-links`. Expected: exit 0.
+6. [ ] Run the phase Checkpoint. Expected: exit 0.

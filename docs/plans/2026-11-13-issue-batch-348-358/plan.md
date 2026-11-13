@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 07f82ba4371c)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 2298fd3a827c)
 Repository: this repository
 Base: main
 
@@ -160,6 +160,7 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 | R52         | 11.1                                                           |
 | R53         | 11.2, 11.3                                                     |
 | R54         | 11.3                                                           |
+| R55         | 11.4                                                           |
 
 ## End-to-end verification
 
