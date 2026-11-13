@@ -16,6 +16,11 @@ vi.mock("../ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ui/toast")>()),
   toastManager: { add: toastAdd },
 }));
+// The real toast viewport reads the route; no router is mounted here.
+vi.mock("@tanstack/react-router", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tanstack/react-router")>()),
+  useParams: ({ select }: { select?: (params: object) => unknown }) => select?.({}),
+}));
 
 import { FileEditingSession } from "./fileEditingSession";
 import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
@@ -839,6 +844,77 @@ describe("UnsavedChangesCloseHost", () => {
       expect(dialogText()).toContain("Installing an update");
       expect(persist).not.toHaveBeenCalled();
     });
+  });
+
+  it("the toast action is reachable while the installing dialog is open", async () => {
+    await act(async () => root.unmount());
+    // The real toast module: its viewport and its manager, not the mocked `add`.
+    const toast = await vi.importActual<typeof import("../ui/toast")>("../ui/toast");
+    const { remoteUpdateRequestToast } = await import("../RemoteUpdateRequestNotifier");
+    let answer!: (state: unknown) => void;
+    let pushState!: (state: unknown) => void;
+    window.desktopBridge = {
+      onCloseRequest: () => () => {},
+      replyCloseRequest: async () => {},
+      onUpdateInstallEnded: () => () => {},
+      onUpdateState: (listener: (state: unknown) => void) => {
+        pushState = listener;
+        return () => {};
+      },
+      getUpdateState: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    } as unknown as DesktopBridge;
+    const outside = document.createElement("textarea");
+    container.append(outside);
+    const mount = document.createElement("div");
+    container.append(mount);
+    root = createRoot(mount);
+    try {
+      await act(async () =>
+        root.render(
+          <toast.ToastProvider>
+            <UnsavedChangesCloseHost />
+          </toast.ToastProvider>,
+        ),
+      );
+      const onManageDevices = vi.fn();
+      // Added as `RemoteUpdateRequestNotifier` adds it, before the dialog opens.
+      await act(async () => {
+        toast.toastManager.add(
+          toast.stackedThreadToast({
+            type: "info",
+            ...remoteUpdateRequestToast({ label: "Test User", detail: null }, "1.2.3"),
+            actionVariant: "outline",
+            actionProps: { children: "Manage devices", onClick: onManageDevices },
+          }),
+        );
+      });
+      const action = await vi.waitFor(() => button("Manage devices"), { timeout: 30_000 });
+
+      await act(async () =>
+        answer({ requestedBy: { label: "Test User", detail: null }, phase: "installing" }),
+      );
+      await vi.waitFor(() => expect(dialogText()).toContain("Installing an update"), {
+        timeout: 30_000,
+      });
+      // Control: the modal dialog does take the page beneath it out of reach.
+      await vi.waitFor(
+        () => expect(outside.closest("[inert], [aria-hidden='true']")).not.toBeNull(),
+        { timeout: 30_000 },
+      );
+      expect(action.isConnected).toBe(true);
+      expect(action.closest("[inert], [aria-hidden='true']")).toBeNull();
+      await act(async () => {
+        action.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      expect(onManageDevices).toHaveBeenCalledOnce();
+    } finally {
+      // The block lives in module state: end it for the tests after this one.
+      await act(async () => pushState?.({ requestedBy: null, phase: "idle" }));
+      delete window.desktopBridge;
+    }
   });
 
   it("answers a desktop close request through the bridge", async () => {
