@@ -397,6 +397,58 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("http://192.168.8.194:3773/pair");
   });
 
+  it("lists local-only private addresses and widens before minting for the chosen one", async () => {
+    const localOnly = (host: string, isDefault: boolean): AdvertisedEndpoint => ({
+      ...nativePrivateDefaultObservation,
+      id: `desktop-network:${host}:3773`,
+      httpBaseUrl: `http://${host}:3773/`,
+      wsBaseUrl: `ws://${host}:3773/`,
+      unavailableReason: "local-only",
+      isDefault,
+    });
+    h.networkQuery.data.advertisedEndpoints = [
+      localOnly("192.168.0.10", true),
+      localOnly("10.20.0.5", false),
+    ];
+    const order: string[] = [];
+    installBridge(
+      vi.fn(async () => {
+        order.push("widen");
+        return wideState;
+      }),
+    );
+    h.createOffer.mockImplementation(async (input) => {
+      order.push(`mint ${input.endpoint}`);
+      return {
+        id: "offer-1",
+        code: "c0de",
+        reach: input.reach,
+        endpoint: input.endpoint,
+        name: input.name,
+        expiresAt: DateTime.makeUnsafe("2026-08-27T01:00:00.000Z"),
+      };
+    });
+    await renderTab();
+
+    const select = container.querySelector("select")!;
+    expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+      "Automatic (LAN)",
+      "192.168.0.10 (enables remote access)",
+      "10.20.0.5 (enables remote access)",
+    ]);
+    await act(async () => {
+      select.value = "desktop-network:10.20.0.5:3773";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    });
+    expect(container.textContent).toContain(
+      "BiBCode will enable remote access, then use this address.",
+    );
+    expect(container.textContent).toContain("Running turns on this machine will stop");
+    await click("Generate pairing offer");
+    expect(order).toEqual(["widen", "mint http://10.20.0.5:3773/"]);
+    expect(container.textContent).toContain("http://10.20.0.5:3773/pair");
+  });
+
   it("fails closed when native exposure discovers only a public address", async () => {
     h.networkQuery.data.advertisedEndpoints = [
       {
