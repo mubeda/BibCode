@@ -313,9 +313,11 @@ struct FirewallJob {
 struct FirewallWorkerState {
     pending: Option<FirewallJob>,
     prompt_open: bool,
-    /// This process added the present rule, so it is ours even when the listing does not
-    /// echo a non-ASCII path byte for byte. Both checks of a widen use this one rule.
-    own_rule: bool,
+    /// How the rule this process added or accepted read back. A rule is ours when its listing
+    /// names this program or reads exactly as observed then, even if the listing does not
+    /// echo a non-ASCII path byte for byte; a rule replaced for another program reads
+    /// differently and is not ours. Both checks of a widen use this one rule.
+    own_rule: Option<u64>,
 }
 
 #[cfg(any(windows, test))]
@@ -430,10 +432,12 @@ async fn run_firewall_worker<Runner>(
                     + 2 * (ELEVATION_PROMPT_TIMEOUT + FIREWALL_CALLER_TIMEOUT);
                 result = elevate_remote_access_rule(&runner, &state, program).await;
             }
-            if result.is_ok() {
+            if let Ok(observed) = result {
                 // An enable leaves this program's rule in place; a disable leaves none.
-                state.lock().expect("firewall worker state").own_rule = enabled;
+                state.lock().expect("firewall worker state").own_rule =
+                    if enabled { observed } else { None };
             }
+            let mut result = result.map(|_| ());
 
             let completed_late = already_late || tokio::time::Instant::now() >= deadline;
             if job.enabled && !already_late && completed_late {
@@ -443,7 +447,7 @@ async fn run_firewall_worker<Runner>(
                 })
                 .await;
                 if cleanup.is_ok() {
-                    state.lock().expect("firewall worker state").own_rule = false;
+                    state.lock().expect("firewall worker state").own_rule = None;
                 }
                 if let Err(cleanup) = cleanup {
                     tracing::warn!(
@@ -675,6 +679,8 @@ enum RuleListing {
     /// Present; `for_program` when the verbose listing names this program's path.
     Present {
         for_program: bool,
+        /// A hash of the listing, so a later read can tell whether it is the same rule.
+        observed: u64,
     },
 }
 
@@ -695,8 +701,15 @@ where
     }
     // The path is compared as text; only its field label is localized.
     let text = firewall_command_text(&listing).to_lowercase();
+    let observed = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    };
     Ok(RuleListing::Present {
         for_program: program.is_some_and(|program| text.contains(&program.to_lowercase())),
+        observed,
     })
 }
 
@@ -733,17 +746,20 @@ where
     Runner: FirewallCommandRunner,
     ResolveProgram: FnOnce() -> Result<String, String>,
 {
-    sync_rule(enabled, runner, false, resolve_program).await
+    sync_rule(enabled, runner, None, resolve_program)
+        .await
+        .map(|_| ())
 }
 
-/// `own_rule` says this process added the present rule (see [`FirewallWorkerState`]).
+/// `own_rule` is how this process's rule read back (see [`FirewallWorkerState`]). Returns
+/// how a kept rule reads, or `None` when none was kept or the rule was added unread.
 #[cfg(any(windows, test))]
 async fn sync_rule<Runner, ResolveProgram>(
     enabled: bool,
     runner: &Runner,
-    own_rule: bool,
+    own_rule: Option<u64>,
     resolve_program: ResolveProgram,
-) -> Result<(), FirewallFailure>
+) -> Result<Option<u64>, FirewallFailure>
 where
     Runner: FirewallCommandRunner,
     ResolveProgram: FnOnce() -> Result<String, String>,
@@ -755,8 +771,11 @@ where
     };
     match read_remote_access_rule(runner, program.as_deref()).await? {
         // A rule for this program already admits it; keep it rather than ask again.
-        RuleListing::Present { for_program } if enabled && (for_program || own_rule) => {
-            return Ok(());
+        RuleListing::Present {
+            for_program,
+            observed,
+        } if enabled && (for_program || own_rule == Some(observed)) => {
+            return Ok(Some(observed));
         }
         RuleListing::Absent => {}
         RuleListing::Present { .. } => {
@@ -786,7 +805,7 @@ where
         }
     }
     let Some(program) = program else {
-        return Ok(());
+        return Ok(None);
     };
     let addition = runner
         .run(
@@ -796,7 +815,7 @@ where
         .await
         .map_err(|_| FirewallFailure::AddFailed)?;
     if addition.success {
-        Ok(())
+        Ok(None)
     } else if runs_unelevated(runner).await {
         Err(FirewallFailure::ElevationRequired)
     } else {
@@ -811,7 +830,7 @@ async fn elevate_remote_access_rule<Runner>(
     runner: &Runner,
     state: &Arc<Mutex<FirewallWorkerState>>,
     program: &str,
-) -> Result<(), FirewallFailure>
+) -> Result<Option<u64>, FirewallFailure>
 where
     Runner: FirewallCommandRunner,
 {
@@ -841,8 +860,14 @@ where
     // The rule was absent before this add, so any rule now is the one it added, even if
     // the listing does not echo a non-ASCII path byte for byte.
     match (read_remote_access_rule(runner, Some(program)).await?, run) {
-        (RuleListing::Present { .. }, ElevatedRun::Exited(_)) => Ok(()),
-        (RuleListing::Present { for_program: true }, ElevatedRun::Refused) => Ok(()),
+        (RuleListing::Present { observed, .. }, ElevatedRun::Exited(_)) => Ok(Some(observed)),
+        (
+            RuleListing::Present {
+                for_program: true,
+                observed,
+            },
+            ElevatedRun::Refused,
+        ) => Ok(Some(observed)),
         // The old rule named another program path, so it is stale and not restored.
         (_, ElevatedRun::Refused) if replacing => Err(FirewallFailure::RuleRemovedNotAdded),
         (_, ElevatedRun::Refused) => Err(FirewallFailure::ElevationRequired),
@@ -1752,9 +1777,10 @@ mod tests {
             ElevatedRun::Exited(0),
         );
         let state = Arc::new(Mutex::new(FirewallWorkerState::default()));
-        assert_eq!(
-            elevate_remote_access_rule(&added, &state, PROGRAM).await,
-            Ok(())
+        assert!(
+            elevate_remote_access_rule(&added, &state, PROGRAM)
+                .await
+                .is_ok_and(|observed| observed.is_some())
         );
 
         let old = r"C:\Old\bibcode-desktop.exe";
@@ -1976,6 +2002,52 @@ mod tests {
 
         assert_eq!(runner.calls().len(), 6, "no delete of its own rule");
         assert_eq!(runner.elevated().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_same_name_rule_replaced_for_another_program_is_not_taken_for_ours() {
+        let program = "C:\\Users\\T\u{e9}st \u{30e6}\u{30fc}\u{30b6}\\bibcode-desktop.exe";
+        let mangled = || listed(r"C:\Users\T?st ???\bibcode-desktop.exe");
+        let other = || listed(r"C:\Other\tool.exe");
+        let runner = FakeFirewallCommandRunner::with_elevation(
+            vec![
+                // The prompted add, read back as the mangled listing.
+                Ok(absent()),
+                Ok(elevation_refusal()),
+                Ok(whoami("S-1-16-8192")),
+                Ok(absent()),
+                Ok(mangled()),
+                // Someone replaced the rule for another program before the locked check.
+                Ok(other()),
+                Ok(elevation_refusal()),
+                Ok(other()),
+                Ok(whoami("S-1-16-8192")),
+            ],
+            ElevatedRun::Exited(0),
+        );
+        let worker = FirewallWorker::start(runner.clone());
+
+        worker
+            .sync(
+                true,
+                true,
+                Some(program.to_owned()),
+                FIREWALL_CALLER_TIMEOUT,
+            )
+            .await
+            .expect("the approved prompt adds the rule");
+        assert_eq!(
+            worker
+                .sync(
+                    true,
+                    false,
+                    Some(program.to_owned()),
+                    FIREWALL_CALLER_TIMEOUT
+                )
+                .await,
+            Err(FirewallFailure::ElevationRequired),
+            "another program's rule under the same name is not ours"
+        );
     }
 
     #[tokio::test(start_paused = true)]

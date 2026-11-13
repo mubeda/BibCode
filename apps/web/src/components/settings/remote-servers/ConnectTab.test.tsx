@@ -2843,6 +2843,75 @@ describe("Remote Servers tabs", () => {
     expect(bridge.applyServerExposure).not.toHaveBeenCalled();
   });
 
+  it("honours a stored Tailscale HTTPS default before the LAN fallback", () => {
+    stubDesktopWindow();
+    h.networkAccessQuery.data = {
+      serverExposureState: {
+        mode: "network-accessible",
+        endpointUrl: "http://192.168.1.20:5133",
+        advertisedHost: "192.168.1.20",
+      },
+      advertisedEndpoints: [
+        endpoint({
+          id: "desktop-lan:1",
+          label: "LAN",
+          httpBaseUrl: "http://192.168.1.20:5133",
+          isDefault: true,
+        }),
+        endpoint({
+          id: "tailscale-magicdns:1",
+          label: "Tailscale HTTPS",
+          httpBaseUrl: "https://machine.tailnet.ts.net",
+          reachability: "private-network",
+          hostedHttpsApp: "compatible",
+        }),
+      ],
+    };
+    h.uiState.defaultAdvertisedEndpointKey = "tailscale:magicdns:https";
+
+    const markup = render();
+
+    const badge = markup.indexOf(">Default</span>");
+    expect(badge).toBeGreaterThan(markup.indexOf("Tailscale HTTPS"));
+    expect(markup.indexOf(">Default</span>", badge + 1)).toBe(-1);
+  });
+
+  it("hides an unanswered Tailscale name an older desktop still reports", () => {
+    stubDesktopWindow();
+    h.networkAccessQuery.data = {
+      serverExposureState: { mode: "local-only", endpointUrl: null, advertisedHost: null },
+      advertisedEndpoints: [
+        endpoint({
+          id: "tailscale-magicdns:1",
+          label: "Tailscale HTTPS",
+          httpBaseUrl: "https://machine.tailnet.ts.net",
+          status: "unavailable",
+          reachability: "private-network",
+          hostedHttpsApp: "requires-configuration",
+        }),
+      ],
+    };
+
+    const markup = render();
+
+    expect(markup).not.toContain("Setup required");
+    expect(markup).not.toContain("https://machine.tailnet.ts.net");
+  });
+
+  it("leaves out the This environment section when it has nothing to show", () => {
+    stubDesktopWindow();
+    h.hasCloudConfig = false;
+    h.networkAccessQuery.data = {
+      serverExposureState: { mode: "local-only", endpointUrl: null, advertisedHost: null },
+      advertisedEndpoints: [],
+    };
+
+    expect(render()).not.toContain('data-section-title="This environment"');
+
+    h.hasCloudConfig = true;
+    expect(render()).toContain('data-section-title="This environment"');
+  });
+
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {
     stubDesktopWindow();
     h.stateOverrides.set(false, true);

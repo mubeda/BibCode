@@ -901,8 +901,8 @@ other settings mutation that can restart the native or WSL topology. Those
 non-exposure mutations preserve the actual runtime exposure across their
 restart instead of reapplying a stale durable mode. Widening first ensures the
 program-scoped `BiBCode Remote Access` Windows Firewall rule (it names the
-program, not the port, so a refused rule never costs the running server a
-restart), then restarts with an ephemeral launch override, verifies a
+program, not the port, so it can be checked before the server widens), then
+restarts with an ephemeral launch override, verifies a
 network-accessible advertised endpoint, and persists network-accessible only
 after those native side effects succeed. Any
 failure attempts every local safeguard even if an earlier recovery step fails:
@@ -938,7 +938,10 @@ starts with **Generate pairing offer**, **Retry** or **Resume legacy remote
 access** in Share this host passes `allowElevationPrompt` through the desktop
 bridge, which only the app's own `main` webview can invoke. That firewall step
 runs before the exposure lock and before any restart, so other exposure changes
-are not held behind an open prompt and a refusal leaves nothing to recover. It
+are not held behind an open prompt, and a refusal there changes nothing and
+restarts nothing. The firewall check repeated under the lock runs before the
+wide restart: if it fails, the server never widens, but the usual recovery still
+restarts it local-only. It
 may ask Windows, through the standard elevation prompt, to run `netsh.exe` from
 the system directory `GetSystemDirectoryW` reports, by `ShellExecuteExW` with
 the `runas` verb; the prompt names the Windows program (Network Command Shell),

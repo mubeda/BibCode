@@ -1089,8 +1089,13 @@ export function ShareTab({
     }
   }, [desktopIdleNamedClients.length, onAccessRevoked]);
   const visibleDesktopPairingLinks = desktopPairingLinks;
+  // An older desktop can still report an unanswered MagicDNS name, which BiBCode no longer
+  // offers to set up; only an address that answers is listed.
   const tailscaleHttpsEndpoint = useMemo(
-    () => desktopAdvertisedEndpoints.find(isTailscaleHttpsEndpoint) ?? null,
+    () =>
+      desktopAdvertisedEndpoints.find(
+        (endpoint) => isTailscaleHttpsEndpoint(endpoint) && endpoint.status === "available",
+      ) ?? null,
     [desktopAdvertisedEndpoints],
   );
   const visibleDesktopNetworkAdvertisedEndpoints = useMemo(
@@ -1107,19 +1112,10 @@ export function ShareTab({
         : visibleDesktopNetworkAdvertisedEndpoints,
     [tailscaleHttpsEndpoint, visibleDesktopNetworkAdvertisedEndpoints],
   );
-  const defaultDesktopNetworkAdvertisedEndpoint = useMemo(
-    () =>
-      selectPairingEndpoint(visibleDesktopNetworkAdvertisedEndpoints, defaultAdvertisedEndpointKey),
-    [defaultAdvertisedEndpointKey, visibleDesktopNetworkAdvertisedEndpoints],
-  );
+  // One selection over every listed address, so a stored preference wins over any fallback.
   const defaultDesktopAdvertisedEndpoint = useMemo(
-    () =>
-      defaultDesktopNetworkAdvertisedEndpoint ??
-      selectPairingEndpoint(
-        tailscaleHttpsEndpoint ? [tailscaleHttpsEndpoint] : [],
-        defaultAdvertisedEndpointKey,
-      ),
-    [defaultAdvertisedEndpointKey, defaultDesktopNetworkAdvertisedEndpoint, tailscaleHttpsEndpoint],
+    () => selectPairingEndpoint(visibleDesktopAdvertisedEndpoints, defaultAdvertisedEndpointKey),
+    [defaultAdvertisedEndpointKey, visibleDesktopAdvertisedEndpoints],
   );
   const defaultDesktopAdvertisedEndpointKey = defaultDesktopAdvertisedEndpoint
     ? endpointDefaultPreferenceKey(defaultDesktopAdvertisedEndpoint)
@@ -1130,6 +1126,13 @@ export function ShareTab({
     },
     [setDefaultAdvertisedEndpointKey],
   );
+  // UI.md: no heading over an empty card. The section has content when it lists an address,
+  // shows an error or version drift, or offers BiBCode Connect.
+  const hasThisEnvironmentContent =
+    primaryVersionMismatch !== null ||
+    hasCloudPublicConfig() ||
+    (desktopBridge !== undefined &&
+      (visibleDesktopAdvertisedEndpoints.length > 0 || Boolean(desktopServerExposureError)));
   const renderEndpointRows = (presentation: AccessSectionPresentation) =>
     visibleDesktopAdvertisedEndpoints.map((endpoint) => {
       const endpointKey = endpointDefaultPreferenceKey(endpoint);
@@ -1171,38 +1174,40 @@ export function ShareTab({
     <>
       {canManageLocalBackend ? (
         <>
-          <SettingsSection title="This environment">
-            {primaryVersionMismatch ? (
-              <SettingsRow
-                title="Version drift"
-                description={
-                  <span className="flex items-center gap-1 text-warning">
-                    <TriangleAlertIcon className="size-3.5 shrink-0" />
-                    Client {primaryVersionMismatch.clientVersion}, server{" "}
-                    {primaryVersionMismatch.serverVersion}. Sync them if RPC calls or reconnects
-                    fail.
-                  </span>
-                }
-              />
-            ) : null}
-            {desktopBridge ? (
-              <>
-                {renderEndpointRows("endpoint-rail")}
-                {desktopServerExposureError ? (
-                  <SettingsRow
-                    title="Network addresses"
-                    description="BiBCode could not read this computer's network addresses. Use Refresh in Share this host to try again."
-                    status={
-                      <span className="block text-destructive">{desktopServerExposureError}</span>
-                    }
-                  />
-                ) : null}
+          {hasThisEnvironmentContent ? (
+            <SettingsSection title="This environment">
+              {primaryVersionMismatch ? (
+                <SettingsRow
+                  title="Version drift"
+                  description={
+                    <span className="flex items-center gap-1 text-warning">
+                      <TriangleAlertIcon className="size-3.5 shrink-0" />
+                      Client {primaryVersionMismatch.clientVersion}, server{" "}
+                      {primaryVersionMismatch.serverVersion}. Sync them if RPC calls or reconnects
+                      fail.
+                    </span>
+                  }
+                />
+              ) : null}
+              {desktopBridge ? (
+                <>
+                  {renderEndpointRows("endpoint-rail")}
+                  {desktopServerExposureError ? (
+                    <SettingsRow
+                      title="Network addresses"
+                      description="BiBCode could not read this computer's network addresses. Use Refresh in Share this host to try again."
+                      status={
+                        <span className="block text-destructive">{desktopServerExposureError}</span>
+                      }
+                    />
+                  ) : null}
+                  <CloudLinkRow canManageRelay={canManageRelay} />
+                </>
+              ) : (
                 <CloudLinkRow canManageRelay={canManageRelay} />
-              </>
-            ) : (
-              <CloudLinkRow canManageRelay={canManageRelay} />
-            )}
-          </SettingsSection>
+              )}
+            </SettingsSection>
+          ) : null}
 
           <SettingsSection
             title="Paired clients"

@@ -100,8 +100,9 @@ async fn apply_exposure_locked(
 
     if desired == "network-accessible" {
         if errors.is_empty() {
-            // The rule names the program, not the port, so it is checked before the restart:
-            // a refused or failed rule then never costs the running server a restart.
+            // The rule names the program, not the port, so it is checked before the wide
+            // restart: a rule that fails here never widens the server, though the recovery
+            // below still restarts it local-only.
             if let Err(error) = operations.sync_firewall(true).await {
                 errors.push(format!("open remote-access firewall rule: {error}"));
             }
@@ -680,7 +681,8 @@ mod tests {
             .await
             .expect_err("firewall-open failure recovers local");
         assert!(error.contains("open failed"));
-        // A refused or failed rule never costs the running server a restart.
+        // A rule that fails under the lock avoids the wide restart; recovery still restarts
+        // the server local-only.
         assert_eq!(
             widening.calls(),
             [
