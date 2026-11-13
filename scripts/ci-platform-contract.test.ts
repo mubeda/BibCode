@@ -331,7 +331,8 @@ describe("cross-platform CI contract", () => {
     for (const row of matrix) {
       // macOS's cold optimized probe and native package use distinct dependency
       // feature sets, in addition to the unoptimized host test graph.
-      const minimum = row.platform === "mac" ? 240 : 120;
+      // Intel's steps were estimated at about 260 minutes without a Rust cache.
+      const minimum = row.platform !== "mac" ? 120 : row.arch === "x64" ? 330 : 240;
       expect(row.jobTimeoutMinutes, String(row.label)).toBeGreaterThanOrEqual(minimum);
     }
   });
@@ -355,7 +356,7 @@ describe("cross-platform CI contract", () => {
     expect(cache?.with?.["save-if"]).toBe("false");
     // The server's test build is what pushed the macOS rows past their budget.
     const native = (requireJob(workflow, "native_desktop_macos").steps ?? [])
-      .filter((step) => step.if === "matrix.platform == 'mac'")
+      .filter((step) => !/matrix\.platform == '(win|linux)'/.test(String(step.if ?? "")))
       .map((step) => String(step.run ?? ""))
       .join("\n");
     expect(native).not.toContain("cargo test -p bibcode-server");

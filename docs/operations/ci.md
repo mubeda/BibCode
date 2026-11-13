@@ -141,7 +141,7 @@ the merge.
   Rust Cache keeps the binary in `~/.cargo/bin`. The macOS exception probe uses
   the same symbol profile so the dependencies both builds share compile once.
   Each matrix row declares its complete-job budget:
-  240 minutes for macOS arm64, 300 minutes for macOS x64, and 120 minutes for the other four targets.
+  240 minutes for macOS arm64, 330 minutes for macOS x64, and 120 minutes for the other four targets.
   That budget includes setup, host tests, the macOS optimized exception-recovery
   probe, and native packaging without shortening any check or test-owned deadline.
   Debug host tests cannot warm the optimized artifacts; the optimized example
@@ -180,7 +180,8 @@ the merge.
   Native desktop rows. They are a separate job because the server's test build
   took 32 to 56 minutes inside the macOS Native desktop rows and pushed both past
   their budget. The job restores the Native desktop Rust cache and never saves
-  one. Its budget is 150 minutes.
+  one. Its budget is 150 minutes. A full run now starts seven macOS jobs against
+  the five-job cap, so two of them wait for a free runner.
 - **Crash smoke** runs on `ubuntu-24.04` and `windows-2025` on every pull
   request, and also on `macos-26` with `ci:full`, on `main`, and in manual runs.
   It builds with the release symbol profile from
@@ -255,7 +256,7 @@ recently used entries above that. Which workflow saves which entry:
 
 A job cancelled by `timeout-minutes` or by a newer run skips the cache post
 step, so the Check and Test budgets above include a cold compile. Native
-desktop keeps its 120-minute, 240-minute and 300-minute row budgets.
+desktop keeps its 120-minute, 240-minute and 330-minute row budgets.
 
 Six native-desktop entries of about 1.6 GB each are about 10 GB on their own,
 before Check, Test, Crash smoke, Linux Git, and the setup-vp caches. Eviction

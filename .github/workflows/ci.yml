@@ -490,9 +490,10 @@ jobs:
             platform: mac
             target: dmg
             arch: x64
-            # A cold run (no Rust cache) needed about 260 minutes for these
-            # steps on 2026-11-13; arm64 needed about 200.
-            jobTimeoutMinutes: 300
+            # Estimated from the 2026-11-13 run without a Rust cache, which was
+            # cancelled in the bundle step: about 260 minutes for these steps
+            # here and about 200 on arm64. Neither is a completed cold run.
+            jobTimeoutMinutes: 330
     steps: *native_desktop_steps
 
   # Linux runs these server tests in Test and Windows in its native desktop rows; macOS Git
