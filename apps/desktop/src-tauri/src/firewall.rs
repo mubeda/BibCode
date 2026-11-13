@@ -5,9 +5,11 @@
 //! firewall here and every call is a successful no-op.
 
 #[cfg(windows)]
+use bibcode_server::diagnostics::profiler::exits::{self, Exited, Watch};
+#[cfg(windows)]
 use bibcode_server::process::ProcessRunner;
 #[cfg(any(windows, test))]
-use bibcode_server::process::{OutputMode, ProcessRunInput, TimeoutBehavior};
+use bibcode_server::process::{OutputMode, ProcessRunInput};
 #[cfg(windows)]
 use std::sync::OnceLock;
 #[cfg(any(windows, test))]
@@ -148,16 +150,85 @@ impl FirewallFailure {
 /// deadline still covers every non-interactive command around it.
 #[cfg(any(windows, test))]
 const ELEVATION_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
-/// Exit code of the unelevated launcher when `Start-Process -Verb RunAs` throws, which it
-/// does when the person declines or dismisses the prompt (`ERROR_CANCELLED`).
-#[cfg(any(windows, test))]
-const ELEVATION_REFUSED_EXIT_CODE: i32 = 1223;
 
 /// Mandatory-label SIDs in `whoami /groups`. SIDs are not localized, unlike netsh text.
 #[cfg(any(windows, test))]
 const UNELEVATED_INTEGRITY_SIDS: [&str; 3] = ["S-1-16-4096", "S-1-16-8192", "S-1-16-8448"];
 #[cfg(any(windows, test))]
 const ELEVATED_INTEGRITY_SIDS: [&str; 2] = ["S-1-16-12288", "S-1-16-16384"];
+
+/// The only programs this module starts. Each runs from the system directory Windows
+/// reports, never from `PATH` or an environment variable.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirewallProgram {
+    Netsh,
+    Whoami,
+}
+
+#[cfg(any(windows, test))]
+impl FirewallProgram {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Netsh => "netsh",
+            Self::Whoami => "whoami",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn system_program_path(
+    system_directory: &std::path::Path,
+    program: FirewallProgram,
+) -> std::path::PathBuf {
+    system_directory.join(format!("{}.exe", program.name()))
+}
+
+/// The system directory from `GetSystemDirectoryW`.
+#[cfg(windows)]
+fn system_directory() -> Result<std::path::PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: the buffer holds `buffer.len()` UTF-16 units.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err("could not resolve the Windows system directory".to_owned());
+    }
+    buffer.truncate(length);
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer,
+    )))
+}
+
+/// Joins arguments by the Windows command-line rules (`CommandLineToArgvW`) that netsh
+/// parses: an argument with a space or tab, or an empty one, is wrapped in double quotes,
+/// with the backslashes before the closing quote doubled. Nothing else is special, so
+/// quotes of any other kind, `$`, `` ` ``, `&`, `%` and non-ASCII letters pass through
+/// as data. A double quote or NUL cannot occur in a Windows path and is refused.
+#[cfg(any(windows, test))]
+fn windows_command_line(args: &[String]) -> Result<String, FirewallFailure> {
+    let mut line = String::new();
+    for arg in args {
+        if arg.contains(['"', '\0']) {
+            return Err(FirewallFailure::Unavailable);
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        if !arg.is_empty() && !arg.contains([' ', '\t']) {
+            line.push_str(arg);
+            continue;
+        }
+        let trailing = arg.len() - arg.trim_end_matches('\\').len();
+        line.push('"');
+        line.push_str(arg);
+        line.push_str(&"\\".repeat(trailing));
+        line.push('"');
+    }
+    Ok(line)
+}
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,13 +238,14 @@ struct FirewallCommandOutput {
     stderr: String,
 }
 
-/// How the elevated firewall change ended, as far as the unelevated launcher can tell.
-/// Whether the rule exists afterwards is read separately and decides success.
+/// How an elevated netsh run ended, as far as this process can tell. Whether the rule
+/// exists afterwards is read separately and decides success.
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ElevatedRun {
-    Finished,
-    /// Declined, dismissed, timed out, or the launcher could not start.
+    /// Approved; netsh ran and exited with this code.
+    Exited(u32),
+    /// Declined, dismissed, timed out, or Windows could not show the prompt.
     Refused,
 }
 
@@ -181,15 +253,14 @@ enum ElevatedRun {
 trait FirewallCommandRunner: Sync {
     fn run(
         &self,
-        executable: String,
+        program: FirewallProgram,
         args: Vec<String>,
     ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send;
 
-    /// Runs the given netsh argument lists, in order, in one elevated process behind one
-    /// Windows prompt.
+    /// Runs the system netsh with `args` elevated, behind one Windows prompt.
     fn run_elevated(
         &self,
-        netsh_commands: Vec<Vec<String>>,
+        netsh_args: Vec<String>,
     ) -> impl std::future::Future<Output = ElevatedRun> + Send;
 }
 
@@ -232,7 +303,7 @@ impl FirewallWorker {
     }
 
     /// `allow_prompt` lets an enable that Windows refuses for lack of administrator
-    /// permission ask once through the elevation prompt; the caller then also waits for it.
+    /// permission ask through the elevation prompt; the caller then also waits for it.
     async fn sync(
         &self,
         enabled: bool,
@@ -242,7 +313,8 @@ impl FirewallWorker {
     ) -> Result<(), FirewallFailure> {
         let deadline = tokio::time::Instant::now() + caller_timeout;
         let wait_until = if allow_prompt {
-            deadline + ELEVATION_PROMPT_TIMEOUT + caller_timeout
+            // Up to two prompts when a rule for another path is replaced.
+            deadline + 2 * (ELEVATION_PROMPT_TIMEOUT + caller_timeout)
         } else {
             deadline
         };
@@ -320,8 +392,7 @@ async fn run_firewall_worker<Runner>(
                 // The wait for a person gets its own budget; the non-interactive steps
                 // before it were held to the caller deadline.
                 deadline = tokio::time::Instant::now()
-                    + ELEVATION_PROMPT_TIMEOUT
-                    + FIREWALL_CALLER_TIMEOUT;
+                    + 2 * (ELEVATION_PROMPT_TIMEOUT + FIREWALL_CALLER_TIMEOUT);
                 state.lock().expect("firewall worker state").prompt_open = true;
                 result = elevate_remote_access_rule(&runner, program).await;
                 state.lock().expect("firewall worker state").prompt_open = false;
@@ -362,67 +433,112 @@ fn firewall_process_input(executable: String, args: Vec<String>) -> ProcessRunIn
         .with_output_mode(OutputMode::Truncate)
 }
 
-/// A PowerShell single-quoted literal: nothing inside it is expanded.
-#[cfg(any(windows, test))]
-fn powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// How a `ShellExecuteExW` run ended.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellRun {
+    Exited(u32),
+    /// The person declined or dismissed the prompt (`ERROR_CANCELLED`).
+    Cancelled,
+    TimedOut,
 }
 
-/// `-EncodedCommand` takes UTF-16LE Base64, so no argument is ever re-quoted by a shell.
-#[cfg(any(windows, test))]
-fn powershell_encoded(script: &str) -> String {
-    use base64::Engine as _;
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
+/// Starts `file` with `parameters` through the shell and waits for it. With the `runas`
+/// verb Windows shows its elevation prompt and this call blocks until the person answers.
+/// The waiting thread owns and closes every handle; a caller that stops waiting leaves
+/// it to finish on its own, because Windows offers no way to withdraw a shown prompt.
+#[cfg(windows)]
+fn shell_execute_and_wait(
+    verb: &str,
+    file: &std::path::Path,
+    parameters: &str,
+    timeout: Duration,
+) -> Result<ShellRun, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::ExitStatusExt;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessId, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
 
-/// The elevated script runs only the system netsh with the given argument lists and stops
-/// at the first failure. The unelevated launcher asks Windows to run it with `-Verb RunAs`
-/// and exits with [`ELEVATION_REFUSED_EXIT_CODE`] when the prompt is declined.
-#[cfg(any(windows, test))]
-fn elevation_launcher_args(netsh_commands: &[Vec<String>]) -> Vec<String> {
-    let mut elevated = String::new();
-    for args in netsh_commands {
-        elevated.push_str("& \"$env:SystemRoot\\System32\\netsh.exe\"");
-        for arg in args {
-            elevated.push(' ');
-            elevated.push_str(&powershell_literal(arg));
+    let wide = |value: &std::ffi::OsStr| value.encode_wide().chain([0]).collect::<Vec<u16>>();
+    let verb = wide(std::ffi::OsStr::new(verb));
+    let file_wide = wide(file.as_os_str());
+    let parameters = wide(std::ffi::OsStr::new(parameters));
+    let started = std::time::Instant::now();
+    // SAFETY: an all-zero SHELLEXECUTEINFOW is valid; the strings outlive the call.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file_wide.as_ptr();
+    info.lpParameters = parameters.as_ptr();
+    info.nShow = 0; // SW_HIDE: netsh needs no console window.
+    // SAFETY: `info` is fully initialized for ShellExecuteExW.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        // SAFETY: reads this thread's last error right after the failed call.
+        let error = unsafe { GetLastError() };
+        if error == ERROR_CANCELLED {
+            return Ok(ShellRun::Cancelled);
         }
-        elevated.push_str("; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ");
+        return Err(format!("ShellExecuteExW failed with error {error}"));
     }
-    elevated.push_str("exit 0");
-    let launcher = format!(
-        "try {{ $p = Start-Process -FilePath \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'; exit $p.ExitCode }} catch {{ exit {ELEVATION_REFUSED_EXIT_CODE} }}",
-        powershell_encoded(&elevated)
+    let process = info.hProcess;
+    if process.is_null() {
+        return Err("ShellExecuteExW returned no process".to_owned());
+    }
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: `process` is the live handle ShellExecuteExW returned; closed below.
+    let (pid, code) = unsafe {
+        let pid = GetProcessId(process);
+        let code = if WaitForSingleObject(process, wait_ms) == WAIT_OBJECT_0 {
+            let mut code = 0u32;
+            (GetExitCodeProcess(process, &mut code) != 0).then_some(code)
+        } else {
+            None
+        };
+        CloseHandle(process);
+        (pid, code)
+    };
+    let Some(code) = code else {
+        return Ok(ShellRun::TimedOut);
+    };
+    let exe = file.to_string_lossy();
+    exits::report_exit(
+        Watch::Signals,
+        &Exited {
+            kind: "command",
+            label: "netsh",
+            exe: &exe,
+            pid,
+            started,
+        },
+        &std::process::ExitStatus::from_raw(code),
+        false,
     );
-    vec![
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-EncodedCommand".to_owned(),
-        powershell_encoded(&launcher),
-    ]
-}
-
-#[cfg(any(windows, test))]
-fn elevation_process_input(netsh_commands: &[Vec<String>]) -> ProcessRunInput {
-    ProcessRunInput::new("powershell", elevation_launcher_args(netsh_commands))
-        .with_timeout(ELEVATION_PROMPT_TIMEOUT)
-        .with_timeout_behavior(TimeoutBehavior::TimedOutResult)
-        .with_max_output_bytes(FIREWALL_COMMAND_MAX_OUTPUT_BYTES)
-        .with_output_mode(OutputMode::Truncate)
+    Ok(ShellRun::Exited(code))
 }
 
 #[cfg(windows)]
 impl FirewallCommandRunner for ProcessFirewallCommandRunner {
     async fn run(
         &self,
-        executable: String,
+        program: FirewallProgram,
         args: Vec<String>,
     ) -> Result<FirewallCommandOutput, String> {
+        let executable = system_program_path(&system_directory()?, program)
+            .to_string_lossy()
+            .into_owned();
         let output = ProcessRunner
-            .run(firewall_process_input(executable.clone(), args))
+            .run(firewall_process_input(executable, args))
             .await
-            .map_err(|error| format!("failed to run {executable}: {error}"))?;
+            .map_err(|error| format!("failed to run {}: {error}", program.name()))?;
         Ok(FirewallCommandOutput {
             success: output.code == Some(0),
             stdout: output.stdout,
@@ -430,17 +546,27 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
         })
     }
 
-    async fn run_elevated(&self, netsh_commands: Vec<Vec<String>>) -> ElevatedRun {
-        // The supervised runner reports the launcher's exit to the Profiler. A prompt it
-        // leaves behind on timeout belongs to Windows and cannot be closed from here.
-        match ProcessRunner
-            .run(elevation_process_input(&netsh_commands))
+    async fn run_elevated(&self, netsh_args: Vec<String>) -> ElevatedRun {
+        let Ok(parameters) = windows_command_line(&netsh_args) else {
+            return ElevatedRun::Refused;
+        };
+        let Ok(system) = system_directory() else {
+            return ElevatedRun::Refused;
+        };
+        let netsh = system_program_path(&system, FirewallProgram::Netsh);
+        let waiting = tokio::task::spawn_blocking(move || {
+            shell_execute_and_wait("runas", &netsh, &parameters, ELEVATION_PROMPT_TIMEOUT)
+        });
+        match tokio::time::timeout(ELEVATION_PROMPT_TIMEOUT + FIREWALL_CALLER_TIMEOUT, waiting)
             .await
         {
-            Ok(output) if !output.timed_out && output.code != Some(ELEVATION_REFUSED_EXIT_CODE) => {
-                ElevatedRun::Finished
+            Ok(Ok(Ok(ShellRun::Exited(code)))) => ElevatedRun::Exited(code),
+            Ok(Ok(Ok(ShellRun::Cancelled | ShellRun::TimedOut))) => ElevatedRun::Refused,
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "the elevated firewall change could not start");
+                ElevatedRun::Refused
             }
-            _ => ElevatedRun::Refused,
+            Ok(Err(_)) | Err(_) => ElevatedRun::Refused,
         }
     }
 }
@@ -490,7 +616,7 @@ where
         return rule_listing_is_absent(output);
     }
     let probe = runner
-        .run("netsh".to_owned(), remote_access_store_probe_args())
+        .run(FirewallProgram::Netsh, remote_access_store_probe_args())
         .await
         .map_err(|_| FirewallFailure::ReadFailed)?;
     if probe.success {
@@ -518,7 +644,7 @@ where
     Runner: FirewallCommandRunner,
 {
     let listing = runner
-        .run("netsh".to_owned(), remote_access_rule_show_args())
+        .run(FirewallProgram::Netsh, remote_access_rule_show_args())
         .await
         .map_err(|_| FirewallFailure::ReadFailed)?;
     if confirm_rule_listing_is_absent(runner, &listing).await? {
@@ -539,7 +665,7 @@ where
     Runner: FirewallCommandRunner,
 {
     match runner
-        .run("whoami".to_owned(), vec!["/groups".to_owned()])
+        .run(FirewallProgram::Whoami, vec!["/groups".to_owned()])
         .await
     {
         Ok(output) if output.success => {
@@ -574,18 +700,27 @@ where
         RuleListing::Present { for_program: true } if enabled => return Ok(()),
         RuleListing::Absent => {}
         RuleListing::Present { .. } => {
+            // A spawn failure or timeout is an Err here and stays a failed safeguard.
             let deletion = runner
-                .run("netsh".to_owned(), remote_access_rule_delete_args())
+                .run(FirewallProgram::Netsh, remote_access_rule_delete_args())
                 .await
                 .map_err(|_| FirewallFailure::RemoveFailed)?;
-            if !deletion.success {
-                return Err(match (runs_unelevated(runner).await, enabled) {
-                    (true, true) => FirewallFailure::ElevationRequired,
-                    (true, false) => FirewallFailure::RuleLeft,
-                    (false, _) => FirewallFailure::RemoveFailed,
+            let still_present = read_remote_access_rule(runner, None).await? != RuleListing::Absent;
+            if !still_present {
+                // The rule is gone, whatever the delete reported.
+            } else if deletion.success {
+                return Err(FirewallFailure::RemoveFailed);
+            } else if runs_unelevated(runner).await {
+                // The integrity level is reason enough: an unelevated process can never
+                // change a firewall rule (the Windows lab refused even a delete of a
+                // rule that did not exist for elevation), so this refusal needs elevation
+                // whatever text netsh printed.
+                return Err(if enabled {
+                    FirewallFailure::ElevationRequired
+                } else {
+                    FirewallFailure::RuleLeft
                 });
-            }
-            if read_remote_access_rule(runner, None).await? != RuleListing::Absent {
+            } else {
                 return Err(FirewallFailure::RemoveFailed);
             }
         }
@@ -594,7 +729,10 @@ where
         return Ok(());
     };
     let addition = runner
-        .run("netsh".to_owned(), remote_access_rule_add_args(&program))
+        .run(
+            FirewallProgram::Netsh,
+            remote_access_rule_add_args(&program),
+        )
         .await
         .map_err(|_| FirewallFailure::AddFailed)?;
     if addition.success {
@@ -606,8 +744,8 @@ where
     }
 }
 
-/// One elevated process replaces a rule for another program and adds this program's rule,
-/// so the person answers one prompt. Success is read back from the rule store.
+/// Asks Windows to run netsh elevated: one prompt to add the rule, or two when a rule for
+/// another path must be deleted first. Success is read back from the rule store.
 #[cfg(any(windows, test))]
 async fn elevate_remote_access_rule<Runner>(
     runner: &Runner,
@@ -617,25 +755,32 @@ where
     Runner: FirewallCommandRunner,
 {
     let replacing = read_remote_access_rule(runner, Some(program)).await? != RuleListing::Absent;
-    let mut netsh_commands = Vec::new();
     if replacing {
-        netsh_commands.push(remote_access_rule_delete_args());
+        match runner.run_elevated(remote_access_rule_delete_args()).await {
+            ElevatedRun::Refused => return Err(FirewallFailure::ElevationRequired),
+            ElevatedRun::Exited(0) => {}
+            ElevatedRun::Exited(_) => return Err(FirewallFailure::RemoveFailed),
+        }
+        if read_remote_access_rule(runner, None).await? != RuleListing::Absent {
+            return Err(FirewallFailure::RemoveFailed);
+        }
     }
-    netsh_commands.push(remote_access_rule_add_args(program));
-    let run = runner.run_elevated(netsh_commands).await;
-    // When there was no rule before, any rule after a finished run is the one it added,
-    // even if the listing does not echo a non-ASCII path byte for byte. A replaced rule
-    // must name this program, since a failed delete leaves the old one.
+    let run = runner
+        .run_elevated(remote_access_rule_add_args(program))
+        .await;
+    // The rule was absent before this add, so any rule now is the one it added, even if
+    // the listing does not echo a non-ASCII path byte for byte.
     match (read_remote_access_rule(runner, Some(program)).await?, run) {
-        (RuleListing::Present { for_program: true }, _) => Ok(()),
-        (RuleListing::Present { .. }, ElevatedRun::Finished) if !replacing => Ok(()),
+        (RuleListing::Present { .. }, ElevatedRun::Exited(_)) => Ok(()),
+        (RuleListing::Present { for_program: true }, ElevatedRun::Refused) => Ok(()),
         (_, ElevatedRun::Refused) => Err(FirewallFailure::ElevationRequired),
-        (_, ElevatedRun::Finished) => Err(FirewallFailure::AddFailed),
+        (RuleListing::Absent, ElevatedRun::Exited(_)) => Err(FirewallFailure::AddFailed),
     }
 }
 
-/// `allow_prompt` is true only for a widen the person started in the Share this host
-/// dialog; recovery and automatic narrowing never raise the Windows prompt.
+/// `allow_prompt` is true only for the widen step a person started in the Share this host
+/// dialog, which runs before and outside the exposure lock; recovery and automatic
+/// narrowing never raise the Windows prompt.
 #[cfg(windows)]
 pub(crate) async fn sync_remote_access_rule(
     enabled: bool,
@@ -690,7 +835,7 @@ mod tests {
     struct FakeFirewallCommandRunner {
         calls: Arc<Mutex<Vec<FirewallCall>>>,
         results: Arc<Mutex<VecDeque<Result<FirewallCommandOutput, String>>>>,
-        elevated: Arc<Mutex<Vec<Vec<Vec<String>>>>>,
+        elevated: Arc<Mutex<Vec<Vec<String>>>>,
         elevated_outcome: Arc<Mutex<Option<ElevatedRun>>>,
     }
 
@@ -715,7 +860,7 @@ mod tests {
             self.calls.lock().expect("firewall calls").clone()
         }
 
-        fn elevated(&self) -> Vec<Vec<Vec<String>>> {
+        fn elevated(&self) -> Vec<Vec<String>> {
             self.elevated.lock().expect("elevated calls").clone()
         }
     }
@@ -723,14 +868,14 @@ mod tests {
     impl FirewallCommandRunner for FakeFirewallCommandRunner {
         fn run(
             &self,
-            executable: String,
+            program: FirewallProgram,
             args: Vec<String>,
         ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send
         {
             self.calls
                 .lock()
                 .expect("firewall calls")
-                .push((executable, args));
+                .push((program.name().to_owned(), args));
             let result = self
                 .results
                 .lock()
@@ -742,12 +887,12 @@ mod tests {
 
         fn run_elevated(
             &self,
-            netsh_commands: Vec<Vec<String>>,
+            netsh_args: Vec<String>,
         ) -> impl std::future::Future<Output = ElevatedRun> + Send {
             self.elevated
                 .lock()
                 .expect("elevated calls")
-                .push(netsh_commands);
+                .push(netsh_args);
             let outcome = self
                 .elevated_outcome
                 .lock()
@@ -1127,7 +1272,7 @@ mod tests {
     impl FirewallCommandRunner for LateSpawnFirewallCommandRunner {
         fn run(
             &self,
-            executable: String,
+            program: FirewallProgram,
             args: Vec<String>,
         ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send
         {
@@ -1136,7 +1281,7 @@ mod tests {
             self.calls
                 .lock()
                 .expect("firewall calls")
-                .push((executable.clone(), args));
+                .push((program.name().to_owned(), args));
             let release_add = self.release_add.clone();
             async move {
                 if should_block {
@@ -1150,7 +1295,7 @@ mod tests {
             }
         }
 
-        async fn run_elevated(&self, _netsh_commands: Vec<Vec<String>>) -> ElevatedRun {
+        async fn run_elevated(&self, _netsh_args: Vec<String>) -> ElevatedRun {
             panic!("no elevation is expected here")
         }
     }
@@ -1362,33 +1507,84 @@ mod tests {
         assert_eq!(runner.calls().len(), 1);
     }
 
+    fn narrowing() -> Result<String, String> {
+        panic!("narrowing must not resolve the executable")
+    }
+
     #[tokio::test]
     async fn narrowing_without_administrator_permission_reports_the_rule_left_in_place() {
         let unelevated = FakeFirewallCommandRunner::with_results(vec![
             Ok(listed(PROGRAM)),
             Ok(elevation_refusal()),
+            Ok(listed(PROGRAM)),
             Ok(whoami("S-1-16-8192")),
         ]);
-        let error = sync_remote_access_rule_with_runner(false, &unelevated, || {
-            panic!("narrowing must not resolve the executable")
-        })
-        .await
-        .expect_err("the delete is refused");
+        let error = sync_remote_access_rule_with_runner(false, &unelevated, narrowing)
+            .await
+            .expect_err("the delete is refused");
         assert_eq!(error, FirewallFailure::RuleLeft);
         assert_eq!(error.token(), FIREWALL_RULE_LEFT_TOKEN);
 
-        // Any other delete failure stays a failed safeguard.
+        // An unelevated process can never change a rule, so any refused delete whose
+        // rule is still present is the tolerated case, whatever netsh printed.
+        let other_text = FakeFirewallCommandRunner::with_results(vec![
+            Ok(listed(PROGRAM)),
+            Ok(failure("The object is in use.")),
+            Ok(listed(PROGRAM)),
+            Ok(whoami("S-1-16-8192")),
+        ]);
+        assert_eq!(
+            sync_remote_access_rule_with_runner(false, &other_text, narrowing).await,
+            Err(FirewallFailure::RuleLeft)
+        );
+
+        // An elevated desktop's failed delete stays a failed safeguard.
         let elevated = FakeFirewallCommandRunner::with_results(vec![
             Ok(listed(PROGRAM)),
             Ok(failure("The object is in use.")),
+            Ok(listed(PROGRAM)),
             Ok(whoami("S-1-16-12288")),
         ]);
         assert_eq!(
-            sync_remote_access_rule_with_runner(false, &elevated, || {
-                panic!("narrowing must not resolve the executable")
-            })
-            .await,
+            sync_remote_access_rule_with_runner(false, &elevated, narrowing).await,
             Err(FirewallFailure::RemoveFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_delete_that_ran_and_left_a_readable_rule_is_tolerated() {
+        // The delete did not run (spawn failure or the runner's timeout).
+        let not_run = FakeFirewallCommandRunner::with_results(vec![
+            Ok(listed(PROGRAM)),
+            Err("timed out".to_owned()),
+        ]);
+        assert_eq!(
+            sync_remote_access_rule_with_runner(false, &not_run, narrowing).await,
+            Err(FirewallFailure::RemoveFailed)
+        );
+        assert_eq!(not_run.calls().len(), 2, "no integrity check without a run");
+
+        // The read-back failed.
+        let unread = FakeFirewallCommandRunner::with_results(vec![
+            Ok(listed(PROGRAM)),
+            Ok(elevation_refusal()),
+            Ok(failure("Access is denied.")),
+            Ok(failure("Access is denied.")),
+        ]);
+        assert_eq!(
+            sync_remote_access_rule_with_runner(false, &unread, narrowing).await,
+            Err(FirewallFailure::ReadFailed)
+        );
+
+        // The rule is gone after all: narrowing succeeded.
+        let gone = FakeFirewallCommandRunner::with_results(vec![
+            Ok(listed(PROGRAM)),
+            Ok(elevation_refusal()),
+            Ok(absent()),
+        ]);
+        assert_eq!(
+            sync_remote_access_rule_with_runner(false, &gone, narrowing).await,
+            Ok(())
         );
     }
 
@@ -1402,7 +1598,7 @@ mod tests {
                 Ok(absent()),
                 Ok(listed(PROGRAM)),
             ],
-            ElevatedRun::Finished,
+            ElevatedRun::Exited(0),
         );
         let worker = FirewallWorker::start(runner.clone());
 
@@ -1418,7 +1614,7 @@ mod tests {
 
         assert_eq!(
             runner.elevated(),
-            vec![vec![remote_access_rule_add_args(PROGRAM)]]
+            vec![remote_access_rule_add_args(PROGRAM)]
         );
     }
 
@@ -1457,33 +1653,36 @@ mod tests {
         let unmatched = || listed(r"C:\Users\?????\bibcode-desktop.exe");
         let added = FakeFirewallCommandRunner::with_elevation(
             vec![Ok(absent()), Ok(unmatched())],
-            ElevatedRun::Finished,
+            ElevatedRun::Exited(0),
         );
         assert_eq!(elevate_remote_access_rule(&added, PROGRAM).await, Ok(()));
 
         let old = r"C:\Old\bibcode-desktop.exe";
         let replaced = FakeFirewallCommandRunner::with_elevation(
             vec![Ok(listed(old)), Ok(listed(old))],
-            ElevatedRun::Finished,
+            ElevatedRun::Exited(0),
         );
         assert_eq!(
             elevate_remote_access_rule(&replaced, PROGRAM).await,
-            Err(FirewallFailure::AddFailed)
+            Err(FirewallFailure::RemoveFailed)
         );
+        assert_eq!(replaced.elevated().len(), 1, "no add after a failed delete");
     }
 
     #[tokio::test]
-    async fn a_rule_for_another_program_is_replaced_behind_one_prompt() {
+    async fn a_rule_for_another_program_is_replaced_with_one_prompt_per_netsh_run() {
         let other = r"C:\Old\bibcode-desktop.exe";
         let runner = FakeFirewallCommandRunner::with_elevation(
             vec![
                 Ok(listed(other)),
                 Ok(elevation_refusal()),
+                Ok(listed(other)),
                 Ok(whoami("S-1-16-8192")),
                 Ok(listed(other)),
+                Ok(absent()),
                 Ok(listed(PROGRAM)),
             ],
-            ElevatedRun::Finished,
+            ElevatedRun::Exited(0),
         );
         let worker = FirewallWorker::start(runner.clone());
 
@@ -1495,14 +1694,14 @@ mod tests {
                 FIREWALL_CALLER_TIMEOUT,
             )
             .await
-            .expect("one prompt replaces the rule");
+            .expect("two prompts replace the rule");
 
         assert_eq!(
             runner.elevated(),
-            vec![vec![
+            vec![
                 remote_access_rule_delete_args(),
                 remote_access_rule_add_args(PROGRAM)
-            ]]
+            ]
         );
     }
 
@@ -1584,54 +1783,117 @@ mod tests {
         assert_eq!(runner.calls()[2].1, remote_access_rule_show_args());
     }
 
-    fn decode_powershell(encoded: &str) -> String {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .expect("Base64");
-        let units: Vec<u16> = bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_le_bytes(*pair))
-            .collect();
-        String::from_utf16(&units).expect("UTF-16LE")
+    /// Hostile install paths: each must reach netsh as one unchanged argument.
+    const HOSTILE_PATHS: [&str; 6] = [
+        r"C:\Program Files\Test User's App\bibcode-desktop.exe",
+        "C:\\Program Files\\Test User\u{2019}; Write-Output 1; #\\bibcode-desktop.exe",
+        "C:\\Apps\\\u{2018}a\u{201a}b\u{201b}c\\bibcode-desktop.exe",
+        r"C:\Apps\$env:x `y & (z) 100%\bibcode-desktop.exe",
+        "C:\\Users\\T\u{e9}st \u{30e6}\u{30fc}\u{30b6}\\bibcode-desktop.exe",
+        r"C:\Apps\Trailing Space\\bibcode-desktop.exe",
+    ];
+
+    #[test]
+    fn netsh_arguments_follow_the_windows_command_line_rules_and_carry_any_path_as_data() {
+        let quoted = |path: &str| {
+            windows_command_line(&remote_access_rule_add_args(path)).expect("valid path")
+        };
+        let prefix =
+            "advfirewall firewall add rule \"name=BiBCode Remote Access\" dir=in action=allow ";
+        let suffix = " protocol=TCP profile=domain,private enable=yes";
+        for path in HOSTILE_PATHS {
+            let expected = if path.contains(' ') {
+                format!("{prefix}\"program={path}\"{suffix}")
+            } else {
+                format!("{prefix}program={path}{suffix}")
+            };
+            assert_eq!(quoted(path), expected);
+        }
+        assert_eq!(
+            quoted("C:\\Apps\\\u{2018}a\u{201a}b\u{201b}c\\bibcode-desktop.exe"),
+            format!(
+                "{prefix}program=C:\\Apps\\\u{2018}a\u{201a}b\u{201b}c\\bibcode-desktop.exe{suffix}"
+            )
+        );
+        // Backslashes before a closing quote are doubled; others stay as they are.
+        assert_eq!(
+            windows_command_line(&["a b\\".to_owned(), String::new(), "c\\d".to_owned()]),
+            Ok("\"a b\\\\\" \"\" c\\d".to_owned())
+        );
+        assert_eq!(
+            windows_command_line(&remote_access_rule_add_args("C:\\a\"b\\x.exe")),
+            Err(FirewallFailure::Unavailable)
+        );
+        assert_eq!(
+            windows_command_line(&["a\0b".to_owned()]),
+            Err(FirewallFailure::Unavailable)
+        );
     }
 
     #[test]
-    fn the_elevated_command_line_runs_only_system_netsh_with_quoted_arguments() {
-        let program = r"C:\Program Files\Test User's & Co\bibcode-desktop.exe";
-        let commands = vec![
-            remote_access_rule_delete_args(),
-            remote_access_rule_add_args(program),
-        ];
-        let input = elevation_process_input(&commands);
-        assert_eq!(input.command, "powershell");
-        assert_eq!(input.timeout, ELEVATION_PROMPT_TIMEOUT);
-        assert_eq!(input.timeout, Duration::from_secs(120));
-        assert_eq!(input.timeout_behavior, TimeoutBehavior::TimedOutResult);
+    fn every_program_runs_from_the_given_system_directory() {
+        let system = std::path::Path::new(r"C:\Windows\System32");
         assert_eq!(
-            input.args[..3],
-            ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
+            system_program_path(system, FirewallProgram::Netsh),
+            system.join("netsh.exe")
         );
-        assert_eq!(input.args.len(), 4);
-
-        let launcher = decode_powershell(&input.args[3]);
-        let prefix = "try { $p = Start-Process -FilePath \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','";
-        let suffix = "'; exit $p.ExitCode } catch { exit 1223 }";
-        assert!(launcher.starts_with(prefix), "{launcher}");
-        assert!(launcher.ends_with(suffix), "{launcher}");
-        let elevated = decode_powershell(&launcher[prefix.len()..launcher.len() - suffix.len()]);
-
         assert_eq!(
-            elevated,
-            concat!(
-                "& \"$env:SystemRoot\\System32\\netsh.exe\" 'advfirewall' 'firewall' 'delete' 'rule' 'name=BiBCode Remote Access'; ",
-                "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ",
-                "& \"$env:SystemRoot\\System32\\netsh.exe\" 'advfirewall' 'firewall' 'add' 'rule' 'name=BiBCode Remote Access' 'dir=in' 'action=allow' ",
-                "'program=C:\\Program Files\\Test User''s & Co\\bibcode-desktop.exe' 'protocol=TCP' 'profile=domain,private' 'enable=yes'; ",
-                "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; exit 0"
+            system_program_path(system, FirewallProgram::Whoami),
+            system.join("whoami.exe")
+        );
+        assert_eq!(ELEVATION_PROMPT_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_spawned_program_is_absolute_and_under_the_api_system_directory() {
+        let system = system_directory().expect("GetSystemDirectoryW");
+        assert!(system.is_absolute());
+        for program in [FirewallProgram::Netsh, FirewallProgram::Whoami] {
+            let path = system_program_path(&system, program);
+            assert!(path.is_absolute());
+            assert_eq!(path.parent(), Some(system.as_path()));
+            assert!(path.is_file(), "{}", path.display());
+        }
+    }
+
+    /// Unelevated, no prompt: starts the `firewall_argv_echo` example through the same
+    /// `ShellExecuteExW` path with the `open` verb, and compares the arguments it received
+    /// with the ones built for netsh, UTF-16 unit for unit.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows VM probe; build the firewall_argv_echo example first"]
+    fn elevation_arguments_reach_a_stand_in_program_byte_for_byte() {
+        let echo = std::env::current_exe()
+            .expect("test executable")
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("target directory")
+            .join("examples")
+            .join("firewall_argv_echo.exe");
+        assert!(echo.is_file(), "missing {}", echo.display());
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (index, path) in HOSTILE_PATHS.iter().enumerate() {
+            let args = remote_access_rule_add_args(path);
+            let output = directory.path().join(format!("argv-{index}.json"));
+            // SAFETY: the probe runs alone; the child inherits this variable.
+            unsafe { std::env::set_var("BIBCODE_ARGV_ECHO_OUT", &output) };
+            let run = shell_execute_and_wait(
+                "open",
+                &echo,
+                &windows_command_line(&args).expect("valid path"),
+                Duration::from_secs(30),
             )
-        );
+            .expect("stand-in started");
+            assert_eq!(run, ShellRun::Exited(0));
+            let received: Vec<Vec<u16>> =
+                serde_json::from_slice(&std::fs::read(&output).expect("echo output"))
+                    .expect("echo JSON");
+            let expected: Vec<Vec<u16>> = args
+                .iter()
+                .map(|arg| arg.encode_utf16().collect())
+                .collect();
+            assert_eq!(received, expected, "{path}");
+        }
     }
 }

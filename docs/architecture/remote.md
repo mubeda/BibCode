@@ -109,8 +109,9 @@ default-route observation. While a native-managed host is local-only and has
 that default route, the Share this host Address list offers "Automatic (LAN)"
 and each address marked `local-only`, labelled "(enables remote access)";
 choosing one widens exposure first, exactly as Automatic does, and the code
-uses that address, which stays valid because the widening rebind keeps the
-port. An address unavailable for any other reason is not offered. Public interface observations are never actionable in a
+uses that address with the port of the endpoint the completed widen reports.
+The wide listener binds `0.0.0.0`, so every listed address reaches it once the
+firewall admits the program. An address unavailable for any other reason is not offered. Public interface observations are never actionable in a
 native-managed topology, including after an unrelated transition has made the
 listener wide. A public-only host must use a custom address backed by an
 externally managed `bibcode serve` listener or reverse proxy rather than asking
@@ -920,24 +921,31 @@ failure, so Retry never loops. When the rule is already present for the same
 executable path, enabling keeps it without any write. Only a widen the person
 starts with **Generate pairing offer**, **Retry** or **Resume legacy remote
 access** in Share this host passes `allowElevationPrompt` through the desktop
-bridge, which only the app's own `main` webview can invoke. That widen may then
-ask Windows once, through the standard elevation prompt, to run the system
-`netsh` from one elevated PowerShell process started with `-Verb RunAs`; the
-prompt therefore names Windows PowerShell, not BiBCode. The
-process runs nothing but `netsh`: one `delete rule` when a rule for another
-path is present, then `add rule`. Its arguments are fixed strings plus the
-desktop's own executable path, passed as PowerShell single-quoted literals in an
-`-EncodedCommand` script, so no value from the web or the network reaches the
-elevated command line. The unelevated launcher is a supervised process with a
-120-second deadline for the person to answer, separate from the five-second
-budget that still covers every non-interactive command. The worker then reads
-the rule back; success means the rule exists for this program. A declined,
-dismissed or timed-out prompt, or a launcher that could not start, is one
+bridge, which only the app's own `main` webview can invoke. That firewall step
+runs before the exposure lock and before any restart, so other exposure changes
+are not held behind an open prompt and a refusal leaves nothing to recover. It
+may ask Windows, through the standard elevation prompt, to run `netsh.exe` from
+the system directory `GetSystemDirectoryW` reports, by `ShellExecuteExW` with
+the `runas` verb; the prompt names the Windows program (Network Command Shell),
+not BiBCode. Each elevated run is one `netsh` command: `add rule`, preceded by a
+separate `delete rule` with its own prompt in the rare case that a rule for
+another executable path is present. No shell or script runs elevated. The
+arguments are fixed strings plus the desktop's own executable path, joined by
+the Windows command-line rules: an argument with a space is wrapped in double
+quotes with the backslashes before the closing quote doubled, and a double
+quote or NUL, which a Windows path cannot contain, is refused. No value from the
+web or the network reaches the elevated command line. Every program this step
+starts, including the unelevated `netsh` and `whoami` runs, comes from that
+system directory, never from `PATH` or an environment variable. The person has
+120 seconds to answer, separate from the five-second budget that still covers
+every non-interactive command; the elevated `netsh` exit is reported to the
+Profiler. The worker then reads the rule back: after an add from an absent
+rule any rule counts, and after a replace the rule must name this program. A
+declined, dismissed or timed-out prompt, or one Windows could not show, is one
 refusal and is not retried. A widen queued while a prompt is open cannot open a
-second one, and the exposure coordinator serializes widens anyway, so other
-exposure changes wait while a prompt is open. Recovery, automatic widening and
-narrowing by the share reconciler, and the WSL-only switch never prompt. A person who is not an administrator gets Windows'
-credential prompt or a refusal; both follow the same path.
+second one. Recovery, automatic widening and narrowing by the share reconciler,
+and the WSL-only switch never prompt. A person who is not an administrator gets
+Windows' credential prompt or a refusal; both follow the same path.
 
 Failures leave the firewall module only as fixed reason tokens, never as `netsh`
 output, which is localized and can name paths:
@@ -959,8 +967,12 @@ not count it as a failed safeguard. Every other delete failure still fails the
 safeguard, and the loopback-only listener check stays mandatory. A prompt left
 open past its deadline belongs to Windows and cannot be closed by BiBCode; a
 late approval can add the rule after the widen was refused, and that rule is
-also left in place. To remove a left rule, run this from an administrator
-terminal:
+also left in place. A tolerated rule needs all of: the delete ran and exited
+(a spawn failure or timeout fails the safeguard), the desktop runs unelevated,
+and a read-back still lists the rule (a failed read-back fails the safeguard).
+The integrity level alone is accepted as the reason because an unelevated
+process can never change a firewall rule. To remove a left rule, run this from
+an administrator terminal:
 
 ```powershell
 netsh advfirewall firewall delete rule name="BiBCode Remote Access"
@@ -968,7 +980,8 @@ netsh advfirewall firewall delete rule name="BiBCode Remote Access"
 
 The rule covers Domain and Private network profiles only. BiBCode does not read
 the adapter's network profile, so on a network Windows classifies as Public,
-other devices can stay blocked although sharing reports success.
+other devices can stay blocked although sharing reports success. On Windows the
+Share this host dialog says so in a note next to **Generate pairing offer**.
 Creating a **This computer only** grant or any **Custom address** grant never
 widens a later launch, and there is no independent manual exposure toggle.
 

@@ -20,7 +20,7 @@ describe("describeWidenFailure", () => {
     ).toEqual({
       reason: "elevation-required",
       message:
-        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows PowerShell permission prompt, or close BiBCode, start it with Run as administrator, and try again.",
+        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows permission prompt, or close BiBCode, start it with Run as administrator, and try again.",
     });
   });
 
@@ -143,6 +143,42 @@ describe("generateShareOffer", () => {
       ok: true,
       offer: { endpoint: "http://192.168.1.20:3773", deepLink: "bibcode://pair?code=c0de" },
     });
+  });
+
+  it("keeps the chosen host but takes the port the widened server listens on", async () => {
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: "AI-SERVER",
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "desktop-network:10.20.0.5:3773",
+        label: "10.20.0.5 (enables remote access)",
+        httpBaseUrl: "http://10.20.0.5:3773/",
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => ({ ...wideState, endpointUrl: "http://192.168.1.20:3774" }),
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(mintOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "http://10.20.0.5:3774/" }),
+    );
+    expect(result).toMatchObject({ ok: true, offer: { endpoint: "http://10.20.0.5:3774/" } });
+  });
+
+  it("says nothing changed when the permission step failed before any restart", () => {
+    expect(
+      describeWidenFailure(
+        "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. No exposure change was made.",
+      ).message,
+    ).toContain("This computer is still local-only.");
   });
 
   it("widens first and keeps a chosen local-only address for the code", async () => {

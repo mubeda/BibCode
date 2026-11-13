@@ -141,13 +141,14 @@ export function describeWidenFailure(error: unknown): {
   readonly reason?: "elevation-required";
 } {
   const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  const localState = raw.includes("Restored local-only safeguards.")
-    ? "This computer is still local-only."
-    : "BiBCode could not confirm that this computer is back to local-only; check Remote access below.";
+  const localState =
+    raw.includes("Restored local-only safeguards.") || raw.includes("No exposure change was made.")
+      ? "This computer is still local-only."
+      : "BiBCode could not confirm that this computer is back to local-only; check Remote access below.";
   if (raw.includes("firewall-elevation-required")) {
     return {
       reason: "elevation-required",
-      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Try again and approve the Windows PowerShell permission prompt, or close BiBCode, start it with Run as administrator, and try again.`,
+      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Try again and approve the Windows permission prompt, or close BiBCode, start it with Run as administrator, and try again.`,
     };
   }
   const step = Object.entries(FIREWALL_STEP_FAILURES).find(([token]) => raw.includes(token));
@@ -248,6 +249,14 @@ function resolveOfferEndpoint(deps: GenerateShareOfferDeps): string | null {
   return deps.selectedOption.httpBaseUrl;
 }
 
+/** Keeps the chosen host and takes the port the widened server actually listens on. */
+function withPortOf(endpoint: string, widenedEndpoint: string | null): string {
+  if (widenedEndpoint === null) return endpoint;
+  const url = new URL(endpoint);
+  url.port = new URL(widenedEndpoint).port;
+  return url.toString();
+}
+
 export async function generateShareOffer(
   deps: GenerateShareOfferDeps,
 ): Promise<
@@ -293,7 +302,7 @@ export async function generateShareOffer(
     try {
       const state = await deps.applyServerExposure("network-accessible");
       widened = true;
-      if (endpoint === null) endpoint = state.endpointUrl;
+      endpoint = endpoint === null ? state.endpointUrl : withPortOf(endpoint, state.endpointUrl);
     } catch (error) {
       return { ok: false, failure: { kind: "widen-failed", ...describeWidenFailure(error) } };
     }

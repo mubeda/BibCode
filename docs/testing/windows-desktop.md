@@ -728,15 +728,25 @@ minimum-size, and relevant Windows DPI states. Verify:
   `server_exposure.rs` (`cargo test -p bibcode-desktop -- firewall
   server_exposure`): the recorded elevation refusal and a translated variant are
   classified by the `whoami /groups` integrity SID, an elevated desktop gets the
-  plain failure, one approved prompt adds or replaces the rule, a declined or
-  timed-out prompt is one refusal that recovery verifies local-only, a second
-  widen cannot open a second prompt, the elevated command line runs only system
-  `netsh` with quoted fixed arguments, and an unelevated narrowing that cannot
+  plain failure, one approved prompt adds the rule (two replace a rule for
+  another path), a declined or timed-out prompt is one refusal that changes
+  nothing, a prompt does not hold other exposure changes, a second widen cannot
+  open a second prompt, the netsh arguments follow the Windows command-line
+  rules for hostile install paths, and an unelevated narrowing that cannot
   delete the rule reports `firewall-rule-left` without failing a verified
-  local-only listener. The real Windows elevation prompt needs a person at the
-  screen to approve or decline it and is not part of the automated gate; when a
-  person runs it, record the dialog text for approve, decline and time-out, the
-  listener with `Get-NetTCPConnection -State Listen`, and the rule state. Run the
+  local-only listener. On Windows, also run the unelevated argument probe, which
+  starts a stand-in program through the same `ShellExecuteExW` path without a
+  prompt and compares the arguments it received with the built ones:
+
+  ```powershell
+  cargo build -p bibcode-desktop --example firewall_argv_echo
+  cargo test -p bibcode-desktop --lib -- --ignored --exact firewall::tests::elevation_arguments_reach_a_stand_in_program_byte_for_byte
+  ```
+
+  The real Windows elevation prompt needs a person at the screen to approve or
+  decline it and is not part of the automated gate; when a person runs it,
+  record the dialog text for approve, decline and time-out, the listener with
+  `Get-NetTCPConnection -State Listen`, and the rule state. Run the
   host-independent deletion-spawn and policy-denial tests, then reproduce a
   deletion denial from an elevated desktop and confirm the app reports
   incomplete cleanup rather than claiming the rule was removed. A missing rule is benign when `netsh advfirewall firewall show rule`
