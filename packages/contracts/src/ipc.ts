@@ -1348,7 +1348,14 @@ export interface DesktopBridge {
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
-  applyServerExposure: (desired: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
+  /**
+   * `allowElevationPrompt` lets a widen the person started ask Windows for administrator
+   * permission to open the firewall. Automatic callers leave it out.
+   */
+  applyServerExposure: (
+    desired: DesktopServerExposureMode,
+    options?: { readonly allowElevationPrompt?: boolean },
+  ) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {
     readonly enabled: boolean;
     readonly port?: number;

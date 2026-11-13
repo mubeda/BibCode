@@ -3,10 +3,57 @@ import type { AdvertisedEndpoint } from "@bibcode/contracts";
 import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
 import {
+  describeWidenFailure,
   generateShareOffer,
   nativeShareAddressUnavailableReason,
   resolveShareAddressOptions,
 } from "./shareOffer.ts";
+
+const RESTORED = "Restored local-only safeguards.";
+
+describe("describeWidenFailure", () => {
+  it("explains missing administrator permission from the desktop's string rejection", () => {
+    expect(
+      describeWidenFailure(
+        `Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. ${RESTORED}`,
+      ),
+    ).toEqual({
+      reason: "elevation-required",
+      message:
+        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Choose Retry and approve the Windows prompt, or close BiBCode, start it with Run as administrator, and generate the code again.",
+    });
+  });
+
+  it.each([
+    ["firewall-add-failed", "BiBCode could not add its Windows Firewall rule"],
+    ["firewall-remove-failed", "BiBCode could not replace its old Windows Firewall rule"],
+    ["firewall-read-failed", "BiBCode could not read the Windows Firewall rules"],
+    ["firewall-timed-out", "the Windows Firewall change took too long"],
+    ["firewall-unavailable", "the Windows Firewall step could not run"],
+  ])("names the failed firewall step for %s", (token, step) => {
+    expect(
+      describeWidenFailure(new Error(`open remote-access firewall rule: ${token}. ${RESTORED}`)),
+    ).toEqual({
+      message: `Remote access was not turned on: ${step}. This computer is still local-only. Try again.`,
+    });
+  });
+
+  it("does not claim local-only when recovery could not confirm it", () => {
+    expect(
+      describeWidenFailure(
+        "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-add-failed. Local-only recovery also reported: stop failed.",
+      ).message,
+    ).toContain("BiBCode could not confirm that this computer is back to local-only");
+  });
+
+  it("keeps a string rejection's own reason instead of the generic text", () => {
+    expect(
+      describeWidenFailure("  restart did not produce a network-accessible endpoint "),
+    ).toEqual({ message: "restart did not produce a network-accessible endpoint" });
+    expect(describeWidenFailure("x".repeat(600)).message).toHaveLength(500);
+    expect(describeWidenFailure(undefined)).toEqual({ message: "Could not enable remote access." });
+  });
+});
 
 const wideState = {
   configuredMode: "network-accessible" as const,

@@ -125,6 +125,39 @@ export function resolveShareAddressOptions(input: {
   return options;
 }
 
+// Fixed reason tokens from the desktop's firewall step, named by what failed.
+const FIREWALL_STEP_FAILURES: Readonly<Record<string, string>> = {
+  "firewall-add-failed": "BiBCode could not add its Windows Firewall rule",
+  "firewall-remove-failed": "BiBCode could not replace its old Windows Firewall rule",
+  "firewall-read-failed": "BiBCode could not read the Windows Firewall rules",
+  "firewall-timed-out": "the Windows Firewall change took too long",
+  "firewall-unavailable": "the Windows Firewall step could not run",
+};
+const MAX_WIDEN_FAILURE_LENGTH = 500;
+
+/** Turns a widen rejection, an `Error` or the desktop bridge's plain string, into dialog text. */
+export function describeWidenFailure(error: unknown): {
+  readonly message: string;
+  readonly reason?: "elevation-required";
+} {
+  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const localState = raw.includes("Restored local-only safeguards.")
+    ? "This computer is still local-only."
+    : "BiBCode could not confirm that this computer is back to local-only; check Remote access below.";
+  if (raw.includes("firewall-elevation-required")) {
+    return {
+      reason: "elevation-required",
+      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Choose Retry and approve the Windows prompt, or close BiBCode, start it with Run as administrator, and generate the code again.`,
+    };
+  }
+  const step = Object.entries(FIREWALL_STEP_FAILURES).find(([token]) => raw.includes(token));
+  if (step !== undefined) {
+    return { message: `Remote access was not turned on: ${step[1]}. ${localState} Try again.` };
+  }
+  const reason = raw.trim().slice(0, MAX_WIDEN_FAILURE_LENGTH);
+  return { message: reason === "" ? "Could not enable remote access." : reason };
+}
+
 export type ShareOfferCleanupOutcome =
   | "local-confirmed"
   | "active-reason"
@@ -133,7 +166,12 @@ export type ShareOfferCleanupOutcome =
 
 export type GenerateShareOfferFailure =
   | { readonly kind: "invalid-address"; readonly message: string }
-  | { readonly kind: "widen-failed"; readonly message: string }
+  | {
+      readonly kind: "widen-failed";
+      readonly message: string;
+      /** Set when Windows refused the firewall change for lack of administrator permission. */
+      readonly reason?: "elevation-required";
+    }
   | {
       readonly kind: "mint-failed";
       readonly message: string;
@@ -257,13 +295,7 @@ export async function generateShareOffer(
       widened = true;
       if (endpoint === null) endpoint = state.endpointUrl;
     } catch (error) {
-      return {
-        ok: false,
-        failure: {
-          kind: "widen-failed",
-          message: error instanceof Error ? error.message : "Could not enable remote access.",
-        },
-      };
+      return { ok: false, failure: { kind: "widen-failed", ...describeWidenFailure(error) } };
     }
   }
 

@@ -612,9 +612,10 @@ function createTauriDesktopBridge(
         undefined,
         defaultServerExposureState,
       ),
-    applyServerExposure: (desired) =>
+    applyServerExposure: (desired, options) =>
       tauriInvokeDesktop<DesktopServerExposureState>("desktop_bridge_apply_server_exposure", {
         desired,
+        allowElevationPrompt: options?.allowElevationPrompt === true,
       }),
     setTailscaleServeEnabled: (input) =>
       tauriInvokeOr<DesktopServerExposureState>(
