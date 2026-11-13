@@ -515,6 +515,7 @@ const testState = vi.hoisted(() => ({
         terminalOrderedInput?: boolean;
         terminalSizeOwnership?: boolean;
         terminalUserInputClaim?: boolean;
+        terminalSizeHandOver?: boolean;
         terminalImagePaste?: boolean;
       };
     };
@@ -2188,10 +2189,68 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledTimes(2);
   });
 
+  /** Drives `applySize` through a reset, an `attached` and a `resized` of one un-owned size. */
+  const handOverSignals = async (capabilities: Record<string, boolean>) => {
+    testState.serverConfig!.environment.capabilities = {
+      terminalSizeOwnership: true,
+      terminalUserInputClaim: true,
+      ...capabilities,
+    };
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const view = await mountViewport();
+    const size = { cols: 151, rows: 50, sizeClaim: null, replyClaim: "other-window" };
+    const snapshot: TerminalAttachStreamEvent = {
+      type: "snapshot",
+      snapshot: { ...terminalSnapshot("prompt"), size },
+    };
+    const fitShown = () => view.mounted.container.textContent?.includes("Fit to this window");
+    const steps: Array<{ claimed: boolean; fitShown: boolean | undefined }> = [];
+    const record = async (signal: () => void) => {
+      view.resizeSpy.mockClear();
+      await act(async () => signal());
+      await view.flushFrame();
+      steps.push({ claimed: view.resizeSpy.mock.calls.length > 0, fitShown: fitShown() });
+    };
+    elapseMountSettle();
+    await record(() => view.runtime.ingest(snapshot));
+    const claim = (testState.attachedSessionInputs.at(-1) as { terminal: { sizeClaim: string } })
+      .terminal.sizeClaim;
+    await record(() => view.runtime.ingest(snapshot, { sizeClaim: claim }));
+    await record(() =>
+      view.runtime.ingest({ type: "resized", threadId: THREAD_ID, terminalId: "term-1", size }),
+    );
+    return steps;
+  };
+
+  it.each([
+    ["absent", {}],
+    ["false", { terminalSizeHandOver: false }],
+  ] as const)(
+    "keeps the claim rule without the hand-over capability (%s): reset, attached and resized",
+    async (_case, extra) => {
+      const steps = await handOverSignals(extra);
+      expect(steps).toEqual([
+        { claimed: true, fitShown: false },
+        { claimed: true, fitShown: false },
+        { claimed: true, fitShown: false },
+      ]);
+    },
+  );
+
+  it("applies the hand-over rule with the hand-over capability: reset, attached and resized", async () => {
+    const steps = await handOverSignals({ terminalSizeHandOver: true });
+    expect(steps).toEqual([
+      { claimed: false, fitShown: true },
+      { claimed: false, fitShown: true },
+      { claimed: false, fitShown: true },
+    ]);
+  });
+
   it("waits for use of a size a handing-over server released, but claims a restart's (#348)", async () => {
     testState.serverConfig!.environment.capabilities = {
       terminalSizeOwnership: true,
       terminalUserInputClaim: true,
+      terminalSizeHandOver: true,
     };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const view = await mountViewport();
@@ -8755,6 +8814,7 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     testState.serverConfig!.environment.capabilities = {
       terminalSizeOwnership: true,
       terminalUserInputClaim: true,
+      terminalSizeHandOver: true,
     };
     server = new FakeTerminalManager();
     machines = [];

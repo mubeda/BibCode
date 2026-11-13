@@ -987,6 +987,9 @@ export function TerminalViewport({
   // The server tells a user's input from the terminal's own replies (#348).
   const userInputClaim =
     sizeOwnership && serverConfig?.environment.capabilities?.terminalUserInputClaim === true;
+  // A released size waits for a window to be used only on a server that says it hands over.
+  const sizeHandOver =
+    sizeOwnership && serverConfig?.environment.capabilities?.terminalSizeHandOver === true;
   const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
   // One claim for this viewport's renderers: a renderer recreated when the window is hidden
   // and shown is the same window to the server, which gives a returning owner its size back.
@@ -1974,7 +1977,7 @@ export function TerminalViewport({
       appliedSize = size ?? null;
       if (size?.sizeClaim != null) unownedUntilUsed = false;
       // A window attaching to a size the server left un-owned waits to be used as well.
-      else if (isUnownedUntilUsed(size)) unownedUntilUsed = true;
+      else if (sizeHandOver && isUnownedUntilUsed(size)) unownedUntilUsed = true;
       if (size && !terminalDimensionsEqual(terminal, size)) {
         const wasAtBottom = followsOutput();
         terminal.resize(size.cols, size.rows);
@@ -1997,7 +2000,7 @@ export function TerminalViewport({
           outputSink.barrier(() => {
             // An older server leaves every released size un-owned; one that hands it over does
             // so only when no remaining window is known to be in use.
-            unownedUntilUsed = userInputClaim && signal.size.sizeClaim === null;
+            unownedUntilUsed = sizeHandOver && signal.size.sizeClaim === null;
             applySize(signal.size, false, signal);
           });
         }
@@ -2605,6 +2608,7 @@ export function TerminalViewport({
     sizeOwnership,
     orderedInput,
     userInputClaim,
+    sizeHandOver,
     viewportSizeClaim,
   ]);
 
