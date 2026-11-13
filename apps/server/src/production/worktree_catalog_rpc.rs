@@ -1278,6 +1278,12 @@ async fn create_managed_worktree(
         .await
 }
 
+/// The `create-rollback` outcome of a failed creation's rollback: a fixed reason token, never
+/// the rollback's detail or a path.
+fn create_rollback_outcome(rolled_back: bool) -> Result<(), &'static str> {
+    if rolled_back { Ok(()) } else { Err("internal") }
+}
+
 async fn create_managed_worktree_locked(
     services: &WorktreeCatalogRpcServices,
     input: WorktreeCreateManagedInput,
@@ -1354,22 +1360,33 @@ async fn create_managed_worktree_locked(
         {
             Ok(record_id) => record_id,
             Err(error) => {
-            tracing::error!(%error, "managed worktree creation could not record the worktree");
-            let rollback = repository
-                .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
-                .await;
-            let detail = match rollback {
-                Ok(()) => format!("The worktree creation could not be recorded: {error}"),
-                Err(rollback) => format!(
-                    "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
-                    rollback.detail
-                ),
-            };
-            return Err(encode(adoption_error(
-                WorktreeAdoptionErrorReason::Internal,
-                detail,
-                None,
-            )));
+                tracing::error!(%error, "managed worktree creation could not record the worktree");
+                let started = Instant::now();
+                let rollback = repository
+                    .rollback_managed_worktree_creation(
+                        Path::new(&project.workspace_root),
+                        &rollback,
+                    )
+                    .await;
+                record_removal_outcome(
+                    "create-rollback",
+                    create_rollback_outcome(rollback.is_ok()),
+                    started.elapsed(),
+                    false,
+                    cancellation.is_cancelled(),
+                );
+                let detail = match rollback {
+                    Ok(()) => format!("The worktree creation could not be recorded: {error}"),
+                    Err(rollback) => format!(
+                        "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
+                        rollback.detail
+                    ),
+                };
+                return Err(encode(adoption_error(
+                    WorktreeAdoptionErrorReason::Internal,
+                    detail,
+                    None,
+                )));
             }
         };
         let terminal_cancellation = CancellationToken::new();
@@ -1403,9 +1420,17 @@ async fn create_managed_worktree_locked(
             )
             .await;
         if let Err(error) = dispatch {
+            let started = Instant::now();
             let rollback = repository
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
                 .await;
+            record_removal_outcome(
+                "create-rollback",
+                create_rollback_outcome(rollback.is_ok()),
+                started.elapsed(),
+                false,
+                cancellation.is_cancelled(),
+            );
             if rollback.is_ok()
                 && let Err(error) = repositories.reap_worktree_creation_record(record_id).await
             {
@@ -5666,6 +5691,71 @@ mod mutation_invalidation_tests {
         assert!(
             creation_records(&fixture).await.is_empty(),
             "the record ends with the worktree, whatever the project spelling"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn create_rollback_outcome_uses_fixed_tokens() {
+        assert_eq!(super::create_rollback_outcome(true), Ok(()));
+        assert_eq!(super::create_rollback_outcome(false), Err("internal"));
+    }
+
+    #[tokio::test]
+    async fn create_rollback_after_a_dispatch_failure_leaves_no_worktree_or_record() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/dup"]);
+        // The thread the creation would add already exists, so its dispatch is refused.
+        fixture
+            .engine
+            .dispatch(OrchestrationCommand::ThreadCreate {
+                command_id: "create-dup-thread".to_owned(),
+                thread_id: "dup-thread".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Existing".to_owned(),
+                kind: Some("workspace".to_owned()),
+                host_thread_id: None,
+                side_chat: false,
+                purpose: None,
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: None,
+                worktree_path: None,
+                created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
+            })
+            .await
+            .expect("thread created");
+        let managed = GitRepository::default()
+            .managed_worktree_parent(&fixture.main)
+            .await
+            .expect("managed worktree directory");
+
+        let error = create_managed(&fixture, "dup", "feature/dup")
+            .await
+            .expect_err("a refused dispatch fails the creation");
+        assert_eq!(error["reason"], "orchestration-failed", "{error}");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&managed)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "no worktree folder: {leftovers:?}");
+        assert!(creation_records(&fixture).await.is_empty(), "no record");
+        let inventory = GitRepository::default()
+            .worktree_inventory(&fixture.main, &CancellationToken::new())
+            .await
+            .expect("repository remains readable");
+        assert_eq!(
+            inventory.records.len(),
+            1,
+            "Git lists only the primary checkout: {:?}",
+            inventory.records
         );
         fixture.shutdown().await;
     }
