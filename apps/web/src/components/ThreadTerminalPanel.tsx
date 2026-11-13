@@ -100,6 +100,7 @@ import {
   isTerminalSizingMinimum,
   proposeTerminalDimensions,
   registerTerminalSizeReader,
+  remeasureTerminalCharSize,
   terminalHostHasArea,
 } from "./terminalSizing";
 import {
@@ -2864,8 +2865,17 @@ export function TerminalViewport({
       scheduleResize();
     }
     watchPixelRatio();
+    // A font that loads later changes the cell without changing the box (#348).
+    const fonts = typeof document.fonts?.addEventListener === "function" ? document.fonts : null;
+    const handleFontLoadingDone = () => {
+      const terminal = terminalRef.current;
+      if (terminal) remeasureTerminalCharSize(terminal);
+      scheduleResize();
+    };
+    fonts?.addEventListener("loadingdone", handleFontLoadingDone);
 
     return () => {
+      fonts?.removeEventListener("loadingdone", handleFontLoadingDone);
       pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
       observer.disconnect();
       workspace?.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);

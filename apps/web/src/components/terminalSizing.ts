@@ -1,4 +1,5 @@
 import type { FitAddon } from "@xterm/addon-fit";
+import type { Terminal } from "@xterm/xterm";
 import {
   TERMINAL_COLS_MIN,
   TERMINAL_COLS_MAX,
@@ -34,6 +35,27 @@ export function proposeTerminalDimensions(
       : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Measures the terminal's cell again, so the fit addon proposes from a late font's glyphs:
+ * xterm caches the cell size and a repaint measures nothing (#348). False when the
+ * installed xterm has no measurement to call.
+ */
+export function remeasureTerminalCharSize(terminal: Terminal): boolean {
+  // shortcut: calls xterm 6.0.0's private CharSizeService.measure, feature-detected; remove when xterm exposes a public re-measure
+  try {
+    const service = (
+      terminal as unknown as {
+        readonly _core?: { readonly _charSizeService?: { readonly measure?: () => void } };
+      }
+    )._core?._charSizeService;
+    if (typeof service?.measure !== "function") return false;
+    service.measure();
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -45,6 +45,7 @@ interface FakeTerminalInstance {
   readonly resize: ReturnType<typeof vi.fn>;
   readonly scrollToBottom: ReturnType<typeof vi.fn>;
   readonly clearTextureAtlas: ReturnType<typeof vi.fn>;
+  readonly _core: { readonly _charSizeService: { readonly measure: ReturnType<typeof vi.fn> } };
   readonly dispose: ReturnType<typeof vi.fn>;
   readonly loadAddon: ReturnType<typeof vi.fn>;
   readonly clearSelection: ReturnType<typeof vi.fn>;
@@ -371,6 +372,8 @@ vi.mock("@xterm/xterm", () => ({
     };
     readonly scrollToBottom = vi.fn();
     readonly clearTextureAtlas = vi.fn();
+    // xterm 6.0.0's private cell measurement, which a late font load re-runs (#348).
+    readonly _core = { _charSizeService: { measure: vi.fn() } };
     readonly loadedAddons: Array<{ dispose?: () => void }> = [];
     readonly dispose = vi.fn(() => {
       this.disposed = true;
@@ -1026,6 +1029,18 @@ function trackedTranscriptRuntime(initialSnapshot: string): {
   };
 }
 
+/** A `document.fonts` whose `loadingdone` the test fires: happy-dom loads no fonts. */
+function stubDocumentFonts(): EventTarget {
+  const fonts = Object.assign(new EventTarget(), { status: "loaded" });
+  Object.defineProperty(document, "fonts", { configurable: true, value: fonts });
+  return fonts;
+}
+
+/** The order of the first call to `mocks` after they were last cleared, or Infinity. */
+function firstCallOrder(...mocks: ReturnType<typeof vi.fn>[]): number {
+  return Math.min(...mocks.map((mock) => mock.mock.invocationCallOrder[0] ?? Infinity));
+}
+
 async function flushAnimationFrames(): Promise<void> {
   await act(async () => {
     while (animationFrames.size > 0) {
@@ -1514,6 +1529,7 @@ afterEach(async () => {
   xtermState.fitAddons = [];
   document.body.replaceChildren();
   Reflect.deleteProperty(document, "execCommand");
+  Reflect.deleteProperty(document, "fonts");
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -3694,6 +3710,146 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(watched()).toEqual([]);
     },
   );
+
+  it.each(["legacy", "owner", "mirror"] as const)(
+    "re-measures and repaints when a font finishes loading under an unchanged mount (%s)",
+    { timeout: 30_000 },
+    async (mode) => {
+      // #348: a font that loads after the terminal measured its cell leaves xterm's cached
+      // cell size stale while the mount keeps its box and the ResizeObserver stays silent.
+      const fonts = stubDocumentFonts();
+      if (mode !== "legacy") {
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      }
+      vi.spyOn(document, "hasFocus").mockReturnValue(false);
+      const view = await mountViewport({ visible: true });
+      const terminal = view.fakeTerminal!;
+      const fitAddon = xtermState.fitAddons.at(-1)!;
+      const fit = fitAddon.fit;
+      // The fake grid changes only when fit runs, as xterm's does.
+      fit.mockImplementation(() => {
+        if (xtermState.proposedDimensions) {
+          terminal.cols = xtermState.proposedDimensions.cols;
+          terminal.rows = xtermState.proposedDimensions.rows;
+        }
+      });
+      await view.flushFrame();
+      await view.flushMountFit();
+      let claim: string | undefined;
+      if (mode !== "legacy") {
+        await act(async () =>
+          view.runtime.ingest({
+            type: "snapshot",
+            snapshot: {
+              ...terminalSnapshot("prompt"),
+              size: { cols: 80, rows: 24, sizeClaim: mode === "owner" ? null : "other-window" },
+            },
+          }),
+        );
+        if (mode === "owner") {
+          claim = view.resizeSpy.mock.calls.at(-1)![0].input.sizeClaim as string;
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 24, sizeClaim: claim! },
+            }),
+          );
+        }
+      }
+      expect(terminal.rows).toBe(24);
+      const measure = terminal._core._charSizeService.measure;
+      xtermState.proposedDimensions = { cols: 80, rows: 23 };
+      view.resizeSpy.mockClear();
+      fit.mockClear();
+      fitAddon.proposeDimensions.mockClear();
+      measure.mockClear();
+      terminal.clearTextureAtlas.mockClear();
+      terminal.refresh.mockClear();
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await act(async () => fonts.dispatchEvent(new Event("loadingdone")));
+        await view.flushFrame();
+        if (mode === "legacy") {
+          expect(fit).toHaveBeenCalledOnce();
+          expect(terminal.rows).toBe(23);
+          expect(view.resizeSpy).toHaveBeenCalledWith({
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              cols: 80,
+              rows: 23,
+              structuredResult: true,
+            },
+          });
+        } else if (mode === "owner") {
+          expect(view.resizeSpy).toHaveBeenCalledWith({
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              cols: 80,
+              rows: 23,
+              sizeClaim: claim,
+              structuredResult: true,
+            },
+          });
+          await act(async () =>
+            view.runtime.ingest({
+              type: "resized",
+              threadId: THREAD_ID,
+              terminalId: "term-1",
+              size: { cols: 80, rows: 23, sizeClaim: claim! },
+            }),
+          );
+          expect(terminal.rows).toBe(23);
+        } else {
+          // A mirror keeps the owner's grid and never claims on a font change.
+          expect(fit).not.toHaveBeenCalled();
+          expect(view.resizeSpy).not.toHaveBeenCalled();
+          expect(terminal.cols).toBe(80);
+          expect(terminal.rows).toBe(24);
+        }
+        await act(async () => vi.advanceTimersByTime(50));
+        expect(terminal.clearTextureAtlas).toHaveBeenCalledOnce();
+        expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+      } finally {
+        vi.useRealTimers();
+      }
+      // The cell is measured before any size is proposed; legacy's fit proposes inside.
+      expect(measure).toHaveBeenCalledOnce();
+      expect(measure.mock.invocationCallOrder[0]).toBeLessThan(
+        firstCallOrder(fitAddon.proposeDimensions, fit),
+      );
+    },
+  );
+
+  it("does nothing when a font finishes loading after unmount", { timeout: 30_000 }, async () => {
+    const fonts = stubDocumentFonts();
+    const view = await mountViewport({ visible: true });
+    await view.flushFrame();
+    await view.flushMountFit();
+    const terminal = view.fakeTerminal!;
+    const fit = xtermState.fitAddons.at(-1)!.fit;
+    await unmount(view.mounted);
+    view.resizeSpy.mockClear();
+    fit.mockClear();
+    terminal._core._charSizeService.measure.mockClear();
+    terminal.clearTextureAtlas.mockClear();
+    terminal.refresh.mockClear();
+
+    await act(async () => fonts.dispatchEvent(new Event("loadingdone")));
+    await view.flushFrame();
+
+    expect(terminal._core._charSizeService.measure).not.toHaveBeenCalled();
+    expect(fit).not.toHaveBeenCalled();
+    expect(terminal.clearTextureAtlas).not.toHaveBeenCalled();
+    expect(terminal.refresh).not.toHaveBeenCalled();
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+  });
 
   it("sends a height-only change of the mount to the PTY as the size owner", async () => {
     // #348: an Activity card appearing below an AI terminal shrinks only its height.
