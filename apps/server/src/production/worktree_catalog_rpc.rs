@@ -351,7 +351,7 @@ pub struct WorktreeCatalogRpcServices {
     panel_dispatch_gate: Option<crate::production::step_gate::StepGate>,
     #[cfg(test)]
     removal_admission_timeout: Duration,
-    #[cfg(test)]
+    /// Receives one permit each time a removal starts waiting for admitted work, for tests.
     removal_drain_entered: Option<Arc<Semaphore>>,
 }
 
@@ -534,7 +534,6 @@ impl WorktreeCatalogRpcServices {
             panel_dispatch_gate: None,
             #[cfg(test)]
             removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
-            #[cfg(test)]
             removal_drain_entered: None,
         }
     }
@@ -542,6 +541,18 @@ impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn with_removal_quiescer(mut self, quiescer: Arc<dyn WorktreeRemovalQuiescer>) -> Self {
         self.removal_quiescer = quiescer;
+        self
+    }
+
+    /// Adds one permit to `entered` each time a removal starts waiting for admitted work to
+    /// drain, so an integration test can act inside the drain without guessing its timing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_removal_drain_signal_for_integration_test(
+        mut self,
+        entered: Arc<Semaphore>,
+    ) -> Self {
+        self.removal_drain_entered = Some(entered);
         self
     }
 
@@ -2299,7 +2310,6 @@ async fn remove_worktree_owned(
                 let drain_timeout = REMOVAL_ADMISSION_DRAIN_TIMEOUT;
                 #[cfg(test)]
                 let drain_timeout = services.removal_admission_timeout;
-                #[cfg(test)]
                 if let Some(entered) = &services.removal_drain_entered {
                     entered.add_permits(1);
                 }

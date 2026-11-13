@@ -31,7 +31,10 @@ use bibcode_server::{
 use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::{sync::watch, time::timeout};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::timeout,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 #[path = "support/isolated_git_config.rs"]
@@ -231,16 +234,22 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .acquire_admission(&thread_id, [fixture.worktree.as_path()])
         .await
         .expect("admission");
+    // Forget the permit of the undrained removal, so the next one is this removal's.
+    let earlier = fixture.drain_entered.available_permits();
+    if let Ok(permits) = fixture
+        .drain_entered
+        .try_acquire_many(u32::try_from(earlier).expect("permit count"))
+    {
+        permits.forget();
+    }
     remove(&mut fixture, &thread_id, "remove-interrupted", true, "6").await;
-    timeout(RPC_DEADLINE, async {
-        while fixture.availability.guard_thread(&thread_id).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the removal holds its removing guard");
-    // Past the plan, which takes milliseconds, and into the drain, which takes 5 s.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Interrupt inside the drain, whatever the plan before it takes: waiting on time instead
+    // lets a slow plan see the interrupt and fail with its own reason.
+    timeout(RPC_DEADLINE, fixture.drain_entered.acquire())
+        .await
+        .expect("the removal reaches the admission drain")
+        .expect("drain signal")
+        .forget();
     send(
         fixture.socket(),
         json!({ "_tag": "Interrupt", "requestId": "7" }),
@@ -680,6 +689,8 @@ struct Fixture {
     repositories: Repositories,
     catalog: WorktreeCatalogService,
     availability: WorkspaceAvailabilityRegistry,
+    /// One permit each time a removal starts waiting for admitted work.
+    drain_entered: Arc<Semaphore>,
     operations: WorktreeCatalogOperationRuntime,
     engine: OrchestrationEngine,
     handle: Option<bibcode_server::ServerHandle>,
@@ -745,7 +756,9 @@ impl Fixture {
             Arc::new(GitRepository::default()),
             availability.clone(),
         );
-        let services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone());
+        let drain_entered = Arc::new(Semaphore::new(0));
+        let services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone())
+            .with_removal_drain_signal_for_integration_test(Arc::clone(&drain_entered));
         let operations = services.operation_runtime();
         let mut registry = RpcRegistry::empty();
         register_worktree_catalog_rpc(&mut registry, services);
@@ -768,6 +781,7 @@ impl Fixture {
             repositories,
             catalog,
             availability,
+            drain_entered,
             operations,
             engine,
             handle: Some(handle),
