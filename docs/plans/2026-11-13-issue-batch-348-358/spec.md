@@ -327,9 +327,12 @@ WHILE the Git Manager branch picker is closed, its list SHALL NOT be rendered or
 
 WHERE the Profiler is on, WHEN the app's error screen catches a render error, the Profiler SHALL record one event for it and SHALL group repeats in one finding. This is the follow-up the issue names; the user added it to #360 on 2026-11-13.
 
-- The record holds: the error's type name, React's error code when the message is React's minified form (185 for the nested-update limit), the names of at most 12 top component-stack frames, the route pattern, and a fingerprint built only from those names.
+- The record holds: the error's type from a fixed list (anything else is "Other"), React's error code when the message is React's minified form (185 for the nested-update limit), at most 12 component names that are plain identifiers (anything else is "Unnamed"), the router's own route pattern (checked against the app's routes; anything else is dropped), and a fingerprint built only from those values. The client applies these rules and the server applies them again.
 - The record never holds: the error's message text, a URL, a file path, a thread or project id, prompt or terminal content. No path or timestamp is part of the fingerprint.
-- Given two identical errors, Then two events and one finding with a count of 2.
+- Given two identical errors, Then two events and one finding with a count of 2. The finding is grouped by type, code, route pattern and names: the packaged build shortens component names to one or two letters, so the route is the readable part.
+- A shape check cannot prove a name is not content: an identifier-shaped component name is recorded as it is. The docs say what is enforced where.
+- A record is kept for each connected server until that server accepts it, at most 8, and every send respects the server's minimum of 5 seconds between batches. Limit: a reload or close inside that window, or before the connection can send, loses the record.
+- Like the other client events, it carries the client's correlation id.
 - Given the Profiler is off, Then nothing is recorded or allocated, and the error screen behaves as before.
 - Reporting never throws from the error screen.
 

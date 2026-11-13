@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 2fe538815249)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 f28219e6df2a)
 Repository: this repository
 Base: main
 
