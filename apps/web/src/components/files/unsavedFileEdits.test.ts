@@ -138,12 +138,24 @@ describe("unsaved file edits across the window", () => {
   });
 
   describe("desktop close requests", () => {
+    let endInstall: (() => void) | null = null;
+    afterEach(() => {
+      // Module state outlives a test: end any install a test left blocked.
+      endInstall?.();
+      endInstall = null;
+      window.sessionStorage.clear();
+    });
+
     function fakeBridge() {
       let listener: ((request: DesktopCloseRequest) => void) | null = null;
       const replies: [number, string][] = [];
       return {
         replies,
         send: (request: DesktopCloseRequest) => listener?.(request),
+        onUpdateInstallEnded: (next: () => void) => {
+          endInstall = next;
+          return () => {};
+        },
         onCloseRequest: (next: (request: DesktopCloseRequest) => void) => {
           listener = next;
           return () => {
@@ -198,6 +210,21 @@ describe("unsaved file edits across the window", () => {
       await vi.waitFor(() => expect(getLeaveQuestion()?.files).toEqual(["notes.md"]));
       getLeaveQuestion()!.answer("cancel");
       await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([6, "stay"]));
+    });
+
+    it("a source registered during an update install is held until the install ends", async () => {
+      register(fakeSource());
+      const bridge = fakeBridge();
+      cleanups.push(respondToDesktopCloseRequests(bridge));
+      bridge.send({ requestId: 11, reason: "update" });
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([11, "allow"]));
+
+      const late = register(fakeSource());
+      expect(late.holdSavingForLeave).toHaveBeenCalledOnce();
+      expect(late.release).not.toHaveBeenCalled();
+      endInstall!();
+      endInstall = null;
+      expect(late.release).toHaveBeenCalledOnce();
     });
 
     it("Save all answers allow once every file is saved", async () => {

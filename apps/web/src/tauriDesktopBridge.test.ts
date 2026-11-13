@@ -237,6 +237,23 @@ function installTauriHarness(options?: {
   return { invoke, listen, listeners, unlisteners };
 }
 
+/** Tauri 2 rejects a command the desktop does not register with this exact text. */
+const UNKNOWN_UPDATE_STATE_COMMAND = "Command desktop_bridge_get_update_state not found";
+
+function rejectCommand(
+  harness: ReturnType<typeof installTauriHarness>,
+  command: string,
+  error: unknown,
+) {
+  const original = harness.invoke.getMockImplementation()!;
+  harness.invoke.mockImplementation(
+    (name: string, args?: Record<string, unknown>) =>
+      (name === command ? Promise.reject(error) : original(name, args)) as ReturnType<
+        typeof original
+      >,
+  );
+}
+
 async function installBridge(): Promise<DesktopBridge> {
   const { tauriDesktopBridgeReady } = await import("./tauriDesktopBridge");
   await tauriDesktopBridgeReady;
@@ -1740,6 +1757,7 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.setWslOnly(true)).rejects.toThrow(
       "unsupported fallback command: desktop_bridge_set_wsl_only",
     );
+    rejectCommand(harness, "desktop_bridge_get_update_state", UNKNOWN_UPDATE_STATE_COMMAND);
     await expect(bridge.getUpdateState()).resolves.toEqual({
       enabled: false,
       status: "disabled",
@@ -1764,6 +1782,74 @@ describe("tauriDesktopBridge", () => {
     );
     expect(localStorage.removeItem).toHaveBeenCalled();
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_update_state", undefined);
+  });
+
+  it("getUpdateState rejects when the native call fails", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const failure = new Error("boom");
+    rejectCommand(harness, "desktop_bridge_get_update_state", failure);
+    await expect(bridge.getUpdateState()).rejects.toBe(failure);
+  });
+
+  it("getUpdateState answers the default when the desktop lacks the command", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    rejectCommand(harness, "desktop_bridge_get_update_state", UNKNOWN_UPDATE_STATE_COMMAND);
+    await expect(bridge.getUpdateState()).resolves.toMatchObject({
+      enabled: false,
+      status: "disabled",
+      requestedBy: null,
+    });
+    rejectCommand(harness, "desktop_bridge_get_update_state", {
+      code: "tauri_capability_unsupported",
+      method: "getUpdateState",
+      capability: "updater",
+    });
+    await expect(bridge.getUpdateState()).resolves.toMatchObject({
+      enabled: false,
+      requestedBy: null,
+    });
+  });
+
+  it("other entries still fall back on a native failure", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    rejectCommand(harness, "desktop_bridge_get_client_settings", new Error("boom"));
+    await expect(bridge.getClientSettings()).resolves.toBeNull();
+  });
+
+  it("a native failure through the real bridge keeps the restored block", async () => {
+    try {
+      const harness = installTauriHarness();
+      const storage = new Map<string, string>([["bibcode:update-install-allowed", "1"]]);
+      Object.assign(window, {
+        addEventListener: vi.fn(),
+        sessionStorage: {
+          getItem: (key: string) => storage.get(key) ?? null,
+          setItem: (key: string, value: string) => storage.set(key, value),
+          removeItem: (key: string) => storage.delete(key),
+        },
+      });
+      const bridge = await installBridge();
+      vi.useFakeTimers();
+      rejectCommand(harness, "desktop_bridge_get_update_state", new Error("boom"));
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { isUpdateInstalling, respondToDesktopCloseRequests } =
+        await import("./components/files/unsavedFileEdits");
+
+      const stop = respondToDesktopCloseRequests(bridge);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const asked = () =>
+        harness.invoke.mock.calls.filter(([name]) => name === "desktop_bridge_get_update_state")
+          .length;
+      expect(asked()).toBeGreaterThanOrEqual(3);
+      expect(isUpdateInstalling()).toBe(true);
+      expect(storage.get("bibcode:update-install-allowed")).toBe("1");
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed when browser catalog storage and event subscription are unavailable", async () => {
