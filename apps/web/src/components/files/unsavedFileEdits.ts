@@ -1,4 +1,9 @@
-import type { DesktopBridge, DesktopCloseReply, DesktopCloseRequest } from "@bibcode/contracts";
+import type {
+  DesktopBridge,
+  DesktopCloseReply,
+  DesktopCloseRequest,
+  DesktopUpdateState,
+} from "@bibcode/contracts";
 
 import { toastManager } from "../ui/toast";
 
@@ -82,8 +87,90 @@ export function isUpdateInstalling(): boolean {
   return updateInstall !== null;
 }
 
+/** Kept per window, so a reload during an allowed install restores the block before any save. */
+const INSTALL_MARKER_KEY = "bibcode:update-install-allowed";
+
+function readInstallMarker(): boolean {
+  try {
+    return window.sessionStorage.getItem(INSTALL_MARKER_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeInstallMarker(on: boolean): void {
+  try {
+    if (on) window.sessionStorage.setItem(INSTALL_MARKER_KEY, "1");
+    else window.sessionStorage.removeItem(INSTALL_MARKER_KEY);
+  } catch {
+    // An unusable sessionStorage means no marker: a reload then cannot restore the block.
+  }
+}
+
+/** The desktop sets `phase` to protecting or installing only after the window allowed it. */
+function isRemoteInstallRunning(state: DesktopUpdateState | null | undefined): boolean {
+  return (
+    state?.requestedBy != null && (state.phase === "protecting" || state.phase === "installing")
+  );
+}
+
+/**
+ * A confirmed state starts or ends the block. Only a cleared requester ends it: between the allow
+ * and the backup the phase still reads "available" with the requester set.
+ */
+function settleInstallState(state: DesktopUpdateState | null | undefined): void {
+  if (isRemoteInstallRunning(state)) blockForUpdateInstall();
+  else if (state?.requestedBy == null && updateInstall !== null) endUpdateInstall();
+}
+
+const INSTALL_STATE_TIMEOUT_MS = 5_000;
+const INSTALL_STATE_RETRY_MS = 2_000;
+
+/**
+ * Asks the desktop for its update state until it answers. A rejection or a timeout is not an
+ * answer: it changes nothing and asks again. Returns the function that stops asking.
+ */
+function askInstallState(
+  bridge: Pick<DesktopBridge, "getUpdateState">,
+  onAnswer: (state: DesktopUpdateState | null | undefined) => void,
+  onAttemptFailed?: () => void,
+): () => void {
+  let stopped = false;
+  let warned = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const attempt = () => {
+    let settled = false;
+    const fail = (error: unknown) => {
+      if (settled || stopped) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!warned) {
+        warned = true;
+        console.warn("[unsaved-file-edits] could not read the desktop update state", error);
+      }
+      timer = setTimeout(attempt, INSTALL_STATE_RETRY_MS);
+      onAttemptFailed?.();
+    };
+    timer = setTimeout(() => fail(new Error("no answer in time")), INSTALL_STATE_TIMEOUT_MS);
+    new Promise<DesktopUpdateState>((resolve) => resolve(bridge.getUpdateState())).then((state) => {
+      // An answer after its own timeout or after stopping is stale.
+      if (settled || stopped) return;
+      settled = true;
+      stopped = true;
+      clearTimeout(timer);
+      onAnswer(state);
+    }, fail);
+  };
+  attempt();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
+}
+
 function blockForUpdateInstall(): void {
   if (updateInstall !== null) return;
+  writeInstallMarker(true);
   const holds = [...sources].map((source) => source.holdSavingForLeave());
   updateInstall = {
     holds,
@@ -97,6 +184,7 @@ function blockForUpdateInstall(): void {
 /** The desktop install ended without a restart: saving and editing run again. */
 function endUpdateInstall(): void {
   releaseLeaveHolds();
+  writeInstallMarker(false);
   const install = updateInstall;
   if (install === null) return;
   updateInstall = null;
@@ -207,10 +295,30 @@ const KEEPALIVE_INTERVAL_MS = 1_000;
  * while this subscription holds a request, and stopping it with one pending answers stay.
  */
 export function respondToDesktopCloseRequests(
-  bridge: Pick<DesktopBridge, "onCloseRequest" | "replyCloseRequest" | "onUpdateInstallEnded">,
+  bridge: Pick<DesktopBridge, "onCloseRequest" | "replyCloseRequest" | "onUpdateInstallEnded"> &
+    Partial<Pick<DesktopBridge, "getUpdateState" | "onUpdateState">>,
 ): () => void {
-  const { onCloseRequest, replyCloseRequest, onUpdateInstallEnded } = bridge;
+  const { onCloseRequest, replyCloseRequest, onUpdateInstallEnded, getUpdateState, onUpdateState } =
+    bridge;
   if (!onCloseRequest || !replyCloseRequest) return () => {};
+  let stopAsking = () => {};
+  const askAgain = () =>
+    new Promise<void>((resolve) => {
+      stopAsking();
+      if (!getUpdateState) {
+        settleInstallState(null);
+        resolve();
+        return;
+      }
+      stopAsking = askInstallState(
+        bridge as Pick<DesktopBridge, "getUpdateState">,
+        (state) => {
+          settleInstallState(state);
+          resolve();
+        },
+        resolve,
+      );
+    });
   let active: {
     readonly requestId: number;
     readonly reason: DesktopCloseRequest["reason"];
@@ -240,11 +348,27 @@ export function respondToDesktopCloseRequests(
     void askBeforeLeaving(reason).then((answer) => {
       if (active !== current) return;
       // Only a remote install asks with "update"; it keeps running long after this answer.
-      if (answer === "proceed" && reason === "update") blockForUpdateInstall();
+      if (answer === "proceed" && reason === "update") {
+        // An answer to a query sent before this allow would be stale.
+        stopAsking();
+        blockForUpdateInstall();
+      }
       finish(answer === "proceed" ? "allow" : "stay");
     });
   });
+  const stopUpdateState = onUpdateState?.(() => {
+    stopAsking();
+  });
+  if (getUpdateState) {
+    // The reload of a window that allowed an install: hold saving before anything can run.
+    if (readInstallMarker()) blockForUpdateInstall();
+    void askAgain();
+  } else if (updateInstall === null) {
+    // Nothing can confirm an install on this desktop, so it counts as not installing.
+    writeInstallMarker(false);
+  }
   const stopEnded = onUpdateInstallEnded?.(() => {
+    stopAsking();
     // The person forced the install from the native prompt while this question was open; a late
     // answer must not start a block that no signal will end.
     if (active?.reason === "update") {
@@ -257,6 +381,8 @@ export function respondToDesktopCloseRequests(
   return () => {
     unsubscribe();
     stopEnded?.();
+    stopUpdateState?.();
+    stopAsking();
     if (active === null) return;
     finish("stay");
     question?.answer("cancel");

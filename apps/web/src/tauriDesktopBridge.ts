@@ -136,6 +136,29 @@ async function tauriInvokeOr<T>(
   }
 }
 
+/**
+ * Falls back only when the desktop does not know the command (an older desktop); any other
+ * failure rejects, so a caller can tell a failed query from an answer.
+ */
+async function tauriInvokeOrWhenUnsupported<T>(
+  command: string,
+  args: Record<string, unknown> | undefined,
+  fallback: () => T,
+): Promise<T> {
+  try {
+    return await tauriInvoke<T>(command, args);
+  } catch (error) {
+    // Tauri 2 words an unregistered command this way (`tauri::webview`, `Command {command} not found`).
+    if (
+      (typeof error === "string" && error.includes(`Command ${command} not found`)) ||
+      isTauriDesktopCapabilityUnsupportedPayload(error)
+    ) {
+      return fallback();
+    }
+    throw normalizeTauriDesktopError(error);
+  }
+}
+
 export class TauriDesktopCapabilityUnsupportedError extends Error {
   readonly code = "tauri_capability_unsupported";
 
@@ -655,7 +678,7 @@ function createTauriDesktopBridge(
     onUpdateInstallEnded: (listener: () => void) =>
       tauriListen(UPDATE_INSTALL_ENDED_EVENT, () => listener()),
     getUpdateState: () =>
-      tauriInvokeOr<DesktopUpdateState>(
+      tauriInvokeOrWhenUnsupported<DesktopUpdateState>(
         "desktop_bridge_get_update_state",
         undefined,
         defaultUpdateState,
