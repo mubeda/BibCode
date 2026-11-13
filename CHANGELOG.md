@@ -7,6 +7,7 @@
 - Each environment has a Host dashboard (the environment card's menu, Settings > Remote Servers, and the status bar's Resource Manager) with its host's CPU, memory and volumes, live and since the server started. It lists the volumes it hides and why, shows per-volume statistics, never reads network volumes, and says when the volume list is not answering. Agents can read the same figures with the `host_metrics` MCP tool. (#292)
 - The Host dashboard on Linux no longer lists another running BiBCode AppImage's mount, or one a killed instance left behind, as a full read-only volume. (#353)
 - A refused pairing offer or pairing credential is now logged as a warning with a fixed reason, so a pairing that fails shows in the server log; the log never holds the offered link or the credential. (#358)
+- An expired pairing link, pairing offer or session is refused from the moment it expires. Before, one whose expiry fell on a whole second could still be accepted for up to a second, because expiry times were compared as text. (#362)
 - With the Profiler on, an error that the "Something went wrong" screen catches is recorded as a `client.render-error` event and grouped in one finding. It holds the error's type, React's error number, component names and the route pattern, never the error's message. (#360)
 
 ### Pipelines
