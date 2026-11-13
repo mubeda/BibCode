@@ -1,7 +1,7 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 2298fd3a827c)
+Spec: spec.md (sha256 793abc187c7f)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: inline
@@ -111,3 +111,4 @@ Branch: claude/open-issues-pr-dc3c33
 - 2026-11-13 14:11 #361 review fixes (lane 11, 7e30d15b2), integrated: elevation now calls `ShellExecuteExW` with the `runas` verb on `netsh.exe` directly (no PowerShell, no script), every program is started from the `GetSystemDirectoryW` directory, arguments follow the Windows command-line rules and a double quote or NUL is refused; the prompt runs before the exposure lock and before any restart; a left rule is tolerated only when the delete ran and exited, the process is not elevated and a read-back still lists the rule; the chosen host keeps its host and takes the port of the completed widen (the wide listener binds every address); a Windows note about networks marked Public. Evidence: `cargo test -p bibcode-desktop` 543 passed, web 316 passed, fmt and Clippy clean. Still not compiled for Windows; a VM probe that sends hostile paths through the same call to a stand-in program is prepared. Spec R53 and R54 amended to what was built.
 - 2026-11-13 14:25 Ruling (user): "we should not have this, tailscale is not managed from Bibcode", about the "Tailscale HTTPS" row in Share this host. Spec R55 and D19 added; Task 11.4 added. Reading Tailscale's addresses stays (agent's reading, to confirm).
 - 2026-11-13 14:19 Codex's final pass on the elevation fix: both security blockers fixed; five P2 findings (the port fix changed a Tailscale HTTPS port; a second check rejected a non-ASCII read-back; prompt ownership released on timeout; a declined second prompt leaves the old rule removed; one discard path in the collector). The collector one is deliberate and now documented (46955bbaf); the four others are in progress in lane 11.
+- 2026-11-13 14:26 Ruling (user): "agreed put it with 361": Task 11.4 is part of #361, and reading Tailscale's addresses read-only stays.

@@ -65,7 +65,7 @@ Names used throughout:
 - D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error screen catches) is part of #360 here as R51 ("follow-up, do it as part of 360", user, 2026-11-13).
 - D17. #361 is added to this pull request. Decided by: user, 2026-11-13.
 - D18. For the Windows firewall rule (R53): BiBCode asks through Windows' own permission prompt when a person generates a code. Decided by: user, 2026-11-13 ("Windows permission prompt"), after being told the cost: without administrator rights the rule cannot be removed later, so it stays after sharing is turned off while the listener goes back to local-only, and a test cannot click the prompt. The other options were a message only, and a rule created by the installer.
-- D19. The "Tailscale HTTPS" row and BiBCode's set-up and disable of Tailscale Serve are removed (R55). Decided by: user, 2026-11-13 ("we should not have this, tailscale is not managed from BiBCode"). Reading Tailscale's addresses stays: agent's reading of the decision, to confirm.
+- D19. The "Tailscale HTTPS" row and BiBCode's set-up and disable of Tailscale Serve are removed (R55). Decided by: user, 2026-11-13 ("we should not have this, tailscale is not managed from BiBCode"). Reading Tailscale's addresses stays, read-only; the user confirmed this the same day ("agreed put it with 361").
 
 ## Requirements
 
