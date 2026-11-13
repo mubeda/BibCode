@@ -13,6 +13,8 @@ export interface ShareAddressOption {
   readonly httpBaseUrl: string | null;
   readonly description?: string;
   readonly requiresExplicitSelection?: boolean;
+  /** Served by the native listener, so widening may move it to the listener's new port. */
+  readonly servedByNativeListener?: true;
 }
 
 export function nativeShareAddressUnavailableReason(
@@ -106,6 +108,7 @@ export function resolveShareAddressOptions(input: {
         label: `${new URL(endpoint.httpBaseUrl).hostname} (enables remote access)`,
         httpBaseUrl: endpoint.httpBaseUrl,
         description: "BiBCode will enable remote access, then use this address.",
+        servedByNativeListener: true,
       });
     }
   }
@@ -149,6 +152,16 @@ export function describeWidenFailure(error: unknown): {
     return {
       reason: "elevation-required",
       message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Try again and approve the Windows permission prompt, or close BiBCode, start it with Run as administrator, and try again.`,
+    };
+  }
+  if (raw.includes("firewall-prompt-open")) {
+    return {
+      message: `A Windows permission prompt for the BiBCode firewall rule is still open, so remote access was not turned on. ${localState} Answer or close that prompt, then try again.`,
+    };
+  }
+  if (raw.includes("firewall-rule-removed-not-added")) {
+    return {
+      message: `BiBCode removed its old Windows Firewall rule, which named an earlier install, but the new rule was not added, so remote access was not turned on. ${localState} Try again and approve the Windows permission prompt.`,
     };
   }
   const step = Object.entries(FIREWALL_STEP_FAILURES).find(([token]) => raw.includes(token));
@@ -302,7 +315,11 @@ export async function generateShareOffer(
     try {
       const state = await deps.applyServerExposure("network-accessible");
       widened = true;
-      endpoint = endpoint === null ? state.endpointUrl : withPortOf(endpoint, state.endpointUrl);
+      // An externally served address (Tailscale Serve HTTPS, say) keeps its own port.
+      if (endpoint === null) endpoint = state.endpointUrl;
+      else if (deps.selectedOption.servedByNativeListener === true) {
+        endpoint = withPortOf(endpoint, state.endpointUrl);
+      }
     } catch (error) {
       return { ok: false, failure: { kind: "widen-failed", ...describeWidenFailure(error) } };
     }
