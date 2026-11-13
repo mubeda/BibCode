@@ -308,7 +308,33 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Resume legacy remote access");
     expect(apply).not.toHaveBeenCalled();
     await click("Resume legacy remote access");
-    expect(apply).toHaveBeenCalledWith("network-accessible");
+    expect(apply).toHaveBeenCalledWith("network-accessible", { allowElevationPrompt: true });
+  });
+
+  it("explains a refused firewall change when legacy resume fails", async () => {
+    Object.assign(h.networkQuery.data.serverExposureState, {
+      ...localState,
+      configuredMode: "network-accessible",
+    });
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "loopback",
+      offHostGrantCount: 0,
+      legacyGrantCount: 1,
+    });
+    installBridge(
+      vi.fn(() =>
+        Promise.reject(
+          "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. Restored local-only safeguards.",
+        ),
+      ),
+    );
+    await renderTab();
+
+    await click("Resume legacy remote access");
+    expect(container.textContent).toContain(
+      "Windows needs administrator permission to open the firewall for BiBCode",
+    );
+    expect(container.textContent).not.toContain("firewall-elevation-required");
   });
 
   it("keeps waiting when legacy exposure resume exceeds the HTTP deadline", async () => {
@@ -528,7 +554,7 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Running turns on this machine will stop");
     await click("Generate pairing offer");
     expect(order).toEqual(["widen", "mint"]);
-    expect(apply).toHaveBeenCalledWith("network-accessible");
+    expect(apply).toHaveBeenCalledWith("network-accessible", { allowElevationPrompt: true });
     expect(container.textContent).toContain("bibcode://pair?code=c0de");
     expect(container.textContent).toContain("for networks you trust");
     expect(
@@ -542,6 +568,37 @@ describe("ShareThisHostTab", () => {
     await click("Generate pairing offer");
     expect(h.createOffer).not.toHaveBeenCalled();
     expect(container.textContent).toContain("bind failed");
+  });
+
+  it("asks for administrator permission only on Generate and Retry, and explains a refusal", async () => {
+    const apply = vi.fn<
+      (
+        desired: DesktopServerExposureMode,
+        options?: { readonly allowElevationPrompt?: boolean },
+      ) => Promise<DesktopServerExposureState>
+    >(() =>
+      // Tauri rejects with the desktop's plain string, not an Error.
+      Promise.reject(
+        "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. Restored local-only safeguards.",
+      ),
+    );
+    installBridge(apply);
+    await renderTab();
+
+    await click("Generate pairing offer");
+    expect(apply).toHaveBeenLastCalledWith("network-accessible", { allowElevationPrompt: true });
+    expect(h.createOffer).not.toHaveBeenCalled();
+    expect(container.textContent).toContain(
+      "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only.",
+    );
+    expect(container.textContent).not.toContain("Could not enable remote access.");
+
+    apply.mockResolvedValueOnce(wideState);
+    await click("Retry");
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(apply).toHaveBeenLastCalledWith("network-accessible", { allowElevationPrompt: true });
+    expect(container.textContent).toContain("bibcode://pair?code=c0de");
+    expect(container.textContent).not.toContain("Windows needs administrator permission");
   });
 
   it("reports completed local-only restoration when minting fails after widening", async () => {
@@ -559,7 +616,11 @@ describe("ShareThisHostTab", () => {
     await renderTab();
     await click("Generate pairing offer");
 
-    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
+    // The person's widen may prompt; the automatic narrowing after it never does.
+    expect(apply.mock.calls).toEqual([
+      ["network-accessible", { allowElevationPrompt: true }],
+      ["local-only"],
+    ]);
     expect(container.textContent).toContain(
       "The offer was not created. Remote access is confirmed local-only.",
     );
@@ -604,7 +665,9 @@ describe("ShareThisHostTab", () => {
     await renderTab();
     await click("Generate pairing offer");
 
-    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible", {
+      allowElevationPrompt: true,
+    });
     expect(container.textContent).toContain(
       "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
     );
@@ -633,7 +696,9 @@ describe("ShareThisHostTab", () => {
 
     // The authoritative share state still reports a live off-host reason, so
     // the reconciling cleanup keeps the host wide with honest copy.
-    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible", {
+      allowElevationPrompt: true,
+    });
     expect(container.textContent).toContain(
       "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
     );
@@ -662,7 +727,11 @@ describe("ShareThisHostTab", () => {
     expect(h.cancelOffer).toHaveBeenCalledTimes(3);
     // The authority reports no live sharing reason, so the reconciling
     // cleanup narrows instead of leaving the host wide until restart.
-    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
+    // The person's widen may prompt; the automatic narrowing after it never does.
+    expect(apply.mock.calls).toEqual([
+      ["network-accessible", { allowElevationPrompt: true }],
+      ["local-only"],
+    ]);
     expect(container.textContent).toContain(
       "The offer was not created. Remote access is confirmed local-only.",
     );

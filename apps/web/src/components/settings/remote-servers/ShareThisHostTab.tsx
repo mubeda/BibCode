@@ -43,6 +43,7 @@ import { Radio, RadioGroup } from "../../ui/radio-group";
 import { SettingsRow, SettingsSection } from "../settingsLayout";
 import { shareClassForPairingEndpoint } from "./endpointClass";
 import {
+  describeWidenFailure,
   type GeneratedShareOffer,
   type GenerateShareOfferFailure,
   generateShareOffer,
@@ -177,11 +178,12 @@ export function ShareThisHostTab(): ReactElement {
     setIsResumingLegacy(true);
     setLegacyResumeError(null);
     try {
-      await desktopBridge.applyServerExposure("network-accessible");
+      // The person asked to resume, so Windows may ask them for permission.
+      await desktopBridge.applyServerExposure("network-accessible", { allowElevationPrompt: true });
       refreshDesktopNetworkAccessState();
       await refreshShareState();
     } catch (error) {
-      setLegacyResumeError(error instanceof Error ? error.message : String(error));
+      setLegacyResumeError(describeWidenFailure(error).message);
     } finally {
       setIsResumingLegacy(false);
     }
@@ -207,7 +209,8 @@ export function ShareThisHostTab(): ReactElement {
       applyServerExposure:
         !canManageNativeExposure || desktopBridge === undefined
           ? null
-          : (desired) => desktopBridge.applyServerExposure(desired),
+          : // The person pressed Generate or Retry, so Windows may ask them for permission.
+            (desired) => desktopBridge.applyServerExposure(desired, { allowElevationPrompt: true }),
       mintOffer: async ({ idempotencyKey, ...input }) => {
         const minted = await createServerPairingOffer(input, idempotencyKey);
         return {
@@ -407,7 +410,21 @@ export function ShareThisHostTab(): ReactElement {
             stop.
           </p>
         ) : null}
-        {sectionError ? <p className="mx-4 mb-3 text-xs text-destructive">{sectionError}</p> : null}
+        {sectionError ? (
+          <div className="mx-4 mb-3 flex items-start gap-2">
+            <p className="text-xs text-destructive">{sectionError}</p>
+            {failure?.kind === "widen-failed" ? (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isGenerating || selectedOption === null}
+                onClick={() => void handleGenerate()}
+              >
+                Retry
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
         <div className="px-4 pb-4">
           <Button
             disabled={isGenerating || selectedOption === null}

@@ -1,8 +1,10 @@
+use bibcode_server::diagnostics::profiler::exits::{self, Exited, Watch};
 use bibcode_server::process::{configure_background_command, isolate_appimage_environment};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    process::ExitStatus,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -11,6 +13,8 @@ use tokio::{
 
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Caps every CLI candidate together, so an address fetch waits at most this for status.
+const TAILSCALE_STATUS_TOTAL_TIMEOUT: Duration = Duration::from_millis(3_000);
 const TAILSCALE_PROBE_TIMEOUT: Duration = Duration::from_millis(2_500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,22 +119,72 @@ pub fn build_tailscale_https_base_url(
 }
 
 pub async fn read_tailscale_status() -> Result<TailscaleStatus, String> {
-    let mut failures = Vec::new();
-    for candidate in tailscale_command_candidates() {
-        match read_tailscale_status_with(&candidate, TAILSCALE_STATUS_TIMEOUT).await {
-            Ok(status) => return Ok(status),
-            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+    read_first_tailscale_status(
+        tailscale_command_candidates(),
+        TAILSCALE_STATUS_TIMEOUT,
+        TAILSCALE_STATUS_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+/// A dropped attempt kills its child (`kill_on_drop`), so the total cap leaves nothing running.
+async fn read_first_tailscale_status(
+    candidates: Vec<PathBuf>,
+    timeout: Duration,
+    total_timeout: Duration,
+) -> Result<TailscaleStatus, String> {
+    let attempts = async {
+        let mut failures = Vec::new();
+        for candidate in candidates {
+            match read_tailscale_status_with(&candidate, timeout).await {
+                Ok(status) => return Ok(status),
+                Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+            }
         }
-    }
-    Err(format!(
-        "Could not read Tailscale status from any known CLI location: {}",
-        failures.join("; ")
-    ))
+        Err(format!(
+            "Could not read Tailscale status from any known CLI location: {}",
+            failures.join("; ")
+        ))
+    };
+    tokio::time::timeout(total_timeout, attempts)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "tailscale status timed out after {}ms in total.",
+                total_timeout.as_millis()
+            ))
+        })
+}
+
+/// A missing, logged-out or stopped Tailscale exits non-zero on every fetch, which is
+/// normal; only a signal or Windows exception death is a crash.
+fn report_tailscale_exit(command_path: &Path, pid: u32, started: Instant, status: &ExitStatus) {
+    let exe = command_path.to_string_lossy();
+    exits::report_exit(
+        Watch::Signals,
+        &Exited {
+            kind: "command",
+            label: "tailscale",
+            exe: &exe,
+            pid,
+            started,
+        },
+        status,
+        false,
+    );
 }
 
 async fn read_tailscale_status_with(
     command_path: &Path,
     timeout: Duration,
+) -> Result<TailscaleStatus, String> {
+    read_tailscale_status_reporting(command_path, timeout, report_tailscale_exit).await
+}
+
+async fn read_tailscale_status_reporting(
+    command_path: &Path,
+    timeout: Duration,
+    report_exit: impl FnOnce(&Path, u32, Instant, &ExitStatus),
 ) -> Result<TailscaleStatus, String> {
     let mut command = Command::new(command_path);
     configure_background_command(&mut command);
@@ -142,8 +196,14 @@ async fn read_tailscale_status_with(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| format!("Failed to spawn tailscale status: {error}"))?;
+    let started = Instant::now();
+    let pid = child.id();
 
+    // A timed-out child was killed on request, so only a completed run is reported.
     let output = wait_for_tailscale_output(child, timeout).await?;
+    if let Some(pid) = pid {
+        report_exit(command_path, pid, started, &output.status);
+    }
 
     decode_tailscale_status_output(output)
 }
@@ -525,6 +585,52 @@ printf '%s' '{TAILSCALE_STATUS_JSON}'"#
             },
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_completed_status_child_is_reported_with_its_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let failing = executable_script(directory.path(), "failing", "exit 7", "exit /b 7");
+        let reported = std::sync::Mutex::new(None);
+
+        let error = read_tailscale_status_reporting(
+            &failing,
+            Duration::from_secs(15),
+            |path, pid, _, status| {
+                *reported.lock().unwrap() = Some((path.to_path_buf(), pid, status.code()));
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "tailscale status exited with code 7.");
+        let (path, pid, code) = reported.lock().unwrap().take().expect("exit reported");
+        assert_eq!(path, failing);
+        assert!(pid > 0);
+        assert_eq!(code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn every_cli_candidate_together_is_bounded_by_one_total_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let slow = executable_script(
+            directory.path(),
+            "slow-total",
+            "sleep 5",
+            "%SystemRoot%\\System32\\ping.exe -n 6 127.0.0.1 >nul",
+        );
+
+        let error = read_first_tailscale_status(
+            vec![slow.clone(), slow],
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "tailscale status timed out after 200ms in total.");
+        assert_eq!(TAILSCALE_STATUS_TOTAL_TIMEOUT, Duration::from_millis(3_000));
     }
 
     #[cfg(unix)]

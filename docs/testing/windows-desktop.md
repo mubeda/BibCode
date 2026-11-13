@@ -722,11 +722,24 @@ minimum-size, and relevant Windows DPI states. Verify:
   TCP-only, and limited to Domain/Private profiles. Revoke the final
   native-managed **Another device** offer or paired client, verify exposure
   returns to loopback, and confirm the
-  named rule is absent. Record an elevation or policy denial as failed native
-  evidence; do not substitute a manually created rule. Run the host-independent
-  deletion-spawn and policy-denial tests, then reproduce a deletion denial
-  natively and confirm the app reports incomplete cleanup rather than claiming
-  the rule was removed. A missing rule is benign when `netsh advfirewall firewall show rule`
+  named rule is absent. Run this step from an elevated desktop; do not
+  substitute a manually created rule. Without administrator rights the
+  automated gate is the stubbed-runner tests in `firewall.rs` and
+  `server_exposure.rs` (`cargo test -p bibcode-desktop -- firewall
+  server_exposure`): the recorded elevation refusal and a translated variant are
+  classified by the `whoami /groups` integrity SID, an elevated desktop gets the
+  plain failure, one approved prompt adds or replaces the rule, a declined or
+  timed-out prompt is one refusal that recovery verifies local-only, a second
+  widen cannot open a second prompt, the elevated command line runs only system
+  `netsh` with quoted fixed arguments, and an unelevated narrowing that cannot
+  delete the rule reports `firewall-rule-left` without failing a verified
+  local-only listener. The real Windows elevation prompt needs a person at the
+  screen to approve or decline it and is not part of the automated gate; when a
+  person runs it, record the dialog text for approve, decline and time-out, the
+  listener with `Get-NetTCPConnection -State Listen`, and the rule state. Run the
+  host-independent deletion-spawn and policy-denial tests, then reproduce a
+  deletion denial from an elevated desktop and confirm the app reports
+  incomplete cleanup rather than claiming the rule was removed. A missing rule is benign when `netsh advfirewall firewall show rule`
   reports that no rule matches. On a non-English display language that sentence
   is translated and the command exits 1, so absence also requires a successful
   `netsh advfirewall show allprofiles state` before the miss is accepted. A
@@ -772,6 +785,9 @@ minimum-size, and relevant Windows DPI states. Verify:
   network labels while retaining **Automatic (LAN)**, uses stable address/port
   IDs, safely preselects a private
   default, reports off-host interface observations unavailable before widening,
+  lists each private, overlay and Tailscale address marked `local-only` as
+  "(enables remote access)" while native exposure is local-only and widens
+  before minting a code for the chosen one,
   and leaves generation disabled with externally managed listener/reverse-proxy
   guidance when native discovery has only a public or non-default private
   address. Public interface candidates remain non-actionable even after native
