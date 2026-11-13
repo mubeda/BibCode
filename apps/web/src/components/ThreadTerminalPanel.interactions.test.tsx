@@ -3566,8 +3566,17 @@ describe("TerminalViewport mounted lifecycle", () => {
 
       mount.style.width = "";
       xtermState.proposedDimensions = { cols: 80, rows: 24 };
-      await view.resizeContainer();
-      await view.flushFrame();
+      terminal.refresh.mockClear();
+      // The same-size return repaints, though nothing is sized (#348).
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await view.resizeContainer();
+        await view.flushFrame();
+        await act(async () => vi.advanceTimersByTime(50));
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
       expect(view.resizeSpy).not.toHaveBeenCalled();
       expect(terminal.cols).toBe(80);
 
