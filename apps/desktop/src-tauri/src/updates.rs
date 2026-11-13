@@ -2586,8 +2586,6 @@ mod tests {
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 

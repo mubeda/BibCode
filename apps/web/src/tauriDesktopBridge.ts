@@ -428,8 +428,6 @@ function defaultServerExposureState(): DesktopServerExposureState {
     management: "native",
     endpointUrl: null,
     advertisedHost: null,
-    tailscaleServeEnabled: false,
-    tailscaleServePort: 443,
   };
 }
 
@@ -617,12 +615,6 @@ function createTauriDesktopBridge(
         desired,
         allowElevationPrompt: options?.allowElevationPrompt === true,
       }),
-    setTailscaleServeEnabled: (input) =>
-      tauriInvokeOr<DesktopServerExposureState>(
-        "desktop_bridge_set_tailscale_serve_enabled",
-        { input },
-        defaultServerExposureState,
-      ),
     getAdvertisedEndpoints: () =>
       tauriInvokeOr("desktop_bridge_get_advertised_endpoints", undefined, () => []),
     getWslState: () =>

@@ -709,8 +709,6 @@ export interface DesktopServerExposureState {
   management: DesktopServerExposureManagement;
   endpointUrl: string | null;
   advertisedHost: string | null;
-  tailscaleServeEnabled: boolean;
-  tailscaleServePort: number;
 }
 
 export const DesktopServerExposureStateSchema = Schema.Struct({
@@ -719,8 +717,6 @@ export const DesktopServerExposureStateSchema = Schema.Struct({
   management: DesktopServerExposureManagementSchema,
   endpointUrl: Schema.NullOr(Schema.String),
   advertisedHost: Schema.NullOr(Schema.String),
-  tailscaleServeEnabled: Schema.Boolean,
-  tailscaleServePort: Schema.Finite,
 });
 
 export interface PickFolderOptions {
@@ -1356,10 +1352,6 @@ export interface DesktopBridge {
     desired: DesktopServerExposureMode,
     options?: { readonly allowElevationPrompt?: boolean },
   ) => Promise<DesktopServerExposureState>;
-  setTailscaleServeEnabled: (input: {
-    readonly enabled: boolean;
-    readonly port?: number;
-  }) => Promise<DesktopServerExposureState>;
   getAdvertisedEndpoints: () => Promise<readonly AdvertisedEndpoint[]>;
   getWslState: () => Promise<DesktopWslState>;
   setWslBackendEnabled: (enabled: boolean) => Promise<DesktopWslState>;

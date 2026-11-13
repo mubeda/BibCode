@@ -100,9 +100,20 @@ wide. A private or CGNAT observation, including a Tailscale IPv4 address, also
 carries `unavailableReason: local-only`, meaning that enabling native remote
 access would make it reachable. The bridge reads Tailscale status (the
 read-only `tailscale status --json`, at most 1.5 seconds per CLI location and
-3 seconds for all of them, with a crash exit reported to the Profiler) while
-local-only too, but leaves out the Tailscale HTTPS row unless Serve is enabled
-or the listener is wide. This lets the renderer distinguish a private default
+3 seconds for all of them, with a crash exit reported to the Profiler) whatever
+the exposure mode. BiBCode does not manage Tailscale: that status query is the
+only Tailscale command it runs, and there is no setting, bridge command or
+dialog that starts, changes or stops Tailscale Serve. When status reports a
+MagicDNS name, the bridge probes `https://<name>/` (port 443, at most 2.5
+seconds) for BiBCode's well-known endpoint and lists the address as available
+only when it answers, which happens when the person set up Serve outside
+BiBCode. An address fetch therefore waits at most about 5.5 seconds for
+Tailscale. The removed `desktop_bridge_set_tailscale_serve_enabled` command
+stays registered and answers the `tauri_capability_unsupported` payload without
+changing anything, and stored `tailscaleServeEnabled` / `tailscaleServePort`
+keys from an earlier version are ignored on read and dropped on the next write.
+The WSL bootstrap still sends those two fields with fixed values because older
+`bibcode serve` builds require them. This lets the renderer distinguish a private default
 route from a public-only or non-default topology before it requests privileged
 mutation. Native-managed automatic sharing accepts only a private or CGNAT
 default-route observation. While a native-managed host is local-only and has

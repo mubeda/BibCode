@@ -793,7 +793,6 @@ function stubBrowserWindow(options?: {
 
 interface DesktopBridgeStub {
   applyServerExposure: ReturnType<typeof vi.fn>;
-  setTailscaleServeEnabled: ReturnType<typeof vi.fn>;
   setWslBackendEnabled: ReturnType<typeof vi.fn>;
   setWslDistro: ReturnType<typeof vi.fn>;
   setWslOnly: ReturnType<typeof vi.fn>;
@@ -813,7 +812,6 @@ function createDesktopBridgeStub(): DesktopBridgeStub {
   };
   return {
     applyServerExposure: vi.fn(async () => ({})),
-    setTailscaleServeEnabled: vi.fn(async () => ({})),
     setWslBackendEnabled: vi.fn(async () => wslState),
     setWslDistro: vi.fn(async () => wslState),
     setWslOnly: vi.fn(async () => wslState),
@@ -2703,8 +2701,6 @@ describe("Remote Servers tabs", () => {
         mode: "network-accessible",
         endpointUrl: "https://desktop.example.com",
         advertisedHost: "desktop.local",
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
       },
       advertisedEndpoints: [
         endpoint({
@@ -2743,7 +2739,6 @@ describe("Remote Servers tabs", () => {
           id: "tailscale-magicdns:1",
           label: "Tailscale HTTPS",
           httpBaseUrl: "https://machine.tailnet.ts.net",
-          status: "unavailable",
           reachability: "private-network",
           hostedHttpsApp: "compatible",
         }),
@@ -2759,7 +2754,8 @@ describe("Remote Servers tabs", () => {
 
     expect(markup).toContain("Version drift");
     expect(markup).toContain("http://192.168.1.20:5133");
-    expect(markup).toContain("Tailscale HTTPS");
+    // A Tailscale Serve address set up outside BiBCode is listed like any other address.
+    expect(markup).toContain("https://machine.tailnet.ts.net");
     expect(markup).toContain("BiBCode Connect");
     expect(markup).toContain("Paired clients");
 
@@ -2783,45 +2779,11 @@ describe("Remote Servers tabs", () => {
     );
     h.copyBehavior = "copy";
 
-    // Only the Tailscale confirmation owns a restart control here.
-    for (const entry of findControls("button", "Restart and disable")) {
-      invoke(entry, "onClick");
-    }
-    await flush();
-    expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledTimes(1);
-    expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: false, port: 443 });
+    // BiBCode does not manage Tailscale Serve: no switch, setup or disable control.
+    expect(findControls("switch", "Enable Tailscale HTTPS")).toHaveLength(0);
+    expect(findControls("button", "Setup")).toHaveLength(0);
+    expect(findControls("button", "Restart and disable")).toHaveLength(0);
     expect(bridge.applyServerExposure).not.toHaveBeenCalled();
-    expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
-
-    // Disabling tailscale can fail with a toast.
-    h.toastAdd.mockClear();
-    bridge.setTailscaleServeEnabled.mockRejectedValueOnce(new Error("serve down"));
-    const disableButtons = findControls("button", "Restart and disable");
-    invoke(disableButtons.at(-1)!, "onClick");
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not disable Tailscale HTTPS" }),
-    );
-
-    // Tailscale setup dialog confirm (valid default port).
-    bridge.setTailscaleServeEnabled.mockClear();
-    invoke(control("button", "Enable"), "onClick");
-    await flush();
-    expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: true, port: 443 });
-    h.toastAdd.mockClear();
-    bridge.setTailscaleServeEnabled.mockRejectedValueOnce(new Error("setup failed"));
-    invoke(control("button", "Enable"), "onClick");
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not set up Tailscale HTTPS" }),
-    );
-
-    // The tailscale switch stages setup/disable flows.
-    invoke(control("switch", "Enable Tailscale HTTPS"), "onCheckedChange", true);
-    invoke(control("switch", "Enable Tailscale HTTPS"), "onCheckedChange", false);
-
-    // Tailscale port input.
-    invoke(control("input", "number"), "onChange", { target: { value: "8443" } });
 
     // Dialog open-change plumbing.
     for (const dialog of findControls("alert-dialog", "false")) {
@@ -2872,8 +2834,6 @@ describe("Remote Servers tabs", () => {
         mode: "local-only",
         endpointUrl: null,
         advertisedHost: null,
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
       },
       advertisedEndpoints: [],
     };
@@ -2893,8 +2853,6 @@ describe("Remote Servers tabs", () => {
         mode: "network-accessible",
         endpointUrl: "https://desktop.example.com",
         advertisedHost: null,
-        tailscaleServeEnabled: true,
-        tailscaleServePort: 443,
       },
       advertisedEndpoints: [
         endpoint({
@@ -2949,7 +2907,6 @@ describe("Remote Servers tabs", () => {
     const markup = render();
 
     // Busy affordances driven by the overridden boolean state.
-    expect(markup).toContain("Restarting…");
     expect(markup).toContain("Adding…");
     expect(markup).toContain("Revoking…");
 
@@ -2959,14 +2916,7 @@ describe("Remote Servers tabs", () => {
     invoke(control("button", "Set as default"), "onClick");
     expect(h.uiState.setDefaultAdvertisedEndpointKey).toHaveBeenCalled();
 
-    // While tailscale updates are running the rail and confirm buttons all
-    // render their busy labels; invoking them exercises the busy guards.
-    expect(markup).toContain("Enter a port from 1 to 65535.");
-    for (const entry of findControls("button", "Restarting…")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
+    // Busy confirm buttons render their busy labels; invoking them exercises the guards.
     for (const entry of findControls("button", "Applying…")) {
       if (typeof entry.props.onClick === "function") {
         invoke(entry, "onClick");
@@ -3487,8 +3437,6 @@ describe("Remote Servers tabs", () => {
       mode: "network-accessible",
       endpointUrl: "https://desktop.example.com" as string | null,
       advertisedHost: null as string | null,
-      tailscaleServeEnabled: false,
-      tailscaleServePort: 443,
     };
     h.networkAccessQuery.data = {
       serverExposureState: exposureState,
