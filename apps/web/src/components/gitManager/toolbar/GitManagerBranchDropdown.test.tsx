@@ -100,6 +100,8 @@ async function renderDropdown(
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   useGitManagerStore.setState({ byProjectKey: {}, toolbarByProjectKey: {} });
+  // The list renders only while the picker is open (#360); these cases inspect its rows.
+  useGitManagerStore.getState().setOpenDropdown(projectRef, "branch");
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -182,13 +184,13 @@ describe("GitManagerBranchDropdown", () => {
         blocked: [{ operation: "branch-checkout", code: "worktree-checked-out", message }],
       }),
     ]);
+    expect(document.body.textContent).toContain("Switch to worktree");
+    expect(document.body.textContent).toContain("/opaque/feature");
 
     await act(async () => rowButton("feature").click());
 
     expect(callbacks.onSwitchWorktree).toHaveBeenCalledWith("/opaque/feature");
     expect(callbacks.onSelectBranch).not.toHaveBeenCalled();
-    expect(document.body.textContent).toContain("Switch to worktree");
-    expect(document.body.textContent).toContain("/opaque/feature");
   });
 
   it("renders a blocked row's server-authored message verbatim", async () => {

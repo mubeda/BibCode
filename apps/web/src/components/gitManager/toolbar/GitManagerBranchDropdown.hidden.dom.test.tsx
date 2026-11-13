@@ -42,6 +42,7 @@ let hiddenMeasurements = 0;
 let container: HTMLDivElement;
 let root: Root | null;
 let uncaught: unknown[];
+let onSelectBranch = vi.fn();
 
 function stubMeasurements() {
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
@@ -120,12 +121,30 @@ async function renderDropdown(refs: ReadonlyArray<GitManagerRefEntry>, currentBr
         selectedWorktreeCwd="/opaque/main"
         onCreateBranch={vi.fn()}
         onMergeInto={vi.fn()}
-        onSelectBranch={vi.fn()}
+        onSelectBranch={onSelectBranch}
         onSwitchWorktree={vi.fn()}
       />,
     ),
   );
   await settle();
+}
+
+async function typeFilter(value: string) {
+  const input = document.querySelector<HTMLInputElement>('input[type="search"]');
+  if (input === null) throw new Error("Missing branch filter");
+  // React tracks the last value it set; go through the native setter so onChange sees a change.
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await settle();
+}
+
+function branchRowNames(): string[] {
+  return [...document.querySelectorAll<HTMLElement>(`${ROW_SELECTOR} .font-mono`)].map(
+    (element) => element.textContent ?? "",
+  );
 }
 
 function trigger(): HTMLButtonElement {
@@ -174,6 +193,7 @@ beforeEach(() => {
   Error.stackTraceLimit = 50;
   useGitManagerStore.setState({ byProjectKey: {}, toolbarByProjectKey: {} });
   hiddenMeasurements = 0;
+  onSelectBranch = vi.fn();
   observed.clear();
   uncaught = [];
   stubMeasurements();
@@ -212,5 +232,42 @@ describe("GitManagerBranchDropdown with the real list and popover (#360)", () =>
     expect(failures(thrown)).toEqual([]);
     // Rows that measure 0 by 0 must not widen the hidden list's rendered range.
     expect(renderedRows()).toBeLessThanOrEqual(rowsWhileOpen);
+  });
+
+  it("renders and measures no branch row while closed, and reopens with its filter and the current branches", async () => {
+    await renderDropdown(branches(4_000, 1), "branch-00001");
+    await toggle();
+    await typeFilter("branch-039");
+    expect(branchRowNames().length).toBeGreaterThan(0);
+    await toggle();
+    expect(positioner().hidden).toBe(true);
+
+    hiddenMeasurements = 0;
+    const refreshed = [...branches(4_000, 2), { ...branches(1, 2)[0]!, name: "branch-039-new" }];
+    await renderDropdown(refreshed, "branch-00002");
+
+    expect(renderedRows()).toBe(0);
+    expect(hiddenMeasurements).toBe(0);
+
+    await toggle();
+    expect(positioner().hidden).toBe(false);
+    expect(document.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe(
+      "branch-039",
+    );
+    const names = branchRowNames();
+    expect(names.length).toBeGreaterThan(0);
+    expect(names.every((name) => name.includes("branch-039"))).toBe(true);
+
+    await typeFilter("branch-039-new");
+    expect(branchRowNames()).toEqual(["branch-039-new"]);
+    const row = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "branch-039-new",
+    );
+    await act(async () => row?.click());
+    await settle();
+    expect(onSelectBranch).toHaveBeenCalledTimes(1);
+    expect(onSelectBranch.mock.calls[0]?.[0]).toMatchObject({ name: "branch-039-new" });
+    expect(positioner().hidden).toBe(true);
+    expect(uncaught).toEqual([]);
   });
 });

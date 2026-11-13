@@ -244,6 +244,8 @@ beforeEach(() => {
     return { cancel: vi.fn(), result: Promise.resolve({ _tag: "Success", value: event }) };
   });
   useGitManagerStore.setState({ byProjectKey: {} });
+  // The branch list renders only while its picker is open (#360); these cases click its rows.
+  useGitManagerStore.getState().setOpenDropdown(currentProject, "branch");
 });
 
 describe("GitManagerToolbar", () => {
