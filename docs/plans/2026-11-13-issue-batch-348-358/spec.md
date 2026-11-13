@@ -2,7 +2,7 @@
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30: reviewed by Codex twice and by the advisor, findings handled; the agent's calls D2, D4 to D13 are listed for the user's confirmation before the push)
 Size: full Mode: gated Type: bug class and chore (#348, #351 to #358) and feature (#350)
-Source: GitHub issues #348 and #350 to #358 of this repository as they stood on 2026-11-13 (copies in `sources/`), the conversation of 2026-11-13 ("process all open issues, fix them all in this PR"), and a read of `main` at `a9938193b` by five read-only verifiers. Evidence record: [evidence.md](evidence.md). #350 has its own folder, [../2026-11-13-terminal-screen-350/](../2026-11-13-terminal-screen-350/terminal-screen-design.md), because its design did not pass its first review.
+Source: GitHub issues #348, #350 to #358 and (added by the user on 2026-11-13) #360 of this repository as they stood on 2026-11-13 (copies in `sources/`), the conversation of 2026-11-13 ("process all open issues, fix them all in this PR"), and a read of `main` at `a9938193b` by five read-only verifiers. Evidence record: [evidence.md](evidence.md). #350 has its own folder, [../2026-11-13-terminal-screen-350/](../2026-11-13-terminal-screen-350/terminal-screen-design.md), because its design did not pass its first review.
 
 The ten issues hold 45 separate items. Most were filed as "found by reading the code" or "not decided", so each item was checked against the code first. This spec gives every item one disposition:
 
@@ -62,6 +62,7 @@ Names used throughout:
 - D13. The Fit button keeps sending nothing when the server already declined that size; it says so instead. Decided by: agent's call, from the existing test.
 - D14. Test names, fixtures and docs use placeholders only (repository rule on sensitive data).
 - D15. During a remote update install, "Manage devices" is disabled with a one-line reason instead of being shown above the installing dialog (R39). An earlier DOM test had passed while the action only navigated under the dialog; the branch review caught it. Decided by: agent's call, to confirm with the user.
+- D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error boundary catches) is a separate change and is not in this spec.
 
 ## Requirements
 
@@ -296,6 +297,29 @@ Reopening the composer's model picker SHALL show an empty search and the current
 ### R47. Read-only Markdown images
 
 The read-only rendered Markdown view in Files SHALL load a relative image from the workspace through the same loader as the rich editor, and refuse a path that leaves the workspace. Chat messages are unchanged.
+
+**#360 Git Manager crash after a branch switch and a fetch (added by the user on 2026-11-13)**
+
+The app showed "Something went wrong" with React error 185 in a repository with thousands of refs. The symbolized stack is inside the list library's measurement path. Supported, not yet confirmed: the Git Manager branch picker keeps its list mounted under a closed popup, a refs update makes the library measure rows that are 0 by 0, and each zero size admits more rows until React's nested-update limit is reached. Task 10.1 confirms or refutes this before any fix.
+
+### R48. Branch selection and fetch stay usable
+
+WHEN a person selects a branch or fetches in Git Manager, the app SHALL NOT be replaced by a React nested-update error, whatever the number of refs.
+
+- Given 4,000 branches and a closed branch picker, When the refs are replaced, Then no error is raised and the list's total size settles.
+- Given the same data, When the person opens the picker, selects a branch and fetches, Then one checkout and one fetch are sent and the picker shows the current branches when reopened.
+
+### R49. A hidden list's measurement is not a row size
+
+WHILE a virtual list's rows measure 0 by 0 because an ancestor is hidden or detached, the list SHALL keep its stored row sizes and SHALL NOT expand its rendered range from that measurement, in both bundle formats of the patched library.
+
+- Given a visible list that is then hidden, When a layout measurement or a deferred shrink check sees 0 by 0, Then no zero size is recorded.
+- Given the list is shown again, Then rows measure and scroll normally.
+- Given a row that really shrinks while visible, Then the new size is accepted.
+
+### R50. A closed branch picker does no list work
+
+WHILE the Git Manager branch picker is closed, its list SHALL NOT be rendered or measured, and its filter text and selection SHALL be kept for the next opening.
 
 ## Verification
 
