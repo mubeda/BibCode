@@ -339,6 +339,28 @@ describe("HostDashboardSheet", () => {
   describe("values view commits", () => {
     const NOW_MS = Date.UTC(2026, 10, 11, 20, 0, 0);
 
+    // The uptime in the "Since" heading ticks every second for the first minute; only that
+    // label may follow the sheet's own 1 s clock, not the whole values view (R18).
+    it("does not render the values view again on the sheet's clock while only the uptime ticks", async () => {
+      vi.useFakeTimers({
+        now: NOW_MS,
+        toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"],
+      });
+      const startedAt = new Date(NOW_MS - 10_000).toISOString();
+      h.data = view({ startedAt, statisticsSince: startedAt });
+      await render();
+      const since = () =>
+        container!.querySelector('[data-testid="host-dashboard-since"] h3')?.textContent;
+      const sinceAtMount = since();
+      expect(sinceAtMount).toContain("up 10");
+      h.badgeRenders = 0;
+      for (let tick = 0; tick < 3; tick += 1) {
+        await act(async () => vi.advanceTimersByTime(1_000));
+      }
+      expect(since()).toBe(sinceAtMount!.replace("up 10", "up 13"));
+      expect(h.badgeRenders).toBe(0);
+    });
+
     /** A fresh `values` object on every call, structurally equal for the same view. */
     function freshValues(reading: HostMetricsView) {
       const values = presentHostDashboard({
