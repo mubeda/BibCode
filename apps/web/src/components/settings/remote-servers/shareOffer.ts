@@ -147,7 +147,7 @@ export function describeWidenFailure(error: unknown): {
   if (raw.includes("firewall-elevation-required")) {
     return {
       reason: "elevation-required",
-      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Choose Retry and approve the Windows prompt, or close BiBCode, start it with Run as administrator, and generate the code again.`,
+      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Try again and approve the Windows PowerShell permission prompt, or close BiBCode, start it with Run as administrator, and try again.`,
     };
   }
   const step = Object.entries(FIREWALL_STEP_FAILURES).find(([token]) => raw.includes(token));

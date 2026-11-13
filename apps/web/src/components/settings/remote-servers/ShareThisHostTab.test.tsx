@@ -308,7 +308,33 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Resume legacy remote access");
     expect(apply).not.toHaveBeenCalled();
     await click("Resume legacy remote access");
-    expect(apply).toHaveBeenCalledWith("network-accessible");
+    expect(apply).toHaveBeenCalledWith("network-accessible", { allowElevationPrompt: true });
+  });
+
+  it("explains a refused firewall change when legacy resume fails", async () => {
+    Object.assign(h.networkQuery.data.serverExposureState, {
+      ...localState,
+      configuredMode: "network-accessible",
+    });
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "loopback",
+      offHostGrantCount: 0,
+      legacyGrantCount: 1,
+    });
+    installBridge(
+      vi.fn(() =>
+        Promise.reject(
+          "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. Restored local-only safeguards.",
+        ),
+      ),
+    );
+    await renderTab();
+
+    await click("Resume legacy remote access");
+    expect(container.textContent).toContain(
+      "Windows needs administrator permission to open the firewall for BiBCode",
+    );
+    expect(container.textContent).not.toContain("firewall-elevation-required");
   });
 
   it("keeps waiting when legacy exposure resume exceeds the HTTP deadline", async () => {

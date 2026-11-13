@@ -43,6 +43,7 @@ import { Radio, RadioGroup } from "../../ui/radio-group";
 import { SettingsRow, SettingsSection } from "../settingsLayout";
 import { shareClassForPairingEndpoint } from "./endpointClass";
 import {
+  describeWidenFailure,
   type GeneratedShareOffer,
   type GenerateShareOfferFailure,
   generateShareOffer,
@@ -177,11 +178,12 @@ export function ShareThisHostTab(): ReactElement {
     setIsResumingLegacy(true);
     setLegacyResumeError(null);
     try {
-      await desktopBridge.applyServerExposure("network-accessible");
+      // The person asked to resume, so Windows may ask them for permission.
+      await desktopBridge.applyServerExposure("network-accessible", { allowElevationPrompt: true });
       refreshDesktopNetworkAccessState();
       await refreshShareState();
     } catch (error) {
-      setLegacyResumeError(error instanceof Error ? error.message : String(error));
+      setLegacyResumeError(describeWidenFailure(error).message);
     } finally {
       setIsResumingLegacy(false);
     }

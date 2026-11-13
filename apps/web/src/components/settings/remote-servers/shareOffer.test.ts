@@ -20,7 +20,7 @@ describe("describeWidenFailure", () => {
     ).toEqual({
       reason: "elevation-required",
       message:
-        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Choose Retry and approve the Windows prompt, or close BiBCode, start it with Run as administrator, and generate the code again.",
+        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows PowerShell permission prompt, or close BiBCode, start it with Run as administrator, and try again.",
     });
   });
 

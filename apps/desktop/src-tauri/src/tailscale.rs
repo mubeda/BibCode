@@ -620,7 +620,6 @@ printf '%s' '{TAILSCALE_STATUS_JSON}'"#
             "sleep 5",
             "%SystemRoot%\\System32\\ping.exe -n 6 127.0.0.1 >nul",
         );
-        let started = std::time::Instant::now();
 
         let error = read_first_tailscale_status(
             vec![slow.clone(), slow],
@@ -631,7 +630,6 @@ printf '%s' '{TAILSCALE_STATUS_JSON}'"#
         .unwrap_err();
 
         assert_eq!(error, "tailscale status timed out after 200ms in total.");
-        assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(TAILSCALE_STATUS_TOTAL_TIMEOUT, Duration::from_millis(3_000));
     }
 

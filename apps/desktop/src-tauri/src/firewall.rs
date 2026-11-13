@@ -616,14 +616,19 @@ async fn elevate_remote_access_rule<Runner>(
 where
     Runner: FirewallCommandRunner,
 {
+    let replacing = read_remote_access_rule(runner, Some(program)).await? != RuleListing::Absent;
     let mut netsh_commands = Vec::new();
-    if read_remote_access_rule(runner, Some(program)).await? != RuleListing::Absent {
+    if replacing {
         netsh_commands.push(remote_access_rule_delete_args());
     }
     netsh_commands.push(remote_access_rule_add_args(program));
     let run = runner.run_elevated(netsh_commands).await;
+    // When there was no rule before, any rule after a finished run is the one it added,
+    // even if the listing does not echo a non-ASCII path byte for byte. A replaced rule
+    // must name this program, since a failed delete leaves the old one.
     match (read_remote_access_rule(runner, Some(program)).await?, run) {
         (RuleListing::Present { for_program: true }, _) => Ok(()),
+        (RuleListing::Present { .. }, ElevatedRun::Finished) if !replacing => Ok(()),
         (_, ElevatedRun::Refused) => Err(FirewallFailure::ElevationRequired),
         (_, ElevatedRun::Finished) => Err(FirewallFailure::AddFailed),
     }
@@ -1447,6 +1452,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_read_back_trusts_a_new_rule_but_not_an_old_one_left_by_a_failed_replace() {
+        // A listing that does not echo the path (a non-ASCII profile name, say).
+        let unmatched = || listed(r"C:\Users\?????\bibcode-desktop.exe");
+        let added = FakeFirewallCommandRunner::with_elevation(
+            vec![Ok(absent()), Ok(unmatched())],
+            ElevatedRun::Finished,
+        );
+        assert_eq!(elevate_remote_access_rule(&added, PROGRAM).await, Ok(()));
+
+        let old = r"C:\Old\bibcode-desktop.exe";
+        let replaced = FakeFirewallCommandRunner::with_elevation(
+            vec![Ok(listed(old)), Ok(listed(old))],
+            ElevatedRun::Finished,
+        );
+        assert_eq!(
+            elevate_remote_access_rule(&replaced, PROGRAM).await,
+            Err(FirewallFailure::AddFailed)
+        );
+    }
+
+    #[tokio::test]
     async fn a_rule_for_another_program_is_replaced_behind_one_prompt() {
         let other = r"C:\Old\bibcode-desktop.exe";
         let runner = FakeFirewallCommandRunner::with_elevation(
@@ -1574,7 +1600,7 @@ mod tests {
 
     #[test]
     fn the_elevated_command_line_runs_only_system_netsh_with_quoted_arguments() {
-        let program = r"C:\Program Files\O'Brien & Co\bibcode-desktop.exe";
+        let program = r"C:\Program Files\Test User's & Co\bibcode-desktop.exe";
         let commands = vec![
             remote_access_rule_delete_args(),
             remote_access_rule_add_args(program),
@@ -1603,7 +1629,7 @@ mod tests {
                 "& \"$env:SystemRoot\\System32\\netsh.exe\" 'advfirewall' 'firewall' 'delete' 'rule' 'name=BiBCode Remote Access'; ",
                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ",
                 "& \"$env:SystemRoot\\System32\\netsh.exe\" 'advfirewall' 'firewall' 'add' 'rule' 'name=BiBCode Remote Access' 'dir=in' 'action=allow' ",
-                "'program=C:\\Program Files\\O''Brien & Co\\bibcode-desktop.exe' 'protocol=TCP' 'profile=domain,private' 'enable=yes'; ",
+                "'program=C:\\Program Files\\Test User''s & Co\\bibcode-desktop.exe' 'protocol=TCP' 'profile=domain,private' 'enable=yes'; ",
                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; exit 0"
             )
         );
