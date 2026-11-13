@@ -109,7 +109,9 @@ default-route observation. While a native-managed host is local-only and has
 that default route, the Share this host Address list offers "Automatic (LAN)"
 and each address marked `local-only`, labelled "(enables remote access)";
 choosing one widens exposure first, exactly as Automatic does, and the code
-uses that address with the port of the endpoint the completed widen reports.
+uses that address with the port of the endpoint the completed widen reports. An
+externally served address, such as a Tailscale Serve HTTPS name, keeps its own
+port.
 The wide listener binds `0.0.0.0`, so every listed address reaches it once the
 firewall admits the program. An address unavailable for any other reason is not offered. Public interface observations are never actionable in a
 native-managed topology, including after an unrelated transition has made the
@@ -886,10 +888,12 @@ never reads as "no backend" and so never as verified local-only. Relaunch the
 app to recover from that state. One coordinator serializes exposure applies and every
 other settings mutation that can restart the native or WSL topology. Those
 non-exposure mutations preserve the actual runtime exposure across their
-restart instead of reapplying a stale durable mode. Widening uses an
-ephemeral launch override, verifies a network-accessible advertised endpoint,
-opens the program-scoped `BiBCode Remote Access` Windows Firewall rule, and
-persists network-accessible only after those native side effects succeed. Any
+restart instead of reapplying a stale durable mode. Widening first ensures the
+program-scoped `BiBCode Remote Access` Windows Firewall rule (it names the
+program, not the port, so a refused rule never costs the running server a
+restart), then restarts with an ephemeral launch override, verifies a
+network-accessible advertised endpoint, and persists network-accessible only
+after those native side effects succeed. Any
 failure attempts every local safeguard even if an earlier recovery step fails:
 persist local-only, restart with a local-only override, close the firewall, and
 stop an unverified backend. Narrowing persists local-only first, restarts and
@@ -940,18 +944,30 @@ system directory, never from `PATH` or an environment variable. The person has
 120 seconds to answer, separate from the five-second budget that still covers
 every non-interactive command; the elevated `netsh` exit is reported to the
 Profiler. The worker then reads the rule back: after an add from an absent
-rule any rule counts, and after a replace the rule must name this program. A
-declined, dismissed or timed-out prompt, or one Windows could not show, is one
-refusal and is not retried. A widen queued while a prompt is open cannot open a
-second one. Recovery, automatic widening and narrowing by the share reconciler,
+rule any rule counts, and after a replace the rule must name this program. The
+worker remembers that this process added the present rule, so the check under
+the exposure lock, which runs before the restart, accepts the same rule even
+when the listing does not echo a non-ASCII path byte for byte. A declined,
+dismissed or timed-out prompt, or one Windows could not show, is one refusal
+and is not retried. A prompt counts as open until the `ShellExecuteExW` call
+really returns, even after its caller was given the refusal; meanwhile a
+permitted widen fails with `firewall-prompt-open` and raises no second prompt.
+When the person approves deleting a rule for another program path but declines
+the add, the old rule stays deleted (it named a stale path), exposure stays
+local-only and the outcome is `firewall-rule-removed-not-added`. Two limits are
+not verified: the stand-in probe checks the Windows argument rules, not how
+netsh itself parses `name=` and `program=` values (a real add is seen only when
+someone approves a prompt), and the wait for the prompt does not count time the
+computer is asleep. Recovery, automatic widening and narrowing by the share reconciler,
 and the WSL-only switch never prompt. A person who is not an administrator gets
 Windows' credential prompt or a refusal; both follow the same path.
 
 Failures leave the firewall module only as fixed reason tokens, never as `netsh`
 output, which is localized and can name paths:
 `firewall-elevation-required`, `firewall-rule-left`, `firewall-read-failed`,
-`firewall-remove-failed`, `firewall-add-failed`, `firewall-timed-out` and
-`firewall-unavailable`. The Share this host dialog turns them into plain text
+`firewall-remove-failed`, `firewall-add-failed`, `firewall-timed-out`,
+`firewall-unavailable`, `firewall-prompt-open` and
+`firewall-rule-removed-not-added`. The Share this host dialog turns them into plain text
 naming the failed step. For `firewall-elevation-required` it says that Windows
 needs administrator permission to open the firewall for BiBCode, that remote
 access was not turned on, whether the computer is confirmed local-only, and

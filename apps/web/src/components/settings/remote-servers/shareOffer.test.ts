@@ -145,6 +145,50 @@ describe("generateShareOffer", () => {
     });
   });
 
+  it("keeps the port of an externally served HTTPS address when widening", async () => {
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: "AI-SERVER",
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "tailscale-magicdns:https://machine.tailnet.ts.net/",
+        label: "machine.tailnet.ts.net",
+        httpBaseUrl: "https://machine.tailnet.ts.net/",
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => ({ ...wideState, endpointUrl: "http://192.168.1.20:3774" }),
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(mintOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "https://machine.tailnet.ts.net/" }),
+    );
+  });
+
+  it.each([
+    [
+      "firewall-prompt-open",
+      "A Windows permission prompt for the BiBCode firewall rule is still open, so remote access was not turned on. This computer is still local-only. Answer or close that prompt, then try again.",
+    ],
+    [
+      "firewall-rule-removed-not-added",
+      "BiBCode removed its old Windows Firewall rule, which named an earlier install, but the new rule was not added, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows permission prompt.",
+    ],
+  ])("explains %s", (token, message) => {
+    expect(
+      describeWidenFailure(
+        `Could not apply server exposure network-accessible: open remote-access firewall rule: ${token}. No exposure change was made.`,
+      ).message,
+    ).toBe(message);
+  });
+
   it("keeps the chosen host but takes the port the widened server listens on", async () => {
     const mintOffer = vi.fn(async (input: { endpoint: string }) => ({
       code: "c0de",
@@ -160,6 +204,7 @@ describe("generateShareOffer", () => {
         id: "desktop-network:10.20.0.5:3773",
         label: "10.20.0.5 (enables remote access)",
         httpBaseUrl: "http://10.20.0.5:3773/",
+        servedByNativeListener: true,
       },
       hasDesktopBridge: true,
       exposureState: loopbackState,
@@ -996,6 +1041,7 @@ describe("resolveShareAddressOptions", () => {
         label: `${host} (enables remote access)`,
         httpBaseUrl: `http://${host}:3773/`,
         description: "BiBCode will enable remote access, then use this address.",
+        servedByNativeListener: true,
       })),
     ]);
   });

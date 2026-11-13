@@ -129,12 +129,19 @@ pub(crate) enum FirewallFailure {
     AddFailed,
     TimedOut,
     Unavailable,
+    /// An earlier Windows prompt is still on screen; no second one is raised.
+    PromptOpen,
+    /// The person approved removing a rule for another program path but not adding the
+    /// new one: the old rule is gone and none was added.
+    RuleRemovedNotAdded,
 }
 
 #[cfg(any(windows, test))]
 impl FirewallFailure {
     pub(crate) const fn token(self) -> &'static str {
         match self {
+            Self::PromptOpen => "firewall-prompt-open",
+            Self::RuleRemovedNotAdded => "firewall-rule-removed-not-added",
             Self::ElevationRequired => "firewall-elevation-required",
             Self::RuleLeft => FIREWALL_RULE_LEFT_TOKEN,
             Self::ReadFailed => "firewall-read-failed",
@@ -257,11 +264,36 @@ trait FirewallCommandRunner: Sync {
         args: Vec<String>,
     ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send;
 
-    /// Runs the system netsh with `args` elevated, behind one Windows prompt.
+    /// Runs the system netsh with `args` elevated, behind one Windows prompt. `prompt` must
+    /// live until the prompt is really gone, which can be after this future returns.
     fn run_elevated(
         &self,
         netsh_args: Vec<String>,
+        prompt: PromptGuard,
     ) -> impl std::future::Future<Output = ElevatedRun> + Send;
+}
+
+/// Marks a Windows prompt as open until dropped, so no second one is raised meanwhile.
+#[cfg(any(windows, test))]
+struct PromptGuard(Arc<Mutex<FirewallWorkerState>>);
+
+#[cfg(any(windows, test))]
+impl PromptGuard {
+    fn open(state: &Arc<Mutex<FirewallWorkerState>>) -> Result<Self, FirewallFailure> {
+        let mut locked = state.lock().expect("firewall worker state");
+        if locked.prompt_open {
+            return Err(FirewallFailure::PromptOpen);
+        }
+        locked.prompt_open = true;
+        Ok(Self(Arc::clone(state)))
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        self.0.lock().expect("firewall worker state").prompt_open = false;
+    }
 }
 
 #[cfg(windows)]
@@ -281,6 +313,9 @@ struct FirewallJob {
 struct FirewallWorkerState {
     pending: Option<FirewallJob>,
     prompt_open: bool,
+    /// This process added the present rule, so it is ours even when the listing does not
+    /// echo a non-ASCII path byte for byte. Both checks of a widen use this one rule.
+    own_rule: bool,
 }
 
 #[cfg(any(windows, test))]
@@ -321,8 +356,6 @@ impl FirewallWorker {
         let (completion, receiver) = oneshot::channel();
         let (superseded, worker_unavailable) = {
             let mut state = self.state.lock().expect("firewall worker state");
-            // A widen queued while a prompt is open never opens a second one.
-            let allow_prompt = allow_prompt && !state.prompt_open;
             let superseded = state.pending.replace(FirewallJob {
                 enabled,
                 allow_prompt,
@@ -370,14 +403,16 @@ async fn run_firewall_worker<Runner>(
             };
             let mut deadline = job.deadline;
             let already_late = tokio::time::Instant::now() >= deadline;
+            let own_rule = state.lock().expect("firewall worker state").own_rule;
+            let enabled = job.enabled && !already_late;
             let mut result = if already_late {
-                sync_remote_access_rule_with_runner(false, &runner, || {
+                sync_rule(false, &runner, own_rule, || {
                     Err("expired firewall job must not add a rule".to_owned())
                 })
                 .await
             } else {
                 let program = job.program.clone();
-                sync_remote_access_rule_with_runner(job.enabled, &runner, move || {
+                sync_rule(job.enabled, &runner, own_rule, move || {
                     program.ok_or_else(|| "desktop executable was not provided".to_owned())
                 })
                 .await
@@ -393,17 +428,23 @@ async fn run_firewall_worker<Runner>(
                 // before it were held to the caller deadline.
                 deadline = tokio::time::Instant::now()
                     + 2 * (ELEVATION_PROMPT_TIMEOUT + FIREWALL_CALLER_TIMEOUT);
-                state.lock().expect("firewall worker state").prompt_open = true;
-                result = elevate_remote_access_rule(&runner, program).await;
-                state.lock().expect("firewall worker state").prompt_open = false;
+                result = elevate_remote_access_rule(&runner, &state, program).await;
+            }
+            if result.is_ok() {
+                // An enable leaves this program's rule in place; a disable leaves none.
+                state.lock().expect("firewall worker state").own_rule = enabled;
             }
 
             let completed_late = already_late || tokio::time::Instant::now() >= deadline;
             if job.enabled && !already_late && completed_late {
-                let cleanup = sync_remote_access_rule_with_runner(false, &runner, || {
+                let own_rule = state.lock().expect("firewall worker state").own_rule;
+                let cleanup = sync_rule(false, &runner, own_rule, || {
                     Err("firewall cleanup must not add a rule".to_owned())
                 })
                 .await;
+                if cleanup.is_ok() {
+                    state.lock().expect("firewall worker state").own_rule = false;
+                }
                 if let Err(cleanup) = cleanup {
                     tracing::warn!(
                         reason = cleanup.token(),
@@ -546,7 +587,7 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
         })
     }
 
-    async fn run_elevated(&self, netsh_args: Vec<String>) -> ElevatedRun {
+    async fn run_elevated(&self, netsh_args: Vec<String>, prompt: PromptGuard) -> ElevatedRun {
         let Ok(parameters) = windows_command_line(&netsh_args) else {
             return ElevatedRun::Refused;
         };
@@ -555,6 +596,8 @@ impl FirewallCommandRunner for ProcessFirewallCommandRunner {
         };
         let netsh = system_program_path(&system, FirewallProgram::Netsh);
         let waiting = tokio::task::spawn_blocking(move || {
+            // Held until ShellExecuteExW returns, after the caller may have stopped waiting.
+            let _prompt = prompt;
             shell_execute_and_wait("runas", &netsh, &parameters, ELEVATION_PROMPT_TIMEOUT)
         });
         match tokio::time::timeout(ELEVATION_PROMPT_TIMEOUT + FIREWALL_CALLER_TIMEOUT, waiting)
@@ -680,10 +723,25 @@ where
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 async fn sync_remote_access_rule_with_runner<Runner, ResolveProgram>(
     enabled: bool,
     runner: &Runner,
+    resolve_program: ResolveProgram,
+) -> Result<(), FirewallFailure>
+where
+    Runner: FirewallCommandRunner,
+    ResolveProgram: FnOnce() -> Result<String, String>,
+{
+    sync_rule(enabled, runner, false, resolve_program).await
+}
+
+/// `own_rule` says this process added the present rule (see [`FirewallWorkerState`]).
+#[cfg(any(windows, test))]
+async fn sync_rule<Runner, ResolveProgram>(
+    enabled: bool,
+    runner: &Runner,
+    own_rule: bool,
     resolve_program: ResolveProgram,
 ) -> Result<(), FirewallFailure>
 where
@@ -697,7 +755,9 @@ where
     };
     match read_remote_access_rule(runner, program.as_deref()).await? {
         // A rule for this program already admits it; keep it rather than ask again.
-        RuleListing::Present { for_program: true } if enabled => return Ok(()),
+        RuleListing::Present { for_program } if enabled && (for_program || own_rule) => {
+            return Ok(());
+        }
         RuleListing::Absent => {}
         RuleListing::Present { .. } => {
             // A spawn failure or timeout is an Err here and stays a failed safeguard.
@@ -749,6 +809,7 @@ where
 #[cfg(any(windows, test))]
 async fn elevate_remote_access_rule<Runner>(
     runner: &Runner,
+    state: &Arc<Mutex<FirewallWorkerState>>,
     program: &str,
 ) -> Result<(), FirewallFailure>
 where
@@ -756,7 +817,11 @@ where
 {
     let replacing = read_remote_access_rule(runner, Some(program)).await? != RuleListing::Absent;
     if replacing {
-        match runner.run_elevated(remote_access_rule_delete_args()).await {
+        let prompt = PromptGuard::open(state)?;
+        match runner
+            .run_elevated(remote_access_rule_delete_args(), prompt)
+            .await
+        {
             ElevatedRun::Refused => return Err(FirewallFailure::ElevationRequired),
             ElevatedRun::Exited(0) => {}
             ElevatedRun::Exited(_) => return Err(FirewallFailure::RemoveFailed),
@@ -765,14 +830,21 @@ where
             return Err(FirewallFailure::RemoveFailed);
         }
     }
+    // A prompt still on screen from the delete keeps this one from opening.
+    let prompt = match PromptGuard::open(state) {
+        Err(_) if replacing => return Err(FirewallFailure::RuleRemovedNotAdded),
+        prompt => prompt?,
+    };
     let run = runner
-        .run_elevated(remote_access_rule_add_args(program))
+        .run_elevated(remote_access_rule_add_args(program), prompt)
         .await;
     // The rule was absent before this add, so any rule now is the one it added, even if
     // the listing does not echo a non-ASCII path byte for byte.
     match (read_remote_access_rule(runner, Some(program)).await?, run) {
         (RuleListing::Present { .. }, ElevatedRun::Exited(_)) => Ok(()),
         (RuleListing::Present { for_program: true }, ElevatedRun::Refused) => Ok(()),
+        // The old rule named another program path, so it is stale and not restored.
+        (_, ElevatedRun::Refused) if replacing => Err(FirewallFailure::RuleRemovedNotAdded),
         (_, ElevatedRun::Refused) => Err(FirewallFailure::ElevationRequired),
         (RuleListing::Absent, ElevatedRun::Exited(_)) => Err(FirewallFailure::AddFailed),
     }
@@ -836,7 +908,9 @@ mod tests {
         calls: Arc<Mutex<Vec<FirewallCall>>>,
         results: Arc<Mutex<VecDeque<Result<FirewallCommandOutput, String>>>>,
         elevated: Arc<Mutex<Vec<Vec<String>>>>,
-        elevated_outcome: Arc<Mutex<Option<ElevatedRun>>>,
+        elevated_outcomes: Arc<Mutex<VecDeque<ElevatedRun>>>,
+        hold_prompts: Arc<AtomicBool>,
+        held_prompts: Arc<Mutex<Vec<PromptGuard>>>,
     }
 
     impl FakeFirewallCommandRunner {
@@ -847,13 +921,25 @@ mod tests {
             }
         }
 
+        /// Every elevated run (at most two) ends with `outcome`.
         fn with_elevation(
             results: Vec<Result<FirewallCommandOutput, String>>,
             outcome: ElevatedRun,
         ) -> Self {
+            Self::with_elevations(results, vec![outcome, outcome])
+        }
+
+        fn with_elevations(
+            results: Vec<Result<FirewallCommandOutput, String>>,
+            outcomes: Vec<ElevatedRun>,
+        ) -> Self {
             let runner = Self::with_results(results);
-            *runner.elevated_outcome.lock().expect("elevated outcome") = Some(outcome);
+            *runner.elevated_outcomes.lock().expect("elevated outcomes") = outcomes.into();
             runner
+        }
+
+        fn release_held_prompts(&self) {
+            self.held_prompts.lock().expect("held prompts").clear();
         }
 
         fn calls(&self) -> Vec<FirewallCall> {
@@ -888,16 +974,22 @@ mod tests {
         fn run_elevated(
             &self,
             netsh_args: Vec<String>,
+            prompt: PromptGuard,
         ) -> impl std::future::Future<Output = ElevatedRun> + Send {
             self.elevated
                 .lock()
                 .expect("elevated calls")
                 .push(netsh_args);
             let outcome = self
-                .elevated_outcome
+                .elevated_outcomes
                 .lock()
-                .expect("elevated outcome")
+                .expect("elevated outcomes")
+                .pop_front()
                 .expect("an elevated run was not expected");
+            if self.hold_prompts.load(Ordering::SeqCst) {
+                // Models a ShellExecuteExW call still blocked after its caller gave up.
+                self.held_prompts.lock().expect("held prompts").push(prompt);
+            }
             async move { outcome }
         }
     }
@@ -1295,7 +1387,11 @@ mod tests {
             }
         }
 
-        async fn run_elevated(&self, _netsh_args: Vec<String>) -> ElevatedRun {
+        async fn run_elevated(
+            &self,
+            _netsh_args: Vec<String>,
+            _prompt: PromptGuard,
+        ) -> ElevatedRun {
             panic!("no elevation is expected here")
         }
     }
@@ -1655,7 +1751,11 @@ mod tests {
             vec![Ok(absent()), Ok(unmatched())],
             ElevatedRun::Exited(0),
         );
-        assert_eq!(elevate_remote_access_rule(&added, PROGRAM).await, Ok(()));
+        let state = Arc::new(Mutex::new(FirewallWorkerState::default()));
+        assert_eq!(
+            elevate_remote_access_rule(&added, &state, PROGRAM).await,
+            Ok(())
+        );
 
         let old = r"C:\Old\bibcode-desktop.exe";
         let replaced = FakeFirewallCommandRunner::with_elevation(
@@ -1663,7 +1763,7 @@ mod tests {
             ElevatedRun::Exited(0),
         );
         assert_eq!(
-            elevate_remote_access_rule(&replaced, PROGRAM).await,
+            elevate_remote_access_rule(&replaced, &state, PROGRAM).await,
             Err(FirewallFailure::RemoveFailed)
         );
         assert_eq!(replaced.elevated().len(), 1, "no add after a failed delete");
@@ -1729,7 +1829,9 @@ mod tests {
         );
         assert!(not_permitted.elevated().is_empty());
 
-        let second = FakeFirewallCommandRunner::with_results(refused());
+        let mut second_results = refused();
+        second_results.push(Ok(absent()));
+        let second = FakeFirewallCommandRunner::with_results(second_results);
         let worker = FirewallWorker::start(second.clone());
         worker
             .state
@@ -1745,12 +1847,135 @@ mod tests {
                     FIREWALL_CALLER_TIMEOUT
                 )
                 .await,
-            Err(FirewallFailure::ElevationRequired)
+            Err(FirewallFailure::PromptOpen)
         );
+        assert_eq!(FirewallFailure::PromptOpen.token(), "firewall-prompt-open");
         assert!(
             second.elevated().is_empty(),
             "a widen queued while a prompt is open must not open a second one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_still_on_screen_after_its_caller_gave_up_blocks_a_second_one() {
+        let refused_then_prompt = || {
+            vec![
+                Ok(absent()),
+                Ok(elevation_refusal()),
+                Ok(whoami("S-1-16-8192")),
+                Ok(absent()),
+                Ok(absent()),
+            ]
+        };
+        let mut results = refused_then_prompt();
+        results.extend(refused_then_prompt());
+        let runner = FakeFirewallCommandRunner::with_elevations(
+            results,
+            vec![ElevatedRun::Refused, ElevatedRun::Exited(0)],
+        );
+        runner.hold_prompts.store(true, Ordering::SeqCst);
+        let worker = FirewallWorker::start(runner.clone());
+        let widen = || {
+            worker.sync(
+                true,
+                true,
+                Some(PROGRAM.to_owned()),
+                FIREWALL_CALLER_TIMEOUT,
+            )
+        };
+
+        // The caller is released with the refusal while the prompt is still up.
+        assert_eq!(widen().await, Err(FirewallFailure::ElevationRequired));
+        assert_eq!(widen().await, Err(FirewallFailure::PromptOpen));
+        assert_eq!(
+            runner.elevated().len(),
+            1,
+            "no second prompt while one is open"
+        );
+
+        runner.release_held_prompts();
+        assert!(
+            !worker
+                .state
+                .lock()
+                .expect("firewall worker state")
+                .prompt_open
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_add_after_an_approved_delete_reports_the_partial_change() {
+        let other = r"C:\Old\bibcode-desktop.exe";
+        let runner = FakeFirewallCommandRunner::with_elevations(
+            vec![
+                Ok(listed(other)),
+                Ok(elevation_refusal()),
+                Ok(listed(other)),
+                Ok(whoami("S-1-16-8192")),
+                Ok(listed(other)),
+                Ok(absent()),
+                Ok(absent()),
+            ],
+            vec![ElevatedRun::Exited(0), ElevatedRun::Refused],
+        );
+        let worker = FirewallWorker::start(runner.clone());
+
+        let error = worker
+            .sync(
+                true,
+                true,
+                Some(PROGRAM.to_owned()),
+                FIREWALL_CALLER_TIMEOUT,
+            )
+            .await
+            .expect_err("the add was declined");
+
+        assert_eq!(error, FirewallFailure::RuleRemovedNotAdded);
+        assert_eq!(error.token(), "firewall-rule-removed-not-added");
+        assert_eq!(runner.elevated().len(), 2, "the stale rule is not restored");
+    }
+
+    #[tokio::test]
+    async fn a_prompted_widen_and_its_locked_check_agree_on_a_non_ascii_path() {
+        let program = "C:\\Users\\T\u{e9}st \u{30e6}\u{30fc}\u{30b6}\\bibcode-desktop.exe";
+        // netsh output read back through another code page loses the non-ASCII letters.
+        let mangled = || listed(r"C:\Users\T?st ???\bibcode-desktop.exe");
+        let runner = FakeFirewallCommandRunner::with_elevation(
+            vec![
+                // The prompted step before the lock: refused add, one approved prompt.
+                Ok(absent()),
+                Ok(elevation_refusal()),
+                Ok(whoami("S-1-16-8192")),
+                Ok(absent()),
+                Ok(mangled()),
+                // The check under the exposure lock, before the restart.
+                Ok(mangled()),
+            ],
+            ElevatedRun::Exited(0),
+        );
+        let worker = FirewallWorker::start(runner.clone());
+
+        worker
+            .sync(
+                true,
+                true,
+                Some(program.to_owned()),
+                FIREWALL_CALLER_TIMEOUT,
+            )
+            .await
+            .expect("the approved prompt adds the rule");
+        worker
+            .sync(
+                true,
+                false,
+                Some(program.to_owned()),
+                FIREWALL_CALLER_TIMEOUT,
+            )
+            .await
+            .expect("the locked check keeps the rule this process added");
+
+        assert_eq!(runner.calls().len(), 6, "no delete of its own rule");
+        assert_eq!(runner.elevated().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
