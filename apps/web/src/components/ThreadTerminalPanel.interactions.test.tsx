@@ -708,6 +708,7 @@ import ThreadTerminalPanel, {
   TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS,
   TerminalViewport,
 } from "./ThreadTerminalPanel";
+import { proposeTerminalDimensions } from "./terminalSizing";
 import {
   clearTerminalSizeDiagnostics,
   readTerminalSizeDiagnostics,
@@ -2388,6 +2389,30 @@ describe("TerminalViewport mounted lifecycle", () => {
     await view.flushFrame();
     expect(written()).toBe("\x1b[1;1R\x1b[?1;2c");
   });
+
+  it.each([false, true])(
+    "keeps the grid within its mount before the first snapshot after a reload (ownership %s)",
+    { timeout: 30_000 },
+    async (ownership) => {
+      // R43 (#348), decided by this test: the fit fake resizes the grid as the real addon does.
+      xtermState.fitAppliesProposal = true;
+      xtermState.proposedDimensions = { cols: 80, rows: 20 };
+      if (ownership)
+        testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
+      const view = await mountViewport({ publishRuntime: false });
+      await view.flushFrame();
+      await view.flushMountFit();
+      const terminal = view.fakeTerminal!;
+      const mount = view.mounted.container.querySelector<HTMLElement>(
+        "[data-terminal-xterm-mount]",
+      )!;
+      const fitted = proposeTerminalDimensions(xtermState.fitAddons.at(-1)!, mount);
+      expect(
+        terminal.rows,
+        JSON.stringify({ rows: terminal.rows, mountHeight: mount.clientHeight, fitted }),
+      ).toBeLessThanOrEqual(20);
+    },
+  );
 
   it("sends keystrokes through the input scheduler before the first snapshot", async () => {
     const view = await mountViewport({ publishRuntime: false });
