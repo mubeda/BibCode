@@ -554,7 +554,7 @@ async fn cancel_pairing_offer(
 
 fn invalid_pairing_offer_response(detail: &str) -> Response {
     let trace_id = Uuid::new_v4().to_string();
-    tracing::debug!(target: "bibcode_server::auth", %trace_id, "invalid pairing offer: {detail}");
+    tracing::warn!(target: "bibcode_server::auth", %trace_id, "invalid pairing offer: {detail}");
     error_response(
         StatusCode::BAD_REQUEST,
         "EnvironmentRequestInvalidError",
@@ -2062,10 +2062,99 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
     use serde::Deserialize;
 
-    use super::{MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES, is_valid_pairing_offer_idempotency_key};
+    use super::{
+        MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES, invalid_pairing_offer_response,
+        is_valid_pairing_offer_idempotency_key, validate_pairing_offer_input,
+    };
     use crate::auth::service::{is_loopback_host, is_unspecified_host};
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct TraceCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for TraceCaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl TraceCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("trace capture").clone())
+                .expect("trace capture UTF-8")
+        }
+    }
+
+    /// #358: a refused offer is an operational failure the reader of the log needs, so it is a
+    /// `warn` with its fixed reason text, and never the offered input.
+    #[tokio::test]
+    async fn a_rejected_pairing_offer_is_logged_at_warn_with_its_reason_and_without_the_token() {
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = validate_pairing_offer_input(
+            "Test Device",
+            "ftp://example.test/?token=pairing-secret-marker",
+            "another-device",
+            None,
+        )
+        .expect_err("an ftp endpoint is refused");
+        for response in [
+            invalid_pairing_offer_response(&error.to_string()),
+            invalid_pairing_offer_response("idempotency key is invalid"),
+        ] {
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("response body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+            assert_eq!(body["reason"], "invalid_pairing_offer", "{body}");
+        }
+
+        let text = capture.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines.iter().all(|line| line.contains("WARN")), "{text}");
+        assert!(
+            lines.iter().all(|line| line.contains("trace_id=")),
+            "{text}"
+        );
+        assert!(
+            lines[0].contains("endpoint must be an http(s) URL"),
+            "{text}"
+        );
+        assert!(lines[1].contains("idempotency key is invalid"), "{text}");
+        assert!(!text.contains("pairing-secret-marker"), "{text}");
+    }
 
     #[derive(Deserialize)]
     struct PairingEndpointFixture {
