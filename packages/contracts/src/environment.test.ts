@@ -85,6 +85,12 @@ describe("execution environment contracts", () => {
       true,
     );
   });
+  it("defaults the terminal size hand-over off and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).terminalSizeHandOver).toBe(false);
+    expect(decodeTerminalCapabilities({ terminalSizeHandOver: true }).terminalSizeHandOver).toBe(
+      true,
+    );
+  });
   it("defaults Pull Requests capabilities off for older servers and preserves advertised support", () => {
     const legacy = decodeExecutionEnvironmentDescriptor({
       environmentId: "env-1",

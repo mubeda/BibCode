@@ -75,6 +75,11 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Terminal writes and input frames accept `userInputClaim` (#348). */
   terminalUserInputClaim: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * A released size waits, un-owned, for a window to be used, and `replyClaim` names the window
+   * that answers queries meanwhile (#348).
+   */
+  terminalSizeHandOver: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `terminal.stageImagePaste` turns a pasted clipboard image into a server file path. */
   terminalImagePaste: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `git.runStackedAction` accepts `pullRequestOptions` and reports `pr.warning`. */
