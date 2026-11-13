@@ -1839,7 +1839,15 @@ describe("TerminalViewport mounted lifecycle", () => {
         terminal.cols += 1;
       });
 
-      await view.setTerminalFontPreference({ mode: "custom", family: "Maple Mono" });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await view.setTerminalFontPreference({ mode: "custom", family: "Maple Mono" });
+        // The loaded font's cell waits for the mount to settle before the claim (#348).
+        elapseMountSettle();
+        await act(async () => vi.advanceTimersByTime(TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS));
+      } finally {
+        vi.useRealTimers();
+      }
 
       // xterm measured at the assignment, before the font loaded; the load measures again.
       expect(terminal._core._charSizeService.measure).toHaveBeenCalledOnce();
@@ -3776,6 +3784,9 @@ describe("TerminalViewport mounted lifecycle", () => {
           for (const listener of watched()[0]!.listeners) listener();
         });
         await view.flushFrame();
+        // A new ratio's rows wait for the mount to settle, as a box change does (#348).
+        elapseMountSettle();
+        await act(async () => vi.advanceTimersByTime(TERMINAL_AUTOMATIC_CLAIM_SETTLE_MS));
         if (mode === "legacy") {
           expect(fit).toHaveBeenCalledOnce();
           expect(terminal.rows).toBe(23);
@@ -3816,7 +3827,8 @@ describe("TerminalViewport mounted lifecycle", () => {
           expect(terminal.rows).toBe(24);
         }
         await act(async () => vi.advanceTimersByTime(50));
-        expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+        // The repaint runs at 50 ms, on the grid before the settled claim; xterm redraws a resize.
+        expect(terminal.refresh).toHaveBeenCalledWith(0, 23);
       } finally {
         vi.useRealTimers();
       }
@@ -9732,6 +9744,81 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
         } finally {
           setTerminalSizeDiagnosticsEnabled(false);
         }
+      },
+    );
+
+    /** Claims after `change` gives 33 rows and a dock then shortens the box to 30 rows. */
+    const claimsAfterCellChangeAndDock = async (
+      prepare: () => void,
+      change: () => Promise<void>,
+    ) => {
+      hasFocus.mockReturnValue(true);
+      prepare();
+      const owner = await openWindow(CLIENT, { cols: 85, rows: 30 });
+      await resizeMount(owner, { width: 600, height: 430 }, { cols: 85, rows: 30 });
+      await settle();
+      const before = claimsOf(owner).length;
+      owner.fit = { cols: 85, rows: 33 };
+      await change();
+      await flushAnimationFrames();
+      await resizeMount(owner, { width: 600, height: 400 }, { cols: 85, rows: 30 });
+      await settle();
+      await settle();
+      return claimsOf(owner).slice(before);
+    };
+    const expectOnlyFinalClaim = (claims: string[]) => {
+      const rows = claims.map((claim) => Number(claim.split("x")[1]));
+      const reverted = rows.some((row, index) => index > 0 && row !== rows[index - 1]);
+      expect(reverted, JSON.stringify(claims)).toBe(false);
+      if (claims.length > 0) expect(claims.at(-1)).toBe("85x30");
+    };
+
+    it(
+      "sends only the final size after a device pixel ratio change and an Activity dock change (pixel-ratio transient)",
+      { timeout: 30_000 },
+      async () => {
+        const listeners = new Set<() => void>();
+        const claims = await claimsAfterCellChangeAndDock(
+          () =>
+            vi.stubGlobal(
+              "matchMedia",
+              vi.fn((query: string) => ({
+                matches: true,
+                media: query,
+                addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+                removeEventListener: (_type: string, listener: () => void) =>
+                  listeners.delete(listener),
+              })),
+            ),
+          async () => {
+            await act(async () => {
+              // A copy: each listener watches the new ratio by re-registering.
+              for (const listener of Array.from(listeners)) listener();
+            });
+          },
+        );
+        expectOnlyFinalClaim(claims);
+      },
+    );
+
+    it(
+      "sends only the final size after the bundled font loads and an Activity dock change (font-effect transient)",
+      { timeout: 30_000 },
+      async () => {
+        let resolveFont: () => void = () => undefined;
+        const claims = await claimsAfterCellChangeAndDock(
+          () =>
+            testState.fontLoad.mockImplementation(
+              () => new Promise<void>((resolve) => (resolveFont = resolve)),
+            ),
+          async () => {
+            await act(async () => {
+              resolveFont();
+              await Promise.resolve();
+            });
+          },
+        );
+        expectOnlyFinalClaim(claims);
       },
     );
 
