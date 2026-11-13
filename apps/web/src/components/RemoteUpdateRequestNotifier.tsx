@@ -40,12 +40,16 @@ export function RemoteUpdateRequestNotifier({
   const notice = useRef<{ id: string; text: ReturnType<typeof remoteUpdateRequestToast> } | null>(
     null,
   );
+  // Announcing tracks the request; `notice` outlives it, so a block released after the requester
+  // cleared still re-enables the action and drops its reason.
+  const announced = useRef(false);
   useEffect(() => {
     if (requestedBy === null) {
-      notice.current = null;
+      announced.current = false;
       return;
     }
-    if (notice.current !== null) return;
+    if (announced.current) return;
+    announced.current = true;
     const text = remoteUpdateRequestToast(
       requestedBy,
       state?.downloadedVersion ?? state?.availableVersion ?? null,
