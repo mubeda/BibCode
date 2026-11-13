@@ -606,7 +606,7 @@ impl PullRequestService {
     /// [`Self::resolve_current_optional`] for VCS status enrichment: a
     /// successful answer (including no open pull request) is reused for a few
     /// seconds per (worktree, provider, branch), concurrent callers share one
-    /// provider run, and failures are never reused. Callers that must see the
+    /// provider run, and a failure answers for 5 seconds. Callers that must see the
     /// hosting service's current answer, such as the existence check before
     /// creating a pull request, use the uncached method.
     pub async fn resolve_current_optional_shared(

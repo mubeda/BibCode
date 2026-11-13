@@ -927,8 +927,13 @@ impl GitVcsRpcServices {
                             .await
                         }
                     });
+                    // The RPC's own cancellation is not the lookup's result, so not a failure.
+                    let mut refresh_cancelled = false;
                     let found = tokio::select! {
-                        () = cancellation.cancelled() => Ok(None),
+                        () = cancellation.cancelled() => {
+                            refresh_cancelled = true;
+                            Ok(None)
+                        }
                         found = tokio::time::timeout(
                             REFRESH_PULL_REQUEST_LOOKUP_BOUND,
                             &mut lookup,
@@ -943,9 +948,15 @@ impl GitVcsRpcServices {
                             );
                             pull_request
                         }
-                        Ok(None) => self
-                            .broadcaster
-                            .known_pull_request(&cwd, ref_name.as_deref()),
+                        Ok(None) => {
+                            // The inner lookup runs under a token nothing cancels: a failure.
+                            if !refresh_cancelled {
+                                self.broadcaster
+                                    .note_failed_pull_request_lookup(&cwd, ref_name.as_deref());
+                            }
+                            self.broadcaster
+                                .known_pull_request(&cwd, ref_name.as_deref())
+                        }
                         Err(_) => {
                             // Only subscribers need the late answer, so the lookup keeps its
                             // lease while the repository has one and then delivers to them.
@@ -959,6 +970,12 @@ impl GitVcsRpcServices {
                                         late_ref.as_deref(),
                                         pull_request,
                                     );
+                                    broadcaster.notify_pull_request_change(&late_cwd).await;
+                                } else if broadcaster
+                                    .note_failed_pull_request_lookup(&late_cwd, late_ref.as_deref())
+                                {
+                                    // Republished so the subscriber shows the cleared request;
+                                    // its own lookup then answers from the failure backoff.
                                     broadcaster.notify_pull_request_change(&late_cwd).await;
                                 }
                             });
@@ -1538,12 +1555,20 @@ impl GitVcsRpcServices {
                         (&mut enrichment.as_mut().expect("lookup in flight").task).await
                     }, if enrichment.is_some() => {
                         let finished = enrichment.take().expect("lookup in flight");
-                        if let Ok(Some(pull_request)) = found {
-                            broadcaster.record_pull_request(
+                        match found {
+                            Ok(Some(pull_request)) => broadcaster.record_pull_request(
                                 &cwd,
                                 finished.ref_name.as_deref(),
                                 pull_request,
-                            );
+                            ),
+                            // A lookup cancelled through its own token is not a failure.
+                            Ok(None) if !finished.cancellation.is_cancelled() => {
+                                broadcaster.note_failed_pull_request_lookup(
+                                    &cwd,
+                                    finished.ref_name.as_deref(),
+                                );
+                            }
+                            _ => {}
                         }
                         if !shown.reconcile(&sender, &broadcaster, &cwd).await {
                             break;
@@ -8233,8 +8258,8 @@ mod open_pull_request_lookup_tests {
     use crate::test_support::TestSandbox;
 
     /// Answers every `pr list` from marker files read when it starts, then
-    /// records its `--head` branch: `fail` exits 1, `slow` sleeps its contents
-    /// in seconds, and `open` returns one open PR for the requested branch.
+    /// records its `--head` branch: `slow` sleeps its contents in seconds, then
+    /// `fail` exits 1, and `open` returns one open PR for the requested branch.
     /// The markers are read before the record, so a test that sees a lookup
     /// recorded can change a marker without the change reaching that lookup.
     const FAKE_GH: &str = r#"#!/bin/sh
@@ -8245,8 +8270,8 @@ case "$1:$2" in
     slow=''; if [ -f 'STATE/slow' ]; then slow="$(cat 'STATE/slow')"; fi
     printf '%s\n' "$4" >> 'CALLS'
     printf '%s\n' "$$" >> 'PIDS'
-    if [ -n "$fail" ]; then echo 'forge unavailable' >&2; exit 1; fi
     if [ -n "$slow" ]; then sleep "$slow"; fi
+    if [ -n "$fail" ]; then echo 'forge unavailable' >&2; exit 1; fi
     if [ -n "$open" ]; then
       printf '[{"number":42,"title":"PR for %s","url":"https://github.com/acme/repo/pull/42","baseRefName":"main","headRefName":"%s","state":"OPEN"}]\n' "$4" "$4"
     else
@@ -8866,9 +8891,20 @@ esac
 
         fixture.clear("fail");
         fixture.set("open", "");
+        // A push, a mutation or a local change clears the remembered failure in production.
+        fixture.forget_lookups();
         let recovered = fixture.refresh().await;
         assert_eq!(recovered["pr"]["number"], 42, "{recovered}");
         assert_eq!(fixture.lookups(), ["main", "main"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_is_not_run_again_inside_the_backoff() {
+        let fixture = Fixture::new("pr-lookup-backoff");
+        fixture.set("fail", "");
+        fixture.refresh().await;
+        fixture.refresh().await;
+        assert_eq!(fixture.lookups(), ["main"], "one gh run");
     }
 
     /// Subscribes and waits until the subscriber shows the open pull request.
@@ -8992,6 +9028,81 @@ esac
             "a failed lookup must keep the pull request: {:?}",
             subscriber.events
         );
+        cancellation.cancel();
+    }
+
+    /// Moves the subscriber's remembered success back by `age` on the real clock.
+    fn age_the_pull_request(fixture: &Fixture, age: Duration) {
+        let canonical = std::fs::canonicalize(&fixture.repository).expect("canonical repository");
+        fixture
+            .services
+            .broadcaster
+            .age_pull_request_for_test(&canonical, age);
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_failed_lookup_after_six_minutes_clears_the_pull_request() {
+        let fixture = Fixture::new("pr-row-stale-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        age_the_pull_request(&fixture, Duration::from_secs(360));
+        fixture.set("fail", "");
+        fixture.forget_lookups();
+        fixture.report_pull_request_change();
+        subscriber
+            .until("a failed lookup on stale data clears the request", |s| {
+                s.pr().is_null()
+            })
+            .await;
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_failed_lookup_after_four_minutes_keeps_the_pull_request() {
+        let fixture = Fixture::new("pr-row-fresh-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+        let from = subscriber.events.len();
+
+        age_the_pull_request(&fixture, Duration::from_secs(240));
+        fixture.set("fail", "");
+        fixture.forget_lookups();
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        subscriber.drain(Duration::from_millis(1000)).await;
+
+        assert!(
+            subscriber.events.len() > from,
+            "the test drove no status event"
+        );
+        assert!(
+            subscriber.shown_since(from).iter().all(|pr| *pr == 42),
+            "a failed lookup on recent data keeps the request: {:?}",
+            subscriber.events
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_late_failed_lookup_after_six_minutes_clears_the_pull_request() {
+        let fixture = Fixture::new("pr-row-late-stale-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        age_the_pull_request(&fixture, Duration::from_secs(360));
+        fixture.set("slow", "6");
+        fixture.set("fail", "");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers at its bound");
+        assert_eq!(status["pr"]["number"], 42, "{status}");
+        subscriber
+            .until("the late failed lookup clears the request", |s| {
+                s.pr().is_null()
+            })
+            .await;
         cancellation.cancel();
     }
 
@@ -9183,6 +9294,39 @@ esac
         // The request is closed, and a local change on the same branch reports it.
         fixture.clear("open");
         std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        subscriber
+            .until(
+                "the closed request must clear after the outdated answer",
+                |s| s.pr().is_null(),
+            )
+            .await;
+        assert_eq!(
+            fixture.lookups(),
+            ["main", "main", "main"],
+            "one follow-up lookup runs after the outdated one"
+        );
+        cancellation.cancel();
+    }
+
+    /// R30: like the test above, but the local change alters no status.
+    #[tokio::test]
+    async fn a_neutral_local_change_during_a_lookup_replaces_its_outdated_answer() {
+        let fixture = Fixture::new("pr-lookup-neutral-again");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        // This lookup reads the open request, then answers slowly.
+        fixture.set("slow", "2");
+        fixture.report_pull_request_change();
+        wait_for_lookups(&fixture, "main", 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The request is closed, and a local change that alters nothing reports it.
+        fixture.clear("open");
         fixture
             .services
             .broadcaster

@@ -15,6 +15,10 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 #[cfg(test)]
 use super::watcher::test_timeout;
 
+/// How old the last successful lookup must be before a failed one stops showing the
+/// remembered pull request (D7).
+pub(crate) const PULL_REQUEST_STALE_AFTER: Duration = Duration::from_secs(300);
+
 use super::{
     ChangeRequest, GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
     GitWatcherHealth, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult,
@@ -100,6 +104,8 @@ struct RepositoryState {
     /// The next remote read publishes even when unchanged: a pull request changed, which only
     /// a published remote makes the status streams look up again.
     republish_remote: bool,
+    /// When a lookup last succeeded for the current branch, including "none open".
+    pr_recorded_at: Option<tokio::time::Instant>,
     /// Ends the work run for the status subscribers once the last one leaves, even while a
     /// Git Manager signal subscriber keeps the entry.
     status_lookups: CancellationToken,
@@ -516,6 +522,7 @@ impl StatusBroadcaster {
                         remote_ref_name: None,
                         pending_local_reconcile: false,
                         republish_remote: false,
+                        pr_recorded_at: None,
                         status_lookups: CancellationToken::new(),
                         remote_refresh_requests,
                         git_manager_signature: None,
@@ -935,6 +942,11 @@ impl StatusBroadcaster {
 
     /// Runs `task` for the repository's status subscribers, until the last one leaves or the
     /// broadcaster shuts down. With no status subscriber, `task` is dropped at once.
+    ///
+    /// shortcut: with no status subscriber the late lookup is dropped (D8). Nothing would
+    /// show its answer, and the next refresh asks again. A refresh with no subscriber
+    /// therefore never warms the remembered request. Upgrade only if a caller needs the
+    /// answer without a stream.
     pub(crate) fn spawn_for_subscribers(
         &self,
         cwd: &Path,
@@ -971,15 +983,69 @@ impl StatusBroadcaster {
         pull_request: Option<ChangeRequest>,
     ) {
         let mut state = self.lock_state();
-        if let Some(remote) = state
+        if let Some(entry) = state
             .repositories
             .get_mut(cwd)
             .filter(|entry| entry.local.ref_name.as_deref() == ref_name)
-            .and_then(|entry| entry.remote.as_mut())
-            .and_then(Option::as_mut)
         {
-            remote.pr = pull_request;
+            entry.pr_recorded_at = Some(tokio::time::Instant::now());
+            if let Some(remote) = entry.remote.as_mut().and_then(Option::as_mut) {
+                remote.pr = pull_request;
+            }
         }
+    }
+
+    /// A lookup for `ref_name` failed. When the last success for that branch is older than
+    /// [`PULL_REQUEST_STALE_AFTER`], the remembered request stops being shown (D7) and this
+    /// returns `true`; otherwise, after shutdown, for a former branch, or with nothing
+    /// remembered, nothing changes. It publishes nothing; callers decide.
+    ///
+    /// Callers pass only failures, never cancellations. The status stream counts its
+    /// `Ok(None)` only while its lookup's own token is not cancelled. The refresh's inner
+    /// lookup runs under a token nothing cancels, so its `None` is a failure, while the refresh
+    /// RPC's own cancellation is not the lookup's result. The late lookup a refresh hands to
+    /// subscribers ends `None` after shutdown, which this refuses because the broadcaster is
+    /// closed.
+    pub(crate) fn note_failed_pull_request_lookup(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+    ) -> bool {
+        let mut state = self.lock_state();
+        if state.closed {
+            return false;
+        }
+        let Some(entry) = state
+            .repositories
+            .get_mut(cwd)
+            .filter(|entry| entry.local.ref_name.as_deref() == ref_name)
+        else {
+            return false;
+        };
+        let stale = entry
+            .pr_recorded_at
+            .is_some_and(|recorded| recorded.elapsed() >= PULL_REQUEST_STALE_AFTER);
+        let Some(remote) = entry.remote.as_mut().and_then(Option::as_mut) else {
+            return false;
+        };
+        if !stale || remote.pr.is_none() {
+            return false;
+        }
+        remote.pr = None;
+        true
+    }
+
+    /// Moves the last success for `cwd` back by `age`, for stream tests on the real clock.
+    #[cfg(all(test, unix))]
+    pub(crate) fn age_pull_request_for_test(&self, cwd: &Path, age: Duration) {
+        let mut state = self.lock_state();
+        let entry = state.repositories.get_mut(cwd).expect("a repository entry");
+        let recorded = entry.pr_recorded_at.expect("a recorded pull request");
+        entry.pr_recorded_at = Some(
+            recorded
+                .checked_sub(age)
+                .expect("the machine has been up longer than the age"),
+        );
     }
 
     /// Registers the observer that runs after a finished mutation or a
@@ -2344,6 +2410,7 @@ fn update_git_manager_signature(
 
 fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
     entry.remote = None;
+    entry.pr_recorded_at = None;
     entry.remote_fence = None;
     entry.remote_ref_name = None;
     entry.pending_local_reconcile = false;
@@ -6733,6 +6800,94 @@ mod tests {
         broadcaster.shutdown().await;
     }
 
+    /// A broadcaster that remembers an open request for the branch `old` of `cwd`.
+    fn remembering_a_pull_request() -> (
+        tempfile::TempDir,
+        PathBuf,
+        StatusBroadcaster,
+        mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>>,
+    ) {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let events = install_epoch_repository(&broadcaster, &cwd);
+        broadcaster.record_pull_request(
+            &cwd,
+            Some("old"),
+            Some(ChangeRequest {
+                number: 7,
+                title: "Feature".to_owned(),
+                url: "https://forge.example.test/pull/7".to_owned(),
+                base_ref: "main".to_owned(),
+                head_ref: "old".to_owned(),
+                state: "open".to_owned(),
+            }),
+        );
+        (root, cwd, broadcaster, events)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_clears_a_request_recorded_six_minutes_ago() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        tokio::time::advance(Duration::from_secs(360)).await;
+        assert!(broadcaster.note_failed_pull_request_lookup(&cwd, Some("old")));
+        assert_eq!(broadcaster.known_pull_request(&cwd, Some("old")), None);
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_keeps_a_request_recorded_four_minutes_ago() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        tokio::time::advance(Duration::from_secs(240)).await;
+        assert!(!broadcaster.note_failed_pull_request_lookup(&cwd, Some("old")));
+        assert!(broadcaster.known_pull_request(&cwd, Some("old")).is_some());
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_recorded_six_minutes_ago_stays_without_a_failed_lookup() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        tokio::time::advance(Duration::from_secs(360)).await;
+        assert!(broadcaster.known_pull_request(&cwd, Some("old")).is_some());
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_for_a_former_branch_clears_nothing() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        tokio::time::advance(Duration::from_secs(360)).await;
+        assert!(!broadcaster.note_failed_pull_request_lookup(&cwd, Some("former")));
+        assert!(broadcaster.known_pull_request(&cwd, Some("old")).is_some());
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_after_a_ref_change_clears_nothing() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        clear_remote_for_ref_change(
+            broadcaster
+                .lock_state()
+                .repositories
+                .get_mut(&cwd)
+                .expect("repository entry"),
+        );
+        tokio::time::advance(Duration::from_secs(360)).await;
+        assert!(!broadcaster.note_failed_pull_request_lookup(&cwd, Some("old")));
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_after_shutdown_clears_nothing() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        tokio::time::advance(Duration::from_secs(360)).await;
+        broadcaster.shutdown().await;
+        assert!(!broadcaster.note_failed_pull_request_lookup(&cwd, Some("old")));
+    }
+
     #[tokio::test]
     async fn a_snapshot_under_a_new_epoch_keeps_the_known_pull_request() {
         let root = tempfile::tempdir().expect("repository folder");
@@ -7617,6 +7772,7 @@ mod tests {
                 remote_ref_name: None,
                 pending_local_reconcile: false,
                 republish_remote: false,
+                pr_recorded_at: None,
                 status_lookups: CancellationToken::new(),
                 remote_refresh_requests,
                 git_manager_signature: None,
