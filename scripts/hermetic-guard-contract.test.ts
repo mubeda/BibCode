@@ -11,6 +11,7 @@ const manifests = [
   "Cargo.toml",
   "apps/server/Cargo.toml",
   "apps/desktop/src-tauri/Cargo.toml",
+  "tools/objc-exception-probe/Cargo.toml",
   "tools/updater-verifier/Cargo.toml",
 ];
 

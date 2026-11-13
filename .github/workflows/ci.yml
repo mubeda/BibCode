@@ -290,9 +290,9 @@ jobs:
   native_desktop:
     name: Native desktop - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    # Host tests, the optimized example (with dev features), and the native
-    # bundle have distinct Cargo builds. Budget the complete cold sequence;
-    # Intel needs additional headroom without shortening any validation phase.
+    # Host tests and the native bundle are distinct Cargo builds of the desktop
+    # and server graph. Budget the complete cold sequence without shortening
+    # any validation phase.
     timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
       fail-fast: false
@@ -388,18 +388,15 @@ jobs:
       - name: Test desktop Rust host
         run: vp run --filter @bibcode/desktop test
 
-      # The release symbol profile, as the bundle build below uses, so the
-      # dependencies both builds share compile once instead of once per
-      # profile. Strip and debug info do not change the unwinding it probes.
+      # A crate of its own with the desktop graph's objc2 features, under the
+      # shipped release profile. As a bibcode-desktop example it compiled the
+      # whole desktop and server graph a second time with test-only features:
+      # 84 of the 215 minutes of the macOS arm64 row on 2026-11-13.
       - name: Verify macOS release exception recovery
         if: matrix.platform == 'mac'
-        env:
-          CARGO_PROFILE_RELEASE_STRIP: none
-          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
-          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: packed
         run: |
           rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
-          cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
+          cargo run --release --target "$rust_target" -p bibcode-objc-exception-probe
 
       - name: Test Windows desktop E2E support contracts
         if: matrix.platform == 'win'
@@ -424,14 +421,6 @@ jobs:
         if: matrix.platform == 'win'
         run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -j 2 -- review_prompt_shim_
 
-      - name: Run Git system configuration tests (macOS)
-        if: matrix.platform == 'mac'
-        run: cargo test -p bibcode-server --test git_system_config -j 2
-
-      - name: Run background Git index lock tests (macOS)
-        if: matrix.platform == 'mac'
-        run: cargo test -p bibcode-server --lib -j 2 -- background_status_ git_stop_ index_lock_cleanup_
-
       # #292: the host collector, its exit with a disk read held, and its runtime start and
       # quiesce. Each command fails the step when its filter matches no test.
       - name: Run host metrics tests (Windows)
@@ -455,8 +444,100 @@ jobs:
           counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
           counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
 
+      # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
+      # keeps ~/.cargo/bin, so a restored runner skips the compile.
+      - name: Install dump_syms
+        run: node scripts/run-msvc.mjs cargo install dump_syms --locked --version 2.3.9
+
+      # --symbols is the release build (release.yml build_desktop): the same
+      # profile, so the cache it saves is the one Release restores.
+      - name: Build native bundle without publishing
+        run: >
+          node scripts/build-desktop-artifact.ts
+          --platform "${{ matrix.platform }}"
+          --target "${{ matrix.target }}"
+          --arch "${{ matrix.arch }}"
+          --output-dir native-artifacts
+          --symbols
+          --verbose
+
+  # The macOS legs take 1-5 hours on a 5-job macOS concurrency cap, so pull
+  # requests skip them unless labelled ci:full. Main pushes and manual runs
+  # always build them. Same steps as native_desktop.
+  native_desktop_macos:
+    name: Native desktop - ${{ matrix.label }}
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-26
+            platform: mac
+            target: dmg
+            arch: arm64
+            # With a Rust cache this row took 215 minutes on 2026-11-13, 84 of
+            # them in the exception probe's own full build, which is gone. The
+            # bundle build alone has taken 75 to 111 minutes.
+            jobTimeoutMinutes: 330
+          # The release producer's runner (release.yml), so the Intel build
+          # this tests and the cache it saves are the ones Release uses.
+          # Seeded upgrade keeps macos-26-intel for newest-OS runtime coverage.
+          - label: macOS x64
+            runner: macos-15-intel
+            platform: mac
+            target: dmg
+            arch: x64
+            # With a Rust cache this row took 228 minutes on 2026-11-13, 81 of
+            # them in the exception probe's own full build, which is gone. No
+            # run without a Rust cache has completed since.
+            jobTimeoutMinutes: 330
+    steps: *native_desktop_steps
+
+  # Linux runs these server tests in Test and Windows in its native desktop rows; macOS Git
+  # (LFS, hooks), the index lock owner check (#341) and the host collector (#292) differ.
+  # They are their own job because the server's test build took 32 to 56 minutes inside the
+  # macOS native desktop rows and pushed both past their budget. Each host metrics command
+  # fails the step when its filter matches no test.
+  # The cache is the native desktop one, restored and never saved: a second macOS entry of
+  # this size does not fit the 10 GB Actions budget.
+  server_tests_macos:
+    name: Server tests - ${{ matrix.label }}
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-26
+          - label: macOS x64
+            runner: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+
+      - name: Restore Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-desktop
+          save-if: "false"
+          workspaces: |
+            . -> target
+
+      - name: Run Git system configuration tests (macOS)
+        run: cargo test -p bibcode-server --test git_system_config -j 2
+
+      - name: Run background Git index lock tests (macOS)
+        run: cargo test -p bibcode-server --lib -j 2 -- background_status_ git_stop_ index_lock_cleanup_
+
       - name: Run host metrics tests (macOS)
-        if: matrix.platform == 'mac'
         shell: bash
         run: |
           counted() {
@@ -475,52 +556,6 @@ jobs:
           counted at-least-one cargo test -p bibcode-server --lib -j 2 -- host_metrics::
           counted exactly-one cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
           counted exactly-one cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
-
-      # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
-      # keeps ~/.cargo/bin, so a restored runner skips the compile.
-      - name: Install dump_syms
-        run: node scripts/run-msvc.mjs cargo install dump_syms --locked --version 2.3.9
-
-      # --symbols is the release build (release.yml build_desktop): the same
-      # profile, so the cache it saves is the one Release restores.
-      - name: Build native bundle without publishing
-        run: >
-          node scripts/build-desktop-artifact.ts
-          --platform "${{ matrix.platform }}"
-          --target "${{ matrix.target }}"
-          --arch "${{ matrix.arch }}"
-          --output-dir native-artifacts
-          --symbols
-          --verbose
-
-  # The macOS legs take 1-4 hours on a 5-job macOS concurrency cap, so pull
-  # requests skip them unless labelled ci:full. Main pushes and manual runs
-  # always build them. Same steps as native_desktop.
-  native_desktop_macos:
-    name: Native desktop - ${{ matrix.label }}
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: macOS arm64
-            runner: macos-26
-            platform: mac
-            target: dmg
-            arch: arm64
-            jobTimeoutMinutes: 240
-          # The release producer's runner (release.yml), so the Intel build
-          # this tests and the cache it saves are the ones Release uses.
-          # Seeded upgrade keeps macos-26-intel for newest-OS runtime coverage.
-          - label: macOS x64
-            runner: macos-15-intel
-            platform: mac
-            target: dmg
-            arch: x64
-            jobTimeoutMinutes: 240
-    steps: *native_desktop_steps
 
   # A real native crash under the crash monitor on every OS, symbolicated with symbols dumped
   # the way the release pipeline dumps them.

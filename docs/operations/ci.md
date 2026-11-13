@@ -20,7 +20,7 @@ workflow as idle.
 
 ## Full CI and the `ci:full` label
 
-The macOS legs take one to four hours each and share a five-job macOS
+The macOS legs take one to five hours each and share a five-job macOS
 concurrency cap with every other workflow, so a pull request runs them only
 when it carries the `ci:full` label:
 
@@ -29,6 +29,7 @@ when it carries the `ci:full` label:
 | Check, Test, Release Smoke                  | yes                     | yes                                             |
 | Native desktop: Linux and Windows rows      | yes                     | yes                                             |
 | Native desktop: macOS arm64 and x64         | no                      | yes                                             |
+| Server tests: macOS arm64 and x64           | no                      | yes                                             |
 | Crash smoke: `ubuntu-24.04`, `windows-2025` | yes                     | yes                                             |
 | Crash smoke: `macos-26`                     | no                      | yes                                             |
 | Seeded Packaged Desktop Upgrade (all jobs)  | no                      | yes                                             |
@@ -137,19 +138,21 @@ the merge.
   release symbol build (`STRIP=none`, line tables, a packed dSYM on macOS, a
   GNU build-id on Linux) that Release uses, so it also proves the `dump_syms`
   path on every pull request; the job installs `dump_syms` 2.3.9 for it, and
-  Rust Cache keeps the binary in `~/.cargo/bin`. The macOS exception probe uses
-  the same symbol profile so the dependencies both builds share compile once.
+  Rust Cache keeps the binary in `~/.cargo/bin`.
   Each matrix row declares its complete-job budget:
-  240 minutes for both macOS architectures, and 120 minutes for the other four targets.
+  330 minutes for each macOS row and 120 minutes for the other four targets.
   That budget includes setup, host tests, the macOS optimized exception-recovery
   probe, and native packaging without shortening any check or test-owned deadline.
-  Debug host tests cannot warm the optimized artifacts; the optimized example
-  also enables dev-dependency features (`tauri/test` and `tokio/test-util`) that
-  the ordinary production bundle does not use. Both optimized commands select
-  the same native target triple, but their feature differences require separate
-  compilation. Keep the real exception probe: a larger complete-job allowance
-  accommodates these deliberate checks without treating a cached build as the
-  cold-build baseline. The shared `scripts/run-msvc.mjs` launcher selects
+  Debug host tests cannot warm the optimized artifacts. The exception probe is
+  the `bibcode-objc-exception-probe` crate: it depends only on `objc2` and
+  `objc2-foundation`, with the `objc2` features the desktop graph enables, and
+  runs under the shipped release profile. Do not move it back into
+  `bibcode-desktop` as an example: an example enables the dev-dependency
+  features (`bibcode-server/hermetic-test-guard`, `tauri/test`,
+  `tokio/test-util`), so it compiled the whole desktop and server graph a
+  second time, 84 of the 215 minutes of the macOS arm64 row on 2026-11-13.
+  Check a change to the probe by running it once with
+  `CARGO_PROFILE_RELEASE_PANIC=abort`, where it must fail. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts`. That step is the
@@ -172,6 +175,15 @@ the merge.
   spaces, dollar signs, backticks, and typographic quotes. Every Git/home
   configuration input is fixture-owned. Other platforms skip that native case;
   their string assertions remain compatibility evidence.
+- **Server tests (macOS)** is the job `server_tests_macos`, on `macos-26` and
+  `macos-15-intel` with the `ci:full` gate above. It runs the server tests whose
+  behaviour differs on macOS: `git_system_config`, the background Git index lock
+  tests, and the host metrics tests. Linux runs them in Test and Windows in its
+  Native desktop rows. They are a separate job because the server's test build
+  took 32 to 56 minutes inside the macOS Native desktop rows and pushed both past
+  their budget. The job restores the Native desktop Rust cache and never saves
+  one. Its budget is 150 minutes. A full run now starts seven macOS jobs against
+  the five-job cap, so two of them wait for a free runner.
 - **Crash smoke** runs on `ubuntu-24.04` and `windows-2025` on every pull
   request, and also on `macos-26` with `ci:full`, on `main`, and in manual runs.
   It builds with the release symbol profile from
@@ -246,7 +258,7 @@ recently used entries above that. Which workflow saves which entry:
 
 A job cancelled by `timeout-minutes` or by a newer run skips the cache post
 step, so the Check and Test budgets above include a cold compile. Native
-desktop keeps its 120-minute and 240-minute row budgets.
+desktop keeps its 120-minute and 330-minute row budgets.
 
 Six native-desktop entries of about 1.6 GB each are about 10 GB on their own,
 before Check, Test, Crash smoke, Linux Git, and the setup-vp caches. Eviction
