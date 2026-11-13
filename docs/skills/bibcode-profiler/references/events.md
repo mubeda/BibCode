@@ -275,30 +275,48 @@ figures go to every connected environment whose profiler is on.
 ### client.render-error
 
 One per render error the app's error screen ("Something went wrong.") caught,
-sent at once in its own batch (or 5 s after the client's previous batch, the
-server's pacing) to every environment whose profiler is on.
-`source` is `client:<clientId>`. It raises
-[`client.render-error`](findings.md#clientrender-error). It never holds the
-error's message, a URL, a file path, an environment, project or thread id, or
-any content.
+sent to every environment whose profiler is on: at once, or as soon as that
+server's 5 s pacing allows. `source` is `client:<clientId>`, and the payload
+carries the same client correlation id as every other client event. It raises
+[`client.render-error`](findings.md#clientrender-error).
 
 - `clientId`;
-- `errorType`: the error's type name, such as `Error` or `TypeError`;
+- `errorType`: one of `Error`, `TypeError`, `RangeError`, `ReferenceError`,
+  `SyntaxError`, `EvalError`, `URIError`, `AggregateError` and `DOMException`,
+  else `Other`;
 - `reactErrorCode`: React's code when the message was React's minified form
   (`185` is "Maximum update depth exceeded", a nested-update loop), else
   `null`. Development builds throw the full message and record `null`;
-- `componentNames`: the names of up to 12 top component-stack frames, innermost
-  first. Frames without a name are skipped; production builds may show
-  minified names;
+- `componentNames`: up to 12 top component-stack frames, innermost first. A
+  name that is not a plain identifier (letters, digits, `_`, `$`; at most 64)
+  is `Unnamed`. The packaged app's names are minified (`i`, `Xe`);
 - `routePattern`: the route id with its placeholders, such as
   `/_chat/$environmentId/$threadId`, never the path, or `null`;
 - `fingerprint`: 8 hex digits the client hashed from `errorType`,
   `reactErrorCode` and `componentNames` only.
 
-An error during the very first render, before the collector started, is not
-recorded. A reload sends a pending one on `pagehide` over the same WebSocket
-RPC, which may not finish before the page closes, and the server refuses it
-within 5 s of the client's previous batch; neither is retried.
+What holds where:
+
+- At the source, the names come only from React's component stack and the
+  route from the router's own matched route id, which the client checks
+  against the app's route ids. The message is read only for React's code.
+- The server enforces again: the closed set of error types, a plain
+  identifier per component name, and a route-id grammar that starts at one of
+  the app's top-level routes; anything else becomes `Other`, `Unnamed` or
+  `null`. It refuses a batch with more than 8 render errors, more than 12
+  names, a code above 9999 or a fingerprint that is not hex.
+- A shape check cannot prove a string is not content: an identifier-shaped
+  component name, or a route of lowercase words under a known top-level
+  route, is recorded as it is.
+
+Delivery: an error stays pending for each environment until that server
+accepts the batch that carried it, so a send refused as too frequent, failed,
+or held back by another batch still on the wire is sent again later. At most 8
+are pending per environment; the oldest goes first. A pending error is also
+sent on `pagehide` and when the page is hidden, over the same WebSocket RPC.
+A reload or close inside the server's 5 s window, or before the connection can
+send, loses the record, as does an error in the very first render, before the
+collector started.
 
 ### subprocess.exit
 

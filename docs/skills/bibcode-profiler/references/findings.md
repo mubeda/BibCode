@@ -470,14 +470,21 @@ covers every client and environment, and the evidence names the latest
   [`client.render-error`](events.md#clientrender-error) event, which
   `eventIds` cites; repeats raise `count`.
 - **Source:** `client`.
-- **Fingerprint:** `[errorType, reactErrorCode or "", ...componentNames]`. The
-  route and the client's own `fingerprint` do not split it, so one crash met on
-  several threads is one finding. It never includes a message, path or time.
+- **Fingerprint:** `[errorType, reactErrorCode or "", routePattern or "",
+  ...componentNames]`, from the values the server kept (`Other`, `Unnamed` and
+  `null` replace anything outside the rules the
+  [event](events.md#clientrender-error) lists). The packaged app's component
+  names are minified, so the route pattern keeps different crashes apart; one
+  crash met on several threads of the same route is still one finding. The
+  client's own `fingerprint` does not split it. It never includes a message,
+  path or time.
 - **Evidence:** the event's `clientId`, `errorType`, `reactErrorCode`,
-  `componentNames`, `routePattern` and `fingerprint`.
+  `componentNames`, `routePattern` and `fingerprint`. An identifier-shaped
+  component name is recorded as it is.
 - **Reading it:** `reactErrorCode` 185 is React's nested-update limit: an
   effect that sets state on every render. The first entry of `componentNames`
-  is the component that threw.
+  is the component that threw; in the packaged app it is a minified name, so
+  start from the route and the code.
 
 ## Worktrees
 

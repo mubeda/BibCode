@@ -2002,14 +2002,19 @@ it.
   channel is never cited.
 - `client.render-error` (R51, `error`) is recorded for each render error the
   web app's error screen caught: the router's `defaultOnCatch` (only the root
-  route has an error component) queues the error's type name, React's code
-  from a minified message (185 for the nested-update limit), up to 12
-  component-stack names, the route id and a client hash of those parts, never
-  the message, a URL, a path or an id. The batch carries them in the optional
-  `renderErrors` field, which older servers ignore. The server accepts only
-  names and route patterns, redacts them, emits one event each and groups
-  repeats by type, code and component names. The error screen runs its own
-  collector, because it replaces the tree that ran the first one.
+  route has an error component) queues the error's type from a closed set
+  (else `Other`), React's code from a minified message (185 for the
+  nested-update limit), up to 12 component-stack names (a name that is not a
+  plain identifier becomes `Unnamed`), the router's matched route id (checked
+  against the app's route ids) and a client hash, never the message, a URL, a
+  path or an id. The batch carries them in the optional `renderErrors` field,
+  which older servers ignore. Each environment keeps its pending errors until
+  its server accepted the batch that carried them, and every send waits out
+  the server's 5 s pacing. The server applies the closed set, the identifier
+  shape and a route-id grammar again, redacts, emits one event each and groups
+  repeats by type, code, route and component names: the packaged bundle
+  minifies component names, so the route keeps crashes apart. The error screen
+  runs its own collector, because it replaces the tree that ran the first one.
 - `delivery.failing` (#273) is recorded once for a message delivery that fails
   for good without reaching its provider: the provider refused its own
   configuration (`provider-configuration`, also when restart recovery meets
@@ -2365,9 +2370,12 @@ policy:
 - a panic message keeps its first line, with quoted text, `Err` and `Ok` values,
   assertion operands, and `Debug` renderings replaced by `[redacted]`; and
 - fingerprints never contain paths or timestamps; and
-- a render error the error screen caught keeps only its type name, React's
-  numeric code, component names and route pattern; the server refuses a batch
-  whose render error holds anything else in those fields.
+- a render error the error screen caught keeps only an error type from a
+  closed set, React's numeric code, component names from React's component
+  stack and the router's own route id. The server replaces a type outside the
+  set, a name that is not a plain identifier and a route outside the route-id
+  grammar. A shape check cannot prove a string is not content, so an
+  identifier-shaped name is recorded as it is.
 
 Minidumps hold raw memory and leave the machine only in an export the user
 asks for. Two authenticated server routes serve profiler data to clients:

@@ -323,10 +323,8 @@ impl ClientBatch {
         )?;
         for error in &self.render_errors {
             ensure(
-                is_name(&error.error_type)
-                    && error.component_names.len() <= MAX_COMPONENT_NAMES
-                    && error.component_names.iter().all(|name| is_name(name)),
-                "A render error's type or component names are not names, or over 12.",
+                error.component_names.len() <= MAX_COMPONENT_NAMES,
+                "A render error has more than 12 component names.",
             )?;
             ensure(
                 error
@@ -337,27 +335,43 @@ impl ClientBatch {
                     && error.fingerprint.bytes().all(|b| b.is_ascii_hexdigit()),
                 "A render error's code or fingerprint is invalid.",
             )?;
-            ensure(
-                error.route_pattern.as_deref().is_none_or(is_route_pattern),
-                "A render error's routePattern is not a route pattern.",
-            )?;
         }
         Ok(())
     }
 }
 
-/// A JavaScript identifier, dotted names allowed: never a message, a URL or a path.
-fn is_name(value: &str) -> bool {
+/// The error types a record may name; any other is [`OTHER_ERROR_TYPE`]. The web collector
+/// applies the same set, identifier shape and placeholder (`clientCollector.ts`).
+const ERROR_TYPES: [&str; 9] = [
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
+    "DOMException",
+];
+const OTHER_ERROR_TYPE: &str = "Other";
+const UNNAMED_COMPONENT: &str = "Unnamed";
+/// The first segments of the web app's route ids (`apps/web/src/routeTree.gen.ts`): a route
+/// under any other is not the app's, so it is recorded as unknown. "" is the index route.
+const ROUTE_ROOTS: [&str; 5] = ["", "_chat", "settings", "pair", "agents"];
+
+/// A plain identifier: letters, digits, `_` and `$`, so never a path, a URL or a sentence.
+fn is_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     value.len() <= MAX_NAME_BYTES
         && chars
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
-/// A route id such as `/_chat/$environmentId/$threadId`: each segment a `$parameter` or a
-/// lowercase word without digits, so a real path's ids are refused.
+/// A route id of the web app, such as `/_chat/$environmentId/$threadId`: it starts at one of
+/// [`ROUTE_ROOTS`], and each further segment is a `$parameter` or a lowercase word without
+/// digits, so a real path's ids are refused.
 fn is_route_pattern(value: &str) -> bool {
     let word = |segment: &str| {
         let segment = segment.strip_prefix('_').unwrap_or(segment);
@@ -370,14 +384,20 @@ fn is_route_pattern(value: &str) -> bool {
     let parameter = |segment: &str| {
         segment
             .strip_prefix('$')
-            .is_some_and(|name| name.is_empty() || is_name(name))
+            .is_some_and(|name| name.is_empty() || is_identifier(name))
     };
-    value == "__root__"
-        || (value.len() <= MAX_ROUTE_BYTES
-            && value.strip_prefix('/').is_some_and(|rest| {
-                rest.split('/')
-                    .all(|segment| segment.is_empty() || word(segment) || parameter(segment))
-            }))
+    if value == "__root__" {
+        return true;
+    }
+    let Some(rest) = value.strip_prefix('/') else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    value.len() <= MAX_ROUTE_BYTES
+        && segments
+            .next()
+            .is_some_and(|root| ROUTE_ROOTS.contains(&root))
+        && segments.all(|segment| segment.is_empty() || word(segment) || parameter(segment))
 }
 
 struct Analysis {
@@ -531,18 +551,35 @@ fn analyze(
     Analysis { events, findings }
 }
 
-/// One caught render error's event and finding. The fields were validated as names and
-/// patterns; they still pass the redaction helper, as every profiler record does. The
-/// finding groups by type, code and component names: the route and the client's hash are
-/// shown, not trusted.
+/// One caught render error's event and finding. The server enforces the shapes again: an
+/// error type outside the closed set becomes "Other", a component name that is not a plain
+/// identifier becomes "Unnamed", and a route that is not one of the app's route ids becomes
+/// `null`; what is left still passes the redaction helper, as every profiler record does.
+/// The finding groups by type, code, route and component names: the packaged app's
+/// component names are minified, so the route keeps different crashes apart. The client's
+/// hash is shown, not trusted.
 fn render_error(batch: &ClientBatch, error: &RenderError) -> (Value, FindingInput) {
-    let error_type = redact_message(&error.error_type);
+    let error_type = redact_message(if ERROR_TYPES.contains(&error.error_type.as_str()) {
+        &error.error_type
+    } else {
+        OTHER_ERROR_TYPE
+    });
     let names: Vec<String> = error
         .component_names
         .iter()
-        .map(|name| redact_message(name))
+        .map(|name| {
+            redact_message(if is_identifier(name) {
+                name
+            } else {
+                UNNAMED_COMPONENT
+            })
+        })
         .collect();
-    let route = error.route_pattern.as_deref().map(redact_message);
+    let route = error
+        .route_pattern
+        .as_deref()
+        .filter(|route| is_route_pattern(route))
+        .map(redact_message);
     let payload = json!({
         "clientId": batch.client_id,
         "errorType": error_type,
@@ -557,7 +594,7 @@ fn render_error(batch: &ClientBatch, error: &RenderError) -> (Value, FindingInpu
     let react = error
         .react_error_code
         .map_or_else(String::new, |code| format!(" (React error #{code})"));
-    let fingerprint_fields = [error_type.clone(), code]
+    let fingerprint_fields = [error_type.clone(), code, route.clone().unwrap_or_default()]
         .into_iter()
         .chain(names.iter().cloned())
         .collect();
@@ -1061,20 +1098,108 @@ mod tests {
         assert_eq!(finding.source, "client");
         assert_eq!(
             finding.fingerprint_fields,
-            ["Error", "185", "GitManagerBranchDropdown", "Popover"]
+            [
+                "Error",
+                "185",
+                "/_chat/$environmentId/$threadId",
+                "GitManagerBranchDropdown",
+                "Popover"
+            ]
         );
         assert_eq!(findings[1].0.fingerprint_fields, finding.fingerprint_fields);
         assert_eq!(analysis.events[*event].0, "client.render-error");
 
-        let mut other_route = render_error();
-        other_route["routePattern"] = json!("/settings/general");
-        other_route["fingerprint"] = json!("ffffffff");
-        report["renderErrors"] = json!([other_route]);
+        let mut other_hash = render_error();
+        other_hash["fingerprint"] = json!("ffffffff");
+        report["renderErrors"] = json!([other_hash]);
         let analysis = analyze_with(&book, &report);
         assert_eq!(
             analysis.findings[0].0.fingerprint_fields, finding.fingerprint_fields,
-            "the route and the client's hash do not split the finding"
+            "the client's hash does not split the finding"
         );
+        // Minified names are shared by unrelated crashes: the route keeps them apart.
+        let mut other_route = render_error();
+        other_route["routePattern"] = json!("/settings/general");
+        report["renderErrors"] = json!([other_route]);
+        let analysis = analyze_with(&book, &report);
+        assert_ne!(
+            analysis.findings[0].0.fingerprint_fields,
+            finding.fingerprint_fields
+        );
+    }
+
+    /// Codex's adversarial shapes: content where a name or a route should be is replaced,
+    /// never recorded, in the event, the evidence and the grouping.
+    #[test]
+    fn content_shaped_render_error_fields_are_replaced() {
+        let book = LatencyBook::default();
+        let cases = [
+            ("errorType", json!("private_document.txt"), "Other"),
+            ("errorType", json!("PrivateDocumentError"), "Other"),
+            ("errorType", json!("Error: secret thread"), "Other"),
+        ];
+        for (field, value, expected) in cases {
+            let mut error = render_error();
+            error[field] = value.clone();
+            let mut report = batch(Vec::new());
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1[field], expected, "{value}");
+            assert_eq!(analysis.findings[0].0.fingerprint_fields[0], expected);
+        }
+        let mut error = render_error();
+        error["componentNames"] = json!([
+            "private prompt words",
+            "/home/test-user/app.tsx",
+            "https://example.test/app.js:1:2",
+            "Context.Provider",
+            "\"quoted\"",
+            "Panel",
+        ]);
+        let mut report = batch(Vec::new());
+        report["renderErrors"] = json!([error]);
+        let analysis = analyze_with(&book, &report);
+        assert_eq!(
+            analysis.events[1].1["componentNames"],
+            json!([
+                "Unnamed", "Unnamed", "Unnamed", "Unnamed", "Unnamed", "Panel"
+            ])
+        );
+        for route in [
+            "/home/test-user/private-project",
+            "/_chat/env-1/thread-42",
+            "/settings?token=x",
+            "private-project",
+        ] {
+            let mut error = render_error();
+            error["routePattern"] = json!(route);
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1["routePattern"], Value::Null, "{route}");
+            assert_eq!(analysis.findings[0].0.fingerprint_fields[2], "", "{route}");
+            let finding = &analysis.findings[0].0;
+            let text = format!(
+                "{:?} {} {} {}",
+                finding.fingerprint_fields, finding.evidence, finding.title, finding.summary
+            );
+            assert!(
+                !text.contains("private") && !text.contains("thread-42"),
+                "{text}"
+            );
+        }
+        for route in [
+            "/",
+            "__root__",
+            "/settings/source-control",
+            "/pair",
+            "/_chat/",
+        ] {
+            let mut error = render_error();
+            error["routePattern"] = json!(route);
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1["routePattern"], route);
+        }
     }
 
     #[test]
@@ -1094,32 +1219,12 @@ mod tests {
     }
 
     #[test]
-    fn free_text_in_a_render_errors_fields_is_rejected() {
+    fn malformed_render_errors_are_rejected() {
         type Mutation = Box<dyn Fn(&mut Value)>;
         let cases: Vec<(&str, Mutation)> = vec![
             (
-                "a message as the type",
-                Box::new(|e| e["errorType"] = json!("Error: secret thread")),
-            ),
-            (
-                "a URL as a component name",
-                Box::new(|e| e["componentNames"] = json!(["https://example.test/app.js:1:2"])),
-            ),
-            (
-                "a path as a component name",
-                Box::new(|e| e["componentNames"] = json!(["/Users/test-user/app.tsx"])),
-            ),
-            (
                 "13 component names",
                 Box::new(|e| e["componentNames"] = json!(vec!["Panel"; 13])),
-            ),
-            (
-                "a real path as the route",
-                Box::new(|e| e["routePattern"] = json!("/_chat/env-1/thread-42")),
-            ),
-            (
-                "a query in the route",
-                Box::new(|e| e["routePattern"] = json!("/settings?token=x")),
             ),
             (
                 "a free-text fingerprint",

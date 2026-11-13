@@ -37,6 +37,8 @@ export function startClientCollector(registry: AtomRegistry.AtomRegistry): () =>
     });
     // Rejected so the collector can see an authorization refusal; it swallows everything.
     if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    // `{ accepted, reason? }`: the collector keeps a render error until it was accepted.
+    return result._tag === "Success" ? result.value : undefined;
   });
   const unsubscribe = registry.subscribe(
     environmentPresentations.presentationsAtom,
