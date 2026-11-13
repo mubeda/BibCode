@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Draft
-Spec: spec.md (Status line: Draft, sha256 2df2631120ee)
+Spec: spec.md (Status line: Draft, sha256 3b06d6886431)
 Repository: this repository
 Base: main
 
@@ -30,8 +30,8 @@ Base: main
 1. A mirror window must never reflow at its own size when it repaints after a font load. Pinned by Task 1.1 (a fit mock that really resizes).
 2. Shutdown order: lookups end before `git-writes` and the profiler teardown, and a lookup admitted after shutdown cannot panic or hang. Pinned by Task 2.4.
 3. A cancelled lookup must not be remembered as a failure, or a leaving caller poisons the key for 5 seconds. Pinned by Task 2.5.
-4. A failed desktop state query must never release the unsaved-edits block. Pinned by Task 4.2.
-5. A popup kept mounted while closed must hold no occlusion lease, or the native preview stays hidden. Pinned by Task 6.2.
+4. A failed desktop state query must never release the unsaved-edits block, and the block must survive a reload and a relaunched web process. Pinned by Task 4.2 and Task 8.1.
+5. A popup kept mounted while closed must hold no occlusion lease, and a popup that moves without resizing must update its lease. Pinned by Task 6.2.
 
 ## Out of scope
 
@@ -81,19 +81,19 @@ Phases in the same round run in parallel. A phase depends only on phases in earl
 | `apps/web/package.json` (dependency `@xterm/addon-unicode11` 0.9.0) | modify | 1 | `vp install`, then the R5 xterm test |
 | `packages/contracts/src/environment.ts`, `packages/contracts/fixtures/**`, `packages/shared/src/testSupport.ts` | modify | 1 | `vp run check:contracts` |
 | `apps/server/src/lifecycle.rs`, `apps/server/src/production/control.rs` | modify | 1 | `cargo test -p bibcode-server --lib lifecycle` |
-| `apps/server/src/git/process.rs`, `apps/server/src/git/sign_in.rs` | modify | 2 | `cargo test -p bibcode-server --lib sign_in:: index_lock_cleanup_` |
+| `apps/server/src/git/process.rs`, `apps/server/src/git/sign_in.rs` | modify | 2 | `cargo test -p bibcode-server --lib -- sign_in:: index_lock_cleanup_` |
 | `apps/server/src/source_control/open_pull_request_lookups.rs`, `apps/server/src/source_control/pull_request.rs` | modify | 2 | `cargo test -p bibcode-server --lib open_pull_request_lookups::` |
 | `apps/server/src/git/broadcaster.rs`, `apps/server/src/production/git_vcs.rs`, `apps/server/src/production/runtime.rs` | modify | 2 | Phase 2 checkpoint |
 | `apps/server/src/production/worktree_catalog_rpc.rs`, `apps/server/src/diagnostics/profiler/worktree_audit.rs` | modify | 3 | `cargo test -p bibcode-server --lib worktree` |
 | `apps/server/src/persistence/repositories.rs`, `apps/server/tests/repositories.rs`, `apps/server/src/production/orchestration_effects.rs`, `apps/server/tests/profiler_worktree_audit.rs`, `apps/server/src/mcp/tools/worktrees.rs` | modify | 3 | `cargo test -p bibcode-server --test repositories` and `--test profiler_worktree_audit` |
-| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/components/RemoteUpdateRequestNotifier.tsx` and its test (only if Task 4.4 finds the action unreachable) | modify | 4 | Phase 4 checkpoint |
+| `apps/web/src/components/files/unsavedFileEdits.ts`, `UnsavedChangesCloseDialog.tsx` and their tests; `apps/web/src/components/RemoteUpdateRequestNotifier.tsx`, `apps/web/src/routes/__root.tsx` and their tests (only if Task 4.4 finds the action unreachable) | modify | 4 | Phase 4 checkpoint |
 | `scripts/desktop-event-names.test.ts` | create | 4 | `vp test run scripts/desktop-event-names.test.ts` |
-| `apps/web/src/components/ChatView.tsx` and `ChatView.test.tsx`; `apps/web/src/components/chat/timelineScrollAnchoring.ts`, `MessagesTimeline.logic.ts` and their tests | modify | 5 | Phase 5 checkpoint |
+| `apps/web/src/components/ChatView.tsx` and `ChatView.test.tsx`; `apps/web/src/components/chat/timelineScrollAnchoring.ts`, `MessagesTimeline.logic.ts`, `MessagesTimeline.tsx` and their tests | modify | 5 | Phase 5 checkpoint |
 | `apps/web/src/components/hostDashboard/HostDashboardSheet.tsx` and its test | modify | 5 | Phase 5 checkpoint |
 | `apps/web/src/browser/browserSurfaceStore.ts`, `browserSurfaceSync.ts` and their tests | modify | 6 | from `apps/web`: `vp test run --project unit src/browser` |
 | `apps/web/src/components/ui/useNativePreviewOcclusion.ts`, `popover.tsx`, `menu.tsx`, `select.tsx`, `combobox.tsx`, `autocomplete.tsx` | modify | 6 | the new popup occlusion DOM test |
 | `apps/web/src/components/ui/usePopupOcclusion.ts` and its DOM test | create | 6 | the new popup occlusion DOM test |
-| `apps/web/src/components/chat/ProviderModelPicker.tsx` and its test; `apps/web/src/components/ChatMarkdown.tsx` and its test; `apps/web/src/components/files/FilePreviewPanel.tsx` and its test | modify | 6 | Phase 6 checkpoint |
+| `apps/web/src/components/chat/ProviderModelPicker.tsx`, its test and a new `ProviderModelPicker.real.test.tsx`; `apps/web/src/components/ChatMarkdown.tsx` and its test; `apps/web/src/components/files/FilePreviewPanel.tsx` and its test | modify | 6 | Phase 6 checkpoint |
 | `apps/server/src/diagnostics/host_metrics/volumes.rs`; `apps/server/src/auth/http.rs`, `apps/server/src/auth/service.rs` | modify | 7 | Phase 7 checkpoint |
 | `apps/server/tests/production_server_terminal_rpc.rs` (only if the R44 runs fail there) | modify | 7 | the 50-run loop of Task 7.3 |
 | `apps/desktop/e2e/wdio.conf.ts`, `apps/desktop/e2e/support/app-lifecycle.ts` and its test | modify | 7 | `vp test run apps/desktop/e2e/support/app-lifecycle.test.ts` |
@@ -113,10 +113,10 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 | R4 | 1.4 |
 | R5 | 1.10, 9.2 |
 | R6 to R11 | not planned: withdrawn from the spec, own folder for #350 (D2) |
-| R12 | 5.1, 5.2, 8.1, 8.3 |
+| R12 | 5.1, 5.2, 8.3 (8.1 guards Linux) |
 | R13 | 3.1, 8.3, 8.4 |
 | R14 | 7.1 |
-| R15 | 7.2 |
+| R15 | 7.2, 8.1 |
 | R16 | 1.8 |
 | R17 | 1.5 |
 | R18 | 5.3 |
@@ -136,7 +136,7 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 | R32 | 3.3, 9.1 |
 | R33 | 3.4 |
 | R34 | 3.5 |
-| R35 | 4.2 |
+| R35 | 4.2, 8.1 |
 | R36 | 4.3 |
 | R37 | 4.1 |
 | R38 | 4.5 |
@@ -153,8 +153,8 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 ## End-to-end verification
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p bibcode-server`, `cargo test -p bibcode-desktop`: exit 0 (Task 9.3).
-- `vp check`, `vp run typecheck`, `vp run test`, `vp run check:contracts`, `vp run check:markdown-links`: exit 0 (Task 9.3).
-- Linux lab: the packaged default list passes with the Profiler on; `chat-reasoning-rows` passes at 1000x720; the R20 numbers are logged (Task 8.1).
+- `vp check --no-fmt` on the whole tree and `vp check` on every changed file, `vp run typecheck`, `vp run test`, `vp run check:contracts`, `vp run check:markdown-links`: exit 0 (Task 9.3).
+- Linux lab: the packaged default list passes with the Profiler on; the webview-kill and reload-marker checks pass; the R20 numbers are logged (Task 8.1).
 - Windows VM: `chat-reasoning-rows` passes; the removal test passes in 12 of 12 whole-suite runs; fmt, Clippy, `vp check` and typecheck exit 0 (Task 8.3).
 - Mac: the removal test passes 50 of 50 under load (Task 8.4); the hint test passes 50 of 50 under load or its failure is fixed (Task 7.3).
 - Previous release's server: attach, resize and keybindings answer through their legacy paths (Task 8.2).
@@ -173,7 +173,7 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 
 - P1. #350 leaves this plan (spec D2). Alternatives: keep its seven phases here (blocks nine issues on a design that failed review). Decided by: agent's call, to confirm with the user before the push.
 - P2. One plan folder for nine issues, one phase per file-ownership area rather than per issue, so that seven lanes can run at once without sharing a file. Alternatives: one phase per issue (three issues share `ThreadTerminalPanel.tsx`). Decided by: agent's call.
-- P3. Before round 1 the coordinator runs the packaged `chat-reasoning-rows` spec on the base commit in the Linux lab at 1000x720 and logs the result, so Task 5.1 starts from a known reproduction or a known absence of one. It is a coordinator step, not a task, because every lab task depends on the fixes. Decided by: agent's call.
+- P3. The baseline for Task 5.1 was taken during planning and is in the log: the harness sets a 1000x720 viewport itself and `chat-reasoning-rows` passes on Linux, so the live trace comes from Chromium at device pixel ratio 2 or from the Windows VM (Task 8.3 step 1, which runs as soon as Task 5.1 asks, ahead of the rest of Phase 8). Decided by: agent's call.
 - P4. Skills were named from the session's installed list by the planner (`tdd`, `vercel-react-best-practices`, `better-interface`, `better-writing`, `mstack-diagnose`, `bibcode-profiler`); `mstack-find-skills` was not run for a wider search. A task runs without a specialist where its Skills line says "none". Decided by: agent's call.
 - P5. Probe scripts for Task 8.2 are not committed: a one-off check does not earn a maintained script and its test. Decided by: agent's call.
 - P6. The plan review is by Codex (`gpt-6.1-sol`, effort high), and approval follows the standing rule of spec D3. Decided by: user's standing rule.

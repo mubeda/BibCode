@@ -30,9 +30,9 @@ Before any other work, ask the user these questions in one message, using the ho
 2. Which reviewer model and effort? I recommend `gpt-6.1-sol` and `high` for Codex reviewers (the plan review used them), `opus` and `medium` for Claude reviewers.
 3. May this run commit each finished task to the branch in `progress.md`'s `Branch` line, or, when there is none, use the existing branch `claude/open-issues-pr-dc3c33` (created from `main` for this batch) and commit to it? Pushing and opening a pull request happen only when the user asks.
 
-## Before round 1 (plan decision P3)
+## Standing rules for this repository
 
-Run the packaged `chat-reasoning-rows` spec on the base commit in the Linux lab at a 1000x720 viewport, with the Profiler on, and log the result in `progress.md`. Task 5.1 reads it. Follow the user's standing rules for this repository: subagents run on `sonnet` or `haiku`, or `opus` at effort medium for complex work, never above; check free disk (at least 60 GB) before each round of Rust writers and keep at most four at once; every review is triaged with the advisor; push once, after the gates pass.
+Subagents run on `sonnet` or `haiku`, or `opus` at effort medium for complex work, never above. Check free disk (at least 60 GB) before each round of Rust writers and keep at most four at once. Every review is triaged with the advisor. Push once, after the gates pass. Task 8.3 step 1 (the Windows trace run) starts as soon as Task 5.1 asks for it.
 
 ## 3. Workflow execution
 

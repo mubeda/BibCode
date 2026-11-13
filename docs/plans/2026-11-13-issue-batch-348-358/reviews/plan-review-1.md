@@ -101,3 +101,30 @@ Consistency: all **47 task IDs and titles** match `progress.md`, and the spec ha
 - What exact automated scenario kills a webview and proves the next test recovers? Phase 7 promises that later evidence, but Phase 8 does not schedule the injection (`PHASE-07:10`; `PHASE-08:30`).
 
 No files changed. Validation was limited to source inspection, in-memory probes, task/hash comparison, and the two failing command-parser checks described above; no builds, suites, or native runs were performed.
+
+## Handling
+
+Every finding was checked against the cited code by the author of the phase it names (read-only), then triaged with the advisor. All 22 were accepted; none contradicted a decision of the spec or the user.
+
+- 1 (R35, Task 4.2): fixed. A `sessionStorage` marker written when the window allows the install restores the block on load; only a confirmed "no remote install" answer clears it; a failing query retries. The marker's survival across a relaunched web process is checked in the packaged app (Task 8.1).
+- 2 (Task 2.4): fixed. Every flight's token is a child of one shutdown token, whether or not it has a cache entry; the cancelled result's type is stated; tests cover an invalidated flight, no cache room and a retained waiter.
+- 3 (Task 2.6): fixed. The late-refresh callback handles a failed lookup too, with a stream test.
+- 4, 5 (Tasks 5.1, 5.2): fixed. The diagnosis now starts from a live trace of the real app (the baseline showed no Linux reproduction, so the trace comes from Chromium at device pixel ratio 2 or the Windows VM) and logs the real `maintainScrollAtEnd` value; the unit test reproduces only the path the trace names, through the real toggle; the callback signature change and its callers are listed for every fix branch.
+- 6 (Task 1.6): fixed. Both entries into the hand-over state are gated on the new capability, with tests for snapshot, attached and resized carrying a reply claim.
+- 7, 11 (Tasks 6.3, 6.4): fixed. The reset follows the real closed-to-open transition, including the composer's controlled path; the stubbed harnesses are changed explicitly and behavior tests use the real components.
+- 8 (Task 6.2): fixed. The lease follows movement without a size change (scroll and a frame loop while open), with a movement-only test.
+- 9 (Task 7.2): fixed. One 100-second deadline covers the whole recovery; a test asserts that `beforeTest` starts with the probe.
+- 10 (Task 7.4): fixed. Classes are promised per storage mode; a revoked in-memory pairing logs `unknown`.
+- 12 (Task 3.3): fixed. The existing single profiler test is extended with both rollback arms; each audit call has an assertion that fails without it.
+- 13 (Task 4.4): fixed. The conditional branch owns the root route's host mounts and their tests.
+- 14 (Task 8.2): fixed. The probe uses the latest published release (`gh release list`), checks the package against the checksum file, and names the docs for starting and pairing.
+- 15, 17, 18, 21 (Phase 2): fixed. Paused time and settlement in the backoff tests; the delay is injected through the loader seam; filters use `--`; the type is `StatusBroadcaster`.
+- 16 (Task 3.2): fixed. The can-fail proof reverts the removal caller to deleting by path.
+- 18 (Task 1.4, plan.md): fixed. Selectors match their test titles; the File map command uses `--`.
+- 19 (Task 9.2): fixed. The overview's lookup and hand-over statements and the shared runbook's webview-recovery text are named for update.
+- 20 (R12): fixed differently. The harness already runs at 1000x720 everywhere and the spec passes on Linux, so a second Linux viewport would show nothing; the spec's R12 now states that and takes the trace from Chromium at device pixel ratio 2 or the Windows VM.
+- 22 (Task 9.3): fixed in the spec. Verification now states whole-tree `vp check --no-fmt` plus `vp check` on changed files locally, because the desktop app writes an ignored settings file into the worktree; CI runs whole-tree `vp check` on a clean checkout.
+- Task-size remarks (2.1 with 2.2, 1.3): deferred. They do not change what gets built and the IDs are referenced across files.
+- Open questions: the reload signal is the marker above; the lab image is used as it exists and the task stops if it is absent; the webview-kill scenario is Task 8.1 step 4.
+
+Beyond the listed findings, each author applied two rules to their whole file: every "prove the test can fail" step reverts the task's own change, every extended test was read against its mocks, every selector matches its task's test names, and every caller and writer of changed state is listed. Spec R42 was also narrowed (the WebGL warning names a stage and an error type, never raw error text) because four existing tests require it.

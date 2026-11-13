@@ -1,9 +1,9 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 2df2631120ee)
+Spec: spec.md (sha256 3b06d6886431)
 Plan status: Draft
-Plan review: none yet
+Plan review: Codex gpt-6.1-sol (effort high), round 1, needs rework; 22 findings handled, see reviews/plan-review-1.md
 Executor: none
 Branch: claude/open-issues-pr-dc3c33
 
@@ -59,3 +59,4 @@ Branch: claude/open-issues-pr-dc3c33
 
 ## Log
 - 2026-11-13 Plan written. Sources: ten issues exported to `sources/`, `evidence.md`, `triage.md`. #350 moved to `../2026-11-13-terminal-screen-350/` after its design review returned "needs rework".
+- 2026-11-13 Baseline for Task 5.1 (plan decision P3): the packaged harness sets a 1000x720 viewport itself, and `chat-reasoning-rows` passed on Linux WebKitGTK in two full lab runs of the build that became `main` (31 passing each). No reproduction on Linux; the Windows VM (WebView2, device pixel ratio 2) is the signal.

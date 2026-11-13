@@ -7,7 +7,7 @@
 - Must not touch: product source and tests (a failing gate goes back to the phase that owns the file)
 - Skills: better-writing (plain, exact wording in docs and the pull request body)
 - Read first: `AGENTS.md` (Task Completion Requirements, Testing Runbook Maintenance, Profiler coverage, Sensitive Data); `docs/README.md` (the docs index and what counts as living documentation); `spec.md` (the dispositions each issue needs before it may be closed)
-- Checkpoint: `vp run check:markdown-links` exits 0, every command of Task 9.2 exits 0, and the pull request's `Closes` list equals the issues whose items all have a log line with evidence.
+- Checkpoint: `vp run check:markdown-links` exits 0, every command of Task 9.3 exits 0, and the pull request's `Closes` list equals the issues whose items all have a log line with evidence.
 
 ## Tasks
 
@@ -34,7 +34,7 @@ Steps
 
 - Satisfies: R5, R41 (documented behavior), spec Verification (runbooks reviewed)
 - Depends on: 9.1, 8.3
-- Files: modify `docs/architecture/overview.md`; modify `docs/architecture/rpc-and-orchestration.md`; modify `docs/testing/linux-desktop.md`, `docs/testing/windows-desktop.md` and `docs/testing/macos-desktop.md` only where a procedure changed; modify `CHANGELOG.md`
+- Files: modify `docs/architecture/overview.md`; modify `docs/architecture/rpc-and-orchestration.md`; modify `docs/testing/cross-platform-validation.md` (webview recovery text); modify `docs/testing/linux-desktop.md`, `docs/testing/windows-desktop.md` and `docs/testing/macos-desktop.md` only where a procedure changed; modify `CHANGELOG.md`
 - Interfaces: consumes the `terminalSizeHandOver` capability (Task 1.6) and the Unicode 11 width mode (Phase 1)
 - Skills: better-writing (states guarantees and limits without marketing words)
 - Read first: `docs/architecture/overview.md` terminal and Profiler sections (the text that now changes)
@@ -44,9 +44,9 @@ Steps
 
 Steps
 
-1. [ ] Update the terminal section of `overview.md`: terminals count widths by Unicode 11, a new terminal retries WebGL after an earlier failure, and the development size record exists and holds no content. Expected: each statement matches the code.
+1. [ ] Update `overview.md` where this batch contradicts it: (a) the pull-request lookup text that says a failure is never reused now states the 5-second failure backoff and that a remembered request is cleared by a failed lookup once its last success is more than 5 minutes old; (b) the terminal text that gates the size hand-over on `terminalUserInputClaim` now names `terminalSizeHandOver`; (c) terminals count widths by Unicode 11, a new terminal retries WebGL after an earlier failure, and the development size record exists and holds no content; (d) the quiesce sequence names the `pull-request-lookups` step. Expected: `rg -n "never reused|terminalUserInputClaim" docs/architecture/overview.md` shows no sentence that contradicts the code.
 2. [ ] Update `rpc-and-orchestration.md` with the `terminalSizeHandOver` capability and what a client does without it. Expected: names equal the contracts in `packages/contracts/src`.
-3. [ ] Review the three desktop runbooks against the changed procedures (the per-test webview probe). Change what is stale; record the others as reviewed and accurate. Expected: no execution-specific numbers are added to a living runbook.
+3. [ ] In `docs/testing/cross-platform-validation.md`, replace the text that describes worker-only webview recovery and cascading failures after a web process crash with the per-test probe and its single overall deadline. Then review the three desktop runbooks against the changed procedures. Change what is stale; record the others as reviewed and accurate. Expected: no execution-specific numbers are added to a living runbook.
 4. [ ] Add the unreleased changelog entries, one line per user-visible change, in the file's existing style. Expected: no issue is described as fixed that the log does not prove.
 5. [ ] Run `vp run check:markdown-links`. Expected: exit 0.
 
@@ -67,7 +67,7 @@ Steps
 1. [ ] Put the pinned Rust toolchain first on `PATH` and run `cargo fmt --all --check`. Expected: exit 0.
 2. [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`. Expected: exit 0.
 3. [ ] Run `cargo test -p bibcode-server` and `cargo test -p bibcode-desktop`. Expected: 0 failed.
-4. [ ] Run `vp check --no-fmt`, `vp check` on the changed files, `vp run typecheck`, `vp run test`, `vp run check:contracts` and `vp run check:markdown-links`. Expected: exit 0 each (the app's own local settings file may fail whole-tree formatting; it is not part of the change).
+4. [ ] Run `vp check --no-fmt` on the whole tree, `vp check <every changed file>`, `vp run typecheck`, `vp run test`, `vp run check:contracts` and `vp run check:markdown-links`, as the spec's Verification section states. Expected: exit 0 each. Whole-tree `vp check` runs in CI on a clean checkout; locally the desktop app's ignored settings file fails its formatting step.
 5. [ ] Review every changed component and hook under `apps/web` against `vercel-react-best-practices`, and every changed screen, dialog, notice and message against `UI.md`. Expected: each finding is fixed in its owning task or logged with the reason it stays.
 6. [ ] Write the profiler coverage line: which items of the `AGENTS.md` coverage list the batch touches (a new quiesce step, a new removal mode, new warn logs) and how each stays covered. Expected: one line per item.
 7. [ ] Read `git diff main...HEAD --stat` and `git status --short`, and search the added lines, commit messages and plan files for local machine paths, private hosts, real names and credentials. Expected: none; no generated or debug file is in the diff.

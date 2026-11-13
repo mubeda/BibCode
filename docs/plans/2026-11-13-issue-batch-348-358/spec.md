@@ -101,7 +101,7 @@ Every terminal in the client SHALL count columns by Unicode 11 (the `@xterm/addo
 ### R12. Reasoning row keeps its place
 
 WHEN the reader has brought a reasoning row into view away from the turn's end and expands or collapses it, the row's header SHALL stay within 2 px of where it was. This is the invariant the packaged spec `chat-reasoning-rows` asserts in `expandThoughtAwayFromEnd` (scroll the row to the center, toggle, compare the header's position).
-- Diagnose first, before any fix. Step 1: run that spec in the Linux lab at a 1000x720 viewport. A failure there is a platform-independent reproduction (WebView2 is not needed); it does not by itself make the viewport the cause, so the viewport is then varied on its own. Step 2: in a unit test with the spec's metrics, record which code path scrolls (the toggle's end reveal, the grown-turn follow, or the list's end maintenance). The fix goes at the first wrong decision that step 2 names; no fix is chosen before it.
+- Diagnose first, before any fix. Known on 2026-11-13: the packaged harness already runs at a 1000x720 viewport on every platform, and the spec passes there on Linux (WebKitGTK), so neither that viewport nor the shared code alone reproduces it; Windows differs by WebView2 (Chromium) and a device pixel ratio of 2. Step 1: get a live trace of which code path scrolls (the toggle's end reveal, the grown-turn follow, or the list's end maintenance, with the real value of each decision), from Chromium at device pixel ratio 2 if that reproduces it, otherwise from the Windows VM. Step 2: a unit test reproduces that path with the trace's metrics. The fix goes at the first wrong decision the trace names; no fix is chosen before it.
 - Given the reader scrolled a reasoning row to the center without a wheel or touch gesture (a programmatic scroll), When the row is toggled, Then no scroll to the end is made within three animation frames.
 - Given the newest reasoning row at the end of an anchored turn, Then the existing reveal still happens (the #173 behavior, asserted by `expandStreamingThoughtAtEnd`).
 - Proof on Windows: the packaged `chat-reasoning-rows` spec passes in the Windows VM at the viewport where it failed.
@@ -228,7 +228,7 @@ On macOS desktop, an open Popover, Menu, Select, Combobox or Autocomplete popup 
 The client SHALL apply the typed-last size hand-over rule only when the server advertises `terminalSizeHandOver`. A server without it gets the old behavior.
 ### R42. WebGL after a failure
 
-A new terminal in the same viewport SHALL try WebGL again after an earlier context loss, and the fallback warning SHALL include the cause.
+A new terminal in the same viewport SHALL try WebGL again after an earlier context loss, and the fallback warning SHALL name the stage that failed (import failed, context lost) and the error's type name. It SHALL NOT carry raw error text: four existing tests require that, and raw text can hold paths.
 ### R43. Tall grid (decide by test)
 
 A test records rows and mount height between mount and first snapshot after a reload. IF rows exceed the fitted rows, the terminal SHALL be fitted before it is shown; otherwise the result is recorded.
@@ -248,7 +248,7 @@ The read-only rendered Markdown view in Files SHALL load a relative image from t
 ## Verification
 
 - `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test -p bibcode-server`; `cargo test -p bibcode-desktop`.
-- `vp check`; `vp run typecheck`; `vp run test`; `vp run check:contracts`; `vp run check:markdown-links`.
+- `vp check --no-fmt` on the whole tree and `vp check` on every changed file (the desktop app writes an ignored local settings file into an app-made worktree, which fails whole-tree formatting and is not part of the change; CI runs whole-tree `vp check` on a clean checkout); `vp run typecheck`; `vp run test`; `vp run check:contracts`; `vp run check:markdown-links`.
 - Linux lab: the packaged default list with the Profiler on, plus the R20 run.
 - Windows VM: `chat-reasoning-rows` (R12), the R13 runs, fmt, Clippy and `cargo test -p bibcode-server`.
 - Review of changed React against `vercel-react-best-practices` and of changed UI against `UI.md`.
