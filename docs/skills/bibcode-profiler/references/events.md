@@ -275,7 +275,8 @@ figures go to every connected environment whose profiler is on.
 ### client.render-error
 
 One per render error the app's error screen ("Something went wrong.") caught,
-sent with the client's next batch to every environment whose profiler is on.
+sent at once in its own batch (or 5 s after the client's previous batch, the
+server's pacing) to every environment whose profiler is on.
 `source` is `client:<clientId>`. It raises
 [`client.render-error`](findings.md#clientrender-error). It never holds the
 error's message, a URL, a file path, an environment, project or thread id, or
@@ -294,8 +295,10 @@ any content.
 - `fingerprint`: 8 hex digits the client hashed from `errorType`,
   `reactErrorCode` and `componentNames` only.
 
-An error during the very first render, before the collector started, and one
-the user reloads past within the 10 s batch interval are not recorded.
+An error during the very first render, before the collector started, is not
+recorded. A reload sends a pending one on `pagehide` over the same WebSocket
+RPC, which may not finish before the page closes, and the server refuses it
+within 5 s of the client's previous batch; neither is retried.
 
 ### subprocess.exit
 

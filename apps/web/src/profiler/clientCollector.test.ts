@@ -582,6 +582,60 @@ describe("clientCollector", () => {
     c.dispose();
   });
 
+  // R51: the person who sees the error screen often reloads at once, so the record leaves now.
+  it("sends render errors without waiting for the interval, one batch for one tick", async () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));
+    const c = createClientCollector({
+      now: () => t,
+      send,
+      supportedEntryTypes: [],
+      clientId: "c1",
+    });
+    c.setEnabledEnvironments(new Set(["env-a"]));
+    c.recordRenderError(new Error("a"), null, () => "/settings");
+    c.recordRenderError(new TypeError("b"), null, () => "/settings");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![1].renderErrors.map((e: any) => e.errorType)).toEqual([
+      "Error",
+      "TypeError",
+    ]);
+
+    // The server refuses a client's batch within 5 s of its last: the next one waits for that.
+    t = 1_000;
+    c.recordRenderError(new RangeError("c"), null, () => "/settings");
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(send).toHaveBeenCalledTimes(1);
+    t = 5_000;
+    await vi.advanceTimersByTimeAsync(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]![1].renderErrors[0].errorType).toBe("RangeError");
+    c.dispose();
+  });
+
+  it("sends a pending render error when the page is hidden or unloads", async () => {
+    vi.useFakeTimers();
+    const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));
+    const c = createClientCollector({
+      now: () => 0,
+      send,
+      supportedEntryTypes: [],
+      clientId: "c1",
+    });
+    c.setEnabledEnvironments(new Set(["env-a"]));
+    c.recordRenderError(new Error("a"), null, () => "/settings");
+    window.dispatchEvent(new Event("pagehide"));
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![1].renderErrors).toHaveLength(1);
+    // Nothing pending: hiding sends nothing extra.
+    setVisibility("hidden");
+    window.dispatchEvent(new Event("pagehide"));
+    expect(send).toHaveBeenCalledTimes(1);
+    c.dispose();
+  });
+
   // R51: both engines' component-stack forms, and the caps.
   it("keeps only named frames of a render error, at most 12, and at most 8 errors a batch", async () => {
     const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));

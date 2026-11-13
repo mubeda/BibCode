@@ -36,6 +36,8 @@ const OVERDUE_HEARTBEAT_MS = 60_000;
  */
 const RESUME_GRACE_MS = 20_000;
 const FLUSH_EVERY_MS = 10_000;
+/** The server refuses a client's batch within this of its previous one (`MIN_BATCH_INTERVAL`). */
+const PACED_MS = 5_000;
 /** The server's caps: a longer sample spans a sleep, and a longer window is rejected. */
 const MAX_SAMPLE_MS = 3_600_000;
 const MAX_WINDOW_MS = 600_000;
@@ -217,6 +219,9 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
    * tree that ran the collector, and its own run sends what the old one caught.
    */
   let renderErrors: ProfilerClientRenderError[] = [];
+  /** When this client last sent a batch, for the server's 5 s pacing. */
+  let lastSentAt = Number.NEGATIVE_INFINITY;
+  let urgentFlush: ReturnType<typeof setTimeout> | undefined;
   let running = false;
   let flushTimer: ReturnType<typeof setInterval> | undefined;
   let heartbeat: ReturnType<typeof setTimeout> | undefined;
@@ -282,10 +287,26 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     scheduleBeat();
   };
 
+  /** Sends caught render errors as soon as the server's 5 s pacing admits the batch. */
+  const sendRenderErrorsSoon = () => {
+    if (urgentFlush !== undefined) return;
+    const delay = Math.max(0, lastSentAt + PACED_MS - now());
+    urgentFlush = setTimeout(() => {
+      urgentFlush = undefined;
+      void flush();
+    }, delay);
+  };
+
+  /** The page may be closing: a pending render error goes now, whatever the pacing. */
+  const onPageHide = () => {
+    if (renderErrors.length > 0) void flush();
+  };
+
   const onForegroundChange = () => {
     epoch += 1;
     if (inBackground()) pauseBeat();
     else resumeBeat();
+    if (isHidden()) onPageHide();
   };
 
   const observe = <E>(init: PerformanceObserverInit, onEntry: (entry: E) => void) => {
@@ -306,9 +327,15 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     windowStart = now();
     stalls = { count: 0, totalMs: 0, maxMs: 0 };
     interactions = { count: 0, maxMs: 0 };
-    flushTimer = setInterval(() => void flush(), FLUSH_EVERY_MS);
+    // A batch the server would refuse as too frequent waits for the next tick instead.
+    flushTimer = setInterval(() => {
+      if (now() - lastSentAt >= PACED_MS) void flush();
+    }, FLUSH_EVERY_MS);
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", onForegroundChange);
+    }
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("pagehide", onPageHide);
     }
     // A window that cannot report focus (an embedding, a test) is treated as focused.
     if (
@@ -354,6 +381,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       window.removeEventListener("focus", onForegroundChange);
       window.removeEventListener("blur", onForegroundChange);
+      window.removeEventListener("pagehide", onPageHide);
     }
     for (const observer of observers) observer.disconnect();
     observers = [];
@@ -475,6 +503,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
         }),
       );
     }
+    if (reports.length > 0) lastSentAt = at;
     // Kept for a later batch while every environment still has one on the wire.
     if (reports.length > 0 && caught.length > 0) renderErrors = [];
     if (windows.size === 0) stop();
@@ -533,6 +562,8 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
       }
       if (windows.size > 0) start();
       else stop();
+      // The error screen restarts the collector after the tree that caught the error unmounted.
+      if (windows.size > 0 && renderErrors.length > 0) sendRenderErrorsSoon();
     },
     recordRenderError(error, componentStack, routePattern) {
       if (windows.size === 0 || renderErrors.length >= PROFILER_CLIENT_BATCH_LIMITS.renderErrors) {
@@ -540,6 +571,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
       }
       try {
         renderErrors.push(describeRenderError(error, componentStack, routePattern()));
+        sendRenderErrorsSoon();
       } catch {
         // A hostile error (a throwing getter) goes unrecorded; the error screen still shows.
       }
@@ -548,6 +580,8 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     dispose() {
       windows.clear();
       renderErrors = [];
+      clearTimeout(urgentFlush);
+      urgentFlush = undefined;
       stop();
     },
   };
