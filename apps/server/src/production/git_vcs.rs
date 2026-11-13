@@ -202,13 +202,21 @@ fn observe_local_changes(
 ) {
     let summary = summary.clone();
     let pull_requests = pull_requests.clone();
+    // Weak: the observer lives inside the broadcaster.
+    let streams = broadcaster.downgrade();
     broadcaster.set_local_change_observer(move |cwd| {
-        pull_requests.invalidate_open_pull_request_lookups(cwd);
+        let outdated_lookup = pull_requests.invalidate_open_pull_request_lookups(cwd);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let summary = summary.clone();
         let cwd = cwd.to_path_buf();
+        // R30: a change that alters no status publishes nothing, so no stream would look up
+        // again after the lookup it outdated. Republishing the remote makes each one do so.
+        if outdated_lookup && let Some(broadcaster) = streams.upgrade() {
+            let cwd = cwd.clone();
+            handle.spawn(async move { broadcaster.notify_pull_request_change(&cwd).await });
+        }
         handle.spawn(async move { summary.notify_local_change(&cwd).await });
     });
 }
@@ -950,9 +958,13 @@ impl GitVcsRpcServices {
                         }
                         Ok(None) => {
                             // The inner lookup runs under a token nothing cancels: a failure.
-                            if !refresh_cancelled {
-                                self.broadcaster
-                                    .note_failed_pull_request_lookup(&cwd, ref_name.as_deref());
+                            // Subscribers show the cleared request too, as after a late lookup.
+                            if !refresh_cancelled
+                                && self
+                                    .broadcaster
+                                    .note_failed_pull_request_lookup(&cwd, ref_name.as_deref())
+                            {
+                                self.broadcaster.notify_pull_request_change(&cwd).await;
                             }
                             self.broadcaster
                                 .known_pull_request(&cwd, ref_name.as_deref())
@@ -9313,7 +9325,10 @@ esac
         cancellation.cancel();
     }
 
-    /// R30: like the test above, but the local change alters no status.
+    /// R30: like the test above, but the local change alters no status. Decided by test:
+    /// defect. The change invalidated the lookup, but an equal local status publishes nothing,
+    /// so the stream never looked up again and kept the outdated answer. The local-change
+    /// observer now republishes the remote when it drops an awaited lookup.
     #[tokio::test]
     async fn a_neutral_local_change_during_a_lookup_replaces_its_outdated_answer() {
         let fixture = Fixture::new("pr-lookup-neutral-again");
@@ -9332,6 +9347,8 @@ esac
             .broadcaster
             .notify_local_change(&fixture.repository)
             .await;
+        // First, so a missing follow-up lookup fails with the calls the forge saw.
+        wait_for_lookups(&fixture, "main", 3).await;
         subscriber
             .until(
                 "the closed request must clear after the outdated answer",
@@ -9343,6 +9360,27 @@ esac
             ["main", "main", "main"],
             "one follow-up lookup runs after the outdated one"
         );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn pr_row_a_failed_refresh_after_six_minutes_clears_the_pull_request() {
+        let fixture = Fixture::new("pr-row-refresh-stale-failed");
+        let cancellation = CancellationToken::new();
+        let mut subscriber = subscriber_showing_the_pull_request(&fixture, &cancellation).await;
+
+        age_the_pull_request(&fixture, Duration::from_secs(360));
+        fixture.set("fail", "");
+        fixture.forget_lookups();
+        let status = tokio::time::timeout(Duration::from_secs(5), fixture.refresh())
+            .await
+            .expect("the refresh answers inside its bound");
+        assert!(status["pr"].is_null(), "{status}");
+        subscriber
+            .until("the subscriber shows the cleared request", |s| {
+                s.pr().is_null()
+            })
+            .await;
         cancellation.cancel();
     }
 

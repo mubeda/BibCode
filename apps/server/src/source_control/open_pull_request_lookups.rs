@@ -247,11 +247,18 @@ impl OpenPullRequestLookups {
     }
 
     /// Forgets every lookup for a worktree at or below `path`, matching either
-    /// the caller's spelling of the path or its canonical form.
-    pub(crate) fn invalidate(&self, path: &Path) {
+    /// the caller's spelling of the path or its canonical form. Returns whether
+    /// it dropped a lookup that callers still wait on, whose answer may now be
+    /// outdated.
+    pub(crate) fn invalidate(&self, path: &Path) -> bool {
+        let mut dropped_a_waited_lookup = false;
         self.lock().entries.retain(|key, entry| {
-            !(key.cwd.starts_with(path) || entry.canonical_cwd.starts_with(path))
+            let keep = !(key.cwd.starts_with(path) || entry.canonical_cwd.starts_with(path));
+            dropped_a_waited_lookup |= !keep
+                && matches!(&entry.slot, Slot::InFlight { lease, .. } if lease.strong_count() > 0);
+            keep
         });
+        dropped_a_waited_lookup
     }
 
     fn admit<F, Fut>(self: &Arc<Self>, key: LookupKey, canonical_cwd: PathBuf, load: F) -> Admission
@@ -937,7 +944,10 @@ mod tests {
         let lookups = Arc::new(OpenPullRequestLookups::default());
         let loader = Loader::answering(Ok(None));
         resolve(&lookups, key("/private/var/repo", "main"), &loader).await;
-        lookups.invalidate(Path::new("/private/var/repo"));
+        assert!(
+            !lookups.invalidate(Path::new("/private/var/repo")),
+            "a stored answer is not an awaited lookup"
+        );
         resolve(&lookups, key("/private/var/repo", "main"), &loader).await;
         assert_eq!(loader.runs(), 2, "invalidation drops the stored answer");
 
@@ -972,7 +982,10 @@ mod tests {
             async move { resolve(&lookups, key("/repo", "main"), &stale).await }
         });
         wait_for_runs(&stale, 1).await;
-        lookups.invalidate(Path::new("/repo"));
+        assert!(
+            lookups.invalidate(Path::new("/repo")),
+            "an awaited lookup was dropped"
+        );
         stale.release.notify_one();
         assert_eq!(waiter.await.unwrap(), Some(Ok(None)));
         let fresh = Loader::answering(Ok(Some(pull_request("main"))));

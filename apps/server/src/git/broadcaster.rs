@@ -40,6 +40,16 @@ pub struct StatusBroadcaster {
     inner: Arc<Inner>,
 }
 
+/// A handle that does not keep the broadcaster alive, for callbacks it stores itself.
+#[derive(Clone)]
+pub(crate) struct WeakStatusBroadcaster(std::sync::Weak<Inner>);
+
+impl WeakStatusBroadcaster {
+    pub(crate) fn upgrade(&self) -> Option<StatusBroadcaster> {
+        self.0.upgrade().map(|inner| StatusBroadcaster { inner })
+    }
+}
+
 struct Inner {
     repository: Arc<GitRepository>,
     local_status_refresh_interval: Duration,
@@ -217,6 +227,10 @@ fn log_signature_failure(error: &GitCommandError) {
 }
 
 impl StatusBroadcaster {
+    pub(crate) fn downgrade(&self) -> WeakStatusBroadcaster {
+        WeakStatusBroadcaster(Arc::downgrade(&self.inner))
+    }
+
     #[must_use]
     pub fn new(
         repository: Arc<GitRepository>,
