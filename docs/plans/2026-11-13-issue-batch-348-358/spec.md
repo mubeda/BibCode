@@ -62,7 +62,7 @@ Names used throughout:
 - D13. The Fit button keeps sending nothing when the server already declined that size; it says so instead. Decided by: agent's call, from the existing test.
 - D14. Test names, fixtures and docs use placeholders only (repository rule on sensitive data).
 - D15. During a remote update install, "Manage devices" is disabled with a one-line reason instead of being shown above the installing dialog (R39). An earlier DOM test had passed while the action only navigated under the dialog; the branch review caught it. Decided by: agent's call, to confirm with the user.
-- D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error boundary catches) is a separate change and is not in this spec.
+- D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error screen catches) is part of #360 here as R51 ("follow-up, do it as part of 360", user, 2026-11-13).
 
 ## Requirements
 
@@ -320,6 +320,16 @@ WHILE a virtual list's rows measure 0 by 0 because an ancestor is hidden or deta
 ### R50. A closed branch picker does no list work
 
 WHILE the Git Manager branch picker is closed, its list SHALL NOT be rendered or measured, and its filter text and selection SHALL be kept for the next opening.
+
+### R51. The Profiler records an error the app's error screen caught
+
+WHERE the Profiler is on, WHEN the app's error screen catches a render error, the Profiler SHALL record one event for it and SHALL group repeats in one finding. This is the follow-up the issue names; the user added it to #360 on 2026-11-13.
+
+- The record holds: the error's type name, React's error code when the message is React's minified form (185 for the nested-update limit), the names of at most 12 top component-stack frames, the route pattern, and a fingerprint built only from those names.
+- The record never holds: the error's message text, a URL, a file path, a thread or project id, prompt or terminal content. No path or timestamp is part of the fingerprint.
+- Given two identical errors, Then two events and one finding with a count of 2.
+- Given the Profiler is off, Then nothing is recorded or allocated, and the error screen behaves as before.
+- Reporting never throws from the error screen.
 
 ## Verification
 

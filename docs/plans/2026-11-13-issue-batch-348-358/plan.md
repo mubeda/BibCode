@@ -1,7 +1,7 @@
 # Issue batch #348 and #351 to #358: terminal panel, Git, worktree, update guard and web follow-ups
 
 Status: Approved 2026-11-13 (the user's standing pre-approval of 2026-10-30, after two Codex reviews and the advisor's; see reviews/)
-Spec: spec.md (Status line: Approved 2026-11-13, sha256 bfd46be7d808)
+Spec: spec.md (Status line: Approved 2026-11-13, sha256 7bdf6460d5a6)
 Repository: this repository
 Base: main
 
@@ -68,7 +68,7 @@ Base: main
 | 7     | phases/PHASE-07-server-odds-and-e2e-harness.md        | AppImage mounts hidden, per-test webview probe, flaky hint test, pairing refusal logs                                                                          | 1     | none                   | standard     |
 | 8     | phases/PHASE-08-labs-and-probes.md                    | Linux lab, Windows VM, mixed-version probe and load runs, with the Profiler on                                                                                 | 2     | 1, 2, 3, 4, 5, 6, 7    | most capable |
 | 9     | phases/PHASE-09-docs-gates-and-pull-request.md        | Living docs, final gates, reviews and the pull request                                                                                                         | 3     | 1, 2, 3, 4, 5, 6, 7, 8 | most capable |
-| 10    | phases/PHASE-10-hidden-list-measurement-crash.md      | A hidden virtual list no longer crashes the app; the closed branch picker does no list work (#360)                                                             | 2     | 6                      | most capable |
+| 10    | phases/PHASE-10-hidden-list-measurement-crash.md      | A hidden virtual list no longer crashes the app; the closed branch picker does no list work; the Profiler records a caught render error (#360)                 | 2     | 6                      | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds.
 
@@ -154,6 +154,7 @@ Parallel conflicts: none. Round 1's seven phases own disjoint files. Two points 
 | R48         | 10.1, 10.3                                                     |
 | R49         | 10.1, 10.2                                                     |
 | R50         | 10.3                                                           |
+| R51         | 10.4                                                           |
 
 ## End-to-end verification
 

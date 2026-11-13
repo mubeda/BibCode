@@ -72,3 +72,25 @@ Steps
 4. [ ] Run the Done-when command. Expected: PASS.
 5. [ ] Prove the test can fail: undo this task's change by hand and rerun the closed-picker case. Expected: FAIL on "renders no list row while closed". Restore it. Expected: PASS.
 6. [ ] Run the phase Checkpoint. Expected: exit 0.
+
+### Task 10.4: The Profiler records an error the app's error screen caught
+
+- Satisfies: R51
+- Depends on: none
+- Files: modify the route error boundary under `apps/web/src` that renders "Something went wrong."; modify the client profiler collector under `apps/web/src/profiler/` and its tests; modify the server's profiler ingestion and redaction under `apps/server/src/diagnostics/profiler/` and its tests, and the contracts under `packages/contracts/src` with their fixtures, only as far as the existing client-event path requires for one new event kind; modify `docs/skills/bibcode-profiler/references/events.md` and `findings.md` and the Profiler section of `docs/architecture/overview.md`
+- Interfaces: consumes the existing client-to-server profiler path (the collector's batches and the server's `profiler::emit` and `profiler::record_finding`, behind `profiler::is_enabled()`); produces one event kind for a caught render error and one finding that groups repeats by a fingerprint
+- Skills: bibcode-profiler (event and finding conventions, redaction rules); tdd (red first on both sides); mstack-diagnose (prove with Task 10.1's reproduction that a real nested-update crash produces the event)
+- Read first: `AGENTS.md` section "Profiler, Crash, and Trace Coverage" (never record message or content; redact through `diagnostics::profiler::redact`; no paths or timestamps in fingerprints; document every new event and finding); `docs/skills/bibcode-profiler/references/events.md` and `findings.md` (the shape of existing client events such as `client.stall`); the client collector and how `client.stall` travels to the server
+- Tier: most capable
+- TDD: red-green
+- Done when: the web test that throws inside the real error boundary sees one profiler record with the fields of R51 and none of the forbidden ones, the server test ingests it and raises the finding once for two identical errors, `vp run check:contracts` exits 0, and `rg -n "client.render-error" docs/skills/bibcode-profiler/references` finds the event and the finding
+
+Steps
+
+1. [ ] Read how an existing client event reaches the server and settle the names by the references' conventions; this plan's working names are the event `client.render-error` and the finding `client.render-error`. Expected: the names and the field list are written at the top of the task's first commit message.
+2. [ ] Write the failing web test: a component that throws under the real route error boundary with the Profiler enabled produces one record holding the error's type name, the React error code when the message is React's minified form (for example 185), the names of the top component-stack frames (at most 12), the route pattern, and a fingerprint built only from those names; and holding no error message text, no URL, no file path, no thread or project id and no timestamp inside the fingerprint. With the Profiler disabled nothing is recorded or allocated. Expected: FAIL, no record exists.
+3. [ ] Write the failing server test: ingesting two such records with the same fingerprint emits two events and raises one finding with a count of 2; a record that carries an unexpected free-text field is rejected or has it dropped by the redaction step. Expected: FAIL.
+4. [ ] Implement the smallest path that makes both pass, reusing the existing client-event transport; the error boundary reports once per caught error and never throws from its reporting. Expected: both tests PASS.
+5. [ ] Prove with Task 10.1's reproduction (the unguarded list crash, or a forced equivalent if 10.2 already landed in your tree) that a real nested-update error yields the event with code 185. Expected: one record with `reactErrorCode` 185.
+6. [ ] Prove the tests can fail: undo the boundary's report call by hand and rerun. Expected: FAIL. Restore it. Expected: PASS.
+7. [ ] Document the event, the finding and their fields in the two references and the overview's Profiler section, then run `vp run check:contracts`, `vp run check:markdown-links`, the Rust fmt and Clippy commands, and the web typecheck. Expected: exit 0 each.
