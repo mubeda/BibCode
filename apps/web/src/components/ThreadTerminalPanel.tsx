@@ -1005,6 +1005,8 @@ export function TerminalViewport({
       : null;
   // The size notice's scale (1 when the owner's grid fits unscaled), or null while hidden.
   const [mirroringSize, setMirroringSize] = useState<number | null>(null);
+  // Fit to this window sent nothing: the server already kept this size (#348).
+  const [fitKept, setFitKept] = useState(false);
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
@@ -1902,6 +1904,7 @@ export function TerminalViewport({
         const request = { ...fitted, sizeClaim };
         sentClaim = request;
         claimInFlight = request;
+        setFitKept(false);
         awaitedAcknowledgement = null;
         claimNoticeSuppressed = true;
         const finishClaim = (succeeded: boolean, result: TerminalResizeResult | null = null) => {
@@ -1967,6 +1970,7 @@ export function TerminalViewport({
       const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
+      if (!terminalSizesEqual(appliedSize, size)) setFitKept(false);
       appliedSize = size ?? null;
       if (size?.sizeClaim != null) unownedUntilUsed = false;
       // A window attaching to a size the server left un-owned waits to be used as well.
@@ -2052,6 +2056,7 @@ export function TerminalViewport({
       fit() {
         const pending = claimInFlight;
         handleSizeTrigger("fit");
+        setFitKept(claimInFlight === pending);
         // The sent claim hides the notice and its button, so focus moves where the keys go.
         if (claimInFlight !== null && claimInFlight !== pending) terminal.focus();
       },
@@ -2530,6 +2535,7 @@ export function TerminalViewport({
       if (disposed) return;
       disposed = true;
       updateMirroringSize(null);
+      setFitKept(false);
 
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
@@ -3011,6 +3017,7 @@ export function TerminalViewport({
           <span>
             Sized for another window.
             {mirroringSize < 1 ? ` Shown at ${Math.floor(mirroringSize * 100)}%.` : ""}
+            {fitKept ? " The server kept this size." : ""}
           </span>
           <Button
             type="button"

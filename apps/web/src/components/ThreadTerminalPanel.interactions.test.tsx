@@ -9061,6 +9061,45 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
     expect(document.activeElement).not.toBe(terminal.textarea);
   });
 
+  /** Fit to this window, pressed twice against a server that declines the claim. */
+  const fitDeclinedTwice = async () => {
+    const { host, client } = await serverHostOwnsTallerGrid();
+    focusableXterm(client);
+    testState.resizeCommand.mockImplementation(async () =>
+      AsyncResult.success({
+        outcome: "claimNotRegistered",
+        size: server.size(),
+        generation: null,
+        sequence: null,
+      } satisfies TerminalResizeResult),
+    );
+    await browserClick(fitButton(client)!);
+    const requests = testState.resizeCommand.mock.calls.length;
+    await browserClick(fitButton(client)!);
+    return { host, client, requests };
+  };
+
+  const sizeNotice = (machine: Machine) =>
+    Array.from(machine.mounted.container.querySelectorAll('[role="status"]')).find((element) =>
+      element.textContent?.includes("Sized for another window."),
+    );
+
+  it("says the server kept this size when Fit to this window sends nothing", async () => {
+    const { client, requests } = await fitDeclinedTwice();
+    expect(sizeNotice(client)?.textContent).toContain("The server kept this size.");
+    expect(testState.resizeCommand.mock.calls.length).toBe(requests);
+    expect(document.activeElement).toBe(fitButton(client));
+  });
+
+  it("drops the server kept this size sentence when the applied size changes", async () => {
+    const { host, client } = await fitDeclinedTwice();
+    expect(sizeNotice(client)?.textContent).toContain("The server kept this size.");
+    server.resize(claimOf(host), 120, 40);
+    await server.deliver();
+    expect(view(client)).toMatchObject({ grid: "120x40", notice: true });
+    expect(sizeNotice(client)?.textContent).not.toContain("The server kept this size.");
+  });
+
   // Real-pair case 5 on builds before the authoritative protocol: after the client took the
   // size and the host took it back by a keypress, a click on the client did not take it back.
   it.each([
