@@ -9,7 +9,10 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock("../state/desktopUpdate", () => ({ useDesktopUpdateState: () => state.update }));
 vi.mock("./ui/toast", () => ({
-  toastManager: { add: (toast: Record<string, unknown>) => state.toasts.push(toast) },
+  toastManager: {
+    add: (toast: Record<string, unknown>) => String(state.toasts.push(toast)),
+    update: vi.fn(),
+  },
   stackedThreadToast: (input: unknown) => input,
 }));
 import {

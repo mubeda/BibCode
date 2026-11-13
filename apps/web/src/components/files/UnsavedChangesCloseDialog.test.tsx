@@ -927,7 +927,9 @@ describe("UnsavedChangesCloseHost", () => {
     });
   });
 
-  it("the toast action is reachable while the installing dialog is open", async () => {
+  // Only the toast layer stays out of the inert region; whether Manage devices may act while the
+  // dialog is up is `RemoteUpdateRequestNotifier.install.test.tsx` (it stays disabled, R39).
+  it("the toast layer stays outside the installing dialog's inert region", async () => {
     await act(async () => root.unmount());
     // The real toast module: its viewport and its manager, not the mocked `add`.
     const toast = await vi.importActual<typeof import("../ui/toast")>("../ui/toast");
