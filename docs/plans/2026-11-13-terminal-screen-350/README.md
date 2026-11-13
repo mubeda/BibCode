@@ -1,6 +1,27 @@
-# #350: server-side terminal screen (status on 2026-11-13)
+# #350: server-side terminal screen (closed as not planned on 2026-11-13)
 
-State: **design in rework, no code written.** This folder is not yet a plan folder (it has no `plan.md`).
+State: **closed as not planned.** No product code was written. This folder keeps the design and the evidence so the work can be picked up if a real case appears.
+
+## Decision
+
+On 2026-11-13 the repository owner decided: "350 close it as not planned".
+
+Why, from the evidence laid out before the decision:
+
+- The missing-characters case is already fixed by the earlier batch for Claude terminals that BiBCode starts on Linux and macOS servers, which is the owner's own setup. What stays unfixed is the same case for other programs, plain shells running a full-screen program, and Windows servers.
+- The stale-rows case after a resize was reproduced with a stand-in program only (4 stale rows, 5 of 5 runs). Whether the real Claude CLI is affected is not known.
+- Every report comes from one account, from validation runs. No second person reported any of it.
+- The cost is high: a terminal engine ported from xterm.js's state model (about 4,000 lines measured in the proof, about 600 more for resize and reflow), a match with xterm.js to keep on every upgrade, memory per terminal, and a protocol that three design reviews each found faults in.
+
+What a later attempt can start from:
+
+- The serializer proof: 19,803 stream-and-cut comparisons against xterm.js 6.0.0, 0 differences, 20.6% answered as an explicit fallback. The `avt` crate differed on about 64% of random cuts and is not a sound base.
+- Open when the work stopped: a resize still forced a fallback (a port of xterm's resize and reflow had been started and was not finished); hyperlink registry state was the largest fallback class, and link-heavy output fed at 0.8 MiB/s without an index.
+- The design at revision 5 below, with its three reviews.
+
+Reopen if one of these shows up in real use: a Windows server, a program other than Claude in daily use on a shared terminal, or the real Claude CLI showing stale rows after a resize.
+
+The status notes below are the working notes from before the decision.
 
 - `terminal-screen-design.md`: first design draft. Status Draft.
 - `reviews/design-review-1.md`: Codex (`gpt-6.1-sol`, effort high) review of that draft. Verdict: needs rework, 13 findings, several reproduced against the installed xterm 6.

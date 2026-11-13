@@ -1,7 +1,7 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 65ea96913129)
+Spec: spec.md (sha256 cd8779b5f2cb)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: inline
@@ -73,3 +73,4 @@ Branch: claude/open-issues-pr-dc3c33
 - 2026-11-13 09:43 1.1 to 1.10 Closed (lane 1), integrated by merge. Evidence: phase web tests 8 files, 415 passed; contracts 39 passed; `check:contracts` exit 0; cargo descriptor tests 2 passed; typecheck, fmt, Clippy exit 0. R16 verdict: defect (claims `85x33` then `85x30` on re-attach), fixed by putting a re-measured cell through the settle window; the same fix was applied to the pixel-ratio and bundled-font paths as a follow-up (4930b0e7d). R43 verdict: no defect. Ruling: the WebGL warning names a stage and an error type only.
 - 2026-11-13 09:53 2.1 to 2.8 Closed (lane 2), integrated by merge. Evidence: checkpoint 79 passed across six filters; fmt and Clippy exit 0. Quiesce step name: `pull-request-lookups` (after `status-broadcaster`, before `git-writes`). R30 verdict: defect (a status-neutral local change left the outdated answer with no follow-up lookup), fixed as an added task. Follow-up open: whether an HTTP-based lookup aborts promptly at shutdown.
 - 2026-11-13 09:54 R12 Windows proof (part of 8.3): fix commit 707d9cba7 built in the VM; `chat-reasoning-rows` passed 3 of 3; the packaged default list passed (37 passing, 4 skipped, 0 failing). Profiler on: no finding in the three runs; three `rpc.slow` warnings in the default list (`gitManager.stagePartial` 1.2 s twice, `vcs.listRefs` 1.5 s three times), pre-existing, unrelated to scrolling.
+- 2026-11-13 10:39 Ruling (user): "350 close it as not planned". The pull request closes the other nine issues and no longer waits for #350. The serializer proof was stopped during its resize work; its project is archived outside the repository. Spec D2 and plan P1 amended; no task changes. Cost if wrong: none, the user decided.

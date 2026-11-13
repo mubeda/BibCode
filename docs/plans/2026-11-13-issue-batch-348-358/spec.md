@@ -48,7 +48,7 @@ Names used throughout:
 ## Decisions
 
 - D1. One pull request covers all ten issues. Decided by: user, 2026-11-13.
-- D2. #350 is planned in its own folder on the same branch, and no #350 wire code is written before its design passes a second review. Its first design failed review on continuation fidelity and on the refresh protocol, so its serializer is settled by a differential test harness, not by prose. The pull request is held until #350 lands with proof: it closes all ten issues, so that the repository has no open issue. Decided by: user, 2026-11-13 ("Hold PR for #350, I want 0 issues in the repo").
+- D2. #350 is closed as not planned and is not part of the pull request, which closes the other nine issues. Its design, reviews and serializer evidence stay in `../2026-11-13-terminal-screen-350/` for a later attempt. Decided by: user, 2026-11-13 ("350 close it as not planned"), replacing the earlier decision of the same day to hold the pull request for it.
 - D3. A design or plan counts as approved once Codex and the advisor have reviewed it and their findings are handled (standing pre-approval of 2026-10-30). Decided by: user's standing rule.
 - D4. The client switches to Unicode 11 widths now, in every terminal, whatever the server (R5). It is the prerequisite #350 names and fixes #353 item 8 on its own. Decided by: agent's call.
 - D5. `pull` stays out of `takes_index_lock`. Its merge child holds the lock, the ownership check sees only the root process, and listing it would arm the Windows 2-second rule during the fetch. Decided by: agent's call, from the code.
