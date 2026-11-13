@@ -149,6 +149,8 @@ pub struct ProductionRuntime {
     /// The server's repository, whose Git writes shutdown stops (R17).
     git_repository: Arc<GitRepository>,
     status_broadcaster: crate::git::StatusBroadcaster,
+    /// Status enrichment's shared open pull-request lookups, which quiesce ends (R26).
+    shared_pull_requests: crate::source_control::PullRequestService,
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
@@ -563,6 +565,7 @@ impl ProductionRuntime {
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
         let clone_operations = git_vcs.clone_operations();
         let status_broadcaster = git_vcs.status_broadcaster();
+        let shared_pull_requests = git_vcs.pull_requests();
         let terminal_status_broadcaster = status_broadcaster.clone();
         terminal_manager.set_process_exit_callback(Arc::new(move |cwd| {
             let status_broadcaster = terminal_status_broadcaster.clone();
@@ -849,6 +852,7 @@ impl ProductionRuntime {
             clone_operations,
             git_repository,
             status_broadcaster,
+            shared_pull_requests,
             workspace,
             _resource_sampler: resource_sampler,
             process_monitor,
@@ -1044,6 +1048,12 @@ impl ProductionRuntime {
         steps.mark("workspace");
         self.status_broadcaster.shutdown().await;
         steps.mark("status-broadcaster");
+        // Every running pull-request lookup ends, its forge CLI reaped, and later ones are
+        // refused, before the Git writes stop and the profiler's teardown (R26).
+        self.shared_pull_requests
+            .shutdown_open_pull_request_lookups()
+            .await;
+        steps.mark("pull-request-lookups");
         self.worktree_catalog_operations.shutdown().await;
         steps.mark("worktree-catalog-operations");
         self._worktree_catalog.shutdown().await;
@@ -5564,9 +5574,15 @@ mod tests {
     /// R17: a Git write still running at shutdown is stopped, and its `index.lock` is gone when
     /// quiescence returns. The write is a `git add` whose clean filter never finishes.
     async fn start_quiesce_runtime(state: &TempDir) -> ProductionRuntime {
-        let config = ServerConfig::new(state.path())
-            .with_bind("127.0.0.1", 0)
-            .with_unsafe_no_auth();
+        start_quiesce_runtime_with(
+            ServerConfig::new(state.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+        )
+        .await
+    }
+
+    async fn start_quiesce_runtime_with(config: ServerConfig) -> ProductionRuntime {
         hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
@@ -5585,6 +5601,75 @@ mod tests {
         )
         .await
         .expect("runtime")
+    }
+
+    /// R26: a pull-request lookup still running at shutdown ends, and its forge CLI is gone,
+    /// when quiescence returns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_in_stops_a_running_pull_request_lookup() {
+        let state = TempDir::new().expect("state");
+        let bin = state.path().join("bin");
+        let worktree = state.path().join("worktree");
+        let pid_file = state.path().join("gh-pid");
+        std::fs::create_dir(&bin).expect("bin");
+        std::fs::create_dir(&worktree).expect("worktree");
+        crate::test_support::TestSandbox::write_executable(
+            &bin.join("gh"),
+            &format!(
+                "#!/bin/sh\ncase \"$1:$2\" in\n  pr:list) echo $$ > '{}.tmp'; mv '{0}.tmp' '{0}'; exec sleep 30 ;;\n  *) exit 64 ;;\nesac\n",
+                pid_file.display()
+            ),
+        );
+        let runtime = start_quiesce_runtime_with(
+            ServerConfig::new(state.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth()
+                .with_hosting_executable_dir_for_integration_test(bin),
+        )
+        .await;
+
+        let lookup = tokio::spawn({
+            let pull_requests = runtime.shared_pull_requests.clone();
+            async move {
+                pull_requests
+                    .resolve_current_optional_shared(
+                        crate::source_control::ResolvePullRequestInput {
+                            cwd: worktree,
+                            provider: crate::source_control::ProviderKind::Github,
+                            reference: "main".into(),
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break pid.trim().to_owned();
+            }
+            assert!(std::time::Instant::now() < deadline, "the lookup started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .expect("kill runs")
+                .success()
+        };
+        assert!(alive(&pid), "the forge CLI runs");
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        assert!(!alive(&pid), "the forge CLI outlived quiescence");
+        let error = timeout(std::time::Duration::from_secs(5), lookup)
+            .await
+            .expect("the lookup has returned")
+            .expect("lookup task")
+            .expect_err("the lookup was cancelled");
+        assert_eq!(&*error.detail, "The pull-request lookup was cancelled.");
     }
 
     /// A write whose stop outlasts both shutdown waits keeps quiescence incomplete: a later

@@ -606,7 +606,7 @@ impl PullRequestService {
     /// [`Self::resolve_current_optional`] for VCS status enrichment: a
     /// successful answer (including no open pull request) is reused for a few
     /// seconds per (worktree, provider, branch), concurrent callers share one
-    /// provider run, and failures are never reused. Callers that must see the
+    /// provider run, and a failure answers for 5 seconds. Callers that must see the
     /// hosting service's current answer, such as the existence check before
     /// creating a pull request, use the uncached method.
     pub async fn resolve_current_optional_shared(
@@ -649,9 +649,15 @@ impl PullRequestService {
     /// Forgets the shared open pull-request lookups for the worktree at or
     /// below `path`, after something that can change the hosting service's
     /// answer: a push, a created pull request, a finished Git mutation, or a
-    /// reported local change such as a terminal command exiting.
-    pub fn invalidate_open_pull_request_lookups(&self, path: &std::path::Path) {
-        self.open_lookups.invalidate(path);
+    /// reported local change such as a terminal command exiting. Returns
+    /// whether a lookup still awaited was dropped, so its answer may be outdated.
+    pub fn invalidate_open_pull_request_lookups(&self, path: &std::path::Path) -> bool {
+        self.open_lookups.invalidate(path)
+    }
+
+    /// Ends every shared open pull-request lookup and refuses new ones, for quiesce (R26).
+    pub async fn shutdown_open_pull_request_lookups(&self) {
+        self.open_lookups.shutdown().await;
     }
 
     pub(crate) fn current_provider_command(
