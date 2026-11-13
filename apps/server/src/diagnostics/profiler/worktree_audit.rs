@@ -660,9 +660,12 @@ async fn compare(
 /// a worktree created at that path since keeps its own record.
 async fn reap_gone_records(repositories: &Repositories, gone: Vec<WorktreeCreationRecord>) {
     for record in gone {
-        match tokio::fs::symlink_metadata(&record.worktree_path).await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => continue,
+        let path = record.worktree_path.clone();
+        if !tokio::task::spawn_blocking(move || record_folder_is_gone(&path))
+            .await
+            .unwrap_or(false)
+        {
+            continue;
         }
         if let Err(error) = repositories
             .reap_worktree_creation_record(record.record_id)
@@ -671,6 +674,18 @@ async fn reap_gone_records(repositories: &Repositories, gone: Vec<WorktreeCreati
             tracing::warn!(%error, "worktree audit could not delete a stale creation record");
         }
     }
+}
+
+/// A record's folder is gone only when it is missing and its parent directory exists: a missing
+/// parent cannot be told apart from an unmounted volume, so its record is kept (D9). `git
+/// worktree list` is no gate, as it answers from a readable repository whatever the volume.
+/// Cost: records under a managed directory deleted as a whole are never reaped.
+fn record_folder_is_gone(worktree_path: &str) -> bool {
+    let path = Path::new(worktree_path);
+    matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && path
+            .parent()
+            .is_some_and(|parent| std::fs::metadata(parent).is_ok_and(|meta| meta.is_dir()))
 }
 
 /// Each project's managed directory in its physical spelling, and what one level of each
@@ -728,13 +743,10 @@ fn resolve(
         .into_iter()
         .take_while(|_| !cancel.is_cancelled())
     {
-        match std::fs::symlink_metadata(&record.worktree_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                comparison.gone_records.push(record);
-            }
-            _ => {
-                recorded.insert(physical(Path::new(&record.worktree_path)));
-            }
+        if record_folder_is_gone(&record.worktree_path) {
+            comparison.gone_records.push(record);
+        } else {
+            recorded.insert(physical(Path::new(&record.worktree_path)));
         }
     }
     let incomplete: HashSet<PathBuf> = evidence
@@ -1380,6 +1392,59 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         reap_gone_records(&repositories, gone).await;
         assert_eq!(recorded_paths(&repositories).await, [written]);
+    }
+
+    #[tokio::test]
+    async fn a_record_under_a_missing_parent_is_kept() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        // An unmounted volume: the folder and its parent are both missing.
+        let path = managed.join("gone/wt").to_string_lossy().into_owned();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
+        assert!(gone_after_read(&repositories, &managed).await.is_empty());
+        let recorded = repositories.list_worktree_creation_records().await.unwrap();
+        reap_gone_records(&repositories, recorded).await;
+        assert_eq!(recorded_paths(&repositories).await, [path]);
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_folder_is_missing_under_an_existing_parent_is_reaped() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        let path = managed.join("wt").to_string_lossy().into_owned();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
+        let gone = gone_after_read(&repositories, &managed).await;
+        assert_eq!(gone.len(), 1, "the parent exists and the folder does not");
+        reap_gone_records(&repositories, gone).await;
+        assert!(recorded_paths(&repositories).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_is_kept_when_its_parent_vanishes_before_the_reap() {
+        let (_root, managed) = managed_dir();
+        let repositories = migrated_repositories().await;
+        let parent = managed.join("volume");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("wt").to_string_lossy().into_owned();
+        repositories
+            .record_worktree_creation("/repo", &path)
+            .await
+            .unwrap();
+        let gone = gone_after_read(&repositories, &managed).await;
+        assert_eq!(gone.len(), 1);
+        std::fs::remove_dir(&parent).unwrap();
+        reap_gone_records(&repositories, gone).await;
+        assert_eq!(
+            recorded_paths(&repositories).await,
+            [path],
+            "the re-check keeps it"
+        );
     }
 
     #[test]
