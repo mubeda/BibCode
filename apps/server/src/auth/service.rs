@@ -3602,11 +3602,26 @@ pub fn owned_scopes(scopes: &[&str]) -> Vec<String> {
 }
 
 #[must_use]
+/// RFC 3339 in UTC with exactly three fraction digits. The store compares these as text
+/// (`expires_at > ?`), which is time order only at a fixed width: a trimmed fraction would sort
+/// `…:00Z` after `…:00.001Z` and keep an expired credential valid for up to a second.
 pub fn format_iso(epoch_ms: i64) -> String {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
         .ok()
-        .and_then(|date| date.format(&Rfc3339).ok())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+        .filter(|date| (0..=9999).contains(&date.year()))
+        .map(|date| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                date.year(),
+                u8::from(date.month()),
+                date.day(),
+                date.hour(),
+                date.minute(),
+                date.second(),
+                date.millisecond()
+            )
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned())
 }
 
 #[must_use]
@@ -4157,7 +4172,10 @@ mod tests {
         let result = service.consume_grant(presented, thumbprint).await;
         assert!(
             matches!(result, Err(AuthError::InvalidCredential)),
-            "{class}: the credential is refused"
+            "{class}: the credential is refused, got {:?}",
+            result
+                .as_ref()
+                .map(|grant| format!("Ok(grant for subject {})", grant.subject))
         );
         let text = capture.text();
         let warnings: Vec<&str> = text.lines().filter(|line| line.contains("WARN")).collect();
@@ -4174,6 +4192,66 @@ mod tests {
             .filter(|secret| !secret.is_empty())
         {
             assert!(!text.contains(secret), "{class}: a credential was logged");
+        }
+    }
+
+    /// The store compares these timestamps as text (`expires_at > ?`), so text order must be time
+    /// order. RFC 3339 with a trimmed fraction is not: `…:00Z` sorts after `…:00.001Z`.
+    #[test]
+    fn stored_timestamps_sort_as_text_in_time_order() {
+        let second = 1_767_225_600_000_i64; // 2026-01-01T00:00:00Z
+        let instants =
+            [0, 1, 9, 10, 100, 120, 121, 999, 1_000, 1_001].map(|offset| second + offset);
+        for earlier in instants {
+            for later in instants.into_iter().filter(|later| *later > earlier) {
+                assert!(
+                    format_iso(earlier) < format_iso(later),
+                    "{} must sort before {}",
+                    format_iso(earlier),
+                    format_iso(later)
+                );
+            }
+        }
+    }
+
+    /// A link is refused from the first millisecond after it expires, whatever the fraction of
+    /// its expiry. Explicit timestamps, so load cannot change the outcome.
+    #[tokio::test]
+    async fn a_pairing_link_is_refused_from_the_millisecond_after_it_expires() {
+        let (_service, repositories, _secrets) = mcp_test_service().await;
+        let second = 1_767_225_600_000_i64;
+        for (index, expires_at) in [second, second + 100, second + 120].into_iter().enumerate() {
+            let credential = format!("expiry-probe-{index}");
+            repositories
+                .create_auth_pairing_link(PersistedPairingLink {
+                    id: format!("expiry-probe-id-{index}"),
+                    credential: credential.clone(),
+                    method: "one-time-token".to_owned(),
+                    scopes: serde_json::json!(owned_scopes(STANDARD_SCOPES)),
+                    subject: "one-time-token".to_owned(),
+                    label: None,
+                    proof_key_thumbprint: None,
+                    created_at: format_iso(expires_at - 60_000),
+                    expires_at: format_iso(expires_at),
+                    consumed_at: None,
+                    revoked_at: None,
+                    reach: None,
+                    off_host: None,
+                    mcp_access: None,
+                    mcp_named_client: None,
+                })
+                .await
+                .expect("the link is stored");
+            let now = format_iso(expires_at + 1);
+            let consumed = repositories
+                .consume_auth_pairing_link(credential, None, now.clone(), now.clone())
+                .await
+                .expect("the store answers");
+            assert!(
+                consumed.is_none(),
+                "expires {} was accepted at {now}",
+                format_iso(expires_at)
+            );
         }
     }
 
@@ -6700,7 +6778,12 @@ mod tests {
         }
         assert!(decode_persisted_scopes(serde_json::json!(42)).is_err());
         assert!(parse_timestamp_ms("not-a-timestamp").is_err());
-        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00Z");
+        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00.000Z");
+        assert_eq!(format_iso(1_767_225_600_120), "2026-01-01T00:00:00.120Z");
+        assert_eq!(
+            parse_timestamp_ms(&format_iso(1_767_225_600_120)).ok(),
+            Some(1_767_225_600_120)
+        );
     }
 
     #[tokio::test]
