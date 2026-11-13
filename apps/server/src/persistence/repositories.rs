@@ -2221,7 +2221,7 @@ impl Repositories {
                     {
                         Some(sooner)
                     }
-                    (_, Some(pending)) => Some(format_epoch_ms(pending)),
+                    (_, Some(pending)) => Some(crate::persistence::format_timestamp_ms(pending)),
                     (next, None) => next,
                 };
                 let mcp_named_clients = if table_has_named_clients(&transaction)? {
@@ -4267,17 +4267,6 @@ fn source_class(source_key: &str) -> &str {
     source_key.split(':').next().unwrap_or_default()
 }
 
-/// Epoch milliseconds as an RFC 3339 timestamp.
-fn format_epoch_ms(epoch_ms: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
-        .ok()
-        .and_then(|date| {
-            date.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
-}
-
 /// An RFC 3339 timestamp as epoch milliseconds; `None` when it does not parse.
 fn parse_epoch_ms(value: &str) -> Option<i64> {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
@@ -4319,7 +4308,7 @@ fn prune_mcp_oauth_on(
     connection.execute(
         "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id NOT IN \
          (SELECT session_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > ?)",
-        params![format_epoch_ms(now_ms)],
+        params![crate::persistence::format_timestamp_ms(now_ms)],
     )?;
     Ok(pending_gone)
 }
@@ -6104,5 +6093,52 @@ mod frozen_session_unfreeze_tests {
             assert_eq!(retained.provider_name, provider);
             assert_eq!(retained.provider_instance_id.as_deref(), instance);
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_text_order_tests {
+    use super::*;
+    use crate::persistence::format_timestamp_ms;
+
+    /// 2026-01-01T00:00:00Z, a whole second: the instant a trimmed fraction writes shortest.
+    const SECOND_MS: i64 = 1_767_225_600_000;
+
+    /// #362: the cleanup keeps the refresh token of a session that expires one millisecond
+    /// after a cleanup run on a whole second. Fixed timestamps, so load cannot change it.
+    #[test]
+    fn the_oauth_cleanup_keeps_a_token_whose_session_outlives_it_by_a_millisecond() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        crate::persistence::run_migrations(&mut connection, None).expect("migrations apply");
+        connection
+            .execute(
+                "INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, \
+                 expires_at) VALUES ('session-a', 'mcp-client', '[]', 'mcp-oauth', ?1, ?2)",
+                params![
+                    format_timestamp_ms(SECOND_MS - 60_000),
+                    format_timestamp_ms(SECOND_MS + 1)
+                ],
+            )
+            .expect("session row");
+        connection
+            .execute(
+                "INSERT INTO mcp_oauth_refresh_tokens (token_hash, session_id, client_id, \
+                 issued_at) VALUES ('hash-a', 'session-a', 'client-a', ?1)",
+                params![SECOND_MS - 60_000],
+            )
+            .expect("refresh token row");
+
+        prune_mcp_oauth_on(&connection, SECOND_MS, crate::auth::oauth::LIMITS)
+            .expect("the cleanup runs");
+
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mcp_oauth_refresh_tokens", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            kept, 1,
+            "the live session's refresh token was deleted early"
+        );
     }
 }

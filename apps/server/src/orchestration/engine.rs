@@ -7884,9 +7884,7 @@ fn request_expiry_command(
 }
 
 fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::persistence::now_timestamp()
 }
 
 fn request_expiry_summary(kind: &str) -> &'static str {

@@ -3602,26 +3602,10 @@ pub fn owned_scopes(scopes: &[&str]) -> Vec<String> {
 }
 
 #[must_use]
-/// RFC 3339 in UTC with exactly three fraction digits. The store compares these as text
-/// (`expires_at > ?`), which is time order only at a fixed width: a trimmed fraction would sort
-/// `…:00Z` after `…:00.001Z` and keep an expired credential valid for up to a second.
+/// Epoch milliseconds in the store's fixed-width timestamp form; see
+/// [`crate::persistence::format_timestamp`].
 pub fn format_iso(epoch_ms: i64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
-        .ok()
-        .filter(|date| (0..=9999).contains(&date.year()))
-        .map(|date| {
-            format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-                date.year(),
-                u8::from(date.month()),
-                date.day(),
-                date.hour(),
-                date.minute(),
-                date.second(),
-                date.millisecond()
-            )
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned())
+    crate::persistence::format_timestamp_ms(epoch_ms)
 }
 
 #[must_use]

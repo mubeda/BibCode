@@ -12,7 +12,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Mutex, Semaphore, TryAcquireError, oneshot, watch},
     task::JoinHandle,
@@ -3836,9 +3835,7 @@ fn stale_generation(expected: u64, current: Option<u64>) -> CatalogError {
 }
 
 fn now_iso() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
+    crate::persistence::now_timestamp()
 }
 
 #[cfg(test)]

@@ -2959,9 +2959,7 @@ const fn platform_arch() -> &'static str {
 }
 
 pub(crate) fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::now_timestamp()
 }
 
 #[cfg(test)]

@@ -933,9 +933,9 @@ impl Store {
     /// Deletes finished deliveries older than 7 days, and beyond the newest 1,000 of each
     /// endpoint. Pending deliveries are never pruned.
     pub(crate) async fn prune(&self) -> Result<usize> {
-        let cutoff = (time::OffsetDateTime::now_utc() - time::Duration::days(KEPT_DAYS))
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
+        let cutoff = crate::persistence::format_timestamp(
+            time::OffsetDateTime::now_utc() - time::Duration::days(KEPT_DAYS),
+        );
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;

@@ -58,9 +58,9 @@ const MOST_ID_CHARS: usize = 128;
 
 /// Rows older than this instant are past the 7-day retention.
 fn retention_cutoff() -> String {
-    (time::OffsetDateTime::now_utc() - time::Duration::days(KEPT_DAYS))
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::persistence::format_timestamp(
+        time::OffsetDateTime::now_utc() - time::Duration::days(KEPT_DAYS),
+    )
 }
 
 /// The actor of a command sent with `context`'s credential: an outside agent's session, with

@@ -112,7 +112,7 @@ use futures_util::{StreamExt, stream};
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
@@ -8962,9 +8962,7 @@ async fn confirm_late_delivery(engine: &OrchestrationEngine, thread_id: &str, de
             expected_attempt: row.attempts,
             next_state: TurnDeliveryState::Delivered,
             detail: None,
-            updated_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+            updated_at: crate::persistence::now_timestamp(),
         };
         match engine.transition_turn_delivery(transition).await {
             Ok(true) => {
@@ -14197,9 +14195,7 @@ fn retained_activity_health() -> ActivitySectionHealth {
 }
 
 fn now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::now_timestamp()
 }
 
 /// The provider inventory the server last published: one snapshot per provider instance, each
