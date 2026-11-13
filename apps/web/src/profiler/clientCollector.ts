@@ -494,6 +494,9 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
       pacedAt.set(environmentId, sentAt);
       if (isProfilerUnsupported(error)) rememberProfilerRefused(environmentId);
       if (isRefusal(error)) {
+        // The second deliberate discard: an environment that refuses the client's
+        // authorization (or does not know the method) is never sent a batch again on this
+        // page (`refused` is never cleared), so its pending render errors could never go.
         refused.add(environmentId);
         pendingRenderErrors.delete(environmentId);
         windows.delete(environmentId);

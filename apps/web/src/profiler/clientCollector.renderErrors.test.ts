@@ -169,6 +169,39 @@ describe("render error records", () => {
     c.dispose();
   });
 
+  // The second deliberate discard: an environment that refuses the client's authorization is
+  // never sent a batch again on this page, so its pending render errors are dropped with it.
+  it.each(["EnvironmentAuthorizationError", "EnvironmentOperationForbiddenError"])(
+    "drops pending render errors for an environment that answers %s",
+    async (tag) => {
+      let t = 0;
+      const send = vi.fn(async (environmentId: string, _batch: any) => {
+        if (environmentId === "env-a") throw { _tag: tag, message: "missing scope" };
+        return { accepted: true };
+      });
+      const c = createClientCollector({
+        now: () => t,
+        send,
+        supportedEntryTypes: [],
+        clientId: "c1",
+      });
+      c.setEnabledEnvironments(new Set(["env-a", "env-b"]));
+      c.recordRenderError(new Error("a"), null, () => undefined);
+      await c.flush();
+      // Enabled again (as the settings subscription would) and flushed later: nothing goes.
+      c.setEnabledEnvironments(new Set(["env-a", "env-b"]));
+      t = 6_000;
+      c.recordRenderError(new TypeError("b"), null, () => undefined);
+      await c.flush();
+      const toA = send.mock.calls.filter(([environmentId]) => environmentId === "env-a");
+      expect(toA).toHaveLength(1);
+      expect(send.mock.calls.filter(([environmentId]) => environmentId === "env-b")).toHaveLength(
+        2,
+      );
+      c.dispose();
+    },
+  );
+
   // Codex finding 6: a flush the pacing holds back must not drop the window's measurements.
   it("keeps the window's measurements while the pacing holds a batch back", async () => {
     vi.useFakeTimers();

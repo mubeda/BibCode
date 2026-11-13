@@ -2010,9 +2010,11 @@ it.
   path or an id. The batch carries them in the optional `renderErrors` field,
   which older servers ignore. Each environment keeps its pending errors (the
   newest 8) until its server answers `{ accepted: true }` to the batch that
-  carried them; only `{ accepted: false }` with no reason, the server's
-  profiler-off answer, drops them, and any other answer, no answer or a failed
-  send keeps them. Every send waits out the server's 5 s pacing, and a batch it
+  carried them. They are dropped on purpose only when the server says its
+  profiler is off (`{ accepted: false }` with no reason), or when the server
+  refuses the client's authorization for profiler batches, after which the
+  client sends that environment nothing more on this page; any other answer,
+  no answer or a failed send keeps them. Every send waits out the server's 5 s pacing, and a batch it
   holds back keeps its whole window of measurements for the next one. The server applies the closed set, the identifier
   shape and a route-id grammar again, redacts, emits one event each and groups
   repeats by type, code, route and component names: the packaged bundle

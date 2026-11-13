@@ -311,8 +311,11 @@ What holds where:
 
 Delivery: an error stays pending for each environment until that server
 answers `{ accepted: true }` to the batch that carried it. It is dropped on
-purpose only when the server answers `{ accepted: false }` with no reason,
-which means its profiler is off, so nothing is kept for it. Any other answer
+purpose only when the server says its profiler is off (`{ accepted: false }`
+with no reason), or when the server refuses the client's authorization for
+profiler batches (`EnvironmentAuthorizationError`,
+`EnvironmentOperationForbiddenError`) or does not know the method: the client
+then sends that environment nothing more until the page reloads. Any other answer
 (`too-frequent`, an unknown reason, no answer) or a failed send keeps it for
 the next allowed batch, as does a batch held back by the pacing or by another
 batch still on the wire; a held-back batch also keeps its window's requests,
