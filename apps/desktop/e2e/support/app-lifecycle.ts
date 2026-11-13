@@ -329,31 +329,97 @@ export async function relaunchDesktopUiApplication(
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   });
-  await withinRecoveryDeadline(deadline, "reloadSession", async () => {
-    try {
-      await browser.reloadSession();
-    } catch (error) {
-      // The service copies the old session's mocks onto the new one after it opens; the new app
-      // never had them, and each spec installs the mocks it needs again.
-      if (!(error instanceof Error) || !error.message.startsWith("Mock updates failed"))
-        throw error;
+  await prepareRelaunchedDesktopUiSession(
+    {
+      reloadSession: async () => {
+        try {
+          await browser.reloadSession();
+        } catch (error) {
+          // The service copies the old session's mocks onto the new one after it opens; the new
+          // app never had them, and each spec installs the mocks it needs again.
+          if (!(error instanceof Error) || !error.message.startsWith("Mock updates failed"))
+            throw error;
+        }
+      },
+      probe: () => browser.execute(() => true),
+      restoreMocks: () => browser.tauri.restoreAllMocks(),
+      waitForPlugin: () =>
+        browser.waitUntil(
+          () =>
+            browser.execute(() => {
+              const host = window as Window & {
+                readonly wdioTauri?: { readonly execute?: unknown };
+              };
+              return typeof host.wdioTauri?.execute === "function";
+            }),
+          {
+            timeout: Math.min(20_000, deadline.remainingMs()),
+            timeoutMsg: "The relaunched app's Tauri WebDriver plugin did not initialize.",
+          },
+        ),
+    },
+    deadline,
+  );
+}
+
+export interface RelaunchedSessionSteps {
+  readonly reloadSession: () => Promise<void>;
+  readonly probe: () => Promise<unknown>;
+  readonly restoreMocks: () => Promise<unknown>;
+  readonly waitForPlugin: () => Promise<unknown>;
+}
+
+/** Bounds one step by its own cap, never past the shared deadline. */
+function withinStepBound<T>(
+  deadline: RecoveryDeadline,
+  capMs: number,
+  step: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withinRecoveryDeadline(
+    startRecoveryDeadline(Math.min(capMs, deadline.remainingMs())),
+    step,
+    operation,
+  );
+}
+
+/**
+ * The new session after a relaunch. A fresh WebKitGTK webview can hang the first script it gets,
+ * so a trivial probe must answer (each try 5 s, all tries 30 s) before any other script; the mock
+ * restore then has 10 s. Every bound is also cut to the shared deadline.
+ */
+export async function prepareRelaunchedDesktopUiSession(
+  steps: RelaunchedSessionSteps,
+  deadline: RecoveryDeadline,
+): Promise<void> {
+  await withinRecoveryDeadline(deadline, "reloadSession", steps.reloadSession);
+  const answerCapMs = Math.min(30_000, deadline.remainingMs());
+  await withinRecoveryDeadline(deadline, "webview answer", async () => {
+    const started = Date.now();
+    for (;;) {
+      const leftMs = answerCapMs - (Date.now() - started);
+      let failure: unknown;
+      try {
+        await withinRecoveryDeadline(
+          startRecoveryDeadline(Math.min(5_000, Math.max(0, leftMs))),
+          "webview probe",
+          steps.probe,
+        );
+        return;
+      } catch (error) {
+        failure = error;
+      }
+      if (Date.now() - started + 250 >= answerCapMs) {
+        throw new Error(
+          `The relaunched webview did not answer a trivial script within ${answerCapMs} ms: ${String(failure)}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
   });
   // Drop the old app's mocks, or every later mock call retries them against the new app.
-  await withinRecoveryDeadline(deadline, "mock restore", () => browser.tauri.restoreAllMocks());
-  await withinRecoveryDeadline(deadline, "plugin wait", () =>
-    browser.waitUntil(
-      () =>
-        browser.execute(() => {
-          const host = window as Window & { readonly wdioTauri?: { readonly execute?: unknown } };
-          return typeof host.wdioTauri?.execute === "function";
-        }),
-      {
-        timeout: Math.min(20_000, deadline.remainingMs()),
-        timeoutMsg: "The relaunched app's Tauri WebDriver plugin did not initialize.",
-      },
-    ),
-  );
+  await withinStepBound(deadline, 10_000, "mock restore", steps.restoreMocks);
+  await withinRecoveryDeadline(deadline, "plugin wait", steps.waitForPlugin);
 }
 
 /** Ends an app this helper relaunched, if it still runs: only a process this helper started. */
@@ -411,16 +477,25 @@ export async function recoverDeadDesktopUiWebview(
 }
 
 /**
- * Failure evidence from a webview that may have died: a dead-webview error costs only the
- * evidence, so the failing test's own error stands and later tests still reach their probe.
+ * Failure evidence from a webview that may have died. When collecting it fails, one trivial
+ * probe (5 s) decides: a webview that fails or misses the probe is dead, and the evidence is
+ * dropped whatever the error said; a webview that answers keeps the error, which is then a
+ * harness fault. Mocha recorded the test's own failure before `afterTest`, so this can only drop
+ * evidence, never an assertion. Throwing here would skip the worker's remaining tests.
  */
 export async function tolerateDeadDesktopUiWebview<T>(
   operation: () => Promise<T>,
+  probe: () => Promise<unknown> = () => browser.execute(() => true),
 ): Promise<T | undefined> {
   try {
     return await operation();
   } catch (error) {
     if (isDeadDesktopUiWebviewError(error)) return undefined;
+    try {
+      await withinRecoveryDeadline(startRecoveryDeadline(5_000), "evidence probe", probe);
+    } catch {
+      return undefined;
+    }
     throw error;
   }
 }

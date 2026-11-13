@@ -12,6 +12,7 @@ import {
   dispatchDesktopUiApplicationExit,
   isDeadDesktopUiWebviewError,
   isFinalDesktopUiSpec,
+  prepareRelaunchedDesktopUiSession,
   recoverDeadDesktopUiWebview,
   startRecoveryDeadline,
   tolerateDeadDesktopUiWebview,
@@ -224,14 +225,108 @@ describe("recovery deadline", () => {
 });
 
 describe("tolerateDeadDesktopUiWebview", () => {
-  it("failure evidence tolerates a dead webview", async () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const live = async () => true;
+  const deadProbe = () => Promise.reject(new Error("Unsupported result type"));
+
+  it("returns the evidence a live webview gives", async () => {
+    await expect(tolerateDeadDesktopUiWebview(async () => 7, live)).resolves.toBe(7);
+  });
+
+  it("drops any evidence error once a probe finds the webview dead", async () => {
+    // The WebKitGTK screenshot text after a web process crash (Linux lab, 2026-11-13).
+    const probe = vi.fn(deadProbe);
     await expect(
-      tolerateDeadDesktopUiWebview(() => Promise.reject(new Error("Unsupported result type"))),
+      tolerateDeadDesktopUiWebview(
+        () => Promise.reject(new Error("There was an error creating the snapshot")),
+        probe,
+      ),
     ).resolves.toBeUndefined();
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an evidence error a live webview cannot explain", async () => {
     await expect(
-      tolerateDeadDesktopUiWebview(() => Promise.reject(new Error("boom"))),
+      tolerateDeadDesktopUiWebview(() => Promise.reject(new Error("boom")), live),
     ).rejects.toThrow("boom");
-    await expect(tolerateDeadDesktopUiWebview(async () => 7)).resolves.toBe(7);
+  });
+
+  it("treats a probe that never answers as a dead webview within its bound", async () => {
+    const evidence = tolerateDeadDesktopUiWebview(
+      () => Promise.reject(new Error("There was an error creating the snapshot")),
+      () => new Promise(() => undefined),
+    );
+    const outcome = expect(evidence).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await outcome;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("prepareRelaunchedDesktopUiSession", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const session = (order: string[]) => ({
+    reloadSession: vi.fn(async () => void order.push("reload")),
+    probe: vi.fn(async () => void order.push("probe")),
+    restoreMocks: vi.fn(async () => void order.push("restore")),
+    waitForPlugin: vi.fn(async () => void order.push("plugin")),
+  });
+
+  it("waits for the new webview to answer before restoring the mocks", async () => {
+    const order: string[] = [];
+    const steps = session(order);
+    let attempts = 0;
+    steps.probe.mockImplementation(async () => {
+      order.push("probe");
+      attempts += 1;
+      if (attempts < 3) throw new Error("Unsupported result type");
+    });
+    const prepared = prepareRelaunchedDesktopUiSession(steps, startRecoveryDeadline());
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(prepared).resolves.toBeUndefined();
+    expect(order).toEqual(["reload", "probe", "probe", "probe", "restore", "plugin"]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a webview that never answers fails within its bound and restores nothing", async () => {
+    const order: string[] = [];
+    const steps = session(order);
+    steps.probe.mockImplementation(() => new Promise(() => undefined));
+    const prepared = prepareRelaunchedDesktopUiSession(steps, startRecoveryDeadline());
+    const outcome = expect(prepared).rejects.toThrow(
+      "The relaunched webview did not answer a trivial script within 30000 ms",
+    );
+    await vi.advanceTimersByTimeAsync(31_000);
+    await outcome;
+    expect(steps.restoreMocks).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a mock restore that hangs becomes a clear error inside the deadline", async () => {
+    const steps = session([]);
+    steps.restoreMocks.mockImplementation(() => new Promise(() => undefined));
+    const deadline = startRecoveryDeadline();
+    const prepared = prepareRelaunchedDesktopUiSession(steps, deadline);
+    const outcome = expect(prepared).rejects.toThrow(
+      "The webview recovery ran out of its 10000 ms during mock restore.",
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await outcome;
+    expect(deadline.remainingMs()).toBeGreaterThan(0);
+    expect(steps.waitForPlugin).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
