@@ -129,7 +129,7 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     fs::remove_dir(&other_orphan).expect("remove one orphan");
     scan_once(&sources, &processes).await;
     let next = runtime.status()["findings"].as_array().unwrap().clone();
-    assert_eq!(next.len(), 2);
+    assert_eq!(next.len(), 2, "{:?}", finding_kinds(&runtime));
     for finding in next {
         let expected = if finding["id"] == remaining_id { 3 } else { 2 };
         assert_eq!(
@@ -220,7 +220,8 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     assert_eq!(
         removal_failures(&runtime),
         2,
-        "a drain timeout is its own finding"
+        "a drain timeout is its own finding: {:?}",
+        removal_failure_summaries(&runtime)
     );
 
     // A client that interrupts the removal once the server-owned operation is waiting for
@@ -269,7 +270,8 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     assert_eq!(
         removal_failures(&runtime),
         2,
-        "an interrupted removal is not a finding"
+        "an interrupted removal is not a finding: {:?}",
+        removal_failure_summaries(&runtime)
     );
     // An exact retry replays the accepted result: not a new outcome.
     request(
@@ -532,6 +534,26 @@ fn removal_failures(runtime: &ProfilerRuntime) -> usize {
         .iter()
         .filter(|kind| *kind == "worktree.removal-failed")
         .count()
+}
+
+/// Each `worktree.removal-failed` finding as `id severity count: summary`. The summary names
+/// the mode and the reason token (or `admission-drain-timeout`), never a path.
+fn removal_failure_summaries(runtime: &ProfilerRuntime) -> Vec<String> {
+    runtime.status()["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|finding| finding["kind"] == "worktree.removal-failed")
+        .map(|finding| {
+            format!(
+                "{} {} x{}: {}",
+                finding["id"].as_str().unwrap_or_default(),
+                finding["severity"].as_str().unwrap_or_default(),
+                finding["count"],
+                finding["summary"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 fn finding_kinds(runtime: &ProfilerRuntime) -> Vec<String> {
