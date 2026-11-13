@@ -9633,6 +9633,50 @@ describe("TerminalViewport shared by windows on two machines (#348)", () => {
       expect(view(owner)).toMatchObject({ grid: "121x26", owner: "this window" });
     });
 
+    it(
+      "sends only the final size after a re-attach, a font-metrics change and an Activity dock change (re-attach transient)",
+      { timeout: 30_000 },
+      async () => {
+        // R16 (#348), decided by this test. The dock is not mounted here; its only effect on
+        // sizing is a shorter mount, which `resizeMount` gives.
+        const fonts = stubDocumentFonts();
+        setTerminalSizeDiagnosticsEnabled(true);
+        clearTerminalSizeDiagnostics();
+        try {
+          hasFocus.mockReturnValue(true);
+          const owner = await openWindow(CLIENT, { cols: 85, rows: 30 });
+          await resizeMount(owner, { width: 600, height: 430 }, { cols: 85, rows: 30 });
+          await settle();
+          const before = claimsOf(owner).length;
+          const recordsBefore = readTerminalSizeDiagnostics().length;
+
+          // The font's new metrics fit more rows in the same box, then the dock opens.
+          owner.fit = { cols: 85, rows: 33 };
+          await act(async () => fonts.dispatchEvent(new Event("loadingdone")));
+          await flushAnimationFrames();
+          await resizeMount(owner, { width: 600, height: 400 }, { cols: 85, rows: 30 });
+          await settle();
+          await settle();
+
+          const claims = claimsOf(owner).slice(before);
+          const requested = readTerminalSizeDiagnostics()
+            .slice(recordsBefore)
+            .flatMap((record) =>
+              record.request?.outcome === "pending"
+                ? [`${record.request.cols}x${record.request.rows}`]
+                : [],
+            );
+          const rows = claims.map((claim) => Number(claim.split("x")[1]));
+          const reverted = rows.some((row, index) => index > 0 && row !== rows[index - 1]);
+          expect(reverted, JSON.stringify(claims)).toBe(false);
+          if (claims.length > 0) expect(claims.at(-1)).toBe("85x30");
+          expect(requested).toEqual(claims);
+        } finally {
+          setTerminalSizeDiagnosticsEnabled(false);
+        }
+      },
+    );
+
     it("does not claim a 4 px mount whose stream attaches before its size first changes", async () => {
       hasFocus.mockReturnValue(true);
       nextMountSize = { width: 4, height: 400 };
