@@ -1,7 +1,7 @@
 # Progress: Issue batch #348 and #351 to #358
 
 Plan: plan.md
-Spec: spec.md (sha256 793abc187c7f)
+Spec: spec.md (sha256 02f0c0379dd2)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6.1-sol (effort high), round 2, needs rework; all 13 findings fixed without a third round, see reviews/plan-review-2.md
 Executor: inline
@@ -112,3 +112,4 @@ Branch: claude/open-issues-pr-dc3c33
 - 2026-11-13 14:25 Ruling (user): "we should not have this, tailscale is not managed from Bibcode", about the "Tailscale HTTPS" row in Share this host. Spec R55 and D19 added; Task 11.4 added. Reading Tailscale's addresses stays (agent's reading, to confirm).
 - 2026-11-13 14:19 Codex's final pass on the elevation fix: both security blockers fixed; five P2 findings (the port fix changed a Tailscale HTTPS port; a second check rejected a non-ASCII read-back; prompt ownership released on timeout; a declined second prompt leaves the old rule removed; one discard path in the collector). The collector one is deliberate and now documented (46955bbaf); the four others are in progress in lane 11.
 - 2026-11-13 14:26 Ruling (user): "agreed put it with 361": Task 11.4 is part of #361, and reading Tailscale's addresses read-only stays.
+- 2026-11-13 14:29 #361 final-pass fixes (lane 11, 329877d23), integrated: an externally served address keeps its port; both firewall checks share one identity rule and the check runs under the lock before the restart; prompt ownership lasts until the Windows call returns (`firewall-prompt-open`); a declined add after an approved delete is reported as `firewall-rule-removed-not-added`. Evidence: `cargo test -p bibcode-desktop` 546 passed, web 319 passed, fmt, Clippy, typecheck clean. Nine order tests in `server_exposure` were rewritten on purpose. Windows-only code still uncompiled.

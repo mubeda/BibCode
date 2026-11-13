@@ -364,6 +364,8 @@ Rollback to local-only on any failed switch, fail-closed firewall cleanup, no au
 
 - Changed by D18, on Windows without administrator rights only: when turning sharing off finds the rule and Windows refuses to delete it for lack of permission, that is reported (`firewall-rule-left`) and tolerated. The listener SHALL still be verified local-only; any other failure to delete stays a failed safeguard. The prompt appears only when the person chooses Generate pairing offer, Retry or Resume legacy remote access in Share this host; automatic widening, narrowing and recovery never prompt. It comes before any restart, so a refusal changes nothing. Only Windows' own firewall command runs with administrator rights: it is started directly by its full path from the Windows system directory, with no script, and the program path is passed as one quoted argument.
 - An existing rule for the same program is kept on the next widening, with no prompt. A changed program path is replaced with two prompts, one to remove the old rule and one to add the new one.
+- If the person approves removing a rule that names another program path but declines adding the new one, the old rule stays removed and is not restored, exposure stays local-only, and the dialog says the old rule was removed and the new one was not added, with Retry.
+- While a permission prompt is still open, a second one is not raised; the dialog says to answer or close the open prompt first.
 - A prompt that is declined, dismissed or left unanswered is a refusal. A late approval can leave a rule; the docs say how to remove it by hand.
 
 ### R55. BiBCode does not manage Tailscale
