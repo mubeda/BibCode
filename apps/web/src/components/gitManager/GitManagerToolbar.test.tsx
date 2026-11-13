@@ -244,6 +244,8 @@ beforeEach(() => {
     return { cancel: vi.fn(), result: Promise.resolve({ _tag: "Success", value: event }) };
   });
   useGitManagerStore.setState({ byProjectKey: {} });
+  // The branch list renders only while its picker is open (#360); these cases click its rows.
+  useGitManagerStore.getState().setOpenDropdown(currentProject, "branch");
 });
 
 describe("GitManagerToolbar", () => {
@@ -347,6 +349,55 @@ describe("GitManagerToolbar", () => {
       }
     },
   );
+
+  it("sends one checkout and one fetch when a branch is chosen and then fetched (#360)", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const click = async (text: string) => {
+      const button = [...document.querySelectorAll("button")].find((entry) =>
+        entry.textContent?.includes(text),
+      );
+      expect(button).toBeDefined();
+      await act(async () => button!.click());
+    };
+    try {
+      await act(async () =>
+        root.render(
+          <GitManagerToolbar
+            projectRef={currentProject}
+            mainCheckoutCwd="/opaque/main"
+            selectedWorktreeCwd="/opaque/main"
+            worktrees={worktrees}
+            catalogPending={false}
+            catalogError={null}
+            repositoryUnavailable={null}
+            branchSyncDisabledReason={null}
+            stashMergeDisabledReason={null}
+            tagDisabledReason={null}
+            onSelectedWorktreeChange={() => undefined}
+          />,
+        ),
+      );
+      await click("origin/develop");
+      // Choosing the branch closes the picker; its rows are gone until it opens again.
+      expect(
+        useGitManagerStore.getState().selectToolbarViewState(currentProject).openDropdown,
+      ).toBe(null);
+      await click("Fetch origin");
+
+      expect(h.runOperation.mock.calls.map((call) => call[1].input._tag)).toEqual([
+        "branch-checkout",
+        "fetch",
+      ]);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
 
   it.each([
     [

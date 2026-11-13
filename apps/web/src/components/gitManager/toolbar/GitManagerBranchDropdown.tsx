@@ -447,11 +447,10 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
     ],
   );
 
+  const open = triggerDisabledReason === null && openDropdown === "branch";
+
   return (
-    <Popover
-      open={triggerDisabledReason === null && openDropdown === "branch"}
-      onOpenChange={handleOpenChange}
-    >
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         aria-describedby={
           triggerDisabledReason === null ? undefined : "git-manager-branch-trigger-reason"
@@ -492,6 +491,9 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
         <div aria-label="Branches">
           {listItems.length === 0 ? (
             <p className="p-4 text-center text-xs text-muted-foreground">No branches found.</p>
+          ) : !open ? (
+            // The closed popup stays mounted; a list in it would measure hidden rows (#360).
+            <div style={BRANCH_LIST_STYLE} />
           ) : (
             <LegendList<BranchListItem>
               data={listItems}
