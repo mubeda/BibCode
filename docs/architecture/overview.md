@@ -3843,6 +3843,16 @@ view), or free scrolling.
   and no later scroll applies it; it also releases the anchor a recent data
   change locked, which was recorded before that adjustment and would apply it
   a second time. A held request therefore never moves a reader who took over.
+- **Hidden lists.** A list under a hidden or detached ancestor measures every
+  row 0 by 0. LegendList's resize path already ignores that rectangle; the
+  patch adds the same skip to its layout-effect measurement
+  (`measureContainersInLayoutEffect`) and to the frame that confirms a row's
+  shrink, in both bundles. Taken as a size, each zero row admitted more rows
+  into a hidden list until React stopped at its nested-update limit (#360), as
+  the branch and model pickers did inside their kept-mounted popovers. A row
+  that really shrinks while visible is still taken. The Git Manager branch
+  picker also unmounts its list once its popover has finished closing
+  (`onOpenChangeComplete`).
 - **Bottom region.** LegendList keeps the list at its end
   (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
   is anchored (`resolveTimelineMaintainScrollAtEnd`). LegendList also scrolls
