@@ -7,6 +7,7 @@
 - Each environment has a Host dashboard (the environment card's menu, Settings > Remote Servers, and the status bar's Resource Manager) with its host's CPU, memory and volumes, live and since the server started. It lists the volumes it hides and why, shows per-volume statistics, never reads network volumes, and says when the volume list is not answering. Agents can read the same figures with the `host_metrics` MCP tool. (#292)
 - The Host dashboard on Linux no longer lists another running BiBCode AppImage's mount, or one a killed instance left behind, as a full read-only volume. (#353)
 - A refused pairing offer or pairing credential is now logged as a warning with a fixed reason, so a pairing that fails shows in the server log; the log never holds the offered link or the credential. (#358)
+- With the Profiler on, an error that the "Something went wrong" screen catches is recorded as a `client.render-error` event and grouped in one finding. It holds the error's type, React's error number, component names and the route pattern, never the error's message. (#360)
 
 ### Pipelines
 
@@ -28,6 +29,7 @@
 
 - A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. A chat whose provider is disabled or removed now says so above the composer and keeps Send unavailable, and **Add as project** in Files opens the new Main on your Default Agent instead of Codex. (#347)
 - Expanding a reasoning row in the chat no longer scrolls the list to its end on Windows. (#351)
+- The app no longer falls to the "Something went wrong" screen (React error 185) when a closed branch picker in Git Manager, or a closed model picker, receives a new list, as happened after a branch switch and a fetch in a repository with thousands of branches. (#360)
 - The model picker opens with an empty search every time, instead of the text from the last time it was open. (#358)
 
 ### Files
@@ -40,6 +42,7 @@
 - A PDF preview in the Files panel is no longer blocked by the page's content security policy in Chromium-based webviews and browsers: the Windows desktop app, and browser mode in Chrome or Edge.
 - A read-only rendered Markdown file (large files, and files the editor cannot change safely) now loads its relative images from the project, as the editable view does. (#358)
 - After you allow an update to install, the Files block survives a reload of the window and covers a Files source opened during the install, and the "Installing an update" dialog has **Check again**, which asks the desktop whether the install is still running. (#357)
+- While an update you allowed is installing, the remote-update notice's **Manage devices** action is switched off and says it is available when the update finishes, instead of opening Settings underneath the dialog. (#357)
 
 ### Appearance
 
