@@ -489,6 +489,15 @@ const REMOVAL_MARKERS: [&str; 2] = [".bibcode-removal-identity", ".bibcode-remov
 
 /// The first kind of evidence `dir` has: the database's first, then one `stat` or one small
 /// read per marker at its root. Nothing below the root is read.
+///
+/// shortcut: a creation record has no folder identity, so it can outlive its worktree when
+/// another folder takes the same path, and that folder is then reported with `CreationRecord`
+/// evidence; upgrade only if that warning proves noisy, by storing an identity at creation (a
+/// schema change, D10).
+///
+/// shortcut: a worktree whose record write never happened (a crash between Git's success and
+/// the write) has no record; it is still recognized by its `.git` pointer file
+/// (`GitPointerFile`).
 fn worktree_evidence(
     dir: &Path,
     recorded: &HashSet<PathBuf>,
@@ -512,6 +521,11 @@ fn worktree_evidence(
 /// A regular file, not a link, that starts with `gitdir:` as a worktree's `.git` file does.
 /// The open neither follows a link nor waits on a FIFO, and the opened file is the one checked,
 /// so a `.git` swapped after the folder was listed cannot block or redirect the audit.
+///
+/// shortcut: the file is opened first and checked through the opened handle, so there is no
+/// check-then-open gap, but `O_NOFOLLOW` and `FILE_FLAG_OPEN_REPARSE_POINT` protect only the
+/// last path component: a swapped parent directory is not contained. Upgrade by reading
+/// through `workspace/beneath.rs` `Dir` if the audit ever stops being advisory (D10).
 fn opens_as_git_pointer_file(path: &Path) -> bool {
     use std::io::Read;
 
