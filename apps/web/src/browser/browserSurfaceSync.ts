@@ -1,6 +1,6 @@
 import type { DesktopPreviewBridge } from "@bibcode/contracts";
 
-import { useBrowserSurfaceStore } from "./browserSurfaceStore";
+import { isBrowserSurfaceOccluded, useBrowserSurfaceStore } from "./browserSurfaceStore";
 
 interface SyncedPresentation {
   readonly x: number;
@@ -83,7 +83,6 @@ export function startBrowserSurfaceSync(
   };
 
   const push = (state: ReturnType<typeof useBrowserSurfaceStore.getState>) => {
-    const occluded = state.occlusionOwners.size > 0;
     for (const [tabId, presentation] of Object.entries(state.byTabId)) {
       if (!presentation.rect) continue;
       const next: SyncedPresentation = {
@@ -91,7 +90,9 @@ export function startBrowserSurfaceSync(
         y: presentation.rect.y,
         width: presentation.rect.width,
         height: presentation.rect.height,
-        visible: presentation.visible && !occluded,
+        visible:
+          presentation.visible &&
+          !isBrowserSurfaceOccluded(presentation.rect, state.occlusionOwners),
       };
       schedule(tabId, next);
     }
