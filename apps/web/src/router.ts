@@ -11,11 +11,13 @@ export function getRouter(history: RouterHistory) {
     // Only the root route has an error component (the "Something went wrong." screen), so
     // this runs once for each error it catches. The route id is the pattern, never the path.
     defaultOnCatch: (error, errorInfo) => {
-      clientCollector.recordRenderError(
-        error,
-        errorInfo.componentStack,
-        () => router.state.matches.at(-1)?.routeId,
-      );
+      clientCollector.recordRenderError(error, errorInfo.componentStack, () => {
+        const routeId = router.state.matches.at(-1)?.routeId;
+        // Only one of the app's own route ids, never anything taken from the location.
+        return routeId !== undefined && Object.hasOwn(router.routesById, routeId)
+          ? routeId
+          : undefined;
+      });
     },
   });
   return router;

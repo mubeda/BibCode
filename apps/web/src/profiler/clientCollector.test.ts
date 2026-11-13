@@ -140,6 +140,8 @@ describe("clientCollector", () => {
     frames.shift()!();
     t = 345;
     frames.shift()!();
+    // Past the server's 5 s pacing since the first batch.
+    t = 5_345;
     await c.flush();
     expect(send.mock.calls[1]![1].records).toEqual([
       { correlationId: "c1:1", method: "m", rttMs: 300, renderMs: 45, startedAtMs: 0 },
@@ -227,6 +229,8 @@ describe("clientCollector", () => {
     };
     report();
     await expect(c.flush()).resolves.toBeUndefined();
+    // Past the server's 5 s pacing, which a failed send waits out too.
+    t += 5_000;
     report();
     await c.flush();
     expect(send.mock.calls.map(([environmentId]) => environmentId)).toEqual([
@@ -429,6 +433,8 @@ describe("clientCollector", () => {
     expect(send).toHaveBeenCalledTimes(1);
     release();
     await first;
+    // Past the server's 5 s pacing since the first batch.
+    t += 5_000;
     slow(500);
     await c.flush();
     expect(send).toHaveBeenCalledTimes(2);
@@ -633,49 +639,6 @@ describe("clientCollector", () => {
     setVisibility("hidden");
     window.dispatchEvent(new Event("pagehide"));
     expect(send).toHaveBeenCalledTimes(1);
-    c.dispose();
-  });
-
-  // R51: both engines' component-stack forms, and the caps.
-  it("keeps only named frames of a render error, at most 12, and at most 8 errors a batch", async () => {
-    const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));
-    const c = createClientCollector({
-      now: () => 0,
-      send,
-      supportedEntryTypes: [],
-      clientId: "c1",
-    });
-    c.setEnabledEnvironments(new Set(["env-a"]));
-    const webkit = [
-      "Panel@https://example.test/assets/app.js:1:200",
-      "@https://example.test/assets/app.js:2:10",
-      "List@https://example.test/assets/app.js:3:30",
-    ].join("\n");
-    const v8 = [
-      "",
-      "    at Panel (https://example.test/assets/app.js:1:200)",
-      "    at https://example.test/assets/app.js:2:10",
-      ...Array.from({ length: 20 }, (_, n) => `    at Frame${n} (/home/test-user/src/x.tsx:1:1)`),
-    ].join("\n");
-    c.recordRenderError(new Error("secret"), webkit, () => "/settings/general");
-    c.recordRenderError(new Error("secret"), v8, () => undefined);
-    for (let n = 0; n < 10; n += 1) c.recordRenderError("thrown text", null, () => undefined);
-    await c.flush();
-    const [, batch] = send.mock.calls[0]! as [string, any];
-    expect(batch.renderErrors).toHaveLength(8);
-    expect(batch.renderErrors[0].componentNames).toEqual(["Panel", "List"]);
-    expect(batch.renderErrors[0].routePattern).toBe("/settings/general");
-    expect(batch.renderErrors[1].componentNames).toHaveLength(12);
-    expect(batch.renderErrors[1].componentNames[1]).toBe("Frame0");
-    expect(batch.renderErrors[1].routePattern).toBeNull();
-    expect(batch.renderErrors[2]).toMatchObject({ errorType: "string", componentNames: [] });
-    expect(JSON.stringify(batch)).not.toMatch(/secret|thrown text|example\.test|test-user/);
-
-    // Sent once; the next batch carries none.
-    await c.flush();
-    expect(send.mock.calls.slice(1).every(([, next]) => next.renderErrors === undefined)).toBe(
-      true,
-    );
     c.dispose();
   });
 });

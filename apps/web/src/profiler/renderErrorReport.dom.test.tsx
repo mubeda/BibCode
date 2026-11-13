@@ -187,8 +187,10 @@ describe("a render error the error screen caught", () => {
     act(() => root.unmount());
     root = createRoot(container);
     message = "another secret";
+    // The second batch comes after the server's 5 s pacing.
+    const realNow = performance.now.bind(performance);
+    vi.spyOn(performance, "now").mockImplementation(() => realNow() + 6_000);
     await showErrorScreen();
-    // The first flush reset the window; the second batch carries the second record.
     await clientCollector.flush();
 
     const records = renderErrors() as Array<Record<string, unknown>>;
