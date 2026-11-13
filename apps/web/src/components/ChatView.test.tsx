@@ -5519,11 +5519,19 @@ describe("ChatView handlers (captured from mocked children)", () => {
   // not a scroll, so the turn's end comes back into view. A press on the list itself, such as
   // its scrollbar, is still the reader taking over.
   it.each([
-    { pressed: "a Thinking row's toggle", onControl: true, revealsEnd: true },
-    { pressed: "the list itself", onControl: false, revealsEnd: false },
+    { pressed: "a Thinking row's toggle", onControl: true, newestInGroup: true, revealsEnd: true },
+    { pressed: "the list itself", onControl: false, newestInGroup: true, revealsEnd: false },
+    // R12 scroll path (#351): thought A of a work row grouping [A, tool B, thought C] is not
+    // the newest step, although no later list row exists, so it keeps its place.
+    {
+      pressed: "a Thinking row's toggle with a later step in its row",
+      onControl: true,
+      newestInGroup: false,
+      revealsEnd: false,
+    },
   ])(
     "a pointer press on $pressed before a toggle at an anchored turn's end",
-    async ({ onControl, revealsEnd }) => {
+    async ({ onControl, newestInGroup, revealsEnd }) => {
       vi.unstubAllGlobals();
       Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
       seedConnectedServerThread();
@@ -5589,7 +5597,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
           new PointerEvent("pointerdown", { bubbles: true }),
         );
         // The turn ends in view; the toggle then opens a trace that pushes its end below.
-        (timeline["onReasoningRowToggle"] as () => void)();
+        (timeline["onReasoningRowToggle"] as (newestInGroup: boolean) => void)(newestInGroup);
         geometry.lastRowHeight = 3000;
         await nextFrames(3);
 
@@ -5609,7 +5617,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
   // wheel or touch), toggled it, and a streamed entry about 150 ms later ran the live follow,
   // which revealed the anchored turn's end from scroll 0 (1014 px) because the move away from
   // the end had been ignored as not the reader's own.
-  it.fails("R12 scroll path: a streamed entry after a programmatic scroll away from an anchored turn's end keeps the reader's place", async () => {
+  it("R12 scroll path: a streamed entry after a programmatic scroll away from an anchored turn's end keeps the reader's place", async () => {
     vi.unstubAllGlobals();
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
     const thread = makeThread();
@@ -5677,15 +5685,19 @@ describe("ChatView handlers (captured from mocked children)", () => {
       // The sent row's glide runs out and the row settles, as it had long before the toggle.
       await nextFrames(70);
 
-      // scrollIntoView({ block: "center" }) moves the list to 0; LegendList reports it.
-      geometry.scroll = 0;
+      // At the turn's end, LegendList reports it; scrollIntoView({ block: "center" }) then
+      // moves the list to 0 and it reports that too.
       timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      geometry.scroll = 796;
+      await act(async () => (timeline["onIsAtEndChange"] as (isAtEnd: boolean) => void)(true));
+      geometry.scroll = 0;
       await act(async () => (timeline["onIsAtEndChange"] as (isAtEnd: boolean) => void)(false));
       list.scrollToOffset.mockClear();
       list.scrollToEnd.mockClear();
       list.scrollToIndex.mockClear();
 
-      (timeline["onReasoningRowToggle"] as () => void)();
+      // The trace's thought was the only one in its work row.
+      (timeline["onReasoningRowToggle"] as (newestInGroup: boolean) => void)(true);
       geometry.turnHeight += 234;
       // The thought is still streaming: its next delivery is a new timeline entry.
       seedServerThread({

@@ -2987,11 +2987,13 @@ describe("MessagesTimeline thinking rows", () => {
       streaming?: boolean;
       turnId?: ReturnType<typeof TurnId.make> | null;
       createdAt?: string;
+      id?: string;
     } = {},
   ) {
     const createdAt = options.createdAt ?? MESSAGE_CREATED_AT;
+    const id = options.id ?? REASONING_ID;
     const reasoning = {
-      id: REASONING_ID,
+      id,
       turnId: options.turnId === undefined ? null : options.turnId,
       text,
       streaming: options.streaming ?? false,
@@ -2999,11 +3001,11 @@ describe("MessagesTimeline thinking rows", () => {
       updatedAt: createdAt,
     };
     return {
-      id: REASONING_ID,
+      id,
       kind: "work" as const,
       createdAt,
       entry: {
-        id: REASONING_ID,
+        id,
         createdAt,
         turnId: reasoning.turnId,
         label: reasoning.streaming ? "Thinking" : "Thought",
@@ -3048,6 +3050,33 @@ describe("MessagesTimeline thinking rows", () => {
     expect(header(container)?.getAttribute("aria-expanded")).toBe("false");
     expect(trace(container)).toBeNull();
     expect(onReasoningRowToggle).toHaveBeenCalledTimes(2);
+  });
+
+  // R12 scroll path (#351): of a work group [thought A, tool B, thought C], only C is the
+  // newest step, so only its toggle may ask for the end reveal.
+  it("tells the toggle whether a later work step follows the thought", async () => {
+    const onReasoningRowToggle = vi.fn();
+    const container = await mountTimeline({
+      onReasoningRowToggle,
+      timelineEntries: [
+        buildReasoningTimelineEntry("Thought A about the parser.", { id: "reasoning:a" }),
+        buildWorkTimelineEntry("entry-tool-b", { command: "npm run build" }),
+        buildReasoningTimelineEntry("Thought C about the fix.", { id: "reasoning:c" }),
+      ],
+    });
+    const headerOf = (id: string) =>
+      container.querySelector<HTMLButtonElement>(`[data-reasoning-id="${id}"] button`);
+    // Open the earlier steps, as the packaged spec does before it toggles a thought.
+    await click(
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+        button.textContent?.includes("previous step"),
+      )!,
+    );
+
+    await click(headerOf("reasoning:a")!);
+    await click(headerOf("reasoning:c")!);
+
+    expect(onReasoningRowToggle.mock.calls).toEqual([[false], [true]]);
   });
 
   it("keeps a thought the reader opened after its row remounts", async () => {

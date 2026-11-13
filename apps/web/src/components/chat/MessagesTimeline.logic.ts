@@ -1297,3 +1297,21 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     }
   }
 }
+
+/**
+ * Whether `entryId` is the last work step in the timeline: a thought toggled there sits at the
+ * turn's end, while one with a later tool call or thought does not, although each step of a
+ * work group is its own list row (#351).
+ */
+export function isNewestWorkEntry(
+  rows: ReadonlyArray<MessagesTimelineRow>,
+  entryId: string,
+): boolean {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.kind === "work") {
+      return row.groupedEntries.at(-1)?.id === entryId;
+    }
+  }
+  return false;
+}
