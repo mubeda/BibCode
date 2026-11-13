@@ -64,7 +64,7 @@ Names used throughout:
 - D15. During a remote update install, "Manage devices" is disabled with a one-line reason instead of being shown above the installing dialog (R39). An earlier DOM test had passed while the action only navigated under the dialog; the branch review caught it. Decided by: agent's call, to confirm with the user.
 - D16. #360 is added to this pull request. Decided by: user, 2026-11-13. Its suggested follow-up (a profiler event for errors the app's error screen catches) is part of #360 here as R51 ("follow-up, do it as part of 360", user, 2026-11-13).
 - D17. #361 is added to this pull request. Decided by: user, 2026-11-13.
-- D18. For the Windows firewall rule (R53): ask through Windows' own elevation prompt for that one command, and fall back to a message with Retry. Alternatives from the issue: a rule created by the installer (needs an installer design and does not help existing installs until they reinstall); a message only (leaves the person to find an administrator terminal). Decided by: agent's call, to confirm with the user; it is built only if Task 11.2 confirms the cause.
+- D18. For the Windows firewall rule (R53): BiBCode asks through Windows' own permission prompt when a person generates a code. Decided by: user, 2026-11-13 ("Windows permission prompt"), after being told the cost: without administrator rights the rule cannot be removed later, so it stays after sharing is turned off while the listener goes back to local-only, and a test cannot click the prompt. The other options were a message only, and a rule created by the installer.
 
 ## Requirements
 
@@ -360,6 +360,10 @@ WHEN a code is generated on Windows and the firewall rule cannot be created for 
 ### R54. The safety guarantees stay
 
 Rollback to local-only on any failed switch, fail-closed firewall cleanup, no automatic choice of a public address and the WSL-only exclusion SHALL stay as they are. A string rejection from the desktop bridge SHALL keep a sanitized reason instead of "Could not enable remote access."
+
+- Changed by D18, on Windows without administrator rights only: when turning sharing off finds the rule and Windows refuses to delete it for lack of permission, that is reported (`firewall-rule-left`) and tolerated. The listener SHALL still be verified local-only; any other failure to delete stays a failed safeguard. The prompt appears only for a person's own Generate or Retry, never for recovery or automatic narrowing. Only the firewall command runs with administrator rights, built from fixed text and the app's own program path.
+- An existing rule for the same program is kept on the next widening, with no prompt. A changed program path is replaced with one prompt.
+- A prompt that is declined, dismissed or left unanswered is a refusal. A late approval can leave a rule; the docs say how to remove it by hand.
 
 ## Verification
 
