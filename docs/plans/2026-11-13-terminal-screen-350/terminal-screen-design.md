@@ -1,13 +1,24 @@
 # Design: server-side terminal screen state and attach checkpoints (#350)
 
-Status: **Draft for review, revision 3** (Codex and the advisor). No code is written until both approve.
+Status: **Draft for review, revision 4 (server protocol reviewed three times; D1, D9 pending the harness report; D8 settled by test)**. No code is written until Codex and the advisor approve.
 Sources:
 - GitHub issue #350: the crate spike and its 16 review findings, cited as F1 to F16; they are binding;
 - this folder's `README.md`: the facts established since revision 1;
-- `reviews/design-review-1.md` and `reviews/design-review-2.md`: the reviews, cited as R1#n and R2#n;
+- `reviews/design-review-1.md` to `reviews/design-review-3.md`: the reviews, cited as R1#n, R2#n and R3#n;
 - the current code on `main`.
 
 Every choice this document makes that the issue left open is marked **(agent's call)** and listed in section 6. The other issues' plan (`../2026-11-13-issue-batch-348-358/`) owns the client's Unicode 11 widths (its R5).
+
+## Changes since revision 3
+
+| Review finding | Where it is answered |
+|---|---|
+| R3#1: other operations consumed a pending checkpoint grant | D6, grant selection: one policy for every grant consumer, each listed |
+| R3#2: the initial snapshot outlived its permit | D6, snapshot permits: the initial snapshot is moved into its first chunk |
+| R3#3: no guard for the unary `readCheckpoint` answer | D6, snapshot permits: a response guard carried in the outbound frame |
+| R3#4: adoption lost the unchanged-terminal lag fast path | D6, step 2a |
+| R3#5: incomplete lock inventory; operation-lock claims | D6, lock order: the reviewer's full table, and the qualified claims |
+| R3 open questions: a raw carried owner; a raw answer to the winner; "exactly once" | D6, grant selection |
 
 ## Changes since revision 2
 
@@ -154,47 +165,77 @@ Held-back tail (F2): the wrapper keeps the bytes of an escape or control string 
 **One generation transition (R1#3, R2#3).** Today `accept()` lets `Restarted` past its sequence filter, resets `next_sequence` and forwards the shared event's raw snapshot (`manager.rs:4909`). Output events carry no generation, so a queued `Restarted(g2)` delivered while the session is already g3 would mix generations. `Started` is a `TerminalEvent` but not in `TerminalAttachStreamEvent` (`packages/contracts/src/terminal.ts:466`), so a client cannot decode one. A restart can also reach an attachment through lag: `recv()` sends `Lagged` to `resync()` (`manager.rs:4829`), which drains queued lifecycle events (`:4946`) and returns a new-process snapshot when the generation changed (`:4963`, `:4972`).
 
 For a checkpoint attachment, both routes call one function, `adopt_current_state(reason)`, with reason `lifecycle` (a `Restarted` or `Started` of this terminal) or `lag`. Steps and locks:
-1. Take the key's operation lock (`inner.operations.for_key`), as `resync()` does. Start (`:2269`), restart (`:2177`) and close take the same lock, so the generation cannot change while it is held.
+0. Take a snapshot permit (below) before any lock, so waiting for one never holds a lock.
+1. Take the key's operation lock (`inner.operations.for_key`), as `resync()` does. Start (`:2269`), restart (`:2177`) and a keyed close take the same lock, so they cannot change this terminal's generation while it is held. Thread-wide close (`:4130`) and shutdown (`:4549`) take no keyed operation lock: they can still remove the session, which is why steps 5 and 6 recheck it.
 2. Drain every queued event.
+2a. Fast path, kept from `resync()` (`:4968`): for reason `lag`, read the session's generation and `sequence` under a brief session lock. If the generation is the attachment's own and the sequence equals `next_sequence`, release the permit and return nothing; no heavy item is built. The existing test `a_lag_caused_by_another_terminal_does_not_resync` covers it and gains a checkpoint-format case.
 3. Read the registry (`inner.sessions.read()`) to clone the current session `Arc`, then release it. If the session is absent, deliver `closed`. Take the session lock only to clone `session.generation`, then release it.
 4. Take that generation's publication lock, with no other lock than the operation lock held.
-5. Read the registry again and check that the same session `Arc` is still registered, then release it. A mismatch can only mean removal under the operation lock: deliver `closed`.
+5. Read the registry again and check that the same session `Arc` is still registered, then release it. A mismatch means removal by a thread-wide close or shutdown: deliver `closed`.
 6. Take the session lock. Check `Arc::ptr_eq(&session.generation, &captured)`.
 7. Build the checkpoint and read `session.sequence`. If the generation differs from the attachment's last one, run the grant selection below. Set `next_sequence` and `generation`, and deliver a plain `snapshot` item (a new process) or a `resync` snapshot (the same process). Later events at or below that sequence are filtered as today.
 
 Lag resync across a process change is the same function, so the existing test `a_resync_across_a_missed_restart_is_a_new_process` (`manager.rs` tests) is extended. It must assert the checkpoint format and that the carried-over owner receives the startup queries through a missed restart. Raw-format attachments keep today's `Restarted` and `resync()` paths, and `Started` stays filtered for them as today.
 
-**Lock order.** Documented order: operation → lifecycle → publication → registry (`inner.sessions`) → session. Rules: never wait for the registry or a publication lock while holding a session lock; never wait for a publication lock while holding the registry. `adopt_current_state` holds only the operation lock while it waits for the publication lock, takes the registry only briefly, and takes the session lock last. Every existing path that takes these locks keeps this order:
+**Lock order.** Documented order: operation (O) → lifecycle (L) → publication (P) → registry (R, `inner.sessions`) → session (S). Rules: never wait for R or P while holding S; never wait for P while holding R. `adopt_current_state` holds only O while it waits for P, takes R only briefly, and takes S last. "Released" means the acquisition phases do not overlap. The inventory of existing paths (`manager.rs`), from the third review, verified against the cited lines:
 
-| Path (`manager.rs`) | Order taken |
+| Existing path | Actual order |
 |---|---|
-| `start` (`:2269`), registration (`:2833`) | operation → lifecycle → publication → registry write → session |
-| `restart_with_publication_cancellation` (`:2177`) | operation → lifecycle → publication (inside `start`) |
-| `attach_with_publication_cancellation` (`:3454`) | registry read (released) → session (brief) → publication → session |
-| `mark_center_panel` (`:2885`) | session (brief) → publication → registry read → session |
-| `finalize_process_exit` (`:3299`) | publication → registry read → session |
-| `resize_acknowledging` (`:3868`) | registry read (released) → session (brief) → publication → session |
-| `release_size_claim` (`:3998`) | publication → registry read → session |
-| `close_sessions` (`:4335`) | registry read (released) → session (brief) → publication → registry write → session |
-| `begin_worktree_removal` (`:4165`) | lifecycle → registry read → session |
-| `thread_sessions` (`:4439`), `live_session_count` (`:4475`), `live_session_pids` (`:4490`), `subscribe_metadata` (`:4506`) | registry read → session |
-| `shutdown_with_report` (`:4532`) | lifecycle → registry read (released) |
-| `resync` (`:4937`), `current_session` (`:4891`) | operation → registry read (released) → session |
+| Start/open and restart | O → R released → S released; registration O → L → P → R released → S (`:2193–2236`, `:2278–2321`, `:2777–2838`) |
+| Attach | initial L released; R released → S released → P → S; creation and restart use the paths above (`:3462–3475`, `:3484`, `:3537`, `:3556–3561`) |
+| `mark_center_panel` | S released → P → R released → S (`:2886–2895`) |
+| `finalize_process_exit` | P → R → S, then R and S released → S again (`:3306–3327`) |
+| `release_size_claim` | R released → S released → P → R released → S (`:3999–4016`) |
+| Ordered input enqueue; unary write | P → S; unary write first captures the generation under a released S (`:453–455`, `:3816–3820`) |
+| Activity and agent-status publication | P → S (`:3194–3204`, `:3276–3281`) |
+| Output, tail flush and output-gap publication | P → S (`:3389–3394`, `:3420–3424`, `:3435–3439`) |
+| Resize, kept-size correction, clear | P → S, with released R or S lookups where needed (`:3881–3890`, `:3975–3977`, `:4088–4098`) |
+| Close, `close_sessions` | optional O → L → P → R write released → S; preliminary R and S captures released before P (`:4130–4155`, `:4343–4376`) |
+| Worktree removal | L → R → S, released before close is called (`:4171–4202`) |
+| Identity capture, workspace quiescence | L → R released → S; finalization runs after L is released (`:4222–4234`, `:4254–4270`, `:4307–4314`) |
+| Thread listing, live counts and PIDs, metadata subscription | R → S (`:4440–4444`, `:4476–4480`, `:4491–4494`, `:4508–4511`) |
+| Shutdown | L → R lookup, then L → P → R write released → S through `close_sessions` (`:4549–4566`, `:4359–4376`) |
+| Existing resync | O → R released → S released → R (`:4941–4959`) |
+| Restart delivery, history read, input begin | R lookup released → S; restart delivery does **not** take O (`:4867–4869`, `:4891–4898`, `:4460–4461`, `:3688–3689`) |
 
-The listing paths hold the registry read while waiting for a session lock. A queued registry writer (start or close, which hold a publication lock) therefore waits behind them. `adopt_current_state` never holds a session lock while reading the registry, so the inversion R2#2 describes cannot form.
+No path takes these locks in reverse, and `adopt_current_state` adds none. The listing paths hold R while waiting for S, and a queued R writer waits behind them. `adopt_current_state` never holds S while reading R, so the inversion R2#2 describes cannot form.
 
-**Grant selection (one function).** Today a restart with surviving claimed streams marks the new generation's grant used (`first_attachment_grant_used = is_restart && …`, `:2847`). For a session with at least one checkpoint attachment, the restart leaves the grant unused. `adopt_current_state` then awards it, whichever route led there:
-- to the carried-over size owner's attachment;
-- with no carried-over owner, to the first checkpoint attachment to adopt the new generation, or the first claimed attach, as at first attach.
+**Grant selection (one policy for every consumer, R3#1).** The session's `first_attachment_grant_used: bool` becomes `startup_grant: StartupGrant`, with three states:
+- `Open`: unused, as today;
+- `Reserved(Option<claim>)`: pending for checkpoint delivery, optionally for one claim;
+- `Used`.
 
-The winner's checkpoint carries the re-issued startup queries (D7). Raw attachments never receive the grant through a restart, as today.
+One function, `Session::take_startup_grant(&mut self, claim: Option<&str>, delivers_handoff: bool) -> bool`, is the only writer. A consumer that delivers no startup handoff never takes a `Reserved` grant. Every place that writes the flag today goes through it:
 
-**Snapshot bytes on every path (R1#10, R2#11).** Every item that carries a snapshot is a heavy item, whatever its label: the initial response, `resync`, an adopted snapshot, and a raw `Event(Restarted)`. Today construction comes before the capacity wait (`server_terminal.rs:951`, `:966`), and the RPC pump frees channel capacity before awaiting the client's acknowledgement (`rpc/session.rs:1646`, `:1718`). So one attachment can hold three snapshots at once. New rule:
-- Before **constructing** a heavy item, the attachment takes a snapshot permit: one per attachment and at most eight per server (**agent's call**).
-- The permit travels with the chunk. `RpcStreamChunk` gains an optional drop guard, and the RPC pump drops it only after the client's acknowledgement for that chunk arrives.
+| Today (`manager.rs`) | What it does now | After the change |
+|---|---|---|
+| New session, `first_attachment_grant_used: false` (`:2753`) | Starts unused | `startup_grant = Open` |
+| Restart, `= is_restart && claims non-empty` (`:2847`) | Marks the grant used when claimed streams survive | With a surviving checkpoint attachment: `Reserved(carried owner's claim)` if that owner is a checkpoint attachment, else `Reserved(None)`. Otherwise as today: `Used` when claims survive, else `Open`. |
+| Attach, `grant = size_owner.is_none() && !used; used = true` (`:3590–3592`) | Every claimed attach consumes it, granted or not | `Open`: as today (granted only with no size owner, consumed either way). `Reserved(Some(c))`: taken only by an attach with claim `c` (a returning owner), else left reserved. `Reserved(None)`: taken by the first checkpoint attach. A raw attach never takes a reservation. |
+| Resize to a refused size, `used \|= size_owner.is_some()` (`:3925`) | A claim consumes it even when nothing changes | `Open`: as today. `Reserved`: unchanged, since no handoff is delivered. |
+| Resize applying a claim, `used \|= size_owner.is_some()` (`:3937`) | The same, for changed or unchanged sizes | The same rule as `:3925` |
+| `adopt_current_state` (new) | — | When adopting a new generation, it takes `Reserved(Some(c))` only for claim `c`, and `Reserved(None)` for the first adopter. |
+
+Open questions from R3, settled:
+- **A raw carried owner while a checkpoint mirror survives:** the reservation is `Reserved(None)`, so the first checkpoint adopter wins. The raw owner gets today's restart behaviour (no grant).
+- **The winner's answer falls back to raw (D3):** the award stands, and the raw snapshot carries `firstAttachmentGrant: true` with raw history. That is today's grant replay, which writes RIS only once and is correct for raw.
+- **"Exactly once"** means one server-side award per generation, taken before delivery as today (`:3592`, `:3655–3675`). Renderer execution is the client's once-only hand-off (D7). Two restarts queued before adoption give one handoff, for the generation adopted.
+
+The winner's checkpoint carries the re-issued startup queries (D7).
+
+**Snapshot bytes on every path (R1#10, R2#11, R3#2, R3#3).** Every item that carries a snapshot is a heavy item, whatever its label: the initial response, `resync`, an adopted snapshot, a `readCheckpoint` answer, and a raw `Event(Restarted)`. Today:
+- construction comes before the capacity wait (`server_terminal.rs:951`, `:966`);
+- the RPC pump frees channel capacity before awaiting the client's acknowledgement (`rpc/session.rs:1646`, `:1718`);
+- `TerminalAttachment` keeps `initial` for its whole life (`manager.rs:4795–4804`; `server_terminal.rs:929–942` serializes it by reference).
+
+New rules:
+- **Permit before construction.** Before building a heavy item, the attachment or the handler takes a snapshot permit: one per attachment and at most eight per server (**agent's call**). For the initial snapshot, attach takes it before `current.snapshot()`.
+- **The initial snapshot is moved, not kept.** `TerminalAttachment::initial` becomes `Option<TerminalSessionSnapshot>`. The stream takes it with `attachment.take_initial()` and serializes it by value into the first chunk, so no copy outlives the chunk.
+- **Streams: the permit rides in the frame.** `RpcStreamChunk` gains an optional guard. The pump moves it into the `RpcOutboundFrame` it queues and drops it only after the client's acknowledgement for that chunk arrives.
+- **Unary: a response guard in the outbound frame.** `RpcUnaryResult` already carries an `enqueue_guard` (`rpc/session.rs:257–279`), but that guard ends when the frame is queued, and unary requests have no acknowledgement (`:1363–1367`, `:1569–1602`, `:1960`). So `RpcUnaryResult` gains a second field, `response_guard: Option<Box<dyn Send>>`, set through a new constructor `RpcUnaryResult::held(result, guard)`. The unary dispatcher moves it into a new field of `RpcOutboundFrame` beside `_budget`. `RpcOutboundFrame::into_parts` returns it with the budget, so the writer holds it until the socket write completes, or until the frame is dropped with the connection. `terminal.readCheckpoint` returns its permit as that guard.
 - A heavy item counts its `history` length toward the batch bytes and ends its batch.
 
-So each attachment has at most one snapshot alive, as its `String` plus its JSON value, and the server at most eight. `terminal.readCheckpoint` takes a permit from the same server-wide pool for the life of its answer.
+So each attachment has at most one snapshot alive (its `String` and its JSON value), and the server at most eight, plus the raw `Event(Restarted)` clones below. One allocation stays outside the pool: tokio's broadcast clones a raw `Event(Restarted)` per receiver before any permit exists. It holds a new generation's history, which the raw history limits bound (`history.rs`); the permit is taken before it is serialized, and the clone is dropped right after. A checkpoint attachment drops it at once and adopts instead.
 
 `CHECKPOINT_MAX_BYTES = 4 MiB` (**agent's call**). Over the bound, the oldest scrollback lines are dropped first; if the two screens alone exceed it, the answer is raw with reason `OverBudget`.
 
@@ -363,5 +404,6 @@ Agent's calls:
 - AC7: every snapshot-carrying item is a heavy item; 4 MiB bound (D6).
 - AC8: keep the first 16 queries within 1 KiB; the range is given in UTF-16 code units (D7).
 - AC9: no client checkpoint cache; a per-renderer fetch with a 1 MiB or 4,096-event pending buffer and three refetches before falling back (D8).
-- AC10: snapshot permits, one per attachment and eight per server, held until the client acknowledges the chunk (D6).
+- AC10: snapshot permits, one per attachment and eight per server, held until the client acknowledges the chunk, or, for a unary answer, until its frame is written (D6).
+- AC12: the three-state `StartupGrant` and `take_startup_grant` as the only writer (D6).
 - AC11: `terminal.clear` keeps exactly the side state RIS keeps, decided by `clear-matches-ris` (D3).

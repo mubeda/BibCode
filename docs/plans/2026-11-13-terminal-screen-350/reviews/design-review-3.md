@@ -1,0 +1,63 @@
+Verdict: **Needs rework**. Revision 3 fixes the specific registry inversion and missed-restart routing, but the startup-grant guarantee still conflicts with existing grant consumers. The snapshot permits also need two explicit ownership changes before their stated bound follows.
+
+References: **D** = `docs/plans/2026-11-13-terminal-screen-350/terminal-screen-design.md`; **M** = `apps/server/src/terminal/manager.rs`; **ST** = `apps/server/src/production/server_terminal.rs`; **RPC** = `apps/server/src/rpc/session.rs`.
+
+| # | Severity | Location | Issue | Evidence | Fix |
+|---|---|---|---|---|---|
+| 1 | P1 | D:186–190 | Other operations can consume the pending restart grant without delivering it. | Checkpoint owner A survives into g2; restart leaves the grant unused; before A adopts, another claimed attach runs. Because A owns the size, that attach receives no grant but still sets `first_attachment_grant_used = true` (`M:3590–3592`). A subsequent adoption therefore cannot award it. A resize can consume it too, including an unchanged/refused-size request (`M:3925`, `M:3937`). Startup queries covered by the adopted checkpoint then receive no grant-enabled replay. | Explicitly route **all** grant consumers through the new selection policy. An attach or resize that delivers no startup handoff must not consume a pending checkpoint grant. |
+| 2 | P2 | D:193–197 | The initial snapshot remains alive after its permit would be released. | `TerminalAttachment` retains `initial` (`M:4795–4804`). The initial `json!` serialization borrows that field, and the attachment remains in the delivery loop (`ST:929–942`). After acknowledgement, constructing a resync leaves both the retained initial history and the new snapshot alive. Nine sequentially acknowledged attachments can consequently retain nine initial histories despite an eight-permit pool. | Consume the initial snapshot during its first delivery, or empty its history after serialization. Tie every remaining snapshot allocation to the permit’s lifetime. |
+| 3 | P2 | D:151, D:197 | A stream-chunk guard cannot cover the unary checkpoint answer’s lifetime. | Unary handlers return an owned `Value` through `RpcResult` (`RPC:58`, `RPC:676–684`), and unary requests have no acknowledgement receiver (`RPC:1363–1367`). Handler completion precedes outbound delivery (`RPC:1569–1602`); sending completes when the frame is queued (`RPC:1960`). Releasing the permit at handler return or enqueue allows further answers to be constructed while earlier answers remain queued. | Specify a unary response guard transferred into the outbound frame and retained through writing/drop. A handler-local permit or the existing enqueue callback alone is insufficient. |
+| 4 | P2 | D:163 | Adoption removes the existing unchanged-terminal lag fast path. | Another terminal can overflow the shared channel while this terminal’s generation and sequence remain unchanged. Current resync returns nothing (`M:4968–4969`), with explicit coverage at `M:6367–6369`. Step 7 instead always delivers a same-process snapshot, unnecessarily resetting that terminal. | Preserve the same-generation, same-sequence `None` result before constructing a heavy item. |
+| 5 | P3 | D:167–182 | The lock-path inventory is incomplete and contains inaccurate summaries. | Shutdown calls `close_sessions` while holding lifecycle (`M:4549–4566`), thereby also taking publication, registry and session (`M:4359–4376`). Several other paths are omitted below. `current_session` itself takes no operation lock (`M:4891–4898`). Thread-wide close takes no keyed operation lock (`M:4130–4137`). | Replace the inventory with the complete paths below and qualify the operation-lock claims at D:157 and D:161. No new inversion is established by these omissions. |
+
+**Round-2 findings requested**
+
+| Finding | Assessment |
+|---|---|
+| **2 — registry inversion** | **Fixed on paper.** The final registry recheck now precedes the session lock (`D:159–162`). The old cycle—listing holds registry/read and waits for session; writer queues; catch-up holds session and waits behind writer—cannot form through this algorithm (`M:4440–4444`, `M:2832–2836`). |
+| **3 — missed restart skips grant** | **Routing fixed; grant guarantee incomplete.** Lag and lifecycle now enter the same operation (`D:156`, `D:165`). Finding **1** supplies a remaining failing interleaving. |
+| **9 — oversized title** | **Fixed on paper.** Oversized side values cause fallback until a supported replacement; clear does not clear their validity flag (`D:102`, `D:106`, `D:110`). |
+| **10 — omitted hyperlink after exhaustion** | **Fixed on paper.** Recovered capacity alone no longer clears fallback; affected cells and current/saved pens must be gone (`D:102`, `D:108`). |
+| **11 — simultaneous snapshots** | **Partially fixed.** Acquiring before construction and retaining through stream acknowledgement fixes the original three-snapshot pipeline (`D:193–195`; `ST:951–966`; `RPC:1646`, `RPC:1718`). Findings **2–3** prevent the stronger bound at D:197 from following yet. |
+
+**Lock audit**
+
+Notation: **O** operation, **L** lifecycle, **P** publication, **R** session registry, **S** session; “released” means acquisition phases do not overlap.
+
+| Existing path | Actual relevant order |
+|---|---|
+| Start/open and restart | O → R released → S released; registration O → L → P → R released → S (`M:2193–2236`, `M:2278–2321`, `M:2777–2838`). |
+| Attach | Initial L released; R released → S released → P → S. Creation/restart uses the paths above (`M:3462–3475`, `M:3484`, `M:3537`, `M:3556–3561`). |
+| `mark_center_panel` | S released → P → R released → S (`M:2886–2895`). |
+| `finalize_process_exit` | P → R → S, then R/S released → S again (`M:3306–3327`). |
+| `release_size_claim` | R released → S released → P → R released → S (`M:3999–4016`). |
+| Ordered input enqueue; unary write | P → S; unary write first captures generation under a released S (`M:453–455`, `M:3816–3820`). **Omitted from D.** |
+| Activity and agent-status publication | P → S (`M:3194–3204`, `M:3276–3281`). **Omitted.** |
+| Output, tail flush and output-gap publication | P → S (`M:3389–3394`, `M:3420–3424`, `M:3435–3439`). **Omitted.** |
+| Resize; kept-size correction; clear | P → S, with released registry/session lookup where needed (`M:3881–3890`, `M:3975–3977`, `M:4088–4098`). **Correction and clear omitted.** |
+| Close / `close_sessions` | Optional O → L → P → R/write released → S. Preliminary registry/session captures are released before P (`M:4130–4155`, `M:4343–4376`). |
+| Worktree removal | L → R → S; releases these before calling close (`M:4171–4202`). |
+| Identity capture / workspace quiescence | L → R released → S. Finalization runs after L is released (`M:4222–4234`, `M:4254–4270`, `M:4307–4314`). **Omitted.** |
+| Thread listing, live counts/PIDs, metadata subscription | R → S (`M:4440–4444`, `M:4476–4480`, `M:4491–4494`, `M:4508–4511`). |
+| Shutdown | L → registry lookup, then L → P → R/write released → S through `close_sessions` (`M:4549–4566`, `M:4359–4376`). |
+| Existing resync | O → R released → S released → R (`M:4941–4959`). |
+| Restart delivery, history read and input begin | Registry lookup released → S; restart delivery does **not** acquire O (`M:4867–4869`, `M:4891–4898`, `M:4460–4461`, `M:3688–3689`). |
+
+**No reverse acquisition among these five locks was found in the current paths, or introduced by D:157–162.** The design’s listed paths are therefore **not complete**, although its revised acquisition order is sound. Bulk close and shutdown explain why the registry recheck remains necessary despite holding O (`M:4130–4137`, `M:4549–4566`).
+
+**Generation and grant walkthroughs**
+
+- **Restart missed through lag:** adoption waits for O, drains queued events, captures the registered g2 under P/S, and advances the attachment to its snapshot sequence. This now reaches grant selection instead of draining the restart past it (`D:157–165`; existing route `M:4829–4830`, `M:4946`). It awards once only if the intended recipient is eligible and finding **1** is fixed.
+- **Restart delivered normally:** the lifecycle event triggers the same current-state adoption, so its embedded historical snapshot is not forwarded. A mirror adopting first must leave the carried owner’s grant pending (`D:154–163`, `D:186–190`). Again, an intervening claimed attach/resize currently defeats that guarantee.
+- **Two restarts:** if g2 and g3 are both queued before adoption, draining and reading current state intentionally skips g2 and adopts g3. That gives **at most one handoff for g3**, not one for every intermediate generation. If g2 is adopted before g3 starts, each generation can receive its own handoff, subject to finding **1** (`D:157–163`, `D:186–190`; fresh generation initialization `M:2753`).
+
+**What is right**
+
+The revised fallback rule directly addresses both retained-state failures (`D:102–110`). Per-attachment format selection preserves raw defaults (`D:147–150`), and D7 now states the complete continuation-preserving handoff requirement, a single RIS, and UTF-16 range coordinates (`D:203–210`). I found no additional implementation contradiction in those D3/D7 requirements within this round’s scope.
+
+**Open questions**
+
+- What happens when the carried owner uses **raw format**, while a checkpoint mirror survives? Only checkpoint attachments enter adoption, but selection reserves the grant for the carried owner and expressly excludes raw restart grants (`D:156`, `D:186–190`). Likewise, specify grant handling when the winner’s answer falls back to raw (`D:102`, `D:205`).
+- Does “exactly once” mean one server-side award, or successful renderer consumption? Current grant consumption happens before delivery (`M:3592`, `M:3655–3675`). The proposed acknowledgement-held permit bounds allocations; it does not itself acknowledge query execution (`D:194`).
+
+Read all six requested files in full. Validation was static inspection plus `git diff --check` and `git status --short`; both Git checks were clean. No files changed, tests/builds ran, or CodeGraph sync occurred. Profiler coverage: this review changes no runtime hooks.
