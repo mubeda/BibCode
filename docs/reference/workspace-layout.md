@@ -23,6 +23,8 @@
   explicit package subpaths.
 - `/infra/relay`: BiBCode Connect relay deployment package.
 - `/oxlint-plugin-bibcode`: repository-specific Oxlint rules.
+- `/tools/objc-exception-probe`: Rust probe that checks Objective-C exception
+  recovery under the release profile on macOS.
 - `/tools/updater-verifier`: Rust tool used to verify signed updater artifacts.
 - `/third_party/portable-pty`: vendored Rust PTY crate included in the Cargo
   workspace.

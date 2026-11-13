@@ -118,7 +118,7 @@ Validate Objective-C recovery with the actual optimized profile:
 
 ```sh
 rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
-cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
+cargo run --release --target "$rust_target" -p bibcode-objc-exception-probe
 ```
 
 The probe must catch its native exception and exit successfully. The workspace

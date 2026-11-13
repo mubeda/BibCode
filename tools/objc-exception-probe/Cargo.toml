@@ -1,0 +1,17 @@
+[package]
+name = "bibcode-objc-exception-probe"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The objc2 features the macOS desktop app's dependency graph enables (`cargo
+# tree -e features -i objc2` on the desktop package), so this probe unwinds
+# through the same objc2 build as the app, under the same release profile.
+# No dependency on the app's own crates: that is what keeps this build small.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, features = ["exception", "disable-encoding-assertions"] }
+objc2-foundation.workspace = true
+
+[lints]
+workspace = true

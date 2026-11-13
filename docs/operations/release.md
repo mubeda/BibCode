@@ -71,7 +71,7 @@ Objective-C exception recovery when navigation cancels an in-flight request;
 `panic=abort` turns that recoverable condition into process termination. Thin LTO,
 one codegen unit, and symbol stripping remain enabled; the release jobs strip
 their binaries after dumping symbols (see [Symbol assets](#symbol-assets)).
-Native macOS CI executes the release-profile `objc_exception_probe`, and the
+Native macOS CI runs the `bibcode-objc-exception-probe` crate in the release profile, and the
 desktop crate rejects an abort profile on macOS.
 
 Each matrix job installs the frontend build toolchain, Rust, and the pinned
