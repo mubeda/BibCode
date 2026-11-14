@@ -144,15 +144,34 @@ impl TerminalOutputSource for crate::terminal::TerminalManager {
     {
         Box::pin(async move {
             let read = self
-                .read_history(owner_thread_id, terminal_id, None, max_chars)
+                .read_history(
+                    owner_thread_id,
+                    terminal_id,
+                    None,
+                    raw_window_chars(max_chars),
+                )
                 .await?;
-            // An escape cut at the window's start or end is dropped with the rest of its bytes.
-            let (text, _open) = crate::ansi::strip_escapes(&read.window.text);
-            Ok(TerminalTail {
-                text,
-                truncated: read.window.start > 0,
-            })
+            Ok(plain_tail(
+                &read.window.text,
+                read.window.start > 0,
+                max_chars,
+            ))
         })
+    }
+}
+
+/// How many raw characters to read so `plain_tail` can return `max_chars` of plain text.
+pub(crate) fn raw_window_chars(max_chars: usize) -> usize {
+    max_chars
+}
+
+/// The last `max_chars` of plain text in `raw`, the end of a terminal's retained output.
+pub(crate) fn plain_tail(raw: &str, older_exists: bool, max_chars: usize) -> TerminalTail {
+    let (text, _open) = crate::ansi::strip_escapes(raw);
+    let count = text.chars().count();
+    TerminalTail {
+        text: text.chars().skip(count.saturating_sub(max_chars)).collect(),
+        truncated: older_exists || count > max_chars,
     }
 }
 

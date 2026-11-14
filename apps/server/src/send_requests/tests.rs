@@ -3403,3 +3403,34 @@ async fn get_terminal_output_conversation_request_falls_back_to_output_until_a_r
     assert_eq!(result["text"], "hello");
     harness.shutdown().await;
 }
+
+/// What the real reader returns for terminal output `raw`: the history keeps the last
+/// `raw_window_chars` characters, then `plain_tail` makes plain text of them.
+fn read_like_the_terminal_manager(
+    raw: &str,
+    max_chars: usize,
+) -> crate::send_requests::service::TerminalTail {
+    use crate::send_requests::service::{plain_tail, raw_window_chars};
+    let window = raw_window_chars(max_chars);
+    let count = raw.chars().count();
+    let kept: String = raw.chars().skip(count.saturating_sub(window)).collect();
+    plain_tail(&kept, count > window, max_chars)
+}
+
+#[test]
+fn get_terminal_output_drops_an_osc_payload_whose_start_is_cut_off() {
+    let raw = format!("\u{1b}]0;{}\u{7}OK", "x".repeat(16_000));
+
+    let tail = read_like_the_terminal_manager(&raw, 16_000);
+
+    assert_eq!(tail.text, "OK");
+}
+
+#[test]
+fn get_terminal_output_text_is_plain_text() {
+    let raw = "\u{9b}31mred\u{9b}0m\0a\u{8}b\u{7f}c\td\r\ne\u{85}f";
+
+    let tail = read_like_the_terminal_manager(raw, 16_000);
+
+    assert_eq!(tail.text, "31mred0mabc\td\nef");
+}
