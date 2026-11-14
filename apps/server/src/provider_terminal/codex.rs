@@ -1643,6 +1643,7 @@ async fn run_codex_observer_inner(
                                 }
                             }
                             if outcome == CodexScopeRetry::Stop {
+                                generation.clear_ready_for_prompt();
                                 return;
                             }
                             live_state = None;
@@ -1856,6 +1857,8 @@ async fn run_codex_observer_inner(
             }
         }
     }
+    // The observer is done; nothing sees the agent's next turn.
+    generation.clear_ready_for_prompt();
 }
 
 /// Why the terminal's activity scope could not be created. The category is safe to log: it is

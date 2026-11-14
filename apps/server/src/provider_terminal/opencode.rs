@@ -1620,20 +1620,19 @@ async fn attach_opencode_root(
 ) -> Option<Box<dyn OpenCodeEventStream>> {
     generation.clear_ready_for_prompt();
     let stream = establish_opencode_event_stream(remote, generation, timeout).await;
-    hydrate_opencode_root_status(remote, generation, root_session_id).await;
-    if stream.is_none() {
-        generation.clear_ready_for_prompt();
-    }
+    hydrate_opencode_root_status(remote, generation, root_session_id, stream.is_some()).await;
     stream
 }
 
 /// Reads the root session's state as the observer attaches or reattaches, which the events it
 /// missed cannot tell (#187). OpenCode lists only sessions that are not idle; an open ask keeps
-/// its session busy, so busy reports progress and leaves the ask shown.
+/// its session busy, so busy reports progress and leaves the ask shown. An idle root reads
+/// ready only when `observed`, that is while a stream will report its next turn.
 async fn hydrate_opencode_root_status(
     remote: &mut dyn OpenCodeRemoteClient,
     generation: &TerminalObserverGenerationLease,
     root_session_id: &str,
+    observed: bool,
 ) {
     let Ok(Ok(statuses)) = tokio::time::timeout(OPENCODE_REQUEST_TIMEOUT, remote.statuses()).await
     else {
@@ -1648,7 +1647,9 @@ async fn hydrate_opencode_root_status(
         // OpenCode lists only sessions that are not idle, so an absent root waits for a prompt.
         Some("idle") | None => {
             generation.publish_agent_status(TerminalAgentState::Done, false);
-            generation.mark_ready_for_prompt();
+            if observed {
+                generation.mark_ready_for_prompt();
+            }
         }
         Some(_) => {}
     }
@@ -4208,6 +4209,34 @@ mod tests {
     struct AttachingRemote {
         subscribed: bool,
         stream_opens: bool,
+        /// Opening a stream never completes, as a replacement that is still connecting.
+        open_hangs: bool,
+    }
+
+    /// An old stream that still holds events while its replacement connects.
+    struct DormantStream {
+        events: VecDeque<Vec<u8>>,
+    }
+
+    impl OpenCodeEventStream for DormantStream {
+        fn discard_next(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            unreachable!("the replacement reads the old stream's status")
+        }
+
+        fn next_data(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+            unreachable!("the replacement reads the old stream as dormant")
+        }
+
+        fn next_dormant_data(&mut self) -> DormantEventData<'_> {
+            match self.events.pop_front() {
+                Some(data) => Box::pin(std::future::ready(Ok(Some(data)))),
+                None => Box::pin(std::future::pending()),
+            }
+        }
     }
 
     struct ConnectedStream {
@@ -4286,6 +4315,9 @@ mod tests {
         }
 
         fn open_event_stream(&mut self) -> OpenCodeEventStreamFuture<'_> {
+            if self.open_hangs {
+                return Box::pin(std::future::pending());
+            }
             if !self.stream_opens {
                 return Box::pin(std::future::ready(Err("down".to_owned())));
             }
@@ -4303,6 +4335,7 @@ mod tests {
         let mut remote = AttachingRemote {
             subscribed: false,
             stream_opens: true,
+            open_hangs: false,
         };
 
         let stream =
@@ -4326,6 +4359,7 @@ mod tests {
         let mut remote = AttachingRemote {
             subscribed: false,
             stream_opens: false,
+            open_hangs: false,
         };
 
         let stream =
@@ -4337,6 +4371,52 @@ mod tests {
         assert!(
             !status.ready_for_prompt,
             "an observer without a stream reported ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_replacement_keeps_reading_the_old_streams_status() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let mut remote = AttachingRemote {
+            subscribed: false,
+            stream_opens: true,
+            open_hangs: true,
+        };
+        let mut old = DormantStream {
+            events: VecDeque::from([
+                br#"{"type":"session.status","properties":{"sessionID":"root","status":{"type":"busy"}}}"#
+                    .to_vec(),
+            ]),
+        };
+        let activity = TerminalAgentActivityControl::enabled();
+        let expected = activity.snapshot();
+        let mut changes = activity.subscribe();
+
+        let outcome = prepare_opencode_replacement(
+            &mut remote,
+            &mut old,
+            &mut changes,
+            expected,
+            &lease,
+            "root",
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            OpenCodeReplacementOutcome::Failed {
+                dormant_stream_healthy: true
+            }
+        ));
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Working);
+        assert!(
+            !status.ready_for_prompt,
+            "a turn that began during the handoff went unseen"
         );
     }
 
