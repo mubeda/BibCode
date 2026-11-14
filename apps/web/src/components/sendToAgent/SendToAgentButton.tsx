@@ -73,6 +73,8 @@ export interface SendToAgentButtonProps {
   previewContentFor?: (choice: SendChoice) => PreviewContent | null;
   send?: (input: SendRequestsSendInput) => Promise<SendOutcome>;
   createPanel?: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
+  /** Brings a panel `createPanel` made inactive forward once its request was sent. */
+  revealPanel?: (panel: ThreadId) => void;
   newId?: () => string;
 }
 
@@ -154,6 +156,7 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
           newPanelProviders={props.newPanelProvidersFor(choice.action)}
           send={props.send ?? noSend}
           createPanel={props.createPanel ?? noPanel}
+          revealPanel={props.revealPanel}
           newId={props.newId ?? defaultNewId}
           onClose={closePreview}
           onPickAnother={pickAnother}
@@ -170,13 +173,19 @@ function PreviewHost(props: {
   newPanelProviders: ReadonlyArray<NewPanelProvider>;
   send: NonNullable<SendToAgentButtonProps["send"]>;
   createPanel: NonNullable<SendToAgentButtonProps["createPanel"]>;
+  revealPanel: SendToAgentButtonProps["revealPanel"];
   newId: () => string;
   onClose: () => void;
   onPickAnother: () => void;
 }) {
-  const { choice, previewContentFor, newPanelProviders, send, createPanel, newId } = props;
+  const { choice, previewContentFor, newPanelProviders, send, createPanel, newId, revealPanel } =
+    props;
   const content = useMemo(() => previewContentFor(choice), [choice, previewContentFor]);
   const target = useMemo(() => {
+    // The picked agent only supplies text: the request goes to this panel's own agent.
+    if (choice.action === "take-over") {
+      return { title: "this agent", providerLabel: null, newPanel: false };
+    }
     if (choice.target.kind === "agent") {
       return {
         title: choice.target.row.shell.title,
@@ -196,18 +205,29 @@ function PreviewHost(props: {
     (draft: Parameters<NonNullable<PreviewContent["submit"]>>[0]) =>
       content?.submit !== undefined
         ? content.submit(draft)
-        : submitSendChoice({ send, createPanel, newId }, choice, draft),
-    [choice, content, createPanel, newId, send],
+        : submitSendChoice(
+            { send, createPanel, newId, ...(revealPanel === undefined ? {} : { revealPanel }) },
+            choice,
+            draft,
+          ),
+    [choice, content, createPanel, newId, revealPanel, send],
   );
   if (content === null) return null;
+  const fromTitle =
+    choice.action === "take-over" && choice.target.kind === "agent"
+      ? choice.target.row.shell.title
+      : choice.source.title;
   return (
     <SendToAgentPreview
       open
-      source={{ key: sendChoiceKey(choice), title: choice.source.title }}
+      source={{ key: sendChoiceKey(choice), title: fromTitle }}
       action={choice.action}
       target={target}
       leadIn={content.leadIn}
       initialAttachments={content.attachments}
+      {...(content.loadAttachments === undefined
+        ? {}
+        : { loadAttachments: content.loadAttachments })}
       {...(content.extraContent === undefined ? {} : { extraContent: content.extraContent })}
       {...(content.warning === undefined ? {} : { warning: content.warning })}
       finalFocus={props.triggerRef}

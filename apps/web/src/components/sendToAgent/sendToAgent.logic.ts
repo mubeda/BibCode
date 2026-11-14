@@ -216,6 +216,8 @@ export interface PreviewAttachment {
   label: string;
   text: string;
   leftOut: string | null;
+  /** Says where the text came from when that is not what the label promises. */
+  note?: string | null;
 }
 
 export interface PreviewDraft {
@@ -237,6 +239,8 @@ export interface PreviewContent {
   extraContent?: ReactNode;
   warning?: string | null;
   submit?: (draft: PreviewDraft) => Promise<SendOutcome>;
+  /** Attachments read when the preview opens, after `attachments`; Send waits for them. */
+  loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
 }
 
 export function sourceAddressOf(
@@ -247,6 +251,22 @@ export function sourceAddressOf(
     : `terminal:${source.threadId}/${source.terminalId}`;
 }
 
+/**
+ * The addresses of a send. Take over from is queued on the source's own agent and names the
+ * picked agent as taken over; every other action goes to the picked agent or the new panel.
+ */
+export function resolveRequestRoles(
+  choice: SendChoice,
+  newPanelAddress: string | null,
+): { source: string; target: string; takenOver: string | null } {
+  const source = sourceAddressOf(choice.source);
+  const picked = choice.target.kind === "agent" ? choice.target.address : newPanelAddress;
+  if (picked === null) throw new Error("A send to a new panel needs the panel's address.");
+  return choice.action === "take-over"
+    ? { source, target: source, takenOver: picked }
+    : { source, target: picked, takenOver: null };
+}
+
 /** The store key of one panel's send of one action: its note, request id and new panel. */
 export function sendChoiceKey(choice: Pick<SendChoice, "source" | "action">): string {
   return `${sendSourceKey(choice.source)}:${choice.action}`;
@@ -255,13 +275,15 @@ export function sendChoiceKey(choice: Pick<SendChoice, "source" | "action">): st
 /**
  * Sends a previewed choice. The request id is reused while the draft and the target are
  * unchanged, so pressing Send again after a lost connection sends the same request, and a new
- * panel is created once. A sent request settles the choice.
+ * panel is created once. A sent request settles the choice and reveals the panel it created.
  */
 export async function submitSendChoice(
   deps: {
     send: (input: SendRequestsSendInput) => Promise<SendOutcome>;
     createPanel: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
     newId: () => string;
+    /** Brings a new panel forward once its request was sent; it was created inactive. */
+    revealPanel?: (panel: ThreadId) => void;
   },
   choice: SendChoice,
   draft: PreviewDraft,
@@ -278,11 +300,9 @@ export async function submitSendChoice(
     JSON.stringify([chosen.kind === "agent" ? chosen.address : panelKey, draft]),
     deps.newId,
   );
-  let target: string;
-  if (chosen.kind === "agent") {
-    target = chosen.address;
-  } else {
-    let panel = store.panelFor(panelKey ?? "");
+  let panel: ThreadId | null = null;
+  if (chosen.kind === "new-panel") {
+    panel = store.panelFor(panelKey ?? "");
     if (panel === null) {
       panel = await deps.createPanel(chosen.selection);
       if (panel === null) {
@@ -290,19 +310,21 @@ export async function submitSendChoice(
       }
       store.rememberPanel(panelKey ?? "", panel);
     }
-    target = `thread:${panel}`;
   }
+  const roles = resolveRequestRoles(choice, panel === null ? null : `thread:${panel}`);
   const outcome = await deps.send({
     requestId,
     action: choice.action,
-    source: sourceAddressOf(choice.source),
-    target,
+    source: roles.source,
+    target: roles.target,
+    ...(roles.takenOver === null ? {} : { takenOver: roles.takenOver }),
     leadIn: draft.leadIn,
     note: draft.note,
     attachments: draft.attachments,
   });
   if (outcome.kind === "sent") {
     useSendToAgentStore.getState().settle(key, { requestId, note: draft.note, panelKey });
+    if (panel !== null) deps.revealPanel?.(panel);
   }
   return outcome;
 }

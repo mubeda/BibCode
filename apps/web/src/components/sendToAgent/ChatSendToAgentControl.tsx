@@ -43,6 +43,7 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
   readonly serverSupported: boolean;
   readonly newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
   readonly createPanel: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
+  readonly revealPanel: (panel: ThreadId) => void;
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
 }) {
   const { threadRef, newPanelProvidersFor } = props;
@@ -92,6 +93,7 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
       previewContentFor={props.previewContentFor}
       send={send}
       createPanel={props.createPanel}
+      revealPanel={props.revealPanel}
     />
   );
 });
