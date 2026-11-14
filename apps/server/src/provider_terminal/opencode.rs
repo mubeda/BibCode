@@ -3796,12 +3796,35 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
     }
 }
 
-/// One OpenCode 2 event as the OpenCode 1 events the terminal observer reads.
+/// One OpenCode 2 event as the OpenCode 1 events the terminal observer reads. A turn's end
+/// also becomes the idle or error event OpenCode 1 sends for it, last, so the root's status
+/// settles on the outcome: ready after a success, failed after a failure.
 fn normalize_opencode_v2_for_terminal(
     normalizer: &mut opencode::v2_activity::V2ActivityNormalizer,
     event: &Value,
 ) -> Vec<Value> {
-    normalizer.normalize(event)
+    let mut events = normalizer.normalize(event);
+    let outcome = match event.get("type").and_then(Value::as_str) {
+        Some("session.execution.succeeded") => "session.idle",
+        Some("session.execution.failed") => {
+            // A failure before any step comes out as an idle status, which would read as
+            // ready for a moment. Without a type it still ends the session's activity and
+            // reports no agent state.
+            for normalized in &mut events {
+                if let Some(status) = normalized.pointer_mut("/properties/status")
+                    && status.get("type").and_then(Value::as_str) == Some("idle")
+                {
+                    *status = json!({});
+                }
+            }
+            "session.error"
+        }
+        _ => return events,
+    };
+    if let Some(session_id) = event.pointer("/data/sessionID") {
+        events.push(json!({ "type": outcome, "properties": { "sessionID": session_id } }));
+    }
+    events
 }
 
 impl OpenCodeRemoteClient for SystemOpenCodeRemoteClient {
