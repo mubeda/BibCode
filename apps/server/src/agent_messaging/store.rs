@@ -505,4 +505,39 @@ mod tests {
         assert_eq!(after.reason, None);
         assert_eq!(after.updated_at, "2026-11-14T00:01:00Z");
     }
+
+    #[test]
+    fn apply_relink_never_revives_a_terminal_message() {
+        let mut connection = connection();
+        for terminal in [
+            AgentMessageStatus::Completed,
+            AgentMessageStatus::Cancelled,
+            AgentMessageStatus::Failed,
+        ] {
+            let id = format!("m-{}", terminal.as_str());
+            let mut new = message(&id);
+            new.client_request_id = None;
+            new.status = terminal;
+            insert(&mut connection, &new);
+            let before = get_message(&connection, &id).unwrap().unwrap();
+            let tx = connection.transaction().unwrap();
+            let revived = apply_relink(
+                &tx,
+                &RelinkAgentMessage {
+                    message_id: id.clone(),
+                    expected_status: terminal,
+                    expected_delivery_command_id: Some("c1".to_owned()),
+                    delivery_command_id: "c2".to_owned(),
+                    delivery_message_id: "dm2".to_owned(),
+                    status: AgentMessageStatus::Queued,
+                    reason: None,
+                },
+                "2026-11-14T00:01:00Z",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            assert!(!revived, "{} is terminal", terminal.as_str());
+            assert_eq!(get_message(&connection, &id).unwrap().unwrap(), before);
+        }
+    }
 }

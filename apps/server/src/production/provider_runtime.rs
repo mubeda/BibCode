@@ -33801,6 +33801,8 @@ done
         let person_text = "@src/secret.txt is what I mean";
         let mut texts: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
         texts.push(person_text.to_owned());
+        // A person may paste a whole envelope; only the server's provenance makes it an agent's.
+        texts.push(cases[0].1.clone());
         let users = deliver_and_capture(&driver, deadline, &capture_path, &texts, |request| {
             request["type"] == "user"
         })
@@ -33823,6 +33825,11 @@ done
         assert!(
             person.get("client_composed").is_none(),
             "a person's text is never marked: {person}"
+        );
+        let pasted = &users[cases.len() + 1];
+        assert!(
+            pasted.get("client_composed").is_none(),
+            "a person's pasted envelope is never marked: {pasted}"
         );
     }
 
@@ -33971,10 +33978,9 @@ done
         }
     }
 
-    /// A handoff owed to the recipient would wrap the envelope in a context block, which no
-    /// provider then sees as an envelope, so an envelope goes out whole and the handoff waits.
+    /// The handoff builder never decides from text whether a turn is an agent's message.
     #[tokio::test]
-    async fn an_agent_envelope_is_never_wrapped_in_a_context_handoff() {
+    async fn a_persons_pasted_envelope_still_gets_the_context_handoff() {
         let database = crate::persistence::Database::open_in_memory()
             .await
             .expect("database");
@@ -33997,6 +34003,7 @@ done
             .expect("message")
         };
 
+        // A person's message that pastes a whole envelope is still a person's message.
         for (_, envelope) in literal_delivery_envelopes() {
             let handoff = super::text_with_pending_context_handoff(
                 &repositories,
@@ -34006,8 +34013,8 @@ done
                 &message(&envelope),
             )
             .await
-            .expect("an envelope is sent");
-            assert!(handoff.is_none(), "an envelope goes out whole");
+            .expect("a pasted envelope is sent");
+            assert!(handoff.is_some(), "a person's pasted envelope gets the handoff");
         }
         let person = super::text_with_pending_context_handoff(
             &repositories,
