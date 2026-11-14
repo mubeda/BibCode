@@ -5,6 +5,7 @@
 pub(crate) mod delivery;
 pub(crate) mod directory;
 pub(crate) mod envelope;
+pub(crate) mod policy;
 pub mod store;
 
 use std::sync::Arc;
@@ -67,6 +68,11 @@ pub(crate) enum AgentMessagingError {
     UnknownMessage,
     /// The agent a reply would go to no longer exists.
     RecipientGone,
+    /// The recipient runs with more access than the sender.
+    ModeCeiling {
+        sender: String,
+        recipient: String,
+    },
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
 }
@@ -79,6 +85,7 @@ impl AgentMessagingError {
             Self::InvalidArgument(_) => "AgentMessagingInvalidArgumentError",
             Self::UnknownMessage => "AgentMessagingUnknownMessageError",
             Self::RecipientGone => "AgentMessagingRecipientGoneError",
+            Self::ModeCeiling { .. } => "AgentMessagingModeCeilingError",
             Self::Storage => "McpStorageError",
         }
     }
@@ -92,6 +99,9 @@ impl AgentMessagingError {
             Self::RecipientGone => {
                 "The agent that sent that message is gone, so it cannot get a reply.".to_owned()
             }
+            Self::ModeCeiling { sender, recipient } => format!(
+                "The recipient runs with more access ({recipient}) than you ({sender}), so it cannot take your message."
+            ),
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
         }
     }
@@ -462,6 +472,14 @@ impl AgentMessaging {
             tracing::warn!("agent messaging has no turn starter");
             return Err(AgentMessagingError::Storage);
         };
+        let sender_mode = &route.sender.runtime_mode;
+        let recipient_mode = &route.recipient.runtime_mode;
+        if !policy::ceiling_allows(sender_mode, recipient_mode) {
+            return Err(AgentMessagingError::ModeCeiling {
+                sender: sender_mode.clone(),
+                recipient: recipient_mode.clone(),
+            });
+        }
         let sender_address = format!("thread:{}", route.sender.thread_id);
         let recipient_address = format!("thread:{}", route.recipient.thread_id);
         let label = match route.sender.title.trim() {
@@ -517,7 +535,7 @@ impl AgentMessaging {
             status: AgentMessageStatus::Accepted,
             reason: None,
             accepted_at: now,
-            sender_runtime_mode: None,
+            sender_runtime_mode: Some(sender_mode.clone()),
             recipient_terminal_generation: None,
             send_request_id: None,
             client_request_id: outgoing.client_request_id.map(str::to_owned),
@@ -574,10 +592,11 @@ impl AgentMessaging {
             .repositories()
             .database()
             .call(move |connection| {
-                let Some(project_id) = directory::project_of(connection, &caller)? else {
+                let Some((project_id, caller_mode)) = directory::project_of(connection, &caller)?
+                else {
                     return Ok(None);
                 };
-                directory::list_agents(connection, &project_id, &caller).map(Some)
+                directory::list_agents(connection, &project_id, &caller, &caller_mode).map(Some)
             })
             .await
             .map_err(|error| {

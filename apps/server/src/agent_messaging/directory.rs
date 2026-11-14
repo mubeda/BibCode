@@ -32,13 +32,15 @@ fn activity_status(session_status: Option<&str>, open_requests: i64) -> &'static
 }
 
 /// The live chat threads of `project_id` except `caller_thread_id`, in creation order.
+/// `canReceive` is false for a thread that runs with more access than `caller_mode`.
 pub(crate) fn list_agents(
     connection: &rusqlite::Connection,
     project_id: &str,
     caller_thread_id: &str,
+    caller_mode: &str,
 ) -> Result<Vec<AgentSummary>> {
     let mut statement = connection.prepare(
-        "SELECT thread.thread_id, thread.title,
+        "SELECT thread.thread_id, thread.title, thread.runtime_mode,
                 COALESCE(session.provider_name, json_extract(thread.model_selection_json, '$.instanceId'), ''),
                 session.status,
                 thread.pending_approval_count + thread.pending_user_input_count
@@ -51,30 +53,30 @@ pub(crate) fn list_agents(
          ORDER BY thread.rowid",
     )?;
     let rows = statement.query_map(params![project_id, caller_thread_id], |row| {
-        let session_status: Option<String> = row.get(3)?;
+        let session_status: Option<String> = row.get(4)?;
         Ok(AgentSummary {
             address: format!("thread:{}", row.get::<_, String>(0)?),
             title: row.get(1)?,
-            provider: row.get(2)?,
+            provider: row.get(3)?,
             kind: "chat",
-            status: activity_status(session_status.as_deref(), row.get(4)?),
-            can_receive: true,
+            status: activity_status(session_status.as_deref(), row.get(5)?),
+            can_receive: super::policy::ceiling_allows(caller_mode, &row.get::<_, String>(2)?),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The project of a live (not deleted) thread.
+/// The project and runtime mode of a live (not deleted) thread.
 pub(crate) fn project_of(
     connection: &rusqlite::Connection,
     thread_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     use rusqlite::OptionalExtension as _;
     Ok(connection
         .query_row(
-            "SELECT project_id FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL",
+            "SELECT project_id, runtime_mode FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL",
             params![thread_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
 }

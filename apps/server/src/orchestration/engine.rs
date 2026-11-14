@@ -5503,7 +5503,8 @@ async fn plan_command(
                 return invariant(command, "Only the queued head can be steered.".to_owned());
             };
             // An agent message never steers a running turn (agent messaging spec, Part A).
-            let (head_command_id, head_message_id) = (row.command_id.clone(), row.message_id.clone());
+            let (head_command_id, head_message_id) =
+                (row.command_id.clone(), row.message_id.clone());
             let agent_message = repositories
                 .database()
                 .call(move |connection| {

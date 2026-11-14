@@ -75,6 +75,8 @@ pub(crate) struct Harness {
     _secrets: tempfile::TempDir,
     tracker: CancellationToken,
     tracker_started: std::sync::atomic::AtomicBool,
+    /// `agentMessaging.enabled` as the claim gate reads it; on unless a test turns it off.
+    messaging_enabled: watch::Sender<bool>,
 }
 
 impl Harness {
@@ -182,6 +184,7 @@ impl Harness {
             _secrets: secrets,
             tracker: CancellationToken::new(),
             tracker_started: std::sync::atomic::AtomicBool::new(false),
+            messaging_enabled: watch::channel(true).0,
         }
     }
 
@@ -306,11 +309,15 @@ impl Harness {
         self.messaging_untracked(enabled)
     }
 
-    /// [`Self::messaging`] without starting the status tracker.
+    /// [`Self::messaging`] without starting the status tracker. The claim gate, installed once,
+    /// reads [`Self::messaging_enabled`], not `enabled`.
     pub(crate) fn messaging_untracked(
         &self,
         enabled: bool,
     ) -> crate::agent_messaging::AgentMessaging {
+        self.engine.repositories().set_agent_claim_gate(
+            crate::agent_messaging::policy::claim_gate(self.messaging_enabled.subscribe()),
+        );
         crate::agent_messaging::AgentMessaging::new(self.engine.clone(), watch::channel(enabled).1)
             .with_starter(super::orchestration_rpc::server_turn_starter(
                 self.engine.clone(),

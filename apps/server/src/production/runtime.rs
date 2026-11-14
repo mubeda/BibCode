@@ -382,6 +382,10 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
+        // Before any delivery can be claimed.
+        repositories.set_agent_claim_gate(crate::agent_messaging::policy::claim_gate(
+            control.agent_messaging_enabled_signal(),
+        ));
         let activity_projections = ActivityProjections::new(
             ActivityRepository::new(repositories.database().clone()),
             chat_activity_controller.clone(),

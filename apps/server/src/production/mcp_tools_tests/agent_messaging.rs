@@ -1448,7 +1448,8 @@ async fn a_person_cannot_steer_a_queued_agent_message_into_a_running_turn() {
 
     let refusal = refused.to_string();
     assert!(
-        refusal.contains("An agent message waits for the running turn to end, so it cannot steer it."),
+        refusal
+            .contains("An agent message waits for the running turn to end, so it cannot steer it."),
         "{refusal}"
     );
     assert!(!refusal.contains("hello"), "{refusal}");
@@ -1575,10 +1576,471 @@ async fn a_reply_reports_its_outcome_like_a_send() {
         Some(accepted.message_id.as_str())
     );
     assert_eq!(outcomes[0].sender_title.as_deref(), Some("Codex thread"));
-    assert_eq!(outcomes[0].recipient_title.as_deref(), Some("Claude thread"));
+    assert_eq!(
+        outcomes[0].recipient_title.as_deref(),
+        Some("Claude thread")
+    );
     assert_eq!(outcomes[1].tool, "agent_message_reply");
     assert_eq!(outcomes[1].outcome, "AgentMessagingUnknownMessageError");
     assert_eq!(outcomes[1].sender_address, "thread:p");
     assert!(!format!("{outcomes:?}").contains("Port 5173"));
+    harness.shutdown().await;
+}
+
+// ---- Task 6.1: runtime-mode ceiling and the claim gate ----
+
+impl Harness {
+    async fn set_mode(&self, thread_id: &str, mode: &str) {
+        self.engine
+            .dispatch(command(json!({
+                "type": "thread.runtime-mode.set",
+                "commandId": format!("mode-{thread_id}-{mode}-{}", uuid::Uuid::new_v4()),
+                "threadId": thread_id, "runtimeMode": mode, "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("mode set");
+    }
+
+    /// A person's message queued (or started, when `thread_id` is idle) on `thread_id`; returns
+    /// its queue entry's command id.
+    async fn person_queues(&self, thread_id: &str) -> String {
+        let command_id = format!("person-{}", uuid::Uuid::new_v4());
+        super::super::orchestration_rpc::server_turn_starter(
+            self.engine.clone(),
+            self.provider.clone(),
+            self.state_dir.clone(),
+            self.delivery.clone(),
+            None,
+            self.uploads.clone(),
+        )
+        .queue_turn_start(
+            command(json!({
+                "type": "thread.turn.start", "commandId": command_id, "threadId": thread_id,
+                "message": {
+                    "messageId": uuid::Uuid::new_v4().to_string(), "role": "user",
+                    "text": "From a person", "attachments": [],
+                },
+                "runtimeMode": "full-access", "interactionMode": "default",
+                "queued": true, "createdAt": CREATED_AT,
+            })),
+            super::super::orchestration_rpc::ServerActor::Person,
+            None,
+        )
+        .await
+        .expect("the person's message is admitted");
+        command_id
+    }
+
+    async fn entry_state(&self, command_id: &str) -> String {
+        let command_id = command_id.to_owned();
+        self.repositories
+            .database()
+            .call(move |connection| {
+                Ok(connection.query_row(
+                    "SELECT state FROM provider_turn_outbox WHERE command_id = ?1",
+                    [&command_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .expect("queue entry")
+    }
+
+    /// Waits until queue entry `command_id` is in `state`.
+    async fn until_entry(&self, command_id: &str, state: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let now = self.entry_state(command_id).await;
+            if now == state {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{command_id} is {now}, not {state}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn claim(&self, message_id: &str) -> Option<crate::orchestration::ProviderTurnDelivery> {
+        let command_id = self
+            .message_row(message_id)
+            .await
+            .delivery_command_id
+            .expect("queue entry");
+        self.engine
+            .repositories()
+            .claim_provider_turn(command_id, CREATED_AT.to_owned())
+            .await
+            .expect("claim")
+    }
+}
+
+fn ceiling_refusal(sender: &str, recipient: &str) -> String {
+    format!(
+        "The recipient runs with more access ({recipient}) than you ({sender}), so it cannot take your message."
+    )
+}
+
+#[tokio::test]
+async fn a_supervised_agent_cannot_drive_a_full_access_agent() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("a", "approval-required").await;
+
+    let result = harness
+        .agent_send("a", send_arguments("thread:b", "hello"))
+        .await;
+
+    assert_eq!(error_tag(&result), "AgentMessagingModeCeilingError");
+    assert_eq!(
+        result["structuredContent"]["error"]["message"],
+        ceiling_refusal("approval-required", "full-access")
+    );
+    assert!(harness.agent_messages().await.is_empty());
+    assert!(harness.outbox_states("b").await.is_empty());
+    let reply_to_b = harness.sent("b", "thread:a").await;
+    let reply = harness.reply("a", &reply_to_b, "ok").await;
+    assert_eq!(error_tag(&reply), "AgentMessagingModeCeilingError");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn equal_or_lower_is_allowed() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("b", "approval-required").await;
+
+    let lower = harness
+        .agent_send("a", send_arguments("thread:b", "hello"))
+        .await;
+    let equal = harness
+        .agent_send("a", send_arguments("thread:p", "hello"))
+        .await;
+
+    assert_eq!(structured(&lower)["status"], "accepted", "{lower}");
+    assert_eq!(structured(&equal)["status"], "accepted", "{equal}");
+    let stored = harness
+        .message_row(structured(&lower)["messageId"].as_str().expect("id"))
+        .await;
+    assert_eq!(stored.sender_runtime_mode.as_deref(), Some("full-access"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_recipients_mode_rises_while_the_message_waits() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("a", "auto-accept-edits").await;
+    harness.set_mode("b", "auto-accept-edits").await;
+    let message_id = harness.sent("a", "thread:b").await;
+    harness.until_status(&message_id, "queued").await;
+    let command_id = harness
+        .message_row(&message_id)
+        .await
+        .delivery_command_id
+        .expect("queue entry");
+
+    harness.set_mode("b", "full-access").await;
+
+    let held = harness.until_status(&message_id, "held").await;
+    assert_eq!(
+        held.reason,
+        Some(AgentMessageReason::RecipientModeAboveSender)
+    );
+    harness.until_entry(&command_id, "dismissed").await;
+    harness.provider_turn("b", "turn-b", "working", true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(harness.entry_state(&command_id).await, "dismissed");
+    let row = harness.message_row(&message_id).await;
+    assert_eq!(row.status.as_str(), "held");
+    assert_eq!(
+        row.reason,
+        Some(AgentMessageReason::RecipientModeAboveSender)
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_held_message_leaves_the_turn_queue() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("a", "auto-accept-edits").await;
+    harness.set_mode("b", "auto-accept-edits").await;
+    let message_id = harness.sent("a", "thread:b").await;
+    let person = harness.person_queues("b").await;
+    assert_eq!(harness.entry_state(&person).await, "queued");
+
+    harness.set_mode("b", "full-access").await;
+    harness.until_status(&message_id, "held").await;
+    harness.provider_turn("b", "turn-b", "working", true).await;
+
+    harness.until_entry(&person, "delivered").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_candidate_that_passed_collection_is_stopped_at_the_claim_by_a_mode_change() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.stop_delivery().await;
+    harness.set_mode("a", "auto-accept-edits").await;
+    harness.set_mode("p", "auto-accept-edits").await;
+    let message_id = harness.sent_untracked("a", "thread:p").await;
+    assert_eq!(
+        harness.outbox_states("p").await[0].1,
+        "pending",
+        "listed for delivery"
+    );
+    // No tracker runs, so only the claim can see the change.
+    harness.set_mode("p", "full-access").await;
+
+    assert!(harness.claim(&message_id).await.is_none());
+
+    let row = harness.message_row(&message_id).await;
+    assert_eq!(row.status.as_str(), "held");
+    assert_eq!(
+        row.reason,
+        Some(AgentMessageReason::RecipientModeAboveSender)
+    );
+    assert_eq!(harness.outbox_states("p").await[0].1, "pending", "not sent");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delivery_claimed_after_messaging_was_switched_off_is_held() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.stop_delivery().await;
+    let message_id = harness.sent_untracked("a", "thread:p").await;
+
+    harness.messaging_enabled.send_replace(false);
+
+    assert!(harness.claim(&message_id).await.is_none());
+    let row = harness.message_row(&message_id).await;
+    assert_eq!(row.status.as_str(), "held");
+    assert_eq!(row.reason, Some(AgentMessageReason::MessagingOff));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_held_row_is_never_claimed() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.stop_delivery().await;
+    let message_id = harness.sent_untracked("a", "thread:p").await;
+    let held_id = message_id.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            crate::agent_messaging::store::set_status(
+                connection,
+                &held_id,
+                crate::agent_messaging::store::AgentMessageStatus::Held,
+                Some(AgentMessageReason::MessagingOff),
+                CREATED_AT,
+            )
+        })
+        .await
+        .expect("held");
+    let before = harness.message_row(&message_id).await;
+
+    assert!(harness.claim(&message_id).await.is_none());
+
+    assert_eq!(harness.message_row(&message_id).await, before);
+    assert_eq!(harness.outbox_states("p").await[0].1, "pending");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_claim_time_hold_does_not_block_a_person_message_behind_it() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let message_id = harness.sent("a", "thread:b").await;
+    let person = harness.person_queues("b").await;
+    harness.messaging_enabled.send_replace(false);
+
+    harness.provider_turn("b", "turn-b", "working", true).await;
+
+    let row = harness.until_status(&message_id, "held").await;
+    assert_eq!(row.reason, Some(AgentMessageReason::MessagingOff));
+    harness
+        .until_entry(&row.delivery_command_id.expect("entry"), "dismissed")
+        .await;
+    harness.until_entry(&person, "delivered").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_held_message_has_no_live_queue_entry_after_a_restart_between_hold_and_withdrawal() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let message_id = harness.sent_untracked("a", "thread:b").await;
+    let person = harness.person_queues("b").await;
+    // The hold was written, then the server stopped before the entry was withdrawn.
+    let held_id = message_id.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            crate::agent_messaging::store::set_status(
+                connection,
+                &held_id,
+                crate::agent_messaging::store::AgentMessageStatus::Held,
+                Some(AgentMessageReason::MessagingOff),
+                CREATED_AT,
+            )
+        })
+        .await
+        .expect("held");
+
+    crate::agent_messaging::delivery::reconcile_all(&harness.engine, None)
+        .await
+        .expect("startup reconciliation");
+
+    let row = harness.message_row(&message_id).await;
+    assert_eq!(row.status.as_str(), "held");
+    assert_eq!(
+        harness
+            .entry_state(&row.delivery_command_id.expect("entry"))
+            .await,
+        "dismissed"
+    );
+    harness.provider_turn("b", "turn-b", "working", true).await;
+    harness.until_entry(&person, "delivered").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_delivery_leaves_nothing_for_a_person_to_retry() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let message_id = harness.sent("a", "thread:p").await;
+    harness
+        .delivery_moves(
+            &message_id,
+            &[("pending", "sending"), ("sending", "failed")],
+        )
+        .await;
+    let row = harness.until_status(&message_id, "failed").await;
+    let command_id = row.delivery_command_id.expect("entry");
+    harness.until_entry(&command_id, "dismissed").await;
+
+    let retry = harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.turn-delivery.resolve", "commandId": "person-retry", "threadId": "p",
+            "messageId": row.delivery_message_id.expect("delivery message"), "action": "retry",
+            "createdAt": CREATED_AT,
+        })))
+        .await;
+
+    assert!(retry.is_err(), "nothing to retry");
+    assert_eq!(harness.entry_state(&command_id).await, "dismissed");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_directory_marks_a_higher_mode_recipient_as_not_receivable() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("a", "auto-accept-edits").await;
+    harness.set_mode("p", "approval-required").await;
+
+    let result = harness.agents_list("a", true).await;
+
+    let can_receive: Vec<(&str, bool)> = named(&result)
+        .into_iter()
+        .map(|agent| {
+            (
+                agent["address"].as_str().expect("address"),
+                agent["canReceive"].as_bool().expect("canReceive"),
+            )
+        })
+        .collect();
+    assert_eq!(can_receive, [("thread:b", false), ("thread:p", true)]);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_mode_that_falls_holds_nothing() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let message_id = harness.sent("a", "thread:b").await;
+    harness.until_status(&message_id, "queued").await;
+
+    harness.set_mode("b", "approval-required").await;
+    harness.provider_turn("b", "turn-b", "working", true).await;
+
+    harness.until_status(&message_id, "delivered").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_already_delivered_is_not_held_by_a_later_mode_change() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.set_mode("a", "auto-accept-edits").await;
+    harness.set_mode("p", "auto-accept-edits").await;
+    let message_id = harness.sent("a", "thread:p").await;
+    harness.until_status(&message_id, "delivered").await;
+
+    harness.set_mode("p", "full-access").await;
+    harness
+        .provider_turn("p", "turn-p", "Port 5173", false)
+        .await;
+
+    let row = harness.until_status(&message_id, "consumed").await;
+    assert_eq!(row.reason, None);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_persons_request_is_not_gated() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.stop_delivery().await;
+    harness.messaging_untracked(true);
+    let person = harness.person_queues("p").await;
+    assert_eq!(harness.entry_state(&person).await, "pending");
+    let command_id = person.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            let tx = connection.transaction()?;
+            crate::agent_messaging::store::insert_message(
+                &tx,
+                &crate::agent_messaging::store::NewAgentMessage {
+                    message_id: "person-request".to_owned(),
+                    conversation_id: "c1".to_owned(),
+                    sender_address: "thread:a".to_owned(),
+                    sender_kind: crate::agent_messaging::store::SenderKind::Person,
+                    recipient_address: "thread:p".to_owned(),
+                    in_reply_to: None,
+                    hop: 1,
+                    text: "From a person".to_owned(),
+                    status: crate::agent_messaging::store::AgentMessageStatus::Accepted,
+                    reason: None,
+                    accepted_at: CREATED_AT.to_owned(),
+                    sender_runtime_mode: Some("approval-required".to_owned()),
+                    recipient_terminal_generation: None,
+                    send_request_id: None,
+                    client_request_id: None,
+                    delivery_command_id: Some(command_id),
+                    delivery_message_id: None,
+                },
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("a person's row");
+    harness.messaging_enabled.send_replace(false);
+
+    let claimed = harness.claim("person-request").await;
+
+    assert!(claimed.is_some(), "a person's request is claimed");
     harness.shutdown().await;
 }

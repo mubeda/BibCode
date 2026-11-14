@@ -6,9 +6,10 @@
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -53,8 +54,25 @@ impl EventPages<'_> {
 #[derive(Clone, Debug)]
 pub struct Repositories {
     database: Database,
+    agent_claims: Arc<AgentClaimHook>,
     #[cfg(test)]
     delivery_test_hooks: Arc<DeliveryRepositoryTestHooks>,
+}
+
+/// The agent message claim gate, shared by every clone, and the signal a hold it decides sends.
+#[derive(Default)]
+struct AgentClaimHook {
+    gate: std::sync::OnceLock<crate::agent_messaging::policy::AgentClaimGate>,
+    holds: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for AgentClaimHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentClaimHook")
+            .field("installed", &self.gate.get().is_some())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -88,9 +106,24 @@ impl Repositories {
     pub fn new(database: Database) -> Self {
         Self {
             database,
+            agent_claims: Arc::default(),
             #[cfg(test)]
             delivery_test_hooks: Arc::new(DeliveryRepositoryTestHooks::default()),
         }
+    }
+
+    /// Installs the agent message claim gate that `claim_provider_turn` asks first. The first
+    /// install wins.
+    pub(crate) fn set_agent_claim_gate(
+        &self,
+        gate: crate::agent_messaging::policy::AgentClaimGate,
+    ) {
+        let _ = self.agent_claims.gate.set(gate);
+    }
+
+    /// Wakes once after each hold the claim gate decided, so the entry can be withdrawn.
+    pub(crate) async fn agent_claim_held(&self) {
+        self.agent_claims.holds.notified().await;
     }
 
     pub fn database(&self) -> &Database {
@@ -1362,10 +1395,34 @@ impl Repositories {
         self.delivery_test_hooks
             .claim_calls
             .fetch_add(1, Ordering::SeqCst);
+        let gate = self.agent_claims.gate.get().cloned();
+        let claimed_at = updated_at.clone();
         // A closed (archived) chat panel starts nothing until it is reopened.
-        let result = self.database.call(move |connection| connection.query_row(
+        let result = self.database.call(move |connection| {
+            // In the claim's own call, so no claim slips between the decision and the claim.
+            if let Some(gate) = gate {
+                match gate(connection, &command_id) {
+                    crate::agent_messaging::policy::ClaimDecision::Proceed => {}
+                    crate::agent_messaging::policy::ClaimDecision::Wait => return Ok((None, false)),
+                    crate::agent_messaging::policy::ClaimDecision::Hold(reason) => {
+                        crate::agent_messaging::store::hold_pending_delivery(
+                            connection, &command_id, reason, &claimed_at,
+                        )?;
+                        // Signalled even when it was already held, so a left entry is withdrawn.
+                        return Ok((None, true));
+                    }
+                }
+            }
+            connection.query_row(
             "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
-            params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
+            params![updated_at, command_id], decode_provider_turn_delivery).optional().map(|claimed| (claimed, false)).map_err(Into::into)
+        }).await;
+        let result = result.map(|(claimed, held)| {
+            if held {
+                self.agent_claims.holds.notify_one();
+            }
+            claimed
+        });
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
             let pause = self

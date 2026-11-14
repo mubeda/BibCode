@@ -366,6 +366,93 @@ pub(crate) fn list_open(connection: &rusqlite::Connection) -> Result<Vec<AgentMe
     Ok(rows)
 }
 
+/// Holds the agent message of queue entry `command_id` with `reason`, only while that entry is
+/// still `pending` and the message waits for it; returns whether it changed.
+pub(crate) fn hold_pending_delivery(
+    connection: &rusqlite::Connection,
+    command_id: &str,
+    reason: AgentMessageReason,
+    updated_at: &str,
+) -> Result<bool> {
+    let changed = connection.execute(
+        "UPDATE agent_messages SET status = 'held', reason = ?2, updated_at = ?3
+          WHERE delivery_command_id = ?1 AND sender_kind = 'agent'
+            AND status IN ('accepted', 'queued', 'held') AND NOT (status = 'held' AND reason IS ?2)
+            AND EXISTS(SELECT 1 FROM provider_turn_outbox WHERE command_id = ?1 AND state = 'pending')",
+        params![command_id, reason.as_str(), updated_at],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Holds, with `recipient_mode_above_sender`, every agent message to `recipient_address` (every
+/// recipient when `None`) still waiting in the queue whose recipient now runs with more access
+/// than its sender had when it sent it. Run in one database call, so no claim falls between
+/// the check of the entry and the hold.
+pub(crate) fn hold_above_ceiling(
+    connection: &rusqlite::Connection,
+    recipient_address: Option<&str>,
+    updated_at: &str,
+) -> Result<usize> {
+    let mut statement = connection.prepare_cached(
+        "SELECT message.message_id, message.sender_runtime_mode, thread.runtime_mode
+           FROM agent_messages AS message
+           JOIN projection_threads AS thread ON 'thread:' || thread.thread_id = message.recipient_address
+           JOIN provider_turn_outbox AS entry ON entry.command_id = message.delivery_command_id
+          WHERE message.sender_kind = 'agent' AND message.status IN ('accepted', 'queued')
+            AND entry.state IN ('queued', 'pending')
+            AND (?1 IS NULL OR message.recipient_address = ?1)
+          ORDER BY message.rowid",
+    )?;
+    let waiting = statement
+        .query_map(params![recipient_address], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut held = 0;
+    for (message_id, sender_mode, recipient_mode) in waiting {
+        if sender_mode.is_some_and(|sender| super::policy::ceiling_allows(&sender, &recipient_mode))
+        {
+            continue;
+        }
+        if set_status(
+            connection,
+            &message_id,
+            AgentMessageStatus::Held,
+            Some(AgentMessageReason::RecipientModeAboveSender),
+            updated_at,
+        )? {
+            held += 1;
+        }
+    }
+    Ok(held)
+}
+
+/// The messages that must not wait in a queue, whose entry still does: a final one, or one held
+/// for the setting or the mode ceiling (a message held for its recipient's paused queue or an
+/// uncertain delivery keeps its entry for a person). Acceptance order.
+pub(crate) fn list_needing_withdrawal(
+    connection: &rusqlite::Connection,
+    recipient_address: Option<&str>,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE (status IN ('completed', 'cancelled', 'failed')
+                 OR (status = 'held' AND reason IN ('messaging_off', 'recipient_mode_above_sender')))
+            AND (?1 IS NULL OR recipient_address = ?1)
+            AND delivery_command_id IN (SELECT command_id FROM provider_turn_outbox
+                                         WHERE state IN ('queued', 'pending', 'failed'))
+          ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![recipient_address], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Whether queue entry `command_id` delivering `message_id` is an agent's message: the server
 /// stored its row in the queue entry's own transaction, so no text a person sends makes it one.
 pub(crate) fn is_agent_message_delivery(
