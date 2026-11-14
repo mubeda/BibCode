@@ -312,6 +312,20 @@ pub(crate) fn apply_relink(
     Ok(changed == 1)
 }
 
+/// Whether queue entry `command_id` delivering `message_id` is an agent's message: the server
+/// stored its row in the queue entry's own transaction, so no text a person sends makes it one.
+pub(crate) fn is_agent_message_delivery(
+    connection: &rusqlite::Connection,
+    command_id: &str,
+    message_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_messages WHERE delivery_command_id = ?1 AND delivery_message_id = ?2 AND sender_kind = 'agent')",
+        params![command_id, message_id],
+        |row| row.get(0),
+    )?)
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentMessageStore {
     database: Database,

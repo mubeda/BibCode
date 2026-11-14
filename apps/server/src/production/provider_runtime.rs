@@ -422,6 +422,18 @@ pub trait ProviderDriver: Send + Sync {
             }
         })
     }
+    /// [`Self::deliver`] for an agent message's envelope, which the server decided from the
+    /// message's stored row, never from its text. A driver whose provider would expand text the
+    /// person's way marks it here.
+    fn deliver_agent_message(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        interaction_mode: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        self.deliver(text, attachments, interaction_mode, delivery_key)
+    }
     fn steer(
         &self,
         _text: String,
@@ -3089,6 +3101,7 @@ mod workspace_loss_tests {
         /// provider took but did not reply to.
         compact_hangs: Arc<AtomicBool>,
         interrupts: Arc<AtomicUsize>,
+        agent_deliveries: Arc<AtomicUsize>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3131,6 +3144,17 @@ mod workspace_loss_tests {
                 self.native_returned.notify_one();
                 Ok((!self.unknown_turn_id.load(Ordering::SeqCst)).then(|| "turn-1".to_owned()))
             })
+        }
+
+        fn deliver_agent_message(
+            &self,
+            text: String,
+            attachments: Vec<Value>,
+            interaction_mode: String,
+            delivery_key: String,
+        ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+            self.agent_deliveries.fetch_add(1, Ordering::SeqCst);
+            self.deliver(text, attachments, interaction_mode, delivery_key)
         }
 
         fn steer(
@@ -4593,6 +4617,78 @@ mod workspace_loss_tests {
                 .is_none()
         );
         assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    /// The delivery path asks the driver for agent treatment only for a turn whose agent message
+    /// row the server stored, never for a person's turn that pastes the same envelope.
+    #[tokio::test]
+    async fn only_a_stored_agent_message_is_delivered_as_one() {
+        use crate::agent_messaging::{envelope, store};
+        let f = Fixture::new(true).await;
+        let text = envelope::build_envelope(&envelope::EnvelopeInput {
+            sender_title: "Sender",
+            provider: "codex",
+            sender_address: "thread:sender",
+            message_id: "a1",
+            conversation_id: "c1",
+            in_reply_to: None,
+            text: "@src/secret.txt",
+        });
+        f.engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let tx = connection.transaction()?;
+                store::insert_message(
+                    &tx,
+                    &store::NewAgentMessage {
+                        message_id: "a1".to_owned(),
+                        conversation_id: "c1".to_owned(),
+                        sender_address: "thread:sender".to_owned(),
+                        sender_kind: store::SenderKind::Agent,
+                        recipient_address: "thread:t1".to_owned(),
+                        in_reply_to: None,
+                        hop: 1,
+                        text: "@src/secret.txt".to_owned(),
+                        status: store::AgentMessageStatus::Accepted,
+                        reason: None,
+                        accepted_at: BEFORE_LOSS.to_owned(),
+                        sender_runtime_mode: None,
+                        recipient_terminal_generation: None,
+                        send_request_id: None,
+                        client_request_id: None,
+                        delivery_command_id: Some("agent-turn".to_owned()),
+                        delivery_message_id: Some("agent-turn".to_owned()),
+                    },
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        for (id, agent_deliveries) in [("pasted-turn", 0), ("agent-turn", 1)] {
+            let mut command = serde_json::to_value(turn(id, false)).unwrap();
+            command["message"]["text"] = json!(text);
+            let delivery = f
+                .supervisor
+                .deliver_turn(serde_json::from_value(command).unwrap(), format!("{id}-key"))
+                .await
+                .unwrap();
+            let outcome = timeout(Duration::from_secs(5), delivery.completion())
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+                "{id}: {outcome:?}"
+            );
+            assert_eq!(
+                f.driver.agent_deliveries.load(Ordering::SeqCst),
+                agent_deliveries,
+                "{id}"
+            );
+        }
         f.shutdown().await;
     }
 
@@ -7888,6 +7984,47 @@ fn active_provider_session_id(
     Ok(session_id.to_owned())
 }
 
+/// What a durable delivery sends.
+#[derive(Debug, PartialEq)]
+enum DeliveryText {
+    /// An agent message: its envelope goes out whole, so a provider still sees it as one and
+    /// expands nothing in it, and an owed handoff waits for the next turn.
+    AgentMessage,
+    Turn(Option<TurnHandoff>),
+}
+
+/// An agent message is known from the row the server stored with its queue entry
+/// (`command_id`), never from its text, so a person's pasted envelope stays a person's message.
+async fn delivery_text(
+    repositories: &Repositories,
+    pending: &AtomicBool,
+    side_chat: Option<(&str, &AtomicBool)>,
+    thread_id: &str,
+    command_id: &str,
+    message: &ThreadMessageInput,
+) -> Result<DeliveryText, String> {
+    let (command_id, message_id) = (command_id.to_owned(), message.message_id.clone());
+    let agent_message = repositories
+        .database()
+        .call(move |connection| {
+            crate::agent_messaging::store::is_agent_message_delivery(
+                connection,
+                &command_id,
+                &message_id,
+            )
+        })
+        .await
+        .map_err(|error| {
+            delivery_detail(&ProviderRuntimeError::Persistence(error.to_string()), None)
+        })?;
+    if agent_message {
+        return Ok(DeliveryText::AgentMessage);
+    }
+    text_with_pending_context_handoff(repositories, pending, side_chat, thread_id, message)
+        .await
+        .map(DeliveryText::Turn)
+}
+
 async fn spawn_delivery(
     engine: &OrchestrationEngine,
     sessions: &mut HashMap<String, SessionEntry>,
@@ -7898,6 +8035,7 @@ async fn spawn_delivery(
     generation: u64,
 ) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
     let OrchestrationCommand::ThreadTurnStart {
+        command_id,
         thread_id,
         message,
         interaction_mode,
@@ -8008,19 +8146,30 @@ async fn spawn_delivery(
                 },
             }
         } else {
-            match text_with_pending_context_handoff(
+            match delivery_text(
                 &repositories,
                 &pending_context_handoff,
                 side_chat_seed_ref(&side_chat),
                 &terminal.thread_id,
+                &command_id,
                 &message,
             )
             .await
             {
-                // A side chat that owes its seed sends nothing without it; the delivery fails
-                // and its retry carries the seed.
+                // A side chat that owes its seed sends nothing without it, and an unreadable
+                // provenance sends nothing either; the delivery fails and its retry reads again.
                 Err(detail) => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
-                Ok(handoff) => {
+                Ok(DeliveryText::AgentMessage) => {
+                    driver
+                        .deliver_agent_message(
+                            message.text,
+                            message.attachments,
+                            interaction_mode,
+                            delivery_key,
+                        )
+                        .await
+                }
+                Ok(DeliveryText::Turn(handoff)) => {
                     let (text, carried) = match handoff {
                         Some(handoff) => (handoff.text, Some(handoff.side_chat_seed)),
                         None => (message.text, None),
@@ -8283,9 +8432,8 @@ fn quote_thread_context_text(text: &str) -> String {
 
 /// The text a turn sends when its session owes the thread a context handoff. `Ok(None)` sends
 /// the turn as written: no handoff is owed, the turn is a provider command (`/…`, which leaves
-/// the handoff for the next turn) or an agent envelope (sent whole, so a provider still sees it
-/// as one and expands nothing in it; the handoff waits for the next turn), or the thread has no
-/// earlier messages (which settles the handoff). A side chat (`side_chat`: its host and whether its seed was shared) that has not
+/// the handoff for the next turn), or the thread has no earlier messages (which settles the
+/// handoff). A side chat (`side_chat`: its host and whether its seed was shared) that has not
 /// shared its seed gets its host's messages instead, which stand in for a lost-session handoff;
 /// `Err` is the detail of a turn that must not be sent because that seed could not be read.
 async fn text_with_pending_context_handoff(
@@ -8295,9 +8443,7 @@ async fn text_with_pending_context_handoff(
     thread_id: &str,
     message: &ThreadMessageInput,
 ) -> Result<Option<TurnHandoff>, String> {
-    if message.text.starts_with('/')
-        || crate::agent_messaging::envelope::is_agent_envelope(&message.text)
-    {
+    if message.text.starts_with('/') {
         return Ok(None);
     }
     if let Some((host_thread_id, shared)) = side_chat
@@ -19330,10 +19476,10 @@ impl ClaudeDriver {
     }
 }
 
-/// The stream-json line of a user turn. An agent envelope carries `client_composed`, with which
+/// The stream-json line of a user turn. An agent message carries `client_composed`, with which
 /// Claude Code expands no `@path` in the text and still replays the line, so the delivery is
 /// acknowledged (probed on Claude Code 2.1.323; `isSynthetic` also stops the expansion but
-/// also the replay). A person's text never carries it.
+/// also the replay). A person's text never carries it, even a pasted envelope.
 fn claude_user_line(session_id: &str, content: Vec<Value>, agent_envelope: bool) -> Value {
     let mut line = json!({
         "type":"user",
@@ -19348,12 +19494,37 @@ fn claude_user_line(session_id: &str, content: Vec<Value>, agent_envelope: bool)
 }
 
 impl ClaudeDriver {
+    /// A new turn's line; `agent_envelope` is the server's provenance, never the text's.
+    async fn deliver_turn_line(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        delivery_key: String,
+        agent_envelope: bool,
+    ) -> ProviderDeliveryOutcome {
+        let outcome = self
+            .deliver_user_line(text, attachments, None, delivery_key, agent_envelope)
+            .await;
+        if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
+            return outcome;
+        }
+        // Claude never took up the conversation, so this message failed for that reason, and
+        // sending it again to the same launch would fail the same way.
+        match self.launch_refusal().await {
+            Some(detail) => ProviderDeliveryOutcome::Rejected {
+                detail: detail.to_owned(),
+            },
+            None => outcome,
+        }
+    }
+
     async fn deliver_user_line(
         &self,
         text: String,
         attachments: Vec<Value>,
         expected_turn_id: Option<String>,
         delivery_key: String,
+        agent_envelope: bool,
     ) -> ProviderDeliveryOutcome {
         let (steer_cancellation, acknowledgement_cancellation, compacting) = {
             let runtime = self.runtime.lock().await;
@@ -19373,7 +19544,6 @@ impl ClaudeDriver {
                 runtime.compaction_watch(),
             )
         };
-        let agent_envelope = crate::agent_messaging::envelope::is_agent_envelope(&text);
         let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
             Ok(input) => input,
             Err(error) => {
@@ -19661,7 +19831,6 @@ impl ProviderDriver for ClaudeDriver {
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
             let turn_id = Uuid::new_v4().to_string();
-            let agent_envelope = crate::agent_messaging::envelope::is_agent_envelope(&text);
             let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
             self.runtime
@@ -19671,7 +19840,7 @@ impl ProviderDriver for ClaudeDriver {
                     turn_id: turn_id.clone(),
                     input: text.clone(),
                 });
-            self.write_json(claude_user_line(&self.session_id, content, agent_envelope))
+            self.write_json(claude_user_line(&self.session_id, content, false))
                 .await?;
             Ok(Some(turn_id))
         })
@@ -19683,22 +19852,16 @@ impl ProviderDriver for ClaudeDriver {
         _: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(async move {
-            let outcome = self
-                .deliver_user_line(text, attachments, None, delivery_key)
-                .await;
-            if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
-                return outcome;
-            }
-            // Claude never took up the conversation, so this message failed for that reason, and
-            // sending it again to the same launch would fail the same way.
-            match self.launch_refusal().await {
-                Some(detail) => ProviderDeliveryOutcome::Rejected {
-                    detail: detail.to_owned(),
-                },
-                None => outcome,
-            }
-        })
+        Box::pin(self.deliver_turn_line(text, attachments, delivery_key, false))
+    }
+    fn deliver_agent_message(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(self.deliver_turn_line(text, attachments, delivery_key, true))
     }
     fn steer(
         &self,
@@ -19707,7 +19870,13 @@ impl ProviderDriver for ClaudeDriver {
         expected_turn_id: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(self.deliver_user_line(text, attachments, Some(expected_turn_id), delivery_key))
+        Box::pin(self.deliver_user_line(
+            text,
+            attachments,
+            Some(expected_turn_id),
+            delivery_key,
+            false,
+        ))
     }
     fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
         Box::pin(self.write_compaction(compaction_id))
@@ -33670,15 +33839,17 @@ done
             .collect()
     }
 
-    /// Delivers each text through the turn queue's own entry point (`deliver`) and waits until
-    /// the fixture captured one more request matching `sent` after each, so the order holds.
-    /// A delivery may wait on an acknowledgement the fixture never sends, so it runs on its own
-    /// task and is dropped once its request is captured.
+    /// Delivers each text through the turn queue's own entry points, the first `agent_messages`
+    /// as agent messages (`deliver_agent_message`) and the rest as a person's (`deliver`), and
+    /// waits until the fixture captured one more request matching `sent` after each, so the
+    /// order holds. A delivery may wait on an acknowledgement the fixture never sends, so it runs
+    /// on its own task and is dropped once its request is captured.
     async fn deliver_and_capture(
         driver: &Arc<dyn super::ProviderDriver>,
         deadline: ProviderFixtureDeadline,
         path: &std::path::Path,
         texts: &[String],
+        agent_messages: usize,
         sent: impl Fn(&Value) -> bool,
     ) -> Vec<Value> {
         let mut deliveries = Vec::new();
@@ -33686,14 +33857,16 @@ done
             let delivering = driver.clone();
             let text = text.clone();
             deliveries.push(tokio::spawn(async move {
-                delivering
-                    .deliver(
-                        text,
-                        Vec::new(),
-                        "default".to_owned(),
-                        format!("key-{index}"),
-                    )
-                    .await
+                let key = format!("key-{index}");
+                if index < agent_messages {
+                    delivering
+                        .deliver_agent_message(text, Vec::new(), "default".to_owned(), key)
+                        .await
+                } else {
+                    delivering
+                        .deliver(text, Vec::new(), "default".to_owned(), key)
+                        .await
+                }
             }));
             deadline
                 .observe(async {
@@ -33740,9 +33913,14 @@ done
             .expect("Codex starts");
         let cases = literal_delivery_envelopes();
         let envelopes: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
-        let turns = deliver_and_capture(&driver, deadline, &capture_path, &envelopes, |request| {
-            request["method"] == "turn/start"
-        })
+        let turns = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &envelopes,
+            envelopes.len(),
+            |request| request["method"] == "turn/start",
+        )
         .await;
         let requests = captured_lines(&capture_path);
         driver.shutdown().await.expect("Codex shuts down");
@@ -33803,9 +33981,14 @@ done
         texts.push(person_text.to_owned());
         // A person may paste a whole envelope; only the server's provenance makes it an agent's.
         texts.push(cases[0].1.clone());
-        let users = deliver_and_capture(&driver, deadline, &capture_path, &texts, |request| {
-            request["type"] == "user"
-        })
+        let users = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &texts,
+            cases.len(),
+            |request| request["type"] == "user",
+        )
         .await;
         driver.shutdown().await.expect("Claude shuts down");
 
@@ -33900,7 +34083,7 @@ done
             let envelope = envelope.clone();
             let delivery = tokio::spawn(async move {
                 delivering
-                    .deliver(
+                    .deliver_agent_message(
                         envelope,
                         Vec::new(),
                         "default".to_owned(),
@@ -33961,12 +34144,18 @@ done
             .expect("the ACP driver starts");
         let cases = literal_delivery_envelopes();
         let envelopes: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
-        let prompts =
-            deliver_and_capture(&driver, deadline, &capture_path, &envelopes, |request| {
+        let prompts = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &envelopes,
+            envelopes.len(),
+            |request| {
                 request["method"] == "session/prompt"
                     && request["params"]["sessionId"] == session_id
-            })
-            .await;
+            },
+        )
+        .await;
         driver.shutdown().await.expect("the ACP driver shuts down");
 
         assert_eq!(prompts.len(), cases.len());
@@ -34016,19 +34205,59 @@ done
             .expect("a pasted envelope is sent");
             assert!(handoff.is_some(), "a person's pasted envelope gets the handoff");
         }
-        let person = super::text_with_pending_context_handoff(
-            &repositories,
-            &pending,
-            None,
-            "t",
-            &message("hello"),
-        )
-        .await
-        .expect("a person's text is sent");
+        let (_, envelope) = literal_delivery_envelopes().remove(0);
+        let delivered = |command_id: &'static str| {
+            let (repositories, pending, message) = (&repositories, &pending, message(&envelope));
+            async move {
+                super::delivery_text(repositories, pending, None, "t", command_id, &message)
+                    .await
+                    .expect("readable")
+            }
+        };
         assert!(
-            person.is_some(),
-            "the handoff still waits for the next turn of a person"
+            matches!(delivered("person-turn").await, super::DeliveryText::Turn(Some(_))),
+            "with no stored agent message the pasted envelope is a person's turn"
         );
+        repositories
+            .database()
+            .call(|connection| {
+                let tx = connection.transaction()?;
+                crate::agent_messaging::store::insert_message(
+                    &tx,
+                    &crate::agent_messaging::store::NewAgentMessage {
+                        message_id: "a1".to_owned(),
+                        conversation_id: "c1".to_owned(),
+                        sender_address: "thread:sender".to_owned(),
+                        sender_kind: crate::agent_messaging::store::SenderKind::Agent,
+                        recipient_address: "thread:t".to_owned(),
+                        in_reply_to: None,
+                        hop: 1,
+                        text: "hello".to_owned(),
+                        status: crate::agent_messaging::store::AgentMessageStatus::Accepted,
+                        reason: None,
+                        accepted_at: "2026-11-14T00:00:00Z".to_owned(),
+                        sender_runtime_mode: None,
+                        recipient_terminal_generation: None,
+                        send_request_id: None,
+                        client_request_id: None,
+                        delivery_command_id: Some("agent-message:a1".to_owned()),
+                        delivery_message_id: Some("m2".to_owned()),
+                    },
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("agent message stored");
+        assert_eq!(
+            delivered("agent-message:a1").await,
+            super::DeliveryText::AgentMessage,
+            "the stored row, not the text, makes it an agent's message"
+        );
+        assert!(matches!(
+            delivered("person-turn").await,
+            super::DeliveryText::Turn(Some(_))
+        ));
     }
 
     #[tokio::test]
