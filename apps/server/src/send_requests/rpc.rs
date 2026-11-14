@@ -6,7 +6,9 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::service::{SendRequestsSendInput, SendRequestsService, refusal};
+use super::service::{
+    SendRequestsGetHandoffTextInput, SendRequestsSendInput, SendRequestsService, refusal,
+};
 use crate::rpc::RpcRegistry;
 
 #[derive(Deserialize)]
@@ -67,6 +69,17 @@ pub(crate) fn register_send_requests_rpc(registry: &mut RpcRegistry, service: Se
             encode(service.get_answer(&context, &input.request_id).await?)
         }
     });
+    let handoff = service.clone();
+    registry.register_unary_with_context(
+        "sendRequests.getHandoffText",
+        move |request, context, _| {
+            let service = handoff.clone();
+            async move {
+                let input = decode::<SendRequestsGetHandoffTextInput>(request.payload)?;
+                encode(service.handoff_text(&context, input).await?)
+            }
+        },
+    );
     registry.register_stream_with_context(
         "sendRequests.subscribe",
         move |request, context, cancellation| match decode::<SubscribeInput>(request.payload) {

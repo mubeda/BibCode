@@ -10,8 +10,9 @@ use crate::{
     send_requests::{
         rpc::register_send_requests_rpc,
         service::{
-            ANSWER_TEXT_MAX_CHARS, RequestChange, SendRequestAttachment, SendRequestsSendInput,
-            SendRequestsService, compose_message_text, require_person, turn_command,
+            ANSWER_TEXT_MAX_CHARS, RequestChange, SendRequestAttachment,
+            SendRequestsGetHandoffTextInput, SendRequestsSendInput, SendRequestsService,
+            compose_message_text, require_person, turn_command,
         },
         store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange},
     },
@@ -2981,5 +2982,216 @@ async fn state_a_sweep_drops_the_requests_of_a_source_deleted_while_not_followin
         stored_request(&harness, "kept").await.state,
         SendState::Queued
     );
+    harness.shutdown().await;
+}
+
+fn handoff_input(source_thread_id: &str, thread_id: &str) -> SendRequestsGetHandoffTextInput {
+    SendRequestsGetHandoffTextInput {
+        source_thread_id: source_thread_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+    }
+}
+
+async fn store_message(harness: &Harness, thread_id: &str, index: usize, role: &str, text: &str) {
+    harness
+        .repositories
+        .upsert_message(crate::persistence::ProjectionThreadMessage {
+            message_id: format!("{thread_id}-m{index:03}"),
+            thread_id: thread_id.to_owned(),
+            turn_id: None,
+            role: role.to_owned(),
+            text: text.to_owned(),
+            attachments: None,
+            is_streaming: false,
+            delivery_state: None,
+            delivery_provider: None,
+            delivery_provider_instance_id: None,
+            delivery_detail: None,
+            delivery_reason: None,
+            delivery_mode: None,
+            delivery_held: None,
+            resend_of_message_id: None,
+            actor: None,
+            source_thread_id: None,
+            person_send: None,
+            created_at: format!("2026-10-30T00:{:02}:{:02}.000Z", index / 60, index % 60),
+            updated_at: format!("2026-10-30T00:{:02}:{:02}.000Z", index / 60, index % 60),
+        })
+        .await
+        .expect("message stored");
+}
+
+/// `count` messages on `thread_id`, the person's first, then alternating with the agent.
+async fn store_thread(harness: &Harness, thread_id: &str, count: usize) {
+    for index in 0..count {
+        let role = if index.is_multiple_of(2) {
+            "user"
+        } else {
+            "assistant"
+        };
+        store_message(harness, thread_id, index, role, &format!("message {index}")).await;
+    }
+}
+
+/// The event-log length, the outbox row count and the session of `thread_id`, as JSON.
+async fn untouched_state(harness: &Harness, thread_id: &str) -> (i64, i64, Value) {
+    let session = harness
+        .repositories
+        .get_thread_session(thread_id.to_owned())
+        .await
+        .unwrap();
+    (
+        count(harness, "SELECT COUNT(*) FROM orchestration_events").await,
+        count(harness, "SELECT COUNT(*) FROM provider_turn_outbox").await,
+        serde_json::to_value(session).unwrap(),
+    )
+}
+
+async fn handoff_refused(harness: &Harness, input: SendRequestsGetHandoffTextInput) -> String {
+    let error = harness
+        .send_requests()
+        .handoff_text(&person(), input)
+        .await
+        .expect_err("the read is refused");
+    assert_eq!(error["_tag"], "SendRequestError", "{error}");
+    assert!(error.get("text").is_none(), "nothing is returned: {error}");
+    error["reason"].as_str().unwrap_or_default().to_owned()
+}
+
+#[tokio::test]
+async fn handoff_reads_another_thread_of_the_project_and_sends_nothing_to_it() {
+    let harness = harness().await;
+    session(&harness, "a", "running").await;
+    store_thread(&harness, "a", 4).await;
+    let before = untouched_state(&harness, "a").await;
+
+    let result = harness
+        .send_requests()
+        .handoff_text(&person(), handoff_input("b", "a"))
+        .await
+        .expect("readable");
+
+    assert_eq!(result.thread_id, "a");
+    assert_eq!(
+        result.text,
+        "[user] message 0\n[assistant] message 1\n[user] message 2\n[assistant] message 3"
+    );
+    assert_eq!(untouched_state(&harness, "a").await, before);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_of_a_thread_that_stopped_with_a_full_context_window_is_still_readable() {
+    let harness = harness().await;
+    dispatch(
+        &harness,
+        json!({
+            "type": "thread.session.set", "commandId": "session-a-full", "threadId": "a",
+            "session": {
+                "threadId": "a", "status": "error", "providerName": "codex",
+                "providerInstanceId": "codex", "runtimeMode": "full-access",
+                "activeTurnId": null, "lastError": "The context window is full.",
+                "lastErrorClass": "context_limit", "updatedAt": AT,
+            },
+            "createdAt": AT,
+        }),
+    )
+    .await;
+    store_thread(&harness, "a", 2).await;
+    let before = untouched_state(&harness, "a").await;
+    assert_eq!(before.2["last_error_class"], "context_limit");
+
+    let result = harness
+        .send_requests()
+        .handoff_text(&person(), handoff_input("b", "a"))
+        .await
+        .expect("a thread that cannot take a turn can still be read");
+
+    assert_eq!(result.text, "[user] message 0\n[assistant] message 1");
+    assert_eq!(
+        untouched_state(&harness, "a").await,
+        before,
+        "no command and no turn"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_result_equals_the_builder_output() {
+    let harness = harness().await;
+    store_thread(&harness, "a", 300).await;
+
+    let result = harness
+        .send_requests()
+        .handoff_text(&person(), handoff_input("a", "a"))
+        .await
+        .expect("a thread hands off its own text");
+
+    let messages = harness
+        .repositories
+        .list_messages_by_thread("a".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        result.text,
+        crate::production::thread_context::handoff_text(&messages, "").render()
+    );
+    let lines = result.text.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "[user] message 0");
+    assert_eq!(lines[1], "[... 259 earlier messages left out ...]");
+    assert_eq!(lines[41], "[assistant] message 299");
+    assert_eq!(result.left_out, 259);
+    assert_eq!(
+        result.included_messages, 41,
+        "the first message and the tail"
+    );
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["leftOut"], 259);
+    assert_eq!(wire["includedMessages"], 41);
+    assert_eq!(wire["threadId"], "a");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_refuses_an_outside_agent_session() {
+    let harness = harness().await;
+    store_thread(&harness, "a", 2).await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let context = RpcSessionContext::authenticated(agent.principal.clone(), harness.auth.clone());
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, harness.send_requests());
+
+    let error = registry
+        .invoke_local(
+            "sendRequests.getHandoffText",
+            json!({ "sourceThreadId": "b", "threadId": "a" }),
+            context,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("an outside agent is refused");
+
+    assert_eq!(error["reason"], "person_only", "{error}");
+    assert!(!error.to_string().contains("message 0"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_refuses_a_thread_of_another_project() {
+    let harness = harness().await;
+    store_thread(&harness, "c", 2).await;
+    assert_eq!(
+        handoff_refused(&harness, handoff_input("b", "c")).await,
+        "other_project"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_refuses_an_unknown_thread() {
+    let harness = harness().await;
+    for input in [handoff_input("b", "missing"), handoff_input("missing", "a")] {
+        assert_eq!(handoff_refused(&harness, input).await, "unknown_thread");
+    }
     harness.shutdown().await;
 }

@@ -33,6 +33,7 @@ mod repository_identity;
 pub mod runtime;
 pub mod server_terminal;
 pub mod step_gate;
+pub(crate) mod thread_context;
 mod tool_maintenance;
 pub use tool_maintenance::TOOL_UPDATE_SHUTDOWN_WAIT;
 pub mod transfer_routes;

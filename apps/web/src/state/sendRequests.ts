@@ -8,6 +8,7 @@ import type {
   EnvironmentId,
   SendRequest,
   SendRequestError,
+  SendRequestsGetHandoffTextInput,
   SendRequestsSendInput,
 } from "@bibcode/contracts";
 import { useCallback, useMemo } from "react";
@@ -85,6 +86,19 @@ export function useDismissSendRequest(environmentId: EnvironmentId) {
   return useCallback(
     async (requestId: string): Promise<SendOutcome> =>
       outcomeFromCommandResult(await run({ environmentId, input: { requestId } })),
+    [environmentId, run],
+  );
+}
+
+/** A thread's handoff text, read from its stored messages; rejects when it cannot be read. */
+export function useGetHandoffText(environmentId: EnvironmentId) {
+  const run = useAtomCommand(sendRequestsEnvironment.getHandoffText, { reportFailure: false });
+  return useCallback(
+    async (input: SendRequestsGetHandoffTextInput) => {
+      const result = await run({ environmentId, input });
+      if (result._tag !== "Success") throw new Error("The handoff text could not be read.");
+      return result.value;
+    },
     [environmentId, run],
   );
 }

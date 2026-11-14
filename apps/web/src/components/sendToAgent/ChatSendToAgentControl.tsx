@@ -9,9 +9,12 @@ import type { DefaultAgentSelection, ScopedThreadRef, ThreadId } from "@bibcode/
 import { memo, useCallback, useMemo, type ReactNode } from "react";
 
 import { useProjects, useThreadMessages, useThreadShell } from "~/state/entities";
+import { useEnvironmentQuery } from "~/state/query";
 import { useSendRequest } from "~/state/sendRequests";
+import { serverEnvironment } from "~/state/server";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { useAgentRows } from "../agents/useAgentRows";
+import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
 import type {
   NewPanelProvider,
@@ -34,8 +37,16 @@ function LiveSendInputsReader(props: {
 }) {
   const messages = useThreadMessages(props.threadRef);
   const rows = useAgentRows();
+  const usage =
+    useEnvironmentQuery(
+      serverEnvironment.providerUsage({ environmentId: props.threadRef.environmentId, input: {} }),
+    ).data ?? null;
   const source = useMemo(() => ({ ...props.base, messages }), [messages, props.base]);
-  return props.render({ source, rows });
+  const hintFor = useCallback(
+    (row: AgentRow) => resolveOutOfTokensHint({ row, usage, now: new Date() }),
+    [usage],
+  );
+  return props.render({ source, rows, hintFor });
 }
 
 export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props: {
@@ -43,6 +54,7 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
   readonly serverSupported: boolean;
   readonly newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
   readonly createPanel: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
+  readonly revealPanel: (panel: ThreadId) => void;
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
 }) {
   const { threadRef, newPanelProvidersFor } = props;
@@ -92,6 +104,7 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
       previewContentFor={props.previewContentFor}
       send={send}
       createPanel={props.createPanel}
+      revealPanel={props.revealPanel}
     />
   );
 });
