@@ -4673,7 +4673,10 @@ mod workspace_loss_tests {
             command["message"]["text"] = json!(text);
             let delivery = f
                 .supervisor
-                .deliver_turn(serde_json::from_value(command).unwrap(), format!("{id}-key"))
+                .deliver_turn(
+                    serde_json::from_value(command).unwrap(),
+                    format!("{id}-key"),
+                )
                 .await
                 .unwrap();
             let outcome = timeout(Duration::from_secs(5), delivery.completion())
@@ -34203,7 +34206,10 @@ done
             )
             .await
             .expect("a pasted envelope is sent");
-            assert!(handoff.is_some(), "a person's pasted envelope gets the handoff");
+            assert!(
+                handoff.is_some(),
+                "a person's pasted envelope gets the handoff"
+            );
         }
         let (_, envelope) = literal_delivery_envelopes().remove(0);
         let delivered = |command_id: &'static str| {
@@ -34215,7 +34221,10 @@ done
             }
         };
         assert!(
-            matches!(delivered("person-turn").await, super::DeliveryText::Turn(Some(_))),
+            matches!(
+                delivered("person-turn").await,
+                super::DeliveryText::Turn(Some(_))
+            ),
             "with no stored agent message the pasted envelope is a person's turn"
         );
         repositories
