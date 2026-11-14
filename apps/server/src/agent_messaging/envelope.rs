@@ -72,7 +72,11 @@ fn header_value(value: &str) -> String {
 fn escape_controls(text: &str, keep_lines: bool) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
-        if character.is_control() && !(keep_lines && matches!(character, '\n' | '\t')) {
+        // U+2028 and U+2029 break a line without being control characters.
+        let breaks_line = matches!(character, '\u{2028}' | '\u{2029}');
+        if (character.is_control() || breaks_line)
+            && !(keep_lines && matches!(character, '\n' | '\t'))
+        {
             escaped.push_str(&format!("\\u{{{:x}}}", u32::from(character)));
         } else {
             escaped.push(character);
@@ -164,7 +168,7 @@ mod tests {
         let title = format!("Evil\ntitle\u{1b}[31m{}", "x".repeat(300));
         let envelope = build_envelope(&EnvelopeInput {
             sender_title: &title,
-            ..input("bell\u{7} and\r\nreturn\tand tab")
+            ..input("bell\u{7} and\r\nreturn\tand tab \u{2028}sep")
         });
         let from = envelope
             .lines()
@@ -176,13 +180,13 @@ mod tests {
         );
         assert!(from["from: ".len()..].chars().count() <= 200, "{from}");
         assert!(
-            envelope.contains("bell\\u{7} and\\u{d}\n  return\tand tab"),
+            envelope.contains("bell\\u{7} and\\u{d}\n  return\tand tab \\u{2028}sep"),
             "{envelope}"
         );
         assert!(
-            !envelope
-                .chars()
-                .any(|character| character.is_control() && !matches!(character, '\n' | '\t')),
+            !envelope.chars().any(|character| (character.is_control()
+                || matches!(character, '\u{2028}' | '\u{2029}'))
+                && !matches!(character, '\n' | '\t')),
             "{envelope:?}"
         );
     }
