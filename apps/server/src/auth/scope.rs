@@ -214,7 +214,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "sendRequests.send" | "sendRequests.cancel" | "sendRequests.dismiss" => {
             Some(SCOPE_ORCHESTRATION_OPERATE)
         }
-        "sendRequests.getAnswer" | "sendRequests.subscribe" => Some(SCOPE_ORCHESTRATION_READ),
+        "sendRequests.getAnswer" | "sendRequests.getHandoffText" | "sendRequests.subscribe" => {
+            Some(SCOPE_ORCHESTRATION_READ)
+        }
         // Connect an agent (#139): a person's own tool configuration, which an outside
         // agent's credential can neither read nor change.
         "mcpClients.getRegistrations" => Some(SCOPE_ACCESS_READ),

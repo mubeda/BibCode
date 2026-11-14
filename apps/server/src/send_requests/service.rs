@@ -13,7 +13,10 @@ use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState, Stat
 use crate::{
     orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
     persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
-    production::orchestration_rpc::{ServerActor, ServerCommandDispatcher},
+    production::{
+        orchestration_rpc::{ServerActor, ServerCommandDispatcher},
+        thread_context::handoff_text,
+    },
     rpc::{RpcSessionContext, RpcStreamChunk},
     transfer::staging::UploadOwner,
 };
@@ -49,6 +52,25 @@ pub(crate) struct SendRequestsGetAnswerResult {
     pub(crate) request_id: String,
     pub(crate) text: String,
     pub(crate) truncated: bool,
+}
+
+/// The wire input of `sendRequests.getHandoffText`: the thread the person clicked in and the
+/// thread to read, which may be the same one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SendRequestsGetHandoffTextInput {
+    pub(crate) source_thread_id: String,
+    pub(crate) thread_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendRequestsGetHandoffTextResult {
+    pub(crate) thread_id: String,
+    pub(crate) text: String,
+    pub(crate) left_out: usize,
+    /// The first message, when it is included, and the tail.
+    pub(crate) included_messages: usize,
 }
 
 /// Sends one stream event; false when the stream was cancelled or closed.
@@ -593,6 +615,37 @@ impl SendRequestsService {
             }),
             _ => Err(refusal("not_answered", "This request has no answer yet.")),
         }
+    }
+
+    /// A thread's handoff text, built from its stored messages for Hand off and Take over from.
+    /// It only reads the store, so the read thread's agent receives nothing, even one that can no
+    /// longer take a turn.
+    pub(crate) async fn handoff_text(
+        &self,
+        context: &RpcSessionContext,
+        input: SendRequestsGetHandoffTextInput,
+    ) -> Result<SendRequestsGetHandoffTextResult, Value> {
+        require_person(context)?;
+        let source = self.live_thread(&input.source_thread_id).await?;
+        let thread = self.live_thread(&input.thread_id).await?;
+        if thread.project_id != source.project_id {
+            return Err(refusal(
+                "other_project",
+                "This agent belongs to another project. Pick an agent from this project.",
+            ));
+        }
+        let messages = self
+            .repositories
+            .list_messages_by_thread(input.thread_id.clone())
+            .await
+            .map_err(storage)?;
+        let handoff = handoff_text(&messages, "");
+        Ok(SendRequestsGetHandoffTextResult {
+            thread_id: input.thread_id,
+            text: handoff.render(),
+            left_out: handoff.left_out,
+            included_messages: handoff.tail.len() + usize::from(handoff.first_message.is_some()),
+        })
     }
 
     /// Every undismissed request of the scope (requests sent from `thread_id`, or all), in a

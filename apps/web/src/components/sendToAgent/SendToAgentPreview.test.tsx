@@ -49,6 +49,7 @@ interface Harness {
   onClose?: () => void;
   onPickAnother?: () => void;
   leadIn?: string;
+  loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
 }
 
 function Host(props: Harness) {
@@ -66,6 +67,7 @@ function Host(props: Harness) {
         target={{ title: "Review bot", providerLabel: "Codex", newPanel: false }}
         leadIn={props.leadIn ?? ""}
         initialAttachments={props.attachments ?? []}
+        {...(props.loadAttachments === undefined ? {} : { loadAttachments: props.loadAttachments })}
         onClose={() => {
           props.onClose?.();
           setOpen(false);
@@ -164,6 +166,59 @@ describe("SendToAgentPreview", () => {
     const input = (send.mock.calls[0] as unknown as [SendRequestsSendInput])[0];
     expect(input.note).toBe("start from the new part");
     expect(input.attachments).toEqual([{ label: "Attachment a", text: shortened }]);
+  });
+
+  it("loads attachments before Send is allowed", async () => {
+    let finish: (loaded: ReadonlyArray<PreviewAttachment>) => void = () => undefined;
+    const loadAttachments = vi.fn(
+      () =>
+        new Promise<ReadonlyArray<PreviewAttachment>>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const send = vi.fn(() => Promise.resolve<SendOutcome>({ kind: "sent" }));
+    render({ action: "hand-off", send, loadAttachments });
+    expect(document.body.querySelector('[role="status"]')?.textContent).toBe(
+      "Reading the messages to attach",
+    );
+    expect(button("Send")!.disabled).toBe(true);
+    await act(async () =>
+      finish([attachment("handoff", "[user] the task", { label: "Handoff from API refactor" })]),
+    );
+    await flush();
+    expect(body()).toContain("Handoff from API refactor");
+    expect(button("Send")!.disabled).toBe(false);
+    await click(button("Send"));
+    await flush();
+    const input = (send.mock.calls[0] as unknown as [SendRequestsSendInput])[0];
+    expect(input.attachments).toEqual([
+      { label: "Handoff from API refactor", text: "[user] the task" },
+    ]);
+    expect(loadAttachments).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed load shows "BiBCode could not read the messages to attach. Try again." with a Retry button that loads again', async () => {
+    const loadAttachments = vi
+      .fn<() => Promise<ReadonlyArray<PreviewAttachment>>>()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce([attachment("handoff", "[user] the task")]);
+    render({ action: "hand-off", loadAttachments });
+    await flush();
+    const alert = [...document.body.querySelectorAll('[role="alert"]')].find((element) =>
+      element.textContent?.includes("could not read"),
+    );
+    expect(alert?.textContent).toContain(
+      "BiBCode could not read the messages to attach. Try again.",
+    );
+    expect(button("Send")!.disabled).toBe(true);
+    act(() => button("Retry")!.focus());
+    await click(button("Retry"));
+    await flush();
+    expect(loadAttachments).toHaveBeenCalledTimes(2);
+    expect(document.activeElement).toBe(textareas()[0]);
+    expect(body()).not.toContain("could not read");
+    expect(body()).toContain("Attachment handoff");
+    expect(button("Send")!.disabled).toBe(false);
   });
 
   it("removing an attachment sends the note alone", async () => {

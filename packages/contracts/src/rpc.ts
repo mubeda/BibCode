@@ -121,6 +121,8 @@ import {
   SendRequestsDismissInput,
   SendRequestsGetAnswerInput,
   SendRequestsGetAnswerResult,
+  SendRequestsGetHandoffTextInput,
+  SendRequestsGetHandoffTextResult,
   SendRequestsSendInput,
   SendRequestsStreamEvent,
   SendRequestsSubscribeInput,
@@ -662,6 +664,7 @@ export const WS_METHODS = {
   sendRequestsDismiss: "sendRequests.dismiss",
   sendRequestsSubscribe: "sendRequests.subscribe",
   sendRequestsGetAnswer: "sendRequests.getAnswer",
+  sendRequestsGetHandoffText: "sendRequests.getHandoffText",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -2273,6 +2276,13 @@ export const WsSendRequestsGetAnswerRpc = Rpc.make(WS_METHODS.sendRequestsGetAns
   error: Schema.Union([SendRequestError, EnvironmentRpcError]),
 });
 
+/** A thread's handoff text, built from its stored messages; nothing is sent to its agent. */
+export const WsSendRequestsGetHandoffTextRpc = Rpc.make(WS_METHODS.sendRequestsGetHandoffText, {
+  payload: SendRequestsGetHandoffTextInput,
+  success: SendRequestsGetHandoffTextResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
 /** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
 export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
   payload: WebhooksListInput,
@@ -2542,6 +2552,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSendRequestsDismissRpc,
   WsSendRequestsSubscribeRpc,
   WsSendRequestsGetAnswerRpc,
+  WsSendRequestsGetHandoffTextRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

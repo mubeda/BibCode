@@ -338,6 +338,7 @@ import { readThreadShell, useProject, useThread, useThreadProposedPlans } from "
 import {
   useCancelSendRequest,
   useDismissSendRequest,
+  useGetHandoffText,
   useSendRequest,
   useSendRequests,
 } from "../state/sendRequests";
@@ -345,6 +346,11 @@ import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
+import {
+  buildHandOffContent,
+  buildTakeOverContent,
+  type HandoffLoader,
+} from "./sendToAgent/handoff.logic";
 import { buildReviewPreviewContent } from "./sendToAgent/ReviewScopePicker";
 import {
   buildReviewContent,
@@ -5169,9 +5175,22 @@ function ChatViewContent(props: ChatViewProps) {
         branch: activeThread.branch ?? null,
         modelSelection: resolution.modelSelection,
         providerLabel: entry.displayName,
+        // A send from a panel other than the host keeps its own tab active until the send
+        // succeeds (`revealSendPanel`): an inactive chat panel unmounts, and its preview with it.
+        activate: !activeThread.hostThreadId,
       });
     },
   );
+  const revealSendPanel = useLatestHandler((panelThreadId: ThreadId) => {
+    if (!activeThread?.hostThreadId) return;
+    void centerPanelActions.openPanelThread(
+      scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId),
+      panelThreadId,
+      // A panel's title is its tab label.
+      readThreadShell(scopeThreadRef(activeThread.environmentId, panelThreadId))?.title ?? "",
+      false,
+    );
+  });
   const sendReviewProviders = useMemo(
     () => reviewPanelProviders(codeReviewMenuReviewers),
     [codeReviewMenuReviewers],
@@ -5182,6 +5201,7 @@ function ChatViewContent(props: ChatViewProps) {
     [sendNewPanelProviders, sendReviewProviders],
   );
   const sendReview = useSendRequest(environmentId);
+  const getHandoffText = useGetHandoffText(environmentId);
   // A Review to a new panel: the panel starts with the review's modes and guard like the Code
   // review button's, but its first message is the tracked request, not a bare turn.
   const startNewPanelReview = useLatestHandler(
@@ -5242,7 +5262,23 @@ function ChatViewContent(props: ChatViewProps) {
     if (choice.action === "message") return EMPTY_SEND_CONTENT;
     if (choice.action === "second-opinion")
       return buildSecondOpinionContent(choice.source.messages);
-    if (choice.action !== "review") return null;
+    // Hand off and Take over from only read stored messages: no agent's session is touched.
+    const loadHandoff: HandoffLoader = (threadId) =>
+      getHandoffText({ sourceThreadId: choice.source.threadId, threadId });
+    if (choice.action === "hand-off") {
+      return buildHandOffContent({ source: choice.source, loadHandoff });
+    }
+    if (choice.action === "take-over") {
+      // A terminal's text needs `sendRequests.getTerminalOutput` (task 9.1), so no loader yet.
+      return choice.target.kind === "agent"
+        ? buildTakeOverContent({
+            source: choice.source,
+            picked: choice.target.row,
+            loadHandoff,
+            loadTerminalOutput: null,
+          })
+        : null;
+    }
     const pickKey = sendChoiceKey(choice);
     const { target } = choice;
     const guardLine =
@@ -5288,12 +5324,14 @@ function ChatViewContent(props: ChatViewProps) {
           serverSupported={sendRequestsSupported}
           newPanelProvidersFor={sendNewPanelProvidersFor}
           createPanel={createSendPanel}
+          revealPanel={revealSendPanel}
           previewContentFor={sendPreviewContentFor}
         />
       ) : null,
     [
       activeThreadRef,
       createSendPanel,
+      revealSendPanel,
       isServerThread,
       sendNewPanelProvidersFor,
       sendPreviewContentFor,

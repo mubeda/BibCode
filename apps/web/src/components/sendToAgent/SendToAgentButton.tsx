@@ -9,6 +9,7 @@ import { ForwardIcon } from "lucide-react";
 import {
   memo,
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -33,6 +34,7 @@ import {
   MenuTrigger,
 } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { hintTargetWarning, type OutOfTokensHint } from "./outOfTokens.logic";
 import { SendToAgentPreview } from "./SendToAgentPreview";
 import {
   buildSendTargets,
@@ -52,6 +54,8 @@ import {
 export interface LiveSendInputs {
   source: SendToAgentSource;
   rows: ReadonlyArray<AgentRow>;
+  /** The out-of-tokens hint of an agent, from data read only while the menu is open. */
+  hintFor?: (row: AgentRow) => OutOfTokensHint | null;
 }
 
 export interface SendToAgentButtonProps {
@@ -67,12 +71,16 @@ export interface SendToAgentButtonProps {
   projectRootByProjectId: ReadonlyMap<string, string>;
   newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
   canNotifyTerminal: (row: AgentRow) => boolean;
+  /** The out-of-tokens hint of an agent; `renderLive` can supply a live one instead. */
+  hintFor?: (row: AgentRow) => OutOfTokensHint | null;
   /** Called when an agent is chosen, before the preview opens. */
   onChoose?: (choice: SendChoice) => void;
   /** What the preview shows for a choice; an action without content opens no preview. */
   previewContentFor?: (choice: SendChoice) => PreviewContent | null;
   send?: (input: SendRequestsSendInput) => Promise<SendOutcome>;
   createPanel?: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
+  /** Brings a panel `createPanel` made inactive forward once its request was sent. */
+  revealPanel?: (panel: ThreadId) => void;
   newId?: () => string;
 }
 
@@ -106,20 +114,23 @@ function TriggerButton(
 
 export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAgentButtonProps) {
   const { serverSupported, onChoose, previewContentFor } = props;
-  const [choice, setChoice] = useState<SendChoice | null>(null);
+  // The hint the chosen agent carried in the list, for the preview's warning.
+  const [picked, setPicked] = useState<{ choice: SendChoice; hint: OutOfTokensHint | null } | null>(
+    null,
+  );
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
   const choose = useCallback(
-    (next: SendChoice) => {
+    (next: SendChoice, hint: OutOfTokensHint | null) => {
       onChoose?.(next);
-      if (previewContentFor !== undefined) setChoice(next);
+      if (previewContentFor !== undefined) setPicked({ choice: next, hint });
     },
     [onChoose, previewContentFor],
   );
-  const closePreview = useCallback(() => setChoice(null), []);
+  const closePreview = useCallback(() => setPicked(null), []);
   const pickAnother = useCallback(() => {
-    setChoice(null);
+    setPicked(null);
     setMenuOpen(true);
   }, []);
 
@@ -141,19 +152,27 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
         <MenuPopup side="top" align="end" className="w-72 max-w-[calc(100vw-2rem)]">
           {menuOpen
             ? (props.renderLive ?? renderGiven(props))((live) => (
-                <ActionList {...props} source={live.source} rows={live.rows} onChoose={choose} />
+                <ActionList
+                  {...props}
+                  source={live.source}
+                  rows={live.rows}
+                  {...(live.hintFor === undefined ? {} : { hintFor: live.hintFor })}
+                  onChoose={choose}
+                />
               ))
             : null}
         </MenuPopup>
       </Menu>
-      {choice !== null && previewContentFor !== undefined ? (
+      {picked !== null && previewContentFor !== undefined ? (
         <PreviewHost
-          choice={choice}
+          choice={picked.choice}
+          hint={picked.hint}
           previewContentFor={previewContentFor}
           triggerRef={triggerRef}
-          newPanelProviders={props.newPanelProvidersFor(choice.action)}
+          newPanelProviders={props.newPanelProvidersFor(picked.choice.action)}
           send={props.send ?? noSend}
           createPanel={props.createPanel ?? noPanel}
+          revealPanel={props.revealPanel}
           newId={props.newId ?? defaultNewId}
           onClose={closePreview}
           onPickAnother={pickAnother}
@@ -165,18 +184,25 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
 
 function PreviewHost(props: {
   choice: SendChoice;
+  hint: OutOfTokensHint | null;
   previewContentFor: NonNullable<SendToAgentButtonProps["previewContentFor"]>;
   triggerRef: RefObject<HTMLElement | null>;
   newPanelProviders: ReadonlyArray<NewPanelProvider>;
   send: NonNullable<SendToAgentButtonProps["send"]>;
   createPanel: NonNullable<SendToAgentButtonProps["createPanel"]>;
+  revealPanel: SendToAgentButtonProps["revealPanel"];
   newId: () => string;
   onClose: () => void;
   onPickAnother: () => void;
 }) {
-  const { choice, previewContentFor, newPanelProviders, send, createPanel, newId } = props;
+  const { choice, previewContentFor, newPanelProviders, send, createPanel, newId, revealPanel } =
+    props;
   const content = useMemo(() => previewContentFor(choice), [choice, previewContentFor]);
   const target = useMemo(() => {
+    // The picked agent only supplies text: the request goes to this panel's own agent.
+    if (choice.action === "take-over") {
+      return { title: "this agent", providerLabel: null, newPanel: false };
+    }
     if (choice.target.kind === "agent") {
       return {
         title: choice.target.row.shell.title,
@@ -192,24 +218,53 @@ function PreviewHost(props: {
     );
     return { title: provider?.label ?? "a new panel", providerLabel: null, newPanel: true };
   }, [choice, newPanelProviders]);
+  // This host is the open preview until it unmounts or another choice replaces `choice`.
+  const latestChoice = useRef(choice);
+  const open = useRef(true);
+  useEffect(() => {
+    latestChoice.current = choice;
+    open.current = true;
+    return () => {
+      open.current = false;
+    };
+  }, [choice]);
   const onSend = useCallback(
-    (draft: Parameters<NonNullable<PreviewContent["submit"]>>[0]) =>
-      content?.submit !== undefined
-        ? content.submit(draft)
-        : submitSendChoice({ send, createPanel, newId }, choice, draft),
-    [choice, content, createPanel, newId, send],
+    (draft: Parameters<NonNullable<PreviewContent["submit"]>>[0]) => {
+      const isCurrent = () => open.current && latestChoice.current === choice;
+      return content?.submit !== undefined
+        ? content.submit(draft, isCurrent)
+        : submitSendChoice(
+            { send, createPanel, newId, ...(revealPanel === undefined ? {} : { revealPanel }) },
+            choice,
+            draft,
+            isCurrent,
+          );
+    },
+    [choice, content, createPanel, newId, revealPanel, send],
   );
   if (content === null) return null;
+  const fromTitle =
+    choice.action === "take-over" && choice.target.kind === "agent"
+      ? choice.target.row.shell.title
+      : choice.source.title;
+  // A taken-over agent only supplies text, so whether it can answer does not matter.
+  const hintWarning =
+    props.hint === null || choice.action === "take-over" ? null : hintTargetWarning(props.hint);
+  const warning =
+    [content.warning ?? null, hintWarning].filter((part) => part !== null).join(" ") || null;
   return (
     <SendToAgentPreview
       open
-      source={{ key: sendChoiceKey(choice), title: choice.source.title }}
+      source={{ key: sendChoiceKey(choice), title: fromTitle }}
       action={choice.action}
       target={target}
       leadIn={content.leadIn}
       initialAttachments={content.attachments}
+      {...(content.loadAttachments === undefined
+        ? {}
+        : { loadAttachments: content.loadAttachments })}
       {...(content.extraContent === undefined ? {} : { extraContent: content.extraContent })}
-      {...(content.warning === undefined ? {} : { warning: content.warning })}
+      warning={warning}
       finalFocus={props.triggerRef}
       onClose={props.onClose}
       onSend={onSend}
@@ -218,7 +273,9 @@ function PreviewHost(props: {
   );
 }
 
-function ActionList(props: SendToAgentButtonProps & { onChoose: (choice: SendChoice) => void }) {
+type Choose = (choice: SendChoice, hint: OutOfTokensHint | null) => void;
+
+function ActionList(props: Omit<SendToAgentButtonProps, "onChoose"> & { onChoose: Choose }) {
   return (
     <div data-text-surface="popover">
       {SEND_TO_AGENT_ACTIONS.map(({ action, label }) => {
@@ -244,13 +301,13 @@ function ActionList(props: SendToAgentButtonProps & { onChoose: (choice: SendCho
 }
 
 function TargetList(
-  props: SendToAgentButtonProps & {
+  props: Omit<SendToAgentButtonProps, "onChoose"> & {
     action: SendChoice["action"];
     actionLabel: string;
-    onChoose: (choice: SendChoice) => void;
+    onChoose: Choose;
   },
 ) {
-  const { source, action, rows, projectRootByProjectId, canNotifyTerminal } = props;
+  const { source, action, rows, projectRootByProjectId, canNotifyTerminal, hintFor } = props;
   const newPanelProviders = props.newPanelProvidersFor(action);
   const entries = useMemo(
     () =>
@@ -261,8 +318,9 @@ function TargetList(
         projectRootByProjectId,
         newPanelProviders,
         canNotifyTerminal,
+        ...(hintFor === undefined ? {} : { hintFor }),
       }),
-    [action, canNotifyTerminal, newPanelProviders, projectRootByProjectId, rows, source],
+    [action, canNotifyTerminal, hintFor, newPanelProviders, projectRootByProjectId, rows, source],
   );
   if (entries.length === 0) {
     return (
@@ -275,7 +333,7 @@ function TargetList(
         <TargetItem
           key={entry.key}
           entry={entry}
-          onPick={() => props.onChoose({ source, action, target: entry.target })}
+          onPick={() => props.onChoose({ source, action, target: entry.target }, entry.hint)}
         />
       ))}
     </div>
@@ -302,19 +360,31 @@ function TargetItem(props: { entry: SendTargetEntry; onPick: () => void }) {
       <MenuItem
         closeOnClick={false}
         aria-disabled="true"
-        aria-label={formatUnavailableActionLabel(entry.title, entry.disabledReason)}
+        aria-label={formatUnavailableActionLabel(
+          entry.hint === null ? entry.title : `${entry.title}, ${entry.hint.text}`,
+          entry.disabledReason,
+        )}
         className="h-auto items-start"
       >
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate opacity-64">{entry.title}</span>
+          {entry.hint === null ? null : (
+            <span className="text-muted-foreground text-xs">{entry.hint.text}</span>
+          )}
           <span className="text-muted-foreground text-xs">{entry.disabledReason}</span>
         </span>
       </MenuItem>
     );
   }
   return (
-    <MenuItem onClick={props.onPick}>
-      <span className="min-w-0 flex-1 truncate">{entry.title}</span>
+    <MenuItem onClick={props.onPick} className={entry.hint === null ? undefined : "h-auto"}>
+      {/* The hint is text inside the item, so it is part of the item's accessible name. */}
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate">{entry.title}</span>
+        {entry.hint === null ? null : (
+          <span className="text-muted-foreground text-xs">{entry.hint.text}</span>
+        )}
+      </span>
       {entry.providerLabel ? (
         <span className="shrink-0 text-muted-foreground text-xs">{entry.providerLabel}</span>
       ) : null}
