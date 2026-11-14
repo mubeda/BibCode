@@ -551,6 +551,66 @@ describe("SendToAgentButton", () => {
     expect(revealPanel.mock.calls).toEqual([[ThreadId.make("panel-1")]]);
   });
 
+  describe("out-of-tokens hint", () => {
+    const hint = {
+      kind: "usage-limit",
+      text: "Out of usage until 3:30 PM",
+      resetsAt: new Date("2026-11-13T15:30:00.000Z"),
+    } as const;
+    const hintFor = (row: { shell: { title: string } }) =>
+      row.shell.title === "beta" ? hint : null;
+    const hintedProps = () =>
+      baseProps({
+        hintFor,
+        previewContentFor: (choice) =>
+          choice.target.kind === "agent" && choice.action === "take-over"
+            ? buildTakeOverContent({
+                source: choice.source,
+                picked: choice.target.row,
+                loadHandoff: () => Promise.resolve({ text: "x", leftOut: 0, includedMessages: 1 }),
+                loadTerminalOutput: null,
+              })
+            : { leadIn: "", attachments: [] },
+      });
+
+    it("the hint is shown beside the agent and is part of its accessible name", async () => {
+      render(hintedProps());
+      await openAction("Message");
+      const beta = menuItem("beta")!;
+      expect(beta.textContent).toContain("Out of usage until 3:30 PM");
+      expect(beta.getAttribute("aria-label")).toBeNull();
+      expect(beta.getAttribute("aria-disabled")).toBeNull();
+      expect(menuItem("alpha")!.textContent).not.toContain("Out of usage");
+    });
+
+    it("picking a hinted agent for Message shows the may-not-answer warning in the preview and Send stays enabled", async () => {
+      render(hintedProps());
+      await openAction("Message");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain("This agent may not answer until 3:30 PM.");
+      const note = document.body.querySelector<HTMLTextAreaElement>("textarea")!;
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!;
+        setter.call(note, "are you there?");
+        note.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(find("button", "Send")!.hasAttribute("disabled")).toBe(false);
+    });
+
+    it("picking a hinted agent for Take over from shows no may-not-answer warning", async () => {
+      render(hintedProps());
+      await openAction("Take over from");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain("Nothing is sent to beta.");
+      expect(document.body.textContent).not.toContain("may not answer");
+    });
+  });
+
   describe("Hand off and Take over from", () => {
     const handoffText = "[user] fix the parser\n[assistant] done";
     const loadHandoff = (text = handoffText) =>

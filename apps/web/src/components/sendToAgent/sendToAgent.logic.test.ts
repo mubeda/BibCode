@@ -11,6 +11,7 @@ import { createModelSelection } from "@bibcode/shared/model";
 import { describe, expect, it } from "vite-plus/test";
 
 import { buildAgentRows, type AgentRow } from "../sidebar/agentsSection.logic";
+import type { OutOfTokensHint } from "./outOfTokens.logic";
 import {
   agentAddress,
   buildSendTargets,
@@ -302,6 +303,62 @@ describe("buildSendTargets", () => {
     const entries = targets("message", rows);
     expect(entries.map((entry) => entry.title).slice(0, 2)).toEqual(["newer", "older"]);
     expect(entries[0]?.busy).toBe(true);
+  });
+
+  describe("out-of-tokens hints", () => {
+    const usageHint: OutOfTokensHint = {
+      kind: "usage-limit",
+      text: "Out of usage until 3:30 PM",
+      resetsAt: null,
+    };
+    const hintedRows = () =>
+      rowsOf([
+        shell("newest", "codex", { updatedAt: "2026-11-13T12:00:00.000Z" }),
+        shell("claude-new", "claudeAgent", { updatedAt: "2026-11-13T11:00:00.000Z" }),
+        shell("middle", "codex", { updatedAt: "2026-11-13T10:30:00.000Z" }),
+        shell("claude-old", "claudeAgent", { updatedAt: "2026-11-13T10:00:00.000Z" }),
+        shell("cursor", "cursor", { updatedAt: "2026-11-13T09:00:00.000Z" }),
+      ]);
+    const hintFor = (row: AgentRow) => (row.shell.title.startsWith("claude") ? usageHint : null);
+    const hinted = (action: SendRequestAction) =>
+      buildSendTargets({
+        source: source(),
+        action,
+        rows: hintedRows(),
+        projectRootByProjectId: ROOTS,
+        newPanelProviders: NEW_PANEL_PROVIDERS,
+        canNotifyTerminal: () => false,
+        hintFor,
+      });
+
+    it("Take over from lists hinted agents first and keeps recency order inside each group", () => {
+      expect(hinted("take-over").map((entry) => entry.title)).toEqual([
+        "claude-new",
+        "claude-old",
+        "newest",
+        "middle",
+        "cursor",
+      ]);
+      expect(
+        hinted("message")
+          .map((entry) => entry.title)
+          .slice(0, 5),
+      ).toEqual(["newest", "claude-new", "middle", "claude-old", "cursor"]);
+    });
+
+    it("a hinted agent is not disabled for Review, Second opinion, Hand off or Message", () => {
+      for (const action of ["review", "second-opinion", "hand-off", "message"] as const) {
+        const entry = byTitle(hinted(action), "claude-new");
+        expect(entry?.hint, action).toEqual(usageHint);
+        expect(entry?.disabledReason, action).toBeNull();
+      }
+    });
+
+    it("a Cursor agent with no hint can still be taken over from", () => {
+      const entry = byTitle(hinted("take-over"), "cursor");
+      expect(entry?.hint).toBeNull();
+      expect(entry?.disabledReason).toBeNull();
+    });
   });
 });
 

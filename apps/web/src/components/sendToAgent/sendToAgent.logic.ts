@@ -13,6 +13,7 @@ import type { ReactNode } from "react";
 import { sendSourceKey, useSendToAgentStore } from "~/sendToAgentStore";
 import type { SendOutcome } from "~/state/sendRequests";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
+import type { OutOfTokensHint } from "./outOfTokens.logic";
 
 export const SEND_TO_AGENT_ACTIONS: ReadonlyArray<{
   readonly action: SendRequestAction;
@@ -62,6 +63,8 @@ export interface SendTargetEntry {
   providerLabel: string | null;
   busy: boolean;
   disabledReason: string | null;
+  /** Out of context or usage; the agent stays pickable. */
+  hint: OutOfTokensHint | null;
 }
 
 export interface NewPanelProvider {
@@ -142,8 +145,9 @@ export function buildSendTargets(input: {
   projectRootByProjectId: ReadonlyMap<string, string>;
   newPanelProviders: ReadonlyArray<NewPanelProvider>;
   canNotifyTerminal: (row: AgentRow) => boolean;
+  hintFor?: (row: AgentRow) => OutOfTokensHint | null;
 }): ReadonlyArray<SendTargetEntry> {
-  const { source, action } = input;
+  const { source, action, hintFor } = input;
   const candidates = input.rows
     .filter(
       (row) =>
@@ -171,19 +175,24 @@ export function buildSendTargets(input: {
       providerLabel: row.providerLabel,
       busy: row.group === "working",
       disabledReason,
+      hint: hintFor?.(row) ?? null,
     };
   });
-  if (action !== "take-over") {
-    for (const provider of input.newPanelProviders) {
-      entries.push({
-        key: `new-panel:${provider.value}`,
-        target: { kind: "new-panel", selection: provider.selection },
-        title: provider.label,
-        providerLabel: null,
-        busy: false,
-        disabledReason: provider.disabledReason,
-      });
-    }
+  if (action === "take-over") {
+    // An agent that ran out is the likely one to take over from (R117); the sort is stable,
+    // so each group keeps its recency order.
+    return entries.toSorted((a, b) => Number(b.hint !== null) - Number(a.hint !== null));
+  }
+  for (const provider of input.newPanelProviders) {
+    entries.push({
+      key: `new-panel:${provider.value}`,
+      target: { kind: "new-panel", selection: provider.selection },
+      title: provider.label,
+      providerLabel: null,
+      busy: false,
+      disabledReason: provider.disabledReason,
+      hint: null,
+    });
   }
   return entries;
 }
