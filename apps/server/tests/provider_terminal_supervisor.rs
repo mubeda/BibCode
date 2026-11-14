@@ -14921,6 +14921,38 @@ async fn opencode_terminal_reads_ready_only_after_a_fresh_idle_on_its_live_strea
         (TerminalAgentStatusState::Done, true),
     )
     .await;
+
+    // Turning activity off keeps the stream; turning it on replaces it, which withdraws
+    // readiness until the new stream carries an idle.
+    let disabled = fixture.manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
+    let opened_before = fixture
+        .remote_state
+        .opened_stream_count
+        .load(Ordering::Acquire);
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    assert!(
+        fixture
+            .remote_state
+            .opened_stream_count
+            .load(Ordering::Acquire)
+            > opened_before,
+        "enabling activity replaced the stream"
+    );
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
     fixture.finish().await;
     isolated.complete();
 }
