@@ -421,6 +421,43 @@ async fn prompt_readiness_publishes_only_at_a_wait_from_the_latest_fresh_root_ev
     );
 }
 
+/// A consumer that takes the readiness, as the pointer does when it types one line, keeps it
+/// taken until a new root event: the observer's later waits and its own withdrawals do not
+/// hand the same idle out again. Readiness the observer withdrew itself returns at its next wait.
+#[tokio::test]
+async fn prompt_readiness_a_consumer_took_returns_only_with_a_new_root_event() {
+    use super::model::PromptEvidence::Fresh;
+    let idle = TerminalAgentReport::Set(Done, false);
+    let generation = super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+    let lease = generation.observation();
+    let mut readiness = super::model::PromptReadiness::default();
+    readiness.observe(&lease, idle, true, Fresh);
+    assert!(ready_while_waiting(&readiness, &lease).await);
+
+    readiness.suspend(&lease);
+    assert!(
+        ready_while_waiting(&readiness, &lease).await,
+        "readiness the observer withdrew itself did not return at its next wait"
+    );
+
+    assert!(lease.clear_ready_for_prompt(), "the consumer takes it");
+    assert!(
+        !ready_while_waiting(&readiness, &lease).await,
+        "a later wait handed out an idle a consumer already took"
+    );
+    readiness.suspend(&lease);
+    assert!(
+        !ready_while_waiting(&readiness, &lease).await,
+        "a withdrawal after a consumer took the idle handed it out again"
+    );
+
+    readiness.observe(&lease, idle, true, Fresh);
+    assert!(
+        ready_while_waiting(&readiness, &lease).await,
+        "a new idle after the consumer took the last one left the terminal not ready"
+    );
+}
+
 /// Only fresh evidence that says the CLI waits makes a terminal ready; any other report,
 /// stale or not, withdraws readiness.
 #[test]
