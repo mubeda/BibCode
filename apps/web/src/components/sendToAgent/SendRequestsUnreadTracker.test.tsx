@@ -156,13 +156,23 @@ describe("SendRequestsUnreadTracker", () => {
     expect(unread()).toEqual([]);
   });
 
-  it("forgets an opened id once its request has left the list", () => {
+  it("forgets an opened id once its request is dismissed", () => {
     h.requests.set("environment-a", [request("r1")]);
     useSendRequestOpenedStore.setState({ openedIds: ["r1", "never-seen"] });
     act(() => root.render(<SendRequestsUnreadTracker />));
-    h.requests.set("environment-a", []);
+    h.requests.set("environment-a", [request("r1", { dismissedAt: "2026-11-13T11:00:00.000Z" })]);
     // The mocked request list is not reactive; a store change re-renders the tracker.
     act(() => useSendRequestOpenedStore.setState({ openedIds: ["r1", "never-seen"] }));
     expect(useSendRequestOpenedStore.getState().openedIds).toEqual(["never-seen"]);
+  });
+
+  it("keeps the opened ids of requests a replacement snapshot leaves for a later page", () => {
+    h.requests.set("environment-a", [request("r1"), request("r2")]);
+    useSendRequestOpenedStore.setState({ openedIds: ["r1", "r2"] });
+    act(() => root.render(<SendRequestsUnreadTracker />));
+    h.requests.set("environment-a", [request("r3")]);
+    act(() => useSendRequestOpenedStore.setState({ openedIds: ["r1", "r2"] }));
+    expect(useSendRequestOpenedStore.getState().openedIds).toEqual(["r1", "r2"]);
+    expect(unread()).toEqual([key("source")]);
   });
 });
