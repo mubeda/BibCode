@@ -13,6 +13,7 @@ import { useSendRequestOpenedStore } from "~/sendRequestOpenedStore";
 import { appendToComposerDraft, composeAnswerBringBack } from "~/sideChatBringBack";
 import { useThreadShell } from "~/state/entities";
 import { useGetAnswer } from "~/state/sendRequests";
+import { useCenterSurfaceVisible } from "../centerSurfaceVisibility";
 import { Button } from "../ui/button";
 import { PermissionButton } from "../ui/permission-button";
 import { describeRequestRow } from "./SendRequestRow";
@@ -45,10 +46,12 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
       mounted.current = false;
     };
   }, []);
-  // Showing the notice is what opens it: the source thread stops counting as unread.
+  // Seeing the notice is what opens it: the source thread stops counting as unread. A hidden host
+  // stays mounted, so the notice opens when its surface is shown, not when it mounts.
+  const surfaceVisible = useCenterSurfaceVisible();
   useEffect(() => {
-    markOpened(requestId);
-  }, [markOpened, requestId]);
+    if (surfaceVisible) markOpened(requestId);
+  }, [markOpened, requestId, surfaceVisible]);
 
   const bringBack = async () => {
     setPhase("reading");
