@@ -244,7 +244,10 @@ function describedText(container: HTMLElement, element: Element): string | null 
   const describedBy = element.getAttribute("aria-describedby");
   return describedBy === null
     ? null
-    : container.querySelector(`[id="${describedBy}"]`)?.textContent;
+    : describedBy
+        .split(" ")
+        .map((id) => container.querySelector(`[id="${id}"]`)?.textContent)
+        .join(" ");
 }
 
 beforeEach(() => {
@@ -402,7 +405,9 @@ describe("AgentIntegrationsSection", () => {
       const container = await render();
       const toggle = messagingSwitch(container);
       expect(toggle.disabled).toBe(true);
-      expect(describedText(container, toggle)).toBe("Update this server to use agent messaging.");
+      expect(describedText(container, toggle)).toContain(
+        "Update this server to use agent messaging.",
+      );
     });
 
     it("disables the switch and says it is reconnecting while a connected server's transport is down", async () => {

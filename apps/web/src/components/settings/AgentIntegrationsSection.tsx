@@ -409,9 +409,11 @@ function EnvironmentMcpServer({
         reason={
           serverConfig === null
             ? `Connecting to ${label}…`
-            : serverConfig.environment.capabilities.agentMessaging
-              ? null
-              : AGENT_MESSAGING_OLDER_SERVER_MESSAGE
+            : environment.connection.phase !== "connected"
+              ? `Reconnecting to ${label}…`
+              : serverConfig.environment.capabilities.agentMessaging
+                ? null
+                : AGENT_MESSAGING_OLDER_SERVER_MESSAGE
         }
       />
       {supported && serverConfig?.mcpLaunch ? (
@@ -515,6 +517,7 @@ function AgentMessagingRow({
   const enabled = useEnvironmentSettings(environmentId, selectAgentMessaging);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
   const reasonId = useId();
+  const descriptionId = useId();
   const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (next: boolean) => {
     setSaveError(null);
@@ -532,7 +535,7 @@ function AgentMessagingRow({
   return (
     <SettingsRow
       title={AGENT_MESSAGING_TITLE}
-      description={AGENT_MESSAGING_DESCRIPTION}
+      description={<span id={descriptionId}>{AGENT_MESSAGING_DESCRIPTION}</span>}
       resetAction={
         reason === null && enabled ? (
           <SettingResetButton label="agent messaging" onClick={() => void save(false)} />
@@ -554,7 +557,7 @@ function AgentMessagingRow({
           disabled={reason !== null}
           onCheckedChange={(checked) => void save(checked)}
           aria-label={AGENT_MESSAGING_TITLE}
-          aria-describedby={reason === null ? undefined : reasonId}
+          aria-describedby={reason === null ? descriptionId : `${descriptionId} ${reasonId}`}
         />
       }
     />
