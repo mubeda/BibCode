@@ -308,30 +308,84 @@ fn register_orchestration_rpc_inner(
     );
 }
 
-/// The command fields a client fills from its own clock.
+/// The command's own timestamp fields, at its root, that a client fills from its own clock.
 const CLIENT_TIMESTAMP_FIELDS: &[&str] =
     &["createdAt", "updatedAt", "completedAt", "implementedAt"];
 
+/// The typed nested timestamp fields of each command type, as paths from the command's root;
+/// `*` is every item of an array.
+const CLIENT_NESTED_TIMESTAMP_PATHS: &[(&str, &[&str])] = &[
+    (
+        "thread.turn.start",
+        &["bootstrap", "createThread", "createdAt"],
+    ),
+    ("thread.history.import", &["messages", "*", "createdAt"]),
+    (
+        "thread.proposed-plan.upsert",
+        &["proposedPlan", "createdAt"],
+    ),
+    (
+        "thread.proposed-plan.upsert",
+        &["proposedPlan", "updatedAt"],
+    ),
+    (
+        "thread.proposed-plan.upsert",
+        &["proposedPlan", "implementedAt"],
+    ),
+    ("thread.activity.append", &["activity", "createdAt"]),
+    ("thread.session.set", &["session", "updatedAt"]),
+];
+
 /// A client writes `toISOString`'s three fraction digits, but the store compares timestamps as
-/// text at the server's one width (#366), so each client instant is re-written in the store form
-/// before the command is decoded. Text that does not parse as RFC 3339 is kept as sent, as before.
-fn canonicalize_client_timestamps(value: &mut Value) {
-    match value {
-        Value::Object(fields) => {
-            for (key, field) in fields.iter_mut() {
-                if CLIENT_TIMESTAMP_FIELDS.contains(&key.as_str())
-                    && let Value::String(text) = field
-                {
-                    if let Some(canonical) = crate::persistence::canonical_timestamp(text) {
-                        *text = canonical;
-                    }
-                } else {
-                    canonicalize_client_timestamps(field);
+/// text at the server's one width (#366), so each of the command's own timestamp fields is
+/// re-written in the store form before the command is decoded. Only those explicit fields:
+/// answers, tool payloads, provider data and message text stay byte for byte, even under a key
+/// named like a timestamp field. Text that does not parse as RFC 3339 is kept as sent, as before.
+/// The payload digest is taken from the bytes as sent, before this runs.
+fn canonicalize_client_timestamps(payload: &mut Value) {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if let Value::Object(fields) = payload {
+        for key in CLIENT_TIMESTAMP_FIELDS {
+            if let Some(field) = fields.get_mut(*key) {
+                canonicalize_timestamp_field(field);
+            }
+        }
+    }
+    for (_, path) in CLIENT_NESTED_TIMESTAMP_PATHS
+        .iter()
+        .filter(|(command, _)| *command == kind)
+    {
+        canonicalize_timestamp_at(payload, path);
+    }
+}
+
+fn canonicalize_timestamp_at(value: &mut Value, path: &[&str]) {
+    match path {
+        [] => canonicalize_timestamp_field(value),
+        ["*", rest @ ..] => {
+            if let Value::Array(items) = value {
+                for item in items {
+                    canonicalize_timestamp_at(item, rest);
                 }
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(canonicalize_client_timestamps),
-        _ => {}
+        [key, rest @ ..] => {
+            if let Some(next) = value.get_mut(*key) {
+                canonicalize_timestamp_at(next, rest);
+            }
+        }
+    }
+}
+
+fn canonicalize_timestamp_field(field: &mut Value) {
+    if let Value::String(text) = field
+        && let Some(canonical) = crate::persistence::canonical_timestamp(text)
+    {
+        *text = canonical;
     }
 }
 
@@ -4737,15 +4791,37 @@ mod tests {
         assert_eq!(order, ["m-client", "m-server"]);
     }
 
+    /// #366 review: a user's answer is free-form data, even under a question id named like a
+    /// timestamp field, so it reaches the provider byte for byte; only the command's own
+    /// `createdAt` is re-written.
+    #[tokio::test]
+    async fn a_user_answer_keyed_like_a_timestamp_field_is_kept_verbatim() {
+        let engine = migrated_engine().await;
+        let command = decode_public_orchestration_command(
+            &engine,
+            json!({
+                "type":"thread.user-input.respond","commandId":"answer","threadId":"thread-a",
+                "requestId":"request-a",
+                "answers":{"createdAt":"2026-01-01T01:00:00+01:00"},
+                "createdAt":"2026-01-01T00:00:00.120Z"
+            }),
+        )
+        .await
+        .expect("the answer decodes");
+        let decoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(decoded["answers"]["createdAt"], "2026-01-01T01:00:00+01:00");
+        assert_eq!(decoded["createdAt"], "2026-01-01T00:00:00.120000000Z");
+    }
+
     /// #366: the ingestion re-writes each client instant, nested ones included, and keeps text
     /// that is not RFC 3339 as sent.
     #[test]
     fn client_timestamps_are_rewritten_and_unparsable_text_is_kept() {
         let mut payload = json!({
+            "type":"thread.turn.start",
             "createdAt":"2026-01-01T00:00:00.120Z",
             "bootstrap":{"createThread":{"createdAt":"2026-01-01T01:00:00+01:00"}},
-            "proposedPlan":{"updatedAt":"not a time"},
-            "message":{"text":"2026-01-01T00:00:00Z"}
+            "message":{"text":"2026-01-01T00:00:00Z","createdAt":"2026-01-01T00:00:00Z"}
         });
         canonicalize_client_timestamps(&mut payload);
         assert_eq!(payload["createdAt"], "2026-01-01T00:00:00.120000000Z");
@@ -4753,8 +4829,22 @@ mod tests {
             payload["bootstrap"]["createThread"]["createdAt"],
             "2026-01-01T00:00:00.000000000Z"
         );
-        assert_eq!(payload["proposedPlan"]["updatedAt"], "not a time");
+        // Not one of the command's timestamp fields: kept byte for byte.
         assert_eq!(payload["message"]["text"], "2026-01-01T00:00:00Z");
+        assert_eq!(payload["message"]["createdAt"], "2026-01-01T00:00:00Z");
+
+        let mut imported = json!({
+            "type":"thread.history.import",
+            "createdAt":"not a time",
+            "messages":[{"createdAt":"2026-01-01T00:00:00.5Z"},{"createdAt":"yesterday"}]
+        });
+        canonicalize_client_timestamps(&mut imported);
+        assert_eq!(imported["createdAt"], "not a time");
+        assert_eq!(
+            imported["messages"][0]["createdAt"],
+            "2026-01-01T00:00:00.500000000Z"
+        );
+        assert_eq!(imported["messages"][1]["createdAt"], "yesterday");
     }
 
     /// Clients cannot set the server-authored identity: serde drops the unknown field, so the
