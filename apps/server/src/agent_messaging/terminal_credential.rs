@@ -455,6 +455,55 @@ mod tests {
         let debug = format!("{credentials:?}");
         assert!(!debug.contains(token.as_str()));
         assert!(debug.contains("[redacted]"));
+
+        // Every value that carries a launch environment on its way to the spawn.
+        let mut open = crate::terminal::TerminalOpenInput::new(
+            "thread-a",
+            "term-1",
+            PathBuf::from("/work"),
+            80,
+            24,
+        );
+        open.env = env.clone();
+        open.command = Some(crate::terminal::TerminalLaunchCommand {
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: None,
+            env: Some(env.clone()),
+        });
+        let mut attach = crate::terminal::TerminalAttachInput::existing("thread-a", "term-1");
+        attach.env = env.clone();
+        let spawn = crate::terminal::PtySpawnInput {
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/work"),
+            cols: 80,
+            rows: 24,
+            env: env.clone(),
+        };
+        let native = crate::provider_terminal::NativeTerminalCommand {
+            args: Vec::new(),
+            env: env.clone(),
+        };
+        let attribution = crate::diagnostics::ProcessAttributionRegistry::new();
+        let shim = crate::provider_terminal::ClaudeShimRequest {
+            invoked: std::path::Path::new("/shims/claude"),
+            manager: std::path::Path::new("/bin/mise"),
+            cwd: std::path::Path::new("/work"),
+            launch_env: &env,
+            process_attribution: &attribution,
+        };
+        for (name, debug) in [
+            ("TerminalOpenInput", format!("{open:?}")),
+            ("TerminalAttachInput", format!("{attach:?}")),
+            ("PtySpawnInput", format!("{spawn:?}")),
+            ("NativeTerminalCommand", format!("{native:?}")),
+            ("ClaudeShimRequest", format!("{shim:?}")),
+        ] {
+            assert!(!debug.contains(token.as_str()), "{name} prints the token");
+            assert!(debug.contains(AUTH_ENV), "{name} prints its keys");
+        }
     }
 
     #[tokio::test]
