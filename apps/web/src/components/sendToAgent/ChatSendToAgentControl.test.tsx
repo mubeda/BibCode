@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -10,19 +10,37 @@ const h = vi.hoisted(() => ({
   messages: [] as unknown[],
   buttonProps: [] as Array<Record<string, unknown>>,
   send: vi.fn(),
+  messageReads: 0,
+  rowReads: 0,
+  menuOpen: false,
 }));
 
 vi.mock("~/state/entities", () => ({
   useThreadShell: () => h.shell,
-  useThreadMessages: () => h.messages,
+  useThreadMessages: () => {
+    h.messageReads += 1;
+    return h.messages;
+  },
   useProjects: () => [{ id: "project-a", workspaceRoot: "/repo/a" }],
 }));
 vi.mock("~/state/sendRequests", () => ({ useSendRequest: () => h.send }));
-vi.mock("../agents/useAgentRows", () => ({ useAgentRows: () => [] }));
+vi.mock("../agents/useAgentRows", () => ({
+  useAgentRows: () => {
+    h.rowReads += 1;
+    return [];
+  },
+}));
 vi.mock("./SendToAgentButton", () => ({
   SendToAgentButton: (props: Record<string, unknown>) => {
     h.buttonProps.push(props);
-    return <span data-send-to-agent />;
+    const renderLive = props["renderLive"] as
+      | undefined
+      | ((render: (live: { source: { messages: unknown[] } }) => ReactNode) => ReactNode);
+    return (
+      <span data-send-to-agent>
+        {h.menuOpen ? renderLive?.((live) => <b data-live>{live.source.messages.length}</b>) : null}
+      </span>
+    );
   },
 }));
 
@@ -55,6 +73,9 @@ function render(serverSupported = true) {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.buttonProps.length = 0;
+  h.messageReads = 0;
+  h.rowReads = 0;
+  h.menuOpen = false;
   h.shell = {
     projectId: ProjectId.make("project-a"),
     title: "API refactor",
@@ -82,7 +103,6 @@ describe("ChatSendToAgentControl", () => {
       projectId: "project-a",
       title: "API refactor",
       checkout: "/repo/a",
-      messages: h.messages,
       terminalHasText: false,
     });
     expect(props["send"]).toBe(h.send);
@@ -105,5 +125,22 @@ describe("ChatSendToAgentControl", () => {
   it("passes the missing capability on, so the button can say why it is off", () => {
     render(false);
     expect(h.buttonProps.at(-1)!["serverSupported"]).toBe(false);
+  });
+
+  it("reads neither the messages nor the agent list while the menu is closed", () => {
+    render();
+    h.messages = [...h.messages, { id: "m2", role: "assistant", text: "More.", streaming: true }];
+    render();
+    expect(h.messageReads).toBe(0);
+    expect(h.rowReads).toBe(0);
+    expect(container.querySelector("[data-live]")).toBeNull();
+  });
+
+  it("reads them once the menu opens, and hands the menu the panel's messages", () => {
+    h.menuOpen = true;
+    render();
+    expect(h.messageReads).toBeGreaterThan(0);
+    expect(h.rowReads).toBeGreaterThan(0);
+    expect(container.querySelector("[data-live]")?.textContent).toBe("1");
   });
 });
