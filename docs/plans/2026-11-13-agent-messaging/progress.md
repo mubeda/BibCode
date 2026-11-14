@@ -28,9 +28,9 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 | 5.1 | Agent message store | 5 | In progress | lane 5A | |
 | 5.2 | Agent messaging setting | 5 | In progress | lane 5A | |
 | 5.3 | Agent directory tool | 5 | In progress | lane 5A | |
-| 5.4 | Sending with identity and scope | 5 | Open | | |
-| 5.5 | Delivery and status tracking | 5 | Open | | |
-| 5.6 | Reply, correlation and status tool | 5 | Open | | |
+| 5.4 | Sending with identity and scope | 5 | In progress | lane 5B | |
+| 5.5 | Delivery and status tracking | 5 | In progress | lane 5B | |
+| 5.6 | Reply, correlation and status tool | 5 | In progress | lane 5B | |
 | 5.7 | Envelope and literal delivery | 5 | In progress | lane 5A | |
 | 6.1 | Runtime-mode ceiling and the claim gate | 6 | Open | | |
 | 6.2 | No user authority | 6 | Open | | |
@@ -80,3 +80,11 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-14 03:20 3.1, 3.2, 3.3 Closed. Evidence: lane 3R fixed the 5 accepted findings, each failing test committed before its fix; the coordinator ran in the lane worktree from apps/web: vp test run --project unit src/components/sendToAgent src/centerPanelStore.test.ts src/centerPanelActions.test.ts src/components/CenterPanel: 19 files, 279 tests passed; vp check --no-fmt: no warnings or lint errors in 2471 files; vp fmt --check on the 16 changed files: correct. Commits: 193aa3612..525225670, merged into the Branch line's branch.
 - 2026-11-14 03:20 Ruling: lane 3R edited centerPanelStore.ts, CenterPanelSurfaceHosts.tsx and added centerSurfaceVisibility.ts (outside phase 3's Owns), because a review panel must be reserved inactive and a notice must know whether its surface is visible. Cost if wrong: two small optional parameters to revert.
 - 2026-11-14 03:20 4.1, 4.2, 4.3 In progress. Owner: lane 4 (opus, medium), started while phase 5 runs; both touch production/provider_runtime.rs in different regions, merged by the coordinator.
+- 2026-11-14 04:25 Lane 5A reported 5.1, 5.2, 5.3 done and 5.7 partial on branch worktree-agent-ad109991242b092ec (c9a6dd109..3c39854bc); lib suite 5589 passed (lane report). 5.7 stays open for Codex: Codex 0.169.0 expands a $skill mention inside any text input and has no input flag to turn it off (measured by the lane); Claude needed client_composed to stop @path expansion (measured); OpenCode kept one literal text part (measured); Cursor not probed (needs folder trust); Grok not installed. Codex review running.
+- 2026-11-14 04:25 Ruling: R8 covers expansion by the provider client (slash command, skill, @path), not a recipient model that decides to call a tool because of the text; the runtime-mode ceiling of phase 6 governs that. Cost if wrong: R8 would need a stronger test per provider.
+- 2026-11-14 04:25 Ruling: agents_list lists a project's auto-created default thread, because it is a live chat thread of the project. Cost if wrong: one filter.
+- 2026-11-14 04:30 Codex review of lane 5A (gpt-6-astra, high): 3 findings, all accepted (a person's pasted envelope gets agent treatment because origin is inferred from text; a relink can revive a terminal message; the contract counts UTF-16 units instead of characters). Fix round and 5.4, 5.5, 5.6 In progress. Owner: lane 5B (opus, medium).
+- 2026-11-14 04:30 Open decision for the user: how an agent's message treats a $skill mention for a Codex recipient (neutralize the $, or accept and document the gap). 5.7 stays In progress until it is answered.
+- 2026-11-14 04:45 Lane 4 reported 4.1, 4.2, 4.3 done on branch worktree-agent-af4e6b1855ce63843 (ddf4a6a81..f33db9376); lib suite 5579 passed, sendToAgent 153 tests passed (lane report). Codex review running.
+- 2026-11-14 04:45 Ruling: execute-plan.md line 52 no longer names two Codex helper models, because the sensitive-data guard's hash list matched one of them (a false positive on a public model name). The file is the start prompt, not a task, so no task changes. Cost if wrong: none; the executor already has the models.
+- 2026-11-14 04:45 Open for task 11.1: docs/architecture/providers.md still describes the side chat seed and the context handoff as the last 40 messages only (D107 adds the first message), and says only a slash turn skips the context handoff (an agent envelope skips it too; Claude marks envelopes client_composed).
