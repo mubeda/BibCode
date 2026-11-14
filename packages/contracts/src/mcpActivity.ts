@@ -17,6 +17,15 @@ export const McpActivityTarget = Schema.Struct({
   fileCount: Schema.optional(NonNegativeInt),
   cloneId: Schema.optional(Schema.String),
   transferId: Schema.optional(Schema.String),
+  /** An agent message's recipient address, and that thread's title when it had one. */
+  recipient: Schema.optional(Schema.String),
+  recipientTitle: Schema.optional(Schema.String),
+  messageId: Schema.optional(Schema.String),
+  conversationId: Schema.optional(Schema.String),
+  /** The message's state name, such as `delivered`. */
+  status: Schema.optional(Schema.String),
+  /** Why a message failed or was held, as a state reason name. */
+  reason: Schema.optional(Schema.String),
 });
 export type McpActivityTarget = typeof McpActivityTarget.Type;
 

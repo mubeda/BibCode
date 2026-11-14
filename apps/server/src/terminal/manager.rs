@@ -4796,6 +4796,10 @@ impl TerminalManager {
             .get(&(thread_id.to_owned(), terminal_id.to_owned()))
             .cloned()?;
         let session = session.lock().await;
+        // Shutdown may have begun while this waited for the session.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
         (session.status == TerminalStatus::Running
             && !session.generation.is_closing()
             && !session.generation.is_invalidated())
@@ -4813,6 +4817,11 @@ impl TerminalManager {
 
     async fn shutdown_with_report(&self) -> ProcessCleanupReport {
         self.inner.cancellation.cancel();
+        // Attachment cleanup can wait on session locks a credential check also waits on: every
+        // generation stops verifying before that wait.
+        for generation in self.inner.generations.snapshot_live() {
+            generation.begin_closing();
+        }
         {
             let _registrations = self
                 .inner
@@ -12541,6 +12550,57 @@ mod tests {
             task.await.unwrap();
             manager.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_credential_waiting_on_a_session_lock_fails_once_shutdown_begins() {
+        // Mutation caught: a verification that checked cancellation before it waited on the
+        // session lock returning the still-running generation after shutdown began.
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        manager
+            .open(ai_terminal_input(root.path(), "term-c"))
+            .await
+            .unwrap();
+        let token = last_agent_token(&backend);
+        let attachment = manager
+            .attach(TerminalAttachInput {
+                size_claim: Some("owner".to_owned()),
+                ..TerminalAttachInput::existing("thread-a", "term-c")
+            })
+            .await
+            .unwrap();
+        let session = manager.require_session("thread-a", "term-c").await.unwrap();
+        let held = session.lock().await;
+
+        let verification = tokio::spawn({
+            let credentials = credentials.clone();
+            async move { credentials.verify(&token).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The attachment's cleanup queues on the same lock, and shutdown waits for it.
+        drop(attachment);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let shutdown = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.inner.cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shutdown began");
+        drop(held);
+
+        assert_eq!(
+            verification.await.unwrap(),
+            None,
+            "a verification waiting on the session lock succeeded after shutdown began"
+        );
+        shutdown.await.unwrap();
     }
 
     #[tokio::test]

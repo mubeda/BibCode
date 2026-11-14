@@ -324,7 +324,12 @@ fn a_lost_codex_connection_withdraws_readiness() {
     lease.mark_ready_for_prompt();
     let activity = super::TerminalAgentActivityControl::enabled();
 
-    super::codex::publish_codex_observation_lost(&activity, &lease, 3);
+    super::codex::publish_codex_observation_lost(
+        &activity,
+        &lease,
+        &mut super::model::PromptReadiness::default(),
+        3,
+    );
 
     let status = lease.subscribe_agent_status().borrow().expect("a status");
     assert_eq!(status.state, Done);
@@ -337,6 +342,119 @@ fn a_lost_codex_connection_withdraws_readiness() {
             .latest_observation()
             .map(|observation| observation.kind),
         Some(super::TerminalAgentActivityObservationKind::Unavailable)
+    );
+}
+
+fn ready_now(lease: &super::TerminalObserverGenerationLease) -> bool {
+    lease
+        .subscribe_agent_status()
+        .borrow()
+        .is_some_and(|status| status.ready_for_prompt)
+}
+
+/// Polls `readiness.wait` on a read that is still pending, as the observer waits on a quiet
+/// stream, and returns whether the terminal then reads ready.
+async fn ready_while_waiting(
+    readiness: &mut super::model::PromptReadiness,
+    lease: &super::TerminalObserverGenerationLease,
+) -> bool {
+    let wait = readiness.wait(lease, std::future::pending::<()>());
+    tokio::pin!(wait);
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    ready_now(lease)
+}
+
+/// R-6: an observer makes its terminal ready only while it waits on a stream with nothing to
+/// read, from the latest root event it read, fresh.
+#[tokio::test]
+async fn prompt_readiness_publishes_only_at_a_wait_from_the_latest_fresh_root_event() {
+    use super::model::PromptEvidence::{Fresh, Stale};
+    let idle = TerminalAgentReport::Set(Done, false);
+    let busy = TerminalAgentReport::Set(Working, false);
+    let generation = super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+    let lease = generation.observation();
+    let mut readiness = super::model::PromptReadiness::default();
+
+    readiness.observe(&lease, idle, true, Fresh);
+    assert!(
+        !ready_now(&lease),
+        "reading an idle made the terminal ready"
+    );
+    assert_eq!(
+        readiness.wait(&lease, std::future::ready(7)).await,
+        7,
+        "a wait returns what its read returns"
+    );
+    assert!(
+        !ready_now(&lease),
+        "a wait whose read was ready at once made the terminal ready"
+    );
+    assert!(
+        ready_while_waiting(&mut readiness, &lease).await,
+        "a quiet wait after a fresh idle left the terminal not ready"
+    );
+
+    readiness.suspend(&lease);
+    assert!(!ready_now(&lease), "suspending kept the terminal ready");
+    assert!(
+        ready_while_waiting(&mut readiness, &lease).await,
+        "suspending forgot the idle it read"
+    );
+
+    readiness.observe(&lease, busy, false, Fresh);
+    assert!(
+        !ready_while_waiting(&mut readiness, &lease).await,
+        "an idle a newer busy superseded made the terminal ready"
+    );
+
+    readiness.observe(&lease, idle, true, Stale);
+    assert!(
+        !ready_while_waiting(&mut readiness, &lease).await,
+        "a stale idle made the terminal ready"
+    );
+
+    readiness.observe(&lease, idle, true, Fresh);
+    readiness.reset(&lease);
+    assert!(
+        !ready_while_waiting(&mut readiness, &lease).await,
+        "a reset kept the idle read before it"
+    );
+}
+
+/// A consumer that takes the readiness, as the pointer does when it types one line, keeps it
+/// taken until a new root event: the observer's later waits and its own withdrawals do not
+/// hand the same idle out again. Readiness the observer withdrew itself returns at its next wait.
+#[tokio::test]
+async fn prompt_readiness_a_consumer_took_returns_only_with_a_new_root_event() {
+    use super::model::PromptEvidence::Fresh;
+    let idle = TerminalAgentReport::Set(Done, false);
+    let generation = super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+    let lease = generation.observation();
+    let mut readiness = super::model::PromptReadiness::default();
+    readiness.observe(&lease, idle, true, Fresh);
+    assert!(ready_while_waiting(&mut readiness, &lease).await);
+
+    readiness.suspend(&lease);
+    assert!(
+        ready_while_waiting(&mut readiness, &lease).await,
+        "readiness the observer withdrew itself did not return at its next wait"
+    );
+
+    assert!(lease.clear_ready_for_prompt(), "the consumer takes it");
+    assert!(
+        !ready_while_waiting(&mut readiness, &lease).await,
+        "a later wait handed out an idle a consumer already took"
+    );
+    readiness.suspend(&lease);
+    assert!(
+        !ready_while_waiting(&mut readiness, &lease).await,
+        "a withdrawal after a consumer took the idle handed it out again"
+    );
+
+    readiness.observe(&lease, idle, true, Fresh);
+    assert!(
+        ready_while_waiting(&mut readiness, &lease).await,
+        "a new idle after the consumer took the last one left the terminal not ready"
     );
 }
 

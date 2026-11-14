@@ -26,7 +26,8 @@ use tokio::{
 #[cfg(test)]
 use super::TerminalObserverGeneration;
 use super::model::{
-    PromptEvidence, TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease,
+    PromptEvidence, PromptReadiness, TerminalAgentReport, TerminalAgentState,
+    TerminalObserverGenerationLease,
 };
 use super::{
     NativeTerminalCommand, PreparedTerminalLaunch, PreparedTerminalObserver,
@@ -75,6 +76,8 @@ const OPENCODE_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const OPENCODE_OBSERVATION_ACK_GRACE: Duration = Duration::from_millis(100);
 const OPENCODE_REATTACH_REQUEST_LIMIT: u32 = (MAX_RECONCILED_CHILDREN as u32) * 2 + 2;
 const OPENCODE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
+/// Events the observer keeps while a reconciliation runs; past this the stream waits unread.
+const OPENCODE_RECONCILIATION_BACKLOG_LIMIT: usize = 1024;
 const OPENCODE_SSE_RETRY_MIN: Duration = Duration::from_millis(100);
 const OPENCODE_SSE_RETRY_MAX: Duration = Duration::from_secs(2);
 /// The first wait before an activity scope that could not be written is written again.
@@ -1087,17 +1090,62 @@ impl OpenCodeLivePublication<'_> {
     }
 }
 
+/// What the observer read from its stream while it did other work, in order: an event or the
+/// stream's error, or `None` where the stream then went unread because the backlog was full.
+type OpenCodeBacklog = VecDeque<Option<Result<Vec<u8>, String>>>;
+
+/// Runs `work` while it keeps reading `stream` into `backlog`, so events do not pile up unread
+/// behind it. Reading stops at the stream's first error or at the backlog's bound.
 async fn wait_for_opencode_live_work<T>(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     generation: &TerminalObserverGenerationLease,
+    stream: &mut dyn OpenCodeEventStream,
+    backlog: &mut OpenCodeBacklog,
     work: impl Future<Output = T>,
 ) -> OpenCodeLiveWork<T> {
     tokio::pin!(work);
-    tokio::select! {
-        biased;
-        _ = generation.cancelled() => OpenCodeLiveWork::Cancelled,
-        changed = activity.changed() => OpenCodeLiveWork::ActivityChanged(changed.is_ok()),
-        completed = &mut work => OpenCodeLiveWork::Completed(completed),
+    let mut reading = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => return OpenCodeLiveWork::Cancelled,
+            changed = activity.changed() => {
+                return OpenCodeLiveWork::ActivityChanged(changed.is_ok());
+            }
+            completed = &mut work => return OpenCodeLiveWork::Completed(completed),
+            data = stream.next_data(), if reading => {
+                let full = data.is_ok()
+                    && backlog.len() + 1 >= OPENCODE_RECONCILIATION_BACKLOG_LIMIT;
+                reading = data.is_ok() && !full;
+                backlog.push_back(Some(data));
+                if full {
+                    backlog.push_back(None);
+                }
+            }
+        }
+    }
+}
+
+/// Reports the root's state a dormant read carries; data that is not JSON breaks the stream.
+fn publish_opencode_dormant_status(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
+    root_session_id: &str,
+    data: Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    match data? {
+        Some(data)
+            if !publish_opencode_agent_status(
+                generation,
+                readiness,
+                root_session_id,
+                &data,
+                PromptEvidence::Fresh,
+            ) =>
+        {
+            Err("malformed OpenCode event".to_owned())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1244,9 +1292,12 @@ async fn run_opencode_observer(
     }
 
     let mut epoch = 0_u64;
+    let mut backlog = OpenCodeBacklog::new();
+    let mut readiness = PromptReadiness::default();
     let mut stream = attach_opencode_root(
         &mut *remote,
         &generation,
+        &mut readiness,
         &root_session_id,
         inner.handshake_timeout,
     )
@@ -1299,12 +1350,13 @@ async fn run_opencode_observer(
             stream = attach_opencode_root(
                 &mut *remote,
                 &generation,
+                &mut readiness,
                 &root_session_id,
                 inner.handshake_timeout,
             )
             .await;
             if generation.cancellation_reason().is_some() {
-                stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                stop_opencode_observer(&inner, &generation, &mut *remote, &root_session_id).await;
                 return;
             }
             if stream.is_some() {
@@ -1333,12 +1385,12 @@ async fn run_opencode_observer(
             tokio::select! {
                 biased;
                 _ = generation.cancelled() => {
-                    stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                    stop_opencode_observer(&inner, &generation, &mut *remote, &root_session_id).await;
                     return;
                 }
                 changed = activity.changed() => {
                     if changed.is_err() {
-                        stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                        stop_opencode_observer(&inner, &generation, &mut *remote, &root_session_id).await;
                         return;
                     }
                 }
@@ -1347,47 +1399,62 @@ async fn run_opencode_observer(
             continue;
         }
 
-        let event = {
-            let current_stream = stream.as_mut().expect("OpenCode stream is present");
-            match mode {
-                OpenCodeObserverMode::Live => tokio::select! {
-                    biased;
-                    _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
-                    changed = activity.changed() => {
-                        OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
-                    }
-                    _ = interval.tick() => OpenCodeObserverEvent::Reconcile,
-                    data = current_stream.next_data() => OpenCodeObserverEvent::Data(data),
-                },
-                OpenCodeObserverMode::Dormant | OpenCodeObserverMode::Unavailable => {
-                    let retry = scope_retry;
-                    tokio::select! {
+        let event = match backlog.pop_front() {
+            // The stream went unread past the backlog: a pending read cannot prove it empty, so
+            // only a root event read after this makes the terminal ready.
+            Some(None) => {
+                readiness.reset(&generation);
+                continue;
+            }
+            Some(Some(data)) if mode == OpenCodeObserverMode::Live => {
+                OpenCodeObserverEvent::Data(data)
+            }
+            Some(Some(data)) => OpenCodeObserverEvent::Discard(publish_opencode_dormant_status(
+                &generation,
+                &mut readiness,
+                &root_session_id,
+                data.map(Some),
+            )),
+            None => {
+                let current_stream = stream.as_mut().expect("OpenCode stream is present");
+                match mode {
+                    OpenCodeObserverMode::Live => tokio::select! {
                         biased;
                         _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
                         changed = activity.changed() => {
                             OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
                         }
-                        // Enabling again writes the scope that could not be written.
-                        () = async {
-                            if let Some(at) = retry {
-                                tokio::time::sleep_until(at).await;
-                            }
-                        }, if retry.is_some() => {
-                            scope_retry = None;
-                            OpenCodeObserverEvent::ActivityChanged(true)
+                        _ = interval.tick() => OpenCodeObserverEvent::Reconcile,
+                        data = readiness.wait(&generation, current_stream.next_data()) => {
+                            OpenCodeObserverEvent::Data(data)
                         }
-                        // Dormant activity still reads the root agent's state (#187).
-                        data = current_stream.next_dormant_data() => {
-                            OpenCodeObserverEvent::Discard(data.map(|data| {
-                                if let Some(data) = data {
-                                    publish_opencode_agent_status(
-                                        &generation,
-                                        &root_session_id,
-                                        &data,
-                                        PromptEvidence::Fresh,
-                                    );
+                    },
+                    OpenCodeObserverMode::Dormant | OpenCodeObserverMode::Unavailable => {
+                        let retry = scope_retry;
+                        tokio::select! {
+                            biased;
+                            _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
+                            changed = activity.changed() => {
+                                OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
+                            }
+                            // Enabling again writes the scope that could not be written.
+                            () = async {
+                                if let Some(at) = retry {
+                                    tokio::time::sleep_until(at).await;
                                 }
-                            }))
+                            }, if retry.is_some() => {
+                                scope_retry = None;
+                                OpenCodeObserverEvent::ActivityChanged(true)
+                            }
+                            // Dormant activity still reads the root agent's state (#187).
+                            data = readiness.wait(&generation, current_stream.next_dormant_data()) => {
+                                OpenCodeObserverEvent::Discard(publish_opencode_dormant_status(
+                                    &generation,
+                                    &mut readiness,
+                                    &root_session_id,
+                                    data,
+                                ))
+                            }
                         }
                     }
                 }
@@ -1409,6 +1476,7 @@ async fn run_opencode_observer(
                 };
                 let publication = OpenCodeLivePublication { fence, admission };
                 reconciled = true;
+                readiness.suspend(&generation);
                 let reconciliation = reconcile_opencode(
                     &inner.publisher,
                     &mut *remote,
@@ -1417,7 +1485,15 @@ async fn run_opencode_observer(
                     &mut sequence,
                     Some(publication),
                 );
-                match wait_for_opencode_live_work(&mut activity, &generation, reconciliation).await
+                let current_stream = stream.as_mut().expect("OpenCode stream is present");
+                match wait_for_opencode_live_work(
+                    &mut activity,
+                    &generation,
+                    &mut **current_stream,
+                    &mut backlog,
+                    reconciliation,
+                )
+                .await
                 {
                     OpenCodeLiveWork::Cancelled => OpenCodeObserverEvent::Cancelled,
                     OpenCodeLiveWork::ActivityChanged(changed) => {
@@ -1431,15 +1507,16 @@ async fn run_opencode_observer(
 
         match event {
             OpenCodeObserverEvent::Cancelled => {
-                stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                stop_opencode_observer(&inner, &generation, &mut *remote, &root_session_id).await;
                 return;
             }
             OpenCodeObserverEvent::ActivityChanged(false) => {
-                stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                stop_opencode_observer(&inner, &generation, &mut *remote, &root_session_id).await;
                 return;
             }
             OpenCodeObserverEvent::ActivityChanged(true) => {
                 let mut state = *activity.borrow();
+                let mut replacement_started = false;
                 loop {
                     if !state.enabled {
                         live_state = None;
@@ -1454,6 +1531,9 @@ async fn run_opencode_observer(
 
                     live_state = None;
                     mode = OpenCodeObserverMode::Dormant;
+                    replacement_started = true;
+                    // What the old stream holds predates the replacement.
+                    backlog.clear();
                     let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
                     let outcome = {
                         let dormant_stream =
@@ -1464,6 +1544,7 @@ async fn run_opencode_observer(
                             &mut activity,
                             state,
                             &generation,
+                            &mut readiness,
                             deadline,
                         )
                         .await
@@ -1496,6 +1577,7 @@ async fn run_opencode_observer(
                             );
                             if promoted {
                                 scope_retry = None;
+                                replacement_started = false;
                                 break;
                             }
                             state = inner.activity.snapshot();
@@ -1530,16 +1612,28 @@ async fn run_opencode_observer(
                             state = current;
                         }
                         OpenCodeReplacementOutcome::Cancelled => {
-                            stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
+                            stop_opencode_observer(
+                                &inner,
+                                &generation,
+                                &mut *remote,
+                                &root_session_id,
+                            )
+                            .await;
                             return;
                         }
                     }
+                }
+                // The old stream's events were discarded while the replacement ran, and those it
+                // still holds predate it: only a new attachment observes fresh again.
+                if replacement_started && stream.take().is_some() {
+                    epoch = epoch.saturating_add(1);
                 }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
                 let Some(state) = live_state else {
                     publish_opencode_agent_status(
                         &generation,
+                        &mut readiness,
                         &root_session_id,
                         &data,
                         PromptEvidence::Fresh,
@@ -1551,7 +1645,7 @@ async fn run_opencode_observer(
                     generation: &generation,
                     state,
                 };
-                let (admission, output) = match decode_and_track_opencode_live_data(
+                let decoded = match decode_and_track_opencode_live_data(
                     fence,
                     &mut tracker,
                     &data,
@@ -1559,23 +1653,30 @@ async fn run_opencode_observer(
                     |event| {
                         OpenCodeStatusEvent::from_value(event).publish(
                             &generation,
+                            &mut readiness,
                             &root_session_id,
                             PromptEvidence::Fresh,
                         );
                     },
                 ) {
-                    OpenCodeLiveData::Undecoded => {
-                        publish_opencode_agent_status(
+                    OpenCodeLiveData::Undecoded
+                        if !publish_opencode_agent_status(
                             &generation,
+                            &mut readiness,
                             &root_session_id,
                             &data,
                             PromptEvidence::Fresh,
-                        );
-                        continue;
+                        ) =>
+                    {
+                        OpenCodeLiveData::Malformed
                     }
-                    OpenCodeLiveData::Stale => continue,
+                    decoded => decoded,
+                };
+                let (admission, output) = match decoded {
+                    OpenCodeLiveData::Undecoded | OpenCodeLiveData::Stale => continue,
                     OpenCodeLiveData::Malformed => {
-                        generation.clear_ready_for_prompt();
+                        readiness.reset(&generation);
+                        backlog.clear();
                         stream = None;
                         epoch = epoch.saturating_add(1);
                         live_state = None;
@@ -1588,6 +1689,12 @@ async fn run_opencode_observer(
                 if !opencode_live_work_is_current(fence, &admission) {
                     continue;
                 }
+                if !output.mutations.is_empty() {
+                    // shortcut: as after a reconciliation, a pending read cannot prove the
+                    // stream empty after it went unread, so only a later root event makes the
+                    // terminal ready. Root events publish no activity, so an idle keeps it.
+                    readiness.reset(&generation);
+                }
                 apply_opencode_output(
                     &inner.publisher,
                     &format!("opencode:terminal:sse:{sequence}"),
@@ -1599,7 +1706,8 @@ async fn run_opencode_observer(
             }
             OpenCodeObserverEvent::Reconcile => unreachable!("reconciliation is resolved above"),
             OpenCodeObserverEvent::Data(Err(_)) | OpenCodeObserverEvent::Discard(Err(_)) => {
-                generation.clear_ready_for_prompt();
+                readiness.reset(&generation);
+                backlog.clear();
                 stream = None;
                 epoch = epoch.saturating_add(1);
                 live_state = None;
@@ -1628,17 +1736,18 @@ async fn publish_opencode_scope(
         .unwrap_or(false)
 }
 
-/// Withdraws readiness, reads the root session's state, then opens the event stream. Every
+/// Resets readiness, reads the root session's state, then opens the event stream. Every
 /// event the stream carries is newer than that state, so none can contradict it, and an idle
 /// among them is fresh evidence that the prompt waits. A change between the two shows from
 /// the next event on.
 async fn attach_opencode_root(
     remote: &mut dyn OpenCodeRemoteClient,
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     root_session_id: &str,
     timeout: Duration,
 ) -> Option<Box<dyn OpenCodeEventStream>> {
-    generation.clear_ready_for_prompt();
+    readiness.reset(generation);
     hydrate_opencode_root_status(remote, generation, root_session_id).await;
     establish_opencode_event_stream(remote, generation, timeout).await
 }
@@ -1670,14 +1779,23 @@ async fn hydrate_opencode_root_status(
 
 /// Publishes the root session's state an OpenCode event reports, for the left panel (#187). It
 /// decodes only the fields that state needs, so no prompt or message text is read or kept.
+///
+/// Returns false for data that is not JSON: an event the stream lost, which the caller treats
+/// as a broken stream, as the live path's `Malformed` does. JSON of an unexpected shape is only
+/// ignored.
 fn publish_opencode_agent_status(
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     root_session_id: &str,
     data: &[u8],
     evidence: PromptEvidence,
-) {
-    if let Ok(event) = serde_json::from_slice::<OpenCodeStatusEvent>(data) {
-        event.publish(generation, root_session_id, evidence);
+) -> bool {
+    match serde_json::from_slice::<OpenCodeStatusEvent>(data) {
+        Ok(event) => {
+            event.publish(generation, readiness, root_session_id, evidence);
+            true
+        }
+        Err(error) => error.is_data(),
     }
 }
 
@@ -1811,11 +1929,13 @@ impl OpenCodeStatusEvent {
     fn publish(
         &self,
         generation: &TerminalObserverGenerationLease,
+        readiness: &mut PromptReadiness,
         root_session_id: &str,
         evidence: PromptEvidence,
     ) {
         if let Some(report) = self.status(root_session_id) {
-            generation.report_agent_evidence(
+            readiness.observe(
+                generation,
                 report,
                 self.ready_for_prompt(root_session_id),
                 evidence,
@@ -1855,9 +1975,12 @@ fn commit_opencode_observation(
 
 async fn stop_opencode_observer(
     inner: &OpenCodeObserverInner,
+    generation: &TerminalObserverGenerationLease,
     remote: &mut dyn OpenCodeRemoteClient,
     root_session_id: &str,
 ) {
+    // The observer stops reading here; nothing sees the agent's next turn.
+    generation.clear_ready_for_prompt();
     let _ = remote.abort(root_session_id).await;
     inner.resources.cleanup_helper().await;
 }
@@ -1927,9 +2050,10 @@ async fn prepare_opencode_replacement(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     expected_state: TerminalAgentActivityState,
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     deadline: tokio::time::Instant,
 ) -> OpenCodeReplacementOutcome {
-    generation.clear_ready_for_prompt();
+    readiness.reset(generation);
     let mut dormant_stream_healthy = true;
     let opening = remote.open_event_stream();
     tokio::pin!(opening);
@@ -4169,12 +4293,14 @@ mod tests {
     ) -> Option<super::super::TerminalAgentObservation> {
         let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
         let lease = generation.observation();
+        let mut readiness = PromptReadiness::default();
         let mut normalizer = opencode::v2_activity::V2ActivityNormalizer::default();
         for event in events {
             for v1 in normalize_opencode_v2_for_terminal(&mut normalizer, event) {
                 if dormant {
                     publish_opencode_agent_status(
                         &lease,
+                        &mut readiness,
                         root,
                         &serde_json::to_vec(&v1).expect("encode"),
                         PromptEvidence::Fresh,
@@ -4182,12 +4308,20 @@ mod tests {
                 } else {
                     OpenCodeStatusEvent::from_value(&v1).publish(
                         &lease,
+                        &mut readiness,
                         root,
                         PromptEvidence::Fresh,
                     );
                 }
             }
         }
+        // The stream is quiet after the last event: the observer waits there.
+        assert!(
+            futures_util::FutureExt::now_or_never(
+                readiness.wait(&lease, std::future::pending::<()>())
+            )
+            .is_none()
+        );
         *lease.subscribe_agent_status().borrow()
     }
 
@@ -4255,6 +4389,59 @@ mod tests {
             "the interrupt still reaches the tracker as an abort"
         );
         assert_eq!(with_idle, replay(false).0);
+    }
+
+    /// The live observer resets readiness before it publishes activity, so a turn ends ready
+    /// only if nothing after the root's last idle publishes activity.
+    #[test]
+    fn opencode_2_turns_end_ready_although_activity_publication_resets_readiness() {
+        for name in [
+            "hello",
+            "interrupt",
+            "child",
+            "children",
+            "shell",
+            "background",
+            "revert",
+        ] {
+            let (events, root) = opencode_2_fixture(name);
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let lease = generation.observation();
+            let mut readiness = PromptReadiness::default();
+            let mut normalizer = opencode::v2_activity::V2ActivityNormalizer::default();
+            let mut tracker = OpenCodeActivityTracker::new(&root);
+            for event in &events {
+                for v1 in normalize_opencode_v2_for_terminal(&mut normalizer, event) {
+                    OpenCodeStatusEvent::from_value(&v1).publish(
+                        &lease,
+                        &mut readiness,
+                        &root,
+                        PromptEvidence::Fresh,
+                    );
+                    if !tracker
+                        .handle_observed_event_at(&v1, 1)
+                        .mutations
+                        .is_empty()
+                    {
+                        readiness.reset(&lease);
+                    }
+                }
+            }
+            assert!(
+                futures_util::FutureExt::now_or_never(
+                    readiness.wait(&lease, std::future::pending::<()>())
+                )
+                .is_none()
+            );
+            assert!(
+                lease
+                    .subscribe_agent_status()
+                    .borrow()
+                    .is_some_and(|status| status.ready_for_prompt),
+                "the {name} turn ended not ready"
+            );
+        }
     }
 
     #[test]
@@ -4436,8 +4623,14 @@ mod tests {
         lease.mark_ready_for_prompt();
         let mut remote = AttachingRemote::new(false, false);
 
-        let stream =
-            attach_opencode_root(&mut remote, &lease, "root", Duration::from_millis(20)).await;
+        let stream = attach_opencode_root(
+            &mut remote,
+            &lease,
+            &mut PromptReadiness::default(),
+            "root",
+            Duration::from_millis(20),
+        )
+        .await;
 
         assert!(stream.is_none());
         let status = lease.subscribe_agent_status().borrow().expect("a status");
@@ -4473,6 +4666,7 @@ mod tests {
             &mut changes,
             expected,
             &lease,
+            &mut PromptReadiness::default(),
             tokio::time::Instant::now() + Duration::from_millis(50),
         )
         .await;
@@ -4526,9 +4720,16 @@ mod tests {
         let mut remote = AttachingRemote::new(true, false);
         remote.queued.push(ROOT_IDLE.to_vec());
 
-        let mut stream = attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1))
-            .await
-            .expect("a stream");
+        let mut readiness = PromptReadiness::default();
+        let mut stream = attach_opencode_root(
+            &mut remote,
+            &lease,
+            &mut readiness,
+            "root",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a stream");
         let snapshot = lease.subscribe_agent_status().borrow().expect("a status");
         assert_eq!(
             (snapshot.state, snapshot.ready_for_prompt),
@@ -4537,7 +4738,11 @@ mod tests {
         );
         let queued = stream.next_data().await.expect("the queued idle");
         OpenCodeStatusEvent::from_value(&serde_json::from_slice(&queued).expect("an event"))
-            .publish(&lease, "root", PromptEvidence::Fresh);
+            .publish(&lease, &mut readiness, "root", PromptEvidence::Fresh);
+        // The observer becomes ready only as it waits on its quiet stream.
+        let wait = readiness.wait(&lease, stream.next_data());
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
 
         let status = lease.subscribe_agent_status().borrow().expect("a status");
         assert!(
@@ -6188,7 +6393,17 @@ mod tests {
             }
         };
         let observation = generation.observation();
-        let waiting = wait_for_opencode_live_work(&mut changes, &observation, reconciliation);
+        let mut stream = ConnectedStream {
+            events: VecDeque::new(),
+        };
+        let mut backlog = OpenCodeBacklog::new();
+        let waiting = wait_for_opencode_live_work(
+            &mut changes,
+            &observation,
+            &mut stream,
+            &mut backlog,
+            reconciliation,
+        );
         tokio::pin!(waiting);
         let first_poll =
             std::future::poll_fn(|context| std::task::Poll::Ready(waiting.as_mut().poll(context)))
