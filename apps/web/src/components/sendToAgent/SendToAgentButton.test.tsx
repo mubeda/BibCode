@@ -551,6 +551,39 @@ describe("SendToAgentButton", () => {
     expect(revealPanel.mock.calls).toEqual([[ThreadId.make("panel-1")]]);
   });
 
+  it("a send that finishes after its preview was cancelled and another opened reveals nothing", async () => {
+    let finish: (outcome: SendOutcome) => void = () => undefined;
+    const send = vi.fn(
+      () =>
+        new Promise<SendOutcome>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const revealPanel = vi.fn();
+    render(
+      baseProps({
+        send,
+        createPanel: () => Promise.resolve(ThreadId.make("panel-1")),
+        revealPanel,
+        previewContentFor: () => ({ leadIn: "", attachments: [] }),
+      }),
+    );
+    await openAction("Second opinion");
+    await act(async () => exactItem("Codex")!.click());
+    await flush();
+    await act(async () => find("button", "Send")!.click());
+    await flush();
+    await act(async () => find("button", "Cancel")!.click());
+    await flush();
+    await openAction("Second opinion");
+    await act(async () => exactItem("Codex")!.click());
+    await flush();
+    await act(async () => finish({ kind: "sent" }));
+    await flush();
+    expect(revealPanel).not.toHaveBeenCalled();
+    expect(document.body.querySelector("textarea")).not.toBeNull();
+  });
+
   describe("out-of-tokens hint", () => {
     const hint = {
       kind: "usage-limit",

@@ -333,6 +333,30 @@ describe("buildReviewContent", () => {
     expect(revealPanel).toHaveBeenCalledExactlyOnceWith("panel-1");
   });
 
+  it("does not reveal the review panel once its preview no longer owns the send", async () => {
+    const revealPanel = vi.fn();
+    const startNewPanelReview = vi.fn(
+      async (input: {
+        send: (panel: ThreadId) => Promise<SendOutcome>;
+      }): Promise<PromptedPanelResult> => {
+        await input.send(ThreadId.make("panel-1"));
+        return {
+          threadId: ThreadId.make("panel-1"),
+          created: true,
+          messageId: null,
+          sent: "sent",
+        };
+      },
+    );
+    const content = build({ startNewPanelReview, revealPanel });
+    const outcome = await content.submit!(
+      { leadIn: content.leadIn, note: "look", attachments: [] },
+      () => false,
+    );
+    expect(outcome).toEqual({ kind: "sent" });
+    expect(revealPanel).not.toHaveBeenCalled();
+  });
+
   it("a panel that could not be created keeps the preview and says so", async () => {
     const content = build();
     const outcome = await content.submit!({ leadIn: content.leadIn, note: "", attachments: [] });
