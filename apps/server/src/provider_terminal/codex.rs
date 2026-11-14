@@ -1407,11 +1407,8 @@ async fn run_codex_observer_inner(
         break resumed;
     };
     // The left panel learns the root agent's state as soon as the observer attaches (#187).
-    let mut stale = publish_codex_resumed_status(
-        generation,
-        &mut *client,
-        resumed.thread.status.as_ref(),
-    );
+    let mut stale =
+        publish_codex_resumed_status(generation, &mut *client, resumed.thread.status.as_ref());
 
     let initial_state = *activity.borrow_and_update();
     let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
@@ -1576,8 +1573,7 @@ async fn run_codex_observer_inner(
             // The barrier resets activity, which drops what is still buffered.
             report_dropped_codex_notifications(generation, &root, &mut stale, &mut *client);
             let outcome = {
-                let barrier =
-                    cross_codex_enable_barrier(&mut *client, generation, &root, deadline);
+                let barrier = cross_codex_enable_barrier(&mut *client, generation, &root, deadline);
                 tokio::pin!(barrier);
                 tokio::select! {
                     biased;
@@ -1592,12 +1588,7 @@ async fn run_codex_observer_inner(
                 CodexObserverWait::Cancelled => break,
                 CodexObserverWait::ActivityChanged(false) => break,
                 CodexObserverWait::ActivityChanged(true) => {
-                    report_dropped_codex_notifications(
-                        generation,
-                        &root,
-                        &mut stale,
-                        &mut *client,
-                    );
+                    report_dropped_codex_notifications(generation, &root, &mut stale, &mut *client);
                     let changed = *activity.borrow_and_update();
                     live_state = None;
                     pending_reconciliation = false;
@@ -1745,12 +1736,7 @@ async fn run_codex_observer_inner(
                 CodexObserverWait::Cancelled => break,
                 CodexObserverWait::ActivityChanged(false) => break,
                 CodexObserverWait::ActivityChanged(true) => {
-                    report_dropped_codex_notifications(
-                        generation,
-                        &root,
-                        &mut stale,
-                        &mut *client,
-                    );
+                    report_dropped_codex_notifications(generation, &root, &mut stale, &mut *client);
                     let changed = *activity.borrow_and_update();
                     retry_at = None;
                     if !changed.enabled {
@@ -1840,6 +1826,10 @@ async fn run_codex_observer_inner(
                         continue;
                     }
                 };
+                // A request dropped older notifications: a turn or ask among them went unseen.
+                if client.take_lost_notifications() {
+                    generation.clear_ready_for_prompt();
+                }
                 // The root agent's state goes to the left panel whatever the activity setting
                 // says (#187).
                 report_codex_root(generation, &envelope, &root, evidence);
@@ -3615,6 +3605,7 @@ impl CodexRemoteClientFactory for SystemCodexRemoteClientFactory {
                     socket,
                     next_request_id: 1,
                     pending: VecDeque::new(),
+                    lost_notifications: false,
                 }) as Box<dyn CodexRemoteClient>)
             }
             #[cfg(not(unix))]
@@ -3631,6 +3622,7 @@ struct SystemCodexRemoteClient {
     socket: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     next_request_id: u64,
     pending: VecDeque<Value>,
+    lost_notifications: bool,
 }
 
 #[cfg(unix)]
@@ -3703,6 +3695,7 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
                 }
                 if self.pending.len() == CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
                     self.pending.pop_front();
+                    self.lost_notifications = true;
                 }
                 self.pending.push_back(value);
             }
@@ -3726,6 +3719,10 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 
     fn drain_request_buffered_notifications(&mut self) -> Vec<Value> {
         self.pending.drain(..).collect()
+    }
+
+    fn take_lost_notifications(&mut self) -> bool {
+        std::mem::take(&mut self.lost_notifications)
     }
 
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + '_>> {
@@ -5304,7 +5301,8 @@ mod tests {
                 .expect("text request");
             let request: Value = serde_json::from_str(&request).expect("request JSON");
             for sequence in 0..=CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
-                let notification = json!({"method": "item/agentMessage/delta", "params": {"n": sequence}});
+                let notification =
+                    json!({"method": "item/agentMessage/delta", "params": {"n": sequence}});
                 socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         notification.to_string().into(),
@@ -5314,7 +5312,9 @@ mod tests {
             }
             socket
                 .send(tokio_tungstenite::tungstenite::Message::Text(
-                    json!({"id": request["id"], "result": {}}).to_string().into(),
+                    json!({"id": request["id"], "result": {}})
+                        .to_string()
+                        .into(),
                 ))
                 .await
                 .expect("response");
@@ -5336,7 +5336,10 @@ mod tests {
             client.take_lost_notifications(),
             "a notification the request dropped went unreported"
         );
-        assert!(!client.take_lost_notifications(), "the loss is reported once");
+        assert!(
+            !client.take_lost_notifications(),
+            "the loss is reported once"
+        );
         drop(client);
         server.await.expect("UDS server");
     }
