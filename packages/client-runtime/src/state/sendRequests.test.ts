@@ -120,4 +120,48 @@ describe("applySendRequestsEvent", () => {
     });
     expect(ids(next)).toEqual(["z"]);
   });
+
+  describe("timestamps of variable fractional precision", () => {
+    // The server trims trailing zeros, so ".1Z" is the earlier instant and sorts after ".11Z".
+    const earlier = "2026-11-14T00:00:00.1Z";
+    const later = "2026-11-14T00:00:00.11Z";
+
+    it("a dismissal a hundredth of a second later replaces the queued row", () => {
+      const current = [request("a", earlier)];
+      const next = applySendRequestsEvent(current, {
+        type: "upsert",
+        request: request("a", earlier, { updatedAt: later, dismissedAt: later }),
+      });
+      expect(next[0]?.dismissedAt).toBe(later);
+    });
+
+    it("an older queued page does not revive a dismissed row", () => {
+      const current = [request("a", earlier, { updatedAt: later, dismissedAt: later })];
+      const next = applySendRequestsEvent(current, {
+        type: "page",
+        requests: [request("a", earlier)],
+      });
+      expect(next[0]?.dismissedAt).toBe(later);
+    });
+
+    it("the later instant sorts first even when its text sorts earlier", () => {
+      const next = applySendRequestsEvent([], {
+        type: "snapshot",
+        requests: [request("old", "2026-11-14T00:00:00.1Z"), request("new", later)],
+      });
+      expect(ids(next)).toEqual(["new", "old"]);
+    });
+
+    it("an equal instant written with another precision lets the incoming row win", () => {
+      const current = [request("a", "2026-11-14T00:00:00.5Z", { state: "queued" })];
+      const next = applySendRequestsEvent(current, {
+        type: "upsert",
+        request: request("a", "2026-11-14T00:00:00.5Z", {
+          state: "waiting",
+          updatedAt: "2026-11-14T00:00:00.500Z",
+        }),
+      });
+      expect(next[0]?.state).toBe("waiting");
+    });
+  });
 });
