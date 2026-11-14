@@ -29,6 +29,7 @@ when it carries the `ci:full` label:
 | Check, Test, Release Smoke                  | yes                     | yes                                             |
 | Native desktop: Linux and Windows rows      | yes                     | yes                                             |
 | Native desktop: macOS arm64 and x64         | no                      | yes                                             |
+| Server tests: Windows x64 and arm64         | yes                     | yes                                             |
 | Server tests: macOS arm64 and x64           | no                      | yes                                             |
 | Crash smoke: `ubuntu-24.04`, `windows-2025` | yes                     | yes                                             |
 | Crash smoke: `macos-26`                     | no                      | yes                                             |
@@ -57,7 +58,8 @@ workflows do not listen for `merge_group`.
 branch deletion and non-fast-forward pushes; it requires no status checks. If
 required checks are added, require the job names that run on every pull
 request: `Secrets`, `Check`, `Test`, `Release Smoke`, the four `Native desktop - Linux
-…`/`Windows …` rows, and `Crash smoke - ubuntu-24.04` and `- windows-2025`.
+…`/`Windows …` rows, the two `Server tests - Windows …` rows, and `Crash smoke -
+ubuntu-24.04` and `- windows-2025`.
 Do not require the macOS rows or the seeded upgrade jobs: on pull requests
 without `ci:full` they do not report under their row names (`macos-26` is not
 in the crash matrix at all), and a required check that never reports blocks
@@ -139,6 +141,26 @@ the merge.
   GNU build-id on Linux) that Release uses, so it also proves the `dump_syms`
   path on every pull request; the job installs `dump_syms` 2.3.9 for it, and
   Rust Cache keeps the binary in `~/.cargo/bin`.
+  It also passes `--workspace-codegen-units 16`, which Release does not: Cargo
+  gets `--config profile.release.package.<crate>.codegen-units=16` for
+  `bibcode-server` and `bibcode-desktop` only. Swatinem/rust-cache never stores
+  workspace crates, so every run compiles those two from scratch, and with the
+  shipped single codegen unit each compiles on one core: on 2026-11-14 the
+  bundle step spent about 23 of 29 minutes on Linux x64, 42 of 42 on Windows x64
+  and 81 of 88 on macOS arm64 after Cargo had started its last dependency. A
+  local build of the same three units took 1125 seconds with one unit and 653
+  with 16. A package override changes no dependency fingerprint, so the entry
+  this job saves is still the one Release restores. CI therefore proves the
+  thin-LTO link, the symbol dump, the strip and the bundle, and Release alone
+  compiles the two crates with the shipped single unit.
+  While it builds, the step prints a heartbeat every 60 seconds: elapsed
+  seconds and, outside Windows, the resident memory of the largest `rustc`,
+  linker and `dsymutil` processes and the system's free memory and swap. It
+  ends with a `Bundle build` notice holding the seconds and the peak single
+  process. The macOS arm64 runner has 3 cores and 7 GB, and the
+  `bibcode-server` compile peaked at 8.7 GB (shipped profile), 9.6 GB (symbol
+  profile) and 12 GB (16 units) on a local machine, so the heartbeat is how a
+  run shows memory pressure there. It never fails the step.
   Each matrix row declares its complete-job budget:
   330 minutes for each macOS row, 180 minutes for each Windows row, and 120
   minutes for each Linux row.
@@ -155,7 +177,7 @@ the merge.
   Check a change to the probe by running it once with
   `CARGO_PROFILE_RELEASE_PANIC=abort`, where it must fail. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
-  the Windows row alone runs
+  the Windows rows alone run
   `vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts`. That step is the
   supported native proof that the generated Cursor `.cmd` shim executes through
   the Windows command processor and writes its exact action record. Simulated
@@ -166,16 +188,27 @@ the merge.
   spaces, dollar signs, backticks, and typographic quotes. Every Git/home
   configuration input is fixture-owned. Other platforms skip that native case;
   their string assertions remain compatibility evidence.
-  The Windows rows then run
-  `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets` so
-  Unix-only test helpers or imports that are unused on Windows fail there under
-  `-D warnings` instead of surfacing only during native validation; Clippy's
-  `--all-targets` pass otherwise runs on Linux alone.
   The repository-availability contract additionally executes the generated
   drive/UNC trust commands through native Windows PowerShell and Git, including
   spaces, dollar signs, backticks, and typographic quotes. Every Git/home
   configuration input is fixture-owned. Other platforms skip that native case;
   their string assertions remain compatibility evidence.
+- **Server tests (Windows)** is the job `server_tests_windows`, on `windows-2025`
+  and `windows-11-vs2026-arm` on every pull request. It first runs
+  `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets`, so
+  Unix-only test helpers or imports that are unused on Windows fail there under
+  `-D warnings` instead of surfacing only during native validation; Clippy's
+  `--all-targets` pass otherwise runs on Linux alone. It then runs the server
+  tests whose behaviour differs on Windows: `git_system_config`, the background
+  Git index lock tests, the review prompt shim tests with the shim timeout test
+  (`-- review_prompt_shim_ shim_timeout_`), and the host metrics tests. These
+  steps left the native desktop rows because one row compiled `bibcode-server`
+  five times (the desktop host tests, this check, two server test builds and
+  the bundle): the five Cargo builds took 76 of the Windows arm64 row's 103
+  minutes on 2026-11-14, against about 2 minutes of running tests. Its commands
+  carry no `-j 2`: nothing runs beside the compiler in this job. It restores
+  the Native desktop Rust cache and never saves one. Its budget is 90 minutes;
+  the moved steps took 38 to 48 minutes inside the native rows.
 - **Server tests (macOS)** is the job `server_tests_macos`, on `macos-26` and
   `macos-15-intel` with the `ci:full` gate above. It runs the server tests whose
   behaviour differs on macOS: `git_system_config`, the background Git index lock
@@ -255,16 +288,28 @@ recently used entries above that. Which workflow saves which entry:
   `main` entries out.
 - Seeded Packaged Desktop Upgrade has no Rust cache step: its harness builds in
   a run-owned target that a repository `target` cache cannot warm.
-- The pnpm store stays on the setup-vp cache.
+
+- The pnpm store stays on the setup-vp cache, about 0.5 GB per runner OS and
+  architecture. Every `setup-vp` step with `cache: true` sets
+  `cache-save: ${{ github.ref == 'refs/heads/main' }}`: a pull request's entry
+  can only be read by that pull request and still counts against the limit.
 
 A job cancelled by `timeout-minutes` or by a newer run skips the cache post
 step, so the Check and Test budgets above include a cold compile. Native
 desktop keeps its 120-minute, 180-minute and 330-minute row budgets.
 
-Six native-desktop entries of about 1.6 GB each are about 10 GB on their own,
-before Check, Test, Crash smoke, Linux Git, and the setup-vp caches. Eviction
-therefore still drops the least recently used entries, now always older `main`
-entries rather than unrestorable tag or pull request entries. List them with
+The store cannot hold what CI saves. On 2026-11-14 it held 9.98 GiB of the
+10 GB limit: three of the six native-desktop entries (1.5 to 1.85 GiB each),
+Check, two Crash smoke entries, Linux Git and six pnpm stores. Every entry
+together would be about 17 GB. GitHub evicts hourly once the limit is passed,
+so entries push each other out: in one `main` run 11 of 13 Rust cache restores
+found nothing, and a Windows arm64 entry restored at 01:09 was gone at 02:08.
+A missing entry costs a job its dependency compile, about 6 minutes in the
+bundle step and about 12 minutes across a Windows native row. It does not
+explain a row that takes an hour or more: that time is the workspace crates,
+which no cache entry holds. The limit is a repository setting (Settings,
+Actions, or `PUT /repos/{owner}/{repo}/actions/cache/storage-limit`); raising
+it is billed per GiB above 10. List the entries with
 `gh cache list --sort size_in_bytes --limit 100`.
 
 ## Other Workflows
@@ -294,7 +339,7 @@ entries rather than unrestorable tag or pull request entries. List them with
   240 minutes; their packaging children keep 60 minutes on Windows and 45 on Linux. If owned-child cleanup does not observe `close`
   within five seconds, the harness releases that child and exits nonzero so the
   job cannot stay open for the rest of the 240-minute budget.
-  The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile.
+  The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release keeps the full release profile; CI's native desktop rows keep it too, except for the 16 codegen units they give the two workspace crates (see Native desktop above).
   The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
   `remote-install` reuses the protected package.
   Repository `target` caching cannot warm the run root's shared Cargo target,

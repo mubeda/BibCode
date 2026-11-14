@@ -483,20 +483,96 @@ describe("cross-platform CI contract", () => {
     );
   });
 
-  it("compiles every bibcode-server test target on the Windows native rows", () => {
-    // Clippy with --all-targets runs on Linux only, so Unix-only test helpers
-    // and imports can leave the Windows server test binaries uncompilable
-    // under -D warnings without this gate.
+  it("runs the Windows server tests off the native desktop rows, without saving a cache", () => {
+    // A native row compiled bibcode-server five times; the test builds were two of them and
+    // ran before the bundle on the same runner. Clippy with --all-targets runs on Linux only,
+    // so the check step still proves the Windows server test targets compile under -D warnings.
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
-    const nativeSteps = requireJob(workflow, "native_desktop").steps ?? [];
-    const windowsCompileStep = nativeSteps.find(
+    const job = requireJob(workflow, "server_tests_windows");
+    expect(job.if).toBeUndefined();
+    expect(job["timeout-minutes"]).toBe(90);
+    expect(job.strategy?.matrix?.include).toEqual([
+      { label: "Windows x64", runner: "windows-2025" },
+      { label: "Windows arm64", runner: "windows-11-vs2026-arm" },
+    ]);
+    const steps = job.steps ?? [];
+    const cache = steps.find((step) => String(step.uses ?? "").startsWith("Swatinem/rust-cache@"));
+    expect(cache?.with?.["shared-key"]).toBe("native-desktop");
+    expect(cache?.with?.["save-if"]).toBe("false");
+    const windowsSteps = steps.filter((step) => String(step.name).endsWith("(Windows)"));
+    expect(windowsSteps.map((step) => step.name)).toEqual([
+      "Run Git system configuration tests (Windows)",
+      "Run background Git index lock tests (Windows)",
+      "Run review prompt argument tests (Windows)",
+      "Run host metrics tests (Windows)",
+    ]);
+    const check = steps.findIndex(
       (step) => step.name === "Check Windows server test targets compile",
     );
-
-    expect(windowsCompileStep?.if).toBe("matrix.platform == 'win'");
-    expect(windowsCompileStep?.run).toBe(
+    expect(steps[check]?.run).toBe(
       "node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets",
     );
+    expect(steps[check + 1]?.name).toBe("Run Git system configuration tests (Windows)");
+    const runs = allStepCommands(job);
+    // Nothing else runs beside the compiler in this job, so it may use every core.
+    expect(runs).not.toContain("-j 2");
+    // The second filter runs the test that proves a timeout prints the terminal output.
+    expect(runs).toContain(
+      "cargo test -p bibcode-server --test windows_terminal_shims -- review_prompt_shim_ shim_timeout_",
+    );
+    // Each host metrics command fails the step when its filter matches no test.
+    expect(runs).toContain("counted exactly-one");
+
+    const native = requireJob(workflow, "native_desktop").steps ?? [];
+    expect(native.filter((step) => String(step.name).endsWith("(Windows)"))).toEqual([]);
+    const nativeRuns = allStepCommands(requireJob(workflow, "native_desktop"));
+    expect(nativeRuns).not.toContain("cargo test -p bibcode-server");
+    expect(nativeRuns).not.toContain("cargo check -p bibcode-server");
+  });
+
+  it("builds CI bundles with 16 codegen units for the workspace crates and a heartbeat", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const build = requireJob(workflow, "native_desktop").steps?.find(
+      (step) => step.name === "Build native bundle without publishing",
+    );
+    const run = String(build?.run);
+    expect(build?.shell).toBe("bash");
+    // The shipped single unit compiles bibcode-server on one core. A package override changes
+    // no dependency fingerprint, so the cache Release restores stays valid.
+    expect(run).toContain("--workspace-codegen-units 16");
+    // One line a minute, with the memory of each compiler and linker where ps can report it.
+    expect(run).toContain("sleep 60");
+    expect(run).toContain("ps -Ao rss=,comm=");
+    // The trap runs under `bash -e`: a heartbeat that already died must not fail a good build.
+    expect(run).toMatch(/trap 'kill "\$heartbeat" 2>\/dev\/null \|\| true; [^']*' EXIT/);
+    expect(run).toContain("::notice title=Bundle build::");
+    // The build's own exit code must reach the step.
+    expect(run).not.toContain("set +e");
+    expect(run).not.toMatch(/build-desktop-artifact\.ts[^\n]*\|\|/);
+
+    // Release ships the profile in Cargo.toml.
+    expect(readWorkflow(RELEASE_WORKFLOW_PATH).raw).not.toContain("--workspace-codegen-units");
+  });
+
+  it("saves the pnpm store cache from main only, in every workflow", () => {
+    // A pull request's entry is readable only by that pull request and still counts against
+    // the repository's cache limit, where it pushes out the main entries every run restores.
+    const directory = NodePath.join(REPOSITORY_ROOT, ".github/workflows");
+    const cached: string[] = [];
+    for (const file of NodeFS.readdirSync(directory).filter((name) => name.endsWith(".yml"))) {
+      const { workflow } = readWorkflow(NodePath.join(directory, file));
+      for (const [name, job] of Object.entries(workflow.jobs ?? {})) {
+        for (const step of job.steps ?? []) {
+          if (!String(step.uses ?? "").startsWith("voidzero-dev/setup-vp@")) continue;
+          if (step.with?.cache !== true) continue;
+          cached.push(`${file} ${name}`);
+          expect(step.with["cache-save"], `${file} ${name}`).toBe(
+            "${{ github.ref == 'refs/heads/main' }}",
+          );
+        }
+      }
+    }
+    expect(cached.length).toBeGreaterThan(0);
   });
 
   it("installs the full official Linux Tauri prerequisite set", () => {

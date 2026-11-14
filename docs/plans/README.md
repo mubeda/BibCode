@@ -16,3 +16,4 @@ only when they do not change the recorded meaning.
 
 - [`git-manager/`](./git-manager/) — Git Manager specification, plan, phases, research (2026-08-31).
 - [`pull-requests/`](./pull-requests/) — Pull Requests module specification, plan, phases, research (2026-09-20).
+- [`2026-11-14-ci-build-times/`](./2026-11-14-ci-build-times/) — CI build time diagnosis, research, spec and plan for #363, #364, #367 and #368 (2026-11-14).

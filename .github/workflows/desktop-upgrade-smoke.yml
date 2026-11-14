@@ -103,6 +103,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: false
 
       # No Rust cache: the harness builds into its own run-root target, which a
@@ -278,6 +279,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: false
 
       - name: Setup Rust
