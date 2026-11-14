@@ -2,13 +2,19 @@
 //! typed: the server types only [`POINTER_LINE`], once per period in which the terminal's agent
 //! waits for a prompt and no person typed, and the agent then fetches its mail itself.
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex, PoisonError},
+};
 
 use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AgentMessaging, AgentMessagingError, MessageOutcome, policy,
+    AgentMessaging, AgentMessagingError, MessageOutcome,
+    envelope::{EnvelopeInput, build_envelope},
+    policy,
     store::{
         self, AgentMessageReason, AgentMessageRow, AgentMessageStatus, NewAgentMessage, SenderKind,
     },
@@ -38,7 +44,10 @@ pub trait PointerTerminals: Send + Sync {
         thread_id: &'a str,
         terminal_id: &'a str,
     ) -> BoxFuture<'a, Option<TerminalGeneration>>;
-    #[expect(dead_code, reason = "task 8.6's hop ledger reads it")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the hop ledger reads it for task 8.2's command")
+    )]
     fn person_input_count<'a>(
         &'a self,
         thread_id: &'a str,
@@ -126,12 +135,57 @@ fn storage(
     }
 }
 
-/// Stores agent mail for AI Terminals and tells each terminal about it. Clones share one wake.
+/// One message a terminal agent fetched: its id and the envelope it reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command prints it"))]
+pub struct InboxEntry {
+    pub message_id: String,
+    pub rendered: String,
+}
+
+/// Told `(thread id, terminal id, generation key)` once for every terminal generation that
+/// ended with mail, read or not.
+pub type GenerationEndSink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+/// The hops one terminal generation fetched since a person last typed into it.
+#[derive(Default)]
+#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command reads it"))]
+struct HopLedger {
+    inputs_seen: Option<u64>,
+    highest: Option<u32>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command reads it"))]
+impl HopLedger {
+    /// Starts the chain again when the person input count changed since it was last seen.
+    fn follow(&mut self, inputs: Option<u64>) {
+        if self.inputs_seen != inputs {
+            self.inputs_seen = inputs;
+            self.highest = None;
+        }
+    }
+}
+
+/// `{address}#{generation key}`: one terminal process, for the hop ledger and the ended set.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "task 8.2's command reads the ledger")
+)]
+fn ledger_key(identity: &TerminalIdentity) -> String {
+    format!("{}#{}", identity.address(), identity.generation_key())
+}
+
+/// Stores agent mail for AI Terminals and tells each terminal about it. Clones share one wake,
+/// one hop ledger and one record of ended generations.
 #[derive(Clone)]
 pub struct TerminalPointer {
     database: Database,
     terminals: Arc<dyn PointerTerminals>,
     wake: Arc<Notify>,
+    // In memory: a terminal never outlives its server, and a restart ends every generation.
+    hops: Arc<StdMutex<HashMap<String, HopLedger>>>,
+    ended: Arc<StdMutex<HashSet<String>>>,
+    generation_end: Option<GenerationEndSink>,
 }
 
 impl TerminalPointer {
@@ -140,7 +194,19 @@ impl TerminalPointer {
             database,
             terminals,
             wake: Arc::new(Notify::new()),
+            hops: Arc::default(),
+            ended: Arc::default(),
+            generation_end: None,
         }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "task 9.3 supplies the generation-end sink")
+    )]
+    pub fn with_generation_end_sink(mut self, sink: GenerationEndSink) -> Self {
+        self.generation_end = Some(sink);
+        self
     }
 
     pub(crate) fn terminals(&self) -> &Arc<dyn PointerTerminals> {
@@ -198,14 +264,29 @@ impl TerminalPointer {
             Some(policy::LimitRefusal::Backlog) => return Err(AgentMessagingError::BacklogLimit),
             None => {}
         }
+        // A generation that ended while the row was stored would leave it waiting for nobody.
+        let live = self
+            .terminals
+            .live_generation(&recipient.thread_id, &recipient.terminal_id)
+            .await;
+        if live.as_ref() != Some(&recipient.generation) {
+            self.end_generation(
+                messaging,
+                &recipient.thread_id,
+                &recipient.terminal_id,
+                &recipient.generation_key(),
+            )
+            .await;
+        }
         self.wake.notify_one();
         Ok(())
     }
 
     /// Pastes the pointer into each terminal whose agent waits for a prompt while its live
-    /// generation has `queued` mail, and marks that mail `delivered`; until `shutdown`. It
-    /// rescans on every terminal metadata change, every new message and every change of the
-    /// setting, so a lost event only delays the pointer. It never pastes for a `held` row.
+    /// generation has `queued` mail, and marks that mail `delivered`; ends the generations no
+    /// process holds any more; until `shutdown`. It rescans on every terminal metadata change,
+    /// every new message and every change of the setting, so a lost event only delays it. It
+    /// never pastes for a `held` row.
     pub(crate) fn start(
         &self,
         messaging: AgentMessaging,
@@ -218,6 +299,7 @@ impl TerminalPointer {
             let (mut setting_open, mut metadata_open) = (true, true);
             pointer.follow_setting(&messaging).await;
             loop {
+                pointer.sweep_ended(&messaging).await;
                 pointer.paste_waiting(&messaging).await;
                 tokio::select! {
                     biased;
@@ -320,6 +402,101 @@ impl TerminalPointer {
         }
     }
 
+    /// Ends each terminal generation with open mail that no process holds now, those of an
+    /// earlier boot included.
+    async fn sweep_ended(&self, messaging: &AgentMessaging) {
+        let generations = match self
+            .database
+            .call(|connection| store::list_open_terminal_generations(connection))
+            .await
+        {
+            Ok(generations) => generations,
+            Err(error) => {
+                tracing::warn!(error = %error, "terminal mail could not be read");
+                return;
+            }
+        };
+        for (address, key) in generations {
+            if self
+                .ended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&format!("{address}#{key}"))
+            {
+                continue;
+            }
+            let Some((thread_id, terminal_id)) = parse_terminal_address(&address) else {
+                continue;
+            };
+            let live = self
+                .terminals
+                .live_generation(&thread_id, &terminal_id)
+                .await;
+            if live.as_ref().map(generation_key).as_deref() != Some(key.as_str()) {
+                self.end_generation(messaging, &thread_id, &terminal_id, &key)
+                    .await;
+            }
+        }
+    }
+
+    /// Fails the unconsumed mail of an ended generation with `recipient_gone`, forgets its hop
+    /// ledger and tells the generation-end sink, once per generation.
+    async fn end_generation(
+        &self,
+        messaging: &AgentMessaging,
+        thread_id: &str,
+        terminal_id: &str,
+        generation_key: &str,
+    ) {
+        let address = format!("terminal:{thread_id}/{terminal_id}");
+        let (lookup, key) = (address.clone(), generation_key.to_owned());
+        let failed = match self
+            .database
+            .call(move |connection| {
+                let ids = store::fail_unconsumed_for_generation(connection, &lookup, &key)?;
+                let mut rows = Vec::with_capacity(ids.len());
+                for id in ids {
+                    rows.extend(store::get_message(connection, &id)?);
+                }
+                Ok(rows)
+            })
+            .await
+        {
+            Ok(failed) => failed,
+            Err(error) => {
+                tracing::warn!(error = %error, "an ended terminal's mail was not failed");
+                return;
+            }
+        };
+        for message in &failed {
+            tracing::warn!(
+                message_id = %message.message_id,
+                reason = AgentMessageReason::RecipientGone.as_str(),
+                "an agent message failed"
+            );
+        }
+        self.report(
+            messaging,
+            &failed,
+            "failed",
+            Some(AgentMessageReason::RecipientGone),
+        )
+        .await;
+        let ended = format!("{address}#{generation_key}");
+        self.hops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ended);
+        let first = self
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(ended);
+        if first && let Some(sink) = &self.generation_end {
+            sink(thread_id, terminal_id, generation_key);
+        }
+    }
+
     /// Tells the outcome sink, if any, of each message's `outcome`, with ids and titles only.
     pub(crate) async fn report(
         &self,
@@ -355,6 +532,95 @@ impl TerminalPointer {
     }
 }
 
+/// The terminal agent's side: its inbox and its hop chain.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "task 8.2's `bibcode agent` command calls these")
+)]
+impl TerminalPointer {
+    /// The mail of `identity`'s own generation, oldest first, rendered as envelopes; each
+    /// returned row is `consumed` in the fetch. `queued` and `delivered` rows only, and an
+    /// agent's message only while messaging is on and its ceiling holds, so a `held` row is never
+    /// returned. Records the highest hop fetched for [`Self::terminal_trigger_hop`].
+    pub(crate) async fn inbox(
+        &self,
+        messaging: &AgentMessaging,
+        identity: &TerminalIdentity,
+    ) -> Result<Vec<InboxEntry>, AgentMessagingError> {
+        let (address, key) = (identity.address(), identity.generation_key());
+        let enabled = messaging.is_enabled();
+        let consumed = self
+            .database
+            .call(move |connection| {
+                store::consume_for_generation(
+                    connection,
+                    &address,
+                    &key,
+                    enabled,
+                    &crate::mcp::control::now_iso(),
+                )
+            })
+            .await
+            .map_err(storage("a terminal's inbox could not be read"))?;
+        let inputs = self
+            .terminals
+            .person_input_count(&identity.thread_id, &identity.terminal_id)
+            .await;
+        {
+            let mut hops = self.hops.lock().unwrap_or_else(PoisonError::into_inner);
+            let ledger = hops.entry(ledger_key(identity)).or_default();
+            ledger.follow(inputs);
+            for message in &consumed {
+                if message.sender_kind == SenderKind::Agent {
+                    ledger.highest = ledger.highest.max(Some(message.hop));
+                }
+            }
+        }
+        let mut entries = Vec::with_capacity(consumed.len());
+        for message in &consumed {
+            let sender = messaging.sender_description(&message.sender_address).await;
+            let label = match sender.title.trim() {
+                "" => "Agent",
+                title => title,
+            };
+            entries.push(InboxEntry {
+                message_id: message.message_id.clone(),
+                rendered: build_envelope(&EnvelopeInput {
+                    sender_title: label,
+                    provider: &sender.provider,
+                    sender_address: &message.sender_address,
+                    message_id: &message.message_id,
+                    conversation_id: &message.conversation_id,
+                    in_reply_to: message.in_reply_to.as_deref(),
+                    text: &message.text,
+                }),
+            });
+        }
+        self.report(messaging, &consumed, "consumed", None).await;
+        Ok(entries)
+    }
+
+    /// The highest hop `identity` fetched in its generation since a person last typed into it;
+    /// `None` when none. Time never resets it (R14).
+    pub(crate) async fn terminal_trigger_hop(&self, identity: &TerminalIdentity) -> Option<u32> {
+        let inputs = self
+            .terminals
+            .person_input_count(&identity.thread_id, &identity.terminal_id)
+            .await;
+        let mut hops = self.hops.lock().unwrap_or_else(PoisonError::into_inner);
+        let ledger = hops.get_mut(&ledger_key(identity))?;
+        ledger.follow(inputs);
+        ledger.highest
+    }
+
+    pub(crate) fn reset_hop(&self, identity: &TerminalIdentity) {
+        self.hops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ledger_key(identity));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Mutex as StdMutex, time::Duration};
@@ -369,7 +635,7 @@ mod tests {
         production::mcp_tools_tests::Harness,
         terminal::{
             ProviderTerminalActivityLaunch, TerminalAgentStatus, TerminalAgentStatusState,
-            TerminalLaunchCommand, TerminalMetadataEvent, TerminalStatus,
+            TerminalLaunchCommand, TerminalMetadataEvent, TerminalRemovalReason, TerminalStatus,
         },
     };
 
@@ -378,7 +644,6 @@ mod tests {
         ai: bool,
         state: TerminalAgentStatusState,
         ready: bool,
-        #[expect(dead_code, reason = "task 8.6's hop ledger reads it")]
         person_inputs: u64,
         attempts: usize,
         writes: Vec<String>,
@@ -508,6 +773,32 @@ mod tests {
         fn attempts(&self, thread_id: &str, terminal_id: &str) -> usize {
             self.read(thread_id, terminal_id, |terminal| terminal.attempts)
         }
+
+        /// A new process (`Some`) or none (`None`, an exit) now holds the terminal.
+        fn set_generation(&self, thread_id: &str, terminal_id: &str, process: Option<u64>) {
+            self.change(thread_id, terminal_id, |terminal| {
+                terminal.generation = process.map(generation);
+                terminal.ready = false;
+            });
+        }
+
+        fn close(&self, thread_id: &str, terminal_id: &str) {
+            self.terminals
+                .lock()
+                .unwrap()
+                .remove(&key(thread_id, terminal_id));
+            let _ = self.metadata.send(TerminalMetadataEvent::Remove {
+                thread_id: thread_id.to_owned(),
+                terminal_id: terminal_id.to_owned(),
+                reason: TerminalRemovalReason::Closed,
+            });
+        }
+
+        fn person_types(&self, thread_id: &str, terminal_id: &str) {
+            self.change(thread_id, terminal_id, |terminal| {
+                terminal.person_inputs += 1;
+            });
+        }
     }
 
     impl PointerTerminals for Scripted {
@@ -595,6 +886,8 @@ mod tests {
         enabled: watch::Sender<bool>,
         messaging: AgentMessaging,
         outcomes: Arc<StdMutex<Vec<MessageOutcome>>>,
+        /// What the generation-end sink was told, in order.
+        ended: Arc<StdMutex<Vec<(String, String, String)>>>,
         stop: CancellationToken,
         _other_project: tempfile::TempDir,
     }
@@ -639,10 +932,21 @@ mod tests {
         }
         let terminals = Scripted::new();
         terminals.add("t", "term-1", 1, true);
+        let ended = Arc::new(StdMutex::new(Vec::new()));
+        let ended_sink = ended.clone();
         let pointer = TerminalPointer::new(
             harness.engine.repositories().database().clone(),
             terminals.clone(),
-        );
+        )
+        .with_generation_end_sink(Arc::new(
+            move |thread_id, terminal_id, generation_key| {
+                ended_sink.lock().unwrap().push((
+                    thread_id.to_owned(),
+                    terminal_id.to_owned(),
+                    generation_key.to_owned(),
+                ));
+            },
+        ));
         let (enabled, receiver) = watch::channel(true);
         let outcomes = Arc::new(StdMutex::new(Vec::new()));
         let sink = outcomes.clone();
@@ -656,6 +960,7 @@ mod tests {
             enabled,
             messaging,
             outcomes,
+            ended,
             stop: CancellationToken::new(),
             _other_project: other_project,
         }
@@ -710,6 +1015,21 @@ mod tests {
             .unwrap_or_else(|_| panic!("message reaches {}", status.as_str()))
         }
 
+        /// Every outcome reported so far, once one of them is `outcome`.
+        async fn until_outcome(&self, outcome: &str) -> Vec<MessageOutcome> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let outcomes = self.outcomes.lock().unwrap().clone();
+                    if outcomes.iter().any(|reported| reported.outcome == outcome) {
+                        return outcomes;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("an outcome {outcome} is reported"))
+        }
+
         /// Waits until the pointer asked `t/terminal_id` to be typed into `count` times.
         async fn until_attempts(&self, terminal_id: &str, count: usize) {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -740,18 +1060,32 @@ mod tests {
             sender_kind: SenderKind,
             terminal_id: &str,
         ) -> Result<(), AgentMessagingError> {
+            self.accept_at_hop(sender_address, sender_kind, terminal_id, 1)
+                .await
+                .map(drop)
+        }
+
+        /// [`Self::accept_from`] at `hop`; returns the message id.
+        async fn accept_at_hop(
+            &self,
+            sender_address: &str,
+            sender_kind: SenderKind,
+            terminal_id: &str,
+            hop: u32,
+        ) -> Result<String, AgentMessagingError> {
             let identity = self.identity(terminal_id);
+            let message_id = uuid::Uuid::new_v4().to_string();
             self.pointer
                 .accept(
                     &self.messaging,
                     NewAgentMessage {
-                        message_id: uuid::Uuid::new_v4().to_string(),
+                        message_id: message_id.clone(),
                         conversation_id: uuid::Uuid::new_v4().to_string(),
                         sender_address: sender_address.to_owned(),
                         sender_kind,
                         recipient_address: String::new(),
                         in_reply_to: None,
-                        hop: 1,
+                        hop,
                         text: BODY.to_owned(),
                         status: AgentMessageStatus::Accepted,
                         reason: None,
@@ -766,6 +1100,20 @@ mod tests {
                     },
                     &identity,
                 )
+                .await
+                .map(|()| message_id)
+        }
+
+        async fn inbox(&self, terminal_id: &str) -> Vec<InboxEntry> {
+            self.pointer
+                .inbox(&self.messaging, &self.identity(terminal_id))
+                .await
+                .expect("the inbox answers")
+        }
+
+        async fn trigger_hop(&self, terminal_id: &str) -> Option<u32> {
+            self.pointer
+                .terminal_trigger_hop(&self.identity(terminal_id))
                 .await
         }
 
@@ -1034,10 +1382,7 @@ mod tests {
         fixture.start();
         let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
         fixture.terminals.set_ready("t", "term-1");
-        fixture
-            .until_status(&receipt.message_id, AgentMessageStatus::Delivered)
-            .await;
-        let outcomes = fixture.outcomes.lock().unwrap().clone();
+        let outcomes = fixture.until_outcome("delivered").await;
         let delivered: Vec<_> = outcomes
             .iter()
             .filter(|outcome| outcome.outcome == "delivered")
@@ -1053,6 +1398,453 @@ mod tests {
                 conversation_id: Some(receipt.conversation_id.clone()),
                 hop: Some(1),
                 reason: None,
+                sender_title: Some("Sender thread".to_owned()),
+                recipient_title: Some("Claude term-1".to_owned()),
+            }]
+        );
+        assert!(!format!("{outcomes:?}").contains(BODY));
+        fixture.shutdown().await;
+    }
+
+    /// An agent message stored as is, bypassing `accept`, for `t/terminal_id`'s generation
+    /// `generation_key`.
+    async fn insert_raw(
+        fixture: &Fixture,
+        terminal_id: &str,
+        generation_key: &str,
+        mode: &str,
+    ) -> String {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let new = NewAgentMessage {
+            message_id: message_id.clone(),
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            sender_address: "thread:a".to_owned(),
+            sender_kind: SenderKind::Agent,
+            recipient_address: format!("terminal:t/{terminal_id}"),
+            in_reply_to: None,
+            hop: 1,
+            text: BODY.to_owned(),
+            status: AgentMessageStatus::Queued,
+            reason: None,
+            accepted_at: crate::mcp::control::now_iso(),
+            sender_runtime_mode: Some(mode.to_owned()),
+            recipient_terminal_generation: Some(generation_key.to_owned()),
+            send_request_id: None,
+            client_request_id: None,
+            delivery_command_id: None,
+            delivery_message_id: None,
+        };
+        fixture
+            .harness
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                store::insert_message(&tx, &new)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        message_id
+    }
+
+    fn ids(entries: &[InboxEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| entry.message_id.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn inbox_consumes_what_it_returns_and_prints_the_envelope() {
+        let fixture = fixture().await;
+        fixture.start();
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.terminals.set_ready("t", "term-1");
+        fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Delivered)
+            .await;
+        let entries = fixture.inbox("term-1").await;
+        assert_eq!(ids(&entries), [receipt.message_id.as_str()]);
+        assert_eq!(
+            entries[0].rendered,
+            super::super::envelope::build_envelope(&super::super::envelope::EnvelopeInput {
+                sender_title: "Sender thread",
+                provider: "codex",
+                sender_address: "thread:a",
+                message_id: &receipt.message_id,
+                conversation_id: &receipt.conversation_id,
+                in_reply_to: None,
+                text: BODY,
+            })
+        );
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Consumed
+        );
+        assert!(fixture.inbox("term-1").await.is_empty());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unready_terminal_can_still_fetch_a_queued_message() {
+        let fixture = fixture().await;
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        assert_eq!(
+            ids(&fixture.inbox("term-1").await),
+            [receipt.message_id.as_str()]
+        );
+        assert!(fixture.terminals.writes("t", "term-1").is_empty());
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Consumed
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_for_another_generation_is_never_returned_by_inbox() {
+        let fixture = fixture().await;
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.start();
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let failed = fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Failed)
+            .await;
+        assert_eq!(failed.reason, Some(AgentMessageReason::RecipientGone));
+        assert!(fixture.inbox("term-1").await.is_empty());
+        // A row of the old generation that is still waiting is never handed to the new one.
+        let stale = insert_raw(&fixture, "term-1", "boot-1:1", "full-access").await;
+        assert!(fixture.inbox("term-1").await.is_empty());
+        assert_ne!(
+            fixture.row(&stale).await.status,
+            AgentMessageStatus::Consumed
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbox_returns_no_agent_message_while_messaging_is_off_and_returns_it_after_it_is_turned_on()
+     {
+        let fixture = fixture().await;
+        fixture.start();
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.enabled.send(false).unwrap();
+        fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Held)
+            .await;
+        let person = fixture
+            .accept_at_hop("thread:a", SenderKind::Person, "term-1", 1)
+            .await
+            .unwrap();
+        assert_eq!(ids(&fixture.inbox("term-1").await), [person.as_str()]);
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Held
+        );
+        fixture.enabled.send(true).unwrap();
+        fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Queued)
+            .await;
+        let person = fixture
+            .accept_at_hop("thread:a", SenderKind::Person, "term-1", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&fixture.inbox("term-1").await),
+            [receipt.message_id.as_str(), person.as_str()]
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbox_skips_a_row_whose_ceiling_no_longer_holds() {
+        let fixture = fixture().await;
+        let below = insert_raw(&fixture, "term-1", "boot-1:1", "auto-accept-edits").await;
+        assert!(fixture.inbox("term-1").await.is_empty());
+        assert_eq!(fixture.row(&below).await.status, AgentMessageStatus::Queued);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_terminal_fails_its_unconsumed_messages() {
+        let fixture = fixture().await;
+        type Ending = fn(&Scripted, &str);
+        let endings: [(&str, Ending); 4] = [
+            ("term-close", |terminals, id| terminals.close("t", id)),
+            ("term-exit", |terminals, id| {
+                terminals.set_generation("t", id, None);
+            }),
+            ("term-restart", |terminals, id| {
+                terminals.set_generation("t", id, Some(2));
+            }),
+            ("term-replace", |terminals, id| {
+                terminals.set_generation("t", id, Some(9));
+            }),
+        ];
+        fixture.start();
+        for (terminal_id, end) in endings {
+            fixture.terminals.add("t", terminal_id, 1, true);
+            let read = fixture
+                .send("a", &format!("terminal:t/{terminal_id}"))
+                .await
+                .unwrap();
+            assert_eq!(fixture.inbox(terminal_id).await.len(), 1);
+            let unread = fixture
+                .send("c", &format!("terminal:t/{terminal_id}"))
+                .await
+                .unwrap();
+            end(&fixture.terminals, terminal_id);
+            let failed = fixture
+                .until_status(&unread.message_id, AgentMessageStatus::Failed)
+                .await;
+            assert_eq!(
+                failed.reason,
+                Some(AgentMessageReason::RecipientGone),
+                "{terminal_id}"
+            );
+            assert_eq!(
+                fixture.row(&read.message_id).await.status,
+                AgentMessageStatus::Consumed,
+                "{terminal_id}"
+            );
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_server_restart_fails_terminal_messages_of_the_earlier_boot() {
+        let fixture = fixture().await;
+        let earlier = insert_raw(&fixture, "term-1", "boot-0:1", "full-access").await;
+        fixture.start();
+        let failed = fixture
+            .until_status(&earlier, AgentMessageStatus::Failed)
+            .await;
+        assert_eq!(failed.reason, Some(AgentMessageReason::RecipientGone));
+        // The sink hears of the end after the rows failed.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.ended.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the end of the earlier boot's generation is reported");
+        assert_eq!(
+            fixture.ended.lock().unwrap().clone(),
+            [("t".to_owned(), "term-1".to_owned(), "boot-0:1".to_owned())]
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_generation_end_sink_is_called_once_per_ended_generation_even_with_no_unconsumed_row()
+     {
+        let fixture = fixture().await;
+        fixture.send("a", "terminal:t/term-1").await.unwrap();
+        assert_eq!(fixture.inbox("term-1").await.len(), 1);
+        fixture.start();
+        fixture.terminals.set_generation("t", "term-1", None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.ended.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the end of the generation is reported");
+        for _ in 0..3 {
+            fixture
+                .terminals
+                .set_state("t", "term-1", TerminalAgentStatusState::Working);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.ended.lock().unwrap().clone(),
+            [("t".to_owned(), "term-1".to_owned(), "boot-1:1".to_owned())]
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_exchange_does_not_reset_itself() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        // The other terminal's agent answered an hour later: no person typed in between.
+        fixture
+            .accept_at_hop("terminal:t/term-2", SenderKind::Agent, "term-1", 8)
+            .await
+            .unwrap();
+        assert_eq!(fixture.inbox("term-1").await.len(), 1);
+        assert_eq!(fixture.trigger_hop("term-1").await, Some(8));
+        assert_eq!(
+            policy::next_hop(fixture.trigger_hop("term-1").await),
+            Err(AgentMessagingError::HopLimit)
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_terminals_cannot_ping_pong() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let (mut from, mut to) = ("term-2", "term-1");
+        let mut hop = 1;
+        loop {
+            fixture
+                .accept_at_hop(&format!("terminal:t/{from}"), SenderKind::Agent, to, hop)
+                .await
+                .unwrap();
+            assert_eq!(fixture.inbox(to).await.len(), 1);
+            match policy::next_hop(fixture.trigger_hop(to).await) {
+                Ok(next) => hop = next,
+                Err(error) => {
+                    assert_eq!(error, AgentMessagingError::HopLimit);
+                    break;
+                }
+            }
+            (from, to) = (to, from);
+        }
+        assert_eq!(hop, 8, "the eighth hop is the last");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_person_typing_resets_the_chain() {
+        let fixture = fixture().await;
+        fixture
+            .accept_at_hop("terminal:t/term-2", SenderKind::Agent, "term-1", 8)
+            .await
+            .unwrap();
+        fixture.inbox("term-1").await;
+        assert_eq!(fixture.trigger_hop("term-1").await, Some(8));
+        fixture.terminals.person_types("t", "term-1");
+        assert_eq!(fixture.trigger_hop("term-1").await, None);
+        assert_eq!(policy::next_hop(fixture.trigger_hop("term-1").await), Ok(1));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_trigger_hop_is_the_highest_fetched_hop_since_the_last_input() {
+        let fixture = fixture().await;
+        assert_eq!(fixture.trigger_hop("term-1").await, None);
+        for hop in [3, 5, 2] {
+            fixture
+                .accept_at_hop("terminal:t/term-2", SenderKind::Agent, "term-1", hop)
+                .await
+                .unwrap();
+        }
+        fixture.inbox("term-1").await;
+        assert_eq!(fixture.trigger_hop("term-1").await, Some(5));
+        fixture.terminals.person_types("t", "term-1");
+        fixture
+            .accept_at_hop("terminal:t/term-2", SenderKind::Agent, "term-1", 2)
+            .await
+            .unwrap();
+        fixture.inbox("term-1").await;
+        assert_eq!(fixture.trigger_hop("term-1").await, Some(2));
+        fixture.pointer.reset_hop(&fixture.identity("term-1"));
+        assert_eq!(fixture.trigger_hop("term-1").await, None);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_delivered_unfetched_message_removes_it_from_the_inbox() {
+        let fixture = fixture().await;
+        fixture.start();
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.terminals.set_ready("t", "term-1");
+        fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Delivered)
+            .await;
+        assert_eq!(
+            fixture.messaging.cancel("a", &receipt.message_id).await,
+            Ok(AgentMessageStatus::Cancelled)
+        );
+        assert!(fixture.inbox("term-1").await.is_empty());
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Cancelled
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_consumed_message_fails_saying_it_was_already_delivered() {
+        let fixture = fixture().await;
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.inbox("term-1").await;
+        let error = fixture
+            .messaging
+            .cancel("a", &receipt.message_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error, AgentMessagingError::NotCancellable);
+        assert!(error.message().contains("already delivered"));
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Consumed
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_racing_an_inbox_fetch_has_exactly_one_winner() {
+        let fixture = fixture().await;
+        let (mut cancelled, mut fetched) = (0, 0);
+        for round in 0..50 {
+            // Two senders keep each under the rate limit.
+            let sender = if round % 2 == 0 { "a" } else { "c" };
+            let receipt = fixture.send(sender, "terminal:t/term-1").await.unwrap();
+            let (cancel, entries) = tokio::join!(
+                fixture.messaging.cancel(sender, &receipt.message_id),
+                fixture.inbox("term-1"),
+            );
+            let status = fixture.row(&receipt.message_id).await.status;
+            match cancel {
+                Ok(AgentMessageStatus::Cancelled) => {
+                    assert!(entries.is_empty(), "round {round}: cancelled and fetched");
+                    assert_eq!(status, AgentMessageStatus::Cancelled, "round {round}");
+                    cancelled += 1;
+                }
+                Err(AgentMessagingError::NotCancellable) => {
+                    assert_eq!(
+                        ids(&entries),
+                        [receipt.message_id.as_str()],
+                        "round {round}"
+                    );
+                    assert_eq!(status, AgentMessageStatus::Consumed, "round {round}");
+                    fetched += 1;
+                }
+                other => panic!("round {round}: unexpected cancel result {other:?}"),
+            }
+        }
+        assert_eq!(cancelled + fetched, 50);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_reaches_the_activity_log_without_text() {
+        let fixture = fixture().await;
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.start();
+        fixture.terminals.set_generation("t", "term-1", None);
+        let outcomes = fixture.until_outcome("failed").await;
+        let failed: Vec<_> = outcomes
+            .iter()
+            .filter(|outcome| outcome.outcome == "failed")
+            .collect();
+        assert_eq!(
+            failed,
+            [&MessageOutcome {
+                sender_address: "thread:a".to_owned(),
+                recipient_address: "terminal:t/term-1".to_owned(),
+                tool: "agent_message_delivery",
+                outcome: "failed".to_owned(),
+                message_id: Some(receipt.message_id.clone()),
+                conversation_id: Some(receipt.conversation_id.clone()),
+                hop: Some(1),
+                reason: Some("recipient_gone".to_owned()),
                 sender_title: Some("Sender thread".to_owned()),
                 recipient_title: Some("Claude term-1".to_owned()),
             }]

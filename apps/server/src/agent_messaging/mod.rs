@@ -807,12 +807,19 @@ impl AgentMessaging {
             return Ok(AgentMessageStatus::Cancelled);
         }
         let id = message_id.to_owned();
+        // A terminal row has no queue entry; it stays cancellable until an inbox fetched it.
+        let terminal = message.recipient_address.starts_with("terminal:");
         let cancelled = self
             .engine
             .repositories()
             .database()
             .call(move |connection| {
-                store::cancel_waiting(connection, &id, &crate::mcp::control::now_iso())
+                let now = crate::mcp::control::now_iso();
+                if terminal {
+                    store::cancel_unfetched_terminal(connection, &id, &now)
+                } else {
+                    store::cancel_waiting(connection, &id, &now)
+                }
             })
             .await
             .map_err(|error| {
@@ -832,7 +839,7 @@ impl AgentMessaging {
         }
         // The claim gate never claims a cancelled message, and the tracker withdraws an entry
         // this leaves behind.
-        if !delivery::withdraw_from_queue(&self.engine, &message).await? {
+        if !terminal && !delivery::withdraw_from_queue(&self.engine, &message).await? {
             tracing::debug!(message_id = %message.message_id, "a cancelled message's entry is left to the tracker");
         }
         Ok(AgentMessageStatus::Cancelled)

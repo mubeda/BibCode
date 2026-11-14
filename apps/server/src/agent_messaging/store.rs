@@ -709,6 +709,123 @@ pub(crate) fn deliver_queued(
     Ok(delivered)
 }
 
+/// Moves the mail of `recipient_address`'s generation `generation_key` that its inbox may return
+/// to `consumed`, oldest first, each by a compare and set from the status it was read with, so a
+/// concurrent cancel or fetch has one winner: `queued` and `delivered` rows only, and an agent's
+/// message only while messaging is `enabled` and its sender's mode reaches `full-access`.
+/// Returns the rows it consumed.
+pub(crate) fn consume_for_generation(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+    generation_key: &str,
+    enabled: bool,
+    updated_at: &str,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut select = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2
+            AND status IN ('queued', 'delivered')
+          ORDER BY rowid"
+    ))?;
+    let waiting = select
+        .query_map(params![recipient_address, generation_key], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut consume = connection.prepare_cached(&format!(
+        "UPDATE agent_messages SET status = 'consumed', reason = NULL, updated_at = ?3
+          WHERE message_id = ?1 AND status = ?2
+          RETURNING {COLUMNS}"
+    ))?;
+    let mut consumed = Vec::new();
+    for message in waiting {
+        let admitted = message.sender_kind != SenderKind::Agent
+            || (enabled
+                && message
+                    .sender_runtime_mode
+                    .as_deref()
+                    .is_some_and(|sender| {
+                        super::policy::ceiling_allows(
+                            sender,
+                            super::pointer::TERMINAL_RECIPIENT_MODE,
+                        )
+                    }));
+        if !admitted {
+            continue;
+        }
+        if let Some(row) = consume
+            .query_row(
+                params![message.message_id, message.status.as_str(), updated_at],
+                decode,
+            )
+            .optional()?
+        {
+            consumed.push(row);
+        }
+    }
+    Ok(consumed)
+}
+
+/// Fails, with `recipient_gone`, every message of the ended generation `generation_key` of
+/// `recipient_address` that its inbox did not fetch. Returns their ids.
+pub(crate) fn fail_unconsumed_for_generation(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+    generation_key: &str,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare_cached(
+        "UPDATE agent_messages SET status = 'failed', reason = 'recipient_gone', updated_at = ?3
+          WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2
+            AND status IN ('accepted', 'queued', 'held', 'delivered')
+          RETURNING message_id",
+    )?;
+    let ids = statement
+        .query_map(
+            params![
+                recipient_address,
+                generation_key,
+                crate::mcp::control::now_iso()
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
+}
+
+/// Each terminal generation that still has mail whose status is not final, consumed mail
+/// included, as `(recipient address, generation key)`, in acceptance order of its first row.
+pub(crate) fn list_open_terminal_generations(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<(String, String)>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT recipient_address, recipient_terminal_generation FROM agent_messages
+          WHERE {TERMINAL_RECIPIENT} AND recipient_terminal_generation IS NOT NULL AND {OPEN}
+          GROUP BY recipient_address, recipient_terminal_generation
+          ORDER BY MIN(rowid)"
+    ))?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Cancels the terminal message `message_id` in one compare and set, only while no inbox has
+/// fetched it: `accepted`, `queued`, `held`, or `delivered` (the pointer was typed, the mail was
+/// not read).
+pub(crate) fn cancel_unfetched_terminal(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let changed = connection.execute(
+        &format!(
+            "UPDATE agent_messages SET status = 'cancelled', reason = NULL, updated_at = ?2
+              WHERE message_id = ?1 AND {TERMINAL_RECIPIENT}
+                AND status IN ('accepted', 'queued', 'held', 'delivered')"
+        ),
+        params![message_id, updated_at],
+    )?;
+    Ok(changed == 1)
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentMessageStore {
     database: Database,
