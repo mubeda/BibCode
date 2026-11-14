@@ -2107,4 +2107,61 @@ mod tests {
         assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
         tools.shutdown().await;
     }
+
+    /// A call refused before the service reads anything returns while the database worker is
+    /// stalled; its row, with the caller's title, is written once the worker answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_returns_while_the_database_is_stalled() {
+        let tools = crate::production::mcp_tools_tests::Harness::new().await;
+        caller_and_recipient(&tools).await;
+        let sink = agent_message_sink(tools.control.activity().clone());
+        let off = tools.messaging_untracked(false).with_outcomes(sink.clone());
+        let on = tools.messaging_untracked(true).with_outcomes(sink);
+        let database = tools.repositories.database().clone();
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stall = tokio::spawn(async move {
+            database
+                .call(move |_| {
+                    let _ = stalled.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let calls = [
+            (
+                &off,
+                "agent_message_send",
+                json!({ "to": "thread:b", "text": "hello" }),
+            ),
+            (
+                &on,
+                "agent_message_reply",
+                json!({ "inReplyTo": 7, "text": "hello" }),
+            ),
+        ];
+        for (messaging, tool, arguments) in &calls {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::mcp::tools::agent_messaging::run(
+                    scope("a"),
+                    tool,
+                    arguments.clone(),
+                    Some(messaging),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{tool} returns without the database"));
+            assert_eq!(result["isError"], true, "{result}");
+        }
+
+        release.send(()).unwrap();
+        stall.await.unwrap().unwrap();
+        let rows = rows_after(tools.control.activity(), calls.len()).await;
+        for row in &rows {
+            assert_eq!(row["label"], "Caller", "{row}");
+        }
+        tools.shutdown().await;
+    }
 }
