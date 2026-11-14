@@ -612,6 +612,11 @@ pub(crate) fn trigger_hop(
                 SELECT 1 FROM projection_turns AS later
                  WHERE later.thread_id = ?1 AND later.row_id > latest.row_id
                    AND later.pending_message_id IS NOT NULL
+                   -- A withdrawn entry started nothing; a requeued agent message leaves one.
+                   AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS entry
+                                   WHERE entry.thread_id = later.thread_id
+                                     AND entry.message_id = later.pending_message_id
+                                     AND entry.state = 'dismissed')
                    AND NOT EXISTS(SELECT 1 FROM agent_messages AS agent
                                    WHERE agent.delivery_message_id = later.pending_message_id
                                      AND agent.sender_kind = 'agent'))",
