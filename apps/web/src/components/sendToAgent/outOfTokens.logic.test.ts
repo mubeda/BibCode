@@ -51,8 +51,9 @@ function usage(
   provider: "claude" | "codex",
   windows: Partial<Pick<ServerProviderUsageSnapshot, "session" | "weekly" | "fableWeekly">>,
   status: ServerProviderUsageSnapshot["status"] = "ok",
+  updatedAt = "2026-11-10T11:59:00.000Z",
 ): ServerProviderUsageResult {
-  const at = DateTime.makeUnsafe("2026-11-10T11:59:00.000Z");
+  const at = DateTime.makeUnsafe(updatedAt);
   return {
     readAt: at,
     isFetching: false,
@@ -102,6 +103,44 @@ describe("outOfTokens.logic", () => {
     });
     expect(hint?.text).toBe("Out of usage until Tue 3:30 PM");
     expect(formatResetTime(new Date("2026-11-10T15:30:00.000Z"), NOW, OPTIONS)).toBe("3:30 PM");
+  });
+
+  it("a limit whose reset time has passed gives no hint", () => {
+    const hint = resolveOutOfTokensHint({
+      row: claude,
+      usage: usage("claude", { session: window(100, "2026-11-10T10:30:00.000Z") }, "ok"),
+      ...OPTIONS,
+    });
+    expect(hint).toBeNull();
+  });
+
+  it("a snapshot older than the freshness window gives no hint, even without a reset time", () => {
+    const stale = "2026-11-10T10:00:00.000Z";
+    const windows = { session: window(100, null) };
+    expect(
+      resolveOutOfTokensHint({
+        row: claude,
+        usage: usage("claude", windows, "ok", stale),
+        ...OPTIONS,
+      }),
+    ).toBeNull();
+    expect(
+      resolveOutOfTokensHint({
+        row: claude,
+        usage: usage("claude", { session: window(100, "2026-11-10T15:30:00.000Z") }, "ok", stale),
+        ...OPTIONS,
+      }),
+    ).toBeNull();
+  });
+
+  it("a snapshot just inside the freshness window still hints", () => {
+    const edge = "2026-11-10T11:30:00.000Z";
+    const hint = resolveOutOfTokensHint({
+      row: claude,
+      usage: usage("claude", { session: window(100, "2026-11-10T15:30:00.000Z") }, "ok", edge),
+      ...OPTIONS,
+    });
+    expect(hint?.text).toBe("Out of usage until 3:30 PM");
   });
 
   it("with two windows at their limit the later reset wins", () => {
