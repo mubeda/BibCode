@@ -2276,6 +2276,7 @@ async fn cancel_racing_a_claim_has_exactly_one_winner() {
         }
     }
     assert_eq!(won + lost, 30);
+    eprintln!("cancel won {won} and the claim won {lost} of 30 races");
     harness.shutdown().await;
 }
 
@@ -2579,6 +2580,98 @@ async fn manage_every_method_refuses_an_outside_agent_session() {
     assert_eq!(
         outbox_state(&harness, "person-send:r1").await.as_deref(),
         Some("queued")
+    );
+    harness.shutdown().await;
+}
+
+async fn set_delivery_state(harness: &Harness, message_id: &'static str, state: &'static str) {
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE provider_turn_outbox SET state = ?1 WHERE message_id = ?2",
+                [state, message_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn manage_cancel_can_be_retried_after_it_lost_to_a_claim() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    // The delivery's claim won: the cancel is too late.
+    set_delivery_state(&harness, "person-send:r1", "sending").await;
+    let lost = service.cancel(&person(), "r1").await.unwrap();
+    assert!(!lost.cancelled);
+    assert_eq!(lost.request.state, "queued");
+
+    // The send failed back to a delivery not claimed yet: the person can cancel again.
+    set_delivery_state(&harness, "person-send:r1", "queued").await;
+    let retried = service.cancel(&person(), "r1").await.unwrap();
+
+    assert!(retried.cancelled);
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("dismissed")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn state_a_dismissal_after_sending_is_not_a_cancel() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    set_delivery_state(&harness, "person-send:r1", "sending").await;
+    dispatch(
+        &harness,
+        json!({
+            "type": "thread.turn-delivery.resolve", "commandId": "dismiss-sending",
+            "threadId": "b", "messageId": "person-send:r1", "action": "dismiss",
+            "createdAt": AT,
+        }),
+    )
+    .await;
+
+    service.sweep().await;
+
+    let row = stored_request(&harness, "r1").await;
+    assert_eq!(row.state, SendState::NotAnswered);
+    assert_eq!(row.reason.as_deref(), Some("delivery_failed"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn state_a_sweep_drops_the_requests_of_a_source_deleted_while_not_following() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    deletable_thread(&harness).await;
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:d", "thread:b")).await;
+    send_with(&service, input("kept", "review", "thread:a", "thread:b")).await;
+    delete_thread(&harness, "d").await;
+    let mut changes = service.subscribe_changes();
+
+    service.sweep().await;
+
+    assert!(matches!(changes.try_recv(), Ok(RequestChange::Remove(id)) if id == "r1"));
+    assert_eq!(
+        SendRequestStore::new(harness.repositories.database().clone())
+            .get("r1")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        stored_request(&harness, "kept").await.state,
+        SendState::Queued
     );
     harness.shutdown().await;
 }

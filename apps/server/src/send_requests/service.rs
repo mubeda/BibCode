@@ -305,23 +305,51 @@ impl SendRequestsService {
         }
         let thread_id = event.aggregate_id.as_str();
         if event.event_type == "thread.deleted" {
-            match self.store.delete_for_source_thread(thread_id).await {
-                Ok(removed) => {
-                    for request_id in removed {
-                        let _ = self.changes.send(RequestChange::Remove(request_id));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "the send requests of a deleted thread were kept");
-                }
-            }
+            self.remove_sent_from(thread_id).await;
         }
         self.refresh_where(|row| row.target_thread_id == thread_id)
             .await;
     }
 
-    /// Reads every open request again.
+    /// Removes every request sent from a deleted thread.
+    async fn remove_sent_from(&self, source_thread_id: &str) {
+        match self.store.delete_for_source_thread(source_thread_id).await {
+            Ok(removed) => {
+                for request_id in removed {
+                    let _ = self.changes.send(RequestChange::Remove(request_id));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the send requests of a deleted thread were kept");
+            }
+        }
+    }
+
+    /// Removes the requests of source threads deleted while no event reached the follower, then
+    /// reads every open request again.
     pub(crate) async fn sweep(&self) {
+        let deleted_sources = self
+            .repositories
+            .database()
+            .call(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT request.source_thread_id FROM send_requests AS request \
+                     LEFT JOIN projection_threads AS thread ON thread.thread_id = request.source_thread_id \
+                     WHERE thread.thread_id IS NULL OR thread.deleted_at IS NOT NULL",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await;
+        match deleted_sources {
+            Ok(sources) => {
+                for source_thread_id in sources {
+                    self.remove_sent_from(&source_thread_id).await;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "deleted source threads could not be read"),
+        }
         self.refresh_where(|_| true).await;
     }
 
@@ -453,7 +481,9 @@ impl SendRequestsService {
         }
         let command = serde_json::from_value(json!({
             "type": "thread.turn-delivery.resolve",
-            "commandId": format!("person-send-cancel:{}", row.request_id),
+            // A fresh id per attempt: a cancel that lost to a claim leaves a rejected receipt,
+            // and a delivery that failed back to pending must stay cancellable.
+            "commandId": format!("person-send-cancel:{}:{}", row.request_id, uuid::Uuid::new_v4()),
             "threadId": row.target_thread_id,
             "messageId": message_id,
             "action": "cancel",
@@ -968,6 +998,8 @@ struct TargetView {
     /// The proposed plan the turn ended with.
     plan: Option<String>,
     assistant_text: Option<String>,
+    /// The delivery was dismissed by a withdrawal (a cancel), not after it was sent.
+    withdrawn: bool,
     /// The engine rejected the request's command.
     rejected: bool,
 }
@@ -1070,6 +1102,20 @@ async fn read_target(
                         .optional()?;
                 }
             }
+            if view.outbox.as_ref().is_some_and(|(state, _)| state == "dismissed") {
+                view.withdrawn = connection
+                    .query_row(
+                        "SELECT json_extract(payload_json, '$.withdrawn') = 1 FROM orchestration_events \
+                         WHERE stream_id = ?1 AND event_type = 'thread.turn-delivery-updated' \
+                           AND json_extract(payload_json, '$.messageId') = ?2 \
+                         ORDER BY sequence DESC LIMIT 1",
+                        params![thread_id, message_id],
+                        |row| row.get::<_, Option<bool>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .unwrap_or(false);
+            }
             if view.outbox.is_none()
                 && let Some(command_id) = &command_id
             {
@@ -1148,8 +1194,14 @@ fn decide(view: TargetView) -> Next {
         Some((state, _)) if matches!(state.as_str(), "failed" | "uncertain") => {
             next(SendState::NotAnswered, Some("delivery_failed"))
         }
-        // Withdrawn before a turn started: a cancel whose own state change was not stored.
-        Some((state, _)) if state == "dismissed" => next(SendState::Cancelled, None),
+        // Withdrawn before it was sent: a cancel whose own state change was not stored. Any
+        // other dismissal may follow a send, so the request ends unanswered.
+        Some((state, _)) if state == "dismissed" && view.withdrawn => {
+            next(SendState::Cancelled, None)
+        }
+        Some((state, _)) if state == "dismissed" => {
+            next(SendState::NotAnswered, Some("delivery_failed"))
+        }
         Some((state, held)) if state == "queued" && (held || paused_session) => {
             next(SendState::Waiting, Some("queue_paused"))
         }
