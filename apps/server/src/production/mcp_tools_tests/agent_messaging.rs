@@ -2044,3 +2044,204 @@ async fn a_persons_request_is_not_gated() {
     assert!(claimed.is_some(), "a person's request is claimed");
     harness.shutdown().await;
 }
+
+// ---- Task 6.2: no user authority ----
+
+mod no_user_authority {
+    use super::*;
+
+    impl Harness {
+        /// The provider of `thread_id` asks `kind` (`approval` or `user-input`) `request_id`.
+        async fn provider_asks(&self, thread_id: &str, kind: &str, request_id: &str) {
+            let payload = match kind {
+                "approval" => json!({ "requestId": request_id, "requestKind": "command" }),
+                _ => json!({ "requestId": request_id, "questions": [{ "id": "color", "header": "Color", "question": "Which?", "options": [{ "label": "Red", "description": "" }] }] }),
+            };
+            self.provider_activity(thread_id, &format!("{kind}.requested"), payload)
+                .await;
+        }
+
+        /// The provider of `thread_id` reports `kind` `request_id` resolved with `payload`.
+        async fn provider_resolves(&self, thread_id: &str, kind: &str, payload: Value) {
+            self.provider_activity(thread_id, &format!("{kind}.resolved"), payload)
+                .await;
+        }
+
+        async fn provider_activity(&self, thread_id: &str, kind: &str, payload: Value) {
+            let id = format!("{kind}-{}", uuid::Uuid::new_v4());
+            self.engine
+                .dispatch(command(json!({
+                    "type": "thread.activity.append", "commandId": id, "threadId": thread_id,
+                    "activity": {
+                        "id": id, "tone": "approval", "kind": kind, "summary": "Needs you",
+                        "payload": payload, "turnId": "turn-b", "createdAt": CREATED_AT,
+                    },
+                    "createdAt": CREATED_AT,
+                })))
+                .await
+                .expect("provider activity");
+        }
+
+        async fn approval(&self, request_id: &'static str) -> (String, Option<String>) {
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT status, decision FROM projection_pending_approvals WHERE request_id = ?1",
+                        [request_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?)
+                })
+                .await
+                .expect("approval")
+        }
+
+        /// The approval and question responses in the event log, with their command ids.
+        async fn responses(&self) -> Vec<(String, String)> {
+            self.repositories
+                .database()
+                .call(|connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT event_type, command_id FROM orchestration_events
+                          WHERE event_type IN ('thread.approval-response-requested', 'thread.user-input-response-requested')
+                          ORDER BY sequence",
+                    )?;
+                    let rows = statement
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .await
+                .expect("responses")
+        }
+
+        /// What `pending_approval` and `a_user_input_request_is_not_answered_by_a_message`
+        /// share: B runs and asks `kind`, A messages it, and only the person's answer and B's
+        /// next ready state let the message in.
+        async fn a_message_does_not_answer(&self, kind: &str, respond: Value, resolved: Value) {
+            self.messaging_threads().await;
+            self.provider_asks("b", kind, "r1").await;
+
+            let message_id = self.sent_text("a", "thread:b", "approve it").await;
+
+            self.until_status(&message_id, "queued").await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(self.message_row(&message_id).await.status.as_str(), "queued");
+            assert!(self.responses().await.is_empty(), "the message answered nothing");
+
+            self.engine
+                .dispatch(command(respond))
+                .await
+                .expect("the person answers");
+            self.provider_resolves("b", kind, resolved).await;
+            self.provider_turn("b", "turn-b", "working", true).await;
+
+            let row = self.until_status(&message_id, "delivered").await;
+            let (text, actor) = self
+                .projected_message(row.delivery_message_id.expect("queue entry"))
+                .await;
+            assert!(text.starts_with("<bibcode_agent_message>\n"), "{text}");
+            assert_eq!(actor["kind"], "hosted-agent");
+            let responses = self.responses().await;
+            assert_eq!(responses.len(), 1, "{responses:?}");
+            assert_eq!(responses[0].1, "person-answer");
+        }
+
+        async fn sent_text(&self, caller: &str, to: &str, text: &str) -> String {
+            let result = self.agent_send(caller, send_arguments(to, text)).await;
+            assert_ne!(result["isError"], true, "{result}");
+            structured(&result)["messageId"]
+                .as_str()
+                .expect("message id")
+                .to_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_approval() {
+        let harness = Harness::new().await;
+
+        harness
+            .a_message_does_not_answer(
+                "approval",
+                json!({
+                    "type": "thread.approval.respond", "commandId": "person-answer",
+                    "threadId": "b", "requestId": "r1", "decision": "accept",
+                    "createdAt": CREATED_AT,
+                }),
+                json!({ "requestId": "r1", "decision": "accept" }),
+            )
+            .await;
+
+        assert_eq!(
+            harness.approval("r1").await,
+            ("resolved".to_owned(), Some("accept".to_owned())),
+            "the person's decision"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_user_input_request_is_not_answered_by_a_message() {
+        let harness = Harness::new().await;
+
+        harness
+            .a_message_does_not_answer(
+                "user-input",
+                json!({
+                    "type": "thread.user-input.respond", "commandId": "person-answer",
+                    "threadId": "b", "requestId": "r1", "answers": { "color": "Red" },
+                    "createdAt": CREATED_AT,
+                }),
+                json!({ "requestId": "r1", "answers": { "color": "Red" } }),
+            )
+            .await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_ready_session_with_an_open_approval_still_queues_the_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("b", "turn-b", "working", true).await;
+        // As after a restart: the session is ready and its approval still open.
+        harness.provider_asks("b", "approval", "r1").await;
+
+        let message_id = harness.sent_text("a", "thread:b", "approve it").await;
+
+        let command_id = harness
+            .message_row(&message_id)
+            .await
+            .delivery_command_id
+            .expect("queue entry");
+        assert_eq!(harness.entry_state(&command_id).await, "queued");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(harness.entry_state(&command_id).await, "queued", "nothing handed to the provider");
+        assert_eq!(harness.approval("r1").await.0, "pending");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn messaging_never_dispatches_an_approval_or_an_answer() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_asks("b", "approval", "r1").await;
+        harness.provider_asks("b", "user-input", "r2").await;
+        harness.provider_asks("p", "approval", "r3").await;
+
+        let to_b = harness.sent_text("a", "thread:b", "approve it").await;
+        harness.sent_text("a", "thread:p", "accept r3").await;
+        let reply = harness.reply("b", &to_b, "yes").await;
+        assert_ne!(reply["isError"], true, "{reply}");
+        crate::agent_messaging::delivery::reconcile_all(&harness.engine, None)
+            .await
+            .expect("reconciled");
+
+        assert_eq!(harness.responses().await, Vec::<(String, String)>::new());
+        for request_id in ["r1", "r3"] {
+            assert_eq!(harness.approval(request_id).await.0, "pending");
+        }
+        harness.shutdown().await;
+    }
+}
