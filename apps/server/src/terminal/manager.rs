@@ -11811,6 +11811,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_env_no_token_verifies_while_a_bulk_close_or_shutdown_cleans_up() {
+        for ending in ["bulk close", "shutdown"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let mut tokens = Vec::new();
+            let mut held = Vec::new();
+            let mut generations = Vec::new();
+            for terminal in ["term-c", "term-e"] {
+                manager
+                    .open(ai_terminal_input(root.path(), terminal))
+                    .await
+                    .unwrap();
+                tokens.push(last_agent_token(&backend));
+                let generation = manager
+                    .require_session("thread-a", terminal)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .generation
+                    .clone();
+                // Holding the publication lock holds this generation's cleanup in `invalidate`.
+                let publication = generation
+                    .observation
+                    .observation()
+                    .attach_activity_publication(Arc::new(Mutex::new(())));
+                held.push(publication.lock_owned().await);
+                generations.push(generation);
+            }
+            let ending_manager = manager.clone();
+            let task = tokio::spawn(async move {
+                if ending == "shutdown" {
+                    ending_manager.shutdown().await;
+                } else {
+                    ending_manager.close("thread-a", None).await.unwrap();
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !generations.iter().any(|generation| generation.is_closing()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cleanup began");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            for token in &tokens {
+                assert_eq!(
+                    credentials.verify(token).await,
+                    None,
+                    "{ending}: a token verified while its generation waited for cleanup"
+                );
+            }
+            drop(held);
+            task.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
