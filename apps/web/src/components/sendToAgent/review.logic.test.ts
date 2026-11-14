@@ -307,6 +307,33 @@ describe("buildReviewContent", () => {
     expect(useSendToAgentStore.getState().panels).toEqual({});
   });
 
+  it("reveals the review panel only once its request was sent, also on a retry", async () => {
+    const send = vi
+      .fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>()
+      .mockResolvedValueOnce({ kind: "failed", reason: "unknown_outcome", message: "lost" })
+      .mockResolvedValueOnce({ kind: "sent" });
+    const revealPanel = vi.fn();
+    const startNewPanelReview = vi.fn(
+      async (input: {
+        send: (panel: ThreadId) => Promise<SendOutcome>;
+      }): Promise<PromptedPanelResult> => {
+        await input.send(ThreadId.make("panel-1"));
+        return {
+          threadId: ThreadId.make("panel-1"),
+          created: true,
+          messageId: null,
+          sent: "unknown",
+        };
+      },
+    );
+    const content = build({ startNewPanelReview, revealPanel }, send);
+    const draft = { leadIn: content.leadIn, note: "look", attachments: [] };
+    await content.submit!(draft);
+    expect(revealPanel).not.toHaveBeenCalled();
+    await content.submit!(draft);
+    expect(revealPanel).toHaveBeenCalledExactlyOnceWith("panel-1");
+  });
+
   it("a panel that could not be created keeps the preview and says so", async () => {
     const content = build();
     const outcome = await content.submit!({ leadIn: content.leadIn, note: "", attachments: [] });
