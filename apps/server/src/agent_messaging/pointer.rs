@@ -653,6 +653,14 @@ mod tests {
     struct Scripted {
         terminals: StdMutex<HashMap<(String, String), FakeTerminal>>,
         metadata: broadcast::Sender<TerminalMetadataEvent>,
+        /// When set, a write that typed parks until released, as a slow PTY write does.
+        gate: StdMutex<Option<Arc<WriteGate>>>,
+    }
+
+    #[derive(Default)]
+    struct WriteGate {
+        written: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     fn key(thread_id: &str, terminal_id: &str) -> (String, String) {
@@ -671,6 +679,7 @@ mod tests {
             Arc::new(Self {
                 terminals: StdMutex::new(HashMap::new()),
                 metadata: broadcast::channel(256).0,
+                gate: StdMutex::new(None),
             })
         }
 
@@ -821,7 +830,17 @@ mod tests {
                 terminal.writes.push(data.to_owned());
                 WriteWhenReady::Written
             };
-            Box::pin(std::future::ready(Ok(outcome)))
+            drop(terminals);
+            let gate = self.gate.lock().unwrap().clone();
+            Box::pin(async move {
+                if outcome == WriteWhenReady::Written
+                    && let Some(gate) = gate
+                {
+                    gate.written.notify_one();
+                    gate.release.notified().await;
+                }
+                Ok(outcome)
+            })
         }
 
         fn live_generation<'a>(
@@ -1821,6 +1840,60 @@ mod tests {
         }
         assert_eq!(cancelled + fetched, 50);
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_pointer_paste_racing_a_fetch_or_a_cancel_never_delivers_the_message_again() {
+        for cancel in [false, true] {
+            let fixture = fixture().await;
+            let gate = Arc::new(WriteGate::default());
+            *fixture.terminals.gate.lock().unwrap() = Some(gate.clone());
+            fixture.start();
+            let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+            fixture.terminals.set_ready("t", "term-1");
+            // The pointer is typed and its pass has not marked the mail yet.
+            tokio::time::timeout(Duration::from_secs(5), gate.written.notified())
+                .await
+                .expect("the pointer is typed");
+            let expected = if cancel {
+                assert_eq!(
+                    fixture.messaging.cancel("a", &receipt.message_id).await,
+                    Ok(AgentMessageStatus::Cancelled)
+                );
+                AgentMessageStatus::Cancelled
+            } else {
+                assert_eq!(
+                    ids(&fixture.inbox("term-1").await),
+                    [receipt.message_id.as_str()]
+                );
+                AgentMessageStatus::Consumed
+            };
+            gate.release.notify_one();
+            // A later message makes the next pass try the terminal: the racing pass ended.
+            let attempts = fixture.terminals.attempts("t", "term-1");
+            fixture.send("c", "terminal:t/term-1").await.unwrap();
+            fixture.until_attempts("term-1", attempts + 1).await;
+            assert_eq!(
+                fixture.row(&receipt.message_id).await.status,
+                expected,
+                "cancel {cancel}"
+            );
+            assert!(
+                !fixture
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|outcome| outcome.outcome == "delivered"
+                        && outcome.message_id.as_deref() == Some(&receipt.message_id)),
+                "cancel {cancel}"
+            );
+            assert!(
+                !ids(&fixture.inbox("term-1").await).contains(&receipt.message_id.as_str()),
+                "cancel {cancel}"
+            );
+            fixture.shutdown().await;
+        }
     }
 
     #[tokio::test]
