@@ -5401,6 +5401,58 @@ mod tests {
         server.await.expect("UDS server");
     }
 
+    #[tokio::test]
+    async fn system_remote_client_reports_a_server_request_it_dropped_during_a_request() {
+        // Mutation caught: a request discarding an approval request that arrived meanwhile as
+        // if it were a late response, so the ask it carried goes unseen and unreported.
+        let root = tempfile::tempdir().expect("UDS directory");
+        let socket_path = root.path().join("server-request-app-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind UDS");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept UDS client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket");
+            let request = socket
+                .next()
+                .await
+                .expect("request frame")
+                .expect("request message")
+                .into_text()
+                .expect("text request");
+            let request: Value = serde_json::from_str(&request).expect("request JSON");
+            for message in [
+                json!({"id": 900, "method": "item/commandExecution/requestApproval", "params": {}}),
+                json!({"id": request["id"], "result": {}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await
+                    .expect("server message");
+            }
+            let _ = socket.next().await;
+        });
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let mut client = SystemCodexRemoteClientFactory
+            .connect(&endpoint)
+            .await
+            .expect("connect real UDS");
+
+        client
+            .request("thread/read", json!({}))
+            .await
+            .expect("response");
+
+        assert!(
+            client.take_lost_notifications(),
+            "a server request the request dropped went unreported"
+        );
+        drop(client);
+        server.await.expect("UDS server");
+    }
+
     /// A history page over the 512 KiB decoder bound is a large reply, not a broken socket: the
     /// client receives it and the same connection keeps serving requests, so the observer can
     /// skip the thread instead of reconnecting.
