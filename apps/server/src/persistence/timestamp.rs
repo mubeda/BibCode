@@ -32,6 +32,14 @@ pub fn format_timestamp_ms(epoch_ms: i64) -> String {
         .map_or_else(|_| EPOCH.to_owned(), format_timestamp)
 }
 
+/// RFC 3339 text from outside the server (a client, an imported transcript) in the store's
+/// timestamp form; `None` when it does not parse.
+pub fn canonical_timestamp(text: &str) -> Option<String> {
+    time::OffsetDateTime::parse(text.trim(), &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(format_timestamp)
+}
+
 /// Now in the store's timestamp form; see [`format_timestamp`].
 pub fn now_timestamp() -> String {
     format_timestamp(time::OffsetDateTime::now_utc())

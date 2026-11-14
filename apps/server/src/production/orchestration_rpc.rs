@@ -308,6 +308,33 @@ fn register_orchestration_rpc_inner(
     );
 }
 
+/// The command fields a client fills from its own clock.
+const CLIENT_TIMESTAMP_FIELDS: &[&str] =
+    &["createdAt", "updatedAt", "completedAt", "implementedAt"];
+
+/// A client writes `toISOString`'s three fraction digits, but the store compares timestamps as
+/// text at the server's one width (#366), so each client instant is re-written in the store form
+/// before the command is decoded. Text that does not parse as RFC 3339 is kept as sent, as before.
+fn canonicalize_client_timestamps(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields.iter_mut() {
+                if CLIENT_TIMESTAMP_FIELDS.contains(&key.as_str())
+                    && let Value::String(text) = field
+                {
+                    if let Some(canonical) = crate::persistence::canonical_timestamp(text) {
+                        *text = canonical;
+                    }
+                } else {
+                    canonicalize_client_timestamps(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(canonicalize_client_timestamps),
+        _ => {}
+    }
+}
+
 /// Decodes the public orchestration wire shape and resolves the small amount of
 /// server-owned context that ordinary commands need. Worktree policy, identity,
 /// lifecycle kind, and adopted-owner deletion are deliberately not part of this
@@ -321,6 +348,8 @@ pub(crate) async fn decode_public_orchestration_command(
         .and_then(|bootstrap| bootstrap.get("prepareWorktree"))
         .and_then(Value::as_object)
         .is_some_and(|prepare| prepare.contains_key("projectCwd"));
+    let mut payload = payload;
+    canonicalize_client_timestamps(&mut payload);
     let mut command = serde_json::from_value::<OrchestrationCommand>(payload)
         .map_err(|error| error.to_string())?;
     if command.is_server_internal() {
@@ -4653,6 +4682,79 @@ mod tests {
         serde_json::to_vec(events)
             .expect("encode event array")
             .len()
+    }
+
+    /// #366: a client's three-digit instant is stored in the server's nine-digit form, so a
+    /// client message and a server message in the same millisecond list in time order.
+    #[tokio::test]
+    async fn a_client_created_at_sorts_with_server_rows_in_the_same_millisecond() {
+        let engine = migrated_engine().await;
+        let command = decode_public_orchestration_command(
+            &engine,
+            json!({
+                "type":"thread.turn.start","commandId":"client-turn","threadId":"thread-a",
+                "message":{"messageId":"m-client","role":"user","text":"hi","attachments":[]},
+                "createdAt":"2026-01-01T00:00:00.120Z"
+            }),
+        )
+        .await
+        .expect("the client command decodes");
+        let client_at = serde_json::to_value(&command).unwrap()["createdAt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // A server message 500 microseconds later, in the same millisecond.
+        let server_at = crate::persistence::format_timestamp(
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_767_225_600_120_500_000).unwrap(),
+        );
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                for (message_id, role, at) in [
+                    ("m-server", "assistant", server_at),
+                    ("m-client", "user", client_at),
+                ] {
+                    connection.execute(
+                        "INSERT INTO projection_thread_messages (message_id, thread_id, role, \
+                         text, is_streaming, created_at, updated_at) \
+                         VALUES (?1, 'thread-a', ?2, '', 0, ?3, ?3)",
+                        rusqlite::params![message_id, role, at],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let order: Vec<String> = engine
+            .repositories()
+            .list_messages_by_thread("thread-a".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect();
+        assert_eq!(order, ["m-client", "m-server"]);
+    }
+
+    /// #366: the ingestion re-writes each client instant, nested ones included, and keeps text
+    /// that is not RFC 3339 as sent.
+    #[test]
+    fn client_timestamps_are_rewritten_and_unparsable_text_is_kept() {
+        let mut payload = json!({
+            "createdAt":"2026-01-01T00:00:00.120Z",
+            "bootstrap":{"createThread":{"createdAt":"2026-01-01T01:00:00+01:00"}},
+            "proposedPlan":{"updatedAt":"not a time"},
+            "message":{"text":"2026-01-01T00:00:00Z"}
+        });
+        canonicalize_client_timestamps(&mut payload);
+        assert_eq!(payload["createdAt"], "2026-01-01T00:00:00.120000000Z");
+        assert_eq!(
+            payload["bootstrap"]["createThread"]["createdAt"],
+            "2026-01-01T00:00:00.000000000Z"
+        );
+        assert_eq!(payload["proposedPlan"]["updatedAt"], "not a time");
+        assert_eq!(payload["message"]["text"], "2026-01-01T00:00:00Z");
     }
 
     /// Clients cannot set the server-authored identity: serde drops the unknown field, so the
