@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -57,7 +57,7 @@ pub struct ProviderTerminalActivityLaunch {
     pub provider_instance_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalLaunchCommand {
     pub executable: String,
@@ -76,6 +76,23 @@ pub struct TerminalLaunchCommand {
     pub env: Option<BTreeMap<String, String>>,
 }
 
+/// Environment values can carry credentials, so only their keys are printed.
+impl fmt::Debug for TerminalLaunchCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalLaunchCommand")
+            .field("executable", &self.executable)
+            .field("args", &self.args)
+            .field("label", &self.label)
+            .field("activity", &self.activity)
+            .field(
+                "env_keys",
+                &self.env.as_ref().map(|env| env.keys().collect::<Vec<_>>()),
+            )
+            .finish()
+    }
+}
+
 fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -84,7 +101,7 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TerminalOpenInput {
     pub thread_id: String,
     pub terminal_id: String,
@@ -96,6 +113,24 @@ pub struct TerminalOpenInput {
     pub command: Option<TerminalLaunchCommand>,
     /// Marks a host thread's center panel; sticky on the session once set.
     pub center_panel: bool,
+}
+
+/// The launch hook writes the terminal's credential into `env`, so only its keys are printed.
+impl fmt::Debug for TerminalOpenInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalOpenInput")
+            .field("thread_id", &self.thread_id)
+            .field("terminal_id", &self.terminal_id)
+            .field("cwd", &self.cwd)
+            .field("worktree_path", &self.worktree_path)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("command", &self.command)
+            .field("center_panel", &self.center_panel)
+            .finish()
+    }
 }
 
 impl TerminalOpenInput {
@@ -120,7 +155,7 @@ impl TerminalOpenInput {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TerminalAttachInput {
     pub thread_id: String,
     pub terminal_id: String,
@@ -133,6 +168,26 @@ pub struct TerminalAttachInput {
     pub command: Option<TerminalLaunchCommand>,
     pub size_claim: Option<String>,
     pub center_panel: bool,
+}
+
+/// Environment values can carry credentials, so only their keys are printed.
+impl fmt::Debug for TerminalAttachInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalAttachInput")
+            .field("thread_id", &self.thread_id)
+            .field("terminal_id", &self.terminal_id)
+            .field("cwd", &self.cwd)
+            .field("worktree_path", &self.worktree_path)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("restart_if_not_running", &self.restart_if_not_running)
+            .field("command", &self.command)
+            .field("size_claim", &self.size_claim)
+            .field("center_panel", &self.center_panel)
+            .finish()
+    }
 }
 
 impl TerminalAttachInput {
@@ -303,6 +358,10 @@ pub struct TerminalAgentStatus {
     /// new report, so a client restamps its receipt only for new evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// The agent finished its turn and its CLI waits for a prompt, as its observer saw it. False
+    /// for a fresh, unavailable or exited agent and for every state but done.
+    #[serde(default)]
+    pub ready_for_prompt: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

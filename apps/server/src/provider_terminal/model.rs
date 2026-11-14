@@ -722,6 +722,88 @@ pub enum TerminalAgentReport {
     Progress,
 }
 
+/// Whether a provider event may make its terminal ready for a prompt. Only fresh evidence can;
+/// every observer transition withdraws readiness until fresh evidence returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptEvidence {
+    /// Read on the observer's active stream after that stream's last transition and after any
+    /// snapshot it took, so nothing the observer holds is newer.
+    Fresh,
+    /// A snapshot, an event buffered across a snapshot or a transition, or one the observer drops:
+    /// its state is reported, which withdraws readiness, but never makes the terminal ready.
+    Stale,
+}
+
+/// When a Codex or OpenCode observer may make its terminal ready for a prompt (R-6): only at the
+/// moment it waits on its live stream with nothing left to read, from the latest root event it
+/// read. Any other awaited work withdraws readiness first; a transition also forgets what was read.
+#[derive(Debug, Default)]
+pub struct PromptReadiness {
+    /// The latest root event read says the CLI waits for a prompt, and it was read fresh.
+    idle: bool,
+    /// A wait made the terminal ready from that event. A consumer that clears it (the pointer
+    /// typing its line) has taken it, and only a new root event hands readiness out again.
+    handed_out: bool,
+}
+
+impl PromptReadiness {
+    /// Reports what one root event says about the agent and keeps whether it says the CLI waits.
+    /// It never makes the terminal ready: the next [`Self::wait`] does.
+    pub fn observe(
+        &mut self,
+        generation: &TerminalObserverGenerationLease,
+        report: TerminalAgentReport,
+        ready: bool,
+        evidence: PromptEvidence,
+    ) {
+        generation.report_agent_status(report);
+        self.idle = ready && evidence == PromptEvidence::Fresh;
+        self.handed_out = false;
+    }
+
+    /// Withdraws readiness before awaited work that is not the wait on the live stream; what the
+    /// observer read still decides the next wait, unless a consumer already took it.
+    pub fn suspend(&mut self, generation: &TerminalObserverGenerationLease) {
+        if generation.clear_ready_for_prompt() {
+            self.handed_out = false;
+        }
+    }
+
+    /// Withdraws readiness at a transition (an attach, a replaced or lost stream, a snapshot,
+    /// dropped events) and forgets what was read before it.
+    pub fn reset(&mut self, generation: &TerminalObserverGenerationLease) {
+        self.idle = false;
+        self.handed_out = false;
+        generation.clear_ready_for_prompt();
+    }
+
+    /// Awaits the next read on the live stream. Only once that read is pending, so nothing is
+    /// immediately readable, does it make the terminal ready, and only if the latest root event
+    /// read says the CLI waits and no consumer took that readiness yet.
+    pub async fn wait<T>(
+        &mut self,
+        generation: &TerminalObserverGenerationLease,
+        next: impl Future<Output = T>,
+    ) -> T {
+        let mut next = std::pin::pin!(next);
+        std::future::poll_fn(|context| {
+            let polled = next.as_mut().poll(context);
+            // A read refused for the task's exhausted budget is not an empty stream; Tokio wakes
+            // the task at once, and the next poll decides.
+            if polled.is_pending()
+                && self.idle
+                && !self.handed_out
+                && tokio::task::coop::has_budget_remaining()
+            {
+                self.handed_out = true;
+                generation.mark_ready_for_prompt();
+            }
+            polled
+        })
+        .await
+    }
+}
+
 /// One status observation: the state, whether the turn that ended failed, and when the
 /// observer saw it on this server's clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -731,6 +813,9 @@ pub struct TerminalAgentObservation {
     pub observed_at: std::time::Instant,
     /// The same moment on the wall clock: the evidence token clients age from their receipt.
     pub observed_wall: std::time::SystemTime,
+    /// The CLI waits for a prompt: set by [`TerminalObserverGenerationLease::mark_ready_for_prompt`]
+    /// on a done, unfailed observation; every new report starts without it.
+    pub ready_for_prompt: bool,
 }
 
 /// Lightweight generation identity shared with provider observer workers.
@@ -909,6 +994,7 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             }));
     }
 
@@ -950,9 +1036,61 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             });
             true
         });
+    }
+
+    /// Reports what one provider event says, then marks the terminal ready only when the event
+    /// says its CLI waits for a prompt and the evidence is fresh.
+    pub fn report_agent_evidence(
+        &self,
+        report: TerminalAgentReport,
+        ready: bool,
+        evidence: PromptEvidence,
+    ) {
+        self.report_agent_status(report);
+        if ready && evidence == PromptEvidence::Fresh {
+            self.mark_ready_for_prompt();
+        }
+    }
+
+    /// Marks the current observation ready for a prompt, only when it is done and did not fail,
+    /// atomically. The Claude observer reaches it through [`Self::report_agent_evidence`]; the
+    /// Codex and OpenCode observers only through [`PromptReadiness::wait`].
+    pub fn mark_ready_for_prompt(&self) {
+        if !self.is_current() {
+            return;
+        }
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation)
+                    if observation.state == TerminalAgentState::Done
+                        && !observation.failed
+                        && !observation.ready_for_prompt =>
+                {
+                    observation.ready_for_prompt = true;
+                    true
+                }
+                _ => false,
+            });
+    }
+
+    /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
+    /// that buffers events, a lost connection or stream, the observer's end) or before awaited
+    /// work. The state stays as last reported. Returns whether it was ready.
+    pub fn clear_ready_for_prompt(&self) -> bool {
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation) if observation.ready_for_prompt => {
+                    observation.ready_for_prompt = false;
+                    true
+                }
+                _ => false,
+            })
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it
@@ -1266,10 +1404,21 @@ pub trait TerminalLaunchPreparer: Send + Sync {
 }
 
 /// Replacement arguments for a provider terminal command, and environment entries to set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NativeTerminalCommand {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+/// Environment values can carry credentials, so only their keys are printed.
+impl fmt::Debug for NativeTerminalCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeTerminalCommand")
+            .field("args", &self.args)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 pub enum TerminalLaunchPreparation {

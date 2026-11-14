@@ -154,15 +154,37 @@ pub struct TerminalManagerOptions {
     pub subprocess_inspector: Option<Arc<dyn TerminalSubprocessInspector>>,
     pub launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
     /// Server-owned variables merged into every spawn's environment after the caller's, so
-    /// they win. Called with the thread id once per process start, never for an open that
-    /// finds the terminal running.
+    /// they win. Called once per process start, before the session is published, never for
+    /// an open that finds the terminal running.
     pub session_env: Option<TerminalSessionEnv>,
 }
+
+/// The process a [`TerminalSessionEnv`] hook launches.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalSessionLaunch<'a> {
+    pub thread_id: &'a str,
+    pub terminal_id: &'a str,
+    pub generation: &'a TerminalGeneration,
+    /// True when the launch command runs a provider CLI (`command.activity` is set).
+    pub ai_terminal: bool,
+}
+
+/// The variables that carry a launch hook's credentials and where they are sent. No prepared
+/// environment may set them, whatever value the caller supplied. A process of the terminal that
+/// copies the credential into another variable of that terminal gains nothing, since every one
+/// of its processes can already read it; only redirecting the endpoint would, and that is
+/// refused here.
+const SESSION_CREDENTIAL_KEYS: [&str; 4] = [
+    crate::open_url::TOKEN_ENV,
+    crate::open_url::ENDPOINT_ENV,
+    crate::agent_messaging::terminal_credential::AUTH_ENV,
+    crate::agent_messaging::terminal_credential::ENDPOINT_ENV,
+];
 
 /// See [`TerminalManagerOptions::session_env`].
 pub type TerminalSessionEnv = Arc<
     dyn for<'a> Fn(
-            &'a str,
+            TerminalSessionLaunch<'a>,
             &'a mut std::collections::BTreeMap<String, String>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
         + Send
@@ -198,7 +220,7 @@ impl TerminalManagerOptions {
     pub fn session_env_hook<F>(hook: F) -> TerminalSessionEnv
     where
         F: for<'a> Fn(
-                &'a str,
+                TerminalSessionLaunch<'a>,
                 &'a mut std::collections::BTreeMap<String, String>,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
             + Send
@@ -370,6 +392,7 @@ impl SessionAgentStatus {
                     .format(&Rfc3339)
                     .ok()
             }),
+            ready_for_prompt: observation.is_some_and(|observation| observation.ready_for_prompt),
         }
     }
 }
@@ -2333,9 +2356,43 @@ impl TerminalManager {
             carry_over = session.carry_over();
         }
         let mut input = input;
+        // The keys the server's hook sets, which no prepared environment may replace: a
+        // project's version manager `[env]` must not redirect a terminal's credential. `PATH`
+        // stays open, since a prepared launch pins its own tools there.
+        let mut session_keys = Vec::new();
         if let Some(session_env) = self.inner.options.session_env.as_ref() {
-            session_env(&input.thread_id, &mut input.env).await;
+            let caller_env = input.env.clone();
+            let ai_terminal = input
+                .command
+                .as_ref()
+                .is_some_and(|command| command.activity.is_some());
+            session_env(
+                TerminalSessionLaunch {
+                    thread_id: &input.thread_id,
+                    terminal_id: &input.terminal_id,
+                    generation: &generation.id,
+                    ai_terminal,
+                },
+                &mut input.env,
+            )
+            .await;
+            session_keys = input
+                .env
+                .iter()
+                .filter(|(key, value)| {
+                    !key.eq_ignore_ascii_case("PATH") && caller_env.get(*key) != Some(*value)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            // The credential keys stay the hook's even when the caller already held the same
+            // value, which the comparison above cannot see.
+            session_keys.extend(SESSION_CREDENTIAL_KEYS.map(str::to_owned));
         }
+        let prepared_may_set = |key: &String| {
+            !session_keys
+                .iter()
+                .any(|session_key| environment_keys_equal(Platform::current(), session_key, key))
+        };
 
         // The provider's native form of the command applies to observed and unobserved
         // launches alike, so it replaces the requested one first. Only the spawn uses it: the
@@ -2365,7 +2422,12 @@ impl TerminalManager {
             .await
             {
                 native_args = Some(native.args);
-                input.env.extend(native.env);
+                input.env.extend(
+                    native
+                        .env
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key)),
+                );
             }
         }
 
@@ -2485,7 +2547,12 @@ impl TerminalManager {
                 });
                 diagnostic_values.dedup();
                 let mut env = input.env.clone();
-                env.extend(prepared.env_overlay);
+                env.extend(
+                    prepared
+                        .env_overlay
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key)),
+                );
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
                 if let Err(observer) = generation.install_observer(observer) {
@@ -3266,6 +3333,7 @@ impl TerminalManager {
                 if published.is_some_and(|previous| {
                     previous.state == observation.state
                         && previous.failed == observation.failed
+                        && previous.ready_for_prompt == observation.ready_for_prompt
                         && observation
                             .observed_at
                             .saturating_duration_since(previous.observed_at)
@@ -4140,6 +4208,11 @@ impl TerminalManager {
             .inner
             .generations
             .remove_matching(thread_id, terminal_id);
+        // Every ending generation stops being live before any cleanup waits, so no credential of
+        // a terminal still queued for cleanup verifies meanwhile.
+        for generation in &generations {
+            generation.begin_closing();
+        }
         for generation in &generations {
             generation.stop_output().await;
             generation
@@ -4520,6 +4593,35 @@ impl TerminalManager {
         TerminalMetadataAttachment { initial, events }
     }
 
+    /// The generation of the terminal's process while it runs. A process a close, restart or
+    /// shutdown has begun to end is no longer live, though its session runs until cleanup.
+    pub async fn live_generation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<TerminalGeneration> {
+        // A manager that shuts down ends every terminal it holds.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let session = session.lock().await;
+        // Shutdown may have begun while this waited for the session.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
+        (session.status == TerminalStatus::Running
+            && !session.generation.is_closing()
+            && !session.generation.is_invalidated())
+        .then(|| session.generation.id.clone())
+    }
+
     pub fn subscribe_events(&self) -> TerminalEventReceiver {
         TerminalEventReceiver::new(self.inner.events.subscribe(), false)
     }
@@ -4531,6 +4633,11 @@ impl TerminalManager {
 
     async fn shutdown_with_report(&self) -> ProcessCleanupReport {
         self.inner.cancellation.cancel();
+        // Attachment cleanup can wait on session locks a credential check also waits on: every
+        // generation stops verifying before that wait.
+        for generation in self.inner.generations.snapshot_live() {
+            generation.begin_closing();
+        }
         {
             let _registrations = self
                 .inner
@@ -4540,7 +4647,11 @@ impl TerminalManager {
             self.inner.attachment_tasks.close();
         }
         self.inner.attachment_tasks.wait().await;
-        for generation in self.inner.generations.remove_all() {
+        let generations = self.inner.generations.remove_all();
+        for generation in &generations {
+            generation.begin_closing();
+        }
+        for generation in generations {
             generation.stop_output().await;
             generation
                 .cancel_and_invalidate(TerminalObserverCancellationReason::Shutdown)
@@ -11182,6 +11293,662 @@ mod tests {
         manager.shutdown().await;
     }
 
+    type LeaseSlot = Arc<StdMutex<Option<TerminalObserverGenerationLease>>>;
+
+    #[derive(Debug)]
+    struct LeaseCapture(LeaseSlot);
+
+    impl PreparedTerminalObserver for LeaseCapture {
+        fn on_spawned(
+            &self,
+            _pid: u32,
+            generation: TerminalObserverGenerationLease,
+            _workers: TerminalObserverWorkerContext,
+        ) {
+            *self.0.lock().unwrap() = Some(generation);
+        }
+
+        fn diagnostic_label(&self) -> &str {
+            "lease-capture"
+        }
+    }
+
+    /// Prepares every AI Terminal with an observer that hands its generation lease to the test.
+    struct LeaseCapturingPreparer(LeaseSlot);
+
+    impl TerminalLaunchPreparer for LeaseCapturingPreparer {
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::new(),
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(self.0.clone())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    async fn next_agent_status(
+        events: &mut broadcast::Receiver<TerminalMetadataEvent>,
+        wanted: impl Fn(&TerminalSummary) -> bool,
+    ) -> TerminalAgentStatus {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(TerminalMetadataEvent::Upsert { terminal }) = events.recv().await
+                    && wanted(&terminal)
+                    && let Some(status) = terminal.agent_status
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .expect("a summary with the wanted agent status is published")
+    }
+
+    fn agent_status_is(
+        terminal: &TerminalSummary,
+        wanted: impl Fn(&TerminalAgentStatus) -> bool,
+    ) -> bool {
+        terminal.agent_status.as_ref().is_some_and(wanted)
+    }
+
+    #[tokio::test]
+    async fn agent_status_summary_carries_ready_for_prompt() {
+        for status in [
+            SessionAgentStatus::Unavailable,
+            SessionAgentStatus::Ready,
+            SessionAgentStatus::Exited { failed: false },
+        ] {
+            assert!(!status.summary().ready_for_prompt, "{status:?}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let slot = LeaseSlot::default();
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer: Some(Arc::new(LeaseCapturingPreparer(slot.clone()))),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = slot.lock().unwrap().clone() {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer receives its generation");
+
+        for (state, shown) in [
+            (
+                TerminalAgentState::Working,
+                TerminalAgentStatusState::Working,
+            ),
+            (
+                TerminalAgentState::Blocked,
+                TerminalAgentStatusState::Blocked,
+            ),
+            (
+                TerminalAgentState::Waiting,
+                TerminalAgentStatusState::Waiting,
+            ),
+        ] {
+            lease.publish_agent_status(state, false);
+            // Only a done, unfailed observation can be marked.
+            lease.mark_ready_for_prompt();
+            let status = next_agent_status(&mut events, |terminal| {
+                agent_status_is(terminal, |status| status.state == shown)
+            })
+            .await;
+            assert!(!status.ready_for_prompt, "{state:?}");
+        }
+        lease.publish_agent_status(TerminalAgentState::Done, true);
+        lease.mark_ready_for_prompt();
+        let failed = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.failed)
+        })
+        .await;
+        assert!(!failed.ready_for_prompt, "a failed turn is not ready");
+
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        let done = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Done && !status.failed
+            })
+        })
+        .await;
+        assert!(!done.ready_for_prompt, "a done report alone is not ready");
+        // The same observation with only the flag changed is published again.
+        lease.mark_ready_for_prompt();
+        let ready = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        assert_eq!(ready.state, TerminalAgentStatusState::Done);
+        assert_eq!(ready.observed_at, done.observed_at);
+
+        backend.latest().exit(0);
+        let exited = next_agent_status(&mut events, |terminal| {
+            terminal.status == TerminalStatus::Exited
+        })
+        .await;
+        assert!(!exited.ready_for_prompt, "an exited agent is not ready");
+        manager.shutdown().await;
+    }
+
+    const TEST_AGENT_ENDPOINT: &str = "http://127.0.0.1:3773/api/agent/call";
+    const TEST_OPEN_URL_ENDPOINT: &str = "http://127.0.0.1:3773/api/preview/open-url";
+
+    fn credential_manager(
+        backend: Arc<HistoryTestBackend>,
+        launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
+    ) -> (
+        TerminalManager,
+        crate::agent_messaging::terminal_credential::TerminalCredentials,
+    ) {
+        let credentials = crate::agent_messaging::terminal_credential::TerminalCredentials::new(
+            "env-1".to_owned(),
+            PathBuf::from("/state/runtime/agent"),
+        );
+        let hook_credentials = credentials.clone();
+        let manager = TerminalManager::new(
+            backend,
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer,
+                session_env: Some(TerminalManagerOptions::session_env_hook(
+                    move |launch, env| {
+                        let credentials = hook_credentials.clone();
+                        Box::pin(async move {
+                            crate::open_url::OpenUrlSession {
+                                endpoint: TEST_OPEN_URL_ENDPOINT.to_owned(),
+                                token: format!("open-url-{}", launch.terminal_id),
+                                shim_dir: PathBuf::from("/state/runtime/open-url"),
+                            }
+                            .apply(env);
+                            credentials.issue(&launch, env).await;
+                        })
+                    },
+                )),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        credentials.bind(
+            "http://127.0.0.1:3773/api/agent/call".to_owned(),
+            Arc::new(manager.clone()),
+        );
+        (manager, credentials)
+    }
+
+    fn ai_terminal_input(root: &Path, terminal_id: &str) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new("thread-a", terminal_id, root.to_path_buf(), 80, 24);
+        input.command = Some(TerminalLaunchCommand {
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: "claudeAgent".to_owned(),
+                provider_instance_id: "claudeAgent".to_owned(),
+            }),
+            env: None,
+        });
+        input
+    }
+
+    fn last_agent_token(backend: &HistoryTestBackend) -> String {
+        backend
+            .spawns()
+            .last()
+            .and_then(|spawn| spawn.env.get("BIBCODE_AGENT_AUTH").cloned())
+            .expect("assertion failed: env contains BIBCODE_AGENT_AUTH")
+    }
+
+    #[tokio::test]
+    async fn terminal_env_agent_credential_only_for_ai_terminals() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+
+        manager
+            .open(ai_terminal_input(root.path(), "term-ai"))
+            .await
+            .unwrap();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-a",
+                "term-plain",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+
+        let spawns = backend.spawns();
+        assert_eq!(
+            spawns[0].env["BIBCODE_AGENT_ENDPOINT"],
+            "http://127.0.0.1:3773/api/agent/call"
+        );
+        let identity = credentials
+            .verify(&spawns[0].env["BIBCODE_AGENT_AUTH"])
+            .await
+            .expect("verify returned None, expected Some(terminal:thread-a/term-ai)");
+        assert_eq!(identity.address(), "terminal:thread-a/term-ai");
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_AUTH"));
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_ENDPOINT"));
+        manager.shutdown().await;
+    }
+
+    /// Prepares every AI Terminal with environment a project could choose, such as a version
+    /// manager's `[env]`.
+    struct OverlayPreparer;
+
+    impl TerminalLaunchPreparer for OverlayPreparer {
+        fn native_command(
+            &self,
+            input: &TerminalLaunchPreparationInput,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Option<crate::provider_terminal::NativeTerminalCommand>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::ready(Some(
+                crate::provider_terminal::NativeTerminalCommand {
+                    args: input.args.clone(),
+                    env: std::collections::BTreeMap::from([(
+                        "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                        "http://example.test/native".to_owned(),
+                    )]),
+                },
+            )))
+        }
+
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::from([
+                        (
+                            "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_AGENT_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_OPEN_URL_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
+                    ]),
+                    // A private key that names a launch variable is refused before the spawn.
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(LeaseSlot::default())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_prepared_environment_cannot_replace_the_agent_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) =
+            credential_manager(backend.clone(), Some(Arc::new(OverlayPreparer)));
+
+        // A caller's environment that already holds the server's own endpoints must not leave
+        // them open to the overlay.
+        for (terminal_id, caller_holds_the_endpoints) in [("term-ai", false), ("term-pre", true)] {
+            let mut input = ai_terminal_input(root.path(), terminal_id);
+            if caller_holds_the_endpoints {
+                input.env.insert(
+                    "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                    TEST_AGENT_ENDPOINT.to_owned(),
+                );
+                input.env.insert(
+                    "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                    TEST_OPEN_URL_ENDPOINT.to_owned(),
+                );
+            }
+            manager.open(input).await.unwrap();
+
+            let spawn = backend.spawns().pop().expect("a spawn");
+            assert_eq!(
+                spawn.env["BIBCODE_AGENT_ENDPOINT"], TEST_AGENT_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_ENDPOINT"], TEST_OPEN_URL_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_AUTH"],
+                format!("open-url-{terminal_id}")
+            );
+            assert!(
+                credentials
+                    .verify(&spawn.env["BIBCODE_AGENT_AUTH"])
+                    .await
+                    .is_some(),
+                "{terminal_id}: the spawned credential is the one the server issued"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_credential_is_refused_after_close_exit_restart_and_replacement() {
+        for ending in ["close", "exit", "restart", "replacement"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let shutdown = CancellationToken::new();
+            let revoker = credentials.spawn_revoker(manager.subscribe_events(), shutdown.clone());
+            let ended = ai_terminal_input(root.path(), "term-c");
+            manager.open(ended.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_process = backend.latest();
+            manager
+                .open(ai_terminal_input(root.path(), "term-e"))
+                .await
+                .unwrap();
+            let sibling = last_agent_token(&backend);
+            let before = manager.live_generation("thread-a", "term-c").await.unwrap();
+
+            match ending {
+                "close" => manager.close("thread-a", Some("term-c")).await.unwrap(),
+                "restart" => {
+                    manager.restart(ended.clone()).await.unwrap();
+                }
+                _ => {
+                    old_process.exit(0);
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while manager
+                            .live_generation("thread-a", "term-c")
+                            .await
+                            .is_some()
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("the process exit is published");
+                    if ending == "replacement" {
+                        manager.open(ended.clone()).await.unwrap();
+                    }
+                }
+            }
+
+            assert_eq!(credentials.verify(&old).await, None, "{ending}");
+            assert!(credentials.verify(&sibling).await.is_some(), "{ending}");
+            if matches!(ending, "restart" | "replacement") {
+                let after = manager.live_generation("thread-a", "term-c").await.unwrap();
+                assert_eq!(after.process, before.process + 2, "{ending}");
+                assert!(
+                    credentials
+                        .verify(&last_agent_token(&backend))
+                        .await
+                        .is_some(),
+                    "{ending}: the new process's token verifies"
+                );
+            }
+            shutdown.cancel();
+            revoker.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_the_new_token_survives_a_restart_and_a_delayed_old_exit() {
+        for exit_first in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let input = ai_terminal_input(root.path(), "term-c");
+            manager.open(input.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_generation = manager.live_generation("thread-a", "term-c").await.unwrap();
+            let snapshot = manager.restart(input).await.unwrap();
+            let new = last_agent_token(&backend);
+            assert_eq!(
+                manager.live_generation("thread-a", "term-c").await,
+                snapshot.generation
+            );
+
+            let exited = TerminalEvent::Exited {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 1,
+                exit_code: Some(0),
+                exit_signal: None,
+                generation: Some(old_generation),
+            };
+            let restarted = TerminalEvent::Restarted {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 2,
+                snapshot,
+            };
+            let (sender, receiver) = broadcast::channel(8);
+            let events = if exit_first {
+                [exited, restarted]
+            } else {
+                [restarted, exited]
+            };
+            for event in events {
+                sender.send(event).unwrap();
+            }
+            drop(sender);
+            credentials
+                .spawn_revoker(
+                    TerminalEventReceiver::new(receiver, false),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                credentials.verify(&new).await.is_some(),
+                "the new token was revoked (exit first: {exit_first})"
+            );
+            assert_eq!(credentials.verify(&old).await, None);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_restarting_generation_stops_verifying_before_its_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        let input = ai_terminal_input(root.path(), "term-c");
+        manager.open(input.clone()).await.unwrap();
+        let old = last_agent_token(&backend);
+        let barrier = Arc::new(PublisherBarrier {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *manager
+            .inner
+            .restart_after_exact_cleanup_barrier
+            .lock()
+            .expect("restart barrier lock") = Some(barrier.clone());
+        let restart_manager = manager.clone();
+        let restart = tokio::spawn(async move { restart_manager.restart(input).await });
+        tokio::time::timeout(Duration::from_secs(2), barrier.started.notified())
+            .await
+            .expect("the restart reached its cleanup barrier");
+
+        assert_eq!(
+            manager.live_generation("thread-a", "term-c").await,
+            None,
+            "an invalidated generation is not live while its session is removed"
+        );
+        assert_eq!(
+            credentials.verify(&old).await,
+            None,
+            "the old token verified during the restart's cleanup"
+        );
+
+        barrier.release.notify_one();
+        restart.await.unwrap().unwrap();
+        assert!(
+            credentials
+                .verify(&last_agent_token(&backend))
+                .await
+                .is_some()
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_no_token_verifies_while_a_bulk_close_or_shutdown_cleans_up() {
+        for ending in ["bulk close", "shutdown"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let mut tokens = Vec::new();
+            let mut held = Vec::new();
+            let mut generations = Vec::new();
+            for terminal in ["term-c", "term-e"] {
+                manager
+                    .open(ai_terminal_input(root.path(), terminal))
+                    .await
+                    .unwrap();
+                tokens.push(last_agent_token(&backend));
+                let generation = manager
+                    .require_session("thread-a", terminal)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .generation
+                    .clone();
+                // Holding the publication lock holds this generation's cleanup in `invalidate`.
+                let publication = generation
+                    .observation
+                    .observation()
+                    .attach_activity_publication(Arc::new(Mutex::new(())));
+                held.push(publication.lock_owned().await);
+                generations.push(generation);
+            }
+            let ending_manager = manager.clone();
+            let task = tokio::spawn(async move {
+                if ending == "shutdown" {
+                    ending_manager.shutdown().await;
+                } else {
+                    ending_manager.close("thread-a", None).await.unwrap();
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !generations.iter().any(|generation| generation.is_closing()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cleanup began");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            for token in &tokens {
+                assert_eq!(
+                    credentials.verify(token).await,
+                    None,
+                    "{ending}: a token verified while its generation waited for cleanup"
+                );
+            }
+            drop(held);
+            task.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_credential_waiting_on_a_session_lock_fails_once_shutdown_begins() {
+        // Mutation caught: a verification that checked cancellation before it waited on the
+        // session lock returning the still-running generation after shutdown began.
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        manager
+            .open(ai_terminal_input(root.path(), "term-c"))
+            .await
+            .unwrap();
+        let token = last_agent_token(&backend);
+        let attachment = manager
+            .attach(TerminalAttachInput {
+                size_claim: Some("owner".to_owned()),
+                ..TerminalAttachInput::existing("thread-a", "term-c")
+            })
+            .await
+            .unwrap();
+        let session = manager.require_session("thread-a", "term-c").await.unwrap();
+        let held = session.lock().await;
+
+        let verification = tokio::spawn({
+            let credentials = credentials.clone();
+            async move { credentials.verify(&token).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The attachment's cleanup queues on the same lock, and shutdown waits for it.
+        drop(attachment);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let shutdown = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.inner.cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shutdown began");
+        drop(held);
+
+        assert_eq!(
+            verification.await.unwrap(),
+            None,
+            "a verification waiting on the session lock succeeded after shutdown began"
+        );
+        shutdown.await.unwrap();
+    }
+
     #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
@@ -11193,11 +11960,11 @@ mod tests {
             TerminalManagerOptions {
                 subprocess_poll_interval: Duration::ZERO,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
-                    move |thread_id, env| {
+                    move |launch, env| {
                         let issued = hook_issued.clone();
                         Box::pin(async move {
                             let mut issued = issued.lock().unwrap();
-                            let token = format!("{thread_id}-token-{}", issued.len());
+                            let token = format!("{}-token-{}", launch.thread_id, issued.len());
                             issued.push(token.clone());
                             crate::open_url::OpenUrlSession {
                                 endpoint: "http://127.0.0.1:3773/api/preview/open-url".to_owned(),
