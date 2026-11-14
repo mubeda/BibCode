@@ -73,6 +73,8 @@ pub(crate) enum AgentMessagingError {
         sender: String,
         recipient: String,
     },
+    /// The sender already used the `clientRequestId` for a different message.
+    Conflict,
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
 }
@@ -86,6 +88,7 @@ impl AgentMessagingError {
             Self::UnknownMessage => "AgentMessagingUnknownMessageError",
             Self::RecipientGone => "AgentMessagingRecipientGoneError",
             Self::ModeCeiling { .. } => "AgentMessagingModeCeilingError",
+            Self::Conflict => "AgentMessagingConflictError",
             Self::Storage => "McpStorageError",
         }
     }
@@ -102,6 +105,10 @@ impl AgentMessagingError {
             Self::ModeCeiling { sender, recipient } => format!(
                 "The recipient runs with more access ({recipient}) than you ({sender}), so it cannot take your message."
             ),
+            Self::Conflict => {
+                "This clientRequestId was already used for a different message. Use a new id."
+                    .to_owned()
+            }
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
         }
     }
@@ -477,6 +484,14 @@ impl AgentMessaging {
             tracing::warn!("agent messaging has no turn starter");
             return Err(AgentMessagingError::Storage);
         };
+        let sender_address = format!("thread:{}", route.sender.thread_id);
+        let recipient_address = format!("thread:{}", route.recipient.thread_id);
+        if let Some(receipt) = self
+            .replay(&sender_address, &recipient_address, &outgoing)
+            .await?
+        {
+            return Ok(receipt);
+        }
         let sender_mode = &route.sender.runtime_mode;
         let recipient_mode = &route.recipient.runtime_mode;
         if !policy::ceiling_allows(sender_mode, recipient_mode) {
@@ -485,8 +500,6 @@ impl AgentMessaging {
                 recipient: recipient_mode.clone(),
             });
         }
-        let sender_address = format!("thread:{}", route.sender.thread_id);
-        let recipient_address = format!("thread:{}", route.recipient.thread_id);
         let label = match route.sender.title.trim() {
             "" => "Agent".to_owned(),
             title => title.to_owned(),
@@ -525,14 +538,14 @@ impl AgentMessaging {
         })?;
         // A queued message waits for the promotion gate, which admits it only once no turn runs
         // and no approval or question is open; one that ended since this read is promoted then.
-        let force_queue = admission_for(&route.recipient, route.session.as_ref())
-            == TurnAdmission::Queue;
+        let force_queue =
+            admission_for(&route.recipient, route.session.as_ref()) == TurnAdmission::Queue;
         let companion = AgentMessageCompanion::Insert(NewAgentMessage {
             message_id: outgoing.message_id.to_owned(),
             conversation_id: outgoing.conversation_id.to_owned(),
             sender_address: sender_address.clone(),
             sender_kind: SenderKind::Agent,
-            recipient_address,
+            recipient_address: recipient_address.clone(),
             in_reply_to: outgoing.in_reply_to.map(str::to_owned),
             hop: outgoing.hop,
             text: outgoing.text.to_owned(),
@@ -546,11 +559,11 @@ impl AgentMessaging {
             delivery_command_id: Some(command_id),
             delivery_message_id: Some(delivery_message_id),
         });
-        starter
+        let admitted = starter
             .queue_turn_start(
                 command,
                 ServerActor::HostedAgent {
-                    address: sender_address,
+                    address: sender_address.clone(),
                     label,
                 },
                 Some(AgentTurn {
@@ -569,13 +582,65 @@ impl AgentMessaging {
                     "an agent message was not admitted"
                 );
                 AgentMessagingError::Storage
-            })?;
+            });
+        if let Err(error) = admitted {
+            // Another call with the same id won the unique index: answer from its row.
+            return match self
+                .replay(&sender_address, &recipient_address, &outgoing)
+                .await?
+            {
+                Some(receipt) => Ok(receipt),
+                None => Err(error),
+            };
+        }
         Ok(MessageReceipt {
             message_id: outgoing.message_id.to_owned(),
             conversation_id: outgoing.conversation_id.to_owned(),
             status: AgentMessageStatus::Accepted,
             hop: outgoing.hop,
         })
+    }
+
+    /// The receipt of the message this sender already stored under `outgoing`'s client
+    /// request id, when its recipient, text and `in_reply_to` are the same (R12); `Conflict`
+    /// when any differs; `None` without an id or a stored message.
+    async fn replay(
+        &self,
+        sender_address: &str,
+        recipient_address: &str,
+        outgoing: &Outgoing<'_>,
+    ) -> Result<Option<MessageReceipt>, AgentMessagingError> {
+        let Some(client_request_id) = outgoing.client_request_id else {
+            return Ok(None);
+        };
+        let (sender, client_request_id) = (sender_address.to_owned(), client_request_id.to_owned());
+        let stored = self
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                store::find_by_client_request(connection, &sender, &client_request_id)
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "agent messaging could not read a client request id");
+                AgentMessagingError::Storage
+            })?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.recipient_address != recipient_address
+            || stored.text != outgoing.text
+            || stored.in_reply_to.as_deref() != outgoing.in_reply_to
+        {
+            return Err(AgentMessagingError::Conflict);
+        }
+        Ok(Some(MessageReceipt {
+            message_id: stored.message_id,
+            conversation_id: stored.conversation_id,
+            status: stored.status,
+            hop: stored.hop,
+        }))
     }
 
     pub(crate) fn is_enabled(&self) -> bool {

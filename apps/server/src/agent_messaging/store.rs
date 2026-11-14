@@ -266,6 +266,23 @@ pub(crate) fn get_message(
         .optional()?)
 }
 
+/// The message `sender_address` stored under `client_request_id`, if any.
+pub(crate) fn find_by_client_request(
+    connection: &rusqlite::Connection,
+    sender_address: &str,
+    client_request_id: &str,
+) -> Result<Option<AgentMessageRow>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM agent_messages WHERE sender_address = ?1 AND client_request_id = ?2"
+            ),
+            params![sender_address, client_request_id],
+            decode,
+        )
+        .optional()?)
+}
+
 /// Returns false and changes nothing when the stored status is terminal or the row is absent.
 pub(crate) fn set_status(
     connection: &rusqlite::Connection,
