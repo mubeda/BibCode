@@ -287,7 +287,8 @@ pub(crate) fn set_status(
     Ok(changed == 1)
 }
 
-/// Returns false when the row is not in the expected status with the expected delivery command.
+/// Returns false when the row is not in the expected status with the expected delivery command,
+/// or its status is terminal.
 pub(crate) fn apply_relink(
     tx: &rusqlite::Transaction<'_>,
     relink: &RelinkAgentMessage,
@@ -295,7 +296,8 @@ pub(crate) fn apply_relink(
 ) -> Result<bool> {
     let changed = tx.execute(
         "UPDATE agent_messages SET delivery_command_id = ?4, delivery_message_id = ?5, status = ?6, reason = ?7, updated_at = ?8 \
-         WHERE message_id = ?1 AND status = ?2 AND delivery_command_id IS ?3",
+         WHERE message_id = ?1 AND status = ?2 AND delivery_command_id IS ?3 \
+           AND status NOT IN ('completed', 'cancelled', 'failed')",
         params![
             relink.message_id,
             relink.expected_status.as_str(),
