@@ -221,6 +221,9 @@ pub(crate) struct SendRequestsService {
     /// request is never queued afterwards.
     // shortcut: one gate for every request; a per-request lock if person sends ever contend.
     dispatch_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Held across each store write and its publication, so changes are published in the order
+    /// they were stored. Taken after `dispatch_gate`, never before it.
+    publish_order: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SendRequestsService {
@@ -235,6 +238,7 @@ impl SendRequestsService {
             dispatcher,
             changes: broadcast::channel(256).0,
             dispatch_gate: std::sync::Arc::default(),
+            publish_order: std::sync::Arc::default(),
         }
     }
 
@@ -250,6 +254,7 @@ impl SendRequestsService {
         from: &[SendState],
         change: StateChange,
     ) -> crate::persistence::Result<Option<SendRequestRow>> {
+        let _order = self.publish_order.lock().await;
         let row = self.store.transition(request_id, from, change).await?;
         if let Some(row) = &row {
             let _ = self
@@ -313,6 +318,7 @@ impl SendRequestsService {
 
     /// Removes every request sent from a deleted thread.
     async fn remove_sent_from(&self, source_thread_id: &str) {
+        let _order = self.publish_order.lock().await;
         match self.store.delete_for_source_thread(source_thread_id).await {
             Ok(removed) => {
                 for request_id in removed {
@@ -553,6 +559,7 @@ impl SendRequestsService {
                 "Only a request that has ended can be dismissed. Cancel it first.",
             ));
         }
+        let _order = self.publish_order.lock().await;
         let dismissed = self
             .store
             .dismiss(request_id, &crate::mcp::control::now_iso())
@@ -796,6 +803,7 @@ impl SendRequestsService {
 
         let command_id = format!("person-send:{}", input.request_id);
         let now = crate::mcp::control::now_iso();
+        let order = self.publish_order.lock().await;
         let (row, created) = self
             .store
             .insert_if_absent(SendRequestRow {
@@ -827,6 +835,13 @@ impl SendRequestsService {
             })
             .await
             .map_err(storage)?;
+        if created {
+            // Published before the turn is queued, so no later state of the request comes first.
+            let _ = self
+                .changes
+                .send(RequestChange::Upsert(Box::new(row.clone())));
+        }
+        drop(order);
         if !created {
             // A simultaneous call with the same id stored it first.
             return self.replay(context, row, &args_digest, &input).await;
