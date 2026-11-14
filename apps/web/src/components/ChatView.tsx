@@ -332,7 +332,15 @@ import {
 } from "./chat/RevertCheckpointDialog.logic";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
-import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
+import { readThreadShell, useProject, useThread, useThreadProposedPlans } from "../state/entities";
+import {
+  useCancelSendRequest,
+  useDismissSendRequest,
+  useSendRequests,
+} from "../state/sendRequests";
+import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
+import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
+import type { NewPanelProvider, PreviewContent, SendChoice } from "./sendToAgent/sendToAgent.logic";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
@@ -434,6 +442,14 @@ const DiffPanel = lazy(() => import("./DiffPanel"));
 const SourceControlPanel = lazy(() => import("./SourceControlPanel"));
 /** Hosts with a terminal review being opened, so a double click opens one (#293). */
 const pendingTerminalReviewHosts = new Set<string>();
+const EMPTY_SEND_CONTENT: PreviewContent = { leadIn: "", attachments: [] };
+/**
+ * What the Send to agent preview shows for each action. Tasks that add Review, Second opinion,
+ * Hand off and Take over from add their branches here; an action without content opens no preview.
+ */
+function sendPreviewContentFor(choice: SendChoice): PreviewContent | null {
+  return choice.action === "message" ? EMPTY_SEND_CONTENT : null;
+}
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
@@ -5093,6 +5109,130 @@ function ChatViewContent(props: ChatViewProps) {
       settings.codeReviewPrompt,
     ],
   );
+  // Send to agent (R101 to R106, R119): a person's request to another agent. The older servers
+  // do not know its methods, so nothing subscribes or sends without the capability.
+  const sendRequestsSupported = serverConfig?.environment.capabilities?.sendRequests === true;
+  const sendNewPanelProviders = useMemo<ReadonlyArray<NewPanelProvider>>(
+    () =>
+      codeReviewAgentActions.flatMap((action) =>
+        action.kind === "chat"
+          ? [
+              {
+                value: action.value,
+                selection: action.selection,
+                label: action.label,
+                disabledReason: action.disabled
+                  ? (action.disabledReason ?? `${action.label} is not available.`)
+                  : null,
+              },
+            ]
+          : [],
+      ),
+    [codeReviewAgentActions],
+  );
+  const createSendPanel = useLatestHandler(
+    async (selection: DefaultAgentSelection): Promise<ThreadId | null> => {
+      const entry = codeReviewAgentActions.find(
+        (action) => action.kind === "chat" && action.entry.instanceId === selection.instanceId,
+      )?.entry;
+      if (entry === undefined || !activeThread || !centerPanelLaunchContext) return null;
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+      });
+      return centerPanelActions.createChatPanel({
+        // A panel cannot host a panel: the new one is hosted by this panel's host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+      });
+    },
+  );
+  const sendToAgentControl = useMemo(
+    () =>
+      isServerThread && activeThreadRef !== null ? (
+        <ChatSendToAgentControl
+          threadRef={activeThreadRef}
+          serverSupported={sendRequestsSupported}
+          newPanelProviders={sendNewPanelProviders}
+          createPanel={createSendPanel}
+          previewContentFor={sendPreviewContentFor}
+        />
+      ) : null,
+    [
+      activeThreadRef,
+      createSendPanel,
+      isServerThread,
+      sendNewPanelProviders,
+      sendRequestsSupported,
+    ],
+  );
+  const sendRequests = useSendRequests(
+    isServerThread && sendRequestsSupported ? environmentId : null,
+  );
+  const threadSendRequests = useMemo(
+    () => selectRowsForThread(sendRequests, threadId),
+    [sendRequests, threadId],
+  );
+  const cancelSendRequest = useCancelSendRequest(environmentId);
+  const dismissSendRequest = useDismissSendRequest(environmentId);
+  const handleCancelSendRequest = useCallback(
+    async (requestId: string) => {
+      const outcome = await cancelSendRequest(requestId);
+      if (outcome.kind === "failed") {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Couldn't cancel the request",
+            description: "BiBCode could not reach the server. Try again.",
+          }),
+        );
+      }
+    },
+    [cancelSendRequest],
+  );
+  const handleDismissSendRequest = useCallback(
+    async (requestId: string) => {
+      const outcome = await dismissSendRequest(requestId);
+      if (outcome.kind === "failed") {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Couldn't dismiss the request",
+            description: "BiBCode could not reach the server. Try again.",
+          }),
+        );
+      }
+    },
+    [dismissSendRequest],
+  );
+  // A request's target opens where it lives: a panel of its host, else its own thread.
+  const handleOpenSendTarget = useCallback(
+    (target: ScopedThreadRef) => {
+      const shell = readThreadShell(target);
+      const hostThreadId = shell?.hostThreadId ?? null;
+      const hostRef =
+        hostThreadId === null ? target : scopeThreadRef(target.environmentId, hostThreadId);
+      if (hostThreadId !== null) {
+        void centerPanelActions.openPanelThread(
+          hostRef,
+          target.threadId,
+          shell?.title ?? "",
+          false,
+        );
+      }
+      void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(hostRef) });
+    },
+    [centerPanelActions, navigate],
+  );
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -7784,6 +7924,16 @@ function ChatViewContent(props: ChatViewProps) {
                         {sideChatHostRef !== null ? (
                           <SideChatBringBack hostRef={sideChatHostRef} summary={bringBackSummary} />
                         ) : null}
+                        {isServerThread && sendRequestsSupported ? (
+                          // Always mounted, so its status region exists before a state changes.
+                          <SendRequestRows
+                            environmentId={environmentId}
+                            requests={threadSendRequests}
+                            onOpen={handleOpenSendTarget}
+                            onCancel={handleCancelSendRequest}
+                            onDismiss={handleDismissSendRequest}
+                          />
+                        ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                         <div className="relative z-10">
                           <ChatComposer
@@ -7877,6 +8027,7 @@ function ChatViewContent(props: ChatViewProps) {
                             onExpandImage={onExpandTimelineImage}
                             onPageTimeline={pageTimeline}
                             historyMenu={historyMenu}
+                            sendToAgentControl={sendToAgentControl}
                           />
                         </div>
                       </div>
