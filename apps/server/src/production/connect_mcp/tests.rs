@@ -2234,6 +2234,70 @@ async fn a_providers_tools_call_reaches_the_directory() {
     tools.shutdown().await;
 }
 
+/// A provider credential reaches send and status, and the sender is the credential's thread.
+#[tokio::test]
+async fn a_providers_send_and_status_calls_reach_the_messaging_service() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tools.control.attach_agent_messaging(tools.messaging(true));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let sent = rpc(
+        &service,
+        headers.clone(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":"thread:b","text":"Which port?","clientRequestId":"k1"}}}),
+    )
+    .await;
+    assert_ne!(sent["result"]["isError"], true, "{sent}");
+    let message_id = sent["result"]["structuredContent"]["messageId"]
+        .as_str()
+        .expect("message id")
+        .to_owned();
+    let status = rpc(
+        &service,
+        headers,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agent_message_status","arguments":{"messageId":message_id}}}),
+    )
+    .await;
+
+    assert_ne!(status["result"]["isError"], true, "{status}");
+    assert!(status["result"]["structuredContent"]["status"].is_string());
+    let sender: String = tools
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT sender_address FROM agent_messages WHERE message_id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(sender, "thread:a");
+    tools.shutdown().await;
+}
+
 #[test]
 fn device_open_takes_a_platform_and_an_image() {
     let tools = tool_descriptors(true);
