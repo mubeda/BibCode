@@ -224,6 +224,14 @@ pub(crate) struct MessageOutcome {
 
 pub(crate) type OutcomeSink = Arc<dyn Fn(MessageOutcome) + Send + Sync>;
 
+/// The outcomes that mark when the admission of a message starts and ends, around its send's
+/// own outcome, so the sink keeps the message's later outcomes behind it. No row is recorded
+/// for either.
+#[cfg_attr(not(test), expect(dead_code, reason = "sent once the hold exists"))]
+pub(crate) const ADMISSION_STARTED: &str = "admission-started";
+#[cfg_attr(not(test), expect(dead_code, reason = "sent once the hold exists"))]
+pub(crate) const ADMISSION_ENDED: &str = "admission-ended";
+
 /// What one send or reply call learned about who it involves, for its activity row: both thread
 /// titles once it resolved the recipient as a live thread of the sender's project, never before.
 #[derive(Default)]

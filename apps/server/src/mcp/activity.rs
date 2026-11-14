@@ -1638,6 +1638,151 @@ mod tests {
         assert!(written < 2_000, "{written} of {sent} rows were kept");
     }
 
+    /// A send whose future is suspended after its admission committed, here at its report,
+    /// which waits until the tracker reported the delivery, still records its acceptance before
+    /// the delivery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_row_never_precedes_its_acceptance() {
+        let tools = crate::production::mcp_tools_tests::Harness::new().await;
+        for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+            dispatch(
+                &tools,
+                json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }),
+            )
+            .await;
+        }
+        let (sink, writer) = agent_message_writer(tools.control.activity().clone());
+        let delivered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gated: OutcomeSink = {
+            let delivered = delivered.clone();
+            Arc::new(move |outcome: MessageOutcome| {
+                let delivery =
+                    outcome.tool == "agent_message_delivery" && outcome.outcome == "delivered";
+                if outcome.tool == "agent_message_send" && outcome.outcome == "accepted" {
+                    let (seen, changed) = &*delivered;
+                    let (_seen, waited) = changed
+                        .wait_timeout_while(
+                            seen.lock().unwrap(),
+                            Duration::from_secs(10),
+                            |seen| !*seen,
+                        )
+                        .unwrap();
+                    assert!(
+                        !waited.timed_out(),
+                        "the tracker reports the delivery while the send waits"
+                    );
+                }
+                sink(outcome);
+                if delivery {
+                    *delivered.0.lock().unwrap() = true;
+                    delivered.1.notify_all();
+                }
+            })
+        };
+        let tracker = CancellationToken::new();
+        let tracking = crate::agent_messaging::delivery::AgentMessageTracker::start(
+            tools.engine.clone(),
+            Some(gated.clone()),
+            watch::channel(true).1,
+            tracker.clone(),
+        );
+        let messaging = tools.messaging_untracked(true).with_outcomes(gated);
+
+        let receipt = messaging
+            .send(
+                "a",
+                crate::agent_messaging::SendRequest {
+                    to: "thread:b".to_owned(),
+                    text: "hello".to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        tracker.cancel();
+        tracking.await.unwrap();
+        writer.close().await;
+        let rows = tools.control.activity().recent().await.unwrap();
+        let states: Vec<(&str, &str)> = rows
+            .iter()
+            .rev()
+            .filter(|row| row["target"]["messageId"] == receipt.message_id.as_str())
+            .map(|row| {
+                (
+                    row["tool"].as_str().unwrap(),
+                    row["target"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states[..2],
+            [
+                ("agent_message_send", "accepted"),
+                ("agent_message_delivery", "delivered")
+            ],
+            "{rows:?}"
+        );
+        tools.shutdown().await;
+    }
+
+    /// Rows of a message being admitted wait behind its send's row; another message's do not,
+    /// and an admission that ends without a row (a dropped call) lets them through.
+    #[tokio::test]
+    async fn rows_of_a_message_being_admitted_wait_for_its_send() {
+        let activity = McpActivity::new(migrated().await);
+        let (sink, writer) = agent_message_writer(activity.clone());
+        let marker = |outcome: &str, id: &str| MessageOutcome {
+            outcome: outcome.to_owned(),
+            ..message_outcome("agent_message_send", "", "", Some(id))
+        };
+        sink(marker(crate::agent_messaging::ADMISSION_STARTED, "m1"));
+        sink(marker(crate::agent_messaging::ADMISSION_STARTED, "m2"));
+        for id in ["m1", "m2", "m3"] {
+            sink(message_outcome(
+                "agent_message_delivery",
+                "delivered",
+                "thread:b",
+                Some(id),
+            ));
+        }
+        sink(message_outcome(
+            "agent_message_send",
+            "accepted",
+            "thread:b",
+            Some("m1"),
+        ));
+        sink(marker(crate::agent_messaging::ADMISSION_ENDED, "m1"));
+        sink(marker(crate::agent_messaging::ADMISSION_ENDED, "m2"));
+        writer.close().await;
+
+        let rows = activity.recent().await.unwrap();
+        let order: Vec<(&str, &str)> = rows
+            .iter()
+            .rev()
+            .map(|row| {
+                (
+                    row["target"]["messageId"].as_str().unwrap(),
+                    row["target"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("m3", "delivered"),
+                ("m1", "accepted"),
+                ("m1", "delivered"),
+                ("m2", "delivered"),
+            ]
+        );
+    }
+
     async fn dispatch(tools: &crate::production::mcp_tools_tests::Harness, value: Value) {
         tools
             .engine
