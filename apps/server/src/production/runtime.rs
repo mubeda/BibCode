@@ -3823,13 +3823,11 @@ mod tests {
             .expect("messaging is attached")
             .clone();
         for _ in 0..20 {
-            messaging
-                .refused(
-                    "agent_message_send",
-                    "missing",
-                    crate::agent_messaging::AgentMessagingError::Disabled,
-                )
-                .await;
+            messaging.refused(
+                "agent_message_send",
+                "missing",
+                crate::agent_messaging::AgentMessagingError::Disabled,
+            );
         }
 
         let _ = runtime.quiesce_for_update().await;

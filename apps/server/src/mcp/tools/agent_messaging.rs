@@ -160,9 +160,7 @@ async fn reply(
     })();
     match request {
         Ok(request) => messaging.reply(&scope.thread_id, request).await,
-        Err(error) => Err(messaging
-            .refused("agent_message_reply", &scope.thread_id, error)
-            .await),
+        Err(error) => Err(messaging.refused("agent_message_reply", &scope.thread_id, error)),
     }
 }
 
@@ -272,9 +270,7 @@ async fn send(
     })();
     match request {
         Ok(request) => messaging.send(&scope.thread_id, request).await,
-        Err(error) => Err(messaging
-            .refused("agent_message_send", &scope.thread_id, error)
-            .await),
+        Err(error) => Err(messaging.refused("agent_message_send", &scope.thread_id, error)),
     }
 }
 

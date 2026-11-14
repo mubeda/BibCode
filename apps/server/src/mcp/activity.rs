@@ -724,8 +724,7 @@ pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, Agent
     ));
     let sink: OutcomeSink = Arc::new(move |outcome| {
         // A closed writer drops the row silently: the runtime is stopping.
-        if let Err(mpsc::error::TrySendError::Full(_)) =
-            sender.try_send(agent_message_row(outcome))
+        if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(agent_message_row(outcome))
         {
             dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -757,9 +756,16 @@ async fn write_agent_messages(
                 receiver.recv().await
             }
         };
-        let Some(row) = row else {
+        let Some(mut row) = row else {
             break;
         };
+        // A send or reply that resolved no titles names its caller by the caller's own thread.
+        if row.label.is_none()
+            && row.tool != "agent_message_delivery"
+            && let Some(thread_id) = row.thread_id.clone()
+        {
+            row.label = own_title(&activity.shared.database, thread_id).await;
+        }
         activity.record(row).await;
         let count = dropped.swap(0, Ordering::Relaxed);
         if count > 0 {
@@ -769,6 +775,24 @@ async fn write_agent_messages(
             );
         }
     }
+}
+
+/// The title of thread `thread_id`, unless it is deleted or unreadable.
+async fn own_title(database: &Database, thread_id: String) -> Option<String> {
+    use rusqlite::OptionalExtension as _;
+    database
+        .call(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT title FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The writer of agent message rows, which the runtime closes in its stop.

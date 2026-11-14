@@ -288,14 +288,13 @@ impl AgentMessaging {
             &request.to,
             attribution,
             result.as_ref(),
-        )
-        .await;
+        );
         result
     }
 
     /// Reports a send or reply the tool refused before calling [`Self::send`] or
     /// [`Self::reply`], with no argument of it, and returns the refusal.
-    pub(crate) async fn refused(
+    pub(crate) fn refused(
         &self,
         tool: &'static str,
         caller_thread_id: &str,
@@ -307,13 +306,12 @@ impl AgentMessaging {
             "",
             Attribution::default(),
             Err(&error),
-        )
-        .await;
+        );
         error
     }
 
     /// Tells the outcome sink, if any, what one send or reply call ended with.
-    async fn report(
+    fn report(
         &self,
         tool: &'static str,
         sender_thread_id: &str,
@@ -324,11 +322,13 @@ impl AgentMessaging {
         let Some(outcomes) = &self.outcomes else {
             return;
         };
-        let titles = match attribution.titles {
-            Some((sender, recipient)) => (Some(sender), Some(recipient)),
-            // The caller's own thread: its title tells it nothing about any other.
-            None => (self.own_title(sender_thread_id).await, None),
-        };
+        // Without titles the writer fills in the caller's own: it tells the caller nothing about
+        // any other thread, and the caller never waits on the database for it.
+        let titles = attribution
+            .titles
+            .map_or((None, None), |(sender, recipient)| {
+                (Some(sender), Some(recipient))
+            });
         let (outcome, receipt) = match result {
             Ok(receipt) => ("accepted".to_owned(), Some(receipt)),
             Err(error) => (error.tag().to_owned(), None),
@@ -345,18 +345,6 @@ impl AgentMessaging {
             sender_title: titles.0,
             recipient_title: titles.1,
         });
-    }
-
-    /// The title of the caller's own thread, unless it is deleted or unreadable.
-    async fn own_title(&self, thread_id: &str) -> Option<String> {
-        self.engine
-            .repositories()
-            .get_thread(thread_id.to_owned())
-            .await
-            .ok()
-            .flatten()
-            .filter(|thread| thread.deleted_at.is_none())
-            .map(|thread| thread.title)
     }
 
     /// Replies to `request.in_reply_to`, a message the agent of `sender_thread_id` received:
@@ -382,8 +370,7 @@ impl AgentMessaging {
             &recipient_address,
             attribution,
             result.as_ref(),
-        )
-        .await;
+        );
         result
     }
 
