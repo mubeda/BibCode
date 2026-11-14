@@ -666,6 +666,49 @@ pub(crate) fn has_open_ask(connection: &rusqlite::Connection, thread_id: &str) -
     )?)
 }
 
+const TERMINAL_RECIPIENT: &str = "substr(recipient_address, 1, 9) = 'terminal:'";
+
+/// The `queued` mail of every terminal, in acceptance order: a person's request always, an
+/// agent's message only while messaging is `enabled`.
+pub(crate) fn list_queued_terminal_mail(
+    connection: &rusqlite::Connection,
+    enabled: bool,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE {TERMINAL_RECIPIENT} AND status = 'queued' AND (sender_kind = 'person' OR ?1)
+          ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![enabled], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Marks each of `message_ids` `delivered`, only while it is still `queued`: a fetch, a cancel or
+/// a hold that came first keeps its status. Returns the rows it changed.
+pub(crate) fn deliver_queued(
+    connection: &rusqlite::Connection,
+    message_ids: &[String],
+    updated_at: &str,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "UPDATE agent_messages SET status = 'delivered', reason = NULL, updated_at = ?2
+          WHERE message_id = ?1 AND status = 'queued'
+          RETURNING {COLUMNS}"
+    ))?;
+    let mut delivered = Vec::new();
+    for message_id in message_ids {
+        if let Some(row) = statement
+            .query_row(params![message_id, updated_at], decode)
+            .optional()?
+        {
+            delivered.push(row);
+        }
+    }
+    Ok(delivered)
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentMessageStore {
     database: Database,

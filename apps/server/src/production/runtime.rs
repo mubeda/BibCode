@@ -125,6 +125,8 @@ pub struct ProductionRuntime {
     terminal_credentials: Arc<crate::agent_messaging::terminal_credential::TerminalCredentials>,
     /// Stops the task that revokes the credentials of ended terminal processes.
     terminal_credential_revoker: CancellationToken,
+    /// Stops the task that tells AI Terminals about their agent mail.
+    terminal_pointer: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -676,6 +678,10 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let terminal_pointer = crate::agent_messaging::pointer::TerminalPointer::new(
+            repositories.database().clone(),
+            Arc::new(terminal_manager.clone()),
+        );
         let shell_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
@@ -860,20 +866,20 @@ impl ProductionRuntime {
             mcp_activity,
         );
         mcp_control.attach_terminals(mcp_terminals);
-        mcp_control.attach_agent_messaging(
-            crate::agent_messaging::AgentMessaging::new(
-                orchestration.clone(),
-                control.agent_messaging_enabled_signal(),
-            )
-            .with_starter(crate::production::orchestration_rpc::server_turn_starter(
-                orchestration.clone(),
-                provider_runtime.clone(),
-                config.state_dir(),
-                turn_delivery.clone(),
-                Some(workspace_availability.clone()),
-                attachment_uploads.clone(),
-            )),
-        );
+        let agent_messaging = crate::agent_messaging::AgentMessaging::new(
+            orchestration.clone(),
+            control.agent_messaging_enabled_signal(),
+        )
+        .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            config.state_dir(),
+            turn_delivery.clone(),
+            Some(workspace_availability.clone()),
+            attachment_uploads.clone(),
+        ))
+        .with_terminals(terminal_pointer.clone());
+        mcp_control.attach_agent_messaging(agent_messaging.clone());
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
@@ -890,6 +896,8 @@ impl ProductionRuntime {
             control.agent_messaging_enabled_signal(),
             agent_message_tracker.clone(),
         );
+        let terminal_pointer_task = CancellationToken::new();
+        terminal_pointer.start(agent_messaging, terminal_pointer_task.clone());
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
@@ -899,6 +907,7 @@ impl ProductionRuntime {
             agent_message_tracker,
             terminal_credentials,
             terminal_credential_revoker,
+            terminal_pointer: terminal_pointer_task,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1101,6 +1110,9 @@ impl ProductionRuntime {
         steps.mark("agent-message-tracker");
         self.terminal_credential_revoker.cancel();
         steps.mark("terminal-credential-revoker");
+        // Before the profiler's teardown: a stopped pointer rescans its mail on the next start.
+        self.terminal_pointer.cancel();
+        steps.mark("terminal-pointer");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");

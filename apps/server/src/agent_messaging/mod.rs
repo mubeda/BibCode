@@ -5,6 +5,7 @@
 pub(crate) mod delivery;
 pub(crate) mod directory;
 pub(crate) mod envelope;
+pub(crate) mod pointer;
 pub(crate) mod policy;
 pub mod store;
 pub mod terminal_credential;
@@ -248,6 +249,7 @@ pub(crate) struct AgentMessaging {
     enabled: watch::Receiver<bool>,
     starter: Option<ServerTurnStarter>,
     outcomes: Option<OutcomeSink>,
+    terminals: Option<pointer::TerminalPointer>,
 }
 
 impl AgentMessaging {
@@ -257,6 +259,7 @@ impl AgentMessaging {
             enabled,
             starter: None,
             outcomes: None,
+            terminals: None,
         }
     }
 
@@ -449,6 +452,13 @@ impl AgentMessaging {
     ) -> Result<Accepted, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
+        }
+        if let Some((owner_thread_id, terminal_id)) =
+            terminal_credential::parse_terminal_address(&request.to)
+        {
+            return self
+                .send_to_terminal(sender_thread_id, request, &owner_thread_id, &terminal_id)
+                .await;
         }
         let recipient_thread_id = request
             .to
@@ -871,5 +881,172 @@ impl AgentMessaging {
                 AgentMessagingError::Storage
             })?;
         agents.ok_or(AgentMessagingError::UnknownRecipient)
+    }
+}
+
+/// Who an address is, for an envelope or the activity log: a thread's title and provider, or a
+/// terminal's label and launch driver kind. Empty when unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SenderDescription {
+    pub(crate) title: String,
+    pub(crate) provider: String,
+}
+
+/// AI Terminal recipients (task 8.4).
+impl AgentMessaging {
+    pub(crate) fn with_terminals(mut self, terminals: pointer::TerminalPointer) -> Self {
+        self.terminals = Some(terminals);
+        self
+    }
+
+    pub(crate) async fn sender_description(&self, address: &str) -> SenderDescription {
+        if let Some(thread_id) = address.strip_prefix("thread:") {
+            let repositories = self.engine.repositories();
+            let Ok(Some(thread)) = repositories.get_thread(thread_id.to_owned()).await else {
+                return SenderDescription::default();
+            };
+            let session = repositories
+                .get_thread_session(thread_id.to_owned())
+                .await
+                .ok()
+                .flatten();
+            let provider = session
+                .and_then(|session| session.provider_name)
+                .or_else(|| {
+                    thread
+                        .model_selection
+                        .get("instanceId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            return SenderDescription {
+                title: thread.title,
+                provider,
+            };
+        }
+        match terminal_credential::parse_terminal_address(address) {
+            Some((thread_id, terminal_id)) => self
+                .terminal_summary(&thread_id, &terminal_id)
+                .await
+                .map(|summary| SenderDescription {
+                    provider: summary
+                        .command
+                        .and_then(|command| command.activity)
+                        .map(|activity| activity.driver_kind)
+                        .unwrap_or_default(),
+                    title: summary.label,
+                })
+                .unwrap_or_default(),
+            None => SenderDescription::default(),
+        }
+    }
+
+    async fn terminal_summary(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::terminal::TerminalSummary> {
+        self.terminals
+            .as_ref()?
+            .terminals()
+            .thread_sessions(thread_id)
+            .await
+            .into_iter()
+            .find(|summary| summary.terminal_id == terminal_id)
+    }
+
+    /// Stores a message for the AI Terminal `terminal_id` of `owner_thread_id`, which must be a
+    /// live thread of the sender's project; a plain shell, a terminal that is not running and
+    /// any other terminal read as an unknown address.
+    async fn send_to_terminal(
+        &self,
+        sender_thread_id: &str,
+        request: &SendRequest,
+        owner_thread_id: &str,
+        terminal_id: &str,
+    ) -> Result<Accepted, AgentMessagingError> {
+        check_text(&request.text)?;
+        let message_id = Uuid::new_v4().to_string();
+        let conversation_id = Uuid::new_v4().to_string();
+        let outgoing = Outgoing {
+            message_id: &message_id,
+            conversation_id: &conversation_id,
+            in_reply_to: None,
+            hop: 1,
+            text: &request.text,
+            client_request_id: request.client_request_id.as_deref(),
+        };
+        let sender_address = format!("thread:{sender_thread_id}");
+        // A stored receipt answers a retry even after its recipient is gone (R12).
+        if let Some(receipt) = self.replay(&sender_address, &request.to, &outgoing).await? {
+            return Ok((receipt, None));
+        }
+        let pointer = self
+            .terminals
+            .as_ref()
+            .ok_or(AgentMessagingError::UnknownRecipient)?;
+        let route = self.route(sender_thread_id, owner_thread_id).await?;
+        let summary = self
+            .terminal_summary(owner_thread_id, terminal_id)
+            .await
+            .filter(|summary| {
+                summary.agent_status.is_some()
+                    && summary.status == crate::terminal::TerminalStatus::Running
+            })
+            .ok_or(AgentMessagingError::UnknownRecipient)?;
+        let generation = pointer
+            .terminals()
+            .live_generation(owner_thread_id, terminal_id)
+            .await
+            .ok_or(AgentMessagingError::UnknownRecipient)?;
+        let hop = self.next_hop(sender_thread_id).await?;
+        let recipient = terminal_credential::TerminalIdentity {
+            // Routing reads only the address and the generation.
+            environment_id: String::new(),
+            thread_id: owner_thread_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            generation,
+        };
+        let new = NewAgentMessage {
+            message_id: message_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sender_address: sender_address.clone(),
+            sender_kind: SenderKind::Agent,
+            recipient_address: recipient.address(),
+            in_reply_to: None,
+            hop,
+            text: request.text.clone(),
+            status: AgentMessageStatus::Queued,
+            reason: None,
+            accepted_at: crate::mcp::control::now_iso(),
+            sender_runtime_mode: Some(route.sender.runtime_mode.clone()),
+            recipient_terminal_generation: None,
+            send_request_id: None,
+            client_request_id: request.client_request_id.clone(),
+            delivery_command_id: None,
+            delivery_message_id: None,
+        };
+        if let Err(error) = pointer.accept(self, new, &recipient).await {
+            // Another call with the same id won the unique index first: answer from its row.
+            return match self.replay(&sender_address, &request.to, &outgoing).await? {
+                Some(receipt) => Ok((receipt, None)),
+                None => Err(error),
+            };
+        }
+        let status = if self.is_enabled() {
+            AgentMessageStatus::Queued
+        } else {
+            AgentMessageStatus::Held
+        };
+        Ok((
+            MessageReceipt {
+                message_id,
+                conversation_id,
+                status,
+                hop,
+            },
+            Some((route.sender.title, summary.label)),
+        ))
     }
 }

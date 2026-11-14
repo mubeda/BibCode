@@ -413,6 +413,9 @@ async fn reconcile(
                     &now,
                 )?;
             }
+            if let Some(enabled) = messaging {
+                follow_setting_for_terminals(connection, enabled, &now)?;
+            }
             hold_above_ceiling(connection, recipient, &now)?;
             let open = match recipient {
                 Some(address) => list_open_for_thread(connection, address)?,
@@ -428,6 +431,30 @@ async fn reconcile(
         release_held(engine, recipient).await?;
     }
     Ok(changes.len())
+}
+
+/// Holds every terminal's `queued` and unfetched `delivered` agent message with `messaging_off`
+/// while messaging is off, and puts each back to `queued` when it is on (the pointer then
+/// announces it). A status change only: a terminal row has no queue entry. A person's request
+/// is never held.
+pub(crate) fn follow_setting_for_terminals(
+    connection: &rusqlite::Connection,
+    enabled: bool,
+    updated_at: &str,
+) -> Result<usize> {
+    let statement = if enabled {
+        "UPDATE agent_messages SET status = 'queued', reason = NULL, updated_at = ?1
+          WHERE status = 'held' AND reason = 'messaging_off'"
+    } else {
+        "UPDATE agent_messages SET status = 'held', reason = 'messaging_off', updated_at = ?1
+          WHERE status IN ('queued', 'delivered')"
+    };
+    Ok(connection.execute(
+        &format!(
+            "{statement} AND sender_kind = 'agent' AND substr(recipient_address, 1, 9) = 'terminal:'"
+        ),
+        params![updated_at],
+    )?)
 }
 
 /// Requeues each held message of `recipient` (every one when `None`) whose hold no longer

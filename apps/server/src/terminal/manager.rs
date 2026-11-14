@@ -280,6 +280,16 @@ pub enum TerminalError {
     WorktreeRemovalInProgress { thread_id: String },
 }
 
+/// What [`TerminalManager::write_when_ready`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteWhenReady {
+    Written,
+    /// The agent is not waiting for a prompt, or a person typed since it was.
+    NotReady,
+    /// Another process holds the terminal now, or none does.
+    GenerationChanged,
+}
+
 struct SizeOwner {
     claim: String,
     attachment: uuid::Uuid,
@@ -326,6 +336,8 @@ struct Session {
     /// goes to the one used last when its owner leaves several viewers (#348).
     user_input_order: HashMap<String, u64>,
     user_input_clock: u64,
+    /// When a person last typed: [`TerminalManager::write_when_ready`] never types over it.
+    last_person_input: Option<std::time::Instant>,
     /// Set while the size is un-owned because its owner left several viewers and none was used
     /// since: the hand-over waits for use, so an attach does not take the size, and only this
     /// viewer answers the terminal's queries meanwhile (#348).
@@ -1865,6 +1877,7 @@ impl Session {
         self.owner_unused_since_handoff = false;
         if let TerminalInputOrigin::User(claim) = origin {
             self.user_input_clock += 1;
+            self.last_person_input = Some(std::time::Instant::now());
             // Departed claims are pruned at each release; past the bound, the window typed in
             // longest ago is forgotten rather than this one.
             if let Some(order) = self.user_input_order.get_mut(claim) {
@@ -2815,6 +2828,7 @@ impl TerminalManager {
             owner_unused_since_handoff: false,
             user_input_order: HashMap::new(),
             user_input_clock: 0,
+            last_person_input: None,
             handover_replier: None,
             refused_size: None,
             first_attachment_grant_used: false,
@@ -4542,6 +4556,77 @@ impl TerminalManager {
             status: session.status,
             exit_code: session.exit_code,
         })
+    }
+
+    /// How many times a person typed into the terminal's current process; the server's own
+    /// writes and unmarked ones (the MCP `terminal_write` tool) never count.
+    pub async fn person_input_count(&self, thread_id: &str, terminal_id: &str) -> Option<u64> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        Some(session.lock().await.user_input_clock)
+    }
+
+    /// Types `data` as the terminal's own input, only while `generation` runs, its agent's
+    /// latest observation is done and ready for a prompt, and no person typed since that
+    /// observation; then ends the ready period, so one write goes per period.
+    pub async fn write_when_ready(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        generation: &TerminalGeneration,
+        data: &str,
+    ) -> Result<WriteWhenReady, TerminalError> {
+        let session = self.require_session(thread_id, terminal_id).await?;
+        let current = session.lock().await.generation.clone();
+        if current.id != *generation {
+            return Ok(WriteWhenReady::GenerationChanged);
+        }
+        let mut pending = {
+            let _publication = current.publication.lock().await;
+            if current.is_invalidated() || current.is_closing() {
+                return Ok(WriteWhenReady::GenerationChanged);
+            }
+            let mut session = session.lock().await;
+            if !Arc::ptr_eq(&session.generation, &current)
+                || session.status != TerminalStatus::Running
+            {
+                return Ok(WriteWhenReady::GenerationChanged);
+            }
+            let Some(process) = session.process.clone() else {
+                return Ok(WriteWhenReady::GenerationChanged);
+            };
+            // Read from the observer itself, not the mirrored summary, with no await before the
+            // write is queued.
+            let lease = current.observation.observation();
+            let observation = *lease.subscribe_agent_status().borrow();
+            let ready = session.agent_status.is_some()
+                && observation.is_some_and(|observation| {
+                    observation.ready_for_prompt
+                        && observation.state == TerminalAgentState::Done
+                        && !observation.failed
+                        && session
+                            .last_person_input
+                            .is_none_or(|typed| typed < observation.observed_at)
+                });
+            if !ready {
+                return Ok(WriteWhenReady::NotReady);
+            }
+            session.note_input(TerminalInputOrigin::Automatic);
+            drop(session);
+            let pending = current.writer.enqueue(&process, data, false)?;
+            lease.clear_ready_for_prompt();
+            current
+                .activity_wake
+                .store(true, std::sync::atomic::Ordering::Release);
+            pending
+        };
+        pending.wait().await?;
+        Ok(WriteWhenReady::Written)
     }
 
     /// Terminal sessions whose process is starting or running.
@@ -11444,6 +11529,261 @@ mod tests {
         })
         .await;
         assert!(!exited.ready_for_prompt, "an exited agent is not ready");
+        manager.shutdown().await;
+    }
+
+    /// A manager whose AI Terminals hand their observer lease to the test.
+    fn write_when_ready_manager(backend: Arc<HistoryTestBackend>) -> (TerminalManager, LeaseSlot) {
+        let slot = LeaseSlot::default();
+        let manager = TerminalManager::new(
+            backend,
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer: Some(Arc::new(LeaseCapturingPreparer(slot.clone()))),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        (manager, slot)
+    }
+
+    /// The lease of the generation spawned after `previous` (any one when `None`).
+    async fn next_lease(
+        slot: &LeaseSlot,
+        previous: Option<&TerminalObserverGenerationLease>,
+    ) -> TerminalObserverGenerationLease {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = slot.lock().unwrap().clone()
+                    && previous.is_none_or(|previous| previous.id() != lease.id())
+                {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer receives its generation")
+    }
+
+    fn mark_ready(lease: &TerminalObserverGenerationLease) {
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_writes_once_per_ready_period_of_the_running_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        assert_eq!(backend.latest().writes(), ["pointer"]);
+        assert!(
+            !lease
+                .subscribe_agent_status()
+                .borrow()
+                .unwrap()
+                .ready_for_prompt,
+            "the write ends the ready period"
+        );
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        assert_eq!(backend.latest().writes(), ["pointer"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_a_busy_blocked_waiting_or_unobserved_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        let write = || manager.write_when_ready("thread-a", "term-1", &generation, "pointer");
+        assert_eq!(
+            write().await.unwrap(),
+            WriteWhenReady::NotReady,
+            "never observed"
+        );
+        for state in [
+            TerminalAgentState::Working,
+            TerminalAgentState::Blocked,
+            TerminalAgentState::Waiting,
+        ] {
+            lease.publish_agent_status(state, false);
+            lease.mark_ready_for_prompt();
+            assert_eq!(
+                write().await.unwrap(),
+                WriteWhenReady::NotReady,
+                "{state:?}"
+            );
+        }
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        assert_eq!(
+            write().await.unwrap(),
+            WriteWhenReady::NotReady,
+            "done without fresh prompt evidence"
+        );
+        // A plain shell never reads ready.
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-a",
+                "shell",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let shell = manager.live_generation("thread-a", "shell").await.unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "shell", &shell, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        for process in backend.processes.lock().unwrap().iter() {
+            assert!(process.writes().is_empty(), "nothing was typed");
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_the_old_generation_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let first = next_lease(&slot, None).await;
+        let old = manager.live_generation("thread-a", "term-1").await.unwrap();
+        manager
+            .restart(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, Some(&first)).await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &old, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::GenerationChanged
+        );
+        assert!(backend.latest().writes().is_empty());
+        let new = manager.live_generation("thread-a", "term-1").await.unwrap();
+        assert_ne!(new, old);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &new, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_is_automatic_and_only_a_persons_input_is_counted() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        let count = || manager.person_input_count("thread-a", "term-1");
+        assert_eq!(count().await, Some(0));
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        assert_eq!(count().await, Some(0), "the pointer is not a person typing");
+        manager.write("thread-a", "term-1", "mcp").await.unwrap();
+        assert_eq!(count().await, Some(0), "an unmarked write is not a person");
+        manager
+            .write_from(
+                "thread-a",
+                "term-1",
+                "x",
+                TerminalInputOrigin::User("window"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count().await, Some(1));
+        assert_eq!(manager.person_input_count("thread-a", "none").await, None);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_once_a_person_typed_after_the_ready_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        manager
+            .write_from(
+                "thread-a",
+                "term-1",
+                "half a prompt",
+                TerminalInputOrigin::User("window"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        assert_eq!(backend.latest().writes(), ["half a prompt"]);
+        // The next turn's end is fresh evidence after the typing.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
         manager.shutdown().await;
     }
 
