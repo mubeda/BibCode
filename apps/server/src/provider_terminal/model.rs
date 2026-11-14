@@ -741,6 +741,9 @@ pub enum PromptEvidence {
 pub struct PromptReadiness {
     /// The latest root event read says the CLI waits for a prompt, and it was read fresh.
     idle: bool,
+    /// A wait made the terminal ready from that event. A consumer that clears it (the pointer
+    /// typing its line) has taken it, and only a new root event hands readiness out again.
+    handed_out: bool,
 }
 
 impl PromptReadiness {
@@ -755,40 +758,45 @@ impl PromptReadiness {
     ) {
         generation.report_agent_status(report);
         self.idle = ready && evidence == PromptEvidence::Fresh;
+        self.handed_out = false;
     }
 
     /// Withdraws readiness before awaited work that is not the wait on the live stream; what the
-    /// observer read still decides the next wait.
-    pub fn suspend(&self, generation: &TerminalObserverGenerationLease) {
-        generation.clear_ready_for_prompt();
+    /// observer read still decides the next wait, unless a consumer already took it.
+    pub fn suspend(&mut self, generation: &TerminalObserverGenerationLease) {
+        if generation.clear_ready_for_prompt() {
+            self.handed_out = false;
+        }
     }
 
     /// Withdraws readiness at a transition (an attach, a replaced or lost stream, a snapshot,
     /// dropped events) and forgets what was read before it.
     pub fn reset(&mut self, generation: &TerminalObserverGenerationLease) {
         self.idle = false;
+        self.handed_out = false;
         generation.clear_ready_for_prompt();
     }
 
     /// Awaits the next read on the live stream. Only once that read is pending, so nothing is
     /// immediately readable, does it make the terminal ready, and only if the latest root event
-    /// read says the CLI waits.
+    /// read says the CLI waits and no consumer took that readiness yet.
     pub async fn wait<T>(
-        &self,
+        &mut self,
         generation: &TerminalObserverGenerationLease,
         next: impl Future<Output = T>,
     ) -> T {
         let mut next = std::pin::pin!(next);
-        let mut published = false;
         std::future::poll_fn(|context| {
             let polled = next.as_mut().poll(context);
             // A read refused for the task's exhausted budget is not an empty stream; Tokio wakes
             // the task at once, and the next poll decides.
-            if polled.is_pending() && !published && tokio::task::coop::has_budget_remaining() {
-                published = true;
-                if self.idle {
-                    generation.mark_ready_for_prompt();
-                }
+            if polled.is_pending()
+                && self.idle
+                && !self.handed_out
+                && tokio::task::coop::has_budget_remaining()
+            {
+                self.handed_out = true;
+                generation.mark_ready_for_prompt();
             }
             polled
         })

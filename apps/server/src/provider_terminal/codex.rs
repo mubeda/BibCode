@@ -1865,7 +1865,7 @@ async fn run_codex_observer_inner(
             }
             (envelope, evidence) = next_codex_envelope(
                 generation,
-                &readiness,
+                &mut readiness,
                 &mut stale,
                 &mut reconciled,
                 &mut *client,
@@ -2135,7 +2135,7 @@ fn withdraw_if_codex_notifications_lost(
 /// connection itself is a wait, where the terminal may become ready (R-6).
 async fn next_codex_envelope(
     generation: &TerminalObserverGenerationLease,
-    readiness: &PromptReadiness,
+    readiness: &mut PromptReadiness,
     stale: &mut VecDeque<Value>,
     reconciled: &mut VecDeque<Value>,
     client: &mut dyn CodexRemoteClient,
