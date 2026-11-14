@@ -109,6 +109,24 @@ pub(crate) fn remote_access_store_probe_args() -> Vec<String> {
     ]
 }
 
+/// Reads the stored form of the rule. Its fields are fixed tokens (`Active=TRUE`), unlike
+/// the localized netsh listing, and standard users can read the key.
+#[must_use]
+#[cfg_attr(
+    all(not(windows), not(test)),
+    expect(dead_code, reason = "Windows-only firewall command")
+)]
+pub(crate) fn remote_access_rule_store_args() -> Vec<String> {
+    vec![
+        "query".to_owned(),
+        r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules"
+            .to_owned(),
+        "/f".to_owned(),
+        format!("Name={REMOTE_ACCESS_RULE_NAME}|"),
+        "/d".to_owned(),
+    ]
+}
+
 /// The reason token narrowing reports when Windows refused to delete the rule for lack of
 /// administrator permission. Recovery tolerates it: the listener is verified loopback-only
 /// on its own, and the rule is scoped to this program.
@@ -171,6 +189,7 @@ const ELEVATED_INTEGRITY_SIDS: [&str; 2] = ["S-1-16-12288", "S-1-16-16384"];
 enum FirewallProgram {
     Netsh,
     Whoami,
+    Reg,
 }
 
 #[cfg(any(windows, test))]
@@ -179,6 +198,7 @@ impl FirewallProgram {
         match self {
             Self::Netsh => "netsh",
             Self::Whoami => "whoami",
+            Self::Reg => "reg",
         }
     }
 }
@@ -713,6 +733,42 @@ where
     })
 }
 
+/// Whether a stored rule lets `program` receive connections: enabled, allowing, inbound and
+/// for this path. A rule that was disabled or turned into a block still names the program
+/// in the listing. When the store cannot be read the listing's word is taken, as before.
+#[cfg(any(windows, test))]
+async fn stored_rule_admits<Runner>(runner: &Runner, program: &str) -> bool
+where
+    Runner: FirewallCommandRunner,
+{
+    let stored = match runner
+        .run(FirewallProgram::Reg, remote_access_rule_store_args())
+        .await
+    {
+        Ok(output) if output.success => output.stdout.to_lowercase(),
+        _ => {
+            tracing::warn!(
+                class = "firewall-store-unreadable",
+                "firewall rule store not read"
+            );
+            return true;
+        }
+    };
+    let name = format!("|name={}|", REMOTE_ACCESS_RULE_NAME.to_lowercase());
+    let app = format!("|app={}|", program.to_lowercase());
+    stored.lines().any(|line| {
+        [
+            name.as_str(),
+            app.as_str(),
+            "|action=allow|",
+            "|active=true|",
+            "|dir=in|",
+        ]
+        .iter()
+        .all(|field| line.contains(field))
+    })
+}
+
 /// True only on positive evidence that this process runs without elevation, so an elevated
 /// desktop whose change failed is never sent round a Retry that cannot help.
 #[cfg(any(windows, test))]
@@ -769,14 +825,21 @@ where
     } else {
         None
     };
-    match read_remote_access_rule(runner, program.as_deref()).await? {
-        // A rule for this program already admits it; keep it rather than ask again.
+    let listing = read_remote_access_rule(runner, program.as_deref()).await?;
+    // A rule that already admits this program is kept rather than asked for again.
+    if let (
         RuleListing::Present {
             for_program,
             observed,
-        } if enabled && (for_program || own_rule == Some(observed)) => {
-            return Ok(Some(observed));
-        }
+        },
+        Some(program),
+    ) = (listing, &program)
+        && (own_rule == Some(observed)
+            || (for_program && stored_rule_admits(runner, program).await))
+    {
+        return Ok(Some(observed));
+    }
+    match listing {
         RuleListing::Absent => {}
         RuleListing::Present { .. } => {
             // A spawn failure or timeout is an Err here and stays a failed safeguard.
@@ -1056,6 +1119,19 @@ mod tests {
             stderr: String::new(),
         }
     }
+
+    /// A stored rule as `reg query` printed it in the Windows 11 lab.
+    fn stored(fields: &str, program: &str) -> FirewallCommandOutput {
+        FirewallCommandOutput {
+            success: true,
+            stdout: format!(
+                "    {{250E3705-6B03-4619-9C93-2C5D06C5115A}}    REG_SZ    v2.33|{fields}|Profile=Domain|Profile=Private|App={program}|Name=BiBCode Remote Access|\r\n"
+            ),
+            stderr: String::new(),
+        }
+    }
+
+    const ADMITTING: &str = "Action=Allow|Active=TRUE|Dir=In";
 
     fn success() -> FirewallCommandOutput {
         FirewallCommandOutput {
@@ -1618,14 +1694,63 @@ mod tests {
 
     #[tokio::test]
     async fn an_existing_rule_for_this_program_is_kept_without_any_change() {
-        let runner =
-            FakeFirewallCommandRunner::with_results(vec![Ok(listed(&PROGRAM.to_uppercase()))]);
+        // An unreadable store leaves the listing's word standing.
+        for store in [
+            Ok(stored(ADMITTING, PROGRAM)),
+            Err("reg missing".to_owned()),
+        ] {
+            let runner = FakeFirewallCommandRunner::with_results(vec![
+                Ok(listed(&PROGRAM.to_uppercase())),
+                store,
+            ]);
 
-        sync_remote_access_rule_with_runner(true, &runner, resolve_program)
+            sync_remote_access_rule_with_runner(true, &runner, resolve_program)
+                .await
+                .expect("the program's rule already admits it");
+
+            assert_eq!(
+                runner.calls()[1],
+                ("reg".to_owned(), remote_access_rule_store_args())
+            );
+            assert_eq!(runner.calls().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_admit_this_program_is_replaced() {
+        for fields in [
+            "Action=Allow|Active=FALSE|Dir=In",
+            "Action=Block|Active=TRUE|Dir=In",
+            "Action=Allow|Active=TRUE|Dir=Out",
+        ] {
+            let runner = FakeFirewallCommandRunner::with_results(vec![
+                Ok(listed(PROGRAM)),
+                Ok(stored(fields, PROGRAM)),
+                Ok(success()),
+                Ok(absent()),
+                Ok(success()),
+            ]);
+
+            sync_remote_access_rule_with_runner(true, &runner, resolve_program)
+                .await
+                .expect("the rule is replaced");
+
+            let calls = runner.calls();
+            assert_eq!(calls[2].1, remote_access_rule_delete_args(), "{fields}");
+            assert_eq!(calls[4].1, remote_access_rule_add_args(PROGRAM), "{fields}");
+        }
+        // Another program's enabled rule under this name does not admit this one.
+        let other = FakeFirewallCommandRunner::with_results(vec![
+            Ok(listed(PROGRAM)),
+            Ok(stored(ADMITTING, r"C:\Old\bibcode-desktop.exe")),
+            Ok(success()),
+            Ok(absent()),
+            Ok(success()),
+        ]);
+        sync_remote_access_rule_with_runner(true, &other, resolve_program)
             .await
-            .expect("the program's rule already admits it");
-
-        assert_eq!(runner.calls().len(), 1);
+            .expect("the rule is replaced");
+        assert_eq!(other.calls().len(), 5);
     }
 
     fn narrowing() -> Result<String, String> {
@@ -2146,7 +2271,11 @@ mod tests {
     fn every_spawned_program_is_absolute_and_under_the_api_system_directory() {
         let system = system_directory().expect("GetSystemDirectoryW");
         assert!(system.is_absolute());
-        for program in [FirewallProgram::Netsh, FirewallProgram::Whoami] {
+        for program in [
+            FirewallProgram::Netsh,
+            FirewallProgram::Whoami,
+            FirewallProgram::Reg,
+        ] {
             let path = system_program_path(&system, program);
             assert!(path.is_absolute());
             assert_eq!(path.parent(), Some(system.as_path()));

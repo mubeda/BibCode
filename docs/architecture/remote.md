@@ -933,7 +933,13 @@ administrator rights. After a refused add or delete, the worker runs
 Low or Medium integrity with no High or System label means the refusal was for
 missing elevation. An elevated desktop whose change fails gets the plain step
 failure, so Retry never loops. When the rule is already present for the same
-executable path, enabling keeps it without any write. Only a widen the person
+executable path, enabling keeps it without any write, but only after
+`reg.exe query` on the firewall policy's rule store shows that rule enabled,
+allowing, inbound and for this path. Those stored fields are fixed tokens
+(`Active=TRUE`), unlike the localized `netsh` listing, and a standard user can
+read them. A rule that was disabled or turned into a block is replaced like a
+rule for another path. When the store cannot be read, the listing's word is
+taken and a `warn` is logged. Only a widen the person
 starts with **Generate pairing offer**, **Retry** or **Resume legacy remote
 access** in Share this host passes `allowElevationPrompt` through the desktop
 bridge, which only the app's own `main` webview can invoke. That firewall step
@@ -953,7 +959,7 @@ the Windows command-line rules: an argument with a space is wrapped in double
 quotes with the backslashes before the closing quote doubled, and a double
 quote or NUL, which a Windows path cannot contain, is refused. No value from the
 web or the network reaches the elevated command line. Every program this step
-starts, including the unelevated `netsh` and `whoami` runs, comes from that
+starts, including the unelevated `netsh`, `whoami` and `reg` runs, comes from that
 system directory, never from `PATH` or an environment variable. The person has
 120 seconds to answer, separate from the five-second budget that still covers
 every non-interactive command; the elevated `netsh` exit is reported to the

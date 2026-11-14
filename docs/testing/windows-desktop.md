@@ -728,7 +728,8 @@ minimum-size, and relevant Windows DPI states. Verify:
   `server_exposure.rs` (`cargo test -p bibcode-desktop -- firewall
   server_exposure`): the recorded elevation refusal and a translated variant are
   classified by the `whoami /groups` integrity SID, an elevated desktop gets the
-  plain failure, one approved prompt adds the rule (two replace a rule for
+  plain failure, a present rule is kept only when the rule store shows it
+  enabled, allowing and inbound for this path, one approved prompt adds the rule (two replace a rule for
   another path), a declined or timed-out prompt is one refusal that changes
   nothing, a prompt does not hold other exposure changes, a second widen cannot
   open a second prompt, the netsh arguments follow the Windows command-line
