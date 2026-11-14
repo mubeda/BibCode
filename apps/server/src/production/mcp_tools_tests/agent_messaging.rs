@@ -3825,6 +3825,36 @@ mod hop_limit {
         harness.shutdown().await;
     }
 
+    /// Review P2: the turn marker of a message withdrawn while messaging was off, and requeued
+    /// under a new thread message, is not a person's turn.
+    #[tokio::test]
+    async fn a_withdrawn_agent_message_does_not_reset_the_chain() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let trigger = harness.hop_8_delivered_to_a().await;
+        harness.provider_turn("a", "turn-a2", "Port", true).await;
+        harness.until_status(&trigger, "completed").await;
+        harness.stop_delivery().await;
+        let withdrawn = harness.sent("b", "thread:a").await;
+        let first_entry = harness.entry_of(&withdrawn).await;
+        assert_eq!(harness.entry_state(&first_entry).await, "pending");
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&withdrawn, AgentMessageReason::MessagingOff)
+            .await;
+        harness.until_entry(&first_entry, "dismissed").await;
+        harness.provider_asks("a", "approval", "r1").await;
+        harness.messaging_enabled.send_replace(true);
+        harness.until_status(&withdrawn, "queued").await;
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.shutdown().await;
+    }
+
     /// Review P2: the hop-8 message was handed to A's provider, which has not reported the
     /// turn running yet.
     #[tokio::test]
@@ -4419,6 +4449,31 @@ mod recovery {
 
         harness.until_entry(&entry, "delivered").await;
         harness.until_status(&m1, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_into_a_paused_queue_stays_held() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.session_ends("b", "error").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientQueueHeld)
+            .await;
+        let entry = harness.entry_of(&m1).await;
+        assert_eq!(entry, format!("agent-message:{m1}:1"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(harness.entry_state(&entry).await, "queued", "not started");
+        assert!(harness.entry_held(&entry).await);
         harness.shutdown().await;
     }
 
