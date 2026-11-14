@@ -87,7 +87,30 @@ export interface CreatePromptedChatPanelInput extends CreateChatPanelInput {
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
   readonly codeReview: boolean;
+  /**
+   * Sends the panel's first message in place of the default `startTurn`, so a caller that tracks
+   * the send (a person's Review) owns its outcome: a failure neither toasts nor writes the prompt
+   * into the panel's composer, because the caller keeps its preview.
+   */
+  readonly sendFirstMessage?: (
+    panelThreadId: ThreadId,
+  ) => Promise<{ messageId: string | null; outcome: "sent" | "failed" | "unknown" }>;
 }
+
+/** What a prompted panel came to: `threadId` null when none opened, `sent` "not-sent" before a send. */
+export interface PromptedPanelResult {
+  readonly threadId: ThreadId | null;
+  readonly created: boolean;
+  readonly messageId: string | null;
+  readonly sent: "sent" | "failed" | "unknown" | "not-sent";
+}
+
+const NO_PANEL: PromptedPanelResult = {
+  threadId: null,
+  created: false,
+  messageId: null,
+  sent: "not-sent",
+};
 
 export const CODE_REVIEW_SEND_FAILED_TITLE = "Couldn't start the review";
 export const CODE_REVIEW_SEND_FAILED_DESCRIPTION = "The review prompt is in its composer.";
@@ -195,10 +218,11 @@ export interface CenterPanelActions extends PanelThreadOpener {
   createSideChat: (input: CreateSideChatInput) => Promise<ThreadId | null>;
   /**
    * Opens a chat panel of `hostRef` with the given modes and sends `prompt` there. Resolves the
-   * panel's thread, or `null` when none opened (one is already being created for this host, or
-   * the creation failed and was shown).
+   * panel's thread (`threadId` null when none opened: one is already being created for this host,
+   * or the creation failed and was shown), whether this call created it, and the first message's
+   * id and outcome.
    */
-  createPromptedChatPanel: (input: CreatePromptedChatPanelInput) => Promise<ThreadId | null>;
+  createPromptedChatPanel: (input: CreatePromptedChatPanelInput) => Promise<PromptedPanelResult>;
   /**
    * Continues a terminal session in a chat panel of `hostRef`, which becomes the active tab when
    * the panel is `hostRef`'s. Resolves where the session landed, or `null` once a failure was
@@ -455,7 +479,7 @@ export function useCenterPanelActions({
 
   /**
    * Sends a new panel's first message. A refused send puts the text in the panel's composer
-   * and shows `failure`; resolves false only when the outcome is unknown.
+   * and shows `failure`; the outcome is "unknown" when the send was interrupted.
    */
   const sendFirstPanelMessage = useCallback(
     async (
@@ -464,8 +488,9 @@ export function useCenterPanelActions({
       text: string,
       kind: PanelThreadKind,
       failure: { readonly title: string; readonly description: string },
-    ): Promise<boolean> => {
+    ): Promise<{ messageId: string; outcome: "sent" | "failed" | "unknown" }> => {
       const panelRef = scopeThreadRef(input.hostRef.environmentId, panelThreadId);
+      const messageId = newMessageId();
       // The panel's own draft is never written on success: what the user types or attaches
       // there meanwhile stays.
       markChatPanelSent(panelRef);
@@ -473,13 +498,15 @@ export function useCenterPanelActions({
         environmentId: input.hostRef.environmentId,
         input: {
           threadId: panelThreadId,
-          message: { messageId: newMessageId(), role: "user", text, attachments: [] },
+          message: { messageId, role: "user", text, attachments: [] },
           modelSelection: input.modelSelection,
           runtimeMode: kind.runtimeMode,
           interactionMode: kind.interactionMode,
         },
       });
-      if (result._tag === "Failure" && isAtomCommandInterrupted(result)) return false;
+      if (result._tag === "Failure" && isAtomCommandInterrupted(result)) {
+        return { messageId, outcome: "unknown" };
+      }
       if (result._tag === "Failure") {
         const drafts = useComposerDraftStore.getState();
         const current = drafts.getComposerDraft(panelRef)?.prompt ?? "";
@@ -488,8 +515,9 @@ export function useCenterPanelActions({
           current === text ? current : [current, text].filter(Boolean).join("\n\n"),
         );
         toastManager.add(stackedThreadToast({ type: "error", ...failure }));
+        return { messageId, outcome: "failed" };
       }
-      return true;
+      return { messageId, outcome: "sent" };
     },
     [startTurn],
   );
@@ -507,7 +535,7 @@ export function useCenterPanelActions({
       // Not created, or closed meanwhile: nothing is sent and the host draft keeps the text.
       if (!panel?.created) return panel?.threadId ?? null;
       if (question.length > 0) {
-        const settled = await sendFirstPanelMessage(
+        const first = await sendFirstPanelMessage(
           input,
           panel.threadId,
           question,
@@ -515,7 +543,7 @@ export function useCenterPanelActions({
           { title: SIDE_CHAT_SEND_FAILED_TITLE, description: SIDE_CHAT_SEND_FAILED_DESCRIPTION },
         );
         // The send may have landed: the `:btw` text stays in the host draft, nothing is lost.
-        if (!settled) return panel.threadId;
+        if (first.outcome === "unknown") return panel.threadId;
       }
       if (submittedText !== undefined) clearSubmittedHostDraft(hostRef, submittedText);
       return panel.threadId;
@@ -524,7 +552,7 @@ export function useCenterPanelActions({
   );
 
   const openPromptedChatPanel = useCallback(
-    async (input: CreatePromptedChatPanelInput): Promise<ThreadId | null> => {
+    async (input: CreatePromptedChatPanelInput): Promise<PromptedPanelResult> => {
       const kind: PanelThreadKind = {
         sideChat: false,
         codeReview: input.codeReview,
@@ -533,20 +561,29 @@ export function useCenterPanelActions({
       };
       const panel = await createPanelThread(input, kind, input.label);
       // Not created, or closed meanwhile: the prompt is not sent.
-      if (!panel?.created) return panel?.threadId ?? null;
-      await sendFirstPanelMessage(input, panel.threadId, input.prompt, kind, {
-        title: CODE_REVIEW_SEND_FAILED_TITLE,
-        description: CODE_REVIEW_SEND_FAILED_DESCRIPTION,
-      });
-      return panel.threadId;
+      if (panel === null) return NO_PANEL;
+      if (!panel.created) return { ...NO_PANEL, threadId: panel.threadId };
+      const first =
+        input.sendFirstMessage !== undefined
+          ? await input.sendFirstMessage(panel.threadId)
+          : await sendFirstPanelMessage(input, panel.threadId, input.prompt, kind, {
+              title: CODE_REVIEW_SEND_FAILED_TITLE,
+              description: CODE_REVIEW_SEND_FAILED_DESCRIPTION,
+            });
+      return {
+        threadId: panel.threadId,
+        created: true,
+        messageId: first.messageId,
+        sent: first.outcome,
+      };
     },
     [createPanelThread, sendFirstPanelMessage],
   );
 
   const createPromptedChatPanel = useCallback(
-    async (input: CreatePromptedChatPanelInput): Promise<ThreadId | null> => {
+    async (input: CreatePromptedChatPanelInput): Promise<PromptedPanelResult> => {
       const hostKey = scopedThreadKey(input.hostRef);
-      if (pendingPromptedPanelHosts.has(hostKey)) return null;
+      if (pendingPromptedPanelHosts.has(hostKey)) return NO_PANEL;
       pendingPromptedPanelHosts.add(hostKey);
       return openPromptedChatPanel(input).finally(() => pendingPromptedPanelHosts.delete(hostKey));
     },

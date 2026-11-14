@@ -17,7 +17,10 @@ import { useSendToAgentStore } from "~/sendToAgentStore";
 import type { SendOutcome } from "~/state/sendRequests";
 import { buildAgentRows } from "../sidebar/agentsSection.logic";
 import { SendToAgentButton, type SendToAgentButtonProps } from "./SendToAgentButton";
-import type { SendToAgentSource } from "./sendToAgent.logic";
+import { resolveCodeReviewPrompt } from "~/codeReview";
+import { buildReviewPreviewContent } from "./ReviewScopePicker";
+import { buildReviewContent, buildReviewScopeOptions } from "./review.logic";
+import { sendChoiceKey, type SendChoice, type SendToAgentSource } from "./sendToAgent.logic";
 
 const ENVIRONMENT = EnvironmentId.make("environment-a");
 const PROJECT = ProjectId.make("project-a");
@@ -311,6 +314,98 @@ describe("SendToAgentButton", () => {
       attachments: [],
     });
     expect(document.body.querySelector("textarea")).toBeNull();
+  });
+
+  describe("Review", () => {
+    const dirtyStatus = {
+      isRepo: true,
+      hasPrimaryRemote: true,
+      isDefaultRef: false,
+      refName: "feature/demo",
+      hasWorkingTreeChanges: true,
+      workingTree: {
+        files: [{ path: "a.ts", insertions: 1, deletions: 0, area: "unstaged" }],
+        insertions: 1,
+        deletions: 0,
+      },
+      hasUpstream: true,
+      aheadCount: 0,
+      behindCount: 0,
+      pr: null,
+      defaultRefName: "main",
+      aheadOfDefaultCount: 0,
+    } as const;
+    const reviewContentFor =
+      (send: (input: SendRequestsSendInput) => Promise<SendOutcome>) => (choice: SendChoice) =>
+        buildReviewPreviewContent({
+          options: buildReviewScopeOptions(dirtyStatus),
+          pickKey: sendChoiceKey(choice),
+          contentFor: (scope) =>
+            buildReviewContent({
+              scope,
+              projectPrompt: "",
+              userPrompt: "",
+              target: choice.target,
+              guardLine: null,
+              sourceKey: sendChoiceKey(choice),
+              source: choice.source,
+              send,
+              newId: () => "request-1",
+              startNewPanelReview: () =>
+                Promise.resolve({
+                  threadId: null,
+                  created: false,
+                  messageId: null,
+                  sent: "not-sent",
+                }),
+            }),
+        });
+
+    it('Review to an existing agent sends action "review", the lead-in and the note, no attachments', async () => {
+      const send = vi.fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>(() =>
+        Promise.resolve({ kind: "sent" }),
+      );
+      render(baseProps({ send, previewContentFor: reviewContentFor(send) }));
+      await openAction("Review");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain("Uncommitted changes");
+      expect(document.body.textContent).toContain("Do not edit files");
+      const note = document.body.querySelector<HTMLTextAreaElement>("textarea")!;
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!;
+        setter.call(note, "check the retry path");
+        note.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => find("button", "Send")!.click());
+      await flush();
+      expect(send).toHaveBeenCalledWith({
+        requestId: "request-1",
+        action: "review",
+        source: "thread:source",
+        target: "thread:beta",
+        leadIn: resolveCodeReviewPrompt({
+          project: "",
+          user: "",
+          scope: { kind: "uncommitted", base: "origin/main" },
+        }),
+        note: "check the retry path",
+        attachments: [],
+      });
+    });
+
+    it("Review to an agent in another checkout is not offered as enabled", async () => {
+      const onChoose = vi.fn();
+      render(baseProps({ onChoose }));
+      await openAction("Review");
+      const blocked = menuItem("gamma")!;
+      expect(blocked.getAttribute("aria-disabled")).toBe("true");
+      await act(async () => blocked.click());
+      expect(onChoose).not.toHaveBeenCalled();
+    });
   });
 
   it("closing the preview returns focus to the control that opened it", async () => {

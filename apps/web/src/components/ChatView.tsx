@@ -213,6 +213,7 @@ import {
 } from "../centerPanelLayout";
 import {
   CODE_REVIEW_SEND_FAILED_TITLE,
+  type PromptedPanelResult,
   takeComposerFocusRequest,
   useCenterPanelActions,
 } from "../centerPanelActions";
@@ -262,7 +263,7 @@ import ThreadTerminalPanel, {
   releaseTerminalUiResources,
 } from "./ThreadTerminalPanel";
 import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
-import { cn, randomHex } from "~/lib/utils";
+import { cn, randomHex, randomUUID } from "~/lib/utils";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
 import { type NewProjectScriptInput } from "./ProjectScriptsControl";
@@ -336,11 +337,24 @@ import { readThreadShell, useProject, useThread, useThreadProposedPlans } from "
 import {
   useCancelSendRequest,
   useDismissSendRequest,
+  useSendRequest,
   useSendRequests,
 } from "../state/sendRequests";
 import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
-import type { NewPanelProvider, PreviewContent, SendChoice } from "./sendToAgent/sendToAgent.logic";
+import { buildReviewPreviewContent } from "./sendToAgent/ReviewScopePicker";
+import {
+  buildReviewContent,
+  buildReviewScopeOptions,
+  reviewPanelProviders,
+  type StartNewPanelReviewInput,
+} from "./sendToAgent/review.logic";
+import {
+  sendChoiceKey,
+  type NewPanelProvider,
+  type PreviewContent,
+  type SendChoice,
+} from "./sendToAgent/sendToAgent.logic";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
@@ -443,13 +457,12 @@ const SourceControlPanel = lazy(() => import("./SourceControlPanel"));
 /** Hosts with a terminal review being opened, so a double click opens one (#293). */
 const pendingTerminalReviewHosts = new Set<string>();
 const EMPTY_SEND_CONTENT: PreviewContent = { leadIn: "", attachments: [] };
-/**
- * What the Send to agent preview shows for each action. Tasks that add Review, Second opinion,
- * Hand off and Take over from add their branches here; an action without content opens no preview.
- */
-function sendPreviewContentFor(choice: SendChoice): PreviewContent | null {
-  return choice.action === "message" ? EMPTY_SEND_CONTENT : null;
-}
+const PANEL_NOT_OPENED: PromptedPanelResult = {
+  threadId: null,
+  created: false,
+  messageId: null,
+  sent: "not-sent",
+};
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
@@ -5156,13 +5169,107 @@ function ChatViewContent(props: ChatViewProps) {
       });
     },
   );
+  const sendReviewProviders = useMemo(
+    () => reviewPanelProviders(codeReviewMenuReviewers),
+    [codeReviewMenuReviewers],
+  );
+  const sendNewPanelProvidersFor = useCallback(
+    (action: SendChoice["action"]) =>
+      action === "review" ? sendReviewProviders : sendNewPanelProviders,
+    [sendNewPanelProviders, sendReviewProviders],
+  );
+  const sendReview = useSendRequest(environmentId);
+  // A Review to a new panel: the panel starts with the review's modes and guard like the Code
+  // review button's, but its first message is the tracked request, not a bare turn.
+  const startNewPanelReview = useLatestHandler(
+    async (input: StartNewPanelReviewInput): Promise<PromptedPanelResult> => {
+      const reviewer = resolveSavedCodeReviewer(
+        codeReviewAgentActions,
+        input.selection,
+        providerInstanceEntries,
+      ).action;
+      if (reviewer === null || !activeThread || !centerPanelLaunchContext) return PANEL_NOT_OPENED;
+      const { entry } = reviewer;
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+        explicitSelection: resolveCodeReviewModelSelection(
+          settings.codeReviewModelSelection,
+          entry.instanceId,
+        ),
+      });
+      return centerPanelActions.createPromptedChatPanel({
+        // A panel cannot host a panel: a review from one is hosted by its host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+        label: `Code review · ${entry.displayName}`,
+        prompt: "",
+        ...resolveCodeReviewChatModes(entry.driverKind),
+        codeReview: true,
+        sendFirstMessage: async (panelThreadId) => {
+          const outcome = await input.send(panelThreadId);
+          return {
+            messageId: null,
+            outcome:
+              outcome.kind === "sent"
+                ? "sent"
+                : outcome.reason === "unknown_outcome"
+                  ? "unknown"
+                  : "failed",
+          };
+        },
+      });
+    },
+  );
+  // What the Send to agent preview shows for each action; an action without content opens no
+  // preview. Stable, so an open preview keeps its content while the git status refreshes.
+  const sendPreviewContentFor = useLatestHandler((choice: SendChoice): PreviewContent | null => {
+    if (choice.action === "message") return EMPTY_SEND_CONTENT;
+    if (choice.action !== "review") return null;
+    const pickKey = sendChoiceKey(choice);
+    const { target } = choice;
+    const guardLine =
+      target.kind === "new-panel"
+        ? (codeReviewMenuReviewers.find(
+            (reviewer) =>
+              reviewer.selection.kind === target.selection.kind &&
+              reviewer.selection.instanceId === target.selection.instanceId,
+          )?.guardLine ?? null)
+        : null;
+    return buildReviewPreviewContent({
+      options: buildReviewScopeOptions(gitStatusQuery.data ?? null),
+      pickKey,
+      contentFor: (scope) =>
+        buildReviewContent({
+          scope,
+          projectPrompt: activeProject?.codeReviewPrompt ?? "",
+          userPrompt: settings.codeReviewPrompt,
+          target,
+          guardLine,
+          sourceKey: pickKey,
+          source: choice.source,
+          send: sendReview,
+          newId: randomUUID,
+          startNewPanelReview,
+        }),
+    });
+  });
   const sendToAgentControl = useMemo(
     () =>
       isServerThread && activeThreadRef !== null ? (
         <ChatSendToAgentControl
           threadRef={activeThreadRef}
           serverSupported={sendRequestsSupported}
-          newPanelProviders={sendNewPanelProviders}
+          newPanelProvidersFor={sendNewPanelProvidersFor}
           createPanel={createSendPanel}
           previewContentFor={sendPreviewContentFor}
         />
@@ -5171,7 +5278,8 @@ function ChatViewContent(props: ChatViewProps) {
       activeThreadRef,
       createSendPanel,
       isServerThread,
-      sendNewPanelProviders,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
       sendRequestsSupported,
     ],
   );

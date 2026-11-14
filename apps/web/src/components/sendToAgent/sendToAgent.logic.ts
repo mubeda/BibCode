@@ -309,10 +309,21 @@ export async function submitSendChoice(
 
 const GENERIC_FAILURE = "BiBCode could not send this. Try again.";
 
+/** Client-made failure of a Review to a new panel; the only message shown from an outcome as is. */
+export const REVIEW_PANEL_NOT_OPENED_MESSAGE =
+  "BiBCode could not open the review panel. Try again.";
+export const REVIEW_NO_CHANGES_MESSAGE = "No changes to review. Make a change, then try again.";
+
 export function describeSendFailure(outcome: Extract<SendOutcome, { kind: "failed" }>): {
   message: string;
   next: "retry" | "pick-another" | "trim" | "none";
 } {
+  if (
+    outcome.message === REVIEW_PANEL_NOT_OPENED_MESSAGE ||
+    outcome.message === REVIEW_NO_CHANGES_MESSAGE
+  ) {
+    return { message: outcome.message, next: "retry" };
+  }
   switch (outcome.reason) {
     case "too_long":
       return { message: OVER_LIMIT_REASON, next: "trim" };

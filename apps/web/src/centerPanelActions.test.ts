@@ -947,7 +947,12 @@ describe("prompted chat panels (code reviews)", () => {
   it("creates a review panel with its modes and flag, then sends the prompt (R95)", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
 
-    await expect(actions.createPromptedChatPanel(review())).resolves.toBe("new-panel-thread");
+    await expect(actions.createPromptedChatPanel(review())).resolves.toEqual({
+      threadId: "new-panel-thread",
+      created: true,
+      messageId: "side-question",
+      sent: "sent",
+    });
 
     expect(h.createPanel).toHaveBeenCalledOnce();
     expect(h.createPanel).toHaveBeenCalledWith({
@@ -990,7 +995,12 @@ describe("prompted chat panels (code reviews)", () => {
 
     const opening = actions.createPromptedChatPanel(review());
     await flush();
-    await expect(actions.createPromptedChatPanel(review())).resolves.toBeNull();
+    await expect(actions.createPromptedChatPanel(review())).resolves.toEqual({
+      threadId: null,
+      created: false,
+      messageId: null,
+      sent: "not-sent",
+    });
     expect(h.createPanel).toHaveBeenCalledOnce();
 
     creation.resolve({ _tag: "Success", value: undefined });
@@ -1011,6 +1021,38 @@ describe("prompted chat panels (code reviews)", () => {
         description: "The review prompt is in its composer.",
       }),
     );
+  });
+
+  it("createPromptedChatPanel returns the panel id, the message id and the send outcome", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    h.startTurn.mockResolvedValueOnce({ _tag: "Failure", cause: new Error("offline") });
+    await expect(actions.createPromptedChatPanel(review())).resolves.toEqual({
+      threadId: "new-panel-thread",
+      created: true,
+      messageId: "side-question",
+      sent: "failed",
+    });
+  });
+
+  it("an injected first message replaces startTurn and a failed one writes nothing into the panel's composer", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const sendFirstMessage = vi.fn(() =>
+      Promise.resolve({ messageId: null, outcome: "unknown" as const }),
+    );
+
+    await expect(
+      actions.createPromptedChatPanel({ ...review(), sendFirstMessage }),
+    ).resolves.toEqual({
+      threadId: "new-panel-thread",
+      created: true,
+      messageId: null,
+      sent: "unknown",
+    });
+
+    expect(sendFirstMessage).toHaveBeenCalledWith("new-panel-thread");
+    expect(h.startTurn).not.toHaveBeenCalled();
+    expect(h.drafts.get("new-panel-thread")).toBeUndefined();
+    expect(h.addToast).not.toHaveBeenCalled();
   });
 
   it("sends nothing when the tab closed while the panel was created", async () => {
