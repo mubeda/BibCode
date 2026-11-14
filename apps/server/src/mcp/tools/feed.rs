@@ -275,6 +275,11 @@ pub(crate) async fn page_after(
             entry["cursor"] = position.text().into();
             entries.push(entry);
         }
+        // Every row up to the head was examined: rows the read skips (agent messaging, another
+        // thread's) must not hold the position back until retention reports them dropped.
+        if complete && read.activity.len() <= limit {
+            position.activity = position.activity.max(read.activity_head);
+        }
     }
     let more = !complete || read.more_events;
     let mut content = json!({ "entries": entries });
