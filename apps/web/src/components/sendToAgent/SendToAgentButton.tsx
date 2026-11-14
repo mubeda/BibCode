@@ -14,6 +14,7 @@ import {
   useState,
   type ComponentProps,
   type ReactElement,
+  type ReactNode,
   type RefObject,
 } from "react";
 
@@ -47,10 +48,22 @@ import {
   type SendToAgentSource,
 } from "./sendToAgent.logic";
 
+/** What the open menu needs and the closed button must not subscribe to. */
+export interface LiveSendInputs {
+  source: SendToAgentSource;
+  rows: ReadonlyArray<AgentRow>;
+}
+
 export interface SendToAgentButtonProps {
   source: SendToAgentSource;
   serverSupported: boolean;
   rows: ReadonlyArray<AgentRow>;
+  /**
+   * Supplies the live `source` and `rows` to the open menu only, by rendering `render` inside a
+   * component that reads them. Without it the menu uses `source` and `rows` as given. Keep it
+   * stable, or the button re-renders with it.
+   */
+  renderLive?: (render: (live: LiveSendInputs) => ReactNode) => ReactNode;
   projectRootByProjectId: ReadonlyMap<string, string>;
   newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
   canNotifyTerminal: (row: AgentRow) => boolean;
@@ -62,6 +75,11 @@ export interface SendToAgentButtonProps {
   createPanel?: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
   newId?: () => string;
 }
+
+const renderGiven =
+  (props: LiveSendInputs): NonNullable<SendToAgentButtonProps["renderLive"]> =>
+  (render) =>
+    render(props);
 
 const defaultNewId = randomUUID;
 const noPanel = () => Promise.resolve(null);
@@ -121,7 +139,11 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
           <TooltipPopup side="top">Send to agent</TooltipPopup>
         </Tooltip>
         <MenuPopup side="top" align="end" className="w-72 max-w-[calc(100vw-2rem)]">
-          {menuOpen ? <ActionList {...props} onChoose={choose} /> : null}
+          {menuOpen
+            ? (props.renderLive ?? renderGiven(props))((live) => (
+                <ActionList {...props} source={live.source} rows={live.rows} onChoose={choose} />
+              ))
+            : null}
         </MenuPopup>
       </Menu>
       {choice !== null && previewContentFor !== undefined ? (

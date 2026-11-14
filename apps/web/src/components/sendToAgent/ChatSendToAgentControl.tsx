@@ -1,15 +1,18 @@
 /**
- * The Send to agent control of one chat panel. It reads the panel's messages, the agent list and
- * the sender itself, so that ChatView and the memoized composer footer see none of their
- * changes: the footer's slot is one stable element.
+ * The Send to agent control of one chat panel. It reads the panel's shell and the sender itself, so
+ * that ChatView and the memoized composer footer see none of their changes: the footer's slot is
+ * one stable element. The panel's messages and the agent list change with every streamed token and
+ * every agent; they are read only while the menu is open, so a closed control re-renders for
+ * neither. A chosen preview keeps the source it was chosen with.
  */
 import type { DefaultAgentSelection, ScopedThreadRef, ThreadId } from "@bibcode/contracts";
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useMemo, type ReactNode } from "react";
 
 import { useProjects, useThreadMessages, useThreadShell } from "~/state/entities";
 import { useSendRequest } from "~/state/sendRequests";
+import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { useAgentRows } from "../agents/useAgentRows";
-import { SendToAgentButton } from "./SendToAgentButton";
+import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
 import type {
   NewPanelProvider,
   PreviewContent,
@@ -17,8 +20,23 @@ import type {
   SendToAgentSource,
 } from "./sendToAgent.logic";
 
+const NO_ROWS: ReadonlyArray<AgentRow> = [];
+const NO_MESSAGES: SendToAgentSource["messages"] = [];
+
 // Until terminals can be notified (phase 9), no terminal is offered as a target.
 const canNotifyTerminal = () => false;
+
+/** Mounted while the menu is open: the only reader of the messages and the agent directory. */
+function LiveSendInputsReader(props: {
+  readonly threadRef: ScopedThreadRef;
+  readonly base: SendToAgentSource;
+  readonly render: (live: LiveSendInputs) => ReactNode;
+}) {
+  const messages = useThreadMessages(props.threadRef);
+  const rows = useAgentRows();
+  const source = useMemo(() => ({ ...props.base, messages }), [messages, props.base]);
+  return props.render({ source, rows });
+}
 
 export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props: {
   readonly threadRef: ScopedThreadRef;
@@ -29,8 +47,6 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
 }) {
   const { threadRef, newPanelProviders } = props;
   const shell = useThreadShell(threadRef);
-  const messages = useThreadMessages(threadRef);
-  const rows = useAgentRows();
   const projects = useProjects();
   const send = useSendRequest(threadRef.environmentId);
   const projectRootByProjectId = useMemo(
@@ -51,18 +67,26 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
             projectId,
             title,
             checkout: worktreePath ?? projectRootByProjectId.get(projectId) ?? "",
-            messages,
+            messages: NO_MESSAGES,
             terminalHasText: false,
           },
-    [messages, projectId, projectRootByProjectId, threadRef, title, worktreePath],
+    [projectId, projectRootByProjectId, threadRef, title, worktreePath],
   );
   const newPanelProvidersFor = useCallback(() => newPanelProviders, [newPanelProviders]);
+  const renderLive = useCallback(
+    (render: (live: LiveSendInputs) => ReactNode) =>
+      source === null ? null : (
+        <LiveSendInputsReader threadRef={threadRef} base={source} render={render} />
+      ),
+    [source, threadRef],
+  );
   if (source === null) return null;
   return (
     <SendToAgentButton
       source={source}
       serverSupported={props.serverSupported}
-      rows={rows}
+      rows={NO_ROWS}
+      renderLive={renderLive}
       projectRootByProjectId={projectRootByProjectId}
       newPanelProvidersFor={newPanelProvidersFor}
       canNotifyTerminal={canNotifyTerminal}

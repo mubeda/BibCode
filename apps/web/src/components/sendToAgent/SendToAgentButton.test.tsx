@@ -9,7 +9,7 @@ import {
   type SendRequestsSendInput,
 } from "@bibcode/contracts";
 import { createModelSelection } from "@bibcode/shared/model";
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -212,6 +212,19 @@ describe("SendToAgentButton", () => {
     expect(choice.source).toBe(props.source);
     expect(choice.action).toBe("message");
     expect(choice.target).toMatchObject({ kind: "agent", address: "thread:beta" });
+  });
+
+  it("asks renderLive for the source and rows only while the menu is open, and chooses with that source", async () => {
+    const onChoose = vi.fn();
+    const props = baseProps({ onChoose });
+    const live = { source: { ...props.source, title: "Live title" }, rows: props.rows };
+    const renderLive = vi.fn((draw: (inputs: typeof live) => ReactNode) => draw(live));
+    render({ ...props, renderLive });
+    expect(renderLive).not.toHaveBeenCalled();
+    await openAction("Message");
+    expect(renderLive).toHaveBeenCalled();
+    await act(async () => menuItem("beta")!.click());
+    expect(onChoose.mock.calls[0]![0].source).toBe(live.source);
   });
 
   it("a disabled entry stays focusable, shows its reason in words, carries it in its accessible name and ignores activation", async () => {
