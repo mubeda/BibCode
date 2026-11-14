@@ -702,16 +702,39 @@ fn target(arguments: &Map<String, Value>, content: &Value) -> Value {
 /// and a state name, never message text. The write is spawned, so a send never waits on the
 /// database. One task writes the rows in the order the outcomes arrive. Call it inside a Tokio
 /// runtime.
+#[cfg(test)]
 pub(crate) fn agent_message_sink(activity: McpActivity) -> OutcomeSink {
+    agent_message_writer(activity).0
+}
+
+/// [`agent_message_sink`] and the handle the runtime stops its writer with.
+pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, AgentMessageWriter) {
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(outcome) = receiver.recv().await {
             activity.record(agent_message_row(outcome)).await;
         }
     });
-    Arc::new(move |outcome| {
+    let sink: OutcomeSink = Arc::new(move |outcome| {
         let _ = sender.send(outcome);
-    })
+    });
+    (
+        sink,
+        AgentMessageWriter {
+            task: Mutex::new(Some(task)),
+        },
+    )
+}
+
+/// The writer of agent message rows, which the runtime closes in its stop.
+pub(crate) struct AgentMessageWriter {
+    #[expect(dead_code, reason = "joined once the writer can be closed")]
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AgentMessageWriter {
+    /// Not implemented yet.
+    pub(crate) async fn close(&self) {}
 }
 
 fn agent_message_row(outcome: MessageOutcome) -> NewActivity {
@@ -1462,6 +1485,107 @@ mod tests {
         assert_eq!(rows[1]["label"], "Caller");
         assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
         tools.shutdown().await;
+    }
+
+    /// Closing the writer writes every row queued before it and ends the writer; an outcome
+    /// after it is dropped.
+    #[tokio::test]
+    async fn closing_the_writer_writes_every_queued_row_and_ends_it() {
+        let activity = McpActivity::new(migrated().await);
+        let (sink, writer) = agent_message_writer(activity.clone());
+        for index in 0..50 {
+            sink(message_outcome(
+                "agent_message_send",
+                "accepted",
+                "thread:b",
+                Some(&format!("m{index}")),
+            ));
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), writer.close())
+            .await
+            .expect("the writer closes");
+
+        assert_eq!(activity.recent().await.unwrap().len(), 50);
+        sink(message_outcome(
+            "agent_message_send",
+            "accepted",
+            "thread:b",
+            Some("late"),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(activity.recent().await.unwrap().len(), 50);
+    }
+
+    /// With the database worker stalled, the sink never blocks its caller and keeps a bounded
+    /// number of rows; the rest are dropped.
+    #[tokio::test]
+    async fn a_stalled_database_drops_rows_past_the_bound_without_blocking() {
+        let database = migrated().await;
+        let activity = McpActivity::new(database.clone());
+        let (sink, writer) = agent_message_writer(activity.clone());
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stall = tokio::spawn(async move {
+            database
+                .call(move |_| {
+                    let _ = stalled.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Refusals of a `to` far past any address: the queue never keeps it.
+        let to = "x".repeat(4 * 1024);
+        let sent = 5_000;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..sent {
+                sink(message_outcome(
+                    "agent_message_send",
+                    "AgentMessagingUnknownRecipientError",
+                    &to,
+                    None,
+                ));
+            }
+        })
+        .await
+        .expect("the sink never blocks");
+
+        release.send(()).unwrap();
+        stall.await.unwrap().unwrap();
+        // The queue has room again: a last row is kept, and written after every row before it.
+        sink(message_outcome(
+            "agent_message_send",
+            "accepted",
+            "thread:b",
+            Some("last"),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while activity
+                .recent()
+                .await
+                .unwrap()
+                .first()
+                .is_none_or(|row| row["target"]["messageId"] != "last")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the last row is written");
+        drop(writer);
+        let written = activity
+            .shared
+            .database
+            .call(|connection| {
+                Ok(connection.query_row("SELECT COUNT(*) FROM mcp_activity", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert!(written > 0, "rows before the bound are written");
+        assert!(written < 2_000, "{written} of {sent} rows were kept");
     }
 
     async fn dispatch(tools: &crate::production::mcp_tools_tests::Harness, value: Value) {

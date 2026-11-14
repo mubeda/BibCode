@@ -121,6 +121,10 @@ pub struct ProductionRuntime {
     send_requests_follower: CancellationToken,
     /// Stops the tracker that moves agent messages through their states.
     agent_message_tracker: CancellationToken,
+    /// The tracker's task, joined in the stop so its last outcome reaches the activity writer.
+    agent_message_tracker_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Writes agent message rows to the activity log; closed and drained in the stop.
+    agent_message_writer: crate::mcp::activity::AgentMessageWriter,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -833,7 +837,8 @@ impl ProductionRuntime {
             control.mcp_server_signal(),
             mcp_activity.clone(),
         );
-        let agent_message_outcomes = crate::mcp::activity::agent_message_sink(mcp_activity);
+        let (agent_message_outcomes, agent_message_writer) =
+            crate::mcp::activity::agent_message_writer(mcp_activity);
         mcp_control.attach_terminals(mcp_terminals);
         mcp_control.attach_agent_messaging(
             crate::agent_messaging::AgentMessaging::new(
@@ -855,7 +860,7 @@ impl ProductionRuntime {
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         let agent_message_tracker = CancellationToken::new();
-        crate::agent_messaging::delivery::AgentMessageTracker::start(
+        let agent_message_tracker_task = crate::agent_messaging::delivery::AgentMessageTracker::start(
             orchestration.clone(),
             Some(agent_message_outcomes),
             control.agent_messaging_enabled_signal(),
@@ -868,6 +873,8 @@ impl ProductionRuntime {
             webhooks,
             send_requests_follower,
             agent_message_tracker,
+            agent_message_tracker_task: std::sync::Mutex::new(Some(agent_message_tracker_task)),
+            agent_message_writer,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1067,7 +1074,21 @@ impl ProductionRuntime {
         steps.mark("send-requests-follower");
         // A stopped tracker resumes from its first reconciliation on the next start.
         self.agent_message_tracker.cancel();
+        let tracker = self
+            .agent_message_tracker_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(tracker) = tracker
+            && let Err(error) = tracker.await
+        {
+            tracing::warn!(%error, "the agent message tracker ended abnormally");
+        }
         steps.mark("agent-message-tracker");
+        // After the tracker and the MCP calls, while the database is open and before the
+        // profiler's teardown: every queued agent message row is written, then the writer ends.
+        self.agent_message_writer.close().await;
+        steps.mark("agent-message-activity");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
