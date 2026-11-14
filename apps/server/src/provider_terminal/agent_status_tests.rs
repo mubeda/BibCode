@@ -6,10 +6,7 @@ use serde_json::{Value, json};
 use super::{
     TerminalAgentState::{Blocked, Done, Waiting, Working},
     claude::claude_hook_ready_for_prompt,
-    codex::{
-        codex_resumed_agent_status, codex_resumed_ready_for_prompt, codex_root_agent_status,
-        codex_root_ready_for_prompt,
-    },
+    codex::{codex_resumed_agent_status, codex_root_agent_status, codex_root_ready_for_prompt},
     model::TerminalAgentReport,
     opencode::{opencode_root_agent_status, opencode_root_ready_for_prompt},
 };
@@ -289,13 +286,8 @@ fn ready_for_prompt_follows_each_provider_event() {
     ] {
         assert_eq!(codex(envelope), ready, "Codex {row}");
     }
-    assert!(codex_resumed_ready_for_prompt(Some(
-        &ReconciliationThreadStatus::Idle
-    )));
-    assert!(!codex_resumed_ready_for_prompt(Some(
-        &ReconciliationThreadStatus::SystemError
-    )));
-    assert!(!codex_resumed_ready_for_prompt(None));
+    // A `thread/resume` status is a snapshot: it reports a state and never makes the terminal
+    // ready (`codex_attach_takes_readiness_only_from_events_after_its_resume`).
 
     let opencode = |event_type: &str, properties: Value| {
         opencode_root_ready_for_prompt(
