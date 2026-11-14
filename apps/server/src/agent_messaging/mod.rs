@@ -77,6 +77,10 @@ pub(crate) enum AgentMessagingError {
     Conflict,
     /// The exchange reached the hop limit; a person has to write before agents continue.
     HopLimit,
+    /// The sender sent its allowance of agent messages in the rate window.
+    RateLimit,
+    /// The recipient has its allowance of agent messages it has not read.
+    BacklogLimit,
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
 }
@@ -92,6 +96,8 @@ impl AgentMessagingError {
             Self::ModeCeiling { .. } => "AgentMessagingModeCeilingError",
             Self::Conflict => "AgentMessagingConflictError",
             Self::HopLimit => "AgentMessagingHopLimitError",
+            Self::RateLimit => "AgentMessagingRateLimitError",
+            Self::BacklogLimit => "AgentMessagingBacklogLimitError",
             Self::Storage => "McpStorageError",
         }
     }
@@ -115,6 +121,15 @@ impl AgentMessagingError {
             Self::HopLimit => format!(
                 "This exchange has reached the limit of {} agent-to-agent hops. A person has to write in a thread before agents can continue.",
                 policy::HOP_LIMIT
+            ),
+            Self::RateLimit => format!(
+                "You have sent {} agent messages in the last {} seconds, which is the limit. Wait before sending more.",
+                policy::RATE_LIMIT,
+                policy::RATE_WINDOW_SECONDS
+            ),
+            Self::BacklogLimit => format!(
+                "The recipient already has {} agent messages it has not read, which is the limit. Try again after it has read some.",
+                policy::BACKLOG_LIMIT
             ),
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
         }
@@ -567,25 +582,28 @@ impl AgentMessaging {
         // and no approval or question is open; one that ended since this read is promoted then.
         let force_queue =
             admission_for(&route.recipient, route.session.as_ref()) == TurnAdmission::Queue;
-        let companion = AgentMessageCompanion::Insert(NewAgentMessage {
-            message_id: outgoing.message_id.to_owned(),
-            conversation_id: outgoing.conversation_id.to_owned(),
-            sender_address: sender_address.clone(),
-            sender_kind: SenderKind::Agent,
-            recipient_address: recipient_address.clone(),
-            in_reply_to: outgoing.in_reply_to.map(str::to_owned),
-            hop: outgoing.hop,
-            text: outgoing.text.to_owned(),
-            status: AgentMessageStatus::Accepted,
-            reason: None,
-            accepted_at: now,
-            sender_runtime_mode: Some(sender_mode.clone()),
-            recipient_terminal_generation: None,
-            send_request_id: None,
-            client_request_id: outgoing.client_request_id.map(str::to_owned),
-            delivery_command_id: Some(command_id),
-            delivery_message_id: Some(delivery_message_id),
-        });
+        let companion = AgentMessageCompanion::Insert(
+            NewAgentMessage {
+                message_id: outgoing.message_id.to_owned(),
+                conversation_id: outgoing.conversation_id.to_owned(),
+                sender_address: sender_address.clone(),
+                sender_kind: SenderKind::Agent,
+                recipient_address: recipient_address.clone(),
+                in_reply_to: outgoing.in_reply_to.map(str::to_owned),
+                hop: outgoing.hop,
+                text: outgoing.text.to_owned(),
+                status: AgentMessageStatus::Accepted,
+                reason: None,
+                accepted_at: now,
+                sender_runtime_mode: Some(sender_mode.clone()),
+                recipient_terminal_generation: None,
+                send_request_id: None,
+                client_request_id: outgoing.client_request_id.map(str::to_owned),
+                delivery_command_id: Some(command_id),
+                delivery_message_id: Some(delivery_message_id),
+            },
+            Some(policy::AdmissionLimits::now()),
+        );
         let admitted = starter
             .queue_turn_start(
                 command,
@@ -600,6 +618,17 @@ impl AgentMessaging {
             )
             .await
             .map_err(|error| {
+                // A limit names itself in the refusal's detail, which quotes nothing else here.
+                let detail = error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if detail.ends_with(policy::LimitRefusal::Rate.detail()) {
+                    return AgentMessagingError::RateLimit;
+                }
+                if detail.ends_with(policy::LimitRefusal::Backlog.detail()) {
+                    return AgentMessagingError::BacklogLimit;
+                }
                 // The refusal's tag only: its detail may quote the command.
                 tracing::warn!(
                     tag = error
@@ -611,6 +640,12 @@ impl AgentMessaging {
                 AgentMessagingError::Storage
             });
         if let Err(error) = admitted {
+            if matches!(
+                error,
+                AgentMessagingError::RateLimit | AgentMessagingError::BacklogLimit
+            ) {
+                return Err(error);
+            }
             // Another call with the same id won the unique index: answer from its row.
             return match self
                 .replay(&sender_address, &recipient_address, &outgoing)

@@ -41,6 +41,74 @@ pub(crate) fn next_hop(trigger: Option<u32>) -> Result<u32, super::AgentMessagin
     Ok(hop)
 }
 
+/// The most agent messages one sender may send in `RATE_WINDOW_SECONDS` (R15).
+pub(crate) const RATE_LIMIT: u32 = 30;
+pub(crate) const RATE_WINDOW_SECONDS: i64 = 60;
+/// The most agent messages a recipient may have that it has not consumed (R15).
+pub(crate) const BACKLOG_LIMIT: u32 = 20;
+
+/// The limits a new agent message is admitted under, checked in its insert's transaction.
+#[derive(Clone, Debug)]
+pub struct AdmissionLimits {
+    /// The start of the rate window, in the server's RFC 3339 form.
+    pub sender_since: String,
+    pub rate_limit: u32,
+    pub backlog_limit: u32,
+}
+
+impl AdmissionLimits {
+    /// The limits of the spec, with the rate window ending now.
+    pub(crate) fn now() -> Self {
+        let since = time::OffsetDateTime::now_utc() - time::Duration::seconds(RATE_WINDOW_SECONDS);
+        Self {
+            sender_since: since
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            rate_limit: RATE_LIMIT,
+            backlog_limit: BACKLOG_LIMIT,
+        }
+    }
+}
+
+/// The limit that refused an agent message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LimitRefusal {
+    Rate,
+    Backlog,
+}
+
+impl LimitRefusal {
+    /// The detail of the `OrchestrationError::Invariant` that fails the admitting command.
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            Self::Rate => "agent-message-limit:rate",
+            Self::Backlog => "agent-message-limit:backlog",
+        }
+    }
+}
+
+/// Refuses `message` when its sender has used its rate or its recipient's backlog is full,
+/// the rate first; only agent-origin rows count, and a person's message is never refused. Run
+/// in the transaction that inserts it, so concurrent sends cannot both pass the last slot.
+pub(crate) fn enforce_limits(
+    tx: &rusqlite::Transaction<'_>,
+    message: &super::store::NewAgentMessage,
+    limits: &AdmissionLimits,
+) -> crate::persistence::Result<Result<(), LimitRefusal>> {
+    if message.sender_kind != SenderKind::Agent {
+        return Ok(Ok(()));
+    }
+    if super::store::count_sent_since(tx, &message.sender_address, &limits.sender_since)?
+        >= limits.rate_limit
+    {
+        return Ok(Err(LimitRefusal::Rate));
+    }
+    if super::store::count_unconsumed(tx, &message.recipient_address)? >= limits.backlog_limit {
+        return Ok(Err(LimitRefusal::Backlog));
+    }
+    Ok(Ok(()))
+}
+
 /// What the claim of a queue entry does with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimDecision {

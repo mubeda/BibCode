@@ -171,7 +171,8 @@ pub struct AgentMessageRow {
     reason = "one per admitted command, moved once; the Insert form is the interface tasks 5.4 and 6.4 build"
 )]
 pub enum AgentMessageCompanion {
-    Insert(NewAgentMessage),
+    /// A new message, refused with its whole command when a limit applies.
+    Insert(NewAgentMessage, Option<super::policy::AdmissionLimits>),
     Relink(RelinkAgentMessage),
 }
 
@@ -251,6 +252,36 @@ pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, new: &NewAgentMessa
         ],
     )?;
     Ok(())
+}
+
+/// How many agent messages `sender_address` had accepted since `since`, compared as times, not
+/// as strings.
+pub(crate) fn count_sent_since(
+    connection: &rusqlite::Connection,
+    sender_address: &str,
+    since: &str,
+) -> Result<u32> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM agent_messages
+          WHERE sender_address = ?1 AND sender_kind = 'agent'
+            AND julianday(accepted_at) >= julianday(?2)",
+        params![sender_address, since],
+        |row| row.get(0),
+    )?)
+}
+
+/// How many agent messages to `recipient_address` are not yet consumed or final.
+pub(crate) fn count_unconsumed(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+) -> Result<u32> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM agent_messages
+          WHERE recipient_address = ?1 AND sender_kind = 'agent'
+            AND status IN ('accepted', 'queued', 'held', 'delivered')",
+        params![recipient_address],
+        |row| row.get(0),
+    )?)
 }
 
 pub(crate) fn get_message(

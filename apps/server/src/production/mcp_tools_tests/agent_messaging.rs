@@ -3813,9 +3813,7 @@ mod hop_limit {
         let harness = Harness::new().await;
         harness.messaging_threads().await;
         let trigger = harness.hop_8_delivered_to_a().await;
-        harness
-            .provider_turn("a", "turn-a2", "Port", true)
-            .await;
+        harness.provider_turn("a", "turn-a2", "Port", true).await;
         harness.until_status(&trigger, "completed").await;
 
         assert_hop_limit(
@@ -3851,7 +3849,7 @@ mod claim_review {
 
     impl Harness {
         /// Send now on `thread_id`'s queued entry `command_id`, as a person clicks it.
-        async fn send_now(&self, thread_id: &str, command_id: &str) {
+        pub(super) async fn send_now(&self, thread_id: &str, command_id: &str) {
             let message_id = self
                 .repositories
                 .get_provider_turn_delivery(command_id.to_owned())
@@ -3968,10 +3966,20 @@ mod claim_review {
             .expect("pending");
         harness.delivery.wake();
 
-        let before = harness.engine.repositories().provider_turn_claims_for_test();
+        let before = harness
+            .engine
+            .repositories()
+            .provider_turn_claims_for_test();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let claims = harness.engine.repositories().provider_turn_claims_for_test() - before;
-        assert!(claims <= 3, "{claims} claims in 500 ms while the ask is open");
+        let claims = harness
+            .engine
+            .repositories()
+            .provider_turn_claims_for_test()
+            - before;
+        assert!(
+            claims <= 3,
+            "{claims} claims in 500 ms while the ask is open"
+        );
         assert_eq!(harness.entry_state(&entry).await, "pending");
 
         let person = harness.person_queues("b").await;
@@ -3986,6 +3994,344 @@ mod claim_review {
             )
             .await;
         harness.until_entry(&entry, "delivered").await;
+        harness.shutdown().await;
+    }
+}
+
+// ---- Task 6.6: rate and backlog limits ----
+
+mod limits {
+    use super::*;
+
+    const RATE_LIMIT: &str = "You have sent 30 agent messages in the last 60 seconds, which is the limit. Wait before sending more.";
+    const BACKLOG_LIMIT: &str = "The recipient already has 20 agent messages it has not read, which is the limit. Try again after it has read some.";
+
+    fn is_rate_limit(result: &Value) -> bool {
+        result["isError"] == true
+            && result["structuredContent"]["error"]["_tag"] == "AgentMessagingRateLimitError"
+            && result["structuredContent"]["error"]["message"] == RATE_LIMIT
+    }
+
+    fn is_backlog_limit(result: &Value) -> bool {
+        result["isError"] == true
+            && result["structuredContent"]["error"]["_tag"] == "AgentMessagingBacklogLimitError"
+            && result["structuredContent"]["error"]["message"] == BACKLOG_LIMIT
+    }
+
+    fn accepted(result: &Value) -> bool {
+        result["isError"] != true && result["structuredContent"]["status"].is_string()
+    }
+
+    impl Harness {
+        /// `count` more agents `s0`, `s1`, ... in project `p1`, in full-access.
+        async fn more_agents(&self, count: usize) -> Vec<String> {
+            let mut threads = Vec::new();
+            for index in 0..count {
+                let thread_id = format!("s{index}");
+                self.engine
+                    .dispatch(command(json!({
+                        "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                        "threadId": thread_id, "projectId": "p1", "title": format!("Agent {index}"),
+                        "modelSelection": { "instanceId": "codex", "model": "model" },
+                        "runtimeMode": "full-access", "createdAt": CREATED_AT,
+                    })))
+                    .await
+                    .expect("thread created");
+                threads.push(thread_id);
+            }
+            threads
+        }
+
+        async fn send_to(&self, caller: &str, to: &str) -> Value {
+            self.agent_send(caller, send_arguments(to, "hello")).await
+        }
+
+        /// `count` sends from `caller`, alternating between B and P so no backlog fills.
+        async fn sends_from(&self, caller: &str, count: usize) {
+            for index in 0..count {
+                let to = if index % 2 == 0 {
+                    "thread:b"
+                } else {
+                    "thread:p"
+                };
+                let result = self.send_to(caller, to).await;
+                assert!(accepted(&result), "send {index}: {result}");
+            }
+        }
+
+        /// Rewrites the acceptance time of every message `sender` sent to `seconds` ago.
+        async fn sent_ago(&self, sender: &str, seconds: i64) {
+            let at = (time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("time");
+            let sender = format!("thread:{sender}");
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE agent_messages SET accepted_at = ?1 WHERE sender_address = ?2",
+                        [&at, &sender],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("rewritten");
+        }
+
+        async fn rows_from(&self, sender: &str) -> i64 {
+            let sender = format!("thread:{sender}");
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM agent_messages WHERE sender_address = ?1",
+                        [&sender],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .expect("count")
+        }
+
+        async fn all_outbox_rows(&self) -> i64 {
+            self.repositories
+                .database()
+                .call(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM provider_turn_outbox WHERE command_id LIKE 'agent-message:%'",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .expect("count")
+        }
+
+        /// `count` rows of sender kind person from `sender` to `recipient`, inserted directly.
+        async fn person_rows(&self, sender: &str, recipient: &str, count: usize) {
+            let (sender, recipient) = (sender.to_owned(), recipient.to_owned());
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    let tx = connection.transaction()?;
+                    for index in 0..count {
+                        crate::agent_messaging::store::insert_message(
+                            &tx,
+                            &crate::agent_messaging::store::NewAgentMessage {
+                                message_id: format!("person-{index}"),
+                                conversation_id: "c1".to_owned(),
+                                sender_address: sender.clone(),
+                                sender_kind: crate::agent_messaging::store::SenderKind::Person,
+                                recipient_address: recipient.clone(),
+                                in_reply_to: None,
+                                hop: 1,
+                                text: "From a person".to_owned(),
+                                status: crate::agent_messaging::store::AgentMessageStatus::Queued,
+                                reason: None,
+                                accepted_at: crate::mcp::control::now_iso(),
+                                sender_runtime_mode: None,
+                                recipient_terminal_generation: None,
+                                send_request_id: None,
+                                client_request_id: None,
+                                delivery_command_id: None,
+                                delivery_message_id: None,
+                            },
+                        )?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await
+                .expect("person rows");
+        }
+    }
+
+    #[tokio::test]
+    async fn flooding_one_recipient() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        for sender in harness.more_agents(20).await {
+            assert!(accepted(&harness.send_to(&sender, "thread:b").await));
+        }
+        assert_eq!(harness.outbox_states("b").await.len(), 20);
+
+        let result = harness.send_to("a", "thread:b").await;
+
+        assert!(is_backlog_limit(&result), "{result}");
+        assert_eq!(harness.outbox_states("b").await.len(), 20);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn thirty_in_sixty_seconds() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.sends_from("a", 30).await;
+
+        let refused = harness.send_to("a", "thread:p").await;
+        assert!(is_rate_limit(&refused), "{refused}");
+
+        harness.sent_ago("a", 61).await;
+        let after = harness.send_to("a", "thread:p").await;
+        assert!(accepted(&after), "{after}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_send_does_not_count() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.sends_from("a", 30).await;
+        let outbox = harness.all_outbox_rows().await;
+
+        for _ in 0..30 {
+            assert!(is_rate_limit(&harness.send_to("a", "thread:b").await));
+        }
+
+        assert_eq!(harness.rows_from("a").await, 30);
+        assert_eq!(harness.all_outbox_rows().await, outbox);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn another_senders_rate_is_separate() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.sends_from("a", 30).await;
+        assert!(is_rate_limit(&harness.send_to("a", "thread:b").await));
+
+        let other = harness.send_to("p", "thread:a").await;
+
+        assert!(accepted(&other), "{other}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn consumed_messages_free_the_backlog() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let senders = harness.more_agents(20).await;
+        let mut sent = Vec::new();
+        for sender in &senders {
+            let result = harness.send_to(sender, "thread:b").await;
+            sent.push(
+                structured(&result)["messageId"]
+                    .as_str()
+                    .expect("id")
+                    .to_owned(),
+            );
+        }
+        assert!(is_backlog_limit(&harness.send_to("a", "thread:b").await));
+        let consumed = sent[..5].to_vec();
+        harness
+            .repositories
+            .database()
+            .call(move |connection| {
+                for message_id in &consumed {
+                    connection.execute(
+                        "UPDATE agent_messages SET status = 'consumed' WHERE message_id = ?1",
+                        [message_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("consumed");
+
+        let result = harness.send_to("a", "thread:b").await;
+
+        assert!(accepted(&result), "{result}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_error_names_the_limit_that_applied() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        for _ in 0..20 {
+            assert!(accepted(&harness.send_to("a", "thread:b").await));
+        }
+        for _ in 0..10 {
+            assert!(accepted(&harness.send_to("a", "thread:p").await));
+        }
+
+        let result = harness.send_to("a", "thread:b").await;
+
+        assert!(is_rate_limit(&result), "{result}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn simultaneous_sends_from_one_sender_admit_exactly_thirty() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let sends = (0..32).map(|index| {
+            let to = if index % 2 == 0 {
+                "thread:b"
+            } else {
+                "thread:p"
+            };
+            harness.send_to("a", to)
+        });
+
+        let results = futures_util::future::join_all(sends).await;
+
+        assert_eq!(results.iter().filter(|result| accepted(result)).count(), 30);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| is_rate_limit(result))
+                .count(),
+            2
+        );
+        assert_eq!(harness.rows_from("a").await, 30);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn simultaneous_sends_from_many_senders_admit_exactly_twenty() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let senders = harness.more_agents(25).await;
+        let sends = senders
+            .iter()
+            .map(|sender| harness.send_to(sender, "thread:b"));
+
+        let results = futures_util::future::join_all(sends).await;
+
+        assert_eq!(results.iter().filter(|result| accepted(result)).count(), 20);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| is_backlog_limit(result))
+                .count(),
+            5
+        );
+        assert_eq!(harness.outbox_states("b").await.len(), 20);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_persons_requests_do_not_use_the_agent_backlog() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.person_rows("thread:p", "thread:b", 20).await;
+
+        let result = harness.send_to("a", "thread:b").await;
+
+        assert!(accepted(&result), "{result}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_persons_sends_do_not_use_the_agent_rate() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.person_rows("thread:a", "thread:p", 30).await;
+
+        let result = harness.send_to("a", "thread:b").await;
+
+        assert!(accepted(&result), "{result}");
         harness.shutdown().await;
     }
 }

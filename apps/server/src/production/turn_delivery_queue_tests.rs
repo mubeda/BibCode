@@ -3508,7 +3508,7 @@ mod agent_message {
         dispatch_queued_with(
             &engine,
             "agent-message:m1",
-            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1"), None),
         )
         .await
         .unwrap();
@@ -3557,7 +3557,7 @@ mod agent_message {
         let result = dispatch_queued_with(
             &engine,
             "agent-message:m1",
-            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1"), None),
         )
         .await;
 
@@ -3576,7 +3576,7 @@ mod agent_message {
         dispatch_queued_with(
             &engine,
             "agent-message:m1",
-            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1"), None),
         )
         .await
         .unwrap();

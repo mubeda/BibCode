@@ -6605,7 +6605,14 @@ async fn persist_command(
                 }
                 // The agent message and its queue entry commit together or not at all.
                 match admission.agent_message {
-                    Some(AgentMessageCompanion::Insert(message)) => {
+                    Some(AgentMessageCompanion::Insert(message, limits)) => {
+                        // Counted and inserted in one transaction, so concurrent sends cannot
+                        // both take the last slot; a refusal rolls the queue entry back too.
+                        if let Some(limits) = &limits
+                            && let Err(refusal) = crate::agent_messaging::policy::enforce_limits(&transaction, &message, limits)?
+                        {
+                            return Ok(Err(refusal.detail()));
+                        }
                         crate::agent_messaging::store::insert_message(&transaction, &message)?;
                     }
                     Some(AgentMessageCompanion::Relink(relink)) => {
