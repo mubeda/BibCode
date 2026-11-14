@@ -2082,7 +2082,6 @@ pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
 /// tool hooks carry its `agent_id` and leave the main state alone, except that its finished
 /// tool ends an approval prompt; a permission prompt blocks the user whoever asks. Only the
 /// event name, the tool name and the notification type are read.
-
 fn claude_hook_agent_status(hook: &ClaudeStatusHook) -> Option<ClaudeAgentReport> {
     let event = safe_text(hook.hook_event_name.as_deref())?;
     safe_text(hook.session_id.as_deref())?;
