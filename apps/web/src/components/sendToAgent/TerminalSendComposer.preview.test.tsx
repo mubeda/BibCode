@@ -18,7 +18,7 @@ const h = vi.hoisted(() => ({
   getTerminalOutput: vi.fn(),
   terminalWrites: 0,
   send: vi.fn(),
-  rows: [] as unknown[],
+  rows: [] as ReadonlyArray<unknown>,
 }));
 
 vi.mock("~/state/entities", () => ({
