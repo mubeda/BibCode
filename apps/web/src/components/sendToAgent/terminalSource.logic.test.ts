@@ -11,6 +11,7 @@ import {
 import {
   isAiTerminal,
   makeTerminalOutputLoader,
+  shouldActivateSendPanel,
   terminalAttachment,
   terminalHasText,
 } from "./terminalSource.logic";
@@ -187,5 +188,25 @@ describe("makeTerminalOutputLoader", () => {
       label: "Recent terminal output",
       text: "$ make test",
     });
+  });
+});
+
+describe("shouldActivateSendPanel", () => {
+  const host = ThreadId.make("host");
+
+  it("keeps the source open when activating the panel would unmount it", () => {
+    // A center terminal and a panel that is not the host both lose their preview to activation.
+    expect(shouldActivateSendPanel({ hostThreadId: null, sourceUnmountsOnActivate: true })).toBe(
+      false,
+    );
+    expect(shouldActivateSendPanel({ hostThreadId: host, sourceUnmountsOnActivate: false })).toBe(
+      false,
+    );
+  });
+
+  it("activates the new panel for a send from the host's own chat", () => {
+    expect(shouldActivateSendPanel({ hostThreadId: null, sourceUnmountsOnActivate: false })).toBe(
+      true,
+    );
   });
 });
