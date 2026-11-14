@@ -3024,7 +3024,11 @@ async fn store_message(harness: &Harness, thread_id: &str, index: usize, role: &
 /// `count` messages on `thread_id`, the person's first, then alternating with the agent.
 async fn store_thread(harness: &Harness, thread_id: &str, count: usize) {
     for index in 0..count {
-        let role = if index % 2 == 0 { "user" } else { "assistant" };
+        let role = if index.is_multiple_of(2) {
+            "user"
+        } else {
+            "assistant"
+        };
         store_message(harness, thread_id, index, role, &format!("message {index}")).await;
     }
 }

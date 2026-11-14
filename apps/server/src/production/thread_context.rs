@@ -232,7 +232,11 @@ mod tests {
     fn alternating(count: usize) -> Vec<ProjectionThreadMessage> {
         (0..count)
             .map(|id| {
-                let role = if id % 2 == 0 { "user" } else { "assistant" };
+                let role = if id.is_multiple_of(2) {
+                    "user"
+                } else {
+                    "assistant"
+                };
                 message(id, role, &format!("message {id}"))
             })
             .collect()
