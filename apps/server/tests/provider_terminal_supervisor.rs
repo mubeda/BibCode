@@ -15925,6 +15925,88 @@ async fn opencode_reconciliation_keeps_reading_the_stream_while_a_request_is_hel
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_reconciliation_backlog_past_its_bound_needs_a_new_root_event_for_readiness() {
+    // Mutation caught: a reconciliation whose backlog filled, so the stream then went unread,
+    // keeping the idle read before it as if nothing could have followed.
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open(vec![OpenCodeFixtureStreamScript::new([Ok(
+        opencode_fixture_connected_frame(),
+    )])])
+    .await;
+    let terminal = "terminal-opencode-toggle";
+    let idle =
+        opencode_fixture_event_frame(opencode_root_event("session.idle", serde_json::json!({})));
+    push_raw_dormant_frame(&fixture.remote_state, &idle);
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    let gate = Arc::new(OpenCodeRequestGate::default());
+    *fixture
+        .remote_state
+        .children_gate
+        .lock()
+        .expect("OpenCode children gate") = Some(gate.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.acquire())
+        .await
+        .expect("the periodic reconciliation asks for the root's children")
+        .expect("OpenCode children entered")
+        .forget();
+    // Events that say nothing about the root, past the observer's backlog of 1024.
+    let unrelated = opencode_fixture_event_frame(serde_json::json!({
+        "type": "server.heartbeat",
+        "properties": {},
+    }));
+    for _ in 0..1100 {
+        push_raw_dormant_frame(&fixture.remote_state, &unrelated);
+    }
+    let handouts = || {
+        fixture
+            .remote_state
+            .handouts
+            .lock()
+            .expect("OpenCode handouts")
+            .len()
+    };
+    // The connected frame, the idle, then the 1024 events the backlog holds while the held
+    // request lasts, under its 500 ms timeout.
+    let filled = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        while handouts() < 1026 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    gate.release.add_permits(1);
+    filled.expect("the backlog fills while the children request is held");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while handouts() < 1102 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer reads every event");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        terminal_readiness(&fixture.manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "an idle read before the stream went unread kept the terminal ready"
+    );
+    push_raw_dormant_frame(&fixture.remote_state, &idle);
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opencode_periodic_reconciliation_withdraws_readiness_and_older_idles_never_restore_it() {
     // Z3: the periodic reconciliation kept readiness while it stopped reading the stream, and
     // an idle queued before a busy and an ask made the terminal ready when read after it.

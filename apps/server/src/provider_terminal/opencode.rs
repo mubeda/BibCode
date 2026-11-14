@@ -76,6 +76,8 @@ const OPENCODE_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const OPENCODE_OBSERVATION_ACK_GRACE: Duration = Duration::from_millis(100);
 const OPENCODE_REATTACH_REQUEST_LIMIT: u32 = (MAX_RECONCILED_CHILDREN as u32) * 2 + 2;
 const OPENCODE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
+/// Events the observer keeps while a reconciliation runs; past this the stream waits unread.
+const OPENCODE_RECONCILIATION_BACKLOG_LIMIT: usize = 1024;
 const OPENCODE_SSE_RETRY_MIN: Duration = Duration::from_millis(100);
 const OPENCODE_SSE_RETRY_MAX: Duration = Duration::from_secs(2);
 /// The first wait before an activity scope that could not be written is written again.
@@ -1088,17 +1090,62 @@ impl OpenCodeLivePublication<'_> {
     }
 }
 
+/// What the observer read from its stream while it did other work, in order: an event or the
+/// stream's error, or `None` where the stream then went unread because the backlog was full.
+type OpenCodeBacklog = VecDeque<Option<Result<Vec<u8>, String>>>;
+
+/// Runs `work` while it keeps reading `stream` into `backlog`, so events do not pile up unread
+/// behind it. Reading stops at the stream's first error or at the backlog's bound.
 async fn wait_for_opencode_live_work<T>(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     generation: &TerminalObserverGenerationLease,
+    stream: &mut dyn OpenCodeEventStream,
+    backlog: &mut OpenCodeBacklog,
     work: impl Future<Output = T>,
 ) -> OpenCodeLiveWork<T> {
     tokio::pin!(work);
-    tokio::select! {
-        biased;
-        _ = generation.cancelled() => OpenCodeLiveWork::Cancelled,
-        changed = activity.changed() => OpenCodeLiveWork::ActivityChanged(changed.is_ok()),
-        completed = &mut work => OpenCodeLiveWork::Completed(completed),
+    let mut reading = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => return OpenCodeLiveWork::Cancelled,
+            changed = activity.changed() => {
+                return OpenCodeLiveWork::ActivityChanged(changed.is_ok());
+            }
+            completed = &mut work => return OpenCodeLiveWork::Completed(completed),
+            data = stream.next_data(), if reading => {
+                let full = data.is_ok()
+                    && backlog.len() + 1 >= OPENCODE_RECONCILIATION_BACKLOG_LIMIT;
+                reading = data.is_ok() && !full;
+                backlog.push_back(Some(data));
+                if full {
+                    backlog.push_back(None);
+                }
+            }
+        }
+    }
+}
+
+/// Reports the root's state a dormant read carries; data that is not JSON breaks the stream.
+fn publish_opencode_dormant_status(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
+    root_session_id: &str,
+    data: Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    match data? {
+        Some(data)
+            if !publish_opencode_agent_status(
+                generation,
+                readiness,
+                root_session_id,
+                &data,
+                PromptEvidence::Fresh,
+            ) =>
+        {
+            Err("malformed OpenCode event".to_owned())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1245,6 +1292,7 @@ async fn run_opencode_observer(
     }
 
     let mut epoch = 0_u64;
+    let mut backlog = OpenCodeBacklog::new();
     let mut readiness = PromptReadiness::default();
     let mut stream = attach_opencode_root(
         &mut *remote,
@@ -1351,53 +1399,62 @@ async fn run_opencode_observer(
             continue;
         }
 
-        let event = {
-            let current_stream = stream.as_mut().expect("OpenCode stream is present");
-            match mode {
-                OpenCodeObserverMode::Live => tokio::select! {
-                    biased;
-                    _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
-                    changed = activity.changed() => {
-                        OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
-                    }
-                    _ = interval.tick() => OpenCodeObserverEvent::Reconcile,
-                    data = readiness.wait(&generation, current_stream.next_data()) => {
-                        OpenCodeObserverEvent::Data(data)
-                    }
-                },
-                OpenCodeObserverMode::Dormant | OpenCodeObserverMode::Unavailable => {
-                    let retry = scope_retry;
-                    tokio::select! {
+        let event = match backlog.pop_front() {
+            // The stream went unread past the backlog: a pending read cannot prove it empty, so
+            // only a root event read after this makes the terminal ready.
+            Some(None) => {
+                readiness.reset(&generation);
+                continue;
+            }
+            Some(Some(data)) if mode == OpenCodeObserverMode::Live => {
+                OpenCodeObserverEvent::Data(data)
+            }
+            Some(Some(data)) => OpenCodeObserverEvent::Discard(publish_opencode_dormant_status(
+                &generation,
+                &mut readiness,
+                &root_session_id,
+                data.map(Some),
+            )),
+            None => {
+                let current_stream = stream.as_mut().expect("OpenCode stream is present");
+                match mode {
+                    OpenCodeObserverMode::Live => tokio::select! {
                         biased;
                         _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
                         changed = activity.changed() => {
                             OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
                         }
-                        // Enabling again writes the scope that could not be written.
-                        () = async {
-                            if let Some(at) = retry {
-                                tokio::time::sleep_until(at).await;
-                            }
-                        }, if retry.is_some() => {
-                            scope_retry = None;
-                            OpenCodeObserverEvent::ActivityChanged(true)
+                        _ = interval.tick() => OpenCodeObserverEvent::Reconcile,
+                        data = readiness.wait(&generation, current_stream.next_data()) => {
+                            OpenCodeObserverEvent::Data(data)
                         }
-                        // Dormant activity still reads the root agent's state (#187).
-                        data = readiness.wait(&generation, current_stream.next_dormant_data()) => {
-                            OpenCodeObserverEvent::Discard(data.and_then(|data| match data {
-                                Some(data)
-                                    if !publish_opencode_agent_status(
-                                        &generation,
-                                        &mut readiness,
-                                        &root_session_id,
-                                        &data,
-                                        PromptEvidence::Fresh,
-                                    ) =>
-                                {
-                                    Err("malformed OpenCode event".to_owned())
+                    },
+                    OpenCodeObserverMode::Dormant | OpenCodeObserverMode::Unavailable => {
+                        let retry = scope_retry;
+                        tokio::select! {
+                            biased;
+                            _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
+                            changed = activity.changed() => {
+                                OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
+                            }
+                            // Enabling again writes the scope that could not be written.
+                            () = async {
+                                if let Some(at) = retry {
+                                    tokio::time::sleep_until(at).await;
                                 }
-                                _ => Ok(()),
-                            }))
+                            }, if retry.is_some() => {
+                                scope_retry = None;
+                                OpenCodeObserverEvent::ActivityChanged(true)
+                            }
+                            // Dormant activity still reads the root agent's state (#187).
+                            data = readiness.wait(&generation, current_stream.next_dormant_data()) => {
+                                OpenCodeObserverEvent::Discard(publish_opencode_dormant_status(
+                                    &generation,
+                                    &mut readiness,
+                                    &root_session_id,
+                                    data,
+                                ))
+                            }
                         }
                     }
                 }
@@ -1428,20 +1485,21 @@ async fn run_opencode_observer(
                     &mut sequence,
                     Some(publication),
                 );
-                match wait_for_opencode_live_work(&mut activity, &generation, reconciliation).await
+                let current_stream = stream.as_mut().expect("OpenCode stream is present");
+                match wait_for_opencode_live_work(
+                    &mut activity,
+                    &generation,
+                    &mut **current_stream,
+                    &mut backlog,
+                    reconciliation,
+                )
+                .await
                 {
                     OpenCodeLiveWork::Cancelled => OpenCodeObserverEvent::Cancelled,
                     OpenCodeLiveWork::ActivityChanged(changed) => {
                         OpenCodeObserverEvent::ActivityChanged(changed)
                     }
-                    OpenCodeLiveWork::Completed(()) => {
-                        // shortcut: the stream went unread meanwhile, and a pending read of it
-                        // cannot prove it empty (its body arrives through the HTTP client's
-                        // connection task), so only a root event read after this makes the
-                        // terminal ready again. Upgrade by reading the stream while reconciling.
-                        readiness.reset(&generation);
-                        continue;
-                    }
+                    OpenCodeLiveWork::Completed(()) => continue,
                 }
             }
             event => event,
@@ -1474,6 +1532,8 @@ async fn run_opencode_observer(
                     live_state = None;
                     mode = OpenCodeObserverMode::Dormant;
                     replacement_started = true;
+                    // What the old stream holds predates the replacement.
+                    backlog.clear();
                     let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
                     let outcome = {
                         let dormant_stream =
@@ -1616,6 +1676,7 @@ async fn run_opencode_observer(
                     OpenCodeLiveData::Undecoded | OpenCodeLiveData::Stale => continue,
                     OpenCodeLiveData::Malformed => {
                         readiness.reset(&generation);
+                        backlog.clear();
                         stream = None;
                         epoch = epoch.saturating_add(1);
                         live_state = None;
@@ -1646,6 +1707,7 @@ async fn run_opencode_observer(
             OpenCodeObserverEvent::Reconcile => unreachable!("reconciliation is resolved above"),
             OpenCodeObserverEvent::Data(Err(_)) | OpenCodeObserverEvent::Discard(Err(_)) => {
                 readiness.reset(&generation);
+                backlog.clear();
                 stream = None;
                 epoch = epoch.saturating_add(1);
                 live_state = None;
@@ -6278,7 +6340,17 @@ mod tests {
             }
         };
         let observation = generation.observation();
-        let waiting = wait_for_opencode_live_work(&mut changes, &observation, reconciliation);
+        let mut stream = ConnectedStream {
+            events: VecDeque::new(),
+        };
+        let mut backlog = OpenCodeBacklog::new();
+        let waiting = wait_for_opencode_live_work(
+            &mut changes,
+            &observation,
+            &mut stream,
+            &mut backlog,
+            reconciliation,
+        );
         tokio::pin!(waiting);
         let first_poll =
             std::future::poll_fn(|context| std::task::Poll::Ready(waiting.as_mut().poll(context)))
