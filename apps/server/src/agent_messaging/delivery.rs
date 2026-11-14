@@ -123,6 +123,15 @@ pub(crate) fn derive_chat_status(
     ) else {
         return Ok(unchanged);
     };
+    // A context-limit recovery sends the message again, and its copy takes over the message.
+    let recovering: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thread_compactions WHERE failed_message_id = ?1 AND state IN ('requested', 'running', 'unresolved'))",
+        [delivery_message_id],
+        |row| row.get(0),
+    )?;
+    if recovering {
+        return Ok(unchanged);
+    }
     if let Some((turn_id, state)) = consuming_turn(
         connection,
         thread_id,
@@ -425,6 +434,7 @@ fn thread_of(event: &OrchestrationEvent) -> Option<&str> {
             | "thread.turn-interrupt-requested"
             | "thread.runtime-mode-set"
             | "thread.deleted"
+            | "thread.compacted"
     )
     .then_some(event.aggregate_id.as_str())
 }

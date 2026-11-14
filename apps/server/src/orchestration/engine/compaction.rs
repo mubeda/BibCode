@@ -678,6 +678,37 @@ fn admit_resend_copy_tx(
     let copy_command_id = resend_command_id(failed_message_id);
     let copy_message_id = resend_message_id(failed_message_id);
     let occurred_at = context.occurred_at.to_owned();
+    // An agent message's copy stays that message, so the claim gate, the envelope and its status
+    // follow the copy; one that can no longer be relinked (cancelled, final) gets no copy.
+    let agent_message = transaction
+        .query_row(
+            "SELECT message_id, status FROM agent_messages WHERE delivery_command_id = ? AND delivery_message_id = ?",
+            params![original_command_id, failed_message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((message_id, status)) = agent_message {
+        use crate::agent_messaging::store::{AgentMessageStatus, RelinkAgentMessage, apply_relink};
+        let relinked = match AgentMessageStatus::parse(&status) {
+            Some(expected_status) => apply_relink(
+                transaction,
+                &RelinkAgentMessage {
+                    message_id,
+                    expected_status,
+                    expected_delivery_command_id: Some(original_command_id.clone()),
+                    delivery_command_id: copy_command_id.clone(),
+                    delivery_message_id: copy_message_id.clone(),
+                    status: AgentMessageStatus::Accepted,
+                    reason: None,
+                },
+                &occurred_at,
+            )?,
+            None => false,
+        };
+        if !relinked {
+            return Ok(None);
+        }
+    }
     let Some(object) = payload.as_object_mut() else {
         return Err(PersistenceError::Corrupt(
             "a stored turn delivery payload is not an object".to_owned(),

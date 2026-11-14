@@ -65,10 +65,10 @@ fn decide(
     connection: &rusqlite::Connection,
     command_id: &str,
     enabled: bool,
-) -> rusqlite::Result<ClaimDecision> {
+) -> crate::persistence::Result<ClaimDecision> {
     let row = connection
         .query_row(
-            "SELECT message.sender_kind, message.status, message.reason, message.sender_runtime_mode, thread.runtime_mode
+            "SELECT message.sender_kind, message.status, message.reason, message.sender_runtime_mode, thread.runtime_mode, message.recipient_address
                FROM agent_messages AS message
                LEFT JOIN projection_threads AS thread
                  ON 'thread:' || thread.thread_id = message.recipient_address
@@ -81,11 +81,13 @@ fn decide(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((sender_kind, status, reason, sender_mode, recipient_mode)) = row else {
+    let Some((sender_kind, status, reason, sender_mode, recipient_mode, recipient_address)) = row
+    else {
         return Ok(ClaimDecision::Proceed);
     };
     if SenderKind::parse(&sender_kind) != Some(SenderKind::Agent) {
@@ -117,6 +119,13 @@ fn decide(
         return Ok(ClaimDecision::Hold(
             AgentMessageReason::RecipientModeAboveSender,
         ));
+    }
+    // Whatever made the entry pending (Send now, a retry, a recovery copy), it never runs past
+    // an open ask (R9); answering it wakes delivery, and the next claim asks again.
+    if let Some(thread_id) = recipient_address.strip_prefix("thread:")
+        && super::store::has_open_ask(connection, thread_id)?
+    {
+        return Ok(ClaimDecision::Wait);
     }
     Ok(ClaimDecision::Proceed)
 }

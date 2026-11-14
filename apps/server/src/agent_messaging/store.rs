@@ -305,14 +305,15 @@ pub(crate) fn set_status(
 }
 
 /// Returns false when the row is not in the expected status with the expected delivery command,
-/// or its status is terminal.
+/// or its status is terminal. The new queue entry starts a new turn, so the recorded one is
+/// cleared.
 pub(crate) fn apply_relink(
     tx: &rusqlite::Transaction<'_>,
     relink: &RelinkAgentMessage,
     updated_at: &str,
 ) -> Result<bool> {
     let changed = tx.execute(
-        "UPDATE agent_messages SET delivery_command_id = ?4, delivery_message_id = ?5, status = ?6, reason = ?7, updated_at = ?8 \
+        "UPDATE agent_messages SET delivery_command_id = ?4, delivery_message_id = ?5, status = ?6, reason = ?7, updated_at = ?8, recipient_turn_id = NULL \
          WHERE message_id = ?1 AND status = ?2 AND delivery_command_id IS ?3 \
            AND status NOT IN ('completed', 'cancelled', 'failed')",
         params![
@@ -480,6 +481,20 @@ pub(crate) fn is_agent_message_delivery(
     Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_messages WHERE delivery_command_id = ?1 AND delivery_message_id = ?2 AND sender_kind = 'agent')",
         params![command_id, message_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether `thread_id` has a pending approval or an open question, by the rule the promotion
+/// gate applies: an agent message never answers or runs past one (R6, R9).
+pub(crate) fn has_open_ask(connection: &rusqlite::Connection, thread_id: &str) -> Result<bool> {
+    let open_user_inputs = crate::persistence::open_user_input_requests_sql("?1");
+    Ok(connection.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM projection_pending_approvals WHERE thread_id = ?1 AND status = 'pending')
+                 OR EXISTS({open_user_inputs})"
+        ),
+        params![thread_id],
         |row| row.get(0),
     )?)
 }

@@ -310,28 +310,35 @@ impl AgentMessaging {
             .sender_address
             .strip_prefix("thread:")
             .ok_or(AgentMessagingError::RecipientGone)?;
+        check_text(&request.text)?;
+        let message_id = Uuid::new_v4().to_string();
+        let outgoing = Outgoing {
+            message_id: &message_id,
+            conversation_id: &original.conversation_id,
+            in_reply_to: Some(&original.message_id),
+            // Hop counting is task 6.5's.
+            hop: 1,
+            text: &request.text,
+            client_request_id: request.client_request_id.as_deref(),
+        };
+        // A stored receipt answers a retry even after its recipient is gone (R12).
+        if let Some(receipt) = self
+            .replay(
+                &format!("thread:{sender_thread_id}"),
+                &original.sender_address,
+                &outgoing,
+            )
+            .await?
+        {
+            return Ok((receipt, (String::new(), String::new())));
+        }
         let route = match self.route(sender_thread_id, recipient_thread_id).await {
             Err(AgentMessagingError::UnknownRecipient) => {
                 return Err(AgentMessagingError::RecipientGone);
             }
             route => route?,
         };
-        check_text(&request.text)?;
-        let message_id = Uuid::new_v4().to_string();
-        let receipt = self
-            .deliver(
-                &route,
-                Outgoing {
-                    message_id: &message_id,
-                    conversation_id: &original.conversation_id,
-                    in_reply_to: Some(&original.message_id),
-                    // Hop counting is task 6.5's.
-                    hop: 1,
-                    text: &request.text,
-                    client_request_id: request.client_request_id.as_deref(),
-                },
-            )
-            .await?;
+        let receipt = self.deliver(&route, outgoing).await?;
         Ok((receipt, (route.sender.title, route.recipient.title)))
     }
 
@@ -399,23 +406,26 @@ impl AgentMessaging {
             .strip_prefix("thread:")
             .filter(|id| !id.is_empty() && *id != sender_thread_id)
             .ok_or(AgentMessagingError::UnknownRecipient)?;
-        let route = self.route(sender_thread_id, recipient_thread_id).await?;
         check_text(&request.text)?;
         let message_id = Uuid::new_v4().to_string();
         let conversation_id = Uuid::new_v4().to_string();
-        let receipt = self
-            .deliver(
-                &route,
-                Outgoing {
-                    message_id: &message_id,
-                    conversation_id: &conversation_id,
-                    in_reply_to: None,
-                    hop: 1,
-                    text: &request.text,
-                    client_request_id: request.client_request_id.as_deref(),
-                },
-            )
-            .await?;
+        let outgoing = Outgoing {
+            message_id: &message_id,
+            conversation_id: &conversation_id,
+            in_reply_to: None,
+            hop: 1,
+            text: &request.text,
+            client_request_id: request.client_request_id.as_deref(),
+        };
+        // A stored receipt answers a retry even after its recipient is gone (R12).
+        if let Some(receipt) = self
+            .replay(&format!("thread:{sender_thread_id}"), &request.to, &outgoing)
+            .await?
+        {
+            return Ok((receipt, (String::new(), String::new())));
+        }
+        let route = self.route(sender_thread_id, recipient_thread_id).await?;
+        let receipt = self.deliver(&route, outgoing).await?;
         Ok((receipt, (route.sender.title, route.recipient.title)))
     }
 
@@ -486,12 +496,6 @@ impl AgentMessaging {
         };
         let sender_address = format!("thread:{}", route.sender.thread_id);
         let recipient_address = format!("thread:{}", route.recipient.thread_id);
-        if let Some(receipt) = self
-            .replay(&sender_address, &recipient_address, &outgoing)
-            .await?
-        {
-            return Ok(receipt);
-        }
         let sender_mode = &route.sender.runtime_mode;
         let recipient_mode = &route.recipient.runtime_mode;
         if !policy::ceiling_allows(sender_mode, recipient_mode) {

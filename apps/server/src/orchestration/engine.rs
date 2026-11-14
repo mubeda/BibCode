@@ -3977,20 +3977,26 @@ async fn process_envelope(
             payload_digest.clone(),
         )
         .await?;
-        if let Some(saved) = committed {
-            return Ok(ProcessEnvelopeOutcome {
-                result: DispatchResult {
-                    sequence: saved.sequence,
-                    thread_id: None,
-                    project_id: None,
-                    disposition: None,
-                },
-                accepted_new: true,
-            });
-        }
+        let refusal = match committed {
+            Ok(saved) => {
+                return Ok(ProcessEnvelopeOutcome {
+                    result: DispatchResult {
+                        sequence: saved.sequence,
+                        thread_id: None,
+                        project_id: None,
+                        disposition: None,
+                    },
+                    accepted_new: true,
+                });
+            }
+            Err(refusal) => refusal,
+        };
 
-        let detail = format!(
-            "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
+        let detail = refusal.map_or_else(
+            || format!(
+                "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
+            ),
+            str::to_owned,
         );
         repositories
             .finalize_command_receipt(CommandReceipt {
@@ -6310,6 +6316,10 @@ struct PersistCommandOutcome {
 
 const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
 const STALE_AGENT_MESSAGE_RELINK: &str = "agent-message-relink-stale";
+const AGENT_MESSAGE_WAITS_FOR_ANSWER: &str =
+    "An agent message waits for the open approval or question to be answered.";
+const AGENT_MESSAGE_NOT_RETRIED: &str =
+    "A failed agent message is not sent again. Its sender can send it again.";
 
 #[allow(clippy::too_many_arguments)]
 async fn persist_command(
@@ -6443,6 +6453,17 @@ async fn persist_command(
                 // promoted, interrupted, or started a turn since command planning.
                 if !can_promote_queued_provider_turn_on(&transaction, &thread_id, &message_id, automatic)? {
                     return Ok(Err(STALE_QUEUED_DELIVERY));
+                }
+                // Send now skips the open-ask check for a person's message, never an agent's (R9).
+                if !automatic {
+                    let command_id: String = transaction.query_row(
+                        "SELECT command_id FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
+                        params![thread_id, message_id], |row| row.get(0))?;
+                    if crate::agent_messaging::store::is_agent_message_delivery(&transaction, &command_id, &message_id)?
+                        && crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
+                    {
+                        return Ok(Err(AGENT_MESSAGE_WAITS_FOR_ANSWER));
+                    }
                 }
                 transaction.execute("UPDATE provider_turn_outbox SET state = 'pending', mode = 'start', held = 0, last_error = NULL, updated_at = ? WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
                     params![created_at, thread_id, message_id])?;
@@ -7172,7 +7193,7 @@ async fn persist_turn_delivery_resolution(
     action: TurnDeliveryResolutionAction,
     updated_at: String,
     payload_digest: Option<String>,
-) -> Result<Option<OrchestrationEvent>, OrchestrationError> {
+) -> Result<Result<OrchestrationEvent, Option<&'static str>>, OrchestrationError> {
     let database = repositories.database().clone();
     let hooks = hooks.clone();
     let committed = database
@@ -7196,8 +7217,16 @@ async fn persist_turn_delivery_resolution(
                 )
                 .optional()?;
             let Some((delivery_command_id, provider, state, last_error, mode, held, provider_instance_id)) = current else {
-                return Ok(None);
+                return Ok(Err(None));
             };
+            // Decided here, so no window before the tracker withdraws the entry lets a failed
+            // agent message be sent as a person's retry; an uncertain one is the person's call.
+            if matches!(action, TurnDeliveryResolutionAction::Retry)
+                && state == "failed"
+                && crate::agent_messaging::store::is_agent_message_delivery(&transaction, &delivery_command_id, &message_id)?
+            {
+                return Ok(Err(Some(AGENT_MESSAGE_NOT_RETRIED)));
+            }
             let resolvable = match action {
                 TurnDeliveryResolutionAction::Retry => state == "uncertain" || state == "failed",
                 TurnDeliveryResolutionAction::Dismiss => {
@@ -7209,7 +7238,7 @@ async fn persist_turn_delivery_resolution(
                 TurnDeliveryResolutionAction::Cancel => matches!(state.as_str(), "queued" | "pending"),
             };
             if !resolvable {
-                return Ok(None);
+                return Ok(Err(None));
             }
 
             let (next_state, detail, updated) = match action {
@@ -7239,7 +7268,7 @@ async fn persist_turn_delivery_resolution(
                 ),
             };
             if updated == 0 {
-                return Ok(None);
+                return Ok(Err(None));
             }
 
             let mut payload = json!({
@@ -7296,11 +7325,11 @@ async fn persist_turn_delivery_resolution(
                 },
             )?;
             transaction.commit()?;
-            Ok(Some(saved))
+            Ok(Ok(saved))
         })
         .await
         .map_err(wrap_persistence)?;
-    if let Some(event) = &committed {
+    if let Ok(event) = &committed {
         let _ = events.send(event.clone());
     }
     Ok(committed)
@@ -8569,10 +8598,11 @@ fn apply_turns_projector_tx(
                         .optional()?
                         .is_some();
                     let updated = if existing_turn {
-                        // The provider reported the turn (an early item) before it ran: the
-                        // turn keeps the message that started it, as a marker bound below would.
+                        // The provider reported the turn (an early item, settled or not) before it
+                        // ran: the turn keeps the message that started it, as a marker bound below
+                        // would. Only a turn first seen after the marker is that message's turn.
                         transaction.execute(
-                            &format!("UPDATE projection_turns SET pending_message_id = (SELECT pending_message_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1) WHERE thread_id = ?1 AND turn_id = ?2 AND state = 'running' AND pending_message_id IS NULL"),
+                            &format!("UPDATE projection_turns SET pending_message_id = (SELECT pending_message_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1) WHERE thread_id = ?1 AND turn_id = ?2 AND pending_message_id IS NULL AND row_id > (SELECT row_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1)"),
                             params![thread_id, turn_id],
                         )?;
                         let updated = transaction.execute("UPDATE projection_turns SET state = 'running', started_at = COALESCE(started_at, ?) WHERE thread_id = ? AND turn_id = ?", params![updated_at, thread_id, turn_id])?;
