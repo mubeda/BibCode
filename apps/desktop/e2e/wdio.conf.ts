@@ -9,11 +9,13 @@ import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
 import {
+  DESKTOP_UI_TEST_TIMEOUT_MS,
   ensureLiveDesktopUiWebview,
   isDesktopUiApplicationRunning,
   isFinalDesktopUiSpec,
   requestDesktopUiApplicationExit,
   stopRelaunchedDesktopUiApplication,
+  tolerateDeadDesktopUiWebview,
 } from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
@@ -72,6 +74,8 @@ const desktopUiSpecFiles =
       ];
 // The default specs share one app session. The closing spec ends the app, so it runs last in a
 // worker of its own, and the service starts the app again for it if a shared spec ended it.
+// Because the shared specs run in one worker, `before` runs once for all of them and
+// `beforeTest` carries the per-test dead-webview probe.
 const desktopUiSpecs = requestedSpec
   ? desktopUiSpecFiles
   : [desktopUiSpecFiles.filter((spec) => spec !== closingSpec), closingSpec];
@@ -169,10 +173,10 @@ export const config = {
   reporters: ["spec"],
   mochaOpts: {
     ui: "bdd",
-    timeout: 120_000,
+    timeout: DESKTOP_UI_TEST_TIMEOUT_MS,
   },
   before: async () => {
-    // A webview that crashed in an earlier spec would fail this one with the same dead session.
+    // Worker start only: the plugin check below needs a live webview. `beforeTest` probes per test.
     await ensureLiveDesktopUiWebview();
     const pluginReady = await browser.execute(() => {
       const host = window as Window & {
@@ -191,6 +195,7 @@ export const config = {
     }
   },
   beforeTest: async () => {
+    await ensureLiveDesktopUiWebview();
     let setupStage = "connection reset and navigation";
     try {
       await resetDesktopUiConnectionCache();
@@ -209,11 +214,18 @@ export const config = {
   ) => {
     // A closing case may have ended the app; there is no window left to record.
     if (!result.passed && (await isDesktopUiApplicationRunning())) {
-      await browser.saveScreenshot(screenshotPath(`failure-${test.title}`));
-      NodeFS.writeFileSync(
-        screenshotPath(`failure-source-${test.title}`).replace(/\.png$/, ".html"),
-        await browser.getPageSource(),
+      // A webview that died in the test cannot answer; a throwing hook would skip the worker's
+      // remaining tests before their probe could relaunch the app.
+      await tolerateDeadDesktopUiWebview(() =>
+        browser.saveScreenshot(screenshotPath(`failure-${test.title}`)),
       );
+      const pageSource = await tolerateDeadDesktopUiWebview(() => browser.getPageSource());
+      if (pageSource !== undefined) {
+        NodeFS.writeFileSync(
+          screenshotPath(`failure-source-${test.title}`).replace(/\.png$/, ".html"),
+          pageSource,
+        );
+      }
     }
   },
   after: async (_result: unknown, _capabilities: unknown, currentSpecs: ReadonlyArray<string>) => {

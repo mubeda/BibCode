@@ -3045,21 +3045,50 @@ impl AuthService {
                     mcp_named_client: None,
                 })
             } else {
+                log_pairing_refusal("desktop_bootstrap_expired");
                 Err(AuthError::InvalidCredential)
             };
         }
 
         if let Some(repositories) = &self.repositories {
+            let now_iso = format_iso(now);
             let consumed = repositories
                 .consume_auth_pairing_link(
                     credential.to_owned(),
                     proof_key_thumbprint.map(str::to_owned),
-                    format_iso(now),
-                    format_iso(now),
+                    now_iso.clone(),
+                    now_iso.clone(),
                 )
                 .await
-                .map_err(|error| AuthError::Internal(error.to_string()))?
-                .ok_or(AuthError::InvalidCredential)?;
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            let Some(consumed) = consumed else {
+                // The update refuses every cause alike; one read of the kept row names it. An
+                // unauthenticated caller can trigger this, so it stays a single query.
+                let class = if credential.trim().is_empty() {
+                    "empty"
+                } else {
+                    match repositories
+                        .get_auth_pairing_link_by_credential(credential.to_owned())
+                        .await
+                    {
+                        Ok(link) => pairing_rejection_class(
+                            credential,
+                            link.as_ref().map(|link| RefusedPairing {
+                                revoked: link.revoked_at.is_some(),
+                                consumed: link.consumed_at.is_some(),
+                                // The same text comparison as the update's `expires_at > ?`.
+                                expired: link.expires_at <= now_iso,
+                                proof_key_thumbprint: link.proof_key_thumbprint.as_deref(),
+                            }),
+                            proof_key_thumbprint,
+                        )
+                        .unwrap_or("unclassified"),
+                        Err(_) => "unclassified",
+                    }
+                };
+                log_pairing_refusal(class);
+                return Err(AuthError::InvalidCredential);
+            };
             let pairing = pairing_record_from_persisted(consumed)?;
             let mut state = self.state.lock().await;
             state.pairings.remove(&pairing.id);
@@ -3085,19 +3114,29 @@ impl AuthService {
         }
 
         let mut state = self.state.lock().await;
-        let pairing = state
+        let Some(pairing) = state
             .pairings
             .values_mut()
             .find(|pairing| pairing.credential == credential)
-            .ok_or(AuthError::InvalidCredential)?;
-        if pairing.revoked_at_ms.is_some()
-            || pairing.consumed_at_ms.is_some()
-            || pairing.expires_at_ms <= now
-            || pairing
-                .proof_key_thumbprint
-                .as_deref()
-                .is_some_and(|expected| Some(expected) != proof_key_thumbprint)
-        {
+        else {
+            // Revoked records are removed and the rest are pruned, so a gone record is `unknown`.
+            log_pairing_refusal(
+                pairing_rejection_class(credential, None, proof_key_thumbprint)
+                    .unwrap_or("unclassified"),
+            );
+            return Err(AuthError::InvalidCredential);
+        };
+        if let Some(class) = pairing_rejection_class(
+            credential,
+            Some(RefusedPairing {
+                revoked: pairing.revoked_at_ms.is_some(),
+                consumed: pairing.consumed_at_ms.is_some(),
+                expired: pairing.expires_at_ms <= now,
+                proof_key_thumbprint: pairing.proof_key_thumbprint.as_deref(),
+            }),
+            proof_key_thumbprint,
+        ) {
+            log_pairing_refusal(class);
             return Err(AuthError::InvalidCredential);
         }
         pairing.consumed_at_ms = Some(now);
@@ -3563,11 +3602,10 @@ pub fn owned_scopes(scopes: &[&str]) -> Vec<String> {
 }
 
 #[must_use]
+/// Epoch milliseconds in the store's fixed-width timestamp form; see
+/// [`crate::persistence::format_timestamp`].
 pub fn format_iso(epoch_ms: i64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
-        .ok()
-        .and_then(|date| date.format(&Rfc3339).ok())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::format_timestamp_ms(epoch_ms)
 }
 
 #[must_use]
@@ -3627,6 +3665,49 @@ fn map_token_error_to_credential(_error: TokenError) -> AuthError {
 
 fn constant_time_text_equal(left: &str, right: &str) -> bool {
     left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
+}
+
+/// What a refused pairing record says about itself, for the refusal's log class.
+struct RefusedPairing<'a> {
+    revoked: bool,
+    consumed: bool,
+    expired: bool,
+    proof_key_thumbprint: Option<&'a str>,
+}
+
+/// The fixed class of a pairing credential refusal, or `None` when `link` admits it. Only the
+/// empty string is told apart as malformed; any other unmatched text is `unknown`.
+fn pairing_rejection_class(
+    credential: &str,
+    link: Option<RefusedPairing<'_>>,
+    presented_thumbprint: Option<&str>,
+) -> Option<&'static str> {
+    if credential.trim().is_empty() {
+        return Some("empty");
+    }
+    let Some(link) = link else {
+        return Some("unknown");
+    };
+    if link.revoked {
+        Some("revoked")
+    } else if link.consumed {
+        Some("already_used")
+    } else if link.expired {
+        Some("expired")
+    } else if link
+        .proof_key_thumbprint
+        .is_some_and(|expected| Some(expected) != presented_thumbprint)
+    {
+        Some("proof_key_mismatch")
+    } else {
+        None
+    }
+}
+
+/// One `warn` per refused pairing credential: the class only, never the credential, a hash of
+/// it, the link, the device or an address.
+fn log_pairing_refusal(class: &'static str) {
+    tracing::warn!(target: "bibcode_server::auth", class = %class, "a pairing credential was refused");
 }
 
 fn generate_pairing_credential() -> Result<String, AuthError> {
@@ -4020,6 +4101,278 @@ mod tests {
         .await
         .expect("service hydrates");
         (service, repositories, secrets)
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct TraceCaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceCaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl TraceCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("trace capture").clone())
+                .expect("trace capture UTF-8")
+        }
+    }
+
+    /// Consumes `presented` under a fresh capture and checks the one `warn` line it must leave:
+    /// the class, and none of the issued credentials nor the presented text.
+    async fn assert_refusal_logged(
+        service: &AuthService,
+        presented: &str,
+        thumbprint: Option<&str>,
+        class: &str,
+        issued: &[String],
+    ) {
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = service.consume_grant(presented, thumbprint).await;
+        assert!(
+            matches!(result, Err(AuthError::InvalidCredential)),
+            "{class}: the credential is refused, got {:?}",
+            result
+                .as_ref()
+                .map(|grant| format!("Ok(grant for subject {})", grant.subject))
+        );
+        let text = capture.text();
+        let warnings: Vec<&str> = text.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{class}: {text}");
+        assert!(warnings[0].contains(&format!("class={class}")), "{text}");
+        assert!(
+            warnings[0].contains("a pairing credential was refused"),
+            "{text}"
+        );
+        for secret in issued
+            .iter()
+            .map(String::as_str)
+            .chain([presented])
+            .filter(|secret| !secret.is_empty())
+        {
+            assert!(!text.contains(secret), "{class}: a credential was logged");
+        }
+    }
+
+    /// The store compares these timestamps as text (`expires_at > ?`), so text order must be time
+    /// order. RFC 3339 with a trimmed fraction is not: `…:00Z` sorts after `…:00.001Z`.
+    #[test]
+    fn stored_timestamps_sort_as_text_in_time_order() {
+        let second = 1_767_225_600_000_i64; // 2026-01-01T00:00:00Z
+        let instants =
+            [0, 1, 9, 10, 100, 120, 121, 999, 1_000, 1_001].map(|offset| second + offset);
+        for earlier in instants {
+            for later in instants.into_iter().filter(|later| *later > earlier) {
+                assert!(
+                    format_iso(earlier) < format_iso(later),
+                    "{} must sort before {}",
+                    format_iso(earlier),
+                    format_iso(later)
+                );
+            }
+        }
+    }
+
+    /// A link is refused from the first millisecond after it expires, whatever the fraction of
+    /// its expiry. Explicit timestamps, so load cannot change the outcome.
+    #[tokio::test]
+    async fn a_pairing_link_is_refused_from_the_millisecond_after_it_expires() {
+        let (_service, repositories, _secrets) = mcp_test_service().await;
+        let second = 1_767_225_600_000_i64;
+        for (index, expires_at) in [second, second + 100, second + 120].into_iter().enumerate() {
+            let credential = format!("expiry-probe-{index}");
+            repositories
+                .create_auth_pairing_link(PersistedPairingLink {
+                    id: format!("expiry-probe-id-{index}"),
+                    credential: credential.clone(),
+                    method: "one-time-token".to_owned(),
+                    scopes: serde_json::json!(owned_scopes(STANDARD_SCOPES)),
+                    subject: "one-time-token".to_owned(),
+                    label: None,
+                    proof_key_thumbprint: None,
+                    created_at: format_iso(expires_at - 60_000),
+                    expires_at: format_iso(expires_at),
+                    consumed_at: None,
+                    revoked_at: None,
+                    reach: None,
+                    off_host: None,
+                    mcp_access: None,
+                    mcp_named_client: None,
+                })
+                .await
+                .expect("the link is stored");
+            let now = format_iso(expires_at + 1);
+            let consumed = repositories
+                .consume_auth_pairing_link(credential, None, now.clone(), now.clone())
+                .await
+                .expect("the store answers");
+            assert!(
+                consumed.is_none(),
+                "expires {} was accepted at {now}",
+                format_iso(expires_at)
+            );
+        }
+    }
+
+    fn expired_pairing(issuance: Result<PairingIssuance, AuthError>) -> PairingCredentialResult {
+        reserved_pairing(issuance.expect("an expired pairing issues")).expect("reserved")
+    }
+
+    /// #358: every refusal of a persisted pairing credential names its class at `warn`.
+    #[tokio::test]
+    async fn a_refused_pairing_credential_is_logged_at_warn_with_its_class_and_never_the_credential_persisted()
+     {
+        let (service, _repositories, _secrets) = mcp_test_service().await;
+        let scopes = || owned_scopes(STANDARD_SCOPES);
+        let mut issued = Vec::new();
+
+        assert_refusal_logged(
+            &service,
+            "pairing-secret-marker-unknown",
+            None,
+            "unknown",
+            &issued,
+        )
+        .await;
+        assert_refusal_logged(&service, "", None, "empty", &issued).await;
+
+        let revoked = service.issue_pairing(scopes(), None).await.expect("issues");
+        issued.push(revoked.credential.clone());
+        assert!(service.revoke_pairing(&revoked.id).await.expect("revokes"));
+        assert_refusal_logged(&service, &revoked.credential, None, "revoked", &issued).await;
+
+        let used = service.issue_pairing(scopes(), None).await.expect("issues");
+        issued.push(used.credential.clone());
+        assert!(service.consume_grant(&used.credential, None).await.is_ok());
+        assert_refusal_logged(&service, &used.credential, None, "already_used", &issued).await;
+
+        let expired = expired_pairing(
+            service
+                .issue_pairing_for_subject(
+                    scopes(),
+                    None,
+                    "one-time-token",
+                    -1,
+                    AuthGrantMetadata::default(),
+                    None,
+                )
+                .await,
+        );
+        issued.push(expired.credential.clone());
+        assert_refusal_logged(&service, &expired.credential, None, "expired", &issued).await;
+
+        let proven = service
+            .issue_pairing_with_proof(scopes(), None, "thumbprint-a".to_owned())
+            .await
+            .expect("issues");
+        issued.push(proven.credential.clone());
+        assert_refusal_logged(
+            &service,
+            &proven.credential,
+            Some("thumbprint-b"),
+            "proof_key_mismatch",
+            &issued,
+        )
+        .await;
+    }
+
+    /// #358: the in-memory store can name fewer classes, because it forgets refused records.
+    #[tokio::test]
+    async fn a_refused_pairing_credential_is_logged_at_warn_with_its_class_and_never_the_credential_in_memory()
+     {
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let mut service = AuthService::new(&config, vec![7_u8; 32]);
+        service.desktop_bootstrap = Some(DesktopBootstrap {
+            credential: "pairing-secret-marker-desktop".into(),
+            expires_at_ms: 0,
+        });
+        let scopes = || owned_scopes(STANDARD_SCOPES);
+        let mut issued = vec!["pairing-secret-marker-desktop".to_owned()];
+
+        assert_refusal_logged(
+            &service,
+            "pairing-secret-marker-unknown",
+            None,
+            "unknown",
+            &issued,
+        )
+        .await;
+        assert_refusal_logged(&service, "", None, "empty", &issued).await;
+
+        // `revoke_pairing` removes the in-memory record, so nothing is left to name the cause.
+        let revoked = service.issue_pairing(scopes(), None).await.expect("issues");
+        issued.push(revoked.credential.clone());
+        assert!(service.revoke_pairing(&revoked.id).await.expect("revokes"));
+        assert_refusal_logged(&service, &revoked.credential, None, "unknown", &issued).await;
+
+        // Consumed and expired records survive until the next issue or list prunes them.
+        let used = service.issue_pairing(scopes(), None).await.expect("issues");
+        issued.push(used.credential.clone());
+        assert!(service.consume_grant(&used.credential, None).await.is_ok());
+        assert_refusal_logged(&service, &used.credential, None, "already_used", &issued).await;
+
+        let expired = expired_pairing(
+            service
+                .issue_pairing_for_subject(
+                    scopes(),
+                    None,
+                    "one-time-token",
+                    -1,
+                    AuthGrantMetadata::default(),
+                    None,
+                )
+                .await,
+        );
+        issued.push(expired.credential.clone());
+        assert_refusal_logged(&service, &expired.credential, None, "expired", &issued).await;
+
+        let proven = service
+            .issue_pairing_with_proof(scopes(), None, "thumbprint-a".to_owned())
+            .await
+            .expect("issues");
+        issued.push(proven.credential.clone());
+        assert_refusal_logged(
+            &service,
+            &proven.credential,
+            Some("thumbprint-b"),
+            "proof_key_mismatch",
+            &issued,
+        )
+        .await;
+
+        assert_refusal_logged(
+            &service,
+            "pairing-secret-marker-desktop",
+            None,
+            "desktop_bootstrap_expired",
+            &issued,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6409,7 +6762,15 @@ mod tests {
         }
         assert!(decode_persisted_scopes(serde_json::json!(42)).is_err());
         assert!(parse_timestamp_ms("not-a-timestamp").is_err());
-        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00Z");
+        assert_eq!(format_iso(i64::MAX), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(
+            format_iso(1_767_225_600_120),
+            "2026-01-01T00:00:00.120000000Z"
+        );
+        assert_eq!(
+            parse_timestamp_ms(&format_iso(1_767_225_600_120)).ok(),
+            Some(1_767_225_600_120)
+        );
     }
 
     #[tokio::test]

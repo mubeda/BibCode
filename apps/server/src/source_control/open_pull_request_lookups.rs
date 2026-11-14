@@ -12,8 +12,10 @@
 //! - Entries are keyed by (worktree path as the caller gave it, provider,
 //!   branch), so a branch change or another repository never reads them.
 //! - A successful answer, including "no open pull request", is reused for
-//!   [`OPEN_PULL_REQUEST_LOOKUP_TTL`]. A failed or cancelled lookup is never
-//!   stored; the next caller asks the forge again.
+//!   [`OPEN_PULL_REQUEST_LOOKUP_TTL`]. A failed lookup answers with its
+//!   failure for [`OPEN_PULL_REQUEST_FAILURE_BACKOFF`] and is logged once at
+//!   `warn`, with the provider only. A cancelled lookup (its last caller left,
+//!   or shutdown) is never stored; the next caller asks the forge again.
 //! - Concurrent callers for one key share one in-flight lookup. It runs in its
 //!   own task and holds one lease per waiting caller, so one caller leaving (a
 //!   stream replacing its enrichment, a cancelled RPC) does not cancel the
@@ -24,6 +26,9 @@
 //! - At most [`OPEN_PULL_REQUEST_LOOKUP_CAPACITY`] entries are held. When full,
 //!   expired and abandoned entries go first, then the entry closest to
 //!   expiring; a lookup with no room still runs, uncoalesced and unstored.
+//! - [`OpenPullRequestLookups::shutdown`] (quiesce step `pull-request-lookups`)
+//!   cancels every flight, with or without an entry, waits until each has
+//!   ended, and answers every later caller as cancelled.
 
 use std::{
     collections::HashMap,
@@ -34,13 +39,15 @@ use std::{
 };
 
 use tokio::{sync::watch, time::Instant};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{ProviderKind, ResolvedPullRequest, SourceControlProviderError};
 
 /// How long a successful lookup answers later status reads. Short, because
 /// pull requests also change outside BiBCode (merged or closed on the web).
 pub(crate) const OPEN_PULL_REQUEST_LOOKUP_TTL: Duration = Duration::from_secs(10);
+/// How long a failed lookup answers later reads with its failure (D6).
+pub(crate) const OPEN_PULL_REQUEST_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 /// Upper bound on remembered and in-flight lookups across all worktrees.
 pub(crate) const OPEN_PULL_REQUEST_LOOKUP_CAPACITY: usize = 64;
 
@@ -55,6 +62,23 @@ pub(crate) struct LookupKey {
 
 pub(crate) struct OpenPullRequestLookups {
     state: Mutex<State>,
+    /// Parent of every flight's token, so shutdown reaches a flight with no entry.
+    shutdown: CancellationToken,
+    /// One token per flight, taken under the state lock at admission.
+    tasks: TaskTracker,
+    #[cfg(test)]
+    admission_gate: Mutex<Option<Arc<AdmissionGate>>>,
+    /// Notified by each flight task once its settlement has run.
+    #[cfg(test)]
+    flights_settled: tokio::sync::Notify,
+}
+
+/// Holds an admission after its closed check and before its spawn, the window shutdown must
+/// not finish in.
+#[cfg(test)]
+struct AdmissionGate {
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 struct State {
@@ -62,6 +86,8 @@ struct State {
     capacity: usize,
     next_flight: u64,
     entries: HashMap<LookupKey, Entry>,
+    /// Set by shutdown; admission checks it under the same lock.
+    closed: bool,
 }
 
 struct Entry {
@@ -81,6 +107,11 @@ enum Slot {
         lease: Weak<FlightLease>,
         result: watch::Receiver<Option<LookupResult>>,
     },
+    /// A lookup that failed, not one that was cancelled.
+    Failed {
+        error: SourceControlProviderError,
+        expires_at: Instant,
+    },
 }
 
 /// One per waiting caller; the last one dropped cancels the shared lookup.
@@ -95,7 +126,9 @@ impl Drop for FlightLease {
 }
 
 enum Admission {
+    Closed,
     Cached(Option<ResolvedPullRequest>),
+    Failed(SourceControlProviderError),
     Wait(Arc<FlightLease>, watch::Receiver<Option<LookupResult>>),
 }
 
@@ -127,7 +160,14 @@ impl OpenPullRequestLookups {
                 capacity,
                 next_flight: 0,
                 entries: HashMap::new(),
+                closed: false,
             }),
+            shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            #[cfg(test)]
+            admission_gate: Mutex::default(),
+            #[cfg(test)]
+            flights_settled: tokio::sync::Notify::new(),
         }
     }
 
@@ -139,8 +179,8 @@ impl OpenPullRequestLookups {
 
     /// The remembered answer for `key`, or the result of the shared lookup
     /// `load` starts. `load` receives the shared lookup's own cancellation.
-    /// `None` means this caller was cancelled, or the shared lookup ended
-    /// without an answer (its task was aborted).
+    /// `None` means this caller was cancelled, the lookups shut down, or the
+    /// shared lookup ended without an answer (its task was aborted).
     pub(crate) async fn resolve<F, Fut>(
         self: &Arc<Self>,
         key: LookupKey,
@@ -153,11 +193,14 @@ impl OpenPullRequestLookups {
         Fut: Future<Output = LookupResult> + Send + 'static,
     {
         let (_lease, mut result) = match self.admit(key, canonical_cwd, load) {
+            Admission::Closed => return None,
             Admission::Cached(value) => return Some(Ok(value)),
+            Admission::Failed(error) => return Some(Err(error)),
             Admission::Wait(lease, result) => (lease, result),
         };
         tokio::select! {
             biased;
+            () = self.shutdown.cancelled() => None,
             () = cancellation.cancelled() => None,
             outcome = result.wait_for(Option::is_some) => {
                 outcome.ok().and_then(|outcome| outcome.clone())
@@ -165,12 +208,57 @@ impl OpenPullRequestLookups {
         }
     }
 
+    /// Refuses new lookups, cancels every running one, in its cache entry or
+    /// not, and waits until each flight task has ended. A forge CLI child is
+    /// stopped by force and reaped inside the loader's awaited runner call, in
+    /// that task, so joining the task is enough. Admission takes its tracker
+    /// token under the state lock that sets `closed`, so an admission is either
+    /// waited for or refused. Safe to call twice.
+    pub(crate) async fn shutdown(&self) {
+        {
+            let mut state = self.lock();
+            state.closed = true;
+            self.shutdown.cancel();
+            self.tasks.close();
+        }
+        self.tasks.wait().await;
+    }
+
+    #[cfg(test)]
+    fn entry_count_for_test(&self) -> usize {
+        self.lock().entries.len()
+    }
+
+    #[cfg(test)]
+    fn wait_at_admission_gate(&self) {
+        let gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(());
+            let _ = gate
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+        }
+    }
+
     /// Forgets every lookup for a worktree at or below `path`, matching either
-    /// the caller's spelling of the path or its canonical form.
-    pub(crate) fn invalidate(&self, path: &Path) {
+    /// the caller's spelling of the path or its canonical form. Returns whether
+    /// it dropped a lookup that callers still wait on, whose answer may now be
+    /// outdated.
+    pub(crate) fn invalidate(&self, path: &Path) -> bool {
+        let mut dropped_a_waited_lookup = false;
         self.lock().entries.retain(|key, entry| {
-            !(key.cwd.starts_with(path) || entry.canonical_cwd.starts_with(path))
+            let keep = !(key.cwd.starts_with(path) || entry.canonical_cwd.starts_with(path));
+            dropped_a_waited_lookup |= !keep
+                && matches!(&entry.slot, Slot::InFlight { lease, .. } if lease.strong_count() > 0);
+            keep
         });
+        dropped_a_waited_lookup
     }
 
     fn admit<F, Fut>(self: &Arc<Self>, key: LookupKey, canonical_cwd: PathBuf, load: F) -> Admission
@@ -178,58 +266,85 @@ impl OpenPullRequestLookups {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = LookupResult> + Send + 'static,
     {
-        let mut state = self.lock();
-        let now = Instant::now();
-        if let Some(entry) = state.entries.get(&key) {
-            match &entry.slot {
-                Slot::Fresh { value, expires_at } if *expires_at > now => {
-                    return Admission::Cached(value.clone());
-                }
-                Slot::InFlight { lease, result, .. } => {
-                    if let Some(lease) = lease.upgrade() {
-                        return Admission::Wait(lease, result.clone());
-                    }
-                }
-                Slot::Fresh { .. } => {}
+        let (id, task, flight_cancellation, lease, sender, result) = {
+            let mut state = self.lock();
+            if state.closed {
+                return Admission::Closed;
             }
-        }
-        state.entries.remove(&key);
-        state.make_room(now);
+            let now = Instant::now();
+            if let Some(entry) = state.entries.get(&key) {
+                match &entry.slot {
+                    Slot::Fresh { value, expires_at } if *expires_at > now => {
+                        return Admission::Cached(value.clone());
+                    }
+                    Slot::InFlight { lease, result, .. } => {
+                        if let Some(lease) = lease.upgrade() {
+                            return Admission::Wait(lease, result.clone());
+                        }
+                    }
+                    Slot::Failed { error, expires_at } if *expires_at > now => {
+                        return Admission::Failed(error.clone());
+                    }
+                    Slot::Fresh { .. } | Slot::Failed { .. } => {}
+                }
+            }
+            state.entries.remove(&key);
+            state.make_room(now);
 
-        let id = state.next_flight;
-        state.next_flight = state.next_flight.wrapping_add(1);
-        let flight_cancellation = CancellationToken::new();
-        let lease = Arc::new(FlightLease {
-            cancellation: flight_cancellation.clone(),
-        });
-        let (sender, result) = watch::channel(None);
-        if state.entries.len() < state.capacity {
-            state.entries.insert(
-                key.clone(),
-                Entry {
-                    canonical_cwd,
-                    slot: Slot::InFlight {
-                        id,
-                        lease: Arc::downgrade(&lease),
-                        result: result.clone(),
+            let id = state.next_flight;
+            state.next_flight = state.next_flight.wrapping_add(1);
+            // Registered before the lock is released, whether or not an entry is stored, so
+            // shutdown waits for this flight once it has seen it admitted.
+            let task = self.tasks.token();
+            let flight_cancellation = self.shutdown.child_token();
+            let lease = Arc::new(FlightLease {
+                cancellation: flight_cancellation.clone(),
+            });
+            let (sender, result) = watch::channel(None);
+            if state.entries.len() < state.capacity {
+                state.entries.insert(
+                    key.clone(),
+                    Entry {
+                        canonical_cwd,
+                        slot: Slot::InFlight {
+                            id,
+                            lease: Arc::downgrade(&lease),
+                            result: result.clone(),
+                        },
                     },
-                },
-            );
-        }
-        let lookup = load(flight_cancellation);
+                );
+            }
+            (id, task, flight_cancellation, lease, sender, result)
+        };
+        #[cfg(test)]
+        self.wait_at_admission_gate();
+        let lookup = load(flight_cancellation.clone());
         let lookups = Arc::clone(self);
         tokio::spawn(async move {
+            let _task = task;
             let outcome = lookup.await;
-            lookups.settle(&key, id, &outcome);
+            // True after the last lease dropped and after shutdown: the outcome is not the
+            // forge's answer, so it is never remembered as a failure.
+            let cancelled = flight_cancellation.is_cancelled();
+            if outcome.is_err() && !cancelled {
+                tracing::warn!(
+                    provider = ?key.provider,
+                    "open pull-request lookup failed; answering with the failure for 5 seconds"
+                );
+            }
+            lookups.settle(&key, id, &outcome, cancelled);
+            #[cfg(test)]
+            lookups.flights_settled.notify_one();
             let _ = sender.send(Some(outcome));
         });
         Admission::Wait(lease, result)
     }
 
-    /// Stores a successful answer only while this flight still owns the key;
-    /// an invalidation or a newer flight since it started means its answer may
-    /// predate a change.
-    fn settle(&self, key: &LookupKey, id: u64, outcome: &LookupResult) {
+    /// Stores a successful answer, or an uncancelled failure for
+    /// [`OPEN_PULL_REQUEST_FAILURE_BACKOFF`], only while this flight still owns
+    /// the key; an invalidation or a newer flight since it started means its
+    /// answer may predate a change.
+    fn settle(&self, key: &LookupKey, id: u64, outcome: &LookupResult, cancelled: bool) {
         let mut state = self.lock();
         let ttl = state.ttl;
         let Some(entry) = state.entries.get_mut(key) else {
@@ -243,6 +358,12 @@ impl OpenPullRequestLookups {
                 entry.slot = Slot::Fresh {
                     value: value.clone(),
                     expires_at: Instant::now() + ttl,
+                };
+            }
+            Err(error) if !cancelled => {
+                entry.slot = Slot::Failed {
+                    error: error.clone(),
+                    expires_at: Instant::now() + OPEN_PULL_REQUEST_FAILURE_BACKOFF,
                 };
             }
             Err(_) => {
@@ -262,7 +383,7 @@ impl State {
             return;
         }
         self.entries.retain(|_, entry| match &entry.slot {
-            Slot::Fresh { expires_at, .. } => *expires_at > now,
+            Slot::Fresh { expires_at, .. } | Slot::Failed { expires_at, .. } => *expires_at > now,
             Slot::InFlight { lease, .. } => lease.strong_count() > 0,
         });
         while self.entries.len() >= self.capacity {
@@ -270,7 +391,9 @@ impl State {
                 .entries
                 .iter()
                 .filter_map(|(key, entry)| match entry.slot {
-                    Slot::Fresh { expires_at, .. } => Some((expires_at, key)),
+                    Slot::Fresh { expires_at, .. } | Slot::Failed { expires_at, .. } => {
+                        Some((expires_at, key))
+                    }
                     Slot::InFlight { .. } => None,
                 })
                 .min_by_key(|(expires_at, _)| *expires_at)
@@ -332,6 +455,9 @@ mod tests {
         release: Arc<Notify>,
         gated: bool,
         answer: LookupResult,
+        /// How long a cancelled gated lookup takes to end, like a child that exits late.
+        cleanup: Duration,
+        ended: Arc<AtomicUsize>,
     }
 
     impl Loader {
@@ -342,6 +468,8 @@ mod tests {
                 release: Arc::new(Notify::new()),
                 gated: false,
                 answer,
+                cleanup: Duration::ZERO,
+                ended: Arc::default(),
             }
         }
 
@@ -356,6 +484,14 @@ mod tests {
             self.runs.load(Ordering::SeqCst)
         }
 
+        fn cancelled(&self) -> usize {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn ended(&self) -> usize {
+            self.ended.load(Ordering::SeqCst)
+        }
+
         fn load(&self) -> impl FnOnce(CancellationToken) -> BoxedLookup + use<> {
             let loader = self.clone();
             move |flight: CancellationToken| -> BoxedLookup {
@@ -365,6 +501,8 @@ mod tests {
                         tokio::select! {
                             () = flight.cancelled() => {
                                 loader.cancelled.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(loader.cleanup).await;
+                                loader.ended.fetch_add(1, Ordering::SeqCst);
                                 return Err(failure());
                             }
                             () = loader.release.notified() => {}
@@ -397,6 +535,139 @@ mod tests {
         })
         .await
         .expect("loader run deadline");
+    }
+
+    /// Every wait on another task is bounded, so a regression fails instead of hanging.
+    async fn bounded<F: Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .expect("bounded wait")
+    }
+
+    fn spawn_resolve(
+        lookups: &Arc<OpenPullRequestLookups>,
+        key: LookupKey,
+        loader: &Loader,
+    ) -> tokio::task::JoinHandle<Option<LookupResult>> {
+        let (lookups, loader) = (Arc::clone(lookups), loader.clone());
+        tokio::spawn(async move { resolve(&lookups, key, &loader).await })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_a_lookup_that_ends_late() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader {
+            cleanup: Duration::from_millis(200),
+            ..Loader::gated(Ok(None))
+        };
+        let waiter = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        wait_for_runs(&loader, 1).await;
+        let start = Instant::now();
+        bounded(lookups.shutdown()).await;
+        assert_eq!(
+            loader.ended(),
+            1,
+            "shutdown returned before the lookup ended"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_an_invalidated_flight() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::gated(Ok(None));
+        let waiter = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        wait_for_runs(&loader, 1).await;
+        lookups.invalidate(Path::new("/repo"));
+        assert_eq!(lookups.entry_count_for_test(), 0);
+        bounded(lookups.shutdown()).await;
+        assert_eq!(loader.cancelled(), 1);
+        assert_eq!(loader.ended(), 1);
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_flight_that_had_no_cache_room() {
+        let lookups = Arc::new(OpenPullRequestLookups::with_limits(
+            OPEN_PULL_REQUEST_LOOKUP_TTL,
+            0,
+        ));
+        let loader = Loader::gated(Ok(None));
+        let waiter = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        wait_for_runs(&loader, 1).await;
+        bounded(lookups.shutdown()).await;
+        assert_eq!(loader.cancelled(), 1);
+        assert_eq!(loader.ended(), 1);
+        assert_eq!(lookups.entry_count_for_test(), 0);
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ends_a_retained_waiter_as_cancelled() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::gated(Ok(Some(pull_request("main"))));
+        // The waiter's own token is never cancelled, so it keeps its lease.
+        let waiter = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        wait_for_runs(&loader, 1).await;
+        bounded(lookups.shutdown()).await;
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+        assert_eq!(loader.cancelled(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_refuses_a_new_lookup() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let warm = Loader::answering(Ok(Some(pull_request("main"))));
+        resolve(&lookups, key("/repo", "main"), &warm).await;
+        bounded(lookups.shutdown()).await;
+
+        let loader = Loader::answering(Ok(None));
+        // A remembered answer is refused too: the closed check comes first.
+        assert_eq!(resolve(&lookups, key("/repo", "main"), &loader).await, None);
+        assert_eq!(
+            resolve(&lookups, key("/repo", "other"), &loader).await,
+            None
+        );
+        assert_eq!(loader.runs(), 0);
+        tokio::time::timeout(Duration::from_millis(1), lookups.shutdown())
+            .await
+            .expect("a second shutdown returns at once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cannot_finish_between_an_admissions_check_and_its_spawn() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let (reached, reached_signal) = std::sync::mpsc::sync_channel(1);
+        let (release_signal, release) = std::sync::mpsc::channel();
+        *lookups
+            .admission_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(AdmissionGate {
+            reached,
+            release: Mutex::new(release),
+        }));
+        let loader = Loader::gated(Ok(None));
+        let mut admitted = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        reached_signal
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the admission reached the gate");
+        let mut shutdown = tokio::spawn({
+            let lookups = Arc::clone(&lookups);
+            async move { lookups.shutdown().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown finished while an admission was between its check and its spawn"
+        );
+        release_signal.send(()).expect("the gate is waiting");
+        bounded(&mut shutdown).await.unwrap();
+        assert_eq!(loader.runs(), 1);
+        assert_eq!(loader.cancelled(), 1);
+        assert_eq!(loader.ended(), 1);
+        assert_eq!(bounded(&mut admitted).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -432,30 +703,167 @@ mod tests {
         assert_eq!(loader.runs(), 4);
     }
 
-    #[tokio::test]
-    async fn failures_are_shared_with_waiters_but_never_stored() {
+    #[tokio::test(start_paused = true)]
+    async fn failures_are_shared_with_waiters_and_remembered_for_five_seconds() {
         let lookups = Arc::new(OpenPullRequestLookups::default());
         let loader = Loader::gated(Err(failure()));
-        let first = tokio::spawn({
-            let lookups = Arc::clone(&lookups);
-            let loader = loader.clone();
-            async move { resolve(&lookups, key("/repo", "main"), &loader).await }
-        });
+        let first = spawn_resolve(&lookups, key("/repo", "main"), &loader);
         wait_for_runs(&loader, 1).await;
-        let second = tokio::spawn({
-            let lookups = Arc::clone(&lookups);
-            let loader = loader.clone();
-            async move { resolve(&lookups, key("/repo", "main"), &loader).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        tokio::time::advance(Duration::from_millis(50)).await;
         loader.release.notify_one();
-        assert_eq!(first.await.unwrap(), Some(Err(failure())));
-        assert_eq!(second.await.unwrap(), Some(Err(failure())));
+        assert_eq!(bounded(first).await.unwrap(), Some(Err(failure())));
+        assert_eq!(bounded(second).await.unwrap(), Some(Err(failure())));
         assert_eq!(loader.runs(), 1, "the waiter joined the running lookup");
 
         let recovered = Loader::answering(Ok(None));
+        assert_eq!(
+            resolve(&lookups, key("/repo", "main"), &recovered).await,
+            Some(Err(failure()))
+        );
+        assert_eq!(recovered.runs(), 0, "the failure answers from memory");
+        tokio::time::advance(OPEN_PULL_REQUEST_FAILURE_BACKOFF).await;
         resolve(&lookups, key("/repo", "main"), &recovered).await;
-        assert_eq!(recovered.runs(), 1, "a failure must not be remembered");
+        assert_eq!(
+            recovered.runs(),
+            1,
+            "an expired failure asks the forge again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_answers_from_memory_for_five_seconds() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::answering(Err(failure()));
+        assert_eq!(
+            resolve(&lookups, key("/repo", "main"), &loader).await,
+            Some(Err(failure()))
+        );
+        assert_eq!(loader.runs(), 1);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            resolve(&lookups, key("/repo", "main"), &loader).await,
+            Some(Err(failure()))
+        );
+        assert_eq!(loader.runs(), 1);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        resolve(&lookups, key("/repo", "main"), &loader).await;
+        assert_eq!(loader.runs(), 2);
+    }
+
+    /// Real clock, so a missing settlement signal ends in a timeout, not a hang.
+    #[tokio::test]
+    async fn a_cancelled_lookup_is_not_remembered_as_failed() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::gated(Err(failure()));
+        let leaving = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let (lookups, loader, leaving) =
+                (Arc::clone(&lookups), loader.clone(), leaving.clone());
+            async move {
+                lookups
+                    .resolve(
+                        key("/repo", "main"),
+                        PathBuf::from("/repo"),
+                        &leaving,
+                        loader.load(),
+                    )
+                    .await
+            }
+        });
+        wait_for_runs(&loader, 1).await;
+        leaving.cancel();
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+        bounded(lookups.flights_settled.notified()).await;
+        assert_eq!(loader.cancelled(), 1);
+        assert_eq!(lookups.entry_count_for_test(), 0);
+        loader.release.notify_one();
+        resolve(&lookups, key("/repo", "main"), &loader).await;
+        assert_eq!(
+            loader.runs(),
+            2,
+            "a cancelled lookup must not answer from memory"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_flight_is_not_remembered_as_failed() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::gated(Err(failure()));
+        let waiter = spawn_resolve(&lookups, key("/repo", "main"), &loader);
+        wait_for_runs(&loader, 1).await;
+        bounded(lookups.shutdown()).await;
+        assert_eq!(loader.cancelled(), 1);
+        assert_eq!(lookups.entry_count_for_test(), 0);
+        assert_eq!(bounded(waiter).await.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidation_clears_a_remembered_failure() {
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::answering(Err(failure()));
+        resolve(&lookups, key("/repo", "main"), &loader).await;
+        lookups.invalidate(Path::new("/repo"));
+        resolve(&lookups, key("/repo", "main"), &loader).await;
+        assert_eq!(loader.runs(), 2);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In a process of its own, so no sibling test can turn the callsite off for this capture.
+    #[tokio::test]
+    async fn a_failed_lookup_warns_once_without_the_remote_address() {
+        let Some(child) = crate::test_support::in_own_process(
+            "source_control::open_pull_request_lookups::tests::a_failed_lookup_warns_once_without_the_remote_address",
+        ) else {
+            return;
+        };
+        let log = CapturedLog::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let loader = Loader::answering(Err(SourceControlProviderError {
+            cwd: "/work/sample-project".into(),
+            detail: "could not reach https://gitlab.example.test/example-group/sample-project"
+                .into(),
+            ..failure()
+        }));
+        for _ in 0..2 {
+            resolve(&lookups, key("/work/sample-project", "main"), &loader).await;
+        }
+        assert_eq!(loader.runs(), 1);
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+        assert_eq!(
+            text.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("gitlab.example.test"), "{text}");
+        assert!(!text.contains("sample-project"), "{text}");
+        child.complete();
     }
 
     #[tokio::test]
@@ -536,7 +944,10 @@ mod tests {
         let lookups = Arc::new(OpenPullRequestLookups::default());
         let loader = Loader::answering(Ok(None));
         resolve(&lookups, key("/private/var/repo", "main"), &loader).await;
-        lookups.invalidate(Path::new("/private/var/repo"));
+        assert!(
+            !lookups.invalidate(Path::new("/private/var/repo")),
+            "a stored answer is not an awaited lookup"
+        );
         resolve(&lookups, key("/private/var/repo", "main"), &loader).await;
         assert_eq!(loader.runs(), 2, "invalidation drops the stored answer");
 
@@ -571,7 +982,10 @@ mod tests {
             async move { resolve(&lookups, key("/repo", "main"), &stale).await }
         });
         wait_for_runs(&stale, 1).await;
-        lookups.invalidate(Path::new("/repo"));
+        assert!(
+            lookups.invalidate(Path::new("/repo")),
+            "an awaited lookup was dropped"
+        );
         stale.release.notify_one();
         assert_eq!(waiter.await.unwrap(), Some(Ok(None)));
         let fresh = Loader::answering(Ok(Some(pull_request("main"))));

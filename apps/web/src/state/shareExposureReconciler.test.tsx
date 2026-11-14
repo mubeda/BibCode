@@ -62,8 +62,6 @@ const localExposure = {
   mode: "local-only" as const,
   endpointUrl: null,
   advertisedHost: null,
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 const wideExposure = {
   ...localExposure,

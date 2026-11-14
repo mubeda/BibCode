@@ -12,8 +12,6 @@ const serverExposureState: DesktopServerExposureState = {
   endpointUrl: "http://192.168.1.10:37737",
   management: "native",
   mode: "network-accessible",
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 
 const advertisedEndpoints: ReadonlyArray<AdvertisedEndpoint> = [];

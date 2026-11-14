@@ -47,7 +47,11 @@ flowchart TB
   webviews into the window's content box, where bounds cannot move them, so
   the desktop wraps the main webview in a `GtkOverlay` with a pass-through
   `GtkFixed` layer and places preview views there
-  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). Removing an environment deletes its preview storage with its other
+  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). On macOS a native
+  preview is a view above the webview, so a popup drawn over it would sit under
+  it. Sheets and dialogs hide the whole preview; a menu, popover, select or
+  combobox leases the popup's rectangle while open, and a preview is hidden
+  only where that rectangle overlaps it. Removing an environment deletes its preview storage with its other
   environment-owned data (`EnvironmentOwnedDataCleanup`, through
   `desktop_preview_forget_environment`); a profile one of its previews used in
   this session stays on disk, since its native view lives until the app exits. In browser mode there is no child
@@ -105,7 +109,13 @@ flowchart TB
     without restarting (a refusal or a failure), the host emits
     `desktop:update-install-ended` (`onUpdateInstallEnded`) to the main window,
     and the web releases the holds, closes the dialog and says the update did
-    not install. Dock Quit on macOS, SIGTERM and session end do not
+    not install. A session marker in the window restores the hold after a
+    reload during the install, and a Files source registered during the
+    install is held as well. The hold ends only on a confirmed desktop update
+    state or the end event; a failed or timed-out state query never releases
+    it and is asked again. The dialog's **Check again** asks the desktop once
+    more and says when the install is still running or the app cannot be
+    reached. Dock Quit on macOS, SIGTERM and session end do not
     wait. A `desktop-e2e` teardown disarms the guard.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
@@ -117,6 +127,13 @@ flowchart TB
   and joined into project reads; generic projection writes cannot change it,
   and projection rewind/replay preserves it. It fences later fallback anchors
   and is not a persisted live catalog.
+  The catalog also keeps a creation record for each worktree BiBCode creates.
+  A removal or a creation rollback deletes the record by the id read when the
+  worktree was resolved, so a worktree recreated at the same path keeps its own
+  record. The profiler's worktree audit reaps a record only when its folder is
+  missing and the folder's parent directory exists; a missing parent cannot be
+  told from an unmounted volume, so that record is kept. Both creation-rollback
+  paths record a `create-rollback` removal outcome for the audit.
   Each project also carries a server-authored `repositoryIdentity` derived from
   its checkout's `origin` remote: a canonical key of the lowercased host and the
   repository path without `.git`, plus the remote (stored without userinfo,
@@ -174,8 +191,14 @@ flowchart TB
   through their final internal publication or delivery check without changing
   public status schemas. Stream and unary pull-request enrichment share one
   coalesced open-request lookup per worktree, provider, and branch, reused for
-  10 seconds after success and never after failure, and forgotten when a
-  mutation finishes, a local change is reported, or BiBCode creates a request.
+  10 seconds after success. A failure is remembered for 5 seconds, so a failing
+  forge CLI is not run back to back; a cancelled lookup is never remembered.
+  The lookup is forgotten when a mutation finishes, a local change is reported,
+  or BiBCode creates a request. A status-neutral local change that outdates a
+  running lookup starts a new one. The pull request the broadcaster remembers
+  for a branch is cleared by a failed lookup when its last success is more than
+  5 minutes old. Lookups run as tracked tasks that quiesce ends
+  (`pull-request-lookups`), so no forge CLI outlives the shutdown.
   Cached remote state additionally carries its producing
   ref identity; an external ref change clears it and resets branch-specific
   client remote fields before reconciliation;
@@ -691,6 +714,9 @@ the session when either passes. Desktop exposure remains a privileged
 externally managed, and only authoritative live grants or an explicit
 legacy-resume action can request a wide native bind. Pairing credentials remain
 pending until the verified client persists local state and confirms the session.
+A refused pairing offer is logged at `warn` with its fixed reason text, and a
+refused pairing credential at `warn` with a fixed class only, never the offered
+input or the credential.
 Desktop discovery advertises only usable IPv4 addresses until a dual-stack
 listener exists; public candidates are labeled, never defaulted, and require an
 explicit warning acknowledgement. Plain `/ws` caps individual frames at 16 MiB
@@ -1366,6 +1392,19 @@ backing-store size through xterm's WebGL resize layers so the drawing viewport
 and glyph shader resolution change atomically with the canvas; resizing the
 canvas alone is not a valid renderer state during center-panel splits.
 
+Every terminal counts character widths by Unicode 11 (the
+`@xterm/addon-unicode11` addon in
+[`terminalUnicode.ts`](../../apps/web/src/components/terminalUnicode.ts)), so
+an emoji takes two columns, as programs such as the Claude CLI assume. xterm
+caches the cell size, so a font that loads after the first fit makes the
+client measure the cell again and fit from the new glyphs. The size request
+that follows waits for the layout to settle, as do a change of the display's
+pixel ratio and a bundled font loading. A new terminal tries WebGL again after
+an earlier terminal's WebGL failed, and its failure warning names the stage and
+the error type only. In development builds a bounded in-memory record
+(`terminalSizeDiagnostics.ts`) keeps the sizing and repaint decisions as
+numbers and enums; it holds no terminal content, id or path.
+
 A terminal session may keep running after its center panel stops rendering. The
 per-terminal input scheduler therefore survives renderer unmounts so an
 immediate replacement can preserve ordering, but its retained writer is
@@ -1537,7 +1576,10 @@ of the window a user typed, pasted or clicked in, or `null` for the terminal's
 own answers to a program's queries. Input without the field, from an older
 client, counts as use as before, since such a client cannot tell its replies
 from typing. Clients send it only to servers advertising
-`terminalUserInputClaim`, because input frames refuse unknown fields.
+`terminalUserInputClaim`, because input frames refuse unknown fields. The
+size hand-over rule (a released size waits, un-owned, for a window to be used)
+has its own capability, `terminalSizeHandOver`; a client never infers it from
+`terminalUserInputClaim`.
 Attachment identities prevent an old stream from clearing a replacement that
 reuses its claim, including across process restarts. Queued requests from an
 unregistered claim cannot resurrect it. Manager shutdown fences new claim
@@ -1570,10 +1612,10 @@ it no longer fits. At that deadline a proposal at the sizing minimum (the fit's
 waits for the quiet period like any other.
 Explicit triggers (click, typing, focus, **Fit to this window**) are not
 delayed. A null claim after a restart, or from a server
-without `terminalUserInputClaim` (which releases every size to nobody), prompts
+without `terminalSizeHandOver` (which releases every size to nobody), prompts
 an immediate claim even without focus, so a visible mirror takes the size as
 soon as the owner's stream ends; a hidden or zero-area mirror does not. A
-`resized` with a null claim from a server advertising `terminalUserInputClaim`
+`resized` with a null claim from a server advertising `terminalSizeHandOver`
 is an intentional hand-over to nobody: windows treat it like another window's
 size (scaled whole, with the notice) and claim it only through the same use
 triggers. A viewport keeps one claim for every renderer it creates, so a window
@@ -1955,8 +1997,29 @@ it.
   error class, never its text) cites its own event; and
   `provider.compaction-failed` (a compaction BiBCode asked for that failed, by
   provider, trigger and reason) cites its `provider.compaction` event, which
-  every settled compaction writes without any message or summary text. An event dropped by a full
+  every settled compaction writes without any message or summary text;
+  `client.render-error` cites its own event. An event dropped by a full
   channel is never cited.
+- `client.render-error` (R51, `error`) is recorded for each render error the
+  web app's error screen caught: the router's `defaultOnCatch` (only the root
+  route has an error component) queues the error's type from a closed set
+  (else `Other`), React's code from a minified message (185 for the
+  nested-update limit), up to 12 component-stack names (a name that is not a
+  plain identifier becomes `Unnamed`), the router's matched route id (checked
+  against the app's route ids) and a client hash, never the message, a URL, a
+  path or an id. The batch carries them in the optional `renderErrors` field,
+  which older servers ignore. Each environment keeps its pending errors (the
+  newest 8) until its server answers `{ accepted: true }` to the batch that
+  carried them. They are dropped on purpose only when the server says its
+  profiler is off (`{ accepted: false }` with no reason), or when the server
+  refuses the client's authorization for profiler batches, after which the
+  client sends that environment nothing more on this page; any other answer,
+  no answer or a failed send keeps them. Every send waits out the server's 5 s pacing, and a batch it
+  holds back keeps its whole window of measurements for the next one. The server applies the closed set, the identifier
+  shape and a route-id grammar again, redacts, emits one event each and groups
+  repeats by type, code, route and component names: the packaged bundle
+  minifies component names, so the route keeps crashes apart. The error screen
+  runs its own collector, because it replaces the tree that ran the first one.
 - `delivery.failing` (#273) is recorded once for a message delivery that fails
   for good without reaching its provider: the provider refused its own
   configuration (`provider-configuration`, also when restart recovery meets
@@ -2260,7 +2323,8 @@ monitor child, timer, dump scan, webview process scan, or web content pid read
 runs. `emit` and
 `record_finding` return at once, and request timing and exit watches check
 `is_enabled()` before allocating anything. The client collector holds no timer,
-listener, or observer and adds no correlation header. Startup still takes the
+listener, or observer, adds no correlation header, and reads nothing from a
+render error the error screen caught. Startup still takes the
 lock and replays `findings.ndjson`.
 
 ### Diagnostics page and status bar
@@ -2310,7 +2374,13 @@ policy:
   characters are stripped, and text fields are capped at 2 KiB;
 - a panic message keeps its first line, with quoted text, `Err` and `Ok` values,
   assertion operands, and `Debug` renderings replaced by `[redacted]`; and
-- fingerprints never contain paths or timestamps.
+- fingerprints never contain paths or timestamps; and
+- a render error the error screen caught keeps only an error type from a
+  closed set, React's numeric code, component names from React's component
+  stack and the router's own route id. The server replaces a type outside the
+  set, a name that is not a plain identifier and a route outside the route-id
+  grammar. A shape check cannot prove a string is not content, so an
+  identifier-shaped name is recorded as it is.
 
 Minidumps hold raw memory and leave the machine only in an export the user
 asks for. Two authenticated server routes serve profiler data to clients:
@@ -3536,7 +3606,10 @@ The host collector (`diagnostics/host_metrics`, #292) is the one diagnostics
 reader that samples while nobody watches: the production runtime starts it with
 the server, and it reads the host's CPU and memory every 60 seconds, and volume
 space every fifth reading, so the Host dashboard can show statistics since the
-server started. It never walks the process table. While at least one
+server started. The dashboard hides every read-only FUSE mount under a
+`.mount_` directory (an AppImage's image, whether this process, another
+instance or a killed one runs from it); a user's own read-only FUSE volume
+mounted there is hidden too. It never walks the process table. While at least one
 `server.subscribeHostMetrics` stream is open it reads once a second, shared by
 every subscriber through one watch channel, and it drops back to 60 seconds
 when the last stream closes. Volume lists and space reads run on four dedicated
@@ -3649,6 +3722,11 @@ sees partial source:
   is cancelled only when its last waiting block leaves, and a result shows only
   in a block that still holds its source. A failed renderer import is cleared
   so **Retry** can try again.
+- **Read-only file view.** The read-only rendered Markdown view of a file
+  (`ChatMarkdown` given the file's path) loads a relative image from the
+  workspace through the same `RichMarkdownImage` loader as the editable view,
+  so it is not requested against the app's own address. Chat messages pass no
+  path and keep a plain image.
 - **Editable file view.** The rendered view of an editable `.md` file is a
   TipTap editor, not `ChatMarkdown`. There,
   `components/files/richMarkdown/mermaidDiagramExtension.ts` turns each fence
@@ -3793,6 +3871,16 @@ view), or free scrolling.
   and no later scroll applies it; it also releases the anchor a recent data
   change locked, which was recorded before that adjustment and would apply it
   a second time. A held request therefore never moves a reader who took over.
+- **Hidden lists.** A list under a hidden or detached ancestor measures every
+  row 0 by 0. LegendList's resize path already ignores that rectangle; the
+  patch adds the same skip to its layout-effect measurement
+  (`measureContainersInLayoutEffect`) and to the frame that confirms a row's
+  shrink, in both bundles. Taken as a size, each zero row admitted more rows
+  into a hidden list until React stopped at its nested-update limit (#360), as
+  the branch and model pickers did inside their kept-mounted popovers. A row
+  that really shrinks while visible is still taken. The Git Manager branch
+  picker also unmounts its list once its popover has finished closing
+  (`onOpenChangeComplete`).
 - **Bottom region.** LegendList keeps the list at its end
   (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
   is anchored (`resolveTimelineMaintainScrollAtEnd`). LegendList also scrolls

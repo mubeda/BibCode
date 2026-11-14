@@ -6,6 +6,7 @@ import {
   getTimelinePageScrollOffset,
   isAboveReadingLine,
   keyboardScrollStopsLiveFollow,
+  listMovedAwayFromEnd,
   rowToggleNeedsEndReveal,
   type TimelineScrollMode,
 } from "./timelineScrollAnchoring";
@@ -178,6 +179,22 @@ describe("rowToggleNeedsEndReveal", () => {
     expect(toggle("following-end", 0)).toBe(false);
     expect(toggle("free-scrolling", 0)).toBe(false);
     expect(toggle("free-scrolling", 400)).toBe(false);
+  });
+});
+
+describe("listMovedAwayFromEnd", () => {
+  it("tells a move up through the content from growth and from rows above changing size", () => {
+    const at = (scroll: number, contentLength: number) => ({ scroll, contentLength });
+    // The Windows trace (#351): scrollIntoView moved the view from 154 to 0.
+    expect(listMovedAwayFromEnd(at(154, 1_439), at(0, 1_439))).toBe(true);
+    // A work group's correction moved it up while the group grew below.
+    expect(listMovedAwayFromEnd(at(734, 1_295), at(34.5, 1_439))).toBe(true);
+    // A streamed reply grows below the view, or the follow scrolls down to it.
+    expect(listMovedAwayFromEnd(at(573, 1_252), at(573, 1_486))).toBe(false);
+    expect(listMovedAwayFromEnd(at(0, 1_673), at(1_014, 1_673))).toBe(false);
+    // Rows above shrink and the list keeps what is on screen in place.
+    expect(listMovedAwayFromEnd(at(593, 1_252), at(512, 1_171))).toBe(false);
+    expect(listMovedAwayFromEnd(at(600, 1_400), at(599, 1_400))).toBe(false);
   });
 });
 

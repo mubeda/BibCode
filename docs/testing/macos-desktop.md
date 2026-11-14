@@ -414,7 +414,10 @@ as not verified, with the lock evidence (`ioreg -n Root -d1` shows
   instead of network labels while retaining **Automatic (LAN)**, uses stable
   address/port IDs, safely preselects a
   private default, reports off-host interface observations unavailable before
-  widening, and leaves generation disabled with externally managed
+  widening, lists each private, overlay and Tailscale address marked
+  `local-only` as "(enables remote access)" while native exposure is local-only
+  and widens before minting a code for the chosen one, and leaves generation
+  disabled with externally managed
   listener/reverse-proxy guidance when native discovery has only a public or
   non-default private address. Public interface candidates remain
   non-actionable even after native exposure is wide. A custom off-host address

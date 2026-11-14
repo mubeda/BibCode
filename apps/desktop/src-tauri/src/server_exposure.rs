@@ -47,6 +47,26 @@ pub(crate) async fn apply_exposure(
         .await
 }
 
+/// Widens after `before_lock`, a firewall step that may wait for a person at the Windows
+/// prompt. It runs before the exposure lock and before any restart, so other exposure
+/// changes are not held behind the prompt, and a refusal leaves nothing to recover.
+pub(crate) async fn apply_exposure_after(
+    coordinator: &ServerExposureCoordinator,
+    operations: &impl ExposureOperations,
+    desired: &str,
+    before_lock: impl Future<Output = Result<(), String>>,
+) -> Result<ExposureTransition, String> {
+    if desired == "network-accessible"
+        && operations.native_exposure_available()?
+        && let Err(error) = before_lock.await
+    {
+        return Err(format!(
+            "Could not apply server exposure {desired}: open remote-access firewall rule: {error}. No exposure change was made."
+        ));
+    }
+    apply_exposure(coordinator, operations, desired).await
+}
+
 pub(crate) async fn recover_local(
     operations: &impl ExposureOperations,
 ) -> Result<ExposureTransition, String> {
@@ -80,20 +100,25 @@ async fn apply_exposure_locked(
 
     if desired == "network-accessible" {
         if errors.is_empty() {
-            let restarted = match operations.restart_with_mode(desired).await {
-                Ok(restarted) => restarted.or_else(|| operations.current_config()),
-                Err(error) => {
-                    errors.push(format!("restart network-accessible backend: {error}"));
-                    None
+            // The rule names the program, not the port, so it is checked before the wide
+            // restart: a rule that fails here never widens the server, though the recovery
+            // below still restarts it local-only.
+            if let Err(error) = operations.sync_firewall(true).await {
+                errors.push(format!("open remote-access firewall rule: {error}"));
+            }
+            let restarted = if errors.is_empty() {
+                match operations.restart_with_mode(desired).await {
+                    Ok(restarted) => restarted.or_else(|| operations.current_config()),
+                    Err(error) => {
+                        errors.push(format!("restart network-accessible backend: {error}"));
+                        None
+                    }
                 }
+            } else {
+                None
             };
             if errors.is_empty() && !is_verified_wide(restarted.as_ref()) {
                 errors.push("restart did not produce a network-accessible endpoint".to_owned());
-            }
-            if errors.is_empty()
-                && let Err(error) = operations.sync_firewall(true).await
-            {
-                errors.push(format!("open remote-access firewall rule: {error}"));
             }
             if errors.is_empty()
                 && let Err(error) = operations.persist_mode(desired).await
@@ -173,8 +198,15 @@ async fn recover_local_steps(operations: &impl ExposureOperations) -> LocalRecov
             None
         }
     };
-    if let Err(error) = operations.sync_firewall(false).await {
-        errors.push(format!("close remote-access firewall rule: {error}"));
+    match operations.sync_firewall(false).await {
+        Ok(()) => {}
+        // Windows keeps a rule an unelevated desktop cannot delete; the program-scoped rule
+        // admits nothing once the listener below is verified loopback-only.
+        Err(error) if error == crate::firewall::FIREWALL_RULE_LEFT_TOKEN => tracing::warn!(
+            reason = %error,
+            "remote-access firewall rule left in place without administrator permission"
+        ),
+        Err(error) => errors.push(format!("close remote-access firewall rule: {error}")),
     }
     let current_config = operations.current_config().or(restarted);
     let verified_local = is_verified_local(current_config.as_ref());
@@ -219,6 +251,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use super::*;
@@ -396,8 +429,6 @@ mod tests {
             server_exposure_mode: mode.to_owned(),
             endpoint_url: wide.then(|| "http://192.168.1.20:3773".to_owned()),
             advertised_host: wide.then(|| "192.168.1.20".to_owned()),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 
@@ -416,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn widening_orders_restart_firewall_then_persistence() {
+    async fn widening_orders_firewall_restart_then_persistence() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("local-only");
 
@@ -434,8 +465,8 @@ mod tests {
         assert_eq!(
             operations.calls(),
             [
-                "restart:network-accessible",
                 "firewall:true",
+                "restart:network-accessible",
                 "persist:network-accessible",
             ]
         );
@@ -455,8 +486,8 @@ mod tests {
         assert_eq!(
             operations.calls(),
             [
-                "restart:network-accessible",
                 "firewall:true",
+                "restart:network-accessible",
                 "persist:network-accessible",
                 "persist:local-only",
                 "restart:local-only",
@@ -470,7 +501,9 @@ mod tests {
     async fn failed_widening_attempts_every_local_safeguard_in_order_and_combines_errors() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("local-only");
-        operations.return_next_restart(Some(config_for_mode("network-accessible")));
+        // The firewall step now runs before the restart, so the topology that recovery
+        // cannot verify is the one already running.
+        operations.set_current_config(Some(config_for_mode("network-accessible")));
         operations.fail_next_firewall("wide firewall failed");
         operations.fail_next_persist("local persistence failed");
         operations.fail_next_restart("local restart failed");
@@ -496,7 +529,6 @@ mod tests {
         assert_eq!(
             operations.calls(),
             [
-                "restart:network-accessible",
                 "firewall:true",
                 "persist:local-only",
                 "restart:local-only",
@@ -508,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn widening_without_an_advertised_endpoint_recovers_before_opening_the_firewall() {
+    async fn widening_without_an_advertised_endpoint_recovers_and_closes_the_firewall() {
         let coordinator = ServerExposureCoordinator::default();
         let operations = FakeExposureOperations::with_persisted_mode("local-only");
         let mut unadvertised = config_for_mode("network-accessible");
@@ -524,6 +556,7 @@ mod tests {
         assert_eq!(
             operations.calls(),
             [
+                "firewall:true",
                 "restart:network-accessible",
                 "persist:local-only",
                 "restart:local-only",
@@ -549,8 +582,8 @@ mod tests {
         assert_eq!(
             operations.calls(),
             [
-                "restart:network-accessible",
                 "firewall:true",
+                "restart:network-accessible",
                 "persist:network-accessible",
                 "persist:local-only",
                 "restart:local-only",
@@ -648,10 +681,11 @@ mod tests {
             .await
             .expect_err("firewall-open failure recovers local");
         assert!(error.contains("open failed"));
+        // A rule that fails under the lock avoids the wide restart; recovery still restarts
+        // the server local-only.
         assert_eq!(
             widening.calls(),
             [
-                "restart:network-accessible",
                 "firewall:true",
                 "persist:local-only",
                 "restart:local-only",
@@ -680,6 +714,129 @@ mod tests {
                 "verify:local-only",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_before_the_lock_changes_nothing() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("local-only");
+
+        let error = apply_exposure_after(&coordinator, &operations, "network-accessible", async {
+            Err("firewall-elevation-required".to_owned())
+        })
+        .await
+        .expect_err("a refused prompt fails the widen");
+
+        assert_eq!(
+            error,
+            "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. No exposure change was made."
+        );
+        assert!(operations.calls().is_empty(), "{:?}", operations.calls());
+    }
+
+    #[tokio::test]
+    async fn the_prompt_step_runs_only_for_a_native_widen() {
+        let coordinator = ServerExposureCoordinator::default();
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        apply_exposure_after(&coordinator, &narrowing, "local-only", async {
+            panic!("narrowing must not prompt")
+        })
+        .await
+        .expect("narrowing succeeds");
+
+        let wsl_only = FakeExposureOperations::with_persisted_mode("local-only");
+        wsl_only.set_native_exposure_available(false);
+        let error = apply_exposure_after(&coordinator, &wsl_only, "network-accessible", async {
+            panic!("WSL-only must not prompt")
+        })
+        .await
+        .expect_err("WSL-only rejects native exposure");
+        assert!(error.contains("WSL-only primary mode"));
+    }
+
+    #[tokio::test]
+    async fn other_exposure_changes_are_not_held_behind_an_open_prompt() {
+        let coordinator = ServerExposureCoordinator::default();
+        let widening = FakeExposureOperations::with_persisted_mode("local-only");
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+
+        let prompted = apply_exposure_after(&coordinator, &widening, "network-accessible", async {
+            answered.await.expect("the person answers");
+            Ok(())
+        });
+        let other = async {
+            apply_exposure(&coordinator, &narrowing, "local-only")
+                .await
+                .expect("a queued change runs while the prompt is open");
+            answer.send(()).expect("prompt still waiting");
+        };
+        let (prompted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(prompted, other)
+        })
+        .await
+        .expect("no change waits behind the prompt");
+
+        prompted.expect("the approved widen completes");
+        assert_eq!(
+            widening.calls(),
+            [
+                "firewall:true",
+                "restart:network-accessible",
+                "persist:network-accessible",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_firewall_rule_windows_refuses_to_delete_is_tolerated_once_local_is_verified() {
+        let coordinator = ServerExposureCoordinator::default();
+        let refused = FakeExposureOperations::with_persisted_mode("local-only");
+        {
+            let mut state = refused.state.lock().expect("fake state");
+            state
+                .firewall_results
+                .push_back(Err("firewall-elevation-required".to_owned()));
+            state
+                .firewall_results
+                .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        }
+        let error = apply_exposure(&coordinator, &refused, "network-accessible")
+            .await
+            .expect_err("a refused widen recovers local");
+        assert_eq!(
+            error,
+            "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. Restored local-only safeguards."
+        );
+
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        narrowing
+            .state
+            .lock()
+            .expect("fake state")
+            .firewall_results
+            .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        apply_exposure(&coordinator, &narrowing, "local-only")
+            .await
+            .expect("a rule left in place does not fail a verified local-only narrowing");
+
+        // The listener check stays a hard requirement even then.
+        let unverified = FakeExposureOperations::with_persisted_mode("network-accessible");
+        unverified.set_current_config(Some(config_for_mode("network-accessible")));
+        {
+            let mut state = unverified.state.lock().expect("fake state");
+            state
+                .restart_results
+                .push_back(Ok(Some(config_for_mode("network-accessible"))));
+            state
+                .firewall_results
+                .push_back(Err(crate::firewall::FIREWALL_RULE_LEFT_TOKEN.to_owned()));
+        }
+        let error = apply_exposure(&coordinator, &unverified, "local-only")
+            .await
+            .expect_err("an unverified listener still fails");
+        assert!(error.contains("not verified local-only"), "{error}");
+        assert!(!error.contains("firewall-rule-left"), "{error}");
     }
 
     #[tokio::test]
@@ -720,8 +877,8 @@ mod tests {
 
         let calls = operations.calls();
         let widen_then_narrow = [
-            "restart:network-accessible",
             "firewall:true",
+            "restart:network-accessible",
             "persist:network-accessible",
             "persist:local-only",
             "restart:local-only",
@@ -733,8 +890,8 @@ mod tests {
             "restart:local-only",
             "firewall:false",
             "verify:local-only",
-            "restart:network-accessible",
             "firewall:true",
+            "restart:network-accessible",
             "persist:network-accessible",
         ];
         assert!(calls == widen_then_narrow || calls == narrow_then_widen);
@@ -764,8 +921,8 @@ mod tests {
         assert!(
             calls
                 == [
-                    "restart:network-accessible",
                     "firewall:true",
+                    "restart:network-accessible",
                     "persist:network-accessible",
                     "settings:write",
                     "settings:restart",
@@ -774,8 +931,8 @@ mod tests {
                     == [
                         "settings:write",
                         "settings:restart",
-                        "restart:network-accessible",
                         "firewall:true",
+                        "restart:network-accessible",
                         "persist:network-accessible",
                     ]
         );

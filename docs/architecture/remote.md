@@ -96,10 +96,35 @@ deduplicates by address, and ranks a usable private default-route address before
 CGNAT/Tailscale and other private addresses. The native bridge publishes usable
 interface observations even while its listener is loopback-only; those
 off-host observations report `status: unavailable` until the native listener is
-wide. This lets the renderer distinguish a private default route from a
-public-only or non-default topology before it requests privileged mutation.
-Native-managed automatic sharing accepts only a private or CGNAT default-route
-observation. Public interface observations are never actionable in a
+wide. A private or CGNAT observation, including a Tailscale IPv4 address, also
+carries `unavailableReason: local-only`, meaning that enabling native remote
+access would make it reachable. The bridge reads Tailscale status (the
+read-only `tailscale status --json`, at most 1.5 seconds per CLI location and
+3 seconds for all of them, with a crash exit reported to the Profiler) whatever
+the exposure mode. BiBCode does not manage Tailscale: that status query is the
+only Tailscale command it runs, and there is no setting, bridge command or
+dialog that starts, changes or stops Tailscale Serve. When status reports a
+MagicDNS name, the bridge probes `https://<name>/` (port 443, at most 2.5
+seconds) for BiBCode's well-known endpoint and lists the address as available
+only when it answers, which happens when the person set up Serve outside
+BiBCode. An address fetch therefore waits at most about 5.5 seconds for
+Tailscale. The removed `desktop_bridge_set_tailscale_serve_enabled` command
+stays registered and answers the `tauri_capability_unsupported` payload without
+changing anything, and stored `tailscaleServeEnabled` / `tailscaleServePort`
+keys from an earlier version are ignored on read and dropped on the next write.
+The WSL bootstrap still sends those two fields with fixed values because older
+`bibcode serve` builds require them. This lets the renderer distinguish a private default
+route from a public-only or non-default topology before it requests privileged
+mutation. Native-managed automatic sharing accepts only a private or CGNAT
+default-route observation. While a native-managed host is local-only and has
+that default route, the Share this host Address list offers "Automatic (LAN)"
+and each address marked `local-only`, labelled "(enables remote access)";
+choosing one widens exposure first, exactly as Automatic does, and the code
+uses that address with the port of the endpoint the completed widen reports. An
+externally served address, such as a Tailscale Serve HTTPS name, keeps its own
+port.
+The wide listener binds `0.0.0.0`, so every listed address reaches it once the
+firewall admits the program. An address unavailable for any other reason is not offered. Public interface observations are never actionable in a
 native-managed topology, including after an unrelated transition has made the
 listener wide. A public-only host must use a custom address backed by an
 externally managed `bibcode serve` listener or reverse proxy rather than asking
@@ -874,9 +899,11 @@ never reads as "no backend" and so never as verified local-only. Relaunch the
 app to recover from that state. One coordinator serializes exposure applies and every
 other settings mutation that can restart the native or WSL topology. Those
 non-exposure mutations preserve the actual runtime exposure across their
-restart instead of reapplying a stale durable mode. Widening uses an
-ephemeral launch override, verifies a network-accessible advertised endpoint,
-opens the program-scoped `BiBCode Remote Access` Windows Firewall rule, and
+restart instead of reapplying a stale durable mode. Widening first ensures the
+program-scoped `BiBCode Remote Access` Windows Firewall rule (it names the
+program, not the port, so it can be checked before the server widens), then
+restarts with an ephemeral launch override, verifies a
+network-accessible advertised endpoint, and
 persists network-accessible only after those native side effects succeed. Any
 failure attempts every local safeguard even if an earlier recovery step fails:
 persist local-only, restart with a local-only override, close the firewall, and
@@ -899,6 +926,98 @@ only after its absence is verified; process, policy, and verification failures
 propagate to the coordinator and are reported as incomplete cleanup. The
 persisted desktop setting records the last completed transition but is neither
 proof of actual topology nor permission to start wide.
+
+Windows refuses every firewall write from a desktop that runs without
+administrator rights. After a refused add or delete, the worker runs
+`whoami /groups` and reads the mandatory-label SID, which is not localized:
+Low or Medium integrity with no High or System label means the refusal was for
+missing elevation. An elevated desktop whose change fails gets the plain step
+failure, so Retry never loops. When the rule is already present for the same
+executable path, enabling keeps it without any write, but only after
+`reg.exe query` on the firewall policy's rule store shows that rule enabled,
+allowing, inbound and for this path. Those stored fields are fixed tokens
+(`Active=TRUE`), unlike the localized `netsh` listing, and a standard user can
+read them. A rule that was disabled or turned into a block is replaced like a
+rule for another path. When the store cannot be read, the listing's word is
+taken and a `warn` is logged. Only a widen the person
+starts with **Generate pairing offer**, **Retry** or **Resume legacy remote
+access** in Share this host passes `allowElevationPrompt` through the desktop
+bridge, which only the app's own `main` webview can invoke. That firewall step
+runs before the exposure lock and before any restart, so other exposure changes
+are not held behind an open prompt, and a refusal there changes nothing and
+restarts nothing. The firewall check repeated under the lock runs before the
+wide restart: if it fails, the server never widens, but the usual recovery still
+restarts it local-only. It
+may ask Windows, through the standard elevation prompt, to run `netsh.exe` from
+the system directory `GetSystemDirectoryW` reports, by `ShellExecuteExW` with
+the `runas` verb; the prompt names the Windows program (Network Command Shell),
+not BiBCode. Each elevated run is one `netsh` command: `add rule`, preceded by a
+separate `delete rule` with its own prompt in the rare case that a rule for
+another executable path is present. No shell or script runs elevated. The
+arguments are fixed strings plus the desktop's own executable path, joined by
+the Windows command-line rules: an argument with a space is wrapped in double
+quotes with the backslashes before the closing quote doubled, and a double
+quote or NUL, which a Windows path cannot contain, is refused. No value from the
+web or the network reaches the elevated command line. Every program this step
+starts, including the unelevated `netsh`, `whoami` and `reg` runs, comes from that
+system directory, never from `PATH` or an environment variable. The person has
+120 seconds to answer, separate from the five-second budget that still covers
+every non-interactive command; the elevated `netsh` exit is reported to the
+Profiler. The worker then reads the rule back: after an add from an absent
+rule any rule counts, and after a replace the rule must name this program. The
+worker remembers that this process added the present rule, so the check under
+the exposure lock, which runs before the restart, accepts the same rule even
+when the listing does not echo a non-ASCII path byte for byte. A declined,
+dismissed or timed-out prompt, or one Windows could not show, is one refusal
+and is not retried. A prompt counts as open until the `ShellExecuteExW` call
+really returns, even after its caller was given the refusal; meanwhile a
+permitted widen fails with `firewall-prompt-open` and raises no second prompt.
+When the person approves deleting a rule for another program path but declines
+the add, the old rule stays deleted (it named a stale path), exposure stays
+local-only and the outcome is `firewall-rule-removed-not-added`. Two limits are
+not verified: the stand-in probe checks the Windows argument rules, not how
+netsh itself parses `name=` and `program=` values (a real add is seen only when
+someone approves a prompt), and the wait for the prompt does not count time the
+computer is asleep. Recovery, automatic widening and narrowing by the share reconciler,
+and the WSL-only switch never prompt. A person who is not an administrator gets
+Windows' credential prompt or a refusal; both follow the same path.
+
+Failures leave the firewall module only as fixed reason tokens, never as `netsh`
+output, which is localized and can name paths:
+`firewall-elevation-required`, `firewall-rule-left`, `firewall-read-failed`,
+`firewall-remove-failed`, `firewall-add-failed`, `firewall-timed-out`,
+`firewall-unavailable`, `firewall-prompt-open` and
+`firewall-rule-removed-not-added`. The Share this host dialog turns them into plain text
+naming the failed step. For `firewall-elevation-required` it says that Windows
+needs administrator permission to open the firewall for BiBCode, that remote
+access was not turned on, whether the computer is confirmed local-only, and
+that the person can choose **Retry** or start BiBCode with **Run as
+administrator**. A plain string rejection from the bridge keeps its own trimmed
+reason rather than a generic message.
+
+On Windows without administrator rights, turning sharing off returns the
+listener to verified local-only but can leave the program-scoped rule in place,
+because Windows also refuses an unelevated delete. Narrowing and recovery report
+that case as `firewall-rule-left`, log it at warn level without a path, and do
+not count it as a failed safeguard. Every other delete failure still fails the
+safeguard, and the loopback-only listener check stays mandatory. A prompt left
+open past its deadline belongs to Windows and cannot be closed by BiBCode; a
+late approval can add the rule after the widen was refused, and that rule is
+also left in place. A tolerated rule needs all of: the delete ran and exited
+(a spawn failure or timeout fails the safeguard), the desktop runs unelevated,
+and a read-back still lists the rule (a failed read-back fails the safeguard).
+The integrity level alone is accepted as the reason because an unelevated
+process can never change a firewall rule. To remove a left rule, run this from
+an administrator terminal:
+
+```powershell
+netsh advfirewall firewall delete rule name="BiBCode Remote Access"
+```
+
+The rule covers Domain and Private network profiles only. BiBCode does not read
+the adapter's network profile, so on a network Windows classifies as Public,
+other devices can stay blocked although sharing reports success. On Windows the
+Share this host dialog says so in a note next to **Generate pairing offer**.
 Creating a **This computer only** grant or any **Custom address** grant never
 widens a later launch, and there is no independent manual exposure toggle.
 

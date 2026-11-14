@@ -12,6 +12,7 @@ import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  isNewestWorkEntry,
   detailsOpenForScope,
   EMPTY_TIMELINE_DISCLOSURES,
   isWorkEntryInUnsettledTurn,
@@ -2714,5 +2715,19 @@ describe("timeline item types", () => {
     "working",
   ] as const)("keeps the %s kind as its type", (kind) => {
     expect(resolveTimelineItemType({ kind, id: kind } as never)).toBe(kind);
+  });
+});
+
+describe("isNewestWorkEntry", () => {
+  const work = (...ids: string[]) =>
+    ({ kind: "work", id: ids[0], groupedEntries: ids.map((id) => ({ id })) }) as never;
+  const other = { kind: "working", id: "working" } as never;
+
+  it("is true only for the last step of the last work row", () => {
+    const rows = [work("thought-a"), work("tool-b"), work("thought-c"), other];
+    expect(isNewestWorkEntry(rows, "thought-c")).toBe(true);
+    expect(isNewestWorkEntry(rows, "thought-a")).toBe(false);
+    expect(isNewestWorkEntry([work("thought-a", "tool-b")], "thought-a")).toBe(false);
+    expect(isNewestWorkEntry([other], "thought-a")).toBe(false);
   });
 });

@@ -16,7 +16,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -1160,24 +1160,10 @@ fn read_session(
     (!records.failed).then_some(session).flatten()
 }
 
+/// The store's one timestamp form, so imported timestamps sort with the thread's other
+/// timestamps (#366).
 fn iso(time: SystemTime) -> String {
-    iso_millis(OffsetDateTime::from(time))
-}
-
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ`, as JavaScript writes it, so imported timestamps sort with the
-/// thread's other timestamps.
-fn iso_millis(time: OffsetDateTime) -> String {
-    let time = time.to_offset(time::UtcOffset::UTC);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        time.year(),
-        u8::from(time.month()),
-        time.day(),
-        time.hour(),
-        time.minute(),
-        time.second(),
-        time.millisecond()
-    )
+    crate::persistence::format_timestamp(OffsetDateTime::from(time))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1604,8 +1590,8 @@ fn trimmed(value: Option<&str>) -> Option<&str> {
 
 fn normalize_timestamp(value: Option<&str>, fallback: &str) -> String {
     value
-        .and_then(|value| OffsetDateTime::parse(value.trim(), &Rfc3339).ok())
-        .map_or_else(|| fallback.to_owned(), iso_millis)
+        .and_then(crate::persistence::canonical_timestamp)
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn truncate_message(text: &str) -> String {

@@ -308,12 +308,12 @@ impl Repositories {
     }
 
     /// Records that BiBCode created a worktree at `worktree_path`. A creation at a path that
-    /// still has a record replaces it with a new `record_id`.
+    /// still has a record replaces it with a new `record_id`, which is returned.
     pub async fn record_worktree_creation(
         &self,
         project_cwd: &str,
         worktree_path: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let (project_cwd, worktree_path) = (project_cwd.to_owned(), worktree_path.to_owned());
         self.database
             .call(move |connection| {
@@ -322,21 +322,25 @@ impl Repositories {
                      VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                     params![worktree_path, project_cwd],
                 )?;
-                Ok(())
+                Ok(connection.last_insert_rowid())
             })
             .await
     }
 
-    /// Deletes the creation record of a removed worktree, written under any project spelling.
-    pub async fn delete_worktree_creation_record(&self, worktree_path: &str) -> Result<()> {
+    /// The `record_id` of the current creation record at `worktree_path`, written under any
+    /// project spelling.
+    pub async fn worktree_creation_record_id(&self, worktree_path: &str) -> Result<Option<i64>> {
         let worktree_path = worktree_path.to_owned();
         self.database
             .call(move |connection| {
-                connection.execute(
-                    "DELETE FROM worktree_creation_records WHERE worktree_path = ?",
-                    [worktree_path],
-                )?;
-                Ok(())
+                connection
+                    .query_row(
+                        "SELECT record_id FROM worktree_creation_records WHERE worktree_path = ?",
+                        [worktree_path],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
             })
             .await
     }
@@ -2217,7 +2221,7 @@ impl Repositories {
                     {
                         Some(sooner)
                     }
-                    (_, Some(pending)) => Some(format_epoch_ms(pending)),
+                    (_, Some(pending)) => Some(crate::persistence::format_timestamp_ms(pending)),
                     (next, None) => next,
                 };
                 let mcp_named_clients = if table_has_named_clients(&transaction)? {
@@ -4263,17 +4267,6 @@ fn source_class(source_key: &str) -> &str {
     source_key.split(':').next().unwrap_or_default()
 }
 
-/// Epoch milliseconds as an RFC 3339 timestamp.
-fn format_epoch_ms(epoch_ms: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
-        .ok()
-        .and_then(|date| {
-            date.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
-}
-
 /// An RFC 3339 timestamp as epoch milliseconds; `None` when it does not parse.
 fn parse_epoch_ms(value: &str) -> Option<i64> {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
@@ -4315,7 +4308,7 @@ fn prune_mcp_oauth_on(
     connection.execute(
         "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id NOT IN \
          (SELECT session_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > ?)",
-        params![format_epoch_ms(now_ms)],
+        params![crate::persistence::format_timestamp_ms(now_ms)],
     )?;
     Ok(pending_gone)
 }
@@ -5771,25 +5764,46 @@ mod worktree_creation_record_tests {
     }
 
     #[tokio::test]
-    async fn worktree_creation_record_delete_removes_only_that_path() {
+    async fn worktree_creation_record_id_names_the_current_record() {
         let repositories = migrated(Database::open_in_memory().await.unwrap()).await;
-        for (project, path) in [
-            ("/repo/", "/worktrees/feature-a"),
-            ("/repo", "/worktrees/feature-b"),
-        ] {
+        let first = repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_eq!(
             repositories
-                .record_worktree_creation(project, path)
+                .worktree_creation_record_id("/worktrees/feature-a")
                 .await
-                .unwrap();
-        }
-        // The worktree path alone names the record, however the project root is spelled.
+                .unwrap(),
+            Some(first)
+        );
+        let second = repositories
+            .record_worktree_creation("/repo", "/worktrees/feature-a")
+            .await
+            .unwrap();
+        assert_ne!(first, second, "a recreation is a new record");
+        assert_eq!(
+            repositories
+                .worktree_creation_record_id("/worktrees/feature-a")
+                .await
+                .unwrap(),
+            Some(second)
+        );
         repositories
-            .delete_worktree_creation_record("/worktrees/feature-a")
+            .reap_worktree_creation_record(first)
             .await
             .unwrap();
         assert_eq!(
             recorded_paths(&repositories).await,
-            ["/worktrees/feature-b"]
+            ["/worktrees/feature-a"],
+            "reaping the old id keeps the later record"
+        );
+        assert_eq!(
+            repositories
+                .worktree_creation_record_id("/worktrees/other")
+                .await
+                .unwrap(),
+            None
         );
     }
 
@@ -6079,5 +6093,52 @@ mod frozen_session_unfreeze_tests {
             assert_eq!(retained.provider_name, provider);
             assert_eq!(retained.provider_instance_id.as_deref(), instance);
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_text_order_tests {
+    use super::*;
+    use crate::persistence::format_timestamp_ms;
+
+    /// 2026-01-01T00:00:00Z, a whole second: the instant a trimmed fraction writes shortest.
+    const SECOND_MS: i64 = 1_767_225_600_000;
+
+    /// #362: the cleanup keeps the refresh token of a session that expires one millisecond
+    /// after a cleanup run on a whole second. Fixed timestamps, so load cannot change it.
+    #[test]
+    fn the_oauth_cleanup_keeps_a_token_whose_session_outlives_it_by_a_millisecond() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        crate::persistence::run_migrations(&mut connection, None).expect("migrations apply");
+        connection
+            .execute(
+                "INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, \
+                 expires_at) VALUES ('session-a', 'mcp-client', '[]', 'mcp-oauth', ?1, ?2)",
+                params![
+                    format_timestamp_ms(SECOND_MS - 60_000),
+                    format_timestamp_ms(SECOND_MS + 1)
+                ],
+            )
+            .expect("session row");
+        connection
+            .execute(
+                "INSERT INTO mcp_oauth_refresh_tokens (token_hash, session_id, client_id, \
+                 issued_at) VALUES ('hash-a', 'session-a', 'client-a', ?1)",
+                params![SECOND_MS - 60_000],
+            )
+            .expect("refresh token row");
+
+        prune_mcp_oauth_on(&connection, SECOND_MS, crate::auth::oauth::LIMITS)
+            .expect("the cleanup runs");
+
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mcp_oauth_refresh_tokens", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            kept, 1,
+            "the live session's refresh token was deleted early"
+        );
     }
 }

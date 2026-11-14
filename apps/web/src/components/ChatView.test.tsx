@@ -5519,11 +5519,19 @@ describe("ChatView handlers (captured from mocked children)", () => {
   // not a scroll, so the turn's end comes back into view. A press on the list itself, such as
   // its scrollbar, is still the reader taking over.
   it.each([
-    { pressed: "a Thinking row's toggle", onControl: true, revealsEnd: true },
-    { pressed: "the list itself", onControl: false, revealsEnd: false },
+    { pressed: "a Thinking row's toggle", onControl: true, newestInGroup: true, revealsEnd: true },
+    { pressed: "the list itself", onControl: false, newestInGroup: true, revealsEnd: false },
+    // R12 scroll path (#351): thought A of a work row grouping [A, tool B, thought C] is not
+    // the newest step, although no later list row exists, so it keeps its place.
+    {
+      pressed: "a Thinking row's toggle with a later step in its row",
+      onControl: true,
+      newestInGroup: false,
+      revealsEnd: false,
+    },
   ])(
     "a pointer press on $pressed before a toggle at an anchored turn's end",
-    async ({ onControl, revealsEnd }) => {
+    async ({ onControl, newestInGroup, revealsEnd }) => {
       vi.unstubAllGlobals();
       Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
       seedConnectedServerThread();
@@ -5589,7 +5597,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
           new PointerEvent("pointerdown", { bubbles: true }),
         );
         // The turn ends in view; the toggle then opens a trace that pushes its end below.
-        (timeline["onReasoningRowToggle"] as () => void)();
+        (timeline["onReasoningRowToggle"] as (newestInGroup: boolean) => void)(newestInGroup);
         geometry.lastRowHeight = 3000;
         await nextFrames(3);
 
@@ -5604,6 +5612,121 @@ describe("ChatView handlers (captured from mocked children)", () => {
       }
     },
   );
+
+  // #351, the Windows trace: the spec scrolled a Thinking row to the center (scrollIntoView, no
+  // wheel or touch), toggled it, and a streamed entry about 150 ms later ran the live follow,
+  // which revealed the anchored turn's end from scroll 0 (1014 px) because the move away from
+  // the end had been ignored as not the reader's own.
+  it("R12 scroll path: a streamed entry after a programmatic scroll away from an anchored turn's end keeps the reader's place", async () => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    const thread = makeThread();
+    seedConnectedServerThread(thread);
+    const scrollNode = document.createElement("div");
+    document.body.append(scrollNode);
+    // The trace's metrics: a 643 px view over a turn whose end sat 780 px below scroll 0.
+    const geometry = { scroll: 796, turnHeight: 1339 };
+    Object.defineProperty(scrollNode, "scrollTop", {
+      configurable: true,
+      get: () => geometry.scroll,
+      set: (value: number) => {
+        geometry.scroll = value;
+      },
+    });
+    const list = {
+      getScrollableNode: () => scrollNode,
+      getState: () => ({
+        scroll: geometry.scroll,
+        scrollLength: 643,
+        contentLength: 100 + geometry.turnHeight,
+        data: [{}, {}],
+        positionAtIndex: (index: number) => index * 100,
+        sizeAtIndex: (index: number) => (index === 1 ? geometry.turnHeight : 100),
+      }),
+      scrollToOffset: vi.fn(({ offset }: { offset: number }) => {
+        geometry.scroll = offset;
+      }),
+      scrollToIndex: vi.fn(),
+      scrollToEnd: vi.fn(),
+    };
+    h.timelineList = list;
+    const nextFrames = (count: number) =>
+      act(
+        () =>
+          new Promise<void>((resolve) => {
+            const step = (left: number) =>
+              left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+            step(count);
+          }),
+      );
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const view = () => (
+      <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />
+    );
+    try {
+      await act(async () => root.render(view()));
+      await nextFrames(2);
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = composerHandle();
+      (composer["promptRef"] as RefObject<string>).current = "think it through";
+      await act(async () => (composer["onSend"] as () => Promise<void>)());
+      const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+        input: { message: { messageId: MessageId } };
+      };
+      let timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      await act(async () =>
+        (timeline["onAnchorReady"] as (id: MessageId, index: number) => void)(
+          sent.input.message.messageId,
+          0,
+        ),
+      );
+      // The sent row's glide runs out and the row settles, as it had long before the toggle.
+      await nextFrames(70);
+
+      // At the turn's end, LegendList reports it; scrollIntoView({ block: "center" }) then
+      // moves the list to 0 and it reports that too.
+      timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      geometry.scroll = 796;
+      await act(async () => (timeline["onIsAtEndChange"] as (isAtEnd: boolean) => void)(true));
+      geometry.scroll = 0;
+      await act(async () => (timeline["onIsAtEndChange"] as (isAtEnd: boolean) => void)(false));
+      list.scrollToOffset.mockClear();
+      list.scrollToEnd.mockClear();
+      list.scrollToIndex.mockClear();
+
+      // The trace's thought was the only one in its work row.
+      (timeline["onReasoningRowToggle"] as (newestInGroup: boolean) => void)(true);
+      geometry.turnHeight += 234;
+      // The thought is still streaming: its next delivery is a new timeline entry.
+      seedServerThread({
+        ...thread,
+        messages: [
+          {
+            id: MessageId.make("message-streaming"),
+            role: "assistant",
+            text: "Streaming update",
+            turnId: null,
+            createdAt: now,
+            updatedAt: "2026-07-22T20:11:00.000Z",
+            streaming: true,
+          },
+        ],
+        updatedAt: "2026-07-22T20:11:00.000Z",
+      });
+      await act(async () => root.render(view()));
+      await nextFrames(3);
+
+      expect(list.scrollToOffset).not.toHaveBeenCalled();
+      expect(list.scrollToEnd).not.toHaveBeenCalled();
+      expect(list.scrollToIndex).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      scrollNode.remove();
+    }
+  });
 
   it("onInterrupt targets the running turn of the active session", async () => {
     const runningTurnId = TurnId.make("turn-running");

@@ -2907,6 +2907,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
     });
     // Outside the literal above, which is at `json!`'s recursion limit.
     capabilities["terminalUserInputClaim"] = json!(true);
+    capabilities["terminalSizeHandOver"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
         json!(crate::production::pipelines_rpc::pipelines_reads_registered());
@@ -2958,9 +2959,7 @@ const fn platform_arch() -> &'static str {
 }
 
 pub(crate) fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::now_timestamp()
 }
 
 #[cfg(test)]
@@ -7586,6 +7585,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
         assert_eq!(descriptor["capabilities"]["terminalUserInputClaim"], true);
+        assert_eq!(descriptor["capabilities"]["terminalSizeHandOver"], true);
         assert_eq!(descriptor["capabilities"]["previewTunnels"], true);
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);

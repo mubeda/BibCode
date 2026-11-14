@@ -87,6 +87,7 @@ import {
   applyTimelineDisclosureChange,
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
+  isNewestWorkEntry,
   deriveUnsettledTurnId,
   detailsDisclosureKey,
   detailsOpenForScope,
@@ -196,7 +197,8 @@ interface TimelineRowSharedState {
   /** Sets one of an entry's own disclosures: its tool row, long body, plan or a details block. */
   onSetEntryDisclosure: (entryId: string, key: string, open: boolean) => void;
   /** A Thinking row was expanded or collapsed: the owner keeps the end in view if it was. */
-  onReasoningRowToggle: () => void;
+  /** Told the toggled thought's work entry id. */
+  onReasoningRowToggle: (entryId: string) => void;
   /** Loads the next page of older history (#226). */
   onLoadOlderHistory: () => void;
 }
@@ -308,7 +310,8 @@ interface MessagesTimelineProps {
   isHostFindSurface?: boolean;
   /** Closing find returns focus to the composer. */
   onFindFocusComposer?: () => void;
-  onReasoningRowToggle: () => void;
+  /** `newestStep`: no later work step follows the toggled thought in the timeline. */
+  onReasoningRowToggle: (newestStep: boolean) => void;
   /** Present while older history is on the server; null once all of it is loaded. */
   olderHistory?: TimelineOlderHistory | null;
 }
@@ -488,6 +491,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       : undefined;
   }, [anchorMessageId, handleAnchorReady, handleAnchorSizeChanged, rows]);
   const readingAnchor = useTimelineReadingAnchor(listRef, timelineViewportElement);
+  // Read when a thought toggles, so the row context does not change with every new row.
+  const rowsRef = useRef(rows);
+  useLayoutEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+  const onReasoningEntryToggle = useCallback(
+    (entryId: string) => onReasoningRowToggle(isNewestWorkEntry(rowsRef.current, entryId)),
+    [onReasoningRowToggle],
+  );
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -593,7 +605,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleTurnFold,
       onToggleWorkGroup,
       onSetEntryDisclosure,
-      onReasoningRowToggle,
+      onReasoningRowToggle: onReasoningEntryToggle,
       onLoadOlderHistory: olderHistory?.onLoadOlder ?? NO_OLDER_HISTORY_LOAD,
     }),
     [
@@ -621,7 +633,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleTurnFold,
       onToggleWorkGroup,
       onSetEntryDisclosure,
-      onReasoningRowToggle,
+      onReasoningEntryToggle,
       olderHistory?.onLoadOlder,
     ],
   );
@@ -2786,7 +2798,7 @@ const ReasoningWorkEntryRow = memo(function ReasoningWorkEntryRow(props: {
   const { onSetEntryDisclosure, onReasoningRowToggle } = use(TimelineRowCtx);
   const toggleExpanded = () => {
     onSetEntryDisclosure(workEntry.id, TOOL_ROW_DISCLOSURE_KEY, !expanded);
-    onReasoningRowToggle();
+    onReasoningRowToggle(workEntry.id);
   };
   const preview = reasoningPreview(reasoning);
 

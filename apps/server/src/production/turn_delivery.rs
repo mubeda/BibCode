@@ -2034,9 +2034,7 @@ fn provider_delivery_outcome(
 }
 
 fn now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::now_timestamp()
 }
 
 #[cfg(test)]

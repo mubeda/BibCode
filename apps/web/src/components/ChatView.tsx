@@ -139,8 +139,10 @@ import {
   getAnchoredTurnMetrics,
   getSentRowLandingDelta,
   bindTimelineTakeoverListeners,
+  type TimelineListPosition,
   type TimelineTakeoverInput,
   getTimelinePageScrollOffset,
+  listMovedAwayFromEnd,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
@@ -3904,7 +3906,10 @@ function ChatViewContent(props: ChatViewProps) {
   // remounts per thread (it is keyed by thread), and a thread with no rows shows an empty state
   // instead, so a new thread's list mounts, and binds, with its first turn.
   const timelineTakeoverCleanupRef = useRef<(() => void) | null>(null);
+  // Where the list was at its last at-end report; another thread's list starts afresh.
+  const lastTimelineListPositionRef = useRef<TimelineListPosition | null>(null);
   const onTimelineListMount = useCallback((list: LegendListRef | null) => {
+    lastTimelineListPositionRef.current = null;
     timelineTakeoverCleanupRef.current?.();
     timelineTakeoverCleanupRef.current = null;
     const scrollNode = list?.getScrollableNode();
@@ -4143,15 +4148,34 @@ function ChatViewContent(props: ChatViewProps) {
   }, []);
 
   const onIsAtEndChange = useCallback((isAtEnd: boolean) => {
+    const state = legendListRef.current?.getState();
+    const previous = lastTimelineListPositionRef.current;
+    const position =
+      state && typeof state.contentLength === "number"
+        ? { scroll: state.scroll, contentLength: state.contentLength }
+        : null;
+    lastTimelineListPositionRef.current = position;
+    // Following ignores the end leaving view, which growth below it does too, but not a scroll
+    // up through the content that no gesture made, such as `scrollIntoView` (#351): following
+    // on from there would throw the reader back to the end. A sent row still being positioned
+    // is the timeline's own scroll.
+    const leftEnd =
+      !isAtEnd &&
+      previous !== null &&
+      position !== null &&
+      listMovedAwayFromEnd(previous, position) &&
+      pendingTimelineAnchorRef.current === null &&
+      settledTimelineAnchorRef.current === positionedTimelineAnchorRef.current;
     if (
       !isAtEnd &&
+      !leftEnd &&
       liveFollowUserScrollGenerationRef.current === anchorUserScrollGenerationRef.current
     ) {
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);
       return;
     }
-    if (isAtEndRef.current === isAtEnd) return;
+    if (isAtEndRef.current === isAtEnd && !leftEnd) return;
     isAtEndRef.current = isAtEnd;
     if (isAtEnd) {
       timelineScrollModeRef.current = "following-end";
@@ -4169,35 +4193,42 @@ function ChatViewContent(props: ChatViewProps) {
 
   // A Thinking row toggled at the end of an anchored turn changes layout but not
   // `timelineEntries`, so the follow effect below never sees it (#173). One pass reveals the
-  // end again once the row re-measured; the other modes keep their own place.
-  const onReasoningRowToggle = useCallback(() => {
-    // The toggle has not rendered yet, so this is where the turn's end sat before it.
-    const before = legendListRef.current
-      ? getActiveTimelineTurnMetrics(legendListRef.current)
-      : null;
-    if (
-      !rowToggleNeedsEndReveal({
-        mode: timelineScrollModeRef.current,
-        scrollDeltaToRevealEnd: before?.scrollDeltaToRevealEnd ?? null,
-      }) ||
-      liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
-    ) {
-      return;
-    }
-    requestAnimationFrame(() => {
+  // end again once the row re-measured; the other modes keep their own place. A thought with
+  // later work steps after it is not at the turn's end, whatever is in view (#351).
+  const onReasoningRowToggle = useCallback(
+    (newestStep: boolean) => {
+      if (!newestStep) {
+        return;
+      }
+      // The toggle has not rendered yet, so this is where the turn's end sat before it.
+      const before = legendListRef.current
+        ? getActiveTimelineTurnMetrics(legendListRef.current)
+        : null;
+      if (
+        !rowToggleNeedsEndReveal({
+          mode: timelineScrollModeRef.current,
+          scrollDeltaToRevealEnd: before?.scrollDeltaToRevealEnd ?? null,
+        }) ||
+        liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
+      ) {
+        return;
+      }
       requestAnimationFrame(() => {
-        const list = legendListRef.current;
-        const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
-        if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
-          return;
-        }
-        void list.scrollToOffset({
-          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
-          animated: false,
+        requestAnimationFrame(() => {
+          const list = legendListRef.current;
+          const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+          if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
+            return;
+          }
+          void list.scrollToOffset({
+            offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+            animated: false,
+          });
         });
       });
-    });
-  }, [getActiveTimelineTurnMetrics]);
+    },
+    [getActiveTimelineTurnMetrics],
+  );
 
   // One pass of live following: reveals an anchored turn's end, or keeps the end in view. It
   // waits while a sent row is still being positioned, which then runs it once it settles.

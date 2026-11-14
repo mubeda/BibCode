@@ -13,6 +13,8 @@ export interface ShareAddressOption {
   readonly httpBaseUrl: string | null;
   readonly description?: string;
   readonly requiresExplicitSelection?: boolean;
+  /** Served by the native listener, so widening may move it to the listener's new port. */
+  readonly servedByNativeListener?: true;
 }
 
 export function nativeShareAddressUnavailableReason(
@@ -89,6 +91,27 @@ export function resolveShareAddressOptions(input: {
   const seen = new Set(
     canOfferAutomaticLan && automaticEndpoint !== null ? [automaticEndpoint] : [],
   );
+  // Widening needs the private default route Automatic needs, so these share its gate.
+  if (nativeManaged && input.exposureState?.mode === "local-only" && canOfferAutomaticLan) {
+    for (const endpoint of offHostEndpoints) {
+      if (
+        endpoint.status !== "unavailable" ||
+        endpoint.unavailableReason !== "local-only" ||
+        (endpoint.reachability !== "lan" && endpoint.reachability !== "private-network") ||
+        seen.has(endpoint.httpBaseUrl)
+      ) {
+        continue;
+      }
+      seen.add(endpoint.httpBaseUrl);
+      options.push({
+        id: endpoint.id,
+        label: `${new URL(endpoint.httpBaseUrl).hostname} (enables remote access)`,
+        httpBaseUrl: endpoint.httpBaseUrl,
+        description: "BiBCode will enable remote access, then use this address.",
+        servedByNativeListener: true,
+      });
+    }
+  }
   for (const endpoint of selectableOffHostEndpoints) {
     if (seen.has(endpoint.httpBaseUrl)) {
       continue;
@@ -105,6 +128,50 @@ export function resolveShareAddressOptions(input: {
   return options;
 }
 
+// Fixed reason tokens from the desktop's firewall step, named by what failed.
+const FIREWALL_STEP_FAILURES: Readonly<Record<string, string>> = {
+  "firewall-add-failed": "BiBCode could not add its Windows Firewall rule",
+  "firewall-remove-failed": "BiBCode could not replace its old Windows Firewall rule",
+  "firewall-read-failed": "BiBCode could not read the Windows Firewall rules",
+  "firewall-timed-out": "the Windows Firewall change took too long",
+  "firewall-unavailable": "the Windows Firewall step could not run",
+};
+const MAX_WIDEN_FAILURE_LENGTH = 500;
+
+/** Turns a widen rejection, an `Error` or the desktop bridge's plain string, into dialog text. */
+export function describeWidenFailure(error: unknown): {
+  readonly message: string;
+  readonly reason?: "elevation-required";
+} {
+  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const localState =
+    raw.includes("Restored local-only safeguards.") || raw.includes("No exposure change was made.")
+      ? "This computer is still local-only."
+      : "BiBCode could not confirm that this computer is back to local-only; check Remote access below.";
+  if (raw.includes("firewall-elevation-required")) {
+    return {
+      reason: "elevation-required",
+      message: `Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. ${localState} Try again and approve the Windows permission prompt, or close BiBCode, start it with Run as administrator, and try again.`,
+    };
+  }
+  if (raw.includes("firewall-prompt-open")) {
+    return {
+      message: `A Windows permission prompt for the BiBCode firewall rule is still open, so remote access was not turned on. ${localState} Answer or close that prompt, then try again.`,
+    };
+  }
+  if (raw.includes("firewall-rule-removed-not-added")) {
+    return {
+      message: `BiBCode removed its old Windows Firewall rule, which named an earlier install, but the new rule was not added, so remote access was not turned on. ${localState} Try again and approve the Windows permission prompt.`,
+    };
+  }
+  const step = Object.entries(FIREWALL_STEP_FAILURES).find(([token]) => raw.includes(token));
+  if (step !== undefined) {
+    return { message: `Remote access was not turned on: ${step[1]}. ${localState} Try again.` };
+  }
+  const reason = raw.trim().slice(0, MAX_WIDEN_FAILURE_LENGTH);
+  return { message: reason === "" ? "Could not enable remote access." : reason };
+}
+
 export type ShareOfferCleanupOutcome =
   | "local-confirmed"
   | "active-reason"
@@ -113,7 +180,12 @@ export type ShareOfferCleanupOutcome =
 
 export type GenerateShareOfferFailure =
   | { readonly kind: "invalid-address"; readonly message: string }
-  | { readonly kind: "widen-failed"; readonly message: string }
+  | {
+      readonly kind: "widen-failed";
+      readonly message: string;
+      /** Set when Windows refused the firewall change for lack of administrator permission. */
+      readonly reason?: "elevation-required";
+    }
   | {
       readonly kind: "mint-failed";
       readonly message: string;
@@ -190,6 +262,14 @@ function resolveOfferEndpoint(deps: GenerateShareOfferDeps): string | null {
   return deps.selectedOption.httpBaseUrl;
 }
 
+/** Keeps the chosen host and takes the port the widened server actually listens on. */
+function withPortOf(endpoint: string, widenedEndpoint: string | null): string {
+  if (widenedEndpoint === null) return endpoint;
+  const url = new URL(endpoint);
+  url.port = new URL(widenedEndpoint).port;
+  return url.toString();
+}
+
 export async function generateShareOffer(
   deps: GenerateShareOfferDeps,
 ): Promise<
@@ -235,15 +315,13 @@ export async function generateShareOffer(
     try {
       const state = await deps.applyServerExposure("network-accessible");
       widened = true;
+      // An externally served address (Tailscale Serve HTTPS, say) keeps its own port.
       if (endpoint === null) endpoint = state.endpointUrl;
+      else if (deps.selectedOption.servedByNativeListener === true) {
+        endpoint = withPortOf(endpoint, state.endpointUrl);
+      }
     } catch (error) {
-      return {
-        ok: false,
-        failure: {
-          kind: "widen-failed",
-          message: error instanceof Error ? error.message : "Could not enable remote access.",
-        },
-      };
+      return { ok: false, failure: { kind: "widen-failed", ...describeWidenFailure(error) } };
     }
   }
 

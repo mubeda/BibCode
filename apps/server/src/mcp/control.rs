@@ -1148,9 +1148,7 @@ pub(crate) fn storage_failure(error: impl std::fmt::Display) -> Value {
 }
 
 pub(crate) fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::persistence::now_timestamp()
 }
 
 impl ToolCall<'_> {
@@ -1398,9 +1396,9 @@ pub(crate) fn idempotency_conflict() -> Value {
 
 /// Retry rows created before this instant are past their 24-hour window.
 pub(crate) fn request_row_cutoff() -> String {
-    (time::OffsetDateTime::now_utc() - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    crate::persistence::format_timestamp(
+        time::OffsetDateTime::now_utc() - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS),
+    )
 }
 
 /// Deletes retry rows past their 24-hour window.

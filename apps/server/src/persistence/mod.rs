@@ -5,6 +5,7 @@ mod migrations;
 mod repositories;
 mod state_files;
 mod store;
+mod timestamp;
 
 pub use backup::{
     BackupError, BackupInventory, BackupInventoryIssue, BackupManifest, BackupTrigger,
@@ -31,3 +32,4 @@ pub use store::{
     PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError,
     ensure_no_interrupted_recovery, prepare_store, read_storage_instance_id,
 };
+pub use timestamp::{canonical_timestamp, format_timestamp, format_timestamp_ms, now_timestamp};

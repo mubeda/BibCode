@@ -606,7 +606,7 @@ impl PullRequestService {
     /// [`Self::resolve_current_optional`] for VCS status enrichment: a
     /// successful answer (including no open pull request) is reused for a few
     /// seconds per (worktree, provider, branch), concurrent callers share one
-    /// provider run, and failures are never reused. Callers that must see the
+    /// provider run, and a failure answers for 5 seconds. Callers that must see the
     /// hosting service's current answer, such as the existence check before
     /// creating a pull request, use the uncached method.
     pub async fn resolve_current_optional_shared(
@@ -649,9 +649,15 @@ impl PullRequestService {
     /// Forgets the shared open pull-request lookups for the worktree at or
     /// below `path`, after something that can change the hosting service's
     /// answer: a push, a created pull request, a finished Git mutation, or a
-    /// reported local change such as a terminal command exiting.
-    pub fn invalidate_open_pull_request_lookups(&self, path: &std::path::Path) {
-        self.open_lookups.invalidate(path);
+    /// reported local change such as a terminal command exiting. Returns
+    /// whether a lookup still awaited was dropped, so its answer may be outdated.
+    pub fn invalidate_open_pull_request_lookups(&self, path: &std::path::Path) -> bool {
+        self.open_lookups.invalidate(path)
+    }
+
+    /// Ends every shared open pull-request lookup and refuses new ones, for quiesce (R26).
+    pub async fn shutdown_open_pull_request_lookups(&self) {
+        self.open_lookups.shutdown().await;
     }
 
     pub(crate) fn current_provider_command(
@@ -3340,6 +3346,65 @@ esac
         assert_eq!(error.operation.as_ref(), "resolvePullRequest");
         assert_eq!(error.reference.as_deref(), Some("73"));
         assert_eq!(error.detail.as_ref(), "Bitbucket request was cancelled.");
+        server.task.abort();
+        let _ = server.task.await;
+    }
+
+    /// R26: the quiesce step ends a shared Bitbucket lookup whose server never answers at once,
+    /// not at the 30-second request timeout.
+    #[tokio::test]
+    async fn pull_request_lookup_shutdown_ends_a_stalled_bitbucket_request() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let repository = bitbucket_repository().await;
+        let mut server = spawn_stalled_http_server().await;
+        let service = bitbucket_service_for_repository(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
+        );
+        let waiter = tokio::spawn({
+            let (service, cwd) = (service.clone(), repository.root().to_path_buf());
+            async move {
+                // The waiter's own token is never cancelled.
+                service
+                    .resolve_current_optional_shared(
+                        ResolvePullRequestInput {
+                            cwd,
+                            provider: ProviderKind::Bitbucket,
+                            reference: "feature/native".into(),
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), server.requests.recv())
+            .await
+            .expect("the request reached the stub")
+            .expect("in-flight request");
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            service.shutdown_open_pull_request_lookups(),
+        )
+        .await
+        .expect("shutdown returns");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited {:?} for the stalled request",
+            started.elapsed()
+        );
+        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter returned")
+            .expect("waiter task")
+            .expect_err("the lookup was cancelled");
+        assert_eq!(
+            error.detail.as_ref(),
+            "The pull-request lookup was cancelled."
+        );
         server.task.abort();
         let _ = server.task.await;
     }

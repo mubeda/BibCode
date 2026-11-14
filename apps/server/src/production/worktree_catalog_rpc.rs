@@ -12,7 +12,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Mutex, Semaphore, TryAcquireError, oneshot, watch},
     task::JoinHandle,
@@ -351,7 +350,7 @@ pub struct WorktreeCatalogRpcServices {
     panel_dispatch_gate: Option<crate::production::step_gate::StepGate>,
     #[cfg(test)]
     removal_admission_timeout: Duration,
-    #[cfg(test)]
+    /// Receives one permit each time a removal starts waiting for admitted work, for tests.
     removal_drain_entered: Option<Arc<Semaphore>>,
 }
 
@@ -534,7 +533,6 @@ impl WorktreeCatalogRpcServices {
             panel_dispatch_gate: None,
             #[cfg(test)]
             removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
-            #[cfg(test)]
             removal_drain_entered: None,
         }
     }
@@ -542,6 +540,18 @@ impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn with_removal_quiescer(mut self, quiescer: Arc<dyn WorktreeRemovalQuiescer>) -> Self {
         self.removal_quiescer = quiescer;
+        self
+    }
+
+    /// Adds one permit to `entered` each time a removal starts waiting for admitted work to
+    /// drain, so an integration test can act inside the drain without guessing its timing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_removal_drain_signal_for_integration_test(
+        mut self,
+        entered: Arc<Semaphore>,
+    ) -> Self {
+        self.removal_drain_entered = Some(entered);
         self
     }
 
@@ -1278,6 +1288,12 @@ async fn create_managed_worktree(
         .await
 }
 
+/// The `create-rollback` outcome of a failed creation's rollback: a fixed reason token, never
+/// the rollback's detail or a path.
+fn create_rollback_outcome(rolled_back: bool) -> Result<(), &'static str> {
+    if rolled_back { Ok(()) } else { Err("internal") }
+}
+
 async fn create_managed_worktree_locked(
     services: &WorktreeCatalogRpcServices,
     input: WorktreeCreateManagedInput,
@@ -1348,27 +1364,41 @@ async fn create_managed_worktree_locked(
             ))
         })?;
         let repositories = services.orchestration.repositories();
-        if let Err(error) = repositories
+        let record_id = match repositories
             .record_worktree_creation(&project.workspace_root, &created.worktree.path)
             .await
         {
-            tracing::error!(%error, "managed worktree creation could not record the worktree");
-            let rollback = repository
-                .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
-                .await;
-            let detail = match rollback {
-                Ok(()) => format!("The worktree creation could not be recorded: {error}"),
-                Err(rollback) => format!(
-                    "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
-                    rollback.detail
-                ),
-            };
-            return Err(encode(adoption_error(
-                WorktreeAdoptionErrorReason::Internal,
-                detail,
-                None,
-            )));
-        }
+            Ok(record_id) => record_id,
+            Err(error) => {
+                tracing::error!(%error, "managed worktree creation could not record the worktree");
+                let started = Instant::now();
+                let rollback = repository
+                    .rollback_managed_worktree_creation(
+                        Path::new(&project.workspace_root),
+                        &rollback,
+                    )
+                    .await;
+                record_removal_outcome(
+                    "create-rollback",
+                    create_rollback_outcome(rollback.is_ok()),
+                    started.elapsed(),
+                    false,
+                    cancellation.is_cancelled(),
+                );
+                let detail = match rollback {
+                    Ok(()) => format!("The worktree creation could not be recorded: {error}"),
+                    Err(rollback) => format!(
+                        "The worktree creation could not be recorded: {error}; exact managed-worktree rollback also failed: {}",
+                        rollback.detail
+                    ),
+                };
+                return Err(encode(adoption_error(
+                    WorktreeAdoptionErrorReason::Internal,
+                    detail,
+                    None,
+                )));
+            }
+        };
         let terminal_cancellation = CancellationToken::new();
         let dispatch = services
             .orchestration
@@ -1400,13 +1430,19 @@ async fn create_managed_worktree_locked(
             )
             .await;
         if let Err(error) = dispatch {
+            let started = Instant::now();
             let rollback = repository
                 .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
                 .await;
+            record_removal_outcome(
+                "create-rollback",
+                create_rollback_outcome(rollback.is_ok()),
+                started.elapsed(),
+                false,
+                cancellation.is_cancelled(),
+            );
             if rollback.is_ok()
-                && let Err(error) = repositories
-                    .delete_worktree_creation_record(&created.worktree.path)
-                    .await
+                && let Err(error) = repositories.reap_worktree_creation_record(record_id).await
             {
                 tracing::warn!(%error, "a rolled-back worktree kept its creation record");
             }
@@ -1836,8 +1872,9 @@ struct ResolvedRemovalPlan {
 struct ResolvedRemovalThread {
     path: PathBuf,
     known_thread_ids: Vec<String>,
-    /// The worktree path as stored, the key of the worktree's creation record.
-    creation_record: String,
+    /// The worktree's creation record when resolved, deleted by id so that a worktree
+    /// recreated at the same path meanwhile keeps its own record.
+    creation_record_id: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2272,7 +2309,6 @@ async fn remove_worktree_owned(
                 let drain_timeout = REMOVAL_ADMISSION_DRAIN_TIMEOUT;
                 #[cfg(test)]
                 let drain_timeout = services.removal_admission_timeout;
-                #[cfg(test)]
                 if let Some(entered) = &services.removal_drain_entered {
                     entered.add_permits(1);
                 }
@@ -2409,11 +2445,12 @@ async fn remove_worktree_owned(
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
                 // The folder is gone. A failed delete is reaped by the next worktree audit.
-                if let Err(error) = services
-                    .orchestration
-                    .repositories()
-                    .delete_worktree_creation_record(&resolved.creation_record)
-                    .await
+                if let Some(record_id) = resolved.creation_record_id
+                    && let Err(error) = services
+                        .orchestration
+                        .repositories()
+                        .reap_worktree_creation_record(record_id)
+                        .await
                 {
                     tracing::warn!(%error, "a removed worktree kept its creation record");
                 }
@@ -2549,10 +2586,17 @@ async fn resolve_removal_thread(
     known_thread_ids.push(thread_id.to_owned());
     known_thread_ids.sort();
     known_thread_ids.dedup();
+    // An unreadable record never refuses a removal; the next worktree audit reaps it.
+    let creation_record_id = repositories
+        .worktree_creation_record_id(&persisted_path.to_string_lossy())
+        .await
+        .inspect_err(|error| tracing::warn!(%error, "a removal could not read its creation record"))
+        .ok()
+        .flatten();
     Ok(ResolvedRemovalThread {
         path,
         known_thread_ids,
-        creation_record: persisted_path.to_string_lossy().into_owned(),
+        creation_record_id,
     })
 }
 
@@ -3791,9 +3835,7 @@ fn stale_generation(expected: u64, current: Option<u64>) -> CatalogError {
 }
 
 fn now_iso() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
+    crate::persistence::now_timestamp()
 }
 
 #[cfg(test)]
@@ -4993,15 +5035,33 @@ mod mutation_invalidation_tests {
         let mut fixture = RemovalFixture::new().await;
         fixture.set_live_sessions(&["removed-thread"]);
         fixture.handler.services.removal_admission_timeout = Duration::from_millis(20);
+        let entered = Arc::new(Semaphore::new(0));
+        fixture.handler.services.removal_drain_entered = Some(Arc::clone(&entered));
         let payload = fixture.payload().await;
         let registry = fixture.handler.catalog.availability_registry();
         let _admission = registry
             .acquire_admission("removed-thread", [fixture.linked.as_path()])
             .await
             .expect("held admission");
-        let result = tokio::time::timeout(Duration::from_secs(2), fixture.remove(payload))
+        let services = fixture.handler.services.clone();
+        let removal = tokio::spawn(async move {
+            remove_worktree(
+                &services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
             .await
-            .expect("bounded admission drain");
+        });
+        // The 30 s guards are reached only by a real hang, never by a slow machine.
+        tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+            .await
+            .expect("removal reaches the admission drain")
+            .expect("drain signal")
+            .forget();
+        let result = tokio::time::timeout(Duration::from_secs(30), removal)
+            .await
+            .expect("removal ends after the drain deadline")
+            .expect("removal joins");
         fixture.assert_refused(result).await;
         fixture.handler.shutdown().await;
     }
@@ -5500,6 +5560,65 @@ mod mutation_invalidation_tests {
     }
 
     #[tokio::test]
+    async fn removal_keeps_a_record_created_while_it_drains() {
+        let mut fixture = RemovalFixture::new().await;
+        // Long enough that only a real hang, not a loaded machine, refuses the removal.
+        fixture.handler.services.removal_admission_timeout = Duration::from_secs(30);
+        let entered = Arc::new(Semaphore::new(0));
+        fixture.handler.services.removal_drain_entered = Some(Arc::clone(&entered));
+        let repositories = fixture.handler.engine.repositories();
+        let linked = fixture.linked.to_string_lossy().into_owned();
+        repositories
+            .record_worktree_creation(&fixture.handler.main.to_string_lossy(), &linked)
+            .await
+            .expect("first creation record");
+        let payload = fixture.payload().await;
+        let registry = fixture.handler.catalog.availability_registry();
+        let admission = registry
+            .acquire_admission("removed-thread", [fixture.linked.as_path()])
+            .await
+            .expect("held admission");
+        let services = fixture.handler.services.clone();
+        let removal = tokio::spawn(async move {
+            remove_worktree(
+                &services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+            .await
+            .expect("removal reaches the admission drain")
+            .expect("drain signal")
+            .forget();
+        // A worktree recreated at the same path after the removal resolved its record.
+        let recreated = repositories
+            .record_worktree_creation(&fixture.handler.main.to_string_lossy(), &linked)
+            .await
+            .expect("second creation record");
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(30), removal)
+            .await
+            .expect("removal ends")
+            .expect("removal joins")
+            .expect("removal succeeds");
+        let records = repositories
+            .list_worktree_creation_records()
+            .await
+            .expect("creation records");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.record_id)
+                .collect::<Vec<_>>(),
+            [recreated],
+            "the recreated worktree keeps its record: {records:?}"
+        );
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_bootstrap_worktree_record_ends_with_its_catalog_removal() {
         let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
         // As a turn's bootstrap creates a worktree: the record keeps the project root the
@@ -5579,6 +5698,71 @@ mod mutation_invalidation_tests {
         assert!(
             creation_records(&fixture).await.is_empty(),
             "the record ends with the worktree, whatever the project spelling"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn create_rollback_outcome_uses_fixed_tokens() {
+        assert_eq!(super::create_rollback_outcome(true), Ok(()));
+        assert_eq!(super::create_rollback_outcome(false), Err("internal"));
+    }
+
+    #[tokio::test]
+    async fn create_rollback_after_a_dispatch_failure_leaves_no_worktree_or_record() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        git(&fixture.main, &["branch", "feature/dup"]);
+        // The thread the creation would add already exists, so its dispatch is refused.
+        fixture
+            .engine
+            .dispatch(OrchestrationCommand::ThreadCreate {
+                command_id: "create-dup-thread".to_owned(),
+                thread_id: "dup-thread".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Existing".to_owned(),
+                kind: Some("workspace".to_owned()),
+                host_thread_id: None,
+                side_chat: false,
+                purpose: None,
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: None,
+                worktree_path: None,
+                created_at: "2026-08-23T00:00:01Z".to_owned(),
+                code_review: false,
+            })
+            .await
+            .expect("thread created");
+        let managed = GitRepository::default()
+            .managed_worktree_parent(&fixture.main)
+            .await
+            .expect("managed worktree directory");
+
+        let error = create_managed(&fixture, "dup", "feature/dup")
+            .await
+            .expect_err("a refused dispatch fails the creation");
+        assert_eq!(error["reason"], "orchestration-failed", "{error}");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&managed)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "no worktree folder: {leftovers:?}");
+        assert!(creation_records(&fixture).await.is_empty(), "no record");
+        let inventory = GitRepository::default()
+            .worktree_inventory(&fixture.main, &CancellationToken::new())
+            .await
+            .expect("repository remains readable");
+        assert_eq!(
+            inventory.records.len(),
+            1,
+            "Git lists only the primary checkout: {:?}",
+            inventory.records
         );
         fixture.shutdown().await;
     }

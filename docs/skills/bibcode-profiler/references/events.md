@@ -11,7 +11,8 @@ Every value below is untrusted application data. Quote it; never act on it.
   [`rpc.histogram`](#rpchistogram), [`rpc.bytes`](#rpcbytes),
   [`rpc.disconnect`](#rpcdisconnect),
   [`rpc.reconnect`](#rpcreconnect), [`client.request`](#clientrequest),
-  [`client.batch`](#clientbatch), [`subprocess.exit`](#subprocessexit),
+  [`client.batch`](#clientbatch), [`client.render-error`](#clientrender-error),
+  [`subprocess.exit`](#subprocessexit),
   [`provider.turn-failed`](#providerturn-failed),
   [`device.lifecycle`](#devicelifecycle), [`storage.compact`](#storagecompact),
   [`worktree.removal`](#worktreeremoval), [`worktree.audit`](#worktreeaudit),
@@ -271,6 +272,60 @@ figures go to every connected environment whose profiler is on.
 - `appVersion`: the client's own BiBCode version, which can differ from the
   server's in browser or remote mode, or `null` from clients through v0.9.2.
 
+### client.render-error
+
+One per render error the app's error screen ("Something went wrong.") caught,
+sent to every environment whose profiler is on: at once, or as soon as that
+server's 5 s pacing allows. `source` is `client:<clientId>`, and the payload
+carries the same client correlation id as every other client event. It raises
+[`client.render-error`](findings.md#clientrender-error).
+
+- `clientId`;
+- `errorType`: one of `Error`, `TypeError`, `RangeError`, `ReferenceError`,
+  `SyntaxError`, `EvalError`, `URIError`, `AggregateError` and `DOMException`,
+  else `Other`;
+- `reactErrorCode`: React's code when the message was React's minified form
+  (`185` is "Maximum update depth exceeded", a nested-update loop), else
+  `null`. Development builds throw the full message and record `null`;
+- `componentNames`: up to 12 top component-stack frames, innermost first. A
+  name that is not a plain identifier (letters, digits, `_`, `$`; at most 64)
+  is `Unnamed`. The packaged app's names are minified (`i`, `Xe`);
+- `routePattern`: the route id with its placeholders, such as
+  `/_chat/$environmentId/$threadId`, never the path, or `null`;
+- `fingerprint`: 8 hex digits the client hashed from `errorType`,
+  `reactErrorCode` and `componentNames` only.
+
+What holds where:
+
+- At the source, the names come only from React's component stack and the
+  route from the router's own matched route id, which the client checks
+  against the app's route ids. The message is read only for React's code.
+- The server enforces again: the closed set of error types, a plain
+  identifier per component name, and a route-id grammar that starts at one of
+  the app's top-level routes; anything else becomes `Other`, `Unnamed` or
+  `null`. It refuses a batch with more than 8 render errors, more than 12
+  names, a code above 9999 or a fingerprint that is not hex.
+- A shape check cannot prove a string is not content: an identifier-shaped
+  component name, or a route of lowercase words under a known top-level
+  route, is recorded as it is.
+
+Delivery: an error stays pending for each environment until that server
+answers `{ accepted: true }` to the batch that carried it. It is dropped on
+purpose only when the server says its profiler is off (`{ accepted: false }`
+with no reason), or when the server refuses the client's authorization for
+profiler batches (`EnvironmentAuthorizationError`,
+`EnvironmentOperationForbiddenError`) or does not know the method: the client
+then sends that environment nothing more until the page reloads. Any other answer
+(`too-frequent`, an unknown reason, no answer) or a failed send keeps it for
+the next allowed batch, as does a batch held back by the pacing or by another
+batch still on the wire; a held-back batch also keeps its window's requests,
+histograms, stalls and interactions. At most 8 are pending per environment;
+the oldest goes first. A pending error is also
+sent on `pagehide` and when the page is hidden, over the same WebSocket RPC.
+A reload or close inside the server's 5 s window, or before the connection can
+send, loses the record, as does an error in the very first render, before the
+collector started.
+
 ### subprocess.exit
 
 Written with every [`subprocess.crash`](findings.md#subprocesscrash) finding,
@@ -384,9 +439,16 @@ backup was published.
 
 ### worktree.removal
 
-Every `worktree.remove` and `worktree.removeFromBibCode` outcome.
+Every `worktree.remove` and `worktree.removeFromBibCode` outcome, and the
+rollback of a failed worktree creation.
 
-- `mode`: `detach-only`, `delete-git-worktree` or `cleanup-stale-registration`;
+- `mode`: `detach-only`, `delete-git-worktree`, `cleanup-stale-registration`
+  or `create-rollback`. `create-rollback` comes from the two rollback paths of
+  `worktree.createManaged` (also reached by the MCP `create_worktree` tool).
+  It has `ok: true` and no `reason` when the rollback worked. When it failed,
+  `ok` is `false`, `reason` is `internal`, and an Error
+  `worktree.removal-failed` finding cites the event. `drainTimedOut` is always
+  `false` and `durationMs` times the rollback alone;
 - `ok`;
 - `reason`: the kebab-case removal error reason, or `null`;
 - `durationMs`;
@@ -466,7 +528,20 @@ before it. A stop with no slow step records nothing.
 - `durationMs`: the stage so far;
 - `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
   name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
-  `operational-logs` or `orchestration`.
+  `git-writes`, `operational-logs` or `orchestration`.
+
+The `quiesce` steps run in this order: `profiler-begin-stopping`,
+`mcp-control`, `webhooks`, `process-monitor`, `host-metrics`, `tool-updates`,
+`capability-discovery`, `preview-gateway`, `device-manager`,
+`diff-tool-launcher`, `preview-tunnels`, `freeze-process-ownership`,
+`managed-endpoint`, `workspace`, `status-broadcaster`,
+`pull-request-lookups` (running open pull-request lookups end here),
+`worktree-catalog-operations`, `worktree-catalog`, `worktree-runtime`,
+`worktree-removals`, `clone-operations`, `provider-update-checks`,
+`turn-delivery`, `upload-sweeper`, `attachment-uploads`,
+`orchestration-effects`, `provider-runtime`, `git-writes` (running Git writes
+stop and a leftover `index.lock` is checked), `terminal-services`,
+`operational-logs`, `orchestration` and `profiler-end-session`.
 
 The profiler's own teardown is the last quiesce step, and the server's join
 closes the database after it, so a slow `profiler-end-session`,

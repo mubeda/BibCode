@@ -100,8 +100,18 @@ import {
   isTerminalSizingMinimum,
   proposeTerminalDimensions,
   registerTerminalSizeReader,
+  remeasureTerminalCharSize,
   terminalHostHasArea,
 } from "./terminalSizing";
+import { activateTerminalUnicode, TERMINAL_BASE_OPTIONS } from "./terminalUnicode";
+import {
+  readTerminalSizeDiagnostics,
+  recordTerminalSizeDiagnostic,
+  setTerminalSizeDiagnosticsEnabled,
+  terminalSizeDiagnosticsEnabled,
+  type TerminalSizeDiagnosticRecord,
+  type TerminalSizeDiagnosticTrigger,
+} from "./terminalSizeDiagnostics";
 import {
   answersTerminalQueries,
   isUnownedUntilUsed,
@@ -148,6 +158,18 @@ const terminalInputBindings = new Map<string, TerminalInputBinding>();
 // releases it alongside the retained input resources below.
 const dismissedTerminalSizes = new Map<string, TerminalSize>();
 const TERMINAL_WRITE_INTERRUPTED = Symbol("terminal-write-interrupted");
+type WebglFailureStage =
+  | "context lost"
+  | "import failed"
+  | "addon creation failed"
+  | "addon load failed";
+// A developer turns the size record on and reads it from the console (#348).
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  (window as { __bibcodeTerminalSizeDiagnostics?: unknown }).__bibcodeTerminalSizeDiagnostics = {
+    enable: setTerminalSizeDiagnosticsEnabled,
+    read: readTerminalSizeDiagnostics,
+  };
+}
 
 interface TerminalInputBinding {
   renderer: {
@@ -971,6 +993,9 @@ export function TerminalViewport({
   // The server tells a user's input from the terminal's own replies (#348).
   const userInputClaim =
     sizeOwnership && serverConfig?.environment.capabilities?.terminalUserInputClaim === true;
+  // A released size waits for a window to be used only on a server that says it hands over.
+  const sizeHandOver =
+    sizeOwnership && serverConfig?.environment.capabilities?.terminalSizeHandOver === true;
   const terminalTargetKey = terminalInputKey(environmentId, threadId, terminalId);
   // One claim for this viewport's renderers: a renderer recreated when the window is hidden
   // and shown is the same window to the server, which gives a returning owner its size back.
@@ -989,10 +1014,19 @@ export function TerminalViewport({
       : null;
   // The size notice's scale (1 when the owner's grid fits unscaled), or null while hidden.
   const [mirroringSize, setMirroringSize] = useState<number | null>(null);
+  // Fit to this window sent nothing: the server already kept this size (#348).
+  const [fitKept, setFitKept] = useState(false);
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
+    /** Records a decision made outside the renderer; callers check diagnostics are on. */
+    diagnose(
+      trigger: TerminalSizeDiagnosticTrigger,
+      repaint: TerminalSizeDiagnosticRecord["repaint"],
+    ): void;
     fit(): void;
+    /** The cell was measured again: automatic claims wait for it to settle. */
+    cellChanged(): void;
     render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
@@ -1125,10 +1159,14 @@ export function TerminalViewport({
     () => ({ cwd, worktreePath, command, runtimeEnvKey }),
     [cwd, worktreePath, command, runtimeEnvKey],
   );
-  const recordWebglDiagnosticOnce = useCallback(() => {
+  // The stage and the error's type name only: raw error text can hold paths (#348).
+  const recordWebglDiagnosticOnce = useCallback((stage: WebglFailureStage, error?: unknown) => {
     if (webglDiagnosticRecordedRef.current) return;
     webglDiagnosticRecordedRef.current = true;
-    console.warn("[terminal] WebGL renderer unavailable; using the standard renderer.");
+    console.warn("[terminal] WebGL renderer unavailable; using the standard renderer.", {
+      cause: stage,
+      error: error instanceof Error ? error.name : error === undefined ? undefined : typeof error,
+    });
   }, []);
   const handleSessionExited = useEffectEvent(() => {
     onSessionExited();
@@ -1422,11 +1460,7 @@ export function TerminalViewport({
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
-      cursorBlink: true,
-      macOptionClickForcesSelection: true,
-      lineHeight: 1,
-      fontSize: 12,
-      scrollback: 5_000,
+      ...TERMINAL_BASE_OPTIONS,
       fontFamily: readTerminalFontFamily(),
       theme: terminalThemeFromApp(
         readEffectiveTerminalTheme(),
@@ -1487,6 +1521,7 @@ export function TerminalViewport({
       },
     });
     terminal.loadAddon(fitAddon);
+    activateTerminalUnicode(terminal);
     terminal.open(mount);
     if (terminalHostHasArea(mount)) fitTerminalSafely(fitAddon);
     // A paused renderer can move the view by itself; the position it had when drawing
@@ -1617,14 +1652,40 @@ export function TerminalViewport({
         environmentId,
         input: { threadId, terminalId, ...size, structuredResult: true },
       });
-    const requestTerminalResize = (rendererGeneration: number, dimensions: TerminalDimensions) => {
-      if (resizeRendererGenerationRef.current !== rendererGeneration) return;
+    // A development-only record of size decisions (#348): numbers and enums, never content.
+    const diagnose = (
+      trigger: TerminalSizeDiagnosticTrigger,
+      fitted: TerminalDimensions | null,
+      request: TerminalSizeDiagnosticRecord["request"] = null,
+      repaint: TerminalSizeDiagnosticRecord["repaint"] = "none",
+    ) =>
+      recordTerminalSizeDiagnostic({
+        trigger,
+        rendererGeneration: resizeRendererGeneration,
+        mountWidth: mount.clientWidth,
+        mountHeight: mount.clientHeight,
+        fitted,
+        applied: !sizeOwnership
+          ? { cols: terminal.cols, rows: terminal.rows }
+          : appliedSize && { cols: appliedSize.cols, rows: appliedSize.rows },
+        role: !sizeOwnership ? "legacy" : appliedSize?.sizeClaim === sizeClaim ? "owner" : "mirror",
+        devicePixelRatio: globalThis.devicePixelRatio,
+        fontStatus: document.fonts?.status ?? "unavailable",
+        renderer: webglLifecycleRef.current !== null ? "webgl" : "standard",
+        request,
+        repaint,
+      });
+    const requestTerminalResize = (
+      rendererGeneration: number,
+      dimensions: TerminalDimensions,
+    ): boolean => {
+      if (resizeRendererGenerationRef.current !== rendererGeneration) return false;
       const current = lastRequestedSizeRef.current;
       if (
         current?.generation === rendererGeneration &&
         terminalDimensionsEqual(current.dimensions, dimensions)
       )
-        return;
+        return false;
       const request = { generation: rendererGeneration, dimensions };
       lastRequestedSizeRef.current = request;
       void resizeTerminal(dimensions).then((result) => {
@@ -1633,6 +1694,11 @@ export function TerminalViewport({
           lastRequestedSizeRef.current !== request
         )
           return;
+        if (terminalSizeDiagnosticsEnabled())
+          diagnose("resize-answer", null, {
+            ...dimensions,
+            outcome: result._tag === "Success" ? "applied" : "failed",
+          });
         if (result._tag === "Success") {
           resizeRetries = 0;
           return;
@@ -1640,6 +1706,7 @@ export function TerminalViewport({
         lastRequestedSizeRef.current = null;
         retryFailedResize();
       });
+      return true;
     };
 
     const resizeRendererGeneration = resizeRendererGenerationRef.current + 1;
@@ -1649,6 +1716,9 @@ export function TerminalViewport({
     fitAddonRef.current = fitAddon;
     rendererEpochRef.current += 1;
     setRendererEpoch(rendererEpochRef.current);
+    // A new terminal tries WebGL again, and reports its own failure (#348).
+    webglFailedRef.current = false;
+    webglDiagnosticRecordedRef.current = false;
     const rendererOwner = {};
     const { binding: inputBinding, scheduler: inputScheduler } =
       acquireTerminalInputBinding(terminalTargetKey);
@@ -1786,6 +1856,7 @@ export function TerminalViewport({
           handleSizeTrigger(pending);
         }, settleRemaining);
         if (sizeOwnership) updateSizeNotice();
+        if (terminalSizeDiagnosticsEnabled()) diagnose(trigger, fittedDimensions);
         return;
       }
       // A settled automatic trigger runs a deferred one now; an attach claim keeps its rule.
@@ -1800,10 +1871,10 @@ export function TerminalViewport({
         const wasAtBottom = followsOutput();
         fitTerminalSafely(fitAddon);
         if (wasAtBottom) terminal.scrollToBottom();
-        requestTerminalResize(resizeRendererGeneration, {
-          cols: terminal.cols,
-          rows: terminal.rows,
-        });
+        const fittedGrid = { cols: terminal.cols, rows: terminal.rows };
+        const sent = requestTerminalResize(resizeRendererGeneration, fittedGrid);
+        if (terminalSizeDiagnosticsEnabled())
+          diagnose(trigger, fittedGrid, sent ? { ...fittedGrid, outcome: "pending" } : null);
         return;
       }
       // A claim already answered for this geometry waits for its acknowledgement; sending it
@@ -1843,9 +1914,12 @@ export function TerminalViewport({
       ) {
         layoutChangedWhileClaimPending = true;
       }
+      let sentClaim: TerminalSize | null = null;
       if (fitted && shouldClaim(fitted)) {
         const request = { ...fitted, sizeClaim };
+        sentClaim = request;
         claimInFlight = request;
+        setFitKept(false);
         awaitedAcknowledgement = null;
         claimNoticeSuppressed = true;
         const finishClaim = (succeeded: boolean, result: TerminalResizeResult | null = null) => {
@@ -1856,6 +1930,13 @@ export function TerminalViewport({
           )
             return;
           claimInFlight = null;
+          if (terminalSizeDiagnosticsEnabled())
+            diagnose("resize-answer", fittedDimensions, {
+              cols: request.cols,
+              rows: request.rows,
+              // An older server answers null for a claim it took.
+              outcome: succeeded ? (result?.outcome ?? "applied") : "failed",
+            });
           if (succeeded) {
             resizeRetries = 0;
             completeClaim(request, result);
@@ -1880,6 +1961,12 @@ export function TerminalViewport({
         );
       }
       updateSizeNotice(fitted);
+      if (terminalSizeDiagnosticsEnabled())
+        diagnose(
+          trigger,
+          fitted,
+          sentClaim && { cols: sentClaim.cols, rows: sentClaim.rows, outcome: "pending" },
+        );
     };
     const applySize = (
       size: TerminalSize | undefined,
@@ -1898,10 +1985,11 @@ export function TerminalViewport({
       const dismissed = dismissedTerminalSizes.get(terminalTargetKey);
       if (size && dismissed && !terminalSizesEqual(dismissed, size))
         dismissedTerminalSizes.delete(terminalTargetKey);
+      if (!terminalSizesEqual(appliedSize, size)) setFitKept(false);
       appliedSize = size ?? null;
       if (size?.sizeClaim != null) unownedUntilUsed = false;
       // A window attaching to a size the server left un-owned waits to be used as well.
-      else if (isUnownedUntilUsed(size)) unownedUntilUsed = true;
+      else if (sizeHandOver && isUnownedUntilUsed(size)) unownedUntilUsed = true;
       if (size && !terminalDimensionsEqual(terminal, size)) {
         const wasAtBottom = followsOutput();
         terminal.resize(size.cols, size.rows);
@@ -1924,7 +2012,7 @@ export function TerminalViewport({
           outputSink.barrier(() => {
             // An older server leaves every released size un-owned; one that hands it over does
             // so only when no remaining window is known to be in use.
-            unownedUntilUsed = userInputClaim && signal.size.sizeClaim === null;
+            unownedUntilUsed = sizeHandOver && signal.size.sizeClaim === null;
             applySize(signal.size, false, signal);
           });
         }
@@ -1983,12 +2071,25 @@ export function TerminalViewport({
       fit() {
         const pending = claimInFlight;
         handleSizeTrigger("fit");
+        setFitKept(claimInFlight === pending);
         // The sent claim hides the notice and its button, so focus moves where the keys go.
         if (claimInFlight !== null && claimInFlight !== pending) terminal.focus();
       },
       dismissSizeNotice() {
         if (appliedSize) dismissedTerminalSizes.set(terminalTargetKey, appliedSize);
         updateSizeNotice();
+      },
+      diagnose(
+        trigger: TerminalSizeDiagnosticTrigger,
+        repaint: TerminalSizeDiagnosticRecord["repaint"],
+      ) {
+        diagnose(trigger, fittedDimensions, null, repaint);
+      },
+      cellChanged() {
+        // New cell metrics change the fit as a box change does, so the claim waits as well:
+        // a dock opening next must not follow a claim it reverts (#348).
+        mountSizeChangedAt = performance.now();
+        mountUnsettledSince ??= mountSizeChangedAt;
       },
     };
     rendererRef.current = renderer;
@@ -2455,6 +2556,7 @@ export function TerminalViewport({
       if (disposed) return;
       disposed = true;
       updateMirroringSize(null);
+      setFitKept(false);
 
       resizeRendererGenerationRef.current += 1;
       lastRequestedSizeRef.current = null;
@@ -2524,6 +2626,7 @@ export function TerminalViewport({
     sizeOwnership,
     orderedInput,
     userInputClaim,
+    sizeHandOver,
     viewportSizeClaim,
   ]);
 
@@ -2562,7 +2665,14 @@ export function TerminalViewport({
   useEffect(() => {
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!shouldRender || terminal === null || fitAddon === null) return;
+    // A renderer created after this effect last ran is repainted once its epoch commits.
+    if (
+      !shouldRender ||
+      terminal === null ||
+      fitAddon === null ||
+      rendererEpoch !== rendererEpochRef.current
+    )
+      return;
 
     terminal.options.fontFamily = terminalFontFamily;
     const rendererGeneration = resizeRendererGenerationRef.current;
@@ -2578,15 +2688,18 @@ export function TerminalViewport({
         return;
       }
 
+      // xterm measured the cell before the font loaded, or not at all for an equal family.
+      if (remeasureTerminalCharSize(terminal)) rendererRef.current?.cellChanged();
       terminal.clearTextureAtlas();
       rendererRef.current?.size("layout");
       terminal.refresh(0, terminal.rows - 1);
+      if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("font", "done");
     });
 
     return () => {
       cancelled = true;
     };
-  }, [shouldRender, terminalFontFamily]);
+  }, [shouldRender, terminalFontFamily, rendererEpoch]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -2613,13 +2726,16 @@ export function TerminalViewport({
     const isCurrent = () =>
       !cleanedUp && webglGenerationRef.current === generation && terminalRef.current === terminal;
 
+    let stage: WebglFailureStage = "import failed";
     void (async () => {
       try {
         const { WebglAddon } = await loadTerminalWebglAddon();
         if (!isCurrent()) return;
 
+        stage = "addon creation failed";
         const addon = new WebglAddon();
         lifecycle = createWebglLifecycle(addon, terminal);
+        stage = "addon load failed";
         terminal.loadAddon(addon);
         if (!isCurrent()) {
           lifecycle.dispose();
@@ -2648,7 +2764,7 @@ export function TerminalViewport({
           if (webglLifecycleRef.current === activeLifecycle) {
             webglLifecycleRef.current = null;
           }
-          recordWebglDiagnosticOnce();
+          recordWebglDiagnosticOnce("context lost");
         });
         lifecycle.setContextLossDisposable(contextLossDisposable);
         if (!isCurrent() || lifecycle.disposed) {
@@ -2657,7 +2773,7 @@ export function TerminalViewport({
         }
 
         webglLifecycleRef.current = lifecycle;
-      } catch {
+      } catch (error) {
         lifecycle?.dispose();
         if (!isCurrent()) return;
 
@@ -2665,7 +2781,7 @@ export function TerminalViewport({
         if (webglLifecycleRef.current === lifecycle) {
           webglLifecycleRef.current = null;
         }
-        recordWebglDiagnosticOnce();
+        recordWebglDiagnosticOnce(stage, error);
       }
     })();
 
@@ -2844,7 +2960,9 @@ export function TerminalViewport({
           }
           terminal.clearTextureAtlas();
           terminal.refresh(0, terminal.rows - 1);
+          if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("repaint", "done");
         }, 50);
+        if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("repaint", "scheduled");
       });
     };
     const observer = new ResizeObserver(scheduleResize);
@@ -2861,11 +2979,23 @@ export function TerminalViewport({
     };
     function handlePixelRatioChange() {
       watchPixelRatio();
+      if (terminalSizeDiagnosticsEnabled()) rendererRef.current?.diagnose("pixel-ratio", "none");
+      // Rounded rows change the fit as a box change does, so the claim waits as well (#348).
+      rendererRef.current?.cellChanged();
       scheduleResize();
     }
     watchPixelRatio();
+    // A font that loads later changes the cell without changing the box (#348).
+    const fonts = typeof document.fonts?.addEventListener === "function" ? document.fonts : null;
+    const handleFontLoadingDone = () => {
+      const terminal = terminalRef.current;
+      if (terminal && remeasureTerminalCharSize(terminal)) rendererRef.current?.cellChanged();
+      scheduleResize();
+    };
+    fonts?.addEventListener("loadingdone", handleFontLoadingDone);
 
     return () => {
+      fonts?.removeEventListener("loadingdone", handleFontLoadingDone);
       pixelRatioQuery?.removeEventListener("change", handlePixelRatioChange);
       observer.disconnect();
       workspace?.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
@@ -2914,6 +3044,7 @@ export function TerminalViewport({
           <span>
             Sized for another window.
             {mirroringSize < 1 ? ` Shown at ${Math.floor(mirroringSize * 100)}%.` : ""}
+            {fitKept ? " The server kept this size." : ""}
           </span>
           <Button
             type="button"
