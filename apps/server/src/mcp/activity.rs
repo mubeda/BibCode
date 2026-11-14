@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::{Inner, McpControl, ToolCall, ToolSpec, invalid_argument, now_iso};
 use crate::{
+    agent_messaging::{MessageOutcome, OutcomeSink},
     auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
     orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
     persistence::Database,
@@ -697,6 +698,97 @@ fn target(arguments: &Map<String, Value>, content: &Value) -> Value {
     Value::Object(target)
 }
 
+/// Records each agent messaging outcome as one content-free row: ids, the two thread titles
+/// and a state name, never message text. The write is spawned, so a send never waits on the
+/// database. One task writes the rows in the order the outcomes arrive. Call it inside a Tokio
+/// runtime.
+pub(crate) fn agent_message_sink(activity: McpActivity) -> OutcomeSink {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(outcome) = receiver.recv().await {
+            activity.record(agent_message_row(outcome)).await;
+        }
+    });
+    Arc::new(move |outcome| {
+        let _ = sender.send(outcome);
+    })
+}
+
+fn agent_message_row(outcome: MessageOutcome) -> NewActivity {
+    let MessageOutcome {
+        sender_address,
+        recipient_address,
+        tool,
+        outcome,
+        message_id,
+        conversation_id,
+        reason,
+        sender_title,
+        recipient_title,
+        ..
+    } = outcome;
+    let thread_id = sender_address
+        .strip_prefix("thread:")
+        .or_else(|| sender_address.strip_prefix("terminal:"))
+        .and_then(|rest| rest.split('/').next())
+        .map(str::to_owned);
+    let (state, recorded) = match outcome.as_str() {
+        "accepted" | "delivered" | "consumed" | "completed" | "held" | "cancelled" => {
+            (Some(outcome.as_str()), "success".to_owned())
+        }
+        "failed" => (Some("failed"), "AgentMessageFailed".to_owned()),
+        // A refused call: the tag of its refusal.
+        _ => (None, outcome.clone()),
+    };
+    let mut target = Map::new();
+    // A `to` the caller typed is stored only when it is an address.
+    if valid_address(&recipient_address) {
+        target.insert("recipient".to_owned(), recipient_address.into());
+    }
+    for (key, value) in [
+        ("recipientTitle", recipient_title),
+        (
+            "messageId",
+            message_id.filter(|id| safe_id(&json!(id)).is_some()),
+        ),
+        (
+            "conversationId",
+            conversation_id.filter(|id| safe_id(&json!(id)).is_some()),
+        ),
+        ("status", state.map(str::to_owned)),
+        (
+            "reason",
+            reason.filter(|reason| safe_id(&json!(reason)).is_some()),
+        ),
+    ] {
+        if let Some(value) = value {
+            target.insert(key.to_owned(), value.into());
+        }
+    }
+    NewActivity {
+        session_id: sender_address,
+        label: sender_title,
+        tool: tool.to_owned(),
+        thread_id,
+        outcome: recorded,
+        target: Value::Object(target),
+    }
+}
+
+/// `thread:{id}` or `terminal:{thread}/{terminal}`, of at most 128 id characters.
+fn valid_address(address: &str) -> bool {
+    address.len() <= MOST_ID_CHARS
+        && address
+            .strip_prefix("thread:")
+            .is_some_and(|id| safe_id(&json!(id)).is_some())
+        || address.len() <= MOST_ID_CHARS
+            && address.strip_prefix("terminal:").is_some_and(|rest| {
+                rest.split_once('/').is_some_and(|(thread, terminal)| {
+                    safe_id(&json!(thread)).is_some() && safe_id(&json!(terminal)).is_some()
+                })
+            })
+}
+
 /// An id made of letters, digits, `-`, `_`, `.` and `:` only.
 fn safe_id(value: &Value) -> Option<&str> {
     value.as_str().filter(|id| {
@@ -1197,5 +1289,178 @@ mod tests {
         assert_eq!(activity.active()[0]["running"], true);
         activity.owned_changed("s-1", false);
         assert_eq!(activity.active()[0]["running"], false);
+    }
+
+    fn message_outcome(
+        tool: &'static str,
+        outcome: &str,
+        recipient: &str,
+        message_id: Option<&str>,
+    ) -> MessageOutcome {
+        MessageOutcome {
+            sender_address: "thread:a".to_owned(),
+            recipient_address: recipient.to_owned(),
+            tool,
+            outcome: outcome.to_owned(),
+            message_id: message_id.map(str::to_owned),
+            conversation_id: message_id.map(|_| "c1".to_owned()),
+            hop: None,
+            reason: None,
+            sender_title: Some("Caller".to_owned()),
+            recipient_title: Some("Recipient".to_owned()),
+        }
+    }
+
+    /// The rows once `count` of them are written.
+    async fn rows_after(activity: &McpActivity, count: usize) -> Vec<Value> {
+        for _ in 0..500 {
+            let rows = activity.recent().await.unwrap();
+            if rows.len() >= count {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {count} rows");
+    }
+
+    #[tokio::test]
+    async fn agent_message_activity_records_the_four_outcomes() {
+        let activity = McpActivity::new(migrated().await);
+        let sink = agent_message_sink(activity.clone());
+        sink(message_outcome(
+            "agent_message_send",
+            "accepted",
+            "thread:b",
+            Some("m1"),
+        ));
+        sink(message_outcome(
+            "agent_message_send",
+            "AgentMessagingUnknownRecipientError",
+            "thread:gone",
+            None,
+        ));
+        sink(message_outcome(
+            "agent_message_delivery",
+            "delivered",
+            "thread:b",
+            Some("m1"),
+        ));
+        let mut failed =
+            message_outcome("agent_message_delivery", "failed", "thread:b", Some("m1"));
+        failed.reason = Some("recipient_turn_failed".to_owned());
+        sink(failed);
+
+        let rows = rows_after(&activity, 4).await;
+
+        let summary: Vec<(&str, &str)> = rows
+            .iter()
+            .rev()
+            .map(|row| {
+                (
+                    row["tool"].as_str().unwrap(),
+                    row["outcome"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("agent_message_send", "success"),
+                ("agent_message_send", "AgentMessagingUnknownRecipientError"),
+                ("agent_message_delivery", "success"),
+                ("agent_message_delivery", "AgentMessageFailed"),
+            ]
+        );
+        assert_eq!(rows[3]["label"], "Caller");
+        assert_eq!(rows[3]["threadId"], "a");
+        assert_eq!(rows[3]["clientId"], "thread:a");
+        assert_eq!(
+            rows[3]["target"],
+            json!({ "recipient": "thread:b", "recipientTitle": "Recipient", "messageId": "m1", "conversationId": "c1", "status": "accepted" })
+        );
+        assert_eq!(rows[0]["target"]["status"], "failed");
+        assert_eq!(rows[0]["target"]["reason"], "recipient_turn_failed");
+        assert!(rows[2]["target"].get("status").is_none(), "{}", rows[2]);
+    }
+
+    #[tokio::test]
+    async fn agent_message_activity_shows_the_newest_rows_first() {
+        let activity = McpActivity::new(migrated().await);
+        let sink = agent_message_sink(activity.clone());
+        for id in ["m1", "m2", "m3"] {
+            sink(message_outcome(
+                "agent_message_send",
+                "accepted",
+                "thread:b",
+                Some(id),
+            ));
+        }
+        let rows = rows_after(&activity, 3).await;
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|row| row["target"]["messageId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["m3", "m2", "m1"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_with_a_malformed_address_records_no_recipient() {
+        let activity = McpActivity::new(migrated().await);
+        let sink = agent_message_sink(activity.clone());
+        for to in [
+            "not an address",
+            &format!("thread:{}", "x".repeat(200)),
+            "thread:",
+        ] {
+            sink(message_outcome(
+                "agent_message_send",
+                "AgentMessagingUnknownRecipientError",
+                to,
+                None,
+            ));
+        }
+        let rows = rows_after(&activity, 3).await;
+        for row in &rows {
+            assert!(row["target"].get("recipient").is_none(), "{row}");
+            assert!(!row.to_string().contains("not an address"), "{row}");
+        }
+    }
+
+    /// A send through the real service, with text no row may hold.
+    #[tokio::test]
+    async fn agent_message_activity_rows_hold_ids_and_titles_only() {
+        let tools = crate::production::mcp_tools_tests::Harness::new().await;
+        for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+            tools
+                .engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                        "threadId": thread_id, "projectId": "p1", "title": title,
+                        "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                        "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let messaging = tools
+            .messaging(true)
+            .with_outcomes(agent_message_sink(tools.control.activity().clone()));
+        let request = |to: &str| crate::agent_messaging::SendRequest {
+            to: to.to_owned(),
+            text: "ROW-CANARY-31337".to_owned(),
+            client_request_id: None,
+        };
+
+        messaging.send("a", request("thread:b")).await.unwrap();
+        assert!(messaging.send("a", request("thread:gone")).await.is_err());
+
+        let rows = rows_after(tools.control.activity(), 2).await;
+        assert_eq!(rows[1]["target"]["recipientTitle"], "Recipient");
+        assert_eq!(rows[1]["label"], "Caller");
+        assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
+        tools.shutdown().await;
     }
 }

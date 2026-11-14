@@ -220,10 +220,6 @@ impl AgentMessaging {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "task 7.2 supplies the activity sink")
-    )]
     pub(crate) fn with_outcomes(mut self, outcomes: OutcomeSink) -> Self {
         self.outcomes = Some(outcomes);
         self

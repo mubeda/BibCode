@@ -2298,6 +2298,141 @@ async fn a_providers_send_and_status_calls_reach_the_messaging_service() {
     tools.shutdown().await;
 }
 
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Message text reaches neither the log, the profiler nor the activity log, whether the send
+/// was accepted, refused or cut. In a process of its own: the tracing capture and the profiler
+/// handle are process-global.
+#[tokio::test]
+async fn the_log_and_the_profiler_never_see_agent_message_text() {
+    let Some(child) = crate::test_support::in_own_process(
+        "production::connect_mcp::tests::the_log_and_the_profiler_never_see_agent_message_text",
+    ) else {
+        return;
+    };
+    let log = CapturedLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+    let state = tempfile::tempdir().expect("profiler state");
+    let (_enabled, enabled) = tokio::sync::watch::channel(true);
+    let runtime = crate::diagnostics::profiler::runtime::ProfilerRuntime::start(
+        state.path(),
+        enabled,
+        vec![],
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while runtime.status()["enabled"] != true {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the profiler turns on");
+
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let sink = crate::mcp::activity::agent_message_sink(tools.control.activity().clone());
+    let tracker = CancellationToken::new();
+    crate::agent_messaging::delivery::AgentMessageTracker::start(
+        tools.engine.clone(),
+        Some(sink.clone()),
+        tracker.clone(),
+    );
+    tools
+        .control
+        .attach_agent_messaging(tools.messaging_untracked(true).with_outcomes(sink));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+    let long = format!("LONG-CANARY{}", "x".repeat(16_000));
+    for (id, to, text) in [
+        (2, "thread:b", "SEND-CANARY-31337".to_owned()),
+        (3, "thread:gone", "REFUSED-CANARY-31337".to_owned()),
+        (4, "thread:b", long),
+    ] {
+        rpc(
+            &service,
+            headers.clone(),
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":to,"text":text}}}),
+        )
+        .await;
+    }
+    // Let the sink write its rows, then read them back.
+    let mut rows = Vec::new();
+    for _ in 0..500 {
+        rows = tools.control.activity().recent().await.unwrap();
+        if rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tracker.cancel();
+    tools.shutdown().await;
+    runtime.shutdown().await;
+
+    let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("MCP tool call failed") && log.contains("AgentMessagingUnknownRecipientError"),
+        "the capture saw the refusal:\n{log}"
+    );
+    assert!(
+        !log.contains("CANARY"),
+        "message text reached the log:\n{log}"
+    );
+    assert!(
+        !serde_json::to_string(&rows).unwrap().contains("CANARY"),
+        "message text reached the activity log"
+    );
+    let profiler = std::fs::read_dir(crate::diagnostics::profiler::profiler_dir(state.path()))
+        .expect("profiler directory")
+        .filter_map(|entry| std::fs::read(entry.expect("entry").path()).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect::<String>();
+    assert!(!profiler.is_empty(), "the profiler recorded the run");
+    assert!(
+        !profiler.contains("CANARY"),
+        "message text reached the profiler"
+    );
+    child.complete();
+}
+
 #[test]
 fn device_open_takes_a_platform_and_an_image() {
     let tools = tool_descriptors(true);

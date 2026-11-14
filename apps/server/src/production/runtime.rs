@@ -831,8 +831,9 @@ impl ProductionRuntime {
             auth.clone(),
             orchestration.clone(),
             control.mcp_server_signal(),
-            mcp_activity,
+            mcp_activity.clone(),
         );
+        let agent_message_outcomes = crate::mcp::activity::agent_message_sink(mcp_activity);
         mcp_control.attach_terminals(mcp_terminals);
         mcp_control.attach_agent_messaging(
             crate::agent_messaging::AgentMessaging::new(
@@ -846,7 +847,8 @@ impl ProductionRuntime {
                 turn_delivery.clone(),
                 Some(workspace_availability.clone()),
                 attachment_uploads.clone(),
-            )),
+            ))
+            .with_outcomes(agent_message_outcomes.clone()),
         );
 
         // Late, so a failed start leaves no follower running.
@@ -855,7 +857,7 @@ impl ProductionRuntime {
         let agent_message_tracker = CancellationToken::new();
         crate::agent_messaging::delivery::AgentMessageTracker::start(
             orchestration.clone(),
-            None,
+            Some(agent_message_outcomes),
             agent_message_tracker.clone(),
         );
         // Last before the runtime exists, so a failed start leaves no collector running.

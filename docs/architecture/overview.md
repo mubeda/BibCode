@@ -3080,6 +3080,12 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   retries share one request scope across its runs within the 24-hour window, and
   Take over is stored on the identity (`mcp_named_clients.taken_over_at`,
   migration 71), so each later run starts read-only until Hand back.
+- **Agent message rows.** Each `agent_message_send`, `agent_message_reply` and
+  delivery outcome writes one `mcp_activity` row through `agent_message_sink`
+  (`mcp/activity.rs`): sender address and title, recipient address and title,
+  message and conversation ids and a state name, never message text. One task
+  writes them in arrival order, so a send never waits on the database. The
+  change feed and webhooks skip these rows.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
   the activity log by a monotonic cursor without reading payload text other than
   an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same
