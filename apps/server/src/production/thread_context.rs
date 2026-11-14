@@ -1,6 +1,8 @@
 //! A thread's stored messages as a handoff text: the transcript lines that a new provider
 //! conversation, a side chat, a Hand off and a Take over from read (spec D107).
 
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
 use crate::persistence::ProjectionThreadMessage;
 
 /// A new provider conversation receives at most this many of the thread's earlier messages,
@@ -21,8 +23,8 @@ pub(crate) fn thread_context_lines(
     messages: &[ProjectionThreadMessage],
     current_message_id: &str,
 ) -> (Vec<String>, bool) {
-    let earlier = messages
-        .iter()
+    let earlier = in_instant_order(messages)
+        .into_iter()
         .rev()
         .filter(|message| is_kept(message, current_message_id));
     let mut budget = THREAD_CONTEXT_MAX_CHARS;
@@ -114,6 +116,16 @@ impl HandoffText {
     }
 }
 
+/// The messages oldest first by their parsed `created_at`; equal instants keep repository order.
+/// The repository sorts the timestamp text, and RFC 3339 text of different fractional precision
+/// does not sort chronologically (".123Z" sorts before ".12Z"). An unparseable timestamp sorts
+/// first, so it cannot displace parsed ones.
+fn in_instant_order(messages: &[ProjectionThreadMessage]) -> Vec<&ProjectionThreadMessage> {
+    let mut ordered = messages.iter().collect::<Vec<_>>();
+    ordered.sort_by_cached_key(|message| OffsetDateTime::parse(&message.created_at, &Rfc3339).ok());
+    ordered
+}
+
 /// The messages `thread_context_lines` keeps.
 fn is_kept(message: &ProjectionThreadMessage, exclude_message_id: &str) -> bool {
     matches!(message.role.as_str(), "user" | "assistant")
@@ -140,8 +152,8 @@ pub(crate) fn handoff_text(
     messages: &[ProjectionThreadMessage],
     exclude_message_id: &str,
 ) -> HandoffText {
-    let kept = messages
-        .iter()
+    let kept = in_instant_order(messages)
+        .into_iter()
         .filter(|message| is_kept(message, exclude_message_id))
         .collect::<Vec<_>>();
     let (tail, _) = thread_context_lines(messages, exclude_message_id);
@@ -193,6 +205,16 @@ mod tests {
 
     use super::*;
 
+    /// One second per id, so ids order the messages by instant.
+    fn instant(id: usize) -> String {
+        format!(
+            "2026-01-01T{:02}:{:02}:{:02}Z",
+            id / 3600,
+            id / 60 % 60,
+            id % 60
+        )
+    }
+
     fn message(id: usize, role: &str, text: &str) -> ProjectionThreadMessage {
         ProjectionThreadMessage {
             message_id: format!("m{id}"),
@@ -213,9 +235,16 @@ mod tests {
             actor: None,
             source_thread_id: None,
             person_send: None,
-            created_at: format!("2026-01-01T00:00:{:02}Z", id % 60),
-            updated_at: format!("2026-01-01T00:00:{:02}Z", id % 60),
+            created_at: instant(id),
+            updated_at: instant(id),
         }
+    }
+
+    /// The message dated before every `message(id, ..)`, as when it was stored first.
+    fn before_the_thread(mut row: ProjectionThreadMessage) -> ProjectionThreadMessage {
+        row.created_at = "2025-12-31T00:00:00Z".to_owned();
+        row.updated_at = row.created_at.clone();
+        row
     }
 
     fn agent_envelope(id: usize, text: &str) -> ProjectionThreadMessage {
@@ -293,7 +322,10 @@ mod tests {
         assert_eq!(handoff.render(), joined_tail(&short));
 
         let mut assistant_first = alternating(12);
-        assistant_first.insert(0, message(99, "assistant", "I was started by a schedule"));
+        assistant_first.insert(
+            0,
+            before_the_thread(message(99, "assistant", "I was started by a schedule")),
+        );
         let handoff = handoff_text(&assistant_first, "");
         assert_eq!(handoff.first_message, None);
         assert_eq!(handoff.render(), joined_tail(&assistant_first));
@@ -377,7 +409,10 @@ mod tests {
     fn handoff_text_of_a_long_thread_whose_first_message_came_from_an_agent_uses_the_first_person_message()
      {
         let mut thread = alternating(60);
-        thread.insert(0, agent_envelope(100, "please look at this"));
+        thread.insert(
+            0,
+            before_the_thread(agent_envelope(100, "please look at this")),
+        );
         let handoff = handoff_text(&thread, "");
         assert_eq!(handoff.first_message.as_deref(), Some("[user] message 0"));
         // The envelope is older than the first person message and is left out with the rest.
@@ -386,8 +421,8 @@ mod tests {
 
     #[test]
     fn handoff_text_skips_an_agent_envelope_between_person_messages() {
-        let mut thread = vec![agent_envelope(100, "from another agent")];
-        thread.push(message(101, "assistant", "noted"));
+        let mut thread = vec![before_the_thread(agent_envelope(100, "from another agent"))];
+        thread.push(before_the_thread(message(101, "assistant", "noted")));
         thread.extend(alternating(50));
         let handoff = handoff_text(&thread, "");
         assert_eq!(handoff.first_message.as_deref(), Some("[user] message 0"));
@@ -428,7 +463,11 @@ mod tests {
             stamped(2, "user", "2026-01-01T10:00:00.123Z"),
         ];
         rows.extend((3..43_usize).map(|id| {
-            let role = if id.is_multiple_of(2) { "assistant" } else { "user" };
+            let role = if id.is_multiple_of(2) {
+                "assistant"
+            } else {
+                "user"
+            };
             stamped(id, role, &format!("2026-01-01T10:00:{:02}.5Z", id))
         }));
         for row in rows {
@@ -460,7 +499,10 @@ mod tests {
             "[user] message 3\n[user] message 1\n[assistant] message 2"
         );
         assert_eq!(
-            thread_context_lines(&thread, "").0.last().map(String::as_str),
+            thread_context_lines(&thread, "")
+                .0
+                .last()
+                .map(String::as_str),
             Some("[assistant] message 2")
         );
     }
