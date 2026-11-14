@@ -861,12 +861,13 @@ impl ProductionRuntime {
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         let agent_message_tracker = CancellationToken::new();
-        let agent_message_tracker_task = crate::agent_messaging::delivery::AgentMessageTracker::start(
-            orchestration.clone(),
-            Some(agent_message_outcomes),
-            control.agent_messaging_enabled_signal(),
-            agent_message_tracker.clone(),
-        );
+        let agent_message_tracker_task =
+            crate::agent_messaging::delivery::AgentMessageTracker::start(
+                orchestration.clone(),
+                Some(agent_message_outcomes),
+                control.agent_messaging_enabled_signal(),
+                agent_message_tracker.clone(),
+            );
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {

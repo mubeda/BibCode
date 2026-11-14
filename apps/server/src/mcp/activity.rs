@@ -818,7 +818,10 @@ async fn write_agent_messages(
         }
         let count = dropped.swap(0, Ordering::Relaxed);
         if count > 0 {
-            tracing::warn!(count, "agent message activity rows were dropped: the writer fell behind");
+            tracing::warn!(
+                count,
+                "agent message activity rows were dropped: the writer fell behind"
+            );
         }
     }
     for row in admitting.into_values().flatten() {
@@ -1707,9 +1710,11 @@ mod tests {
             .shared
             .database
             .call(|connection| {
-                Ok(connection.query_row("SELECT COUNT(*) FROM mcp_activity", [], |row| {
-                    row.get::<_, i64>(0)
-                })?)
+                Ok(
+                    connection.query_row("SELECT COUNT(*) FROM mcp_activity", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
             })
             .await
             .unwrap();
@@ -1745,11 +1750,9 @@ mod tests {
                 if outcome.tool == "agent_message_send" && outcome.outcome == "accepted" {
                     let (seen, changed) = &*delivered;
                     let (_seen, waited) = changed
-                        .wait_timeout_while(
-                            seen.lock().unwrap(),
-                            Duration::from_secs(10),
-                            |seen| !*seen,
-                        )
+                        .wait_timeout_while(seen.lock().unwrap(), Duration::from_secs(10), |seen| {
+                            !*seen
+                        })
                         .unwrap();
                     assert!(
                         !waited.timed_out(),
@@ -1959,7 +1962,10 @@ mod tests {
             json!({ "recipient": "thread:b", "recipientTitle": "Recipient" })
         );
         for (row, to) in rows[..3].iter().rev().zip(&refusals[1..]) {
-            assert_eq!(row["outcome"], "AgentMessagingUnknownRecipientError", "{row}");
+            assert_eq!(
+                row["outcome"], "AgentMessagingUnknownRecipientError",
+                "{row}"
+            );
             assert_eq!(row["label"], "Caller", "{row}");
             assert_eq!(row["target"], json!({ "recipient": to }), "{row}");
         }

@@ -2333,7 +2333,10 @@ impl crate::production::provider_runtime::ProviderDriverFactory for EnvelopeDriv
     > {
         let driver = self.clone();
         Box::pin(async move {
-            Ok(Arc::new(driver) as Arc<dyn crate::production::provider_runtime::ProviderDriver>)
+            Ok(Arc::new(driver)
+                as Arc<
+                    dyn crate::production::provider_runtime::ProviderDriver,
+                >)
         })
     }
 }
@@ -2614,12 +2617,18 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
         "AgentMessagingInvalidArgumentError",
     ]) {
         assert_eq!(result["isError"], true, "{result}");
-        assert_eq!(result["structuredContent"]["error"]["_tag"], tag, "{result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["_tag"], tag,
+            "{result}"
+        );
     }
     // The driver took the turn, so the message reads delivered, or consumed once the tracker
     // ties it to the driver's turn.
     let status = delivered_status(&engine).await;
-    assert!(matches!(status.as_str(), "delivered" | "consumed"), "{status}");
+    assert!(
+        matches!(status.as_str(), "delivered" | "consumed"),
+        "{status}"
+    );
     // The positive control: the envelope crossed the delivery path to the driver.
     let delivered = driver.delivered.lock().unwrap().clone();
     assert!(
@@ -2651,8 +2660,16 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
         summary[..3],
         [
             ("agent_message_send", "success", Some("accepted")),
-            ("agent_message_send", "AgentMessagingUnknownRecipientError", None),
-            ("agent_message_send", "AgentMessagingInvalidArgumentError", None),
+            (
+                "agent_message_send",
+                "AgentMessagingUnknownRecipientError",
+                None
+            ),
+            (
+                "agent_message_send",
+                "AgentMessagingInvalidArgumentError",
+                None
+            ),
         ],
         "{rows:?}"
     );
@@ -2661,7 +2678,11 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
         !deliveries.is_empty()
             && deliveries.iter().all(|row| matches!(
                 row,
-                ("agent_message_delivery", "success", Some("delivered" | "consumed"))
+                (
+                    "agent_message_delivery",
+                    "success",
+                    Some("delivered" | "consumed")
+                )
             )),
         "{rows:?}"
     );

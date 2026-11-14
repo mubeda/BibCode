@@ -788,7 +788,12 @@ async fn a_cut_page_never_skips_a_visible_row_behind_message_rows() {
     let first = feed(&harness, &agent, json!({ "cursor": cursor, "limit": 1 })).await;
     assert_eq!(kinds(&first), ["agent.call"], "{first}");
     assert_eq!(first["more"], true, "{first}");
-    let second = feed(&harness, &agent, json!({ "cursor": first["cursor"], "limit": 1 })).await;
+    let second = feed(
+        &harness,
+        &agent,
+        json!({ "cursor": first["cursor"], "limit": 1 }),
+    )
+    .await;
 
     assert_eq!(kinds(&second), ["agent.call"], "{second}");
     assert_eq!(
