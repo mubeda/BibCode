@@ -5850,7 +5850,10 @@ async fn codex_reconnect_withdraws_readiness_until_an_event_after_its_resume() {
             .expect("Codex endpoints")
             .len()
             == connections_before
-            || remote_state.completed_resume_responses.load(Ordering::Acquire) < 2
+            || remote_state
+                .completed_resume_responses
+                .load(Ordering::Acquire)
+                < 2
         {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }

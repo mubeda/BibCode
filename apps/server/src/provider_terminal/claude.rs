@@ -4534,14 +4534,22 @@ mod tests {
         };
 
         for (event, notification, expected) in [
-            ("UserPromptSubmit", None, (TerminalAgentState::Working, false)),
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
             ("Stop", None, (TerminalAgentState::Done, false)),
             (
                 "Notification",
                 Some("idle_prompt"),
                 (TerminalAgentState::Done, true),
             ),
-            ("UserPromptSubmit", None, (TerminalAgentState::Working, false)),
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert("authorization", "Bearer token".parse().unwrap());

@@ -4241,8 +4241,8 @@ mod tests {
                     normalizer.normalize(event)
                 };
                 for v1 in normalized {
-                    cancelled |= v1.pointer("/properties/error/name")
-                        == Some(&json!("MessageAbortedError"));
+                    cancelled |=
+                        v1.pointer("/properties/error/name") == Some(&json!("MessageAbortedError"));
                     mutations.extend(tracker.handle_observed_event_at(&v1, 1).mutations);
                 }
             }
@@ -4250,7 +4250,10 @@ mod tests {
         };
 
         let (with_idle, cancelled) = replay(true);
-        assert!(cancelled, "the interrupt still reaches the tracker as an abort");
+        assert!(
+            cancelled,
+            "the interrupt still reaches the tracker as an abort"
+        );
         assert_eq!(with_idle, replay(false).0);
     }
 

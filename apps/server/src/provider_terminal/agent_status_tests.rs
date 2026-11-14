@@ -351,7 +351,12 @@ fn readiness_needs_fresh_evidence_and_any_other_report_withdraws_it() {
         (idle, true, Stale, false),
         (idle, false, Fresh, false),
         (TerminalAgentReport::Set(Done, true), true, Fresh, false),
-        (TerminalAgentReport::Set(Working, false), false, Stale, false),
+        (
+            TerminalAgentReport::Set(Working, false),
+            false,
+            Stale,
+            false,
+        ),
         (TerminalAgentReport::Progress, false, Fresh, false),
     ] {
         let generation =
