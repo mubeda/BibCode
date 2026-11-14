@@ -722,6 +722,18 @@ pub enum TerminalAgentReport {
     Progress,
 }
 
+/// Whether a provider event may make its terminal ready for a prompt. Only fresh evidence can;
+/// every observer transition withdraws readiness until fresh evidence returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptEvidence {
+    /// Read on the observer's active stream after that stream's last transition and after any
+    /// snapshot it took, so nothing the observer holds is newer.
+    Fresh,
+    /// A snapshot, an event buffered across a request or a transition, or one the observer drops:
+    /// its state is reported, which withdraws readiness, but never makes the terminal ready.
+    Stale,
+}
+
 /// One status observation: the state, whether the turn that ended failed, and when the
 /// observer saw it on this server's clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -960,9 +972,22 @@ impl TerminalObserverGenerationLease {
         });
     }
 
+    /// Reports what one provider event says, then marks the terminal ready only when the event
+    /// says its CLI waits for a prompt and the evidence is fresh.
+    pub fn report_agent_evidence(
+        &self,
+        report: TerminalAgentReport,
+        ready: bool,
+        evidence: PromptEvidence,
+    ) {
+        self.report_agent_status(report);
+        if ready && evidence == PromptEvidence::Fresh {
+            self.mark_ready_for_prompt();
+        }
+    }
+
     /// Marks the current observation ready for a prompt, only when it is done and did not fail,
-    /// atomically. A provider event that says its CLI waits for input calls it right after the
-    /// report of that event.
+    /// atomically. Observers reach it through [`Self::report_agent_evidence`].
     pub fn mark_ready_for_prompt(&self) {
         if !self.is_current() {
             return;
@@ -982,8 +1007,9 @@ impl TerminalObserverGenerationLease {
             });
     }
 
-    /// Withdraws readiness when the observer can no longer see the agent's next turn or ask: a
-    /// lost connection or stream. The state stays as last reported.
+    /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
+    /// that buffers events, a lost connection or stream, the observer's end) until fresh
+    /// evidence returns. The state stays as last reported.
     pub fn clear_ready_for_prompt(&self) {
         self.inner
             .agent_status
