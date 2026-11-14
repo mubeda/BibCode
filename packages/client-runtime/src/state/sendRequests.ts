@@ -13,9 +13,26 @@ import {
 
 const EMPTY_REQUESTS: ReadonlyArray<SendRequest> = [];
 
+const FRACTION = /\.(\d+)/;
+
+/**
+ * Orders two RFC 3339 timestamps by instant. The server trims trailing zeros, so the strings
+ * ("...00.1Z" and "...00.11Z") do not sort like the instants. Whole seconds are parsed and the
+ * fraction, which can be finer than a millisecond, is compared as padded digits. An unparseable
+ * timestamp compares equal.
+ */
+function compareInstants(a: string, b: string): number {
+  const seconds = Date.parse(a.replace(FRACTION, "")) - Date.parse(b.replace(FRACTION, ""));
+  if (seconds !== 0) return Number.isNaN(seconds) ? 0 : seconds;
+  const fractionA = (FRACTION.exec(a)?.[1] ?? "").padEnd(9, "0");
+  const fractionB = (FRACTION.exec(b)?.[1] ?? "").padEnd(9, "0");
+  return fractionA < fractionB ? -1 : fractionA > fractionB ? 1 : 0;
+}
+
 /** Newest first; ties order by id so a re-fold never reorders rows. */
 function newestFirst(a: SendRequest, b: SendRequest): number {
-  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+  const byInstant = compareInstants(b.createdAt, a.createdAt);
+  if (byInstant !== 0) return byInstant;
   return a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0;
 }
 
@@ -27,7 +44,7 @@ function merge(
   for (const request of incoming) {
     const known = byId.get(request.requestId);
     // The row of the later `updatedAt` wins, so a late page never rolls a row back.
-    if (known === undefined || request.updatedAt >= known.updatedAt) {
+    if (known === undefined || compareInstants(request.updatedAt, known.updatedAt) >= 0) {
       byId.set(request.requestId, request);
     }
   }
