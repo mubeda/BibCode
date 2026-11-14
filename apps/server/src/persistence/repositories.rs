@@ -5073,6 +5073,7 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
             "SELECT a.activity_id, a.occurred_at, a.session_id, a.label, a.tool, a.thread_id, a.outcome, a.target_json, s.mcp_named_client_id \
              FROM mcp_activity AS a LEFT JOIN auth_sessions AS s ON s.session_id = a.session_id \
              WHERE a.activity_id > ?1 AND (?2 IS NULL OR a.thread_id = ?2) \
+             AND a.tool NOT IN ('agent_message_send', 'agent_message_reply', 'agent_message_delivery') \
              ORDER BY a.activity_id LIMIT ?3",
         )?;
         statement

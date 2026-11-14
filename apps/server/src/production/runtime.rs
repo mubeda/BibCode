@@ -121,6 +121,10 @@ pub struct ProductionRuntime {
     send_requests_follower: CancellationToken,
     /// Stops the tracker that moves agent messages through their states.
     agent_message_tracker: CancellationToken,
+    /// The tracker's task, joined in the stop so its last outcome reaches the activity writer.
+    agent_message_tracker_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Writes agent message rows to the activity log; closed and drained in the stop.
+    agent_message_writer: crate::mcp::activity::AgentMessageWriter,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -831,8 +835,10 @@ impl ProductionRuntime {
             auth.clone(),
             orchestration.clone(),
             control.mcp_server_signal(),
-            mcp_activity,
+            mcp_activity.clone(),
         );
+        let (agent_message_outcomes, agent_message_writer) =
+            crate::mcp::activity::agent_message_writer(mcp_activity);
         mcp_control.attach_terminals(mcp_terminals);
         mcp_control.attach_agent_messaging(
             crate::agent_messaging::AgentMessaging::new(
@@ -846,19 +852,21 @@ impl ProductionRuntime {
                 turn_delivery.clone(),
                 Some(workspace_availability.clone()),
                 attachment_uploads.clone(),
-            )),
+            ))
+            .with_outcomes(agent_message_outcomes.clone()),
         );
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         let agent_message_tracker = CancellationToken::new();
-        crate::agent_messaging::delivery::AgentMessageTracker::start(
-            orchestration.clone(),
-            None,
-            control.agent_messaging_enabled_signal(),
-            agent_message_tracker.clone(),
-        );
+        let agent_message_tracker_task =
+            crate::agent_messaging::delivery::AgentMessageTracker::start(
+                orchestration.clone(),
+                Some(agent_message_outcomes),
+                control.agent_messaging_enabled_signal(),
+                agent_message_tracker.clone(),
+            );
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
@@ -866,6 +874,8 @@ impl ProductionRuntime {
             webhooks,
             send_requests_follower,
             agent_message_tracker,
+            agent_message_tracker_task: std::sync::Mutex::new(Some(agent_message_tracker_task)),
+            agent_message_writer,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1063,9 +1073,25 @@ impl ProductionRuntime {
         // A stopped follower resumes from its first sweep on the next start.
         self.send_requests_follower.cancel();
         steps.mark("send-requests-follower");
-        // A stopped tracker resumes from its first reconciliation on the next start.
+        // A stopped tracker resumes from its first reconciliation on the next start. Its join is
+        // bounded by the database and the engine, the only things it waits on, which both run
+        // until the `orchestration` step below.
         self.agent_message_tracker.cancel();
+        let tracker = self
+            .agent_message_tracker_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(tracker) = tracker
+            && let Err(error) = tracker.await
+        {
+            tracing::warn!(%error, "the agent message tracker ended abnormally");
+        }
         steps.mark("agent-message-tracker");
+        // After the tracker and the MCP calls, while the database is open and before the
+        // profiler's teardown: every queued agent message row is written, then the writer ends.
+        self.agent_message_writer.close().await;
+        steps.mark("agent-message-activity");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
@@ -3763,6 +3789,163 @@ mod tests {
         .await
         .expect("optional provider observation must fail open");
 
+        runtime.shutdown().await;
+    }
+
+    /// The stop writes the agent message rows still queued and ends their writer, before the
+    /// profiler's teardown.
+    #[tokio::test]
+    async fn quiesce_writes_the_queued_agent_message_rows_and_ends_their_writer() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        for _ in 0..20 {
+            messaging.refused(
+                "agent_message_send",
+                "missing",
+                crate::agent_messaging::AgentMessagingError::Disabled,
+            );
+        }
+
+        let _ = runtime.quiesce_for_update().await;
+
+        assert!(
+            runtime.agent_message_writer.is_closed(),
+            "the stop ended the writer"
+        );
+        let rows: i64 = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'agent_message_send'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("the rows are readable");
+        assert_eq!(rows, 20, "every queued row was written");
+        runtime.shutdown().await;
+    }
+
+    /// A send whose future is suspended after its message was admitted, before it reports,
+    /// never holds up the stop: the stop reaches the profiler's teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiesce_completes_while_a_send_is_suspended_before_its_report() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({ "agentMessaging": { "enabled": true } }),
+        );
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let workspace = TempDir::new().expect("workspace");
+        let mut commands = vec![json!({
+            "type": "project.create", "commandId": "project-create", "projectId": "p1",
+            "title": "Project", "workspaceRoot": workspace.path(),
+            "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "createdAt": "2026-11-14T00:00:00.000Z",
+        })];
+        for thread_id in ["a", "b"] {
+            commands.push(json!({
+                "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                "threadId": thread_id, "projectId": "p1", "title": thread_id,
+                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+            }));
+        }
+        for command in commands {
+            runtime
+                .orchestration
+                .dispatch(serde_json::from_value(command).expect("command"))
+                .await
+                .expect("dispatch");
+        }
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        let mut send = Box::pin(messaging.send(
+            "a",
+            crate::agent_messaging::SendRequest {
+                to: "thread:b".to_owned(),
+                text: "hello".to_owned(),
+                client_request_id: None,
+            },
+        ));
+        // Polled by hand until its message is admitted, then never again.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let admitted: i64 = database
+                    .call(|connection| {
+                        Ok(connection.query_row(
+                            "SELECT COUNT(*) FROM agent_messages",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .await
+                    .expect("messages are readable");
+                if admitted > 0 {
+                    break;
+                }
+                assert!(
+                    send.as_mut().poll(&mut context).is_pending(),
+                    "the send stays suspended until its admission is seen"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the message is admitted");
+
+        tokio::time::timeout(Duration::from_secs(30), runtime.quiesce_for_update())
+            .await
+            .expect("the stop never waits on the suspended send")
+            .expect("the stop succeeds");
+
+        drop(send);
         runtime.shutdown().await;
     }
 

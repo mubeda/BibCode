@@ -143,17 +143,25 @@ async fn reply(
     arguments: &Value,
     messaging: &AgentMessaging,
 ) -> Result<MessageReceipt, AgentMessagingError> {
-    let object = strict_object(
-        "agent_message_reply",
-        arguments,
-        &["inReplyTo", "text", "clientRequestId"],
-    )?;
-    let request = ReplyRequest {
-        in_reply_to: string_field(object, "inReplyTo", true)?.unwrap_or_default(),
-        text: string_field(object, "text", true)?.unwrap_or_default(),
-        client_request_id: string_field(object, "clientRequestId", false)?,
-    };
-    messaging.reply(&scope.thread_id, request).await
+    let request = (|| {
+        if !messaging.is_enabled() {
+            return Err(AgentMessagingError::Disabled);
+        }
+        let object = strict_object(
+            "agent_message_reply",
+            arguments,
+            &["inReplyTo", "text", "clientRequestId"],
+        )?;
+        Ok(ReplyRequest {
+            in_reply_to: string_field(object, "inReplyTo", true)?.unwrap_or_default(),
+            text: string_field(object, "text", true)?.unwrap_or_default(),
+            client_request_id: string_field(object, "clientRequestId", false)?,
+        })
+    })();
+    match request {
+        Ok(request) => messaging.reply(&scope.thread_id, request).await,
+        Err(error) => Err(messaging.refused("agent_message_reply", &scope.thread_id, error)),
+    }
 }
 
 async fn status(
@@ -245,17 +253,25 @@ async fn send(
     arguments: &Value,
     messaging: &AgentMessaging,
 ) -> Result<MessageReceipt, AgentMessagingError> {
-    let object = strict_object(
-        "agent_message_send",
-        arguments,
-        &["to", "text", "clientRequestId"],
-    )?;
-    let request = SendRequest {
-        to: string_field(object, "to", true)?.unwrap_or_default(),
-        text: string_field(object, "text", true)?.unwrap_or_default(),
-        client_request_id: string_field(object, "clientRequestId", false)?,
-    };
-    messaging.send(&scope.thread_id, request).await
+    let request = (|| {
+        if !messaging.is_enabled() {
+            return Err(AgentMessagingError::Disabled);
+        }
+        let object = strict_object(
+            "agent_message_send",
+            arguments,
+            &["to", "text", "clientRequestId"],
+        )?;
+        Ok(SendRequest {
+            to: string_field(object, "to", true)?.unwrap_or_default(),
+            text: string_field(object, "text", true)?.unwrap_or_default(),
+            client_request_id: string_field(object, "clientRequestId", false)?,
+        })
+    })();
+    match request {
+        Ok(request) => messaging.send(&scope.thread_id, request).await,
+        Err(error) => Err(messaging.refused("agent_message_send", &scope.thread_id, error)),
+    }
 }
 
 /// Runs provider tool `name` for the thread of `scope`.
@@ -286,24 +302,14 @@ pub(crate) async fn run(
                 Err(error) => failure(&error),
             }
         }
-        "agent_message_send" => {
-            if !messaging.is_enabled() {
-                return failure(&AgentMessagingError::Disabled);
-            }
-            match send(&scope, &arguments, messaging).await {
-                Ok(receipt) => receipt_result(&receipt),
-                Err(error) => failure(&error),
-            }
-        }
-        "agent_message_reply" => {
-            if !messaging.is_enabled() {
-                return failure(&AgentMessagingError::Disabled);
-            }
-            match reply(&scope, &arguments, messaging).await {
-                Ok(receipt) => receipt_result(&receipt),
-                Err(error) => failure(&error),
-            }
-        }
+        "agent_message_send" => match send(&scope, &arguments, messaging).await {
+            Ok(receipt) => receipt_result(&receipt),
+            Err(error) => failure(&error),
+        },
+        "agent_message_reply" => match reply(&scope, &arguments, messaging).await {
+            Ok(receipt) => receipt_result(&receipt),
+            Err(error) => failure(&error),
+        },
         "agent_message_status" => {
             if !messaging.is_enabled() {
                 return failure(&AgentMessagingError::Disabled);

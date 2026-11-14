@@ -227,9 +227,12 @@ pub(crate) struct MessageOutcome {
 
 pub(crate) type OutcomeSink = Arc<dyn Fn(MessageOutcome) + Send + Sync>;
 
-/// An accepted send or reply: its receipt and, unless it replays a stored one, the sender's and
-/// the recipient's thread titles.
-type Accepted = (MessageReceipt, Option<(String, String)>);
+/// What one send or reply call learned about who it involves, for its activity row: both thread
+/// titles once it resolved the recipient as a live thread of the sender's project, never before.
+#[derive(Default)]
+struct Attribution {
+    titles: Option<(String, String)>,
+}
 
 /// The sender and recipient threads of a send that passed every check.
 struct Route {
@@ -264,10 +267,6 @@ impl AgentMessaging {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "task 7.2 supplies the activity sink")
-    )]
     pub(crate) fn with_outcomes(mut self, outcomes: OutcomeSink) -> Self {
         self.outcomes = Some(outcomes);
         self
@@ -279,9 +278,36 @@ impl AgentMessaging {
         sender_thread_id: &str,
         request: SendRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
-        let result = self.send_inner(sender_thread_id, &request).await;
-        self.report("agent_message_send", sender_thread_id, &request.to, &result);
-        result.map(|(receipt, _)| receipt)
+        let mut attribution = Attribution::default();
+        let result = self
+            .send_inner(sender_thread_id, &request, &mut attribution)
+            .await;
+        self.report(
+            "agent_message_send",
+            sender_thread_id,
+            &request.to,
+            attribution,
+            result.as_ref(),
+        );
+        result
+    }
+
+    /// Reports a send or reply the tool refused before calling [`Self::send`] or
+    /// [`Self::reply`], with no argument of it, and returns the refusal.
+    pub(crate) fn refused(
+        &self,
+        tool: &'static str,
+        caller_thread_id: &str,
+        error: AgentMessagingError,
+    ) -> AgentMessagingError {
+        self.report(
+            tool,
+            caller_thread_id,
+            "",
+            Attribution::default(),
+            Err(&error),
+        );
+        error
     }
 
     /// Tells the outcome sink, if any, what one send or reply call ended with.
@@ -290,14 +316,22 @@ impl AgentMessaging {
         tool: &'static str,
         sender_thread_id: &str,
         recipient_address: &str,
-        result: &Result<Accepted, AgentMessagingError>,
+        attribution: Attribution,
+        result: Result<&MessageReceipt, &AgentMessagingError>,
     ) {
         let Some(outcomes) = &self.outcomes else {
             return;
         };
-        let (outcome, receipt, titles) = match result {
-            Ok((receipt, titles)) => ("accepted".to_owned(), Some(receipt), titles.as_ref()),
-            Err(error) => (error.tag().to_owned(), None, None),
+        // Without titles the writer fills in the caller's own: it tells the caller nothing about
+        // any other thread, and the caller never waits on the database for it.
+        let titles = attribution
+            .titles
+            .map_or((None, None), |(sender, recipient)| {
+                (Some(sender), Some(recipient))
+            });
+        let (outcome, receipt) = match result {
+            Ok(receipt) => ("accepted".to_owned(), Some(receipt)),
+            Err(error) => (error.tag().to_owned(), None),
         };
         outcomes(MessageOutcome {
             sender_address: format!("thread:{sender_thread_id}"),
@@ -308,8 +342,8 @@ impl AgentMessaging {
             conversation_id: receipt.map(|receipt| receipt.conversation_id.clone()),
             hop: receipt.map(|receipt| receipt.hop),
             reason: None,
-            sender_title: titles.map(|(sender, _)| sender.clone()),
-            recipient_title: titles.map(|(_, recipient)| recipient.clone()),
+            sender_title: titles.0,
+            recipient_title: titles.1,
         });
     }
 
@@ -321,27 +355,34 @@ impl AgentMessaging {
         request: ReplyRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
         let mut recipient_address = String::new();
+        let mut attribution = Attribution::default();
         let result = self
-            .reply_inner(sender_thread_id, &request, &mut recipient_address)
+            .reply_inner(
+                sender_thread_id,
+                &request,
+                &mut recipient_address,
+                &mut attribution,
+            )
             .await;
         self.report(
             "agent_message_reply",
             sender_thread_id,
             &recipient_address,
-            &result,
+            attribution,
+            result.as_ref(),
         );
-        result.map(|(receipt, _)| receipt)
+        result
     }
 
-    /// The receipt and, unless it replays a stored one, the two thread titles of an accepted
-    /// reply. `recipient_address` is set once the message replied to is known to be the
-    /// caller's.
+    /// The receipt of an accepted reply. `recipient_address` is set once the message replied to
+    /// is known to be the caller's.
     async fn reply_inner(
         &self,
         sender_thread_id: &str,
         request: &ReplyRequest,
         recipient_address: &mut String,
-    ) -> Result<Accepted, AgentMessagingError> {
+        attribution: &mut Attribution,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -374,7 +415,7 @@ impl AgentMessaging {
             )
             .await?
         {
-            return Ok((receipt, None));
+            return Ok(receipt);
         }
         let route = match self.route(sender_thread_id, recipient_thread_id).await {
             Err(AgentMessagingError::UnknownRecipient) => {
@@ -382,12 +423,12 @@ impl AgentMessaging {
             }
             route => route?,
         };
+        attribution.titles = Some((route.sender.title.clone(), route.recipient.title.clone()));
         let outgoing = Outgoing {
             hop: self.next_hop(sender_thread_id).await?,
             ..outgoing
         };
-        let receipt = self.deliver(&route, outgoing).await?;
-        Ok((receipt, Some((route.sender.title, route.recipient.title))))
+        self.deliver(&route, outgoing).await
     }
 
     /// The stored status of a message the agent of `caller_thread_id` sent. Any other message,
@@ -440,12 +481,13 @@ impl AgentMessaging {
             })
     }
 
-    /// The receipt and, unless it replays a stored one, the two thread titles of an accepted send.
+    /// The receipt of an accepted send.
     async fn send_inner(
         &self,
         sender_thread_id: &str,
         request: &SendRequest,
-    ) -> Result<Accepted, AgentMessagingError> {
+        attribution: &mut Attribution,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -474,15 +516,15 @@ impl AgentMessaging {
             )
             .await?
         {
-            return Ok((receipt, None));
+            return Ok(receipt);
         }
         let route = self.route(sender_thread_id, recipient_thread_id).await?;
+        attribution.titles = Some((route.sender.title.clone(), route.recipient.title.clone()));
         let outgoing = Outgoing {
             hop: self.next_hop(sender_thread_id).await?,
             ..outgoing
         };
-        let receipt = self.deliver(&route, outgoing).await?;
-        Ok((receipt, Some((route.sender.title, route.recipient.title))))
+        self.deliver(&route, outgoing).await
     }
 
     /// Both threads, when the recipient is a live thread of the sender's project. Every other

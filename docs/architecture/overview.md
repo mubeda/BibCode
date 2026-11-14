@@ -3080,6 +3080,24 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   retries share one request scope across its runs within the 24-hour window, and
   Take over is stored on the identity (`mcp_named_clients.taken_over_at`,
   migration 71), so each later run starts read-only until Hand back.
+- **Agent message rows.** Each `agent_message_send`, `agent_message_reply` and
+  delivery outcome writes one `mcp_activity` row through `agent_message_writer`
+  (`mcp/activity.rs`). A row holds ids, addresses, thread titles and state
+  names, never message text. A thread title is free text that a person or an
+  agent wrote, so a row is not content-free. A refusal names the recipient's
+  title only after the send resolved it as a live thread of the caller's
+  project, so a row never confirms that a thread the caller may not see
+  exists. A send or reply the tool refuses before the service (messaging off,
+  a rejected argument) writes one row with the tool, the caller and the tag.
+  The sink maps each outcome to its row in the caller and queues at most 1,024
+  rows without waiting; past that it drops the row and logs one warning with
+  the count. The send and the tracker report independently, so in a rare
+  scheduling a message's `delivered` row is written before its `accepted` row;
+  each row carries the message id, its state and its own time. The runtime
+  closes the writer in its stop, after the tracker and before the profiler's
+  teardown: every queued row is written, the stop never waits on a send in
+  flight, and a row reported after that is dropped. The change feed and webhooks skip
+  these rows, and the feed's cursor moves past them.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
   the activity log by a monotonic cursor without reading payload text other than
   an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same
