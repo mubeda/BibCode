@@ -124,13 +124,15 @@ export function buildReviewContent(input: {
   const choice = { source, action: "review", target } as const;
   const submit =
     target.kind === "agent"
-      ? (draft: PreviewDraft) =>
+      ? (draft: PreviewDraft, isCurrent?: () => boolean) =>
           submitSendChoice(
             { send: input.send, createPanel: () => Promise.resolve(null), newId: input.newId },
             choice,
             draft,
+            isCurrent,
           )
-      : (draft: PreviewDraft) => submitToNewPanel(input, target.selection, draft);
+      : (draft: PreviewDraft, isCurrent: () => boolean = () => true) =>
+          submitToNewPanel(input, target.selection, draft, isCurrent);
   return {
     leadIn,
     attachments: [],
@@ -147,6 +149,7 @@ async function submitToNewPanel(
   input: Parameters<typeof buildReviewContent>[0],
   selection: DefaultAgentSelection,
   draft: PreviewDraft,
+  isCurrent: () => boolean,
 ): Promise<SendOutcome> {
   const store = useSendToAgentStore.getState();
   const key = sendChoiceKey({ source: input.source, action: "review" });
@@ -186,7 +189,7 @@ async function submitToNewPanel(
   }
   if (outcome.kind === "sent") {
     useSendToAgentStore.getState().settle(key, { requestId, note: draft.note, panelKey });
-    if (panel !== null) input.revealPanel?.(panel);
+    if (panel !== null && isCurrent()) input.revealPanel?.(panel);
   }
   return outcome;
 }

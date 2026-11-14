@@ -9,6 +9,7 @@ import { ForwardIcon } from "lucide-react";
 import {
   memo,
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -217,15 +218,28 @@ function PreviewHost(props: {
     );
     return { title: provider?.label ?? "a new panel", providerLabel: null, newPanel: true };
   }, [choice, newPanelProviders]);
+  // This host is the open preview until it unmounts or another choice replaces `choice`.
+  const latestChoice = useRef(choice);
+  const open = useRef(true);
+  useEffect(() => {
+    latestChoice.current = choice;
+    open.current = true;
+    return () => {
+      open.current = false;
+    };
+  }, [choice]);
   const onSend = useCallback(
-    (draft: Parameters<NonNullable<PreviewContent["submit"]>>[0]) =>
-      content?.submit !== undefined
-        ? content.submit(draft)
+    (draft: Parameters<NonNullable<PreviewContent["submit"]>>[0]) => {
+      const isCurrent = () => open.current && latestChoice.current === choice;
+      return content?.submit !== undefined
+        ? content.submit(draft, isCurrent)
         : submitSendChoice(
             { send, createPanel, newId, ...(revealPanel === undefined ? {} : { revealPanel }) },
             choice,
             draft,
-          ),
+            isCurrent,
+          );
+    },
     [choice, content, createPanel, newId, revealPanel, send],
   );
   if (content === null) return null;

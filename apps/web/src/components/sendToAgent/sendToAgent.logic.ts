@@ -247,7 +247,11 @@ export interface PreviewContent {
   attachments: ReadonlyArray<PreviewAttachment>;
   extraContent?: ReactNode;
   warning?: string | null;
-  submit?: (draft: PreviewDraft) => Promise<SendOutcome>;
+  /**
+   * `isCurrent` says whether the preview that sent still owns the screen. A send finishing for a
+   * preview that was closed or replaced must not activate a tab: that can unmount a newer one.
+   */
+  submit?: (draft: PreviewDraft, isCurrent?: () => boolean) => Promise<SendOutcome>;
   /** Attachments read when the preview opens, after `attachments`; Send waits for them. */
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
 }
@@ -296,6 +300,7 @@ export async function submitSendChoice(
   },
   choice: SendChoice,
   draft: PreviewDraft,
+  isCurrent: () => boolean = () => true,
 ): Promise<SendOutcome> {
   const store = useSendToAgentStore.getState();
   const key = sendChoiceKey(choice);
@@ -333,7 +338,7 @@ export async function submitSendChoice(
   });
   if (outcome.kind === "sent") {
     useSendToAgentStore.getState().settle(key, { requestId, note: draft.note, panelKey });
-    if (panel !== null) deps.revealPanel?.(panel);
+    if (panel !== null && isCurrent()) deps.revealPanel?.(panel);
   }
   return outcome;
 }
