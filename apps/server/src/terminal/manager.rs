@@ -11762,6 +11762,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_env_a_restarting_generation_stops_verifying_before_its_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        let input = ai_terminal_input(root.path(), "term-c");
+        manager.open(input.clone()).await.unwrap();
+        let old = last_agent_token(&backend);
+        let barrier = Arc::new(PublisherBarrier {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *manager
+            .inner
+            .restart_after_exact_cleanup_barrier
+            .lock()
+            .expect("restart barrier lock") = Some(barrier.clone());
+        let restart_manager = manager.clone();
+        let restart = tokio::spawn(async move { restart_manager.restart(input).await });
+        tokio::time::timeout(Duration::from_secs(2), barrier.started.notified())
+            .await
+            .expect("the restart reached its cleanup barrier");
+
+        assert_eq!(
+            manager.live_generation("thread-a", "term-c").await,
+            None,
+            "an invalidated generation is not live while its session is removed"
+        );
+        assert_eq!(
+            credentials.verify(&old).await,
+            None,
+            "the old token verified during the restart's cleanup"
+        );
+
+        barrier.release.notify_one();
+        restart.await.unwrap().unwrap();
+        assert!(
+            credentials
+                .verify(&last_agent_token(&backend))
+                .await
+                .is_some()
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
