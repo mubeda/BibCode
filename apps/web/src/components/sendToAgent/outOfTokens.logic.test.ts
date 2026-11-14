@@ -157,6 +157,12 @@ describe("outOfTokens.logic", () => {
       ...OPTIONS,
     });
     expect(hint).toEqual({ kind: "context-full", text: "Context window full" });
+    const recovered = resolveOutOfTokensHint({
+      row: row("codex", { status: "ready", lastErrorClass: "context_limit" }),
+      usage: null,
+      ...OPTIONS,
+    });
+    expect(recovered, "a session that took a turn since is no longer full").toBeNull();
   });
 
   it("an agent whose session failed for another reason gets no hint", () => {

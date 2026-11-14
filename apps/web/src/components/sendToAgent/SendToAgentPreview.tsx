@@ -228,7 +228,8 @@ function PreviewBody(props: SendToAgentPreviewProps) {
             ref={retryRef}
             size="xs"
             variant="outline"
-            className="self-start"
+            // Button styles native `disabled` only; this one stays focusable while it retries.
+            className={loading === "loading" ? "self-start opacity-64" : "self-start"}
             aria-disabled={loading === "loading" ? "true" : undefined}
             onClick={loading === "failed" ? retryLoad : undefined}
           >

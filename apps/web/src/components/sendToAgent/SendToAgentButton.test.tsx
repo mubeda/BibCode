@@ -601,6 +601,21 @@ describe("SendToAgentButton", () => {
       expect(find("button", "Send")!.hasAttribute("disabled")).toBe(false);
     });
 
+    it("the hint can come from the live inputs of the open menu", async () => {
+      const props = baseProps({ previewContentFor: () => ({ leadIn: "", attachments: [] }) });
+      render({
+        ...props,
+        renderLive: (renderMenu) => renderMenu({ source: props.source, rows, hintFor }),
+      });
+      await openAction("Take over from");
+      const items = [...document.body.querySelectorAll('[role="menuitem"]')].map(
+        (item) => item.textContent ?? "",
+      );
+      const beta = items.findIndex((text) => text.includes("beta"));
+      expect(items[beta]).toContain("Out of usage until 3:30 PM");
+      expect(beta).toBeLessThan(items.findIndex((text) => text.includes("alpha")));
+    });
+
     it("picking a hinted agent for Take over from shows no may-not-answer warning", async () => {
       render(hintedProps());
       await openAction("Take over from");

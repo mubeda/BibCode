@@ -65,7 +65,9 @@ export function resolveOutOfTokensHint(input: {
 }): OutOfTokensHint | null {
   const { row } = input;
   if (row.terminalId !== null) return null;
-  if (row.shell.session?.lastErrorClass === "context_limit") {
+  // The class can outlive the failure, so it counts only while the session is still failed.
+  const session = row.shell.session;
+  if (session?.status === "error" && session.lastErrorClass === "context_limit") {
     return { kind: "context-full", text: "Context window full" };
   }
   const provider = usageProviderOf(row.providerDriverKind);
