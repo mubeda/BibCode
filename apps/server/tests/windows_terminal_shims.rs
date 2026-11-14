@@ -29,6 +29,12 @@ const WINDOWS_CONSOLE_THEME_ENV: &str = "BIBCODE_WINDOWS_CONSOLE_THEME";
 const TRUSTED_CMD_FIXTURE_ENV: &str = "BIBCODE_TEST_TRUSTED_CMD_FIXTURE";
 const NATIVE_ARGV_MARKER: &str = "BIBCODE_NATIVE_ARGV";
 const TERMINAL_PROCESS_TREE_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a shim may take to print its marker and then to exit. These tests check what a
+/// shim receives, not how fast a runner starts processes: on a fresh Windows arm64 CI runner the
+/// first terminal spawns usually take 4 to 7 seconds, and in 1 of 80 cold runs they stalled for
+/// about 20 seconds, with the pseudoconsole up and the shim not yet printing (#367). A shim
+/// that never prints still fails, with what the terminal showed.
+const SHIM_DEADLINE: Duration = Duration::from_secs(60);
 
 struct OwnedHandle(HANDLE);
 
@@ -189,7 +195,7 @@ async fn assert_shim_output(
         .unwrap();
     let mut output = process.subscribe_output();
     let mut exit = process.subscribe_exit();
-    let text = wait_for_marker(&mut output, &mut exit, marker, Duration::from_secs(10))
+    let text = wait_for_marker(&mut output, &mut exit, marker, SHIM_DEADLINE)
         .await
         .unwrap_or_else(|timed_out| panic!("{timed_out}"));
     assert!(
@@ -197,7 +203,7 @@ async fn assert_shim_output(
         "terminal exited without the expected marker; output={text:?}, exit={:?}",
         exit.borrow().clone()
     );
-    tokio::time::timeout(Duration::from_secs(10), exit.changed())
+    tokio::time::timeout(SHIM_DEADLINE, exit.changed())
         .await
         .unwrap()
         .unwrap();
