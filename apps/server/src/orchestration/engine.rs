@@ -7222,10 +7222,15 @@ async fn persist_turn_delivery_resolution(
             // Decided here, so no window before the tracker withdraws the entry lets a failed
             // agent message be sent as a person's retry; an uncertain one is the person's call.
             if matches!(action, TurnDeliveryResolutionAction::Retry)
-                && state == "failed"
                 && crate::agent_messaging::store::is_agent_message_delivery(&transaction, &delivery_command_id, &message_id)?
             {
-                return Ok(Err(Some(AGENT_MESSAGE_NOT_RETRIED)));
+                if state == "failed" {
+                    return Ok(Err(Some(AGENT_MESSAGE_NOT_RETRIED)));
+                }
+                // Like Send now, a retry never takes an agent message past an open ask (R9).
+                if crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)? {
+                    return Ok(Err(Some(AGENT_MESSAGE_WAITS_FOR_ANSWER)));
+                }
             }
             let resolvable = match action {
                 TurnDeliveryResolutionAction::Retry => state == "uncertain" || state == "failed",

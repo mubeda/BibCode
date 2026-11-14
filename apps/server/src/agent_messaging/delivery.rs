@@ -582,6 +582,17 @@ pub(crate) async fn requeue(
     object.insert("createdAt".to_owned(), serde_json::json!(now));
     object.insert("queued".to_owned(), serde_json::json!(queued));
     object.remove("bootstrap");
+    // The recipient runs in its current modes now, not those of the first send.
+    if let Some(thread) = &thread {
+        object.insert(
+            "runtimeMode".to_owned(),
+            serde_json::json!(thread.runtime_mode),
+        );
+        object.insert(
+            "interactionMode".to_owned(),
+            serde_json::json!(thread.interaction_mode),
+        );
+    }
     if let Some(stored) = object
         .get_mut("message")
         .and_then(serde_json::Value::as_object_mut)

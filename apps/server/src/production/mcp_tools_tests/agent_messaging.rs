@@ -2980,6 +2980,71 @@ mod safety_review {
         harness.shutdown().await;
     }
 
+    /// N4 follow-up: a person's retry of an uncertain agent delivery waits for an open ask, as
+    /// Send now does.
+    #[tokio::test]
+    async fn a_retry_does_not_take_an_agent_message_past_an_open_ask() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent_untracked("a", "thread:p").await;
+        harness
+            .delivery_moves(
+                &message_id,
+                &[("pending", "sending"), ("sending", "uncertain")],
+            )
+            .await;
+        harness.provider_asks("p", "approval", "r1").await;
+        let row = harness.message_row(&message_id).await;
+
+        let refused = harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn-delivery.resolve", "commandId": "person-retry",
+                "threadId": "p", "messageId": row.delivery_message_id.clone().expect("entry"),
+                "action": "retry", "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect_err("the ask is open")
+            .to_string();
+
+        assert!(refused.contains(WAITS_FOR_AN_ANSWER), "{refused}");
+        assert_eq!(
+            harness
+                .entry_state(&row.delivery_command_id.expect("entry"))
+                .await,
+            "uncertain"
+        );
+        harness.shutdown().await;
+    }
+
+    /// Review follow-up: a released message runs in the recipient's current modes, not those
+    /// of its first send.
+    #[tokio::test]
+    async fn a_released_message_takes_the_recipients_current_mode() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.set_mode("b", "approval-required").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        harness.until_status(&m1, "queued").await;
+        let entry = harness
+            .repositories
+            .get_provider_turn_delivery(harness.entry_of(&m1).await)
+            .await
+            .expect("readable")
+            .expect("entry");
+        assert_eq!(entry.payload["runtimeMode"], "approval-required");
+        harness.shutdown().await;
+    }
+
     /// N5: a retry with the same clientRequestId replays the stored receipt after its
     /// recipient was archived or deleted, for a send and for a reply.
     #[tokio::test]
@@ -3246,6 +3311,12 @@ mod messaging_off {
         let requeued = format!("agent-message:{m1}:1");
         assert_eq!(row.delivery_command_id.as_deref(), Some(requeued.as_str()));
         assert_eq!(harness.entry_state(&first_entry).await, "dismissed");
+        let (text, actor) = harness
+            .projected_message(row.delivery_message_id.expect("entry"))
+            .await;
+        assert!(text.starts_with("<bibcode_agent_message>\n"), "{text}");
+        assert_eq!(actor["kind"], "hosted-agent");
+        assert_eq!(actor["address"], "thread:a");
         harness.b_takes_its_next_turn("turn-b").await;
         harness.until_entry(&person, "delivered").await;
         assert_eq!(harness.entry_state(&requeued).await, "queued");

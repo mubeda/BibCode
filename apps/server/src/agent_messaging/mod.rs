@@ -253,13 +253,13 @@ impl AgentMessaging {
         tool: &'static str,
         sender_thread_id: &str,
         recipient_address: &str,
-        result: &Result<(MessageReceipt, (String, String)), AgentMessagingError>,
+        result: &Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError>,
     ) {
         let Some(outcomes) = &self.outcomes else {
             return;
         };
         let (outcome, receipt, titles) = match result {
-            Ok((receipt, titles)) => ("accepted".to_owned(), Some(receipt), Some(titles)),
+            Ok((receipt, titles)) => ("accepted".to_owned(), Some(receipt), titles.as_ref()),
             Err(error) => (error.tag().to_owned(), None, None),
         };
         outcomes(MessageOutcome {
@@ -296,14 +296,15 @@ impl AgentMessaging {
         result.map(|(receipt, _)| receipt)
     }
 
-    /// The receipt and the two thread titles of an accepted reply. `recipient_address` is set
-    /// once the message replied to is known to be the caller's.
+    /// The receipt and, unless it replays a stored one, the two thread titles of an accepted
+    /// reply. `recipient_address` is set once the message replied to is known to be the
+    /// caller's.
     async fn reply_inner(
         &self,
         sender_thread_id: &str,
         request: &ReplyRequest,
         recipient_address: &mut String,
-    ) -> Result<(MessageReceipt, (String, String)), AgentMessagingError> {
+    ) -> Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -336,7 +337,7 @@ impl AgentMessaging {
             )
             .await?
         {
-            return Ok((receipt, (String::new(), String::new())));
+            return Ok((receipt, None));
         }
         let route = match self.route(sender_thread_id, recipient_thread_id).await {
             Err(AgentMessagingError::UnknownRecipient) => {
@@ -349,7 +350,7 @@ impl AgentMessaging {
             ..outgoing
         };
         let receipt = self.deliver(&route, outgoing).await?;
-        Ok((receipt, (route.sender.title, route.recipient.title)))
+        Ok((receipt, Some((route.sender.title, route.recipient.title))))
     }
 
     /// The stored status of a message the agent of `caller_thread_id` sent. Any other message,
@@ -402,12 +403,12 @@ impl AgentMessaging {
             })
     }
 
-    /// The receipt and the two thread titles of an accepted send.
+    /// The receipt and, unless it replays a stored one, the two thread titles of an accepted send.
     async fn send_inner(
         &self,
         sender_thread_id: &str,
         request: &SendRequest,
-    ) -> Result<(MessageReceipt, (String, String)), AgentMessagingError> {
+    ) -> Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -436,7 +437,7 @@ impl AgentMessaging {
             )
             .await?
         {
-            return Ok((receipt, (String::new(), String::new())));
+            return Ok((receipt, None));
         }
         let route = self.route(sender_thread_id, recipient_thread_id).await?;
         let outgoing = Outgoing {
@@ -444,7 +445,7 @@ impl AgentMessaging {
             ..outgoing
         };
         let receipt = self.deliver(&route, outgoing).await?;
-        Ok((receipt, (route.sender.title, route.recipient.title)))
+        Ok((receipt, Some((route.sender.title, route.recipient.title))))
     }
 
     /// Both threads, when the recipient is a live thread of the sender's project. Every other
