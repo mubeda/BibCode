@@ -11890,6 +11890,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_credential_waiting_on_a_session_lock_fails_once_shutdown_begins() {
+        // Mutation caught: a verification that checked cancellation before it waited on the
+        // session lock returning the still-running generation after shutdown began.
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        manager
+            .open(ai_terminal_input(root.path(), "term-c"))
+            .await
+            .unwrap();
+        let token = last_agent_token(&backend);
+        let attachment = manager
+            .attach(TerminalAttachInput {
+                size_claim: Some("owner".to_owned()),
+                ..TerminalAttachInput::existing("thread-a", "term-c")
+            })
+            .await
+            .unwrap();
+        let session = manager.require_session("thread-a", "term-c").await.unwrap();
+        let held = session.lock().await;
+
+        let verification = tokio::spawn({
+            let credentials = credentials.clone();
+            async move { credentials.verify(&token).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The attachment's cleanup queues on the same lock, and shutdown waits for it.
+        drop(attachment);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let shutdown = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.inner.cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shutdown began");
+        drop(held);
+
+        assert_eq!(
+            verification.await.unwrap(),
+            None,
+            "a verification waiting on the session lock succeeded after shutdown began"
+        );
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
