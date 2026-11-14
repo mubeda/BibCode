@@ -135,6 +135,10 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).profiler).toBe(false);
     expect(decodeTerminalCapabilities({ profiler: true }).profiler).toBe(true);
   });
+  it("the agentMessaging capability defaults to false", () => {
+    expect(decodeTerminalCapabilities({}).agentMessaging).toBe(false);
+    expect(decodeTerminalCapabilities({ agentMessaging: true }).agentMessaging).toBe(true);
+  });
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
   });

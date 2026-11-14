@@ -108,6 +108,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   codeReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
   threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** The `agentMessaging.enabled` setting and the agent messaging tools exist. */
+  agentMessaging: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `server.subscribeHostMetrics`: the host's CPU, memory and volumes (#292). */
   hostMetrics: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `sendRequests.*`: a person's request to a specific agent. */

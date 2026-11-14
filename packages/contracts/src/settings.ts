@@ -545,6 +545,12 @@ export const TerminalSettings = Schema.Struct({
 });
 export type TerminalSettings = typeof TerminalSettings.Type;
 
+/** Agents of one project may message each other (spec R5). Off by default. */
+export const AgentMessagingSettings = Schema.Struct({
+  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+export type AgentMessagingSettings = typeof AgentMessagingSettings.Type;
+
 export const DefaultAgentSelection = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("chat"),
@@ -664,6 +670,7 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
   terminal: TerminalSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  agentMessaging: AgentMessagingSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -798,6 +805,11 @@ export const ServerSettingsPatch = Schema.Struct({
   terminal: Schema.optionalKey(
     Schema.Struct({
       webglEnabled: Schema.optionalKey(Schema.Boolean),
+    }),
+  ),
+  agentMessaging: Schema.optionalKey(
+    Schema.Struct({
+      enabled: Schema.optionalKey(Schema.Boolean),
     }),
   ),
   providers: Schema.optionalKey(
