@@ -998,6 +998,8 @@ struct TargetView {
     /// The proposed plan the turn ended with.
     plan: Option<String>,
     assistant_text: Option<String>,
+    /// The assistant message is still streaming: its turn can complete before its last output.
+    assistant_streaming: bool,
     /// The delivery was dismissed by a withdrawal (a cancel), not after it was sent.
     withdrawn: bool,
     /// The engine rejected the request's command.
@@ -1092,14 +1094,17 @@ async fn read_target(
                         )
                         .optional()?;
                 }
-                if let Some(assistant_message_id) = &turn.assistant_message_id {
-                    view.assistant_text = connection
+                if let Some(assistant_message_id) = &turn.assistant_message_id
+                    && let Some((text, streaming)) = connection
                         .query_row(
-                            "SELECT text FROM projection_thread_messages WHERE message_id = ? AND thread_id = ?",
+                            "SELECT text, is_streaming FROM projection_thread_messages WHERE message_id = ? AND thread_id = ?",
                             params![assistant_message_id, thread_id],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?)),
                         )
-                        .optional()?;
+                        .optional()?
+                {
+                    view.assistant_text = Some(text);
+                    view.assistant_streaming = streaming;
                 }
             }
             if view.outbox.as_ref().is_some_and(|(state, _)| state == "dismissed") {
@@ -1170,6 +1175,10 @@ fn decide(view: TargetView) -> Next {
             "completed" => {
                 return match (view.plan, view.assistant_text) {
                     (Some(plan), _) => settled(SendState::Answered, None, Some((None, plan))),
+                    // The provider runtime completes the turn before it settles the message.
+                    (None, Some(_)) if view.assistant_streaming => {
+                        settled(SendState::Read, None, None)
+                    }
                     (None, Some(text)) => settled(
                         SendState::Answered,
                         None,
