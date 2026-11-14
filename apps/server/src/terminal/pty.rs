@@ -1573,6 +1573,20 @@ mod tests {
     }
 
     #[test]
+    fn the_pty_command_prints_environment_keys_without_values() {
+        let mut command = CommandBuilder::new("dummy");
+        command.env("BIBCODE_AGENT_AUTH", "agent-token-value");
+
+        let printed = format!("{command:?}");
+
+        assert!(printed.contains("BIBCODE_AGENT_AUTH"), "{printed}");
+        assert!(
+            !printed.contains("agent-token-value"),
+            "the PTY command printed an environment value"
+        );
+    }
+
+    #[test]
     fn pty_output_preserves_utf8_split_across_reads() {
         let expected = "é◆😀─";
         let (sender, mut receiver) = broadcast::channel(32);
