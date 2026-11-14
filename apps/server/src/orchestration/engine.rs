@@ -7162,7 +7162,10 @@ async fn persist_turn_delivery_resolution(
                 TurnDeliveryResolutionAction::Dismiss => {
                     matches!(state.as_str(), "pending" | "sending" | "uncertain" | "failed")
                 }
-                TurnDeliveryResolutionAction::Cancel => state == "queued",
+                // A queued delivery, or a person's request still pending (unclaimed, for example
+                // behind a failed delivery), which `sendRequests.cancel` withdraws. The claim moves
+                // a pending row on this same worker, so a withdrawal and a claim exclude each other.
+                TurnDeliveryResolutionAction::Cancel => matches!(state.as_str(), "queued" | "pending"),
             };
             if !resolvable {
                 return Ok(None);
@@ -7173,7 +7176,7 @@ async fn persist_turn_delivery_resolution(
                     "dismissed",
                     last_error,
                     transaction.execute(
-                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state = 'queued'",
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND (state = 'queued' OR (state = 'pending' AND json_extract(payload_json, '$.message.personSend') IS NOT NULL))",
                         params![updated_at, delivery_command_id],
                     )?,
                 ),

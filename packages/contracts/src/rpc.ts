@@ -113,7 +113,18 @@ import {
   WebhooksUpsertInput,
   WebhooksUpsertResult,
 } from "./webhooks.ts";
-import { SendRequest, SendRequestError, SendRequestsSendInput } from "./sendRequests.ts";
+import {
+  SendRequest,
+  SendRequestError,
+  SendRequestsCancelInput,
+  SendRequestsCancelResult,
+  SendRequestsDismissInput,
+  SendRequestsGetAnswerInput,
+  SendRequestsGetAnswerResult,
+  SendRequestsSendInput,
+  SendRequestsStreamEvent,
+  SendRequestsSubscribeInput,
+} from "./sendRequests.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -647,6 +658,10 @@ export const WS_METHODS = {
 
   // A person's request to an agent
   sendRequestsSend: "sendRequests.send",
+  sendRequestsCancel: "sendRequests.cancel",
+  sendRequestsDismiss: "sendRequests.dismiss",
+  sendRequestsSubscribe: "sendRequests.subscribe",
+  sendRequestsGetAnswer: "sendRequests.getAnswer",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -2229,6 +2244,35 @@ export const WsSendRequestsSendRpc = Rpc.make(WS_METHODS.sendRequestsSend, {
   error: Schema.Union([SendRequestError, EnvironmentRpcError]),
 });
 
+/** Withdraws a request the agent has not taken yet; `cancelled` is false once it was read. */
+export const WsSendRequestsCancelRpc = Rpc.make(WS_METHODS.sendRequestsCancel, {
+  payload: SendRequestsCancelInput,
+  success: SendRequestsCancelResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** Hides a request that has ended. */
+export const WsSendRequestsDismissRpc = Rpc.make(WS_METHODS.sendRequestsDismiss, {
+  payload: SendRequestsDismissInput,
+  success: SendRequest,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** Every undismissed request of the scope in pages, then each change. */
+export const WsSendRequestsSubscribeRpc = Rpc.make(WS_METHODS.sendRequestsSubscribe, {
+  payload: SendRequestsSubscribeInput,
+  success: SendRequestsStreamEvent,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+  stream: true,
+});
+
+/** The stored answer of a request, which stays readable after its agent is gone. */
+export const WsSendRequestsGetAnswerRpc = Rpc.make(WS_METHODS.sendRequestsGetAnswer, {
+  payload: SendRequestsGetAnswerInput,
+  success: SendRequestsGetAnswerResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
 /** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
 export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
   payload: WebhooksListInput,
@@ -2494,6 +2538,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsReviewListDiffToolsRpc,
   WsReviewOpenDiffToolRpc,
   WsSendRequestsSendRpc,
+  WsSendRequestsCancelRpc,
+  WsSendRequestsDismissRpc,
+  WsSendRequestsSubscribeRpc,
+  WsSendRequestsGetAnswerRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

@@ -6,7 +6,7 @@
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange};
@@ -14,7 +14,7 @@ use crate::{
     orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
     persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
     production::orchestration_rpc::{ServerActor, ServerCommandDispatcher},
-    rpc::RpcSessionContext,
+    rpc::{RpcSessionContext, RpcStreamChunk},
     transfer::staging::UploadOwner,
 };
 
@@ -25,6 +25,10 @@ pub(crate) const LEAD_IN_MAX_CHARS: usize = 16_000;
 /// The answer text a request keeps, in Unicode scalar values.
 pub(crate) const ANSWER_TEXT_MAX_CHARS: usize = 48_000;
 
+/// The requests a `snapshot` or `page` event of `sendRequests.subscribe` carries.
+pub(crate) const SEND_REQUESTS_PAGE_SIZE: usize = 100;
+const SUBSCRIBE_CAPACITY: usize = 16;
+
 const OPEN: [SendState; 4] = [
     SendState::Queued,
     SendState::Waiting,
@@ -32,11 +36,37 @@ const OPEN: [SendState; 4] = [
     SendState::Read,
 ];
 
+/// The result of `sendRequests.cancel`: `cancelled` is false once the target took it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct SendRequestsCancelResult {
+    pub(crate) request: SendRequest,
+    pub(crate) cancelled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendRequestsGetAnswerResult {
+    pub(crate) request_id: String,
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+}
+
+/// Sends one stream event; false when the stream was cancelled or closed.
+async fn send_event(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    cancellation: &CancellationToken,
+    event: Value,
+) -> bool {
+    tokio::select! {
+        () = cancellation.cancelled() => false,
+        sent = sender.send(Ok(vec![event])) => sent.is_ok(),
+    }
+}
+
 /// One change of a stored request, as `sendRequests.subscribe` sends it on.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // sendRequests.subscribe (task 1.6) reads it.
 pub(crate) enum RequestChange {
-    Upsert(SendRequestRow),
+    Upsert(Box<SendRequestRow>),
     /// The request was removed with its source thread.
     Remove(String),
 }
@@ -187,6 +217,10 @@ pub(crate) struct SendRequestsService {
     repositories: Repositories,
     dispatcher: ServerCommandDispatcher,
     changes: broadcast::Sender<RequestChange>,
+    /// Held across a dispatch, and by a cancel that finds no delivery yet, so a cancelled
+    /// request is never queued afterwards.
+    // shortcut: one gate for every request; a per-request lock if person sends ever contend.
+    dispatch_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SendRequestsService {
@@ -200,10 +234,10 @@ impl SendRequestsService {
             repositories,
             dispatcher,
             changes: broadcast::channel(256).0,
+            dispatch_gate: std::sync::Arc::default(),
         }
     }
 
-    #[allow(dead_code)] // sendRequests.subscribe (task 1.6) reads it.
     pub(crate) fn subscribe_changes(&self) -> broadcast::Receiver<RequestChange> {
         self.changes.subscribe()
     }
@@ -218,7 +252,9 @@ impl SendRequestsService {
     ) -> crate::persistence::Result<Option<SendRequestRow>> {
         let row = self.store.transition(request_id, from, change).await?;
         if let Some(row) = &row {
-            let _ = self.changes.send(RequestChange::Upsert(row.clone()));
+            let _ = self
+                .changes
+                .send(RequestChange::Upsert(Box::new(row.clone())));
         }
         Ok(row)
     }
@@ -358,6 +394,261 @@ impl SendRequestsService {
         )
         .await?;
         Ok(())
+    }
+
+    async fn stored(&self, request_id: &str) -> Result<SendRequestRow, Value> {
+        self.store
+            .get(request_id)
+            .await
+            .map_err(storage)?
+            .ok_or_else(|| refusal("not_found", "BiBCode has no such request."))
+    }
+
+    /// Withdraws a request the target has not taken yet. A request already read, or whose
+    /// delivery the target already claimed, is returned unchanged with `cancelled: false`.
+    pub(crate) async fn cancel(
+        &self,
+        context: &RpcSessionContext,
+        request_id: &str,
+    ) -> Result<SendRequestsCancelResult, Value> {
+        require_person(context)?;
+        let row = self.stored(request_id).await?;
+        let target = parse_address(&row.target_address)
+            .ok_or_else(|| invalid("The request's target is not an agent address."))?;
+        match target.terminal {
+            // shortcut: no terminal request exists before task 9.2 adds its branch here.
+            true => {}
+            false => self.cancel_chat(context, &row).await?,
+        }
+        let request = self.stored(request_id).await?;
+        Ok(SendRequestsCancelResult {
+            cancelled: request.state == SendState::Cancelled,
+            request: SendRequest::from(&request),
+        })
+    }
+
+    /// Withdraws a chat request's message. A queued or pending delivery is withdrawn by the
+    /// engine's worker, which also runs the delivery's claim, so the withdrawal and the claim
+    /// are one compare and set each and exactly one of them wins. Before any delivery exists,
+    /// the dispatch gate keeps `send` from queueing the request after it was cancelled.
+    async fn cancel_chat(
+        &self,
+        context: &RpcSessionContext,
+        row: &SendRequestRow,
+    ) -> Result<(), Value> {
+        if !matches!(row.state, SendState::Queued | SendState::Waiting) {
+            return Ok(());
+        }
+        let message_id = row.target_message_id.clone().unwrap_or_default();
+        {
+            let _gate = self.dispatch_gate.lock().await;
+            if !self
+                .has_delivery(&row.target_thread_id, &message_id)
+                .await
+                .map_err(storage)?
+            {
+                self.mark_cancelled(row).await?;
+                return Ok(());
+            }
+        }
+        let command = serde_json::from_value(json!({
+            "type": "thread.turn-delivery.resolve",
+            "commandId": format!("person-send-cancel:{}", row.request_id),
+            "threadId": row.target_thread_id,
+            "messageId": message_id,
+            "action": "cancel",
+            "createdAt": crate::mcp::control::now_iso(),
+        }))
+        .map_err(|_| invalid("BiBCode could not build this cancel."))?;
+        let owner = UploadOwner::from_context(context);
+        if (self.dispatcher)(command, owner, ServerActor::Person)
+            .await
+            .is_ok()
+        {
+            self.mark_cancelled(row).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_cancelled(&self, row: &SendRequestRow) -> Result<(), Value> {
+        self.apply(
+            &row.request_id,
+            &[SendState::Queued, SendState::Waiting],
+            StateChange {
+                to: SendState::Cancelled,
+                reason: None,
+                answering_turn_id: None,
+                answer_message_id: None,
+                answer_text: None,
+                answer_truncated: false,
+                dismiss: false,
+                at: crate::mcp::control::now_iso(),
+            },
+        )
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    async fn has_delivery(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> crate::persistence::Result<bool> {
+        let (thread_id, message_id) = (thread_id.to_owned(), message_id.to_owned());
+        self.repositories
+            .database()
+            .call(move |connection| {
+                Ok(connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?)",
+                    params![thread_id, message_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+    }
+
+    /// Hides a request that has ended. The dismissed row is published as an upsert whose
+    /// `updated_at` advanced, so a page that arrives later cannot bring it back.
+    pub(crate) async fn dismiss(
+        &self,
+        context: &RpcSessionContext,
+        request_id: &str,
+    ) -> Result<SendRequest, Value> {
+        require_person(context)?;
+        let row = self.stored(request_id).await?;
+        if !row.state.is_final() {
+            return Err(refusal(
+                "not_final",
+                "Only a request that has ended can be dismissed. Cancel it first.",
+            ));
+        }
+        let dismissed = self
+            .store
+            .dismiss(request_id, &crate::mcp::control::now_iso())
+            .await
+            .map_err(storage)?
+            .ok_or_else(|| {
+                refusal(
+                    "not_final",
+                    "Only a request that has ended can be dismissed.",
+                )
+            })?;
+        let _ = self
+            .changes
+            .send(RequestChange::Upsert(Box::new(dismissed.clone())));
+        Ok(SendRequest::from(&dismissed))
+    }
+
+    /// The stored answer of a request, which does not depend on the target thread.
+    pub(crate) async fn get_answer(
+        &self,
+        context: &RpcSessionContext,
+        request_id: &str,
+    ) -> Result<SendRequestsGetAnswerResult, Value> {
+        require_person(context)?;
+        let row = self.stored(request_id).await?;
+        match (row.state, row.answer_text) {
+            (SendState::Answered, Some(text)) => Ok(SendRequestsGetAnswerResult {
+                request_id: row.request_id,
+                text,
+                truncated: row.answer_truncated,
+            }),
+            _ => Err(refusal("not_answered", "This request has no answer yet.")),
+        }
+    }
+
+    /// Every undismissed request of the scope (requests sent from `thread_id`, or all), in a
+    /// snapshot and pages, then each change. A lag sends a new snapshot and pages.
+    pub(crate) fn subscribe(
+        &self,
+        context: &RpcSessionContext,
+        thread_id: Option<String>,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        let (sender, receiver) = mpsc::channel(SUBSCRIBE_CAPACITY);
+        if let Err(error) = require_person(context) {
+            let _ = sender.try_send(Err(error));
+            return receiver;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            // Subscribed before the first read, so no change after it is missed.
+            let mut changes = service.subscribe_changes();
+            if !service
+                .send_pages(&sender, &cancellation, thread_id.as_deref())
+                .await
+            {
+                return;
+            }
+            loop {
+                let change = tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    change = changes.recv() => change,
+                };
+                let event = match change {
+                    Ok(RequestChange::Upsert(row)) => {
+                        if thread_id
+                            .as_deref()
+                            .is_some_and(|thread_id| row.source_thread_id != thread_id)
+                        {
+                            continue;
+                        }
+                        json!({ "type": "upsert", "request": SendRequest::from(row.as_ref()) })
+                    }
+                    // The removed request's source thread is gone, so every scope hears it.
+                    Ok(RequestChange::Remove(request_id)) => {
+                        json!({ "type": "remove", "requestId": request_id })
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !service
+                            .send_pages(&sender, &cancellation, thread_id.as_deref())
+                            .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                if !send_event(&sender, &cancellation, event).await {
+                    return;
+                }
+            }
+        });
+        receiver
+    }
+
+    async fn send_pages(
+        &self,
+        sender: &mpsc::Sender<RpcStreamChunk>,
+        cancellation: &CancellationToken,
+        thread_id: Option<&str>,
+    ) -> bool {
+        let rows = match self.store.list_undismissed(thread_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = sender.send(Err(storage(error))).await;
+                return false;
+            }
+        };
+        let page = |kind: &str, rows: &[SendRequestRow]| json!({ "type": kind, "requests": rows.iter().map(SendRequest::from).collect::<Vec<_>>() });
+        let mut pages = rows.chunks(SEND_REQUESTS_PAGE_SIZE);
+        if !send_event(
+            sender,
+            cancellation,
+            page("snapshot", pages.next().unwrap_or(&[])),
+        )
+        .await
+        {
+            return false;
+        }
+        for rows in pages {
+            if !send_event(sender, cancellation, page("page", rows)).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// A live thread, or `unknown_thread`.
@@ -565,6 +856,17 @@ impl SendRequestsService {
             compose_message_text(&input.lead_in, &input.note, &attachments),
         )
         .map_err(|_| invalid("BiBCode could not build this request."))?;
+        let _gate = self.dispatch_gate.lock().await;
+        // Cancelled (or otherwise ended) before any delivery existed: never queued afterwards.
+        if self
+            .store
+            .get(&row.request_id)
+            .await
+            .map_err(storage)?
+            .is_some_and(|current| current.state.is_final())
+        {
+            return Ok(());
+        }
         let Err(error) = (self.dispatcher)(
             command,
             UploadOwner::from_context(context),
@@ -621,7 +923,10 @@ impl SendRequestsService {
 
 /// The `thread.turn.start` a request queues, built only from its stored row and its text, so
 /// a replay builds the same command.
-pub(super) fn turn_command(row: &SendRequestRow, text: String) -> Result<OrchestrationCommand, String> {
+pub(super) fn turn_command(
+    row: &SendRequestRow,
+    text: String,
+) -> Result<OrchestrationCommand, String> {
     // A take-over is labelled with the agent whose work it takes over.
     let source_address = row
         .taken_over_address

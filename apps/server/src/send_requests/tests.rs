@@ -1114,7 +1114,8 @@ async fn send_a_malformed_input_is_refused_without_quoting_it() {
     let harness = harness().await;
     let mut registry = RpcRegistry::empty();
     register_send_requests_rpc(&mut registry, harness.send_requests());
-    let mut malformed = serde_json::to_value(input("r1", "review", "thread:a", "thread:b")).unwrap();
+    let mut malformed =
+        serde_json::to_value(input("r1", "review", "thread:a", "thread:b")).unwrap();
     malformed["attachments"] = json!(["private marker text"]);
 
     let error = registry
@@ -1251,7 +1252,10 @@ async fn proposed_plan(harness: &Harness, turn_id: &str, markdown: &str) {
 async fn state_read_when_the_target_turn_starts() {
     let (harness, service, stop) = followed().await;
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
-    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Queued
+    );
 
     harness.provider_turn("b", "t1", "Working", false).await;
 
@@ -1264,13 +1268,20 @@ async fn state_read_when_the_target_turn_starts() {
 #[tokio::test]
 async fn a_review_that_ends_as_a_plan_card_is_answered_with_the_plan() {
     let (harness, service, stop) = followed().await;
-    send_with(&service, input("plan-only", "review", "thread:a", "thread:b")).await;
+    send_with(
+        &service,
+        input("plan-only", "review", "thread:a", "thread:b"),
+    )
+    .await;
     turn_session(&harness, "b", "t1", "running").await;
     proposed_plan(&harness, "t1", "# Plan\n\n1. Fix the parser.").await;
     turn_session(&harness, "b", "t1", "ready").await;
 
     let row = until_state(&harness, &service, "plan-only", SendState::Answered).await;
-    assert_eq!(row.answer_text.as_deref(), Some("# Plan\n\n1. Fix the parser."));
+    assert_eq!(
+        row.answer_text.as_deref(),
+        Some("# Plan\n\n1. Fix the parser.")
+    );
     assert_eq!(row.answer_message_id, None, "a plan has no message");
     assert_eq!(row.answering_turn_id.as_deref(), Some("t1"));
 
@@ -1372,7 +1383,10 @@ async fn state_a_queue_held_behind_a_running_turn_that_errors_waits() {
     session(&harness, "b", "running").await;
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
     service.sweep().await;
-    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Queued
+    );
 
     session(&harness, "b", "error").await;
 
@@ -1618,7 +1632,10 @@ async fn state_a_message_hand_off_or_take_over_is_dismissed_once_read() {
         (input("hand-off", "hand-off", "thread:a", "thread:b"), true),
         (take_over, true),
         (input("review", "review", "thread:a", "thread:b"), false),
-        (input("second", "second-opinion", "thread:a", "thread:b"), false),
+        (
+            input("second", "second-opinion", "thread:a", "thread:b"),
+            false,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1665,7 +1682,10 @@ async fn state_deleting_the_source_drops_its_requests() {
             .unwrap(),
         None
     );
-    assert_eq!(stored_request(&harness, "kept").await.state, SendState::Queued);
+    assert_eq!(
+        stored_request(&harness, "kept").await.state,
+        SendState::Queued
+    );
     stop.cancel();
     harness.shutdown().await;
 }
@@ -1677,12 +1697,30 @@ async fn state_survives_a_restart() {
     let stop = CancellationToken::new();
     before.start_follower(harness.engine.clone(), stop.clone());
     send_with(&before, input("r1", "review", "thread:a", "thread:b")).await;
+    // The delivery's own events end before the restart, so only a sweep can see the answer.
+    for _ in 0..200 {
+        if outbox_state(&harness, "person-send:r1").await.as_deref() == Some("delivered") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("delivered")
+    );
     stop.cancel();
     drop(before);
+    // Lets the stopped follower finish a read it had begun.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // The turn runs and ends while no follower runs.
-    harness.provider_turn("b", "t1", "Answered while away", true).await;
-    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
+    harness
+        .provider_turn("b", "t1", "Answered while away", true)
+        .await;
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Queued
+    );
 
     let after = harness.send_requests();
     let stop = CancellationToken::new();
@@ -1789,7 +1827,9 @@ async fn reserved_first_attempt(harness: &Harness, input: &SendRequestsSendInput
         .unwrap();
     drop(claim);
     assert_eq!(
-        receipt(harness, "person-send:r1").await.map(|receipt| receipt.0),
+        receipt(harness, "person-send:r1")
+            .await
+            .map(|receipt| receipt.0),
         Some("reserved".to_owned())
     );
 }
@@ -1858,7 +1898,9 @@ async fn retry_after_a_reserved_receipt_dispatches_the_identical_command_again()
         .unwrap_or_else(|error| panic!("the replay is accepted: {error}"));
 
     assert_eq!(
-        receipt(&harness, "person-send:r1").await.map(|receipt| receipt.0),
+        receipt(&harness, "person-send:r1")
+            .await
+            .map(|receipt| receipt.0),
         Some("accepted".to_owned())
     );
     assert_eq!(stored(&harness).await, (1, 1, 1));
@@ -1952,7 +1994,10 @@ async fn retry_the_same_request_id_with_other_arguments_is_a_conflict() {
     let mut other = input("r1", "review", "thread:a", "thread:b");
     other.note = "Another note.".to_owned();
 
-    assert_eq!(refused(&harness, &person(), other).await, "request_conflict");
+    assert_eq!(
+        refused(&harness, &person(), other).await,
+        "request_conflict"
+    );
 
     assert_eq!(stored_request(&harness, "r1").await, before);
     assert_eq!(stored(&harness).await, (1, 1, 1));
@@ -2003,7 +2048,12 @@ async fn retry_after_the_target_was_deleted_replays_without_validating_the_targe
 /// The harness's send service whose dispatcher runs `before` first.
 fn service_with(
     harness: &Harness,
-    before: impl Fn(crate::orchestration::OrchestrationEngine) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+    before: impl Fn(
+        crate::orchestration::OrchestrationEngine,
+    ) -> futures_util::future::BoxFuture<'static, ()>
+    + Send
+    + Sync
+    + 'static,
 ) -> SendRequestsService {
     let real = harness.server_dispatcher();
     let engine = harness.engine.clone();
@@ -2022,7 +2072,6 @@ fn service_with(
         }),
     )
 }
-
 
 #[tokio::test]
 async fn retry_a_first_attempt_the_engine_rejected_ends_not_answered() {
@@ -2050,7 +2099,9 @@ async fn retry_a_first_attempt_the_engine_rejected_ends_not_answered() {
 
     assert_eq!(error["_tag"], "SendRequestError", "{error}");
     assert_eq!(
-        receipt(&harness, "person-send:r1").await.map(|receipt| receipt.0),
+        receipt(&harness, "person-send:r1")
+            .await
+            .map(|receipt| receipt.0),
         Some("rejected".to_owned())
     );
     let row = stored_request(&harness, "r1").await;
@@ -2074,7 +2125,10 @@ async fn retry_a_first_attempt_that_failed_without_a_receipt_stays_replayable() 
         .send(&person(), request.clone())
         .await
         .expect_err("the dispatch failed");
-    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Queued
+    );
 
     harness
         .send_requests()
@@ -2083,5 +2137,448 @@ async fn retry_a_first_attempt_that_failed_without_a_receipt_stays_replayable() 
         .unwrap();
 
     assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+// Cancel, dismiss, subscribe and answer retrieval (task 1.6).
+
+#[tokio::test]
+async fn manage_cancel_withdraws_a_queued_message() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "message", "thread:a", "thread:b")).await;
+
+    let result = service.cancel(&person(), "r1").await.unwrap();
+
+    assert!(result.cancelled);
+    assert_eq!(result.request.state, "cancelled");
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("dismissed")
+    );
+    session(&harness, "b", "ready").await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("dismissed"),
+        "the message is never delivered"
+    );
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Cancelled
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_cancel_a_waiting_request_withdraws_it_too() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    session(&harness, "b", "error").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    service.sweep().await;
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Waiting
+    );
+
+    let result = service.cancel(&person(), "r1").await.unwrap();
+
+    assert!(result.cancelled);
+    assert_eq!(result.request.state, "cancelled");
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("dismissed")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_a_waiting_request_behind_a_failed_head() {
+    for head in ["failed", "uncertain"] {
+        let harness = harness().await;
+        let service = harness.send_requests();
+        older_delivery(&harness, head).await;
+        send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+        service.sweep().await;
+        assert_eq!(
+            stored_request(&harness, "r1").await.state,
+            SendState::Waiting,
+            "{head}"
+        );
+        assert_eq!(
+            outbox_state(&harness, "person-send:r1").await.as_deref(),
+            Some("pending")
+        );
+
+        let result = service.cancel(&person(), "r1").await.unwrap();
+
+        assert!(result.cancelled, "{head}");
+        assert_eq!(result.request.state, "cancelled");
+        dispatch(
+            &harness,
+            json!({
+                "type": "thread.turn-delivery.resolve", "commandId": "dismiss-older",
+                "threadId": "b", "messageId": "older-message", "action": "dismiss",
+                "createdAt": AT,
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            outbox_state(&harness, "person-send:r1").await.as_deref(),
+            Some("dismissed"),
+            "{head}: dismissing the head delivers nothing"
+        );
+        service.sweep().await;
+        assert_eq!(
+            stored_request(&harness, "r1").await.state,
+            SendState::Cancelled
+        );
+        harness.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cancel_racing_a_claim_has_exactly_one_winner() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let (mut won, mut lost) = (0, 0);
+    for index in 0..30 {
+        let id = format!("r{index}");
+        send_with(&service, input(&id, "review", "thread:a", "thread:b")).await;
+
+        let result = service.cancel(&person(), &id).await.unwrap();
+
+        let message_id = format!("person-send:{id}");
+        // Let a claim that won finish its delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let delivery = outbox_state(&harness, &message_id).await;
+        if result.cancelled {
+            won += 1;
+            assert_eq!(delivery.as_deref(), Some("dismissed"), "{id}");
+            assert_eq!(
+                stored_request(&harness, &id).await.state,
+                SendState::Cancelled
+            );
+        } else {
+            lost += 1;
+            assert!(
+                matches!(delivery.as_deref(), Some("sending" | "delivered")),
+                "{id}: {delivery:?}"
+            );
+            assert_ne!(
+                stored_request(&harness, &id).await.state,
+                SendState::Cancelled
+            );
+        }
+    }
+    assert_eq!(won + lost, 30);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_cancel_after_the_turn_started_is_too_late() {
+    let (harness, service, stop) = followed().await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    harness.provider_turn("b", "t1", "Working", false).await;
+    until_state(&harness, &service, "r1", SendState::Read).await;
+
+    let result = service.cancel(&person(), "r1").await.unwrap();
+
+    assert!(!result.cancelled);
+    assert_eq!(result.request.state, "read");
+    stop.cancel();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_dismiss_only_a_final_request() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+
+    let error = service
+        .dismiss(&person(), "r1")
+        .await
+        .expect_err("a queued request is not final");
+    assert_eq!(error["reason"], "not_final", "{error}");
+    assert_eq!(stored_request(&harness, "r1").await.dismissed_at, None);
+
+    service.cancel(&person(), "r1").await.unwrap();
+    let mut changes = service.subscribe_changes();
+    let dismissed = service.dismiss(&person(), "r1").await.unwrap();
+
+    assert!(dismissed.dismissed_at.is_some());
+    let Ok(RequestChange::Upsert(row)) = changes.recv().await else {
+        panic!("an upsert follows the dismissal");
+    };
+    assert_eq!(row.request_id, "r1");
+    assert!(
+        row.dismissed_at.is_some(),
+        "the upsert carries the dismissal"
+    );
+    assert_eq!(row.updated_at, dismissed.updated_at);
+    harness.shutdown().await;
+}
+
+/// Every event the stream sent, read until it has been quiet for 200 ms.
+async fn stream_events(
+    receiver: &mut tokio::sync::mpsc::Receiver<crate::rpc::RpcStreamChunk>,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    while let Ok(Some(chunk)) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv()).await
+    {
+        events.extend(chunk.expect("a stream event"));
+    }
+    events
+}
+
+fn request_ids(event: &Value) -> Vec<String> {
+    event["requests"]
+        .as_array()
+        .expect("requests")
+        .iter()
+        .map(|request| request["requestId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn manage_subscribe_delivers_every_undismissed_request_in_pages() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let store = SendRequestStore::new(harness.repositories.database().clone());
+    for index in 0..450 {
+        insert(
+            &store,
+            row(
+                &format!("r{index:03}"),
+                "a",
+                &format!("2026-11-13T00:{:02}:{:02}Z", index / 60, index % 60),
+            ),
+        )
+        .await;
+    }
+    insert(&store, row("gone", "a", "2026-11-13T09:00:00Z")).await;
+    set_state(&store, "gone", SendState::Cancelled).await;
+    store.dismiss("gone", "2026-11-13T09:00:01Z").await.unwrap();
+
+    let mut receiver = service.subscribe(&person(), None, CancellationToken::new());
+    let events = stream_events(&mut receiver).await;
+
+    assert_eq!(events[0]["type"], "snapshot");
+    assert_eq!(request_ids(&events[0]).len(), 100);
+    assert!(events[1..].iter().all(|event| event["type"] == "page"));
+    let ids = events.iter().flat_map(request_ids).collect::<Vec<_>>();
+    assert_eq!(ids.len(), 450, "no request is missing");
+    assert_eq!(ids[0], "r449", "newest first");
+    assert_eq!(ids[449], "r000");
+    assert!(
+        !ids.iter().any(|id| id == "gone"),
+        "a dismissed request is absent"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_subscribe_filters_by_source_thread_and_delivers_changes() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let store = SendRequestStore::new(harness.repositories.database().clone());
+    insert(&store, row("from-a", "a", "2026-11-13T00:00:00Z")).await;
+    insert(&store, row("from-b", "b", "2026-11-13T00:00:01Z")).await;
+
+    let mut receiver = service.subscribe(&person(), Some("a".to_owned()), CancellationToken::new());
+    let snapshot = stream_events(&mut receiver).await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(request_ids(&snapshot[0]), ["from-a"]);
+
+    for request_id in ["from-b", "from-a"] {
+        service
+            .apply(request_id, &[SendState::Queued], change(SendState::Read))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let changes = stream_events(&mut receiver).await;
+    assert_eq!(changes.len(), 1, "only the scope's change: {changes:?}");
+    assert_eq!(changes[0]["type"], "upsert");
+    assert_eq!(changes[0]["request"]["requestId"], "from-a");
+    assert_eq!(changes[0]["request"]["state"], "read");
+    assert!(
+        changes[0]["request"].get("answerText").is_none(),
+        "a stream event carries no answer text"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_subscribe_resnapshots_after_lag() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let store = SendRequestStore::new(harness.repositories.database().clone());
+    insert(&store, row("r1", "a", "2026-11-13T00:00:00Z")).await;
+    let mut receiver = service.subscribe(&person(), None, CancellationToken::new());
+    assert_eq!(stream_events(&mut receiver).await[0]["type"], "snapshot");
+
+    // Far more changes than the stream holds, while nobody reads it.
+    for index in 0..600 {
+        let (from, to) = if index % 2 == 0 {
+            (SendState::Queued, SendState::Waiting)
+        } else {
+            (SendState::Waiting, SendState::Queued)
+        };
+        service
+            .apply("r1", &[from], change(to))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let events = stream_events(&mut receiver).await;
+    assert!(events.len() < 600, "changes were lost to the lag");
+    let last_snapshot = events
+        .iter()
+        .rposition(|event| event["type"] == "snapshot")
+        .expect("a new snapshot after the lag");
+    assert_eq!(request_ids(&events[last_snapshot]), ["r1"]);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_an_empty_scope_sends_an_empty_snapshot() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+
+    let mut receiver = service.subscribe(&person(), Some("a".to_owned()), CancellationToken::new());
+    let events = stream_events(&mut receiver).await;
+
+    assert_eq!(events, [json!({ "type": "snapshot", "requests": [] })]);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_get_answer_returns_the_stored_answer_after_the_target_is_deleted() {
+    let (harness, service, stop) = followed().await;
+    deletable_thread(&harness).await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:d")).await;
+    harness.provider_turn("d", "t1", "The review", true).await;
+    until_state(&harness, &service, "r1", SendState::Answered).await;
+
+    delete_thread(&harness, "d").await;
+
+    let answer = service.get_answer(&person(), "r1").await.unwrap();
+    assert_eq!(answer.text, "The review");
+    assert!(!answer.truncated);
+    assert_eq!(answer.request_id, "r1");
+    stop.cancel();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_get_answer_does_not_depend_on_the_history_window() {
+    let (harness, service, stop) = followed().await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    harness
+        .provider_turn("b", "t0", "The first answer", true)
+        .await;
+    until_state(&harness, &service, "r1", SendState::Answered).await;
+    for index in 1..=12 {
+        user_message(&harness, "b", &format!("later-{index}")).await;
+        harness
+            .provider_turn("b", &format!("t{index}"), &format!("Later {index}"), true)
+            .await;
+    }
+
+    let answer = service.get_answer(&person(), "r1").await.unwrap();
+
+    assert_eq!(answer.text, "The first answer");
+    stop.cancel();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_get_answer_reports_truncation() {
+    let (harness, service, stop) = followed().await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    harness
+        .provider_turn("b", "t1", &"z".repeat(60_000), true)
+        .await;
+    until_state(&harness, &service, "r1", SendState::Answered).await;
+
+    let answer = service.get_answer(&person(), "r1").await.unwrap();
+
+    assert_eq!(answer.text.chars().count(), 48_000);
+    assert!(answer.truncated);
+    stop.cancel();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_get_answer_of_an_unanswered_or_unknown_request() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+
+    let unanswered = service.get_answer(&person(), "r1").await.unwrap_err();
+    let unknown = service.get_answer(&person(), "missing").await.unwrap_err();
+
+    assert_eq!(unanswered["reason"], "not_answered", "{unanswered}");
+    assert_eq!(unknown["reason"], "not_found", "{unknown}");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_every_method_refuses_an_outside_agent_session() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    let before = stored_request(&harness, "r1").await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let context = RpcSessionContext::authenticated(agent.principal.clone(), harness.auth.clone());
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, service.clone());
+
+    for method in [
+        "sendRequests.cancel",
+        "sendRequests.dismiss",
+        "sendRequests.getAnswer",
+    ] {
+        let error = registry
+            .invoke_local(
+                method,
+                json!({ "requestId": "r1" }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an outside agent is refused");
+        assert_eq!(error["reason"], "person_only", "{method}: {error}");
+    }
+    let mut stream = service.subscribe(&context, None, CancellationToken::new());
+    let refused = stream
+        .recv()
+        .await
+        .expect("one chunk")
+        .expect_err("refused");
+    assert_eq!(refused["reason"], "person_only");
+    assert!(stream.recv().await.is_none(), "the stream ends");
+
+    assert_eq!(
+        stored_request(&harness, "r1").await,
+        before,
+        "nothing changed"
+    );
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("queued")
+    );
     harness.shutdown().await;
 }

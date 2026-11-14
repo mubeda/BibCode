@@ -422,8 +422,24 @@
       "mode": "unary"
     },
     {
+      "name": "sendRequests.cancel",
+      "mode": "unary"
+    },
+    {
+      "name": "sendRequests.dismiss",
+      "mode": "unary"
+    },
+    {
+      "name": "sendRequests.getAnswer",
+      "mode": "unary"
+    },
+    {
       "name": "sendRequests.send",
       "mode": "unary"
+    },
+    {
+      "name": "sendRequests.subscribe",
+      "mode": "stream"
     },
     {
       "name": "server.claimDiagnosticLogsRelay",
@@ -798,8 +814,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 30,
-  "expectedTopLevelStreamShapes": 96,
+  "streamMethodCount": 31,
+  "expectedTopLevelStreamShapes": 100,
   "expectedOrchestrationEventShapes": 27,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -833,6 +849,10 @@
     "stream-shapes/previewAutomation__connect-00.json",
     "stream-shapes/previewAutomation__connect-01.json",
     "stream-shapes/pullRequests__subscribe-00.json",
+    "stream-shapes/sendRequests__subscribe-00.json",
+    "stream-shapes/sendRequests__subscribe-01.json",
+    "stream-shapes/sendRequests__subscribe-02.json",
+    "stream-shapes/sendRequests__subscribe-03.json",
     "stream-shapes/server__downloadDiagnosticLogs-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-01.json",
     "stream-shapes/server__subscribeDiagnosticLogsRelay-00.json",
@@ -1105,6 +1125,12 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/sendRequests__cancel-00.json",
+    "typed-failures/sendRequests__cancel-01.json",
+    "typed-failures/sendRequests__dismiss-00.json",
+    "typed-failures/sendRequests__dismiss-01.json",
+    "typed-failures/sendRequests__getAnswer-00.json",
+    "typed-failures/sendRequests__getAnswer-01.json",
     "typed-failures/sendRequests__send-00.json",
     "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",
@@ -1555,8 +1581,18 @@
     "typed-failures/review__readFileVersion-00.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/review__readFileVersion-01.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/review__readFileVersion-02.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/sendRequests__cancel-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
+    "typed-failures/sendRequests__cancel-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/sendRequests__dismiss-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
+    "typed-failures/sendRequests__dismiss-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/sendRequests__getAnswer-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
+    "typed-failures/sendRequests__getAnswer-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/sendRequests__send-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
     "typed-failures/sendRequests__send-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "stream-shapes/sendRequests__subscribe-00.json": "0b06002207fdde2999799e2c07021a94ee1d93fbb7e6988989c8641ec594ac1e",
+    "stream-shapes/sendRequests__subscribe-01.json": "82d84e79085a6ced7d0ba2edbe23335f251f7bfc90f36f456d47e8131f96592c",
+    "stream-shapes/sendRequests__subscribe-02.json": "3bc5ca3d515ddf75a935afe47123d5966e7472644a4bb6b8360dab73fe27f7bd",
+    "stream-shapes/sendRequests__subscribe-03.json": "ea627097b9a1ef347430269b72f07a37e8cfacf51d237ed41760676e41fd976b",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json": "685a31ed25a91248b90c7b17d501f68c20523a70cc7dafa2da7412984f83a4c3",
     "typed-failures/server__claimDiagnosticLogsRelay-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/server__consumeCodexRateLimitReset-00.json": "6e23dade8593c0a59319f4ff081d53d3261c82f9223eed493544c12438f8a17c",
@@ -1907,6 +1943,10 @@
     "stream-shapes/preview__tunnelOpen-00.json",
     "stream-shapes/preview__tunnelOpen-01.json",
     "stream-shapes/pullRequests__subscribe-00.json",
+    "stream-shapes/sendRequests__subscribe-00.json",
+    "stream-shapes/sendRequests__subscribe-01.json",
+    "stream-shapes/sendRequests__subscribe-02.json",
+    "stream-shapes/sendRequests__subscribe-03.json",
     "stream-shapes/server__downloadDiagnosticLogs-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-01.json",
     "stream-shapes/server__subscribeDiagnosticLogsRelay-00.json",
@@ -2177,6 +2217,12 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/sendRequests__cancel-00.json",
+    "typed-failures/sendRequests__cancel-01.json",
+    "typed-failures/sendRequests__dismiss-00.json",
+    "typed-failures/sendRequests__dismiss-01.json",
+    "typed-failures/sendRequests__getAnswer-00.json",
+    "typed-failures/sendRequests__getAnswer-01.json",
     "typed-failures/sendRequests__send-00.json",
     "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",

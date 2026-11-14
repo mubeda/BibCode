@@ -262,6 +262,7 @@ impl SendRequestStore {
             .await
     }
 
+    #[allow(dead_code)] // The follower reads open requests by target thread instead.
     pub(crate) async fn by_target_message(
         &self,
         thread_id: &str,
