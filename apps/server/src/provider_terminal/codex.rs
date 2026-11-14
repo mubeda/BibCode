@@ -3746,8 +3746,10 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
                     return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
                 // A timed-out request may complete after a later request has
-                // started. Its response is stale, not a future notification.
+                // started. Its response is stale, not a future notification. A
+                // server request (it has a method) is dropped too, so it is lost.
                 if value.get("id").is_some() {
+                    self.lost_notifications |= value.get("method").is_some();
                     continue;
                 }
                 if self.pending.len() == CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {

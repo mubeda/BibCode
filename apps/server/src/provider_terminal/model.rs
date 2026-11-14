@@ -987,7 +987,9 @@ impl TerminalObserverGenerationLease {
     }
 
     /// Marks the current observation ready for a prompt, only when it is done and did not fail,
-    /// atomically. Observers reach it through [`Self::report_agent_evidence`].
+    /// atomically. Observers reach it through [`Self::report_agent_evidence`], and the Codex
+    /// observer also after a reconciliation that lost nothing and left nothing unread about the
+    /// root, to restore the readiness it withdrew at the reconciliation's start.
     pub fn mark_ready_for_prompt(&self) {
         if !self.is_current() {
             return;
@@ -1009,7 +1011,8 @@ impl TerminalObserverGenerationLease {
 
     /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
     /// that buffers events, a lost connection or stream, the observer's end) until fresh
-    /// evidence returns. The state stays as last reported. Returns whether it was ready.
+    /// evidence returns, or, for a Codex reconciliation, until it ends having lost nothing.
+    /// The state stays as last reported. Returns whether it was ready.
     pub fn clear_ready_for_prompt(&self) -> bool {
         self.inner
             .agent_status
