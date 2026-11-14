@@ -31,7 +31,10 @@ export const ReviewScopePicker = memo(function ReviewScopePicker(props: {
         const reasonId = `${groupId}-${option.scope.kind}`;
         const blocked = option.disabledReason !== null;
         return (
-          <label key={option.scope.kind} className="flex items-start gap-2 text-sm">
+          <label
+            key={option.scope.kind}
+            className={`flex items-start gap-2 text-sm ${blocked ? "cursor-not-allowed" : ""}`}
+          >
             <Radio
               value={option.scope.kind}
               aria-disabled={blocked ? "true" : undefined}

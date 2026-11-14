@@ -17,6 +17,7 @@ import {
   type ServerProvider,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
+  type SendRequest,
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
@@ -342,6 +343,7 @@ import {
 } from "../state/sendRequests";
 import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
+import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
 import { buildReviewPreviewContent } from "./sendToAgent/ReviewScopePicker";
 import {
@@ -5344,6 +5346,21 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [centerPanelActions, navigate],
   );
+  // A Review or Second opinion that is answered, or not, gets the notice with Bring back; the
+  // other actions keep the plain row.
+  const renderSendAnswer = useCallback(
+    (request: SendRequest) =>
+      activeThreadRef !== null &&
+      (request.action === "review" || request.action === "second-opinion") ? (
+        <AnswerNotice
+          request={request}
+          hostRef={activeThreadRef}
+          onOpen={handleOpenSendTarget}
+          onDismiss={handleDismissSendRequest}
+        />
+      ) : null,
+    [activeThreadRef, handleDismissSendRequest, handleOpenSendTarget],
+  );
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -8043,6 +8060,7 @@ function ChatViewContent(props: ChatViewProps) {
                             onOpen={handleOpenSendTarget}
                             onCancel={handleCancelSendRequest}
                             onDismiss={handleDismissSendRequest}
+                            renderAnswer={renderSendAnswer}
                           />
                         ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
