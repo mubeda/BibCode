@@ -2055,7 +2055,9 @@ mod no_user_authority {
         async fn provider_asks(&self, thread_id: &str, kind: &str, request_id: &str) {
             let payload = match kind {
                 "approval" => json!({ "requestId": request_id, "requestKind": "command" }),
-                _ => json!({ "requestId": request_id, "questions": [{ "id": "color", "header": "Color", "question": "Which?", "options": [{ "label": "Red", "description": "" }] }] }),
+                _ => {
+                    json!({ "requestId": request_id, "questions": [{ "id": "color", "header": "Color", "question": "Which?", "options": [{ "label": "Red", "description": "" }] }] })
+                }
             };
             self.provider_activity(thread_id, &format!("{kind}.requested"), payload)
                 .await;
@@ -2126,8 +2128,14 @@ mod no_user_authority {
 
             self.until_status(&message_id, "queued").await;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            assert_eq!(self.message_row(&message_id).await.status.as_str(), "queued");
-            assert!(self.responses().await.is_empty(), "the message answered nothing");
+            assert_eq!(
+                self.message_row(&message_id).await.status.as_str(),
+                "queued"
+            );
+            assert!(
+                self.responses().await.is_empty(),
+                "the message answered nothing"
+            );
 
             self.engine
                 .dispatch(command(respond))
@@ -2217,7 +2225,11 @@ mod no_user_authority {
             .expect("queue entry");
         assert_eq!(harness.entry_state(&command_id).await, "queued");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(harness.entry_state(&command_id).await, "queued", "nothing handed to the provider");
+        assert_eq!(
+            harness.entry_state(&command_id).await,
+            "queued",
+            "nothing handed to the provider"
+        );
         assert_eq!(harness.approval("r1").await.0, "pending");
         harness.shutdown().await;
     }
@@ -2291,7 +2303,10 @@ mod idempotent_sends {
             .agent_send("a", with_id("thread:b", "Which port?", "k"))
             .await;
 
-        assert_eq!(structured(&first)["messageId"], structured(&retry)["messageId"]);
+        assert_eq!(
+            structured(&first)["messageId"],
+            structured(&retry)["messageId"]
+        );
         assert_eq!(
             structured(&first)["conversationId"],
             structured(&retry)["conversationId"]
@@ -2367,7 +2382,10 @@ mod idempotent_sends {
             .agent_tool("b", "agent_message_reply", arguments)
             .await;
 
-        assert_eq!(structured(&first)["messageId"], structured(&retry)["messageId"]);
+        assert_eq!(
+            structured(&first)["messageId"],
+            structured(&retry)["messageId"]
+        );
         assert_eq!(harness.agent_messages().await.len(), 2, "m1 and one reply");
         assert_eq!(harness.outbox_states("a").await.len(), 1);
         harness.shutdown().await;
