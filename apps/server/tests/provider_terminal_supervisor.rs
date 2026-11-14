@@ -5947,9 +5947,16 @@ async fn open_ready_codex_terminal(
         .events
         .lock()
         .expect("Codex events")
-        .push_back(codex_root_status(&root_id, serde_json::json!({"type": "idle"})));
-    wait_for_terminal_readiness(&manager, terminal_id, (TerminalAgentStatusState::Done, true))
-        .await;
+        .push_back(codex_root_status(
+            &root_id,
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        terminal_id,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
     (root, manager, remote_state, root_id)
 }
 
@@ -6022,7 +6029,10 @@ async fn codex_reconciliation_that_drops_a_turn_leaves_the_terminal_not_ready() 
         .events
         .lock()
         .expect("Codex events")
-        .push_back(codex_root_status(&root_id, serde_json::json!({"type": "idle"})));
+        .push_back(codex_root_status(
+            &root_id,
+            serde_json::json!({"type": "idle"}),
+        ));
     wait_for_terminal_readiness(&manager, terminal, (TerminalAgentStatusState::Done, true)).await;
     manager
         .close("thread-codex", Some(terminal))
@@ -6072,6 +6082,139 @@ async fn codex_reconciliation_interrupted_by_an_activity_change_leaves_the_termi
         Some((TerminalAgentStatusState::Done, false)),
         "an interrupted reconciliation that dropped a turn left the terminal ready"
     );
+    manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reconciliation_withdraws_readiness_while_its_requests_buffer_events() {
+    // Mutation caught: a reconciliation that keeps readiness while its requests hold a
+    // turn/started it has not read yet, so a busy terminal reads ready meanwhile.
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-buffering";
+    let (_root, manager, remote_state, root_id) = open_ready_codex_terminal(terminal).await;
+    remote_state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("thread/backgroundTerminals/list".to_owned())
+        .or_default()
+        .push_back(vec![serde_json::json!({
+            "method": "turn/started",
+            "params": {"threadId": root_id, "turn": {"id": "turn-2"}},
+        })]);
+    remote_state
+        .request_delays
+        .lock()
+        .expect("request delays")
+        .entry("thread/list".to_owned())
+        .or_default()
+        .push_back(std::time::Duration::from_secs(5));
+    let reconciliations = count_codex_method_calls(&remote_state, "thread/list");
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&root_id));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while count_codex_method_calls(&remote_state, "thread/list") == reconciliations {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reconciliation holds its thread/list request");
+
+    assert_eq!(
+        terminal_readiness(&manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "a terminal read ready while a reconciliation held a turn it had not read"
+    );
+    manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_terminal_reads_ready_again_after_the_reconciliation_its_turn_completion_starts() {
+    // Mutation caught: the withdrawal at the reconciliation's start never undone. Codex reports
+    // the root idle before turn/completed, so nothing after it would make the terminal ready.
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-quiet";
+    let (_root, manager, remote_state, root_id) = open_ready_codex_terminal(terminal).await;
+    let reconciliations = count_codex_method_calls(&remote_state, "thread/list");
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&root_id));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while count_codex_method_calls(&remote_state, "thread/list") == reconciliations {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the turn completion starts a reconciliation");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        terminal_readiness(&manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, true)),
+        "a reconciliation that lost and buffered nothing left the terminal not ready"
+    );
+    manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_idle_buffered_by_a_reconciliation_makes_the_terminal_ready() {
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-idle";
+    let (_root, manager, remote_state, root_id) = open_ready_codex_terminal(terminal).await;
+    remote_state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("thread/backgroundTerminals/list".to_owned())
+        .or_default()
+        .push_back(vec![codex_root_status(
+            &root_id,
+            serde_json::json!({"type": "idle"}),
+        )]);
+    let delivered = remote_state
+        .request_buffered_deliveries
+        .load(Ordering::Acquire);
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&root_id));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while remote_state
+            .request_buffered_deliveries
+            .load(Ordering::Acquire)
+            == delivered
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the idle the reconciliation buffered is read");
+
+    wait_for_terminal_readiness(&manager, terminal, (TerminalAgentStatusState::Done, true)).await;
     manager
         .close("thread-codex", Some(terminal))
         .await
@@ -13864,7 +14007,9 @@ impl OpenCodeRemoteClient for OpenCodeFixtureRemoteClient {
             if self
                 .state
                 .open_stream_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| left.checked_sub(1))
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
                 .is_ok()
             {
                 return Err("injected OpenCode event stream failure".to_owned());

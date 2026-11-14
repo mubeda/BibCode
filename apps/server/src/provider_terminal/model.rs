@@ -729,7 +729,7 @@ pub enum PromptEvidence {
     /// Read on the observer's active stream after that stream's last transition and after any
     /// snapshot it took, so nothing the observer holds is newer.
     Fresh,
-    /// A snapshot, an event buffered across a request or a transition, or one the observer drops:
+    /// A snapshot, an event buffered across a snapshot or a transition, or one the observer drops:
     /// its state is reported, which withdraws readiness, but never makes the terminal ready.
     Stale,
 }
@@ -1009,8 +1009,8 @@ impl TerminalObserverGenerationLease {
 
     /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
     /// that buffers events, a lost connection or stream, the observer's end) until fresh
-    /// evidence returns. The state stays as last reported.
-    pub fn clear_ready_for_prompt(&self) {
+    /// evidence returns. The state stays as last reported. Returns whether it was ready.
+    pub fn clear_ready_for_prompt(&self) -> bool {
         self.inner
             .agent_status
             .send_if_modified(|current| match current {
@@ -1019,7 +1019,7 @@ impl TerminalObserverGenerationLease {
                     true
                 }
                 _ => false,
-            });
+            })
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it
