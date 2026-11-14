@@ -465,7 +465,9 @@ export function useCenterPanelActions({
       const threadId = newThreadId();
       const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
       if (input.activate === false) {
-        useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label, { activate: false });
+        useCenterPanelStore
+          .getState()
+          .reserveChatPanel(hostRef, threadId, label, { activate: false });
       } else {
         useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
       }

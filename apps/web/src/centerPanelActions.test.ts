@@ -947,9 +947,14 @@ describe("prompted chat panels (code reviews)", () => {
   it("reserves the review tab without activating it when the caller asks to keep its own tab", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
     await actions.createPromptedChatPanel({ ...review(), activate: false });
-    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, "new-panel-thread", "Code review · Claude", {
-      activate: false,
-    });
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(
+      hostRef,
+      "new-panel-thread",
+      "Code review · Claude",
+      {
+        activate: false,
+      },
+    );
   });
 
   it("creates a review panel with its modes and flag, then sends the prompt (R95)", async () => {

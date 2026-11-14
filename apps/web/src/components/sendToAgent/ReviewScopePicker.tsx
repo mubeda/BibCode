@@ -71,11 +71,12 @@ function resolveScope(
 function ReviewScopeSection(props: {
   options: ReadonlyArray<ReviewScopeOption>;
   pickKey: string;
-  chosen: { kind: CodeReviewScope["kind"] | undefined };
+  initialKind: CodeReviewScope["kind"] | undefined;
+  onPick: (kind: CodeReviewScope["kind"]) => void;
   leadInFor: (scope: CodeReviewScope) => string;
 }) {
-  const { options, pickKey, chosen, leadInFor } = props;
-  const [kind, setKind] = useState(() => resolveScope(options, chosen.kind)?.kind ?? null);
+  const { options, pickKey, initialKind, onPick, leadInFor } = props;
+  const [kind, setKind] = useState(() => resolveScope(options, initialKind)?.kind ?? null);
   const scope = options.find((option) => option.scope.kind === kind)?.scope ?? null;
   return (
     <div className="flex flex-col gap-3">
@@ -84,7 +85,7 @@ function ReviewScopeSection(props: {
         value={scope}
         onChange={(next) => {
           pickedKinds.set(pickKey, next.kind);
-          chosen.kind = next.kind;
+          onPick(next.kind);
           setKind(next.kind);
         }}
       />
@@ -114,7 +115,10 @@ export function buildReviewPreviewContent(input: {
     <ReviewScopeSection
       options={options}
       pickKey={pickKey}
-      chosen={chosen}
+      initialKind={chosen.kind}
+      onPick={(kind) => {
+        chosen.kind = kind;
+      }}
       leadInFor={(scope) => contentFor(scope).leadIn}
     />
   );

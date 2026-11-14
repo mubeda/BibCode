@@ -285,14 +285,13 @@ describe("buildReviewContent", () => {
       Promise.resolve({ kind: "sent" }),
     );
     // The launcher's creation response was lost: the panel id is known, the panel may exist.
-    const startNewPanelReview = vi.fn(
-      (): Promise<PromptedPanelResult> =>
-        Promise.resolve({
-          threadId: ThreadId.make("panel-1"),
-          created: false,
-          messageId: null,
-          sent: "not-sent",
-        }),
+    const startNewPanelReview = vi.fn((): Promise<PromptedPanelResult> =>
+      Promise.resolve({
+        threadId: ThreadId.make("panel-1"),
+        created: false,
+        messageId: null,
+        sent: "not-sent",
+      }),
     );
     const content = build({ startNewPanelReview }, send);
     const draft = { leadIn: content.leadIn, note: "look", attachments: [] };

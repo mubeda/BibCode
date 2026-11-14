@@ -70,7 +70,9 @@ function EnvironmentUnreadTracker(props: { readonly environmentId: EnvironmentId
   // replacement snapshot carries only the first page, and the list cannot tell that from a removal.
   useEffect(() => {
     const retired = new Set(
-      requests.filter((request) => request.dismissedAt !== null).map((request) => request.requestId),
+      requests
+        .filter((request) => request.dismissedAt !== null)
+        .map((request) => request.requestId),
     );
     if (retired.size === 0) return;
     const { openedIds: opened, keepOnly } = useSendRequestOpenedStore.getState();
