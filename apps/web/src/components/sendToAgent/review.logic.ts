@@ -112,6 +112,8 @@ export function buildReviewContent(input: {
   send: (input: SendRequestsSendInput) => Promise<SendOutcome>;
   newId: () => string;
   startNewPanelReview: (input: StartNewPanelReviewInput) => Promise<PromptedPanelResult>;
+  /** Called with the review panel once its request was sent, to bring its tab forward. */
+  revealPanel?: (panelThreadId: ThreadId) => void;
 }): PreviewContent {
   const { scope, target, source } = input;
   const leadIn = resolveCodeReviewPrompt({
@@ -162,6 +164,7 @@ async function submitToNewPanel(
     });
   const remembered = store.panelFor(panelKey);
   const sent: { outcome: SendOutcome | null } = { outcome: null };
+  let panel = remembered;
   if (remembered !== null) {
     sent.outcome = await sendTo(remembered);
   } else {
@@ -172,6 +175,7 @@ async function submitToNewPanel(
     });
     // A created panel whose send failed, or one whose creation outcome is unknown (the response
     // was lost; the panel may exist): the retry goes to this panel, never to a second one.
+    panel = result.threadId;
     if (result.threadId !== null && sent.outcome?.kind !== "sent") {
       useSendToAgentStore.getState().rememberPanel(panelKey, result.threadId);
     }
@@ -182,6 +186,7 @@ async function submitToNewPanel(
   }
   if (outcome.kind === "sent") {
     useSendToAgentStore.getState().settle(key, { requestId, note: draft.note, panelKey });
+    if (panel !== null) input.revealPanel?.(panel);
   }
   return outcome;
 }

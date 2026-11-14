@@ -66,6 +66,8 @@ export interface CreateChatPanelInput {
   readonly modelSelection: ModelSelection;
   /** Display label used for the thread title and the tab. */
   readonly providerLabel: string;
+  /** False: the new tab is added without becoming active; the caller reveals it later. */
+  readonly activate?: boolean;
 }
 
 /** A side chat of the host: a chat panel the server seeds with the host's messages. */
@@ -462,7 +464,11 @@ export function useCenterPanelActions({
       const environmentId = hostRef.environmentId;
       const threadId = newThreadId();
       const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
-      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
+      if (input.activate === false) {
+        useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label, { activate: false });
+      } else {
+        useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
+      }
       const key = scopedThreadKey(panelRef);
       creations.set(key, { closed: false });
       if (focusComposer) composerFocusRequests.add(key);

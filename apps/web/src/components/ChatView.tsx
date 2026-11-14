@@ -5214,6 +5214,9 @@ function ChatViewContent(props: ChatViewProps) {
         branch: activeThread.branch ?? null,
         modelSelection: resolution.modelSelection,
         providerLabel: entry.displayName,
+        // A review from a panel other than the host keeps its own tab active until the send
+        // succeeds: an inactive chat panel unmounts, and its preview with it.
+        activate: !activeThread.hostThreadId,
         label: `Code review · ${entry.displayName}`,
         prompt: "",
         ...resolveCodeReviewChatModes(entry.driverKind),
@@ -5265,6 +5268,15 @@ function ChatViewContent(props: ChatViewProps) {
           send: sendReview,
           newId: randomUUID,
           startNewPanelReview,
+          revealPanel: (panelThreadId) => {
+            if (!activeThread?.hostThreadId) return;
+            void centerPanelActions.openPanelThread(
+              scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId),
+              panelThreadId,
+              "Code review",
+              false,
+            );
+          },
         }),
     });
   });
