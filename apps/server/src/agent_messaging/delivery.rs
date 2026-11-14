@@ -6,19 +6,24 @@
 //! that withdrawal, so it cannot steer or answer anything.
 
 use rusqlite::{OptionalExtension as _, params};
-use tokio::{sync::broadcast, task::JoinHandle};
+use tokio::{
+    sync::{broadcast, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     AgentMessagingError, MessageOutcome, OutcomeSink,
     store::{
-        AgentMessageReason, AgentMessageRow, AgentMessageStatus, hold_above_ceiling,
+        AgentMessageCompanion, AgentMessageReason, AgentMessageRow, AgentMessageStatus,
+        RelinkAgentMessage, hold_above_ceiling, hold_waiting, list_held_for,
         list_needing_withdrawal, list_open, list_open_for_thread, set_recipient_turn, set_status,
     },
 };
 use crate::{
     orchestration::{
-        OrchestrationCommand, OrchestrationEngine, TurnDeliveryState,
+        CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
+        TurnDeliveryMode, TurnDeliveryState, canonical_command_digest,
         engine::TurnDeliveryResolutionAction,
     },
     persistence::{OrchestrationEvent, Result},
@@ -301,8 +306,9 @@ async fn report(
 }
 
 /// Takes `message`'s queue entry out of its recipient's queue: `Cancel` for a queued entry,
-/// `Dismiss` for a pending or failed one. False when the entry is sending or later (too late),
-/// absent, or no longer takes the resolution.
+/// `Dismiss` for a pending or failed one; true when it is out of the queue, already dismissed
+/// included. False when the entry is sending or later (too late), absent, or no longer takes
+/// the resolution.
 pub(crate) async fn withdraw_from_queue(
     engine: &OrchestrationEngine,
     message: &AgentMessageRow,
@@ -331,6 +337,7 @@ pub(crate) async fn withdraw_from_queue(
         TurnDeliveryState::Pending | TurnDeliveryState::Failed => {
             TurnDeliveryResolutionAction::Dismiss
         }
+        TurnDeliveryState::Dismissed => return Ok(true),
         _ => return Ok(false),
     };
     let resolve = OrchestrationCommand::ThreadTurnDeliveryResolve {
@@ -367,20 +374,28 @@ async fn withdraw_left_entries(engine: &OrchestrationEngine, messages: Vec<Agent
     }
 }
 
-/// Holds what the mode ceiling no longer admits, re-derives each open message of `recipient`
-/// (every one when `None`) and withdraws the entries no message may keep. Every step reads the
-/// stored state, so a restart between a hold and its withdrawal repeats only the withdrawal.
+/// Holds what the setting (`messaging`, when given, is `agentMessaging.enabled`) and the mode
+/// ceiling no longer admit, re-derives each open message of `recipient` (every one when
+/// `None`), withdraws the entries no message may keep, and, while messaging is on, requeues the
+/// held messages whose cause ended. Every step reads the stored state, so a restart between a
+/// hold and its withdrawal repeats only the withdrawal.
 async fn reconcile(
     engine: &OrchestrationEngine,
     outcomes: Option<&OutcomeSink>,
     recipient: Option<String>,
+    messaging: Option<bool>,
 ) -> Result<usize> {
+    let scope = recipient.clone();
     let (changes, withdrawals) = engine
         .repositories()
         .database()
         .call(move |connection| {
-            let recipient = recipient.as_deref();
-            hold_above_ceiling(connection, recipient, &crate::mcp::control::now_iso())?;
+            let recipient = scope.as_deref();
+            let now = crate::mcp::control::now_iso();
+            if messaging == Some(false) {
+                hold_waiting(connection, recipient, AgentMessageReason::MessagingOff, &now)?;
+            }
+            hold_above_ceiling(connection, recipient, &now)?;
             let open = match recipient {
                 Some(address) => list_open_for_thread(connection, address)?,
                 None => list_open(connection)?,
@@ -391,23 +406,283 @@ async fn reconcile(
         .await?;
     withdraw_left_entries(engine, withdrawals).await;
     report(engine, outcomes, &changes).await;
+    if messaging == Some(true) {
+        release_held(engine, recipient).await?;
+    }
     Ok(changes.len())
+}
+
+/// Requeues each held message of `recipient` (every one when `None`) whose hold no longer
+/// applies, in acceptance order per reason. A message whose recipient is gone fails, and one
+/// whose recipient still runs above its sender's mode stays held for that.
+async fn release_held(engine: &OrchestrationEngine, recipient: Option<String>) -> Result<()> {
+    let ready = engine
+        .repositories()
+        .database()
+        .call(move |connection| {
+            let mut held = list_held_for(connection, AgentMessageReason::MessagingOff)?;
+            held.extend(list_held_for(
+                connection,
+                AgentMessageReason::RecipientModeAboveSender,
+            )?);
+            let now = crate::mcp::control::now_iso();
+            let mut ready = Vec::new();
+            for message in held {
+                if recipient
+                    .as_deref()
+                    .is_some_and(|address| address != message.recipient_address)
+                {
+                    continue;
+                }
+                let Some(thread_id) = message.recipient_address.strip_prefix("thread:") else {
+                    continue;
+                };
+                let recipient_mode = connection
+                    .query_row(
+                        "SELECT runtime_mode FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL",
+                        [thread_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(recipient_mode) = recipient_mode else {
+                    set_status(
+                        connection,
+                        &message.message_id,
+                        AgentMessageStatus::Failed,
+                        Some(AgentMessageReason::RecipientGone),
+                        &now,
+                    )?;
+                    continue;
+                };
+                let allowed = message.sender_runtime_mode.as_deref().is_some_and(|sender| {
+                    super::policy::ceiling_allows(sender, &recipient_mode)
+                });
+                if allowed {
+                    ready.push(message);
+                } else if message.reason != Some(AgentMessageReason::RecipientModeAboveSender) {
+                    set_status(
+                        connection,
+                        &message.message_id,
+                        AgentMessageStatus::Held,
+                        Some(AgentMessageReason::RecipientModeAboveSender),
+                        &now,
+                    )?;
+                }
+            }
+            Ok(ready)
+        })
+        .await?;
+    for message in ready {
+        if let Err(error) = requeue(engine, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id,
+                tag = error.tag(),
+                "a held agent message was not requeued"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Puts a held `message` back at the end of its recipient's queue: its old entry leaves the
+/// queue, and one fresh turn start under `agent-message:{message id}:{n}` with a new thread
+/// message id is admitted with a relink of the message, in one transaction that rolls back when
+/// the message is no longer held on that entry. False when it was not requeued.
+pub(crate) async fn requeue(
+    engine: &OrchestrationEngine,
+    message: &AgentMessageRow,
+) -> std::result::Result<bool, AgentMessagingError> {
+    let (Some(old_command_id), Some(thread_id)) = (
+        message.delivery_command_id.clone(),
+        message
+            .recipient_address
+            .strip_prefix("thread:")
+            .map(str::to_owned),
+    ) else {
+        return Ok(false);
+    };
+    if message.status != AgentMessageStatus::Held {
+        return Ok(false);
+    }
+    // The old entry leaves first, so the message never has two live entries.
+    if !withdraw_from_queue(engine, message).await? {
+        return Ok(false);
+    }
+    let storage = |error: crate::persistence::PersistenceError| {
+        tracing::warn!(error = %error, "a held agent message could not be read");
+        AgentMessagingError::Storage
+    };
+    let repositories = engine.repositories();
+    let Some(entry) = repositories
+        .get_provider_turn_delivery(old_command_id.clone())
+        .await
+        .map_err(storage)?
+    else {
+        return Ok(false);
+    };
+    let thread = repositories
+        .get_thread(thread_id.clone())
+        .await
+        .map_err(storage)?;
+    let session = repositories
+        .get_thread_session(thread_id.clone())
+        .await
+        .map_err(storage)?;
+    let (prefix, sender) = (
+        format!("agent-message:{}:", message.message_id),
+        message
+            .sender_address
+            .strip_prefix("thread:")
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    let lookup_thread = thread_id.clone();
+    let (earlier, waiting, label) = repositories
+        .database()
+        .call(move |connection| {
+            let earlier: u32 = connection.query_row(
+                "SELECT COUNT(*) FROM provider_turn_outbox WHERE substr(command_id, 1, length(?1)) = ?1",
+                [&prefix],
+                |row| row.get(0),
+            )?;
+            let waiting: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state IN ('queued', 'pending', 'sending'))",
+                [&lookup_thread],
+                |row| row.get(0),
+            )?;
+            let title: Option<String> = connection
+                .query_row(
+                    "SELECT title FROM projection_threads WHERE thread_id = ?1",
+                    [&sender],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok((earlier, waiting, title))
+        })
+        .await
+        .map_err(storage)?;
+    // Behind whatever waits, and behind a turn that runs or an open ask, as a send would be.
+    let queued = waiting
+        || thread
+            .as_ref()
+            .is_none_or(|thread| super::admission_for(thread, session.as_ref()) == super::TurnAdmission::Queue);
+    let command_id = format!("agent-message:{}:{}", message.message_id, earlier + 1);
+    let delivery_message_id = uuid::Uuid::new_v4().to_string();
+    let now = crate::mcp::control::now_iso();
+    let mut payload = entry.payload.clone();
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(false);
+    };
+    object.insert("commandId".to_owned(), serde_json::json!(command_id));
+    object.insert("createdAt".to_owned(), serde_json::json!(now));
+    object.insert("queued".to_owned(), serde_json::json!(queued));
+    object.remove("bootstrap");
+    if let Some(stored) = object
+        .get_mut("message")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        stored.insert(
+            "messageId".to_owned(),
+            serde_json::json!(delivery_message_id),
+        );
+    }
+    let command: OrchestrationCommand = serde_json::from_value(payload.clone()).map_err(|error| {
+        tracing::warn!(error = %error, "a held agent message's turn start did not build");
+        AgentMessagingError::Storage
+    })?;
+    let payload_digest = canonical_command_digest(&command).map_err(|error| {
+        tracing::warn!(error = %error, "a held agent message's turn start has no digest");
+        AgentMessagingError::Storage
+    })?;
+    let claim = engine
+        .acquire_command_admission(&command_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "a held agent message was not admitted");
+            AgentMessagingError::Storage
+        })?;
+    let label = label
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Agent".to_owned());
+    claim.attribute_to(serde_json::json!({
+        "kind": "hosted-agent",
+        "address": message.sender_address,
+        "label": label,
+    }));
+    let (state, status) = if queued {
+        (TurnDeliveryState::Queued, AgentMessageStatus::Queued)
+    } else {
+        (TurnDeliveryState::Pending, AgentMessageStatus::Accepted)
+    };
+    let admission = CommandAdmission {
+        payload_digest,
+        attachment_refs: Vec::new(),
+        provider_turn: Some(NewProviderTurnDelivery {
+            command_id: command_id.clone(),
+            thread_id,
+            message_id: delivery_message_id.clone(),
+            provider_instance_id: entry.provider_instance_id,
+            provider_kind: entry.provider_kind,
+            provider_session_id: None,
+            delivery_key: uuid::Uuid::new_v4().to_string(),
+            payload,
+            state,
+            mode: TurnDeliveryMode::Start,
+            created_at: now,
+        }),
+        agent_message: Some(AgentMessageCompanion::Relink(RelinkAgentMessage {
+            message_id: message.message_id.clone(),
+            expected_status: AgentMessageStatus::Held,
+            expected_delivery_command_id: Some(old_command_id),
+            delivery_command_id: command_id,
+            delivery_message_id,
+            status,
+            reason: None,
+        })),
+    };
+    let waker = engine.clone();
+    match engine
+        .dispatch_with_admission_and_command_claim(command, admission, claim, move || {
+            waker.wake_turn_delivery();
+        })
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            // Another release or a cancel moved the message first; the store decides.
+            tracing::debug!(error = %error, "a held agent message was not requeued");
+            Ok(false)
+        }
+    }
 }
 
 async fn reconcile_thread(
     engine: &OrchestrationEngine,
     outcomes: Option<&OutcomeSink>,
     thread_id: &str,
+    messaging: bool,
 ) -> Result<usize> {
-    reconcile(engine, outcomes, Some(format!("thread:{thread_id}"))).await
+    reconcile(
+        engine,
+        outcomes,
+        Some(format!("thread:{thread_id}")),
+        Some(messaging),
+    )
+    .await
 }
 
-/// Re-derives every open message; returns how many changed.
+/// Re-derives every open message; returns how many changed. It neither holds nor releases for
+/// the setting, which only the tracker follows.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the tracker reconciles with the setting")
+)]
 pub(crate) async fn reconcile_all(
     engine: &OrchestrationEngine,
     outcomes: Option<&OutcomeSink>,
 ) -> Result<usize> {
-    reconcile(engine, outcomes, None).await
+    reconcile(engine, outcomes, None, None).await
 }
 
 /// The thread an event may change a message status of.
@@ -439,21 +714,16 @@ fn thread_of(event: &OrchestrationEvent) -> Option<&str> {
     .then_some(event.aggregate_id.as_str())
 }
 
-pub(crate) async fn requeue(
-    _engine: &OrchestrationEngine,
-    _message: &AgentMessageRow,
-) -> std::result::Result<bool, AgentMessagingError> {
-    Ok(false)
-}
-
 pub(crate) struct AgentMessageTracker;
 
 impl AgentMessageTracker {
-    /// Follows the engine's events until `shutdown`, after one full reconciliation.
+    /// Follows the engine's events and `enabled` (`agentMessaging.enabled`) until `shutdown`,
+    /// after one full reconciliation: while messaging is off every waiting agent message is held
+    /// and leaves its queue, and once it is on again the held ones rejoin the end of the queue.
     pub(crate) fn start(
         engine: OrchestrationEngine,
         outcomes: Option<OutcomeSink>,
-        _enabled: tokio::sync::watch::Receiver<bool>,
+        mut enabled: watch::Receiver<bool>,
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         // Subscribed before the first reconciliation, so no event between the two is missed.
@@ -461,14 +731,21 @@ impl AgentMessageTracker {
         let repositories = engine.repositories();
         tokio::spawn(async move {
             let outcomes = outcomes.as_ref();
-            log_failure(reconcile_all(&engine, outcomes).await);
+            let mut setting_open = true;
+            let messaging = |enabled: &watch::Receiver<bool>| Some(*enabled.borrow());
+            log_failure(reconcile(&engine, outcomes, None, messaging(&enabled)).await);
             loop {
                 let event = tokio::select! {
                     biased;
                     () = shutdown.cancelled() => return,
+                    changed = enabled.changed(), if setting_open => {
+                        setting_open = changed.is_ok();
+                        log_failure(reconcile(&engine, outcomes, None, messaging(&enabled)).await);
+                        continue;
+                    }
                     // A hold decided at a claim writes no event; its entry is withdrawn here.
                     () = repositories.agent_claim_held() => {
-                        log_failure(reconcile_all(&engine, outcomes).await);
+                        log_failure(reconcile(&engine, outcomes, None, messaging(&enabled)).await);
                         continue;
                     }
                     event = events.recv() => event,
@@ -476,11 +753,12 @@ impl AgentMessageTracker {
                 match event {
                     Ok(event) => {
                         if let Some(thread_id) = thread_of(&event) {
-                            log_failure(reconcile_thread(&engine, outcomes, thread_id).await);
+                            let on = *enabled.borrow();
+                            log_failure(reconcile_thread(&engine, outcomes, thread_id, on).await);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        log_failure(reconcile_all(&engine, outcomes).await);
+                        log_failure(reconcile(&engine, outcomes, None, messaging(&enabled)).await);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }

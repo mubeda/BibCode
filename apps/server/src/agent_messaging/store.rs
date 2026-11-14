@@ -449,6 +449,38 @@ pub(crate) fn hold_above_ceiling(
     Ok(held)
 }
 
+/// Holds with `reason` every agent message to `recipient_address` (every recipient when `None`)
+/// whose entry still waits in the queue. A message whose entry is already being sent is left to
+/// complete (the accepted limit of turning messaging off).
+pub(crate) fn hold_waiting(
+    connection: &rusqlite::Connection,
+    recipient_address: Option<&str>,
+    reason: AgentMessageReason,
+    updated_at: &str,
+) -> Result<usize> {
+    Ok(connection.execute(
+        "UPDATE agent_messages SET status = 'held', reason = ?2, updated_at = ?3
+          WHERE sender_kind = 'agent' AND status IN ('accepted', 'queued')
+            AND (?1 IS NULL OR recipient_address = ?1)
+            AND delivery_command_id IN (SELECT command_id FROM provider_turn_outbox WHERE state IN ('queued', 'pending'))",
+        params![recipient_address, reason.as_str(), updated_at],
+    )?)
+}
+
+/// The agent messages held for `reason`, in acceptance order.
+pub(crate) fn list_held_for(
+    connection: &rusqlite::Connection,
+    reason: AgentMessageReason,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages WHERE status = 'held' AND reason = ?1 AND sender_kind = 'agent' ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![reason.as_str()], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The messages that must not wait in a queue, whose entry still does: a final one, or one held
 /// for the setting or the mode ceiling (a message held for its recipient's paused queue or an
 /// uncertain delivery keeps its entry for a person). Acceptance order.
