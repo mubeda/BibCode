@@ -37,7 +37,9 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
-use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
+use super::model::{
+    PromptEvidence, TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease,
+};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -2050,12 +2052,12 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
         }
     }
     match report {
-        ClaudeAgentReport::Set(agent_state, failed) => {
-            state.status.publish_agent_status(agent_state, failed);
-            if claude_hook_ready_for_prompt(hook) {
-                state.status.mark_ready_for_prompt();
-            }
-        }
+        // Claude's hooks are its only stream and carry no snapshot, so each one is fresh.
+        ClaudeAgentReport::Set(agent_state, failed) => state.status.report_agent_evidence(
+            TerminalAgentReport::Set(agent_state, failed),
+            claude_hook_ready_for_prompt(hook),
+            PromptEvidence::Fresh,
+        ),
         ClaudeAgentReport::ToolFinished => {
             state
                 .status
@@ -2066,22 +2068,20 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
     }
 }
 
+/// Whether a Claude hook proves the CLI waits for the user's next prompt: only Claude's
+/// `idle_prompt` notification does, sent once the prompt has waited for input a while. `Stop`
+/// does not: a Stop hook of the project or the user runs beside this one and can block the
+/// stop, and Claude then continues without a new prompt and without another hook to say so.
+pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
+    safe_text(hook.session_id.as_deref()).is_some()
+        && safe_text(hook.hook_event_name.as_deref()) == Some("Notification")
+        && safe_text(hook.notification_type.as_deref()) == Some("idle_prompt")
+}
+
 /// The main agent's state a Claude hook reports, for the left panel (#187). A subagent's own
 /// tool hooks carry its `agent_id` and leave the main state alone, except that its finished
 /// tool ends an approval prompt; a permission prompt blocks the user whoever asks. Only the
 /// event name, the tool name and the notification type are read.
-/// Whether a Claude hook says the CLI waits for the user's next prompt: its turn stopped, or it
-/// has idled at the prompt. A session start or end is no such signal.
-pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
-    if safe_text(hook.session_id.as_deref()).is_none() {
-        return false;
-    }
-    match safe_text(hook.hook_event_name.as_deref()) {
-        Some("Stop") => true,
-        Some("Notification") => safe_text(hook.notification_type.as_deref()) == Some("idle_prompt"),
-        _ => false,
-    }
-}
 
 fn claude_hook_agent_status(hook: &ClaudeStatusHook) -> Option<ClaudeAgentReport> {
     let event = safe_text(hook.hook_event_name.as_deref())?;
