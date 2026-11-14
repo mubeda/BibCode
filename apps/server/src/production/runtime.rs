@@ -3791,6 +3791,66 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// The stop writes the agent message rows still queued and ends their writer, before the
+    /// profiler's teardown.
+    #[tokio::test]
+    async fn quiesce_writes_the_queued_agent_message_rows_and_ends_their_writer() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        for _ in 0..20 {
+            messaging
+                .refused(
+                    "agent_message_send",
+                    "missing",
+                    crate::agent_messaging::AgentMessagingError::Disabled,
+                )
+                .await;
+        }
+
+        let _ = runtime.quiesce_for_update().await;
+
+        assert!(
+            runtime.agent_message_writer.is_closed(),
+            "the stop ended the writer"
+        );
+        let rows: i64 = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'agent_message_send'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("the rows are readable");
+        assert_eq!(rows, 20, "every queued row was written");
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
         let state = TempDir::new().expect("temporary state directory");

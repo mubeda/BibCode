@@ -853,6 +853,15 @@ impl AgentMessageWriter {
         })
     }
 
+    /// Whether [`Self::close`] ended the writer.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
     /// Refuses new rows, writes every queued one and waits for the writer to end.
     pub(crate) async fn close(&self) {
         self.stop.cancel();
@@ -1647,6 +1656,59 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(activity.recent().await.unwrap().len(), 50);
+    }
+
+    /// An admission that ends while the queue is full still ends: its message's later rows are
+    /// written, not held until another thousand admissions or the shutdown.
+    #[tokio::test]
+    async fn a_stalled_database_never_parks_a_message_whose_admission_ended() {
+        let database = migrated().await;
+        let activity = McpActivity::new(database.clone());
+        let (sink, writer) = agent_message_writer(activity.clone());
+        let admissions = writer.admissions();
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stall = tokio::spawn(async move {
+            database
+                .call(move |_| {
+                    let _ = stalled.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        admissions("m1", true);
+        // The queue fills while the admission runs, so its end finds no room.
+        for index in 0..2 * MESSAGE_QUEUE {
+            sink(message_outcome(
+                "agent_message_send",
+                "accepted",
+                "thread:b",
+                Some(&format!("other-{index}")),
+            ));
+        }
+        admissions("m1", false);
+        release.send(()).unwrap();
+        stall.await.unwrap().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                // Sent again until the draining queue has room for it.
+                sink(message_outcome(
+                    "agent_message_delivery",
+                    "delivered",
+                    "thread:b",
+                    Some("m1"),
+                ));
+                let rows = activity.recent().await.unwrap();
+                if rows.iter().any(|row| row["target"]["messageId"] == "m1") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the delivery row is written, not held behind an ended admission");
+        drop(writer);
     }
 
     /// With the database worker stalled, the sink never blocks its caller and keeps a bounded
