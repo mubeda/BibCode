@@ -170,7 +170,10 @@ pub struct TerminalSessionLaunch<'a> {
 }
 
 /// The variables that carry a launch hook's credentials and where they are sent. No prepared
-/// environment may set them, whatever value the caller supplied.
+/// environment may set them, whatever value the caller supplied. A process of the terminal that
+/// copies the credential into another variable of that terminal gains nothing, since every one
+/// of its processes can already read it; only redirecting the endpoint would, and that is
+/// refused here.
 const SESSION_CREDENTIAL_KEYS: [&str; 4] = [
     crate::open_url::TOKEN_ENV,
     crate::open_url::ENDPOINT_ENV,
@@ -4205,6 +4208,11 @@ impl TerminalManager {
             .inner
             .generations
             .remove_matching(thread_id, terminal_id);
+        // Every ending generation stops being live before any cleanup waits, so no credential of
+        // a terminal still queued for cleanup verifies meanwhile.
+        for generation in &generations {
+            generation.begin_closing();
+        }
         for generation in &generations {
             generation.stop_output().await;
             generation
@@ -4592,6 +4600,10 @@ impl TerminalManager {
         thread_id: &str,
         terminal_id: &str,
     ) -> Option<TerminalGeneration> {
+        // A manager that shuts down ends every terminal it holds.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
         let session = self
             .inner
             .sessions
@@ -4626,7 +4638,11 @@ impl TerminalManager {
             self.inner.attachment_tasks.close();
         }
         self.inner.attachment_tasks.wait().await;
-        for generation in self.inner.generations.remove_all() {
+        let generations = self.inner.generations.remove_all();
+        for generation in &generations {
+            generation.begin_closing();
+        }
+        for generation in generations {
             generation.stop_output().await;
             generation
                 .cancel_and_invalidate(TerminalObserverCancellationReason::Shutdown)
