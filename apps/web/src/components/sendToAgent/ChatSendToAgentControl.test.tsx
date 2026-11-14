@@ -64,6 +64,7 @@ function render(serverSupported = true) {
         serverSupported={serverSupported}
         newPanelProvidersFor={() => []}
         createPanel={createPanel}
+        revealPanel={() => undefined}
         previewContentFor={previewContentFor}
       />,
     ),

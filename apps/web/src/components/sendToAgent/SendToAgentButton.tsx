@@ -261,7 +261,7 @@ function PreviewHost(props: {
 
 type Choose = (choice: SendChoice, hint: OutOfTokensHint | null) => void;
 
-function ActionList(props: SendToAgentButtonProps & { onChoose: Choose }) {
+function ActionList(props: Omit<SendToAgentButtonProps, "onChoose"> & { onChoose: Choose }) {
   return (
     <div data-text-surface="popover">
       {SEND_TO_AGENT_ACTIONS.map(({ action, label }) => {
@@ -287,7 +287,7 @@ function ActionList(props: SendToAgentButtonProps & { onChoose: Choose }) {
 }
 
 function TargetList(
-  props: SendToAgentButtonProps & {
+  props: Omit<SendToAgentButtonProps, "onChoose"> & {
     action: SendChoice["action"];
     actionLabel: string;
     onChoose: Choose;

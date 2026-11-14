@@ -111,7 +111,7 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(564);
+    expect(manifest.fixtures).toHaveLength(566);
     expect(manifest.fixtures).toContain(
       "contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
     );
@@ -128,7 +128,7 @@ describe("RPC wire fixture exporter", () => {
       ]),
     );
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(523);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(525);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));
