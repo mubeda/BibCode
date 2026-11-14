@@ -856,6 +856,7 @@ impl ProductionRuntime {
         crate::agent_messaging::delivery::AgentMessageTracker::start(
             orchestration.clone(),
             None,
+            control.agent_messaging_enabled_signal(),
             agent_message_tracker.clone(),
         );
         // Last before the runtime exists, so a failed start leaves no collector running.

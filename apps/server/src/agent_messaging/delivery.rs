@@ -439,6 +439,13 @@ fn thread_of(event: &OrchestrationEvent) -> Option<&str> {
     .then_some(event.aggregate_id.as_str())
 }
 
+pub(crate) async fn requeue(
+    _engine: &OrchestrationEngine,
+    _message: &AgentMessageRow,
+) -> std::result::Result<bool, AgentMessagingError> {
+    Ok(false)
+}
+
 pub(crate) struct AgentMessageTracker;
 
 impl AgentMessageTracker {
@@ -446,6 +453,7 @@ impl AgentMessageTracker {
     pub(crate) fn start(
         engine: OrchestrationEngine,
         outcomes: Option<OutcomeSink>,
+        _enabled: tokio::sync::watch::Receiver<bool>,
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         // Subscribed before the first reconciliation, so no event between the two is missed.

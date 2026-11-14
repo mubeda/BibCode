@@ -303,6 +303,7 @@ impl Harness {
             crate::agent_messaging::delivery::AgentMessageTracker::start(
                 self.engine.clone(),
                 None,
+                self.messaging_enabled.subscribe(),
                 self.tracker.clone(),
             );
         }

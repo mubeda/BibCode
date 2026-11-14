@@ -3027,3 +3027,370 @@ mod safety_review {
         }
     }
 }
+
+// ---- Task 6.4: ordering and turning messaging off ----
+
+impl Harness {
+    async fn entry_of(&self, message_id: &str) -> String {
+        self.message_row(message_id)
+            .await
+            .delivery_command_id
+            .expect("queue entry")
+    }
+
+    /// Lets B's current turn end and the next one, which takes the promoted entry, end too.
+    async fn b_takes_its_next_turn(&self, turn_id: &str) {
+        self.provider_turn("b", turn_id, "ok", true).await;
+    }
+
+    /// Waits until the message is held for `reason`.
+    async fn until_held_for(&self, message_id: &str, reason: AgentMessageReason) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let row = self.message_row(message_id).await;
+            if row.status.as_str() == "held" && row.reason == Some(reason) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{message_id} reads {} ({:?})",
+                row.status.as_str(),
+                row.reason
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The queue entries that ever carried `message_id` after its first one.
+    async fn requeued_entries(&self, message_id: &str) -> Vec<String> {
+        let prefix = format!("agent-message:{message_id}:%");
+        self.repositories
+            .database()
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT command_id FROM provider_turn_outbox WHERE command_id LIKE ?1 ORDER BY rowid",
+                )?;
+                let rows = statement
+                    .query_map([&prefix], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("entries")
+    }
+
+    async fn is_projected(&self, message_id: String) -> bool {
+        self.repositories
+            .database()
+            .call(move |connection| {
+                Ok(connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projection_thread_messages WHERE message_id = ?1)",
+                    [&message_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("projection")
+    }
+
+    /// Holds the message for `messaging_off` as the tracker would, with no tracker running.
+    async fn hold_untracked(&self, message_id: &str) -> crate::agent_messaging::store::AgentMessageRow {
+        let held_id = message_id.to_owned();
+        self.repositories
+            .database()
+            .call(move |connection| {
+                crate::agent_messaging::store::set_status(
+                    connection,
+                    &held_id,
+                    crate::agent_messaging::store::AgentMessageStatus::Held,
+                    Some(AgentMessageReason::MessagingOff),
+                    CREATED_AT,
+                )
+            })
+            .await
+            .expect("held");
+        self.message_row(message_id).await
+    }
+}
+
+mod ordering {
+    use super::*;
+
+    #[tokio::test]
+    async fn two_senders_one_recipient() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let from_a = harness.sent("a", "thread:b").await;
+        let from_c = harness.sent("p", "thread:b").await;
+        let (entry_a, entry_c) = (
+            harness.entry_of(&from_a).await,
+            harness.entry_of(&from_c).await,
+        );
+
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&entry_a, "delivered").await;
+        assert_eq!(harness.entry_state(&entry_c).await, "queued");
+        harness.b_takes_its_next_turn("turn-b2").await;
+
+        harness.until_entry(&entry_c, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_persons_queued_message_keeps_its_place() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let first = harness.person_queues("b").await;
+        let agent = harness.sent("a", "thread:b").await;
+        let agent = harness.entry_of(&agent).await;
+        let last = harness.person_queues("b").await;
+
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&first, "delivered").await;
+        assert_eq!(harness.entry_state(&agent).await, "queued");
+        harness.b_takes_its_next_turn("turn-b2").await;
+        harness.until_entry(&agent, "delivered").await;
+        assert_eq!(harness.entry_state(&last).await, "queued");
+        harness.b_takes_its_next_turn("turn-b3").await;
+
+        harness.until_entry(&last, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_message_never_overtakes_an_earlier_person_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let person = harness.person_queues("b").await;
+        let agent = harness.sent("a", "thread:b").await;
+        let agent = harness.entry_of(&agent).await;
+
+        harness.b_takes_its_next_turn("turn-b").await;
+
+        harness.until_entry(&person, "delivered").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(harness.entry_state(&agent).await, "queued");
+        harness.shutdown().await;
+    }
+}
+
+mod messaging_off {
+    use super::*;
+
+    #[tokio::test]
+    async fn turned_off_mid_conversation() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        let person = harness.person_queues("b").await;
+
+        harness.messaging_enabled.send_replace(false);
+
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        let row = harness.message_row(&m1).await;
+        harness
+            .until_entry(&row.delivery_command_id.expect("entry"), "dismissed")
+            .await;
+        assert!(
+            !harness
+                .is_projected(row.delivery_message_id.expect("entry"))
+                .await
+        );
+        let off = harness.messaging(false);
+        for (caller, tool, arguments) in [
+            ("a", "agents_list", json!({})),
+            ("a", "agent_message_send", send_arguments("thread:b", "again")),
+            (
+                "b",
+                "agent_message_reply",
+                json!({ "inReplyTo": m1, "text": "ok" }),
+            ),
+            ("a", "agent_message_status", json!({ "messageId": m1 })),
+        ] {
+            let result = run(scope(caller), tool, arguments, Some(&off)).await;
+            assert_eq!(error_tag(&result), "AgentMessagingDisabledError", "{tool}");
+        }
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&person, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn turned_on_again_rejoins_the_end_of_the_queue() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        let first_entry = harness.entry_of(&m1).await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.until_entry(&first_entry, "dismissed").await;
+        let person = harness.person_queues("b").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        let row = harness.until_status(&m1, "queued").await;
+        assert_eq!(row.message_id, m1);
+        let requeued = format!("agent-message:{m1}:1");
+        assert_eq!(row.delivery_command_id.as_deref(), Some(requeued.as_str()));
+        assert_eq!(harness.entry_state(&first_entry).await, "dismissed");
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&person, "delivered").await;
+        assert_eq!(harness.entry_state(&requeued).await, "queued");
+        harness.b_takes_its_next_turn("turn-b2").await;
+        harness.until_entry(&requeued, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn turning_it_on_rechecks_the_ceiling() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.set_mode("a", "auto-accept-edits").await;
+        harness.set_mode("b", "auto-accept-edits").await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.set_mode("b", "full-access").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientModeAboveSender)
+            .await;
+        assert!(harness.requeued_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_deleted_recipient_fails_when_it_returns() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness
+            .engine
+            .dispatch(command(
+                json!({"type": "thread.delete", "commandId": "delete-b", "threadId": "b"}),
+            ))
+            .await
+            .expect("deleted");
+
+        harness.messaging_enabled.send_replace(true);
+
+        let row = harness.until_status(&m1, "failed").await;
+        assert_eq!(row.reason, Some(AgentMessageReason::RecipientGone));
+        assert!(harness.requeued_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_delivered_message_is_untouched_by_turning_messaging_off() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:p").await;
+        harness.until_status(&m1, "delivered").await;
+
+        harness.messaging_enabled.send_replace(false);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let row = harness.message_row(&m1).await;
+        assert_eq!(row.status.as_str(), "delivered");
+        assert_eq!(
+            harness
+                .entry_state(&row.delivery_command_id.expect("entry"))
+                .await,
+            "delivered"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_held_for_the_mode_ceiling_is_requeued_when_the_mode_falls() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.set_mode("a", "auto-accept-edits").await;
+        harness.set_mode("b", "auto-accept-edits").await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        let first_entry = harness.entry_of(&m1).await;
+        harness.set_mode("b", "full-access").await;
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientModeAboveSender)
+            .await;
+        harness.until_entry(&first_entry, "dismissed").await;
+
+        harness.set_mode("b", "auto-accept-edits").await;
+
+        harness.until_status(&m1, "queued").await;
+        assert_eq!(harness.requeued_entries(&m1).await.len(), 1);
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_status(&m1, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_releases_of_one_held_message_make_one_queue_entry() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging_untracked(true);
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let held = harness.hold_untracked(&m1).await;
+
+        let (first, second) = tokio::join!(messaging.requeue(&held), messaging.requeue(&held));
+
+        assert_eq!(
+            [first.expect("first"), second.expect("second")]
+                .iter()
+                .filter(|released| **released)
+                .count(),
+            1
+        );
+        let entries = harness.requeued_entries(&m1).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let row = harness.message_row(&m1).await;
+        assert_eq!(row.delivery_command_id.as_deref(), Some(entries[0].as_str()));
+        assert_eq!(row.status.as_str(), "queued");
+        assert_eq!(
+            harness
+                .entry_state(&held.delivery_command_id.expect("entry"))
+                .await,
+            "dismissed"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_after_a_restart_does_nothing() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging_untracked(true);
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let held = harness.hold_untracked(&m1).await;
+        assert!(messaging.requeue(&held).await.expect("released"));
+        let released = harness.message_row(&m1).await;
+
+        assert!(!messaging.requeue(&held).await.expect("stale"));
+        // A restart's tracker runs its startup reconciliation with messaging on.
+        harness.messaging(true);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(harness.requeued_entries(&m1).await.len(), 1);
+        let row = harness.message_row(&m1).await;
+        assert_eq!(row.delivery_command_id, released.delivery_command_id);
+        assert_eq!(row.status.as_str(), "queued");
+        harness.shutdown().await;
+    }
+}

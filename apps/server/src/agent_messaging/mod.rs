@@ -647,6 +647,19 @@ impl AgentMessaging {
         }))
     }
 
+    /// Puts a held message back at the end of its recipient's queue under a new entry; false
+    /// when it is no longer held on the entry `message` names. See [`delivery::requeue`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the tracker releases through delivery::requeue")
+    )]
+    pub(crate) async fn requeue(
+        &self,
+        message: &AgentMessageRow,
+    ) -> Result<bool, AgentMessagingError> {
+        delivery::requeue(&self.engine, message).await
+    }
+
     pub(crate) fn is_enabled(&self) -> bool {
         *self.enabled.borrow()
     }
