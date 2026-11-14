@@ -1364,3 +1364,220 @@ async fn an_outside_agent_cannot_call_reply_or_status() {
     }
     harness.shutdown().await;
 }
+
+// ---- Review findings on phase 5 ----
+
+impl Harness {
+    /// Stops the harness's own queue service, so each queue step below is the test's.
+    async fn stop_delivery(&self) {
+        self.delivery.shutdown().await;
+    }
+
+    /// Whether `thread_id` has an unbound turn marker for `delivery_message_id`.
+    async fn has_marker(&self, thread_id: &'static str, delivery_message_id: String) -> bool {
+        self.repositories
+            .database()
+            .call(move |connection| {
+                Ok(connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projection_turns WHERE thread_id = ?1 AND pending_message_id = ?2 AND turn_id IS NULL)",
+                    rusqlite::params![thread_id, delivery_message_id],
+                    |row| row.get::<_, bool>(0),
+                )?)
+            })
+            .await
+            .expect("markers")
+    }
+
+    async fn early_delta(&self, thread_id: &str, turn_id: &str) {
+        self.engine
+            .dispatch(command(json!({
+                "type": "thread.message.assistant.delta",
+                "commandId": format!("early-delta-{turn_id}"),
+                "threadId": thread_id, "messageId": format!("early-reply-{turn_id}"),
+                "delta": "Port", "turnId": turn_id, "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("early item");
+    }
+
+    /// The message's row after one full reconciliation, as at startup.
+    async fn reconciled_status(
+        &self,
+        message_id: &str,
+    ) -> crate::agent_messaging::store::AgentMessageRow {
+        crate::agent_messaging::delivery::reconcile_all(&self.engine, None)
+            .await
+            .expect("reconciled");
+        self.message_row(message_id).await
+    }
+
+    /// An accepted send from `caller` to `to` through an untracked service.
+    async fn sent_untracked(&self, caller: &str, to: &str) -> String {
+        let result = run(
+            scope(caller),
+            "agent_message_send",
+            send_arguments(to, "hello"),
+            Some(&self.messaging_untracked(true)),
+        )
+        .await;
+        structured(&result)["messageId"]
+            .as_str()
+            .expect("id")
+            .to_owned()
+    }
+}
+
+#[tokio::test]
+async fn a_person_cannot_steer_a_queued_agent_message_into_a_running_turn() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let message_id = harness.sent("a", "thread:b").await;
+    let row = harness.message_row(&message_id).await;
+    let delivery_message_id = row.delivery_message_id.expect("queue entry");
+    assert_eq!(harness.outbox_states("b").await[0].1, "queued");
+
+    let refused = harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.turn.steer", "commandId": "steer-agent-message", "threadId": "b",
+            "messageId": delivery_message_id, "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect_err("an agent message never steers");
+
+    let refusal = refused.to_string();
+    assert!(
+        refusal.contains("An agent message waits for the running turn to end, so it cannot steer it."),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("hello"), "{refusal}");
+    assert_eq!(harness.outbox_states("b").await[0].1, "queued");
+    assert_eq!(harness.event_count("thread.turn-steer-requested").await, 0);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_early_provider_event_still_ties_the_message_to_its_own_turn() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.provider_turn("a", "turn-a", "done", true).await;
+    harness.stop_delivery().await;
+    let message_id = harness.sent_untracked("b", "thread:a").await;
+    let delivery_message_id = harness
+        .message_row(&message_id)
+        .await
+        .delivery_message_id
+        .expect("queue entry");
+    assert!(harness.has_marker("a", delivery_message_id).await);
+
+    // The provider names the turn in an item before its session reports it running, and both
+    // arrive before the delivery is recorded as complete.
+    harness.early_delta("a", "turn-t").await;
+    harness.provider_turn("a", "turn-t", "Port", false).await;
+    harness
+        .delivery_moves(
+            &message_id,
+            &[("pending", "sending"), ("sending", "delivered")],
+        )
+        .await;
+    let consumed = harness.reconciled_status(&message_id).await;
+    assert_eq!(consumed.status.as_str(), "consumed");
+    assert_eq!(consumed.recipient_turn_id.as_deref(), Some("turn-t"));
+    harness.provider_turn("a", "turn-t", "Port", true).await;
+    assert_eq!(
+        harness.reconciled_status(&message_id).await.status.as_str(),
+        "completed"
+    );
+
+    // An unrelated later turn that fails changes nothing.
+    harness.provider_turn("a", "turn-u", "other", false).await;
+    harness.session_ends("a", "error").await;
+    let row = harness.reconciled_status(&message_id).await;
+    assert_eq!(row.status.as_str(), "completed");
+    assert_eq!(row.recipient_turn_id.as_deref(), Some("turn-t"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_whose_turn_is_unknown_is_never_given_another_turn() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.provider_turn("a", "turn-a", "done", true).await;
+    harness.stop_delivery().await;
+    let message_id = harness.sent_untracked("b", "thread:a").await;
+    harness
+        .delivery_moves(
+            &message_id,
+            &[("pending", "sending"), ("sending", "delivered")],
+        )
+        .await;
+    assert_eq!(
+        harness.reconciled_status(&message_id).await.status.as_str(),
+        "delivered"
+    );
+    // The link to the message's own turn is lost: nothing ties a later turn to it.
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_turns WHERE turn_id IS NULL", [])?;
+            Ok(())
+        })
+        .await
+        .expect("marker removed");
+
+    harness.provider_turn("a", "turn-u", "other", false).await;
+    harness.session_ends("a", "error").await;
+
+    let row = harness.reconciled_status(&message_id).await;
+    assert_eq!(row.status.as_str(), "delivered", "{:?}", row.reason);
+    assert_eq!(row.recipient_turn_id, None);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reply_reports_its_outcome_like_a_send() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("a", "thread:b").await;
+    let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = outcomes.clone();
+    let messaging = harness
+        .messaging_untracked(true)
+        .with_outcomes(std::sync::Arc::new(
+            move |outcome: crate::agent_messaging::MessageOutcome| {
+                sink.lock().expect("outcomes").push(outcome);
+            },
+        ));
+    let reply = |caller: &'static str, text: &str| {
+        messaging.reply(
+            caller,
+            crate::agent_messaging::ReplyRequest {
+                in_reply_to: m1.clone(),
+                text: text.to_owned(),
+                client_request_id: None,
+            },
+        )
+    };
+
+    let accepted = reply("b", "Port 5173").await.expect("reply accepted");
+    assert!(reply("p", "not mine").await.is_err());
+
+    let outcomes = outcomes.lock().expect("outcomes").clone();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    assert_eq!(outcomes[0].tool, "agent_message_reply");
+    assert_eq!(outcomes[0].outcome, "accepted");
+    assert_eq!(outcomes[0].sender_address, "thread:b");
+    assert_eq!(outcomes[0].recipient_address, "thread:a");
+    assert_eq!(
+        outcomes[0].message_id.as_deref(),
+        Some(accepted.message_id.as_str())
+    );
+    assert_eq!(outcomes[0].sender_title.as_deref(), Some("Codex thread"));
+    assert_eq!(outcomes[0].recipient_title.as_deref(), Some("Claude thread"));
+    assert_eq!(outcomes[1].tool, "agent_message_reply");
+    assert_eq!(outcomes[1].outcome, "AgentMessagingUnknownMessageError");
+    assert_eq!(outcomes[1].sender_address, "thread:p");
+    assert!(!format!("{outcomes:?}").contains("Port 5173"));
+    harness.shutdown().await;
+}
