@@ -763,13 +763,30 @@ fn admit_resend_copy_tx(
         params![copy_message_id, row.compaction_id],
     )?;
     let thread_id = row.thread_id.as_str();
+    // The copy is shown as sent by whoever sent the original: the actor the server stamped on
+    // it, such as the agent of an agent message.
+    let actor: Option<String> = transaction
+        .query_row(
+            "SELECT actor_json FROM projection_thread_messages WHERE thread_id = ? AND message_id = ?",
+            params![thread_id, failed_message_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let metadata = match actor {
+        Some(actor) => json!({
+            "actor": serde_json::from_str::<Value>(&actor)
+                .map_err(|error| PersistenceError::Corrupt(error.to_string()))?
+        }),
+        None => json!({}),
+    };
     let user = make_event(
         "thread.message-sent",
         "thread",
         thread_id,
         &occurred_at,
         &copy_command_id,
-        json!({}),
+        metadata.clone(),
         json!({"threadId": thread_id, "messageId": copy_message_id, "role": "user", "text": text, "attachments": attachments, "turnId": null, "streaming": false, "resendOf": failed_message_id, "createdAt": occurred_at, "updatedAt": occurred_at}),
     );
     let mut start_payload = json!({
@@ -791,7 +808,7 @@ fn admit_resend_copy_tx(
         thread_id,
         &occurred_at,
         &copy_command_id,
-        json!({}),
+        metadata.clone(),
         start_payload,
     );
     start.causation_event_id = Some(user.event_id.clone());
@@ -801,7 +818,7 @@ fn admit_resend_copy_tx(
         thread_id,
         &occurred_at,
         &copy_command_id,
-        json!({}),
+        metadata,
         json!({"threadId": thread_id, "messageId": copy_message_id, "state": "pending", "provider": provider_kind, "detail": null, "updatedAt": occurred_at,
             "delivery": delivery_value("pending", &provider_kind, &instance_id, "start", false, None)}),
     );
