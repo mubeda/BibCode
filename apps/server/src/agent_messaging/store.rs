@@ -517,6 +517,32 @@ pub(crate) fn is_agent_message_delivery(
     )?)
 }
 
+/// The hop of the agent message that started the active turn of `sender_thread_id`'s session:
+/// the message whose recorded turn is that turn, or whose queue entry's thread message is the
+/// one that turn's marker bound. `None` when neither exists, as for a turn a person started.
+pub(crate) fn trigger_hop(
+    connection: &rusqlite::Connection,
+    sender_thread_id: &str,
+) -> Result<Option<u32>> {
+    Ok(connection
+        .query_row(
+            "SELECT MAX(message.hop)
+               FROM projection_thread_sessions AS session
+               JOIN agent_messages AS message
+                 ON message.recipient_address = 'thread:' || session.thread_id
+                AND message.sender_kind = 'agent'
+                AND (message.recipient_turn_id = session.active_turn_id
+                     OR message.delivery_message_id IN (
+                          SELECT turn.pending_message_id FROM projection_turns AS turn
+                           WHERE turn.thread_id = session.thread_id AND turn.turn_id = session.active_turn_id))
+              WHERE session.thread_id = ?1 AND session.active_turn_id IS NOT NULL",
+            params![sender_thread_id],
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Whether `thread_id` has a pending approval or an open question, by the rule the promotion
 /// gate applies: an agent message never answers or runs past one (R6, R9).
 pub(crate) fn has_open_ask(connection: &rusqlite::Connection, thread_id: &str) -> Result<bool> {

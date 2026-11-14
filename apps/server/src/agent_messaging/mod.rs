@@ -75,6 +75,8 @@ pub(crate) enum AgentMessagingError {
     },
     /// The sender already used the `clientRequestId` for a different message.
     Conflict,
+    /// The exchange reached the hop limit; a person has to write before agents continue.
+    HopLimit,
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
 }
@@ -89,6 +91,7 @@ impl AgentMessagingError {
             Self::RecipientGone => "AgentMessagingRecipientGoneError",
             Self::ModeCeiling { .. } => "AgentMessagingModeCeilingError",
             Self::Conflict => "AgentMessagingConflictError",
+            Self::HopLimit => "AgentMessagingHopLimitError",
             Self::Storage => "McpStorageError",
         }
     }
@@ -109,6 +112,10 @@ impl AgentMessagingError {
                 "This clientRequestId was already used for a different message. Use a new id."
                     .to_owned()
             }
+            Self::HopLimit => format!(
+                "This exchange has reached the limit of {} agent-to-agent hops. A person has to write in a thread before agents can continue.",
+                policy::HOP_LIMIT
+            ),
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
         }
     }
@@ -316,7 +323,6 @@ impl AgentMessaging {
             message_id: &message_id,
             conversation_id: &original.conversation_id,
             in_reply_to: Some(&original.message_id),
-            // Hop counting is task 6.5's.
             hop: 1,
             text: &request.text,
             client_request_id: request.client_request_id.as_deref(),
@@ -337,6 +343,10 @@ impl AgentMessaging {
                 return Err(AgentMessagingError::RecipientGone);
             }
             route => route?,
+        };
+        let outgoing = Outgoing {
+            hop: self.next_hop(sender_thread_id).await?,
+            ..outgoing
         };
         let receipt = self.deliver(&route, outgoing).await?;
         Ok((receipt, (route.sender.title, route.recipient.title)))
@@ -425,6 +435,10 @@ impl AgentMessaging {
             return Ok((receipt, (String::new(), String::new())));
         }
         let route = self.route(sender_thread_id, recipient_thread_id).await?;
+        let outgoing = Outgoing {
+            hop: self.next_hop(sender_thread_id).await?,
+            ..outgoing
+        };
         let receipt = self.deliver(&route, outgoing).await?;
         Ok((receipt, (route.sender.title, route.recipient.title)))
     }
@@ -603,6 +617,23 @@ impl AgentMessaging {
             status: AgentMessageStatus::Accepted,
             hop: outgoing.hop,
         })
+    }
+
+    /// The hop of a message the agent of `sender_thread_id` sends now, from the message that
+    /// started its turn (R14); `HopLimit` past the limit.
+    async fn next_hop(&self, sender_thread_id: &str) -> Result<u32, AgentMessagingError> {
+        let sender = sender_thread_id.to_owned();
+        let trigger = self
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| store::trigger_hop(connection, &sender))
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "agent messaging could not read the sender's turn");
+                AgentMessagingError::Storage
+            })?;
+        policy::next_hop(trigger)
     }
 
     /// The receipt of the message this sender already stored under `outgoing`'s client

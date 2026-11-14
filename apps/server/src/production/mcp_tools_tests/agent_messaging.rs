@@ -3463,6 +3463,18 @@ mod hop_limit {
             message_id
         }
 
+        async fn message_count(&self) -> i64 {
+            self.repositories
+                .database()
+                .call(|connection| {
+                    Ok(connection.query_row("SELECT COUNT(*) FROM agent_messages", [], |row| {
+                        row.get(0)
+                    })?)
+                })
+                .await
+                .expect("count")
+        }
+
         async fn hop_of(&self, result: &Value) -> u64 {
             assert_ne!(result["isError"], true, "{result}");
             structured(result)["hop"].as_u64().expect("hop")
@@ -3614,14 +3626,14 @@ mod hop_limit {
         assert_eq!(harness.hop_of(&eighth).await, 8);
 
         harness.turn_started_by("a", "turn-a8", 8, true, true).await;
-        let stored = harness.agent_messages().await.len();
+        let stored = harness.message_count().await;
 
         assert_hop_limit(
             &harness
                 .agent_send("a", send_arguments("thread:b", "ping"))
                 .await,
         );
-        assert_eq!(harness.agent_messages().await.len(), stored);
+        assert_eq!(harness.message_count().await, stored);
         harness.shutdown().await;
     }
 

@@ -27,6 +27,20 @@ pub(crate) fn ceiling_allows(sender_mode: &str, recipient_mode: &str) -> bool {
     )
 }
 
+/// The most agent-to-agent hops of one exchange before a person has to write in it (R14).
+pub(crate) const HOP_LIMIT: u32 = 8;
+
+/// The hop of a new agent message, from the hop of the message that started its sender's turn
+/// (`None` when a person or anything else started it): one more, and refused above the limit.
+/// A chain is reset only by a person, never by time.
+pub(crate) fn next_hop(trigger: Option<u32>) -> Result<u32, super::AgentMessagingError> {
+    let hop = trigger.map_or(1, |trigger| trigger.saturating_add(1));
+    if hop > HOP_LIMIT {
+        return Err(super::AgentMessagingError::HopLimit);
+    }
+    Ok(hop)
+}
+
 /// What the claim of a queue entry does with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimDecision {
@@ -157,5 +171,15 @@ mod tests {
         }
         assert!(!ceiling_allows("full-access", "x"));
         assert!(!ceiling_allows("x", "approval-required"));
+    }
+
+    #[test]
+    fn next_hop_counts_from_the_trigger() {
+        assert_eq!(next_hop(None), Ok(1));
+        assert_eq!(next_hop(Some(7)), Ok(8));
+        assert_eq!(
+            next_hop(Some(8)),
+            Err(super::super::AgentMessagingError::HopLimit)
+        );
     }
 }
