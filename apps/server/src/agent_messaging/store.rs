@@ -668,10 +668,28 @@ pub(crate) fn has_open_ask(connection: &rusqlite::Connection, thread_id: &str) -
 
 const TERMINAL_RECIPIENT: &str = "substr(recipient_address, 1, 9) = 'terminal:'";
 
+/// Terminal mail with work left: not final, and consumed mail only until its generation's end is
+/// recorded. Written exactly as the WHERE of `idx_agent_messages_terminal_pending` (migration 76),
+/// so the queries below read only these rows, through that index.
+const TERMINAL_PENDING: &str = "recipient_terminal_generation IS NOT NULL AND (status IN ('accepted', 'queued', 'held', 'delivered') OR (status = 'consumed' AND reason IS NULL))";
+
+/// Whether a terminal's inbox may return `message` now: a person's request always, an agent's
+/// message only while messaging is `enabled` and its sender's mode reaches `full-access`.
+fn inbox_admits(message: &AgentMessageRow, enabled: bool) -> bool {
+    message.sender_kind != SenderKind::Agent
+        || (enabled
+            && message
+                .sender_runtime_mode
+                .as_deref()
+                .is_some_and(|sender| {
+                    super::policy::ceiling_allows(sender, super::pointer::TERMINAL_RECIPIENT_MODE)
+                }))
+}
+
 fn queued_terminal_mail_sql() -> String {
     format!(
         "SELECT {COLUMNS} FROM agent_messages
-          WHERE {TERMINAL_RECIPIENT} AND status = 'queued' AND (sender_kind = 'person' OR ?1)
+          WHERE {TERMINAL_PENDING} AND status = 'queued' AND (sender_kind = 'person' OR ?1)
           ORDER BY rowid"
     )
 }
@@ -685,6 +703,26 @@ pub(crate) fn list_queued_terminal_mail(
     let mut statement = connection.prepare_cached(&queued_terminal_mail_sql())?;
     let rows = statement
         .query_map(params![enabled], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The `queued` mail of `recipient_address`'s generation `generation_key` that its inbox would
+/// return now, in acceptance order: what a pointer may announce.
+pub(crate) fn eligible_terminal_mail(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+    generation_key: &str,
+    enabled: bool,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2 AND status = 'queued'
+          ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![recipient_address, generation_key], decode)?
+        .filter(|row| row.as_ref().map_or(true, |row| inbox_admits(row, enabled)))
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -714,10 +752,10 @@ pub(crate) fn deliver_queued(
 }
 
 /// Moves the mail of `recipient_address`'s generation `generation_key` that its inbox may return
-/// to `consumed`, oldest first, each by a compare and set from the status it was read with, so a
-/// concurrent cancel or fetch has one winner: `queued` and `delivered` rows only, and an agent's
-/// message only while messaging is `enabled` and its sender's mode reaches `full-access`.
-/// Returns the rows it consumed.
+/// ([`inbox_admits`]) to `consumed`, oldest first, in one transaction: each row by a compare and
+/// set from the status it was read with, so a concurrent cancel or fetch has one winner, and an
+/// error leaves every row as it was. `queued` and `delivered` rows only. Returns the rows it
+/// consumed.
 pub(crate) fn consume_for_generation(
     connection: &rusqlite::Connection,
     recipient_address: &str,
@@ -725,7 +763,8 @@ pub(crate) fn consume_for_generation(
     enabled: bool,
     updated_at: &str,
 ) -> Result<Vec<AgentMessageRow>> {
-    let mut select = connection.prepare_cached(&format!(
+    let tx = connection.unchecked_transaction()?;
+    let mut select = tx.prepare_cached(&format!(
         "SELECT {COLUMNS} FROM agent_messages
           WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2
             AND status IN ('queued', 'delivered')
@@ -734,25 +773,14 @@ pub(crate) fn consume_for_generation(
     let waiting = select
         .query_map(params![recipient_address, generation_key], decode)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut consume = connection.prepare_cached(&format!(
+    let mut consume = tx.prepare_cached(&format!(
         "UPDATE agent_messages SET status = 'consumed', reason = NULL, updated_at = ?3
           WHERE message_id = ?1 AND status = ?2
           RETURNING {COLUMNS}"
     ))?;
     let mut consumed = Vec::new();
     for message in waiting {
-        let admitted = message.sender_kind != SenderKind::Agent
-            || (enabled
-                && message
-                    .sender_runtime_mode
-                    .as_deref()
-                    .is_some_and(|sender| {
-                        super::policy::ceiling_allows(
-                            sender,
-                            super::pointer::TERMINAL_RECIPIENT_MODE,
-                        )
-                    }));
-        if !admitted {
+        if !inbox_admits(&message, enabled) {
             continue;
         }
         if let Some(row) = consume
@@ -765,6 +793,8 @@ pub(crate) fn consume_for_generation(
             consumed.push(row);
         }
     }
+    drop((select, consume));
+    tx.commit()?;
     Ok(consumed)
 }
 
@@ -794,17 +824,40 @@ pub(crate) fn fail_unconsumed_for_generation(
     Ok(ids)
 }
 
+/// Records the end of generation `generation_key` of `recipient_address` on the mail its inbox
+/// fetched: `consumed` rows keep their status and take the reason `recipient_gone` (read, then
+/// the terminal went), so the end is never handled again. Returns how many rows it marked.
+pub(crate) fn end_consumed_for_generation(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+    generation_key: &str,
+) -> Result<usize> {
+    Ok(connection.execute(
+        "UPDATE agent_messages SET reason = 'recipient_gone', updated_at = ?3
+          WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2
+            AND status = 'consumed' AND reason IS NULL",
+        params![
+            recipient_address,
+            generation_key,
+            crate::mcp::control::now_iso()
+        ],
+    )?)
+}
+
 fn open_terminal_generations_sql() -> String {
+    // The redundant status list lets the planner search the index by its leading column.
     format!(
         "SELECT recipient_address, recipient_terminal_generation FROM agent_messages
-          WHERE {TERMINAL_RECIPIENT} AND recipient_terminal_generation IS NOT NULL AND {OPEN}
+          WHERE {TERMINAL_PENDING}
+            AND status IN ('accepted', 'queued', 'held', 'delivered', 'consumed')
           GROUP BY recipient_address, recipient_terminal_generation
           ORDER BY MIN(rowid)"
     )
 }
 
-/// Each terminal generation that still has mail whose status is not final, consumed mail
-/// included, as `(recipient address, generation key)`, in acceptance order of its first row.
+/// Each terminal generation with pending mail ([`TERMINAL_PENDING`]), consumed mail whose end
+/// is not recorded included, as `(recipient address, generation key)`, in acceptance order of
+/// its first row.
 pub(crate) fn list_open_terminal_generations(
     connection: &rusqlite::Connection,
 ) -> Result<Vec<(String, String)>> {
