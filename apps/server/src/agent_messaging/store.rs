@@ -176,6 +176,17 @@ pub enum AgentMessageCompanion {
     Relink(RelinkAgentMessage),
 }
 
+impl AgentMessageCompanion {
+    /// Whether the message waits in its recipient's paused queue, its entry held with it.
+    pub(crate) fn is_held(&self) -> bool {
+        let status = match self {
+            Self::Insert(message, _) => message.status,
+            Self::Relink(relink) => relink.status,
+        };
+        status == AgentMessageStatus::Held
+    }
+}
+
 /// Moves a message to a new queue entry, only from the state the caller last read.
 #[derive(Clone, Debug)]
 pub struct RelinkAgentMessage {
@@ -588,8 +599,8 @@ pub(crate) fn is_agent_message_delivery(
 /// The hop the chain of `sender_thread_id` stands at: the hop of the agent message that started
 /// its latest agent-started turn (the message whose recorded turn it is, or whose thread message
 /// its marker names, a marker not yet bound to a turn included), unless a later turn of the
-/// thread started from a message that is not an agent's, which only a person writes. `None`
-/// when no agent message started a turn since. A turn with no known message resets nothing, and
+/// thread started from a signed-in person's message: a stored thread message with no actor.
+/// `None` when no agent message started a turn since. A turn with no known message resets nothing, and
 /// neither does the end of a turn or time (R14); turns are ordered by their row, never by time.
 pub(crate) fn trigger_hop(
     connection: &rusqlite::Connection,
@@ -617,14 +628,28 @@ pub(crate) fn trigger_hop(
                                    WHERE entry.thread_id = later.thread_id
                                      AND entry.message_id = later.pending_message_id
                                      AND entry.state = 'dismissed')
-                   AND NOT EXISTS(SELECT 1 FROM agent_messages AS agent
-                                   WHERE agent.delivery_message_id = later.pending_message_id
-                                     AND agent.sender_kind = 'agent'))",
+                   -- Only a signed-in person's message has no actor; an outside client's or a
+                   -- hosted agent's message keeps the chain (R14).
+                   AND EXISTS(SELECT 1 FROM projection_thread_messages AS sent
+                               WHERE sent.message_id = later.pending_message_id
+                                 AND sent.actor_json IS NULL))",
             params![sender_thread_id],
             |row| row.get::<_, Option<u32>>(0),
         )
         .optional()?
         .flatten())
+}
+
+/// Whether `thread_id`'s queue is paused: an entry a person has not released waits in it, or
+/// its last turn ended in an error or an interrupt. An agent message joins a paused queue held
+/// and never starts a turn (R18).
+pub(crate) fn queue_paused(connection: &rusqlite::Connection, thread_id: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state = 'queued' AND held = 1)
+             OR EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = ?1 AND status IN ('error', 'interrupted'))",
+        params![thread_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Whether `thread_id` has a pending approval or an open question, by the rule the promotion

@@ -70,6 +70,11 @@ impl AdmissionLimits {
     }
 }
 
+/// The detail of the `OrchestrationError::Invariant` that fails an agent message's admission
+/// whose hold no longer matches its recipient's queue: the queue paused, or a person released
+/// it, after the sender read it.
+pub(crate) const QUEUE_PAUSE_CHANGED: &str = "agent-message-queue-pause-changed";
+
 /// The limit that refused an agent message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LimitRefusal {

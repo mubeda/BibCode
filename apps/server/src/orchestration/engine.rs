@@ -4124,6 +4124,12 @@ async fn process_envelope(
         .as_ref()
         .and_then(|value| value.provider_turn.as_ref())
     {
+        // An agent message admitted into a paused queue is published held, as its entry is.
+        let held = turn.state == TurnDeliveryState::Queued
+            && admission
+                .as_ref()
+                .and_then(|value| value.agent_message.as_ref())
+                .is_some_and(AgentMessageCompanion::is_held);
         planned.push(make_event(
             "thread.turn-delivery-updated",
             "thread",
@@ -4136,7 +4142,7 @@ async fn process_envelope(
                 "messageId": turn.message_id,
                 "state": turn_delivery_state_name(turn.state),
                 "provider": turn.provider_kind,
-                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, &turn.provider_instance_id, turn.mode.as_str(), false, None),
+                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, &turn.provider_instance_id, turn.mode.as_str(), held, None),
                 "detail": null,
                 "updatedAt": turn.created_at,
             }),
@@ -6321,24 +6327,6 @@ const AGENT_MESSAGE_WAITS_FOR_ANSWER: &str =
 const AGENT_MESSAGE_NOT_RETRIED: &str =
     "A failed agent message is not sent again. Its sender can send it again.";
 
-/// An agent message admitted into its recipient's paused queue holds its entry there, as the
-/// pause holds every queued entry, so only a person's release sends it (R18).
-fn hold_agent_message_entry(
-    transaction: &Transaction<'_>,
-    status: crate::agent_messaging::store::AgentMessageStatus,
-    command_id: Option<&str>,
-) -> Result<(), PersistenceError> {
-    if status == crate::agent_messaging::store::AgentMessageStatus::Held
-        && let Some(command_id) = command_id
-    {
-        transaction.execute(
-            "UPDATE provider_turn_outbox SET held = 1 WHERE command_id = ? AND state = 'queued'",
-            [command_id],
-        )?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
@@ -6616,9 +6604,22 @@ async fn persist_command(
                     )?;
                 }
                 if let Some(turn) = admission.provider_turn {
+                    // An agent message's hold was decided from a read before this command; the
+                    // queue it joins is checked again here, where commands are serialized, so a
+                    // message neither starts past a paused queue nor sits held in a released one.
+                    let held = match &admission.agent_message {
+                        Some(companion) => {
+                            let held = companion.is_held();
+                            if held !=crate::agent_messaging::store::queue_paused(&transaction, &turn.thread_id)? {
+                                return Ok(Err(crate::agent_messaging::policy::QUEUE_PAUSE_CHANGED));
+                            }
+                            held && turn.state == TurnDeliveryState::Queued
+                        }
+                        None => false,
+                    };
                     transaction.execute(
-                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
-                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at],
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, attempts, last_error, created_at, updated_at, held) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)",
+                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at, held],
                     )?;
                 }
                 // The agent message and its queue entry commit together or not at all.
@@ -6632,14 +6633,12 @@ async fn persist_command(
                             return Ok(Err(refusal.detail()));
                         }
                         crate::agent_messaging::store::insert_message(&transaction, &message)?;
-                        hold_agent_message_entry(&transaction, message.status, message.delivery_command_id.as_deref())?;
                     }
                     Some(AgentMessageCompanion::Relink(relink)) => {
                         let updated_at = event_list.last().map(|event| event.occurred_at.as_str()).unwrap_or_default();
                         if !crate::agent_messaging::store::apply_relink(&transaction, &relink, updated_at)? {
                             return Ok(Err(STALE_AGENT_MESSAGE_RELINK));
                         }
-                        hold_agent_message_entry(&transaction, relink.status, Some(&relink.delivery_command_id))?;
                     }
                     None => {}
                 }

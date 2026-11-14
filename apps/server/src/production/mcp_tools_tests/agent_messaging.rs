@@ -3907,7 +3907,9 @@ mod hop_limit {
             .await
             .expect("queue entry");
         harness.until_entry(&entry, "delivered").await;
-        harness.provider_turn("a", "turn-cli", "working", false).await;
+        harness
+            .provider_turn("a", "turn-cli", "working", false)
+            .await;
 
         assert_hop_limit(
             &harness
@@ -4578,14 +4580,15 @@ mod recovery {
                 .recipient_address
                 .trim_start_matches("thread:")
                 .to_owned();
-            let snapshot = crate::orchestration::load_thread_snapshot(&self.repositories, &thread_id)
-                .await
-                .expect("snapshot")
-                .messages
-                .into_iter()
-                .find(|message| message.message_id == delivered)
-                .expect("the message is in the snapshot")
-                .delivery_held;
+            let snapshot =
+                crate::orchestration::load_thread_snapshot(&self.repositories, &thread_id)
+                    .await
+                    .expect("snapshot")
+                    .messages
+                    .into_iter()
+                    .find(|message| message.message_id == delivered)
+                    .expect("the message is in the snapshot")
+                    .delivery_held;
             let lookup = delivered.clone();
             let (projected, published) = self
                 .repositories
@@ -4681,6 +4684,120 @@ mod recovery {
         assert_eq!(harness.entry_state(&first).await, "queued");
         assert_eq!(harness.message_row(&m1).await.status.as_str(), "held");
         assert_eq!(harness.held_views(&m2).await, [Some(true); 4]);
+        harness.shutdown().await;
+    }
+
+    impl Harness {
+        /// Admits an agent message from A to B straight through the turn starter, with the hold
+        /// a sender decided from an earlier read of B's queue.
+        async fn admit_decided(&self, message_id: &str, held: bool) -> Result<Value, Value> {
+            use crate::agent_messaging::store::{
+                AgentMessageCompanion, AgentMessageStatus, NewAgentMessage, SenderKind,
+            };
+            let command_id = format!("agent-message:{message_id}");
+            let delivery_message_id = uuid::Uuid::new_v4().to_string();
+            let (status, reason) = if held {
+                (
+                    AgentMessageStatus::Held,
+                    Some(AgentMessageReason::RecipientQueueHeld),
+                )
+            } else {
+                (AgentMessageStatus::Accepted, None)
+            };
+            super::super::super::orchestration_rpc::server_turn_starter(
+                self.engine.clone(),
+                self.provider.clone(),
+                self.state_dir.clone(),
+                self.delivery.clone(),
+                None,
+                self.uploads.clone(),
+            )
+            .queue_turn_start(
+                command(json!({
+                    "type": "thread.turn.start", "commandId": command_id, "threadId": "b",
+                    "message": {
+                        "messageId": delivery_message_id, "role": "user",
+                        "text": "hello", "attachments": [],
+                    },
+                    "runtimeMode": "full-access", "interactionMode": "default",
+                    "queued": true, "createdAt": CREATED_AT,
+                })),
+                super::super::super::orchestration_rpc::ServerActor::HostedAgent {
+                    address: "thread:a".to_owned(),
+                    label: "A".to_owned(),
+                },
+                Some(super::super::super::orchestration_rpc::AgentTurn {
+                    companion: AgentMessageCompanion::Insert(
+                        NewAgentMessage {
+                            message_id: message_id.to_owned(),
+                            conversation_id: "c1".to_owned(),
+                            sender_address: "thread:a".to_owned(),
+                            sender_kind: SenderKind::Agent,
+                            recipient_address: "thread:b".to_owned(),
+                            in_reply_to: None,
+                            hop: 1,
+                            text: "hello".to_owned(),
+                            status,
+                            reason,
+                            accepted_at: CREATED_AT.to_owned(),
+                            sender_runtime_mode: Some("full-access".to_owned()),
+                            recipient_terminal_generation: None,
+                            send_request_id: None,
+                            client_request_id: None,
+                            delivery_command_id: Some(command_id),
+                            delivery_message_id: Some(delivery_message_id),
+                        },
+                        None,
+                    ),
+                    force_queue: held,
+                }),
+            )
+            .await
+        }
+    }
+
+    fn pause_changed(result: &Result<Value, Value>) -> bool {
+        result.as_ref().is_err_and(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(|detail| detail.ends_with("agent-message-queue-pause-changed"))
+        })
+    }
+
+    /// Review W1: the queue paused after the sender read it. The admitting transaction refuses
+    /// the stale decision, and nothing of it is stored.
+    #[tokio::test]
+    async fn a_start_decided_before_the_queue_paused_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.session_ends("b", "interrupted").await;
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientQueueHeld)
+            .await;
+        harness.session_ends("b", "ready").await;
+        let rows = harness.agent_messages().await.len();
+        let entries = harness.outbox_states("b").await.len();
+
+        let result = harness.admit_decided("stale-start", false).await;
+
+        assert!(pause_changed(&result), "{result:?}");
+        assert_eq!(harness.agent_messages().await.len(), rows);
+        assert_eq!(harness.outbox_states("b").await.len(), entries);
+        harness.shutdown().await;
+    }
+
+    /// Review W1: a person released the queue after the sender read it paused.
+    #[tokio::test]
+    async fn a_hold_decided_before_the_queue_was_released_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        let result = harness.admit_decided("stale-hold", true).await;
+
+        assert!(pause_changed(&result), "{result:?}");
+        assert!(harness.agent_messages().await.is_empty());
         harness.shutdown().await;
     }
 
