@@ -140,7 +140,7 @@ pub struct PtyExit {
     pub signal: Option<i32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PtySpawnInput {
     pub executable: String,
     pub args: Vec<String>,
@@ -148,6 +148,21 @@ pub struct PtySpawnInput {
     pub cols: u16,
     pub rows: u16,
     pub env: BTreeMap<String, String>,
+}
+
+/// The spawn environment carries the terminal's credential, so only its keys are printed.
+impl fmt::Debug for PtySpawnInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PtySpawnInput")
+            .field("executable", &self.executable)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 pub trait PtyProcess: fmt::Debug + Send + Sync {

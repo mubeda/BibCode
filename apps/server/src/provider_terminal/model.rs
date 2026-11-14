@@ -1307,10 +1307,21 @@ pub trait TerminalLaunchPreparer: Send + Sync {
 }
 
 /// Replacement arguments for a provider terminal command, and environment entries to set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NativeTerminalCommand {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+/// Environment values can carry credentials, so only their keys are printed.
+impl fmt::Debug for NativeTerminalCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeTerminalCommand")
+            .field("args", &self.args)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 pub enum TerminalLaunchPreparation {

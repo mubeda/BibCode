@@ -194,7 +194,7 @@ impl fmt::Debug for ClaudeShimResolution {
 }
 
 /// A launch of a multi-call shim, as the terminal would start it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ClaudeShimRequest<'a> {
     /// The path the terminal invokes, such as `~/.local/share/mise/shims/claude`.
     pub invoked: &'a Path,
@@ -203,6 +203,23 @@ pub struct ClaudeShimRequest<'a> {
     pub cwd: &'a Path,
     pub launch_env: &'a BTreeMap<String, String>,
     pub process_attribution: &'a ProcessAttributionRegistry,
+}
+
+/// The launch environment carries the terminal's credential, so only its keys are printed.
+impl fmt::Debug for ClaudeShimRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeShimRequest")
+            .field("invoked", &self.invoked)
+            .field("manager", &self.manager)
+            .field("cwd", &self.cwd)
+            .field(
+                "launch_env_keys",
+                &self.launch_env.keys().collect::<Vec<_>>(),
+            )
+            .field("process_attribution", &self.process_attribution)
+            .finish()
+    }
 }
 
 /// Finds the real install behind a multi-call shim. Its answer is untrusted: preparation
