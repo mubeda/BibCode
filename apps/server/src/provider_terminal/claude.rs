@@ -4713,4 +4713,131 @@ mod tests {
             Some(TerminalAgentState::Working)
         );
     }
+
+    fn status_only_hook_state(generation: &TerminalObserverGeneration) -> ClaudeHookState {
+        let (requests, _request_receiver) = mpsc::channel(4);
+        ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+            status_session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn authenticated_hook_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert(
+            CLAUDE_HOOK_CORRELATION_HEADER,
+            "correlation".parse().unwrap(),
+        );
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    }
+
+    async fn send_status_hook(state: &ClaudeHookState, body: Body) -> StatusCode {
+        capture_claude_hook(State(state.clone()), authenticated_hook_headers(), body)
+            .await
+            .into_response()
+            .status()
+    }
+
+    fn idle_prompt_hook() -> Value {
+        json!({"hook_event_name":"Notification","session_id":"s","notification_type":"idle_prompt"})
+    }
+
+    #[tokio::test]
+    async fn an_idle_hook_read_before_a_newer_hook_never_restores_readiness() {
+        // Mutation caught: a hook publishing in body-completion order, so an idle_prompt whose
+        // body arrives after a newer prompt, approval or lost hook makes a busy terminal ready.
+        for (newer, newer_state) in [
+            (
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string(),
+                TerminalAgentState::Working,
+            ),
+            (
+                json!({"hook_event_name":"PermissionRequest","session_id":"s"}).to_string(),
+                TerminalAgentState::Blocked,
+            ),
+            ("{".to_owned(), TerminalAgentState::Done),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let status = generation.observation().subscribe_agent_status();
+            let state = status_only_hook_state(&generation);
+            let stop = json!({"hook_event_name":"Stop","session_id":"s"}).to_string();
+            assert_eq!(
+                send_status_hook(&state, Body::from(stop)).await,
+                StatusCode::NO_CONTENT
+            );
+
+            let (idle_body, idle_chunks) =
+                mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+            let idle = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    send_status_hook(
+                        &state,
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                            idle_chunks,
+                        )),
+                    )
+                    .await
+                }
+            });
+            while state.request_permits.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+            send_status_hook(&state, Body::from(newer.clone())).await;
+            idle_body
+                .send(Ok(idle_prompt_hook().to_string().into()))
+                .await
+                .expect("idle body");
+            drop(idle_body);
+            assert_eq!(idle.await.expect("idle hook"), StatusCode::NO_CONTENT);
+
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| (observation.state, observation.ready_for_prompt)),
+                Some((newer_state, false)),
+                "an idle hook older than {newer} restored readiness"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_authenticated_hook_withdraws_readiness() {
+        // Mutation caught: a hook whose body is too large or malformed returning before it
+        // withdraws readiness, so the prompt it carried leaves the terminal ready.
+        for lost in [
+            Body::from(vec![b' '; CLAUDE_HOOK_BODY_LIMIT + 1]),
+            Body::from("{\"hook_event_name\":\"UserPromptSubmit\""),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let status = generation.observation().subscribe_agent_status();
+            let state = status_only_hook_state(&generation);
+            send_status_hook(&state, Body::from(idle_prompt_hook().to_string())).await;
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| observation.ready_for_prompt),
+                Some(true)
+            );
+
+            send_status_hook(&state, lost).await;
+
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| observation.ready_for_prompt),
+                Some(false),
+                "a hook the observer could not read left the terminal ready"
+            );
+        }
+    }
 }
