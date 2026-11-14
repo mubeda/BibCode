@@ -312,6 +312,20 @@ pub(crate) fn apply_relink(
     Ok(changed == 1)
 }
 
+/// The newest reply to `in_reply_to`, in acceptance order.
+pub(crate) fn latest_reply_id(
+    connection: &rusqlite::Connection,
+    in_reply_to: &str,
+) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT message_id FROM agent_messages WHERE in_reply_to = ?1 ORDER BY rowid DESC LIMIT 1",
+            params![in_reply_to],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// Records the recipient's turn that took the message.
 pub(crate) fn set_recipient_turn(
     connection: &rusqlite::Connection,

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_messaging::{AgentMessaging, AgentMessagingError},
-    agent_messaging::{MessageReceipt, SendRequest},
+    agent_messaging::{MessageReceipt, ReplyRequest, SendRequest, StatusReport},
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     mcp::{
         control::{Family, ProgressSink, ToolCall, ToolFuture, ToolSpec, object_schema},
@@ -18,6 +18,8 @@ use crate::{
 pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec::provider("agents_list", SCOPE_ORCHESTRATION_READ).reads(),
     ToolSpec::provider("agent_message_send", SCOPE_ORCHESTRATION_OPERATE),
+    ToolSpec::provider("agent_message_reply", SCOPE_ORCHESTRATION_OPERATE),
+    ToolSpec::provider("agent_message_status", SCOPE_ORCHESTRATION_OPERATE).reads(),
 ];
 
 pub(crate) const FAMILY: Family = Family {
@@ -42,6 +44,10 @@ fn call<'a>(
 const AGENTS_LIST: &str = "List the other agents of your project that you can message: each with its address (thread:<id>), title, provider, kind (chat or terminal), activity status (working, waiting, ready, error, stopped) and canReceive. Your own thread is not listed. Takes no arguments.";
 
 const AGENT_MESSAGE_SEND: &str = "Send a message to another agent of your project (an address from agents_list). It is delivered in an envelope that names you as the sender, after the recipient's running turn ends. Returns at once with messageId, conversationId, status accepted and hop; check progress with agent_message_status. Text of 1 to 16000 characters; clientRequestId is optional.";
+
+const AGENT_MESSAGE_REPLY: &str = "Reply to an agent message you received (inReplyTo is its message-id from the envelope). The reply goes to its sender in the same conversation and returns at once with messageId, conversationId, status and hop. Text of 1 to 16000 characters; clientRequestId is optional.";
+
+const AGENT_MESSAGE_STATUS: &str = "Read the status of a message you sent: accepted, queued, held, delivered, consumed, completed, cancelled or failed, with reason for held and failed, updatedAt, and replyMessageId once the recipient replied. It never waits.";
 
 /// The descriptors a provider's `tools/list` adds for this family.
 pub(crate) fn tool_descriptors() -> Vec<Value> {
@@ -77,7 +83,83 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "openWorldHint": false,
             }),
         ),
+        tool_descriptor(
+            "agent_message_reply",
+            AGENT_MESSAGE_REPLY,
+            object_schema(
+                json!({
+                    "inReplyTo": { "type": "string", "minLength": 1 },
+                    "text": { "type": "string", "minLength": 1, "maxLength": 16000 },
+                    "clientRequestId": { "type": "string", "minLength": 1 },
+                }),
+                &["inReplyTo", "text"],
+            ),
+            json!({
+                "title": "Reply to an agent",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false,
+            }),
+        ),
+        tool_descriptor(
+            "agent_message_status",
+            AGENT_MESSAGE_STATUS,
+            object_schema(
+                json!({ "messageId": { "type": "string", "minLength": 1 } }),
+                &["messageId"],
+            ),
+            json!({
+                "title": "Agent message status",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false,
+            }),
+        ),
     ]
+}
+
+async fn reply(
+    scope: &PreviewScope,
+    arguments: &Value,
+    messaging: &AgentMessaging,
+) -> Result<MessageReceipt, AgentMessagingError> {
+    let object = strict_object(
+        "agent_message_reply",
+        arguments,
+        &["inReplyTo", "text", "clientRequestId"],
+    )?;
+    let request = ReplyRequest {
+        in_reply_to: string_field(object, "inReplyTo", true)?.unwrap_or_default(),
+        text: string_field(object, "text", true)?.unwrap_or_default(),
+        client_request_id: string_field(object, "clientRequestId", false)?,
+    };
+    messaging.reply(&scope.thread_id, request).await
+}
+
+async fn status(
+    scope: &PreviewScope,
+    arguments: &Value,
+    messaging: &AgentMessaging,
+) -> Result<StatusReport, AgentMessagingError> {
+    let object = strict_object("agent_message_status", arguments, &["messageId"])?;
+    let message_id = string_field(object, "messageId", true)?.unwrap_or_default();
+    messaging.status(&scope.thread_id, &message_id).await
+}
+
+fn status_result(report: &StatusReport) -> Value {
+    let mut result = json!({
+        "status": report.status.as_str(),
+        "updatedAt": report.updated_at,
+    });
+    if let Some(reason) = report.reason {
+        result["reason"] = json!(reason.as_str());
+    }
+    if let Some(reply) = &report.reply_message_id {
+        result["replyMessageId"] = json!(reply);
+    }
+    tool_result(result, &[])
 }
 
 fn failure(error: &AgentMessagingError) -> Value {
@@ -182,6 +264,24 @@ pub(crate) async fn run(
             }
             match send(&scope, &arguments, messaging).await {
                 Ok(receipt) => receipt_result(&receipt),
+                Err(error) => failure(&error),
+            }
+        }
+        "agent_message_reply" => {
+            if !messaging.is_enabled() {
+                return failure(&AgentMessagingError::Disabled);
+            }
+            match reply(&scope, &arguments, messaging).await {
+                Ok(receipt) => receipt_result(&receipt),
+                Err(error) => failure(&error),
+            }
+        }
+        "agent_message_status" => {
+            if !messaging.is_enabled() {
+                return failure(&AgentMessagingError::Disabled);
+            }
+            match status(&scope, &arguments, messaging).await {
+                Ok(report) => status_result(&report),
                 Err(error) => failure(&error),
             }
         }

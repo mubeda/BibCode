@@ -19,7 +19,10 @@ use crate::{
 };
 use directory::AgentSummary;
 use envelope::{EnvelopeInput, build_envelope};
-use store::{AgentMessageCompanion, AgentMessageStatus, NewAgentMessage, SenderKind};
+use store::{
+    AgentMessageCompanion, AgentMessageReason, AgentMessageRow, AgentMessageStatus,
+    NewAgentMessage, SenderKind,
+};
 
 /// The longest message text, counted in Unicode scalar values.
 const AGENT_MESSAGE_MAX_CHARACTERS: usize = 16_000;
@@ -60,6 +63,10 @@ pub(crate) enum AgentMessagingError {
     Disabled,
     UnknownRecipient,
     InvalidArgument(String),
+    /// A message that does not exist or that the caller may not use: one answer for both.
+    UnknownMessage,
+    /// The agent a reply would go to no longer exists.
+    RecipientGone,
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
 }
@@ -70,6 +77,8 @@ impl AgentMessagingError {
             Self::Disabled => "AgentMessagingDisabledError",
             Self::UnknownRecipient => "AgentMessagingUnknownRecipientError",
             Self::InvalidArgument(_) => "AgentMessagingInvalidArgumentError",
+            Self::UnknownMessage => "AgentMessagingUnknownMessageError",
+            Self::RecipientGone => "AgentMessagingRecipientGoneError",
             Self::Storage => "McpStorageError",
         }
     }
@@ -79,6 +88,10 @@ impl AgentMessagingError {
             Self::Disabled => DISABLED_MESSAGE.to_owned(),
             Self::UnknownRecipient => UNKNOWN_RECIPIENT_MESSAGE.to_owned(),
             Self::InvalidArgument(detail) => detail.clone(),
+            Self::UnknownMessage => "No message with that id that you may use.".to_owned(),
+            Self::RecipientGone => {
+                "The agent that sent that message is gone, so it cannot get a reply.".to_owned()
+            }
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
         }
     }
@@ -89,6 +102,22 @@ pub(crate) struct SendRequest {
     pub(crate) to: String,
     pub(crate) text: String,
     pub(crate) client_request_id: Option<String>,
+}
+
+/// A reply to a message the caller received; it goes to that message's sender.
+pub(crate) struct ReplyRequest {
+    pub(crate) in_reply_to: String,
+    pub(crate) text: String,
+    pub(crate) client_request_id: Option<String>,
+}
+
+/// A message's status as stored, for its sender.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusReport {
+    pub(crate) status: AgentMessageStatus,
+    pub(crate) reason: Option<AgentMessageReason>,
+    pub(crate) updated_at: String,
+    pub(crate) reply_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +231,98 @@ impl AgentMessaging {
             });
         }
         result.map(|(receipt, _)| receipt)
+    }
+
+    /// Replies to `request.in_reply_to`, a message the agent of `sender_thread_id` received:
+    /// the reply goes to that message's sender, in the same conversation. It returns at once.
+    pub(crate) async fn reply(
+        &self,
+        sender_thread_id: &str,
+        request: ReplyRequest,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
+        if !self.is_enabled() {
+            return Err(AgentMessagingError::Disabled);
+        }
+        let original = self
+            .message(&request.in_reply_to)
+            .await?
+            .filter(|message| message.recipient_address == format!("thread:{sender_thread_id}"))
+            .ok_or(AgentMessagingError::UnknownMessage)?;
+        let recipient_thread_id = original
+            .sender_address
+            .strip_prefix("thread:")
+            .ok_or(AgentMessagingError::RecipientGone)?;
+        let route = match self.route(sender_thread_id, recipient_thread_id).await {
+            Err(AgentMessagingError::UnknownRecipient) => {
+                return Err(AgentMessagingError::RecipientGone);
+            }
+            route => route?,
+        };
+        check_text(&request.text)?;
+        let message_id = Uuid::new_v4().to_string();
+        self.deliver(
+            &route,
+            Outgoing {
+                message_id: &message_id,
+                conversation_id: &original.conversation_id,
+                in_reply_to: Some(&original.message_id),
+                // Hop counting is task 6.5's.
+                hop: 1,
+                text: &request.text,
+                client_request_id: request.client_request_id.as_deref(),
+            },
+        )
+        .await
+    }
+
+    /// The stored status of a message the agent of `caller_thread_id` sent. Any other message,
+    /// one it received included, reads exactly as a message that does not exist.
+    pub(crate) async fn status(
+        &self,
+        caller_thread_id: &str,
+        message_id: &str,
+    ) -> Result<StatusReport, AgentMessagingError> {
+        if !self.is_enabled() {
+            return Err(AgentMessagingError::Disabled);
+        }
+        let message = self
+            .message(message_id)
+            .await?
+            .filter(|message| message.sender_address == format!("thread:{caller_thread_id}"))
+            .ok_or(AgentMessagingError::UnknownMessage)?;
+        let in_reply_to = message.message_id.clone();
+        let reply_message_id = self
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| store::latest_reply_id(connection, &in_reply_to))
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "agent_message_status could not read replies");
+                AgentMessagingError::Storage
+            })?;
+        Ok(StatusReport {
+            status: message.status,
+            reason: message.reason,
+            updated_at: message.updated_at,
+            reply_message_id,
+        })
+    }
+
+    async fn message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<AgentMessageRow>, AgentMessagingError> {
+        let message_id = message_id.to_owned();
+        self.engine
+            .repositories()
+            .database()
+            .call(move |connection| store::get_message(connection, &message_id))
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "agent messaging could not read a message");
+                AgentMessagingError::Storage
+            })
     }
 
     /// The receipt and the two thread titles of an accepted send.

@@ -662,7 +662,8 @@ impl Harness {
 
     /// Moves the message's queue entry through `steps`, as the turn queue would. The harness's
     /// own queue service may promote or claim the entry first: a step waits until the entry
-    /// is in its `from` state and is skipped when the entry already reached its `to` state.
+    /// is in its `from` state and is skipped when the entry already reached or passed its `to`
+    /// state.
     async fn delivery_moves(&self, message_id: &str, steps: &[(&str, &str)]) {
         let row = self.message_row(message_id).await;
         let command_id = row.delivery_command_id.expect("queue entry");
@@ -684,7 +685,21 @@ impl Harness {
                     .await
                     .expect("readable")
                     .expect("queue entry");
-                if entry.state == state(to) {
+                let rank = |state: &TurnDeliveryState| {
+                    [
+                        TurnDeliveryState::Queued,
+                        TurnDeliveryState::Pending,
+                        TurnDeliveryState::Sending,
+                        TurnDeliveryState::Delivered,
+                    ]
+                    .iter()
+                    .position(|step| step == state)
+                };
+                let reached = match (rank(&entry.state), rank(&state(to))) {
+                    (Some(now), Some(target)) => now >= target,
+                    _ => entry.state == state(to),
+                };
+                if reached {
                     break;
                 }
                 if entry.state == state(from)
@@ -1123,5 +1138,233 @@ async fn startup_reconciliation_repairs_a_missed_event() {
         harness.message_row(&message_id).await.status.as_str(),
         "completed"
     );
+    harness.shutdown().await;
+}
+
+// ---- Task 5.6: reply, correlation and status ----
+
+impl Harness {
+    async fn agent_tool(&self, caller: &str, tool: &str, arguments: Value) -> Value {
+        run(scope(caller), tool, arguments, Some(&self.messaging(true))).await
+    }
+
+    async fn reply(&self, caller: &str, in_reply_to: &str, text: &str) -> Value {
+        self.agent_tool(
+            caller,
+            "agent_message_reply",
+            json!({ "inReplyTo": in_reply_to, "text": text }),
+        )
+        .await
+    }
+
+    async fn status_of(&self, caller: &str, message_id: &str) -> Value {
+        self.agent_tool(
+            caller,
+            "agent_message_status",
+            json!({ "messageId": message_id }),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn round_trip_across_two_providers() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    // B (Codex) finishes its own turn first, so A's message starts B's next one.
+    harness.provider_turn("b", "turn-b", "working", true).await;
+    let m1 = harness.sent("a", "thread:b").await;
+    harness
+        .provider_turn("b", "turn-b2", "Looking", false)
+        .await;
+    harness.until_status(&m1, "consumed").await;
+
+    let started = std::time::Instant::now();
+    let reply = harness.reply("b", &m1, "Port 5173").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the reply call returns at once"
+    );
+    assert_ne!(reply["isError"], true, "{reply}");
+    let reply_id = structured(&reply)["messageId"]
+        .as_str()
+        .expect("reply id")
+        .to_owned();
+    let original = harness.message_row(&m1).await;
+    assert_eq!(
+        structured(&reply)["conversationId"],
+        original.conversation_id
+    );
+    assert_ne!(reply_id, m1);
+
+    let stored = harness.message_row(&reply_id).await;
+    assert_eq!(stored.sender_address, "thread:b");
+    assert_eq!(stored.recipient_address, "thread:a");
+    assert_eq!(stored.in_reply_to.as_deref(), Some(m1.as_str()));
+    assert_eq!(stored.conversation_id, original.conversation_id);
+    let (text, _) = harness
+        .projected_message(stored.delivery_message_id.clone().expect("queued"))
+        .await;
+    assert!(text.contains("\n  Port 5173\n"), "{text}");
+    assert!(text.contains(&format!("in-reply-to: {m1}\n")), "{text}");
+    assert!(
+        text.contains(&format!("conversation-id: {}\n", original.conversation_id)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("message-id: {reply_id}\n")),
+        "{text}"
+    );
+    assert!(text.contains("address: thread:b\n"), "{text}");
+    // A's thread starts a turn with the reply.
+    harness.provider_turn("a", "turn-a", "Thanks", false).await;
+    let consumed = harness.until_status(&reply_id, "consumed").await;
+    assert_eq!(consumed.recipient_turn_id.as_deref(), Some("turn-a"));
+
+    harness.provider_turn("b", "turn-b2", "Looking", true).await;
+    harness.until_status(&m1, "completed").await;
+    let status = harness.status_of("a", &m1).await;
+    assert_eq!(structured(&status)["status"], "completed", "{status}");
+    assert_eq!(structured(&status)["replyMessageId"], reply_id.as_str());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reply_to_a_message_that_was_not_yours() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("a", "thread:b").await;
+
+    let result = harness.reply("p", &m1, "I am not b").await;
+
+    assert_eq!(error_tag(&result), "AgentMessagingUnknownMessageError");
+    assert_eq!(
+        result["structuredContent"]["error"]["message"],
+        "No message with that id that you may use."
+    );
+    assert_eq!(harness.agent_messages().await.len(), 1);
+    assert!(harness.outbox_states("a").await.is_empty());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn only_the_sender_may_ask() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("a", "thread:b").await;
+
+    let not_sender = harness.status_of("p", &m1).await;
+    let made_up = harness.status_of("p", "no-such-message").await;
+    let recipient = harness.status_of("b", &m1).await;
+
+    assert_eq!(error_tag(&not_sender), "AgentMessagingUnknownMessageError");
+    assert_eq!(not_sender, made_up, "C learns nothing about m1");
+    assert_eq!(recipient, made_up, "the recipient may not read it either");
+    let sender = harness.status_of("a", &m1).await;
+    assert_ne!(sender["isError"], true, "{sender}");
+    assert!(structured(&sender)["updatedAt"].is_string());
+    assert!(structured(&sender).get("replyMessageId").is_none());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_later_reply_is_accepted() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("a", "thread:b").await;
+    let first = harness.reply("b", &m1, "first").await;
+    assert_ne!(first["isError"], true, "{first}");
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE agent_messages SET accepted_at = '2026-11-13T23:00:00Z'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("an hour earlier");
+
+    let second = harness.reply("b", &m1, "second").await;
+
+    assert_ne!(second["isError"], true, "{second}");
+    let status = harness.status_of("a", &m1).await;
+    assert_eq!(
+        structured(&status)["replyMessageId"],
+        structured(&second)["messageId"],
+        "the newest reply"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reply_to_a_deleted_sender_fails_with_recipient_gone() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("p", "thread:b").await;
+    harness
+        .engine
+        .dispatch(command(
+            json!({"type": "thread.delete", "commandId": "delete-p", "threadId": "p"}),
+        ))
+        .await
+        .expect("deleted");
+
+    let result = harness.reply("b", &m1, "too late").await;
+
+    assert_eq!(error_tag(&result), "AgentMessagingRecipientGoneError");
+    assert_eq!(harness.agent_messages().await.len(), 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reply_has_its_own_text_limits() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let m1 = harness.sent("a", "thread:b").await;
+
+    for text in [String::new(), "x".repeat(16_001)] {
+        let result = harness.reply("b", &m1, &text).await;
+        assert_eq!(
+            error_tag(&result),
+            "AgentMessagingInvalidArgumentError",
+            "{} characters",
+            text.len()
+        );
+    }
+    let result = harness
+        .agent_tool(
+            "b",
+            "agent_message_reply",
+            json!({ "inReplyTo": m1, "text": "ok", "from": "thread:x" }),
+        )
+        .await;
+    assert_eq!(error_tag(&result), "AgentMessagingInvalidArgumentError");
+    assert_eq!(harness.agent_messages().await.len(), 1, "no reply stored");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_outside_agent_cannot_call_reply_or_status() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+
+    for (tool, arguments) in [
+        (
+            "agent_message_reply",
+            json!({ "inReplyTo": "m1", "text": "hi" }),
+        ),
+        ("agent_message_status", json!({ "messageId": "m1" })),
+        (
+            "agent_message_send",
+            json!({ "to": "thread:b", "text": "hi" }),
+        ),
+    ] {
+        let result = harness.call(&agent, tool, arguments).await;
+        assert_eq!(error_tag(&result), "McpScopeError", "{tool}: {result}");
+    }
     harness.shutdown().await;
 }
