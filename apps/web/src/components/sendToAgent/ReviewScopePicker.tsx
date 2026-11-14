@@ -60,9 +60,8 @@ const pickedKinds = new Map<string, CodeReviewScope["kind"]>();
 
 function resolveScope(
   options: ReadonlyArray<ReviewScopeOption>,
-  pickKey: string,
+  picked: CodeReviewScope["kind"] | undefined,
 ): CodeReviewScope | null {
-  const picked = pickedKinds.get(pickKey);
   const option =
     options.find((entry) => entry.scope.kind === picked && entry.disabledReason === null) ??
     options.find((entry) => entry.isDefault);
@@ -72,10 +71,11 @@ function resolveScope(
 function ReviewScopeSection(props: {
   options: ReadonlyArray<ReviewScopeOption>;
   pickKey: string;
+  chosen: { kind: CodeReviewScope["kind"] | undefined };
   leadInFor: (scope: CodeReviewScope) => string;
 }) {
-  const { options, pickKey, leadInFor } = props;
-  const [kind, setKind] = useState(() => resolveScope(options, pickKey)?.kind ?? null);
+  const { options, pickKey, chosen, leadInFor } = props;
+  const [kind, setKind] = useState(() => resolveScope(options, chosen.kind)?.kind ?? null);
   const scope = options.find((option) => option.scope.kind === kind)?.scope ?? null;
   return (
     <div className="flex flex-col gap-3">
@@ -84,6 +84,7 @@ function ReviewScopeSection(props: {
         value={scope}
         onChange={(next) => {
           pickedKinds.set(pickKey, next.kind);
+          chosen.kind = next.kind;
           setKind(next.kind);
         }}
       />
@@ -105,11 +106,15 @@ export function buildReviewPreviewContent(input: {
   contentFor: (scope: CodeReviewScope) => PreviewContent;
 }): PreviewContent {
   const { options, pickKey, contentFor } = input;
-  const initial = resolveScope(options, pickKey);
+  // The scope belongs to this preview: the remembered pick only seeds it, so a send finishing
+  // late for an earlier preview cannot change what this one submits.
+  const chosen = { kind: pickedKinds.get(pickKey) };
+  const initial = resolveScope(options, chosen.kind);
   const extraContent = (
     <ReviewScopeSection
       options={options}
       pickKey={pickKey}
+      chosen={chosen}
       leadInFor={(scope) => contentFor(scope).leadIn}
     />
   );
@@ -129,10 +134,13 @@ export function buildReviewPreviewContent(input: {
     extraContent,
     warning: contentFor(initial).warning ?? null,
     submit: async (draft) => {
-      const scope = resolveScope(options, pickKey) ?? initial;
+      const scope = resolveScope(options, chosen.kind) ?? initial;
       const content = contentFor(scope);
       const outcome = await content.submit!({ ...draft, leadIn: content.leadIn });
-      if (outcome.kind === "sent") pickedKinds.delete(pickKey);
+      // Forget the pick only while it is still the one this send used.
+      if (outcome.kind === "sent" && pickedKinds.get(pickKey) === scope.kind) {
+        pickedKinds.delete(pickKey);
+      }
       return outcome;
     },
   };
