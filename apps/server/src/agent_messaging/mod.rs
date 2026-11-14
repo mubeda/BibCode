@@ -3,6 +3,7 @@
 //! of its credential, never an argument, and it reaches only agents of its own project.
 
 pub(crate) mod directory;
+pub(crate) mod envelope;
 pub mod store;
 
 use tokio::sync::watch;
