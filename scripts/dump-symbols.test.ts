@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   DumpSymbolsError,
   assertUsableSymbols,
+  countStackRecords,
+  dumpSymbols,
   parseDumpSymbolsArguments,
   symbolStorePath,
   writeZip,
@@ -128,5 +130,105 @@ describe("dump-symbols", () => {
     expect(zip.readUInt32LE(end)).toBe(0x06054b50);
     expect(zip.readUInt16LE(end + 10)).toBe(1);
     expect(zip.readUInt32LE(zip.readUInt32LE(end + 16))).toBe(0x02014b50);
+  });
+  it("counts STACK records at the start of the file and after a newline", () => {
+    const sym =
+      "STACK CFI INIT 1000 20 .cfa: $rsp 8 +\nFUNC 1000 20 0 f\nSTACK CFI 1004 .cfa: $rsp 16 +\n";
+    expect(countStackRecords(sym)).toBe(2);
+    expect(countStackRecords(Buffer.from(sym))).toBe(2);
+    expect(countStackRecords("FUNC 1000 20 0 not_a_STACK record\n")).toBe(0);
+  });
+
+  // A stand-in for dump_syms: the first run (with --store) and the binary-only rerun each write
+  // the configured .sym and standard error, and every invocation is recorded.
+  const CFI_ERROR =
+    "[ERROR] CFI: CfiError { kind: BadDebugInfo, source: Some(UnknownVersion(0)) }\n";
+  const withStack = (count: number) =>
+    LINUX_SYM + "STACK CFI 1004 .cfa: $rsp 16 +\n".repeat(count - 1);
+  function fakeDumpSyms(runs: {
+    readonly stored: { readonly sym: string; readonly stderr?: string };
+    readonly binaryOnly?: { readonly sym: string; readonly stderr?: string };
+  }) {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-fake-dump-syms-"));
+    temporaryRoots.push(root);
+    const calls = NodePath.join(root, "calls.log");
+    const tool = NodePath.join(root, "dump_syms");
+    NodeFS.writeFileSync(
+      tool,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        `const runs = ${JSON.stringify(runs)};`,
+        "const args = process.argv.slice(2);",
+        `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+        'const run = args.includes("--store") ? runs.stored : runs.binaryOnly;',
+        'fs.writeFileSync(args[args.indexOf("--output") + 1], run.sym);',
+        'process.stderr.write(run.stderr ?? "");',
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const binary = NodePath.join(root, "bibcode-desktop-1234");
+    NodeFS.writeFileSync(binary, "binary");
+    const dwarf = NodePath.join(root, "app.dSYM", "Contents", "Resources", "DWARF");
+    NodeFS.mkdirSync(dwarf, { recursive: true });
+    NodeFS.writeFileSync(NodePath.join(dwarf, "bibcode_desktop-1234"), "dwarf");
+    const input = { binary, moduleName: "bibcode-desktop", out: NodePath.join(root, "symbols") };
+    return {
+      tool,
+      input,
+      withDsym: { ...input, dsym: NodePath.join(root, "app.dSYM") },
+      calls: () =>
+        NodeFS.readFileSync(calls, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as string[]),
+    };
+  }
+  // The stand-in is a shebang script, which Windows cannot spawn without a shell.
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- A standalone script test samples its host once to skip a POSIX-only stand-in.
+  const onPosix = it.skipIf(NodeOS.platform() === "win32");
+
+  onPosix("runs dump_syms once when it reports nothing", () => {
+    const fake = fakeDumpSyms({ stored: { sym: withStack(3) } });
+    expect(dumpSymbols(fake.withDsym, fake.tool)).toContain("crash-smoke.sym");
+    expect(fake.calls()).toHaveLength(1);
+  });
+
+  onPosix("accepts an error that the binary alone does not produce: it came from the dSYM", () => {
+    const fake = fakeDumpSyms({
+      stored: { sym: withStack(3), stderr: CFI_ERROR },
+      binaryOnly: { sym: withStack(3) },
+    });
+    expect(dumpSymbols(fake.withDsym, fake.tool)).toContain("crash-smoke.sym");
+    const [, rerun] = fake.calls();
+    // One input, the staged binary under its shipped name, and no --store.
+    expect(rerun).not.toContain("--store");
+    expect(rerun?.filter((argument) => argument.endsWith("bibcode-desktop"))).toHaveLength(1);
+  });
+
+  onPosix("fails when the binary alone reports the error too", () => {
+    const fake = fakeDumpSyms({
+      stored: { sym: withStack(3), stderr: CFI_ERROR },
+      binaryOnly: { sym: withStack(3), stderr: CFI_ERROR },
+    });
+    expect(() => dumpSymbols(fake.withDsym, fake.tool)).toThrow(
+      "dump_syms reported an error while reading the unwind tables of the binary",
+    );
+  });
+
+  onPosix("fails when the stored symbols hold fewer STACK records than the binary", () => {
+    const fake = fakeDumpSyms({
+      stored: { sym: withStack(3), stderr: CFI_ERROR },
+      binaryOnly: { sym: withStack(5) },
+    });
+    expect(() => dumpSymbols(fake.withDsym, fake.tool)).toThrow(
+      "the stored symbols hold 3 STACK records, the binary 5",
+    );
+  });
+
+  onPosix("fails on an error it cannot attribute: there is no dSYM to set aside", () => {
+    const fake = fakeDumpSyms({ stored: { sym: withStack(3), stderr: CFI_ERROR } });
+    expect(() => dumpSymbols(fake.input, fake.tool)).toThrow("dump_syms reported an error");
+    expect(fake.calls()).toHaveLength(1);
   });
 });

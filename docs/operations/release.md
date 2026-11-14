@@ -160,6 +160,15 @@ builds, so `dump_syms` reads the symbols before they are removed:
 - `RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1` on Linux, so the debug ID that
   minidumps and symbols share never depends on the linker's default.
 
+On macOS `dump_syms` can log `[ERROR] CFI: CfiError { kind: BadDebugInfo, ... }` and still
+exit 0: the dSYM's DWARF file carries an `__unwind_info` section header with no data behind it,
+and the unwind records come from the binary alone. The same line would appear if the binary's
+own unwind tables failed to parse, and then the records stop at the failing entry. So when
+`dump_syms` logs an error, `scripts/dump-symbols.ts` dumps the binary alone once more: it fails
+if that run logs an error too, if the stored file holds a different number of `STACK` records,
+or if there was no dSYM to set aside, and otherwise prints that the binary's records are all
+stored (#364).
+
 The desktop jobs run `scripts/build-desktop-artifact.ts --symbols`:
 `tauri build --no-bundle`, then `scripts/dump-symbols.ts`, then the strip, then
 `tauri bundle`. The Tauri CLI's bundle step does not run Cargo, and must not:
