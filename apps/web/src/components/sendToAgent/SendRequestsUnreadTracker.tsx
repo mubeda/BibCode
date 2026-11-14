@@ -66,16 +66,15 @@ function EnvironmentUnreadTracker(props: { readonly environmentId: EnvironmentId
     }
   }, [keys, markRead, markUnread]);
 
-  // Forget the opened ids of requests that left this list. An id never seen here stays, because a
-  // request on a page that has not arrived yet is not gone.
-  const seen = useRef(new Set<string>());
+  // Forget the opened ids of dismissed requests. A request missing from the list is not gone: a
+  // replacement snapshot carries only the first page, and the list cannot tell that from a removal.
   useEffect(() => {
-    const current = new Set(requests.map((request) => request.requestId));
-    const gone = [...seen.current].filter((id) => !current.has(id));
-    seen.current = current;
-    if (gone.length === 0) return;
+    const retired = new Set(
+      requests.filter((request) => request.dismissedAt !== null).map((request) => request.requestId),
+    );
+    if (retired.size === 0) return;
     const { openedIds: opened, keepOnly } = useSendRequestOpenedStore.getState();
-    keepOnly(opened.filter((id) => !gone.includes(id)));
+    if (opened.some((id) => retired.has(id))) keepOnly(opened.filter((id) => !retired.has(id)));
   }, [requests]);
   return null;
 }
