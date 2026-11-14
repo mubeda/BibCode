@@ -1401,6 +1401,9 @@ async fn run_codex_observer_inner(
     // The left panel learns the root agent's state as soon as the observer attaches (#187).
     if let Some((state, failed)) = codex_resumed_agent_status(resumed.thread.status.as_ref()) {
         generation.publish_agent_status(state, failed);
+        if codex_resumed_ready_for_prompt(resumed.thread.status.as_ref()) {
+            generation.mark_ready_for_prompt();
+        }
     }
 
     let initial_state = *activity.borrow_and_update();
@@ -1823,6 +1826,9 @@ async fn run_codex_observer_inner(
                 // says (#187).
                 if let Some(report) = codex_root_agent_status(&envelope, &root) {
                     generation.report_agent_status(report);
+                    if codex_root_ready_for_prompt(&envelope, &root) {
+                        generation.mark_ready_for_prompt();
+                    }
                 }
                 let desired = inner.activity.snapshot();
                 if live_state != Some(desired)
@@ -2007,6 +2013,9 @@ async fn reconnect_attached_codex_client(
         .and_then(|status| serde_json::from_value::<ReconciliationThreadStatus>(status).ok());
     if let Some((state, failed)) = codex_resumed_agent_status(status.as_ref()) {
         generation.publish_agent_status(state, failed);
+        if codex_resumed_ready_for_prompt(status.as_ref()) {
+            generation.mark_ready_for_prompt();
+        }
     }
     Some(client)
 }
@@ -2275,6 +2284,18 @@ pub(super) fn codex_root_agent_status(envelope: &Value, root: &str) -> Option<Te
         _ if method.starts_with("item/") => Some(TerminalAgentReport::Progress),
         _ => None,
     }
+}
+
+/// Whether a Codex notification says the TUI waits for a prompt: the root thread went idle or
+/// its turn completed without failing.
+pub(super) fn codex_root_ready_for_prompt(envelope: &Value, root: &str) -> bool {
+    codex_root_agent_status(envelope, root)
+        == Some(TerminalAgentReport::Set(TerminalAgentState::Done, false))
+}
+
+/// Whether a `thread/resume` response says the TUI waits for a prompt: the root thread is idle.
+pub(super) fn codex_resumed_ready_for_prompt(status: Option<&ReconciliationThreadStatus>) -> bool {
+    matches!(status, Some(ReconciliationThreadStatus::Idle))
 }
 
 /// The root agent's state a `thread/resume` response reports, for the left panel (#187).

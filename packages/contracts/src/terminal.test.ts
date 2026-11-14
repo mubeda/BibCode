@@ -8,6 +8,7 @@ import {
   TERMINAL_LAUNCH_EXECUTABLE_MAX_LENGTH,
   TERMINAL_LAUNCH_LABEL_MAX_LENGTH,
   ProviderTerminalActivityLaunch,
+  TerminalAgentStatus,
   TerminalAttachInput,
   TerminalAttachStreamEvent,
   TerminalClearInput,
@@ -834,6 +835,18 @@ describe("TerminalEvent", () => {
         data: "ready\n",
       }).type,
     ).toBe("output");
+  });
+});
+
+describe("TerminalAgentStatus", () => {
+  it("decodes readyForPrompt, and reads a status without it as not ready", () => {
+    expect(
+      decodeSync(TerminalAgentStatus, { state: "done", failed: false, readyForPrompt: true })
+        .readyForPrompt,
+    ).toBe(true);
+    const older = decodeSync(TerminalAgentStatus, { state: "done", failed: false });
+    expect(older.readyForPrompt ?? false).toBe(false);
+    expect(decodes(TerminalAgentStatus, { state: "done", readyForPrompt: "yes" })).toBe(false);
   });
 });
 

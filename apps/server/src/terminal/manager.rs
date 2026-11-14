@@ -380,6 +380,7 @@ impl SessionAgentStatus {
                     .format(&Rfc3339)
                     .ok()
             }),
+            ready_for_prompt: observation.is_some_and(|observation| observation.ready_for_prompt),
         }
     }
 }
@@ -3289,6 +3290,7 @@ impl TerminalManager {
                 if published.is_some_and(|previous| {
                     previous.state == observation.state
                         && previous.failed == observation.failed
+                        && previous.ready_for_prompt == observation.ready_for_prompt
                         && observation
                             .observed_at
                             .saturating_duration_since(previous.observed_at)
@@ -11219,6 +11221,169 @@ mod tests {
             processes.iter().all(|process| process.is_killed()),
             "one failed kill must not prevent later terminals from being signaled"
         );
+        manager.shutdown().await;
+    }
+
+    type LeaseSlot = Arc<StdMutex<Option<TerminalObserverGenerationLease>>>;
+
+    #[derive(Debug)]
+    struct LeaseCapture(LeaseSlot);
+
+    impl PreparedTerminalObserver for LeaseCapture {
+        fn on_spawned(
+            &self,
+            _pid: u32,
+            generation: TerminalObserverGenerationLease,
+            _workers: TerminalObserverWorkerContext,
+        ) {
+            *self.0.lock().unwrap() = Some(generation);
+        }
+
+        fn diagnostic_label(&self) -> &str {
+            "lease-capture"
+        }
+    }
+
+    /// Prepares every AI Terminal with an observer that hands its generation lease to the test.
+    struct LeaseCapturingPreparer(LeaseSlot);
+
+    impl TerminalLaunchPreparer for LeaseCapturingPreparer {
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::new(),
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(self.0.clone())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    async fn next_agent_status(
+        events: &mut broadcast::Receiver<TerminalMetadataEvent>,
+        wanted: impl Fn(&TerminalSummary) -> bool,
+    ) -> TerminalAgentStatus {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(TerminalMetadataEvent::Upsert { terminal }) = events.recv().await
+                    && wanted(&terminal)
+                    && let Some(status) = terminal.agent_status
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .expect("a summary with the wanted agent status is published")
+    }
+
+    fn agent_status_is(
+        terminal: &TerminalSummary,
+        wanted: impl Fn(&TerminalAgentStatus) -> bool,
+    ) -> bool {
+        terminal.agent_status.as_ref().is_some_and(wanted)
+    }
+
+    #[tokio::test]
+    async fn agent_status_summary_carries_ready_for_prompt() {
+        for status in [
+            SessionAgentStatus::Unavailable,
+            SessionAgentStatus::Ready,
+            SessionAgentStatus::Exited { failed: false },
+        ] {
+            assert!(!status.summary().ready_for_prompt, "{status:?}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let slot = LeaseSlot::default();
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer: Some(Arc::new(LeaseCapturingPreparer(slot.clone()))),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = slot.lock().unwrap().clone() {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer receives its generation");
+
+        for (state, shown) in [
+            (
+                TerminalAgentState::Working,
+                TerminalAgentStatusState::Working,
+            ),
+            (
+                TerminalAgentState::Blocked,
+                TerminalAgentStatusState::Blocked,
+            ),
+            (
+                TerminalAgentState::Waiting,
+                TerminalAgentStatusState::Waiting,
+            ),
+        ] {
+            lease.publish_agent_status(state, false);
+            // Only a done, unfailed observation can be marked.
+            lease.mark_ready_for_prompt();
+            let status = next_agent_status(&mut events, |terminal| {
+                agent_status_is(terminal, |status| status.state == shown)
+            })
+            .await;
+            assert!(!status.ready_for_prompt, "{state:?}");
+        }
+        lease.publish_agent_status(TerminalAgentState::Done, true);
+        lease.mark_ready_for_prompt();
+        let failed = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.failed)
+        })
+        .await;
+        assert!(!failed.ready_for_prompt, "a failed turn is not ready");
+
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        let done = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Done && !status.failed
+            })
+        })
+        .await;
+        assert!(!done.ready_for_prompt, "a done report alone is not ready");
+        // The same observation with only the flag changed is published again.
+        lease.mark_ready_for_prompt();
+        let ready = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        assert_eq!(ready.state, TerminalAgentStatusState::Done);
+        assert_eq!(ready.observed_at, done.observed_at);
+
+        backend.latest().exit(0);
+        let exited = next_agent_status(&mut events, |terminal| {
+            terminal.status == TerminalStatus::Exited
+        })
+        .await;
+        assert!(!exited.ready_for_prompt, "an exited agent is not ready");
         manager.shutdown().await;
     }
 

@@ -303,6 +303,10 @@ pub struct TerminalAgentStatus {
     /// new report, so a client restamps its receipt only for new evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// The agent finished its turn and its CLI waits for a prompt, as its observer saw it. False
+    /// for a fresh, unavailable or exited agent and for every state but done.
+    #[serde(default)]
+    pub ready_for_prompt: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

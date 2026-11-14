@@ -1989,7 +1989,7 @@ const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
 /// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
 /// prompt, message and tool content included.
 #[derive(Debug, Default, serde::Deserialize)]
-struct ClaudeStatusHook {
+pub(super) struct ClaudeStatusHook {
     #[serde(default)]
     hook_event_name: Option<String>,
     #[serde(default)]
@@ -2033,6 +2033,9 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
     match report {
         ClaudeAgentReport::Set(agent_state, failed) => {
             state.status.publish_agent_status(agent_state, failed);
+            if claude_hook_ready_for_prompt(hook) {
+                state.status.mark_ready_for_prompt();
+            }
         }
         ClaudeAgentReport::ToolFinished => {
             state
@@ -2048,6 +2051,19 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
 /// tool hooks carry its `agent_id` and leave the main state alone, except that its finished
 /// tool ends an approval prompt; a permission prompt blocks the user whoever asks. Only the
 /// event name, the tool name and the notification type are read.
+/// Whether a Claude hook says the CLI waits for the user's next prompt: its turn stopped, or it
+/// has idled at the prompt. A session start or end is no such signal.
+pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
+    if safe_text(hook.session_id.as_deref()).is_none() {
+        return false;
+    }
+    match safe_text(hook.hook_event_name.as_deref()) {
+        Some("Stop") => true,
+        Some("Notification") => safe_text(hook.notification_type.as_deref()) == Some("idle_prompt"),
+        _ => false,
+    }
+}
+
 fn claude_hook_agent_status(hook: &ClaudeStatusHook) -> Option<ClaudeAgentReport> {
     let event = safe_text(hook.hook_event_name.as_deref())?;
     safe_text(hook.session_id.as_deref())?;

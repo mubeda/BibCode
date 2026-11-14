@@ -731,6 +731,9 @@ pub struct TerminalAgentObservation {
     pub observed_at: std::time::Instant,
     /// The same moment on the wall clock: the evidence token clients age from their receipt.
     pub observed_wall: std::time::SystemTime,
+    /// The CLI waits for a prompt: set by [`TerminalObserverGenerationLease::mark_ready_for_prompt`]
+    /// on a done, unfailed observation; every new report starts without it.
+    pub ready_for_prompt: bool,
 }
 
 /// Lightweight generation identity shared with provider observer workers.
@@ -909,6 +912,7 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             }));
     }
 
@@ -950,9 +954,32 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             });
             true
         });
+    }
+
+    /// Marks the current observation ready for a prompt, only when it is done and did not fail,
+    /// atomically. A provider event that says its CLI waits for input calls it right after the
+    /// report of that event.
+    pub fn mark_ready_for_prompt(&self) {
+        if !self.is_current() {
+            return;
+        }
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation)
+                    if observation.state == TerminalAgentState::Done
+                        && !observation.failed
+                        && !observation.ready_for_prompt =>
+                {
+                    observation.ready_for_prompt = true;
+                    true
+                }
+                _ => false,
+            });
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it

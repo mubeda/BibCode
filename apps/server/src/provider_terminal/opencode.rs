@@ -1619,7 +1619,11 @@ async fn hydrate_opencode_root_status(
         .and_then(Value::as_str)
     {
         Some("busy" | "retry") => generation.publish_agent_progress(),
-        Some("idle") | None => generation.publish_agent_status(TerminalAgentState::Done, false),
+        // OpenCode lists only sessions that are not idle, so an absent root waits for a prompt.
+        Some("idle") | None => {
+            generation.publish_agent_status(TerminalAgentState::Done, false);
+            generation.mark_ready_for_prompt();
+        }
         Some(_) => {}
     }
 }
@@ -1655,10 +1659,16 @@ pub(super) fn opencode_root_agent_status(
     decoded
 }
 
+/// [`OpenCodeStatusEvent::ready_for_prompt`] of a decoded event.
+#[cfg(test)]
+pub(super) fn opencode_root_ready_for_prompt(event: &Value, root_session_id: &str) -> bool {
+    OpenCodeStatusEvent::from_value(event).ready_for_prompt(root_session_id)
+}
+
 /// The few fields of an OpenCode event the root agent's status reads (#187); serde skips the
 /// rest, message and prompt text included.
 #[derive(Debug, Default, serde::Deserialize)]
-struct OpenCodeStatusEvent {
+pub(super) struct OpenCodeStatusEvent {
     #[serde(rename = "type", default)]
     event_type: String,
     #[serde(default)]
@@ -1751,9 +1761,18 @@ impl OpenCodeStatusEvent {
         }
     }
 
+    /// Whether the event says the root session waits for a prompt: it went idle.
+    pub(super) fn ready_for_prompt(&self, root_session_id: &str) -> bool {
+        self.status(root_session_id)
+            == Some(TerminalAgentReport::Set(TerminalAgentState::Done, false))
+    }
+
     fn publish(&self, generation: &TerminalObserverGenerationLease, root_session_id: &str) {
         if let Some(report) = self.status(root_session_id) {
             generation.report_agent_status(report);
+            if self.ready_for_prompt(root_session_id) {
+                generation.mark_ready_for_prompt();
+            }
         }
     }
 }
