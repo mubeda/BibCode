@@ -37,14 +37,14 @@ impl Derived {
     }
 }
 
-/// The turn that took the message: bound to its marker, named on the message, or, when the
-/// provider reported the turn before the marker bound (so the marker was dropped), the first
-/// turn the thread started after the queue entry was delivered. Order is the event sequence,
-/// never a timestamp.
+/// The turn that took the message: the one already recorded on it, the one its marker bound to
+/// (the projector keeps that link when the provider reported the turn early), or the one its
+/// projected message names. No other turn is ever taken for it, a later one included.
 fn consuming_turn(
     connection: &rusqlite::Connection,
     thread_id: &str,
     delivery_message_id: &str,
+    recorded_turn_id: Option<&str>,
 ) -> Result<Option<(String, String)>> {
     let turn_state = |turn_id: String| -> Result<Option<(String, String)>> {
         Ok(connection
@@ -56,6 +56,9 @@ fn consuming_turn(
             .optional()?
             .map(|state| (turn_id, state)))
     };
+    if let Some(turn_id) = recorded_turn_id {
+        return turn_state(turn_id.to_owned());
+    }
     let bound = connection
         .query_row(
             "SELECT turn_id, state FROM projection_turns
@@ -76,32 +79,7 @@ fn consuming_turn(
         )
         .optional()?
         .flatten();
-    if let Some(turn_id) = named
-        && let Some(turn) = turn_state(turn_id)?
-    {
-        return Ok(Some(turn));
-    }
-    let started_after_delivery: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(started.payload_json, '$.session.activeTurnId')
-               FROM orchestration_events AS started
-              WHERE started.stream_id = ?1 AND started.event_type = 'thread.session-set'
-                AND json_extract(started.payload_json, '$.session.status') = 'running'
-                AND json_extract(started.payload_json, '$.compactionId') IS NULL
-                AND json_extract(started.payload_json, '$.session.activeTurnId') IS NOT NULL
-                AND started.sequence > (
-                    SELECT MIN(delivered.sequence) FROM orchestration_events AS delivered
-                     WHERE delivered.stream_id = ?1
-                       AND delivered.event_type = 'thread.turn-delivery-updated'
-                       AND json_extract(delivered.payload_json, '$.messageId') = ?2
-                       AND json_extract(delivered.payload_json, '$.state') = 'delivered')
-              ORDER BY started.sequence LIMIT 1",
-            params![thread_id, delivery_message_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    match started_after_delivery {
+    match named {
         Some(turn_id) => turn_state(turn_id),
         None => Ok(None),
     }
@@ -140,7 +118,12 @@ pub(crate) fn derive_chat_status(
     ) else {
         return Ok(unchanged);
     };
-    if let Some((turn_id, state)) = consuming_turn(connection, thread_id, delivery_message_id)? {
+    if let Some((turn_id, state)) = consuming_turn(
+        connection,
+        thread_id,
+        delivery_message_id,
+        message.recipient_turn_id.as_deref(),
+    )? {
         let status = match state.as_str() {
             "running" => Some((AgentMessageStatus::Consumed, None)),
             // A turn can be completed while its reply still streams; it ends with the reply.

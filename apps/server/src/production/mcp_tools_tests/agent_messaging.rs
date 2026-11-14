@@ -1393,7 +1393,8 @@ impl Harness {
             .dispatch(command(json!({
                 "type": "thread.message.assistant.delta",
                 "commandId": format!("early-delta-{turn_id}"),
-                "threadId": thread_id, "messageId": format!("early-reply-{turn_id}"),
+                // The reply `provider_turn` streams and settles for the same turn.
+                "threadId": thread_id, "messageId": format!("reply-{turn_id}"),
                 "delta": "Port", "turnId": turn_id, "createdAt": CREATED_AT,
             })))
             .await

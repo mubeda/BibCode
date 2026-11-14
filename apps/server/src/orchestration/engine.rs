@@ -5502,6 +5502,26 @@ async fn plan_command(
             let Some(row) = row.filter(|row| row.message_id == *message_id) else {
                 return invariant(command, "Only the queued head can be steered.".to_owned());
             };
+            // An agent message never steers a running turn (agent messaging spec, Part A).
+            let (head_command_id, head_message_id) = (row.command_id.clone(), row.message_id.clone());
+            let agent_message = repositories
+                .database()
+                .call(move |connection| {
+                    crate::agent_messaging::store::is_agent_message_delivery(
+                        connection,
+                        &head_command_id,
+                        &head_message_id,
+                    )
+                })
+                .await
+                .map_err(wrap_persistence)?;
+            if agent_message {
+                return invariant(
+                    command,
+                    "An agent message waits for the running turn to end, so it cannot steer it."
+                        .to_owned(),
+                );
+            }
             let session = repositories
                 .get_thread_session(thread_id.clone())
                 .await
@@ -8548,6 +8568,12 @@ fn apply_turns_projector_tx(
                         .optional()?
                         .is_some();
                     let updated = if existing_turn {
+                        // The provider reported the turn (an early item) before it ran: the
+                        // turn keeps the message that started it, as a marker bound below would.
+                        transaction.execute(
+                            &format!("UPDATE projection_turns SET pending_message_id = (SELECT pending_message_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1) WHERE thread_id = ?1 AND turn_id = ?2 AND state = 'running' AND pending_message_id IS NULL"),
+                            params![thread_id, turn_id],
+                        )?;
                         let updated = transaction.execute("UPDATE projection_turns SET state = 'running', started_at = COALESCE(started_at, ?) WHERE thread_id = ? AND turn_id = ?", params![updated_at, thread_id, turn_id])?;
                         transaction.execute(
                             &format!("DELETE FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION}"),

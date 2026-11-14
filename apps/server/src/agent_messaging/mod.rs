@@ -214,26 +214,37 @@ impl AgentMessaging {
         request: SendRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
         let result = self.send_inner(sender_thread_id, &request).await;
-        if let Some(outcomes) = &self.outcomes {
-            let (outcome, receipt) = match &result {
-                Ok((receipt, _)) => ("accepted".to_owned(), Some(receipt)),
-                Err(error) => (error.tag().to_owned(), None),
-            };
-            let titles = result.as_ref().ok().map(|(_, titles)| titles);
-            outcomes(MessageOutcome {
-                sender_address: format!("thread:{sender_thread_id}"),
-                recipient_address: request.to.clone(),
-                tool: "agent_message_send",
-                outcome,
-                message_id: receipt.map(|receipt| receipt.message_id.clone()),
-                conversation_id: receipt.map(|receipt| receipt.conversation_id.clone()),
-                hop: receipt.map(|receipt| receipt.hop),
-                reason: None,
-                sender_title: titles.map(|(sender, _)| sender.clone()),
-                recipient_title: titles.map(|(_, recipient)| recipient.clone()),
-            });
-        }
+        self.report("agent_message_send", sender_thread_id, &request.to, &result);
         result.map(|(receipt, _)| receipt)
+    }
+
+    /// Tells the outcome sink, if any, what one send or reply call ended with.
+    fn report(
+        &self,
+        tool: &'static str,
+        sender_thread_id: &str,
+        recipient_address: &str,
+        result: &Result<(MessageReceipt, (String, String)), AgentMessagingError>,
+    ) {
+        let Some(outcomes) = &self.outcomes else {
+            return;
+        };
+        let (outcome, receipt, titles) = match result {
+            Ok((receipt, titles)) => ("accepted".to_owned(), Some(receipt), Some(titles)),
+            Err(error) => (error.tag().to_owned(), None, None),
+        };
+        outcomes(MessageOutcome {
+            sender_address: format!("thread:{sender_thread_id}"),
+            recipient_address: recipient_address.to_owned(),
+            tool,
+            outcome,
+            message_id: receipt.map(|receipt| receipt.message_id.clone()),
+            conversation_id: receipt.map(|receipt| receipt.conversation_id.clone()),
+            hop: receipt.map(|receipt| receipt.hop),
+            reason: None,
+            sender_title: titles.map(|(sender, _)| sender.clone()),
+            recipient_title: titles.map(|(_, recipient)| recipient.clone()),
+        });
     }
 
     /// Replies to `request.in_reply_to`, a message the agent of `sender_thread_id` received:
@@ -243,6 +254,27 @@ impl AgentMessaging {
         sender_thread_id: &str,
         request: ReplyRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
+        let mut recipient_address = String::new();
+        let result = self
+            .reply_inner(sender_thread_id, &request, &mut recipient_address)
+            .await;
+        self.report(
+            "agent_message_reply",
+            sender_thread_id,
+            &recipient_address,
+            &result,
+        );
+        result.map(|(receipt, _)| receipt)
+    }
+
+    /// The receipt and the two thread titles of an accepted reply. `recipient_address` is set
+    /// once the message replied to is known to be the caller's.
+    async fn reply_inner(
+        &self,
+        sender_thread_id: &str,
+        request: &ReplyRequest,
+        recipient_address: &mut String,
+    ) -> Result<(MessageReceipt, (String, String)), AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -251,6 +283,7 @@ impl AgentMessaging {
             .await?
             .filter(|message| message.recipient_address == format!("thread:{sender_thread_id}"))
             .ok_or(AgentMessagingError::UnknownMessage)?;
+        recipient_address.clone_from(&original.sender_address);
         let recipient_thread_id = original
             .sender_address
             .strip_prefix("thread:")
@@ -263,19 +296,21 @@ impl AgentMessaging {
         };
         check_text(&request.text)?;
         let message_id = Uuid::new_v4().to_string();
-        self.deliver(
-            &route,
-            Outgoing {
-                message_id: &message_id,
-                conversation_id: &original.conversation_id,
-                in_reply_to: Some(&original.message_id),
-                // Hop counting is task 6.5's.
-                hop: 1,
-                text: &request.text,
-                client_request_id: request.client_request_id.as_deref(),
-            },
-        )
-        .await
+        let receipt = self
+            .deliver(
+                &route,
+                Outgoing {
+                    message_id: &message_id,
+                    conversation_id: &original.conversation_id,
+                    in_reply_to: Some(&original.message_id),
+                    // Hop counting is task 6.5's.
+                    hop: 1,
+                    text: &request.text,
+                    client_request_id: request.client_request_id.as_deref(),
+                },
+            )
+            .await?;
+        Ok((receipt, (route.sender.title, route.recipient.title)))
     }
 
     /// The stored status of a message the agent of `caller_thread_id` sent. Any other message,
