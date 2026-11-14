@@ -302,8 +302,7 @@ export async function submitSendChoice(
     attachments: draft.attachments,
   });
   if (outcome.kind === "sent") {
-    useSendToAgentStore.getState().settle(key);
-    if (panelKey !== null) useSendToAgentStore.getState().settle(panelKey);
+    useSendToAgentStore.getState().settle(key, { requestId, note: draft.note, panelKey });
   }
   return outcome;
 }

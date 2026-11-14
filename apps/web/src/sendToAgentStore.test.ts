@@ -48,12 +48,24 @@ describe("sendToAgentStore", () => {
     expect(store.requestIdFor("k", "note two", newId)).toBe("request-2");
   });
 
+  it("settling an older send keeps the newer note, pending id and panel", () => {
+    const store = useSendToAgentStore.getState();
+    store.setNote("k", "newer note");
+    store.requestIdFor("k", "newer args", () => "request-2");
+    store.rememberPanel("k#new", ThreadId.make("panel"));
+    store.settle("k", { requestId: "request-1", note: "older note", panelKey: "k#new" });
+    const after = useSendToAgentStore.getState();
+    expect(after.notes["k"]).toBe("newer note");
+    expect(after.pending["k"]?.requestId).toBe("request-2");
+    expect(after.panelFor("k#new")).toBe("panel");
+  });
+
   it("settling a send clears the pending id, the panel and the note", () => {
     const store = useSendToAgentStore.getState();
     store.setNote("k", "note");
     store.requestIdFor("k", "args", () => "request-1");
     store.rememberPanel("k", ThreadId.make("panel"));
-    store.settle("k");
+    store.settle("k", { requestId: "request-1", note: "note", panelKey: "k" });
     const after = useSendToAgentStore.getState();
     expect(after.notes["k"]).toBeUndefined();
     expect(after.pending["k"]).toBeUndefined();

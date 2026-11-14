@@ -14,13 +14,18 @@ interface SendToAgentState {
   pending: Record<string, { argsKey: string; requestId: string }>;
   panels: Record<string, ThreadId>;
   setNote: (key: string, note: string) => void;
-  clearNote: (key: string) => void;
+  /** Clears the note; with `ifEquals`, only while it is still that text. */
+  clearNote: (key: string, ifEquals?: string) => void;
   /** The pending id while `argsKey` is unchanged, else a new id from `newId`. */
   requestIdFor: (key: string, argsKey: string, newId: () => string) => string;
   panelFor: (key: string) => ThreadId | null;
   rememberPanel: (key: string, threadId: ThreadId) => void;
-  /** The send finished: forget its pending id, its panel and its note. */
-  settle: (key: string) => void;
+  /**
+   * The send of `sent.requestId` finished: forget its pending id, its new panel (`panelKey`) and
+   * its note, each only while it still belongs to that send, so a late completion cannot erase
+   * what a reopened preview has since started.
+   */
+  settle: (key: string, sent: { requestId: string; note: string; panelKey: string | null }) => void;
 }
 
 function without<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -34,7 +39,12 @@ export const useSendToAgentStore = create<SendToAgentState>((set, get) => ({
   pending: {},
   panels: {},
   setNote: (key, note) => set((state) => ({ notes: { ...state.notes, [key]: note } })),
-  clearNote: (key) => set((state) => ({ notes: without(state.notes, key) })),
+  clearNote: (key, ifEquals) =>
+    set((state) =>
+      ifEquals === undefined || state.notes[key] === ifEquals
+        ? { notes: without(state.notes, key) }
+        : state,
+    ),
   requestIdFor: (key, argsKey, newId) => {
     const known = get().pending[key];
     if (known !== undefined && known.argsKey === argsKey) return known.requestId;
@@ -45,12 +55,16 @@ export const useSendToAgentStore = create<SendToAgentState>((set, get) => ({
   panelFor: (key) => get().panels[key] ?? null,
   rememberPanel: (key, threadId) =>
     set((state) => ({ panels: { ...state.panels, [key]: threadId } })),
-  settle: (key) =>
-    set((state) => ({
-      pending: without(state.pending, key),
-      panels: without(state.panels, key),
-      notes: without(state.notes, key),
-    })),
+  settle: (key, sent) =>
+    set((state) => {
+      const ours = state.pending[key]?.requestId === sent.requestId;
+      return {
+        pending: ours ? without(state.pending, key) : state.pending,
+        panels:
+          ours && sent.panelKey !== null ? without(state.panels, sent.panelKey) : state.panels,
+        notes: state.notes[key] === sent.note ? without(state.notes, key) : state.notes,
+      };
+    }),
 }));
 
 /** One key per panel or terminal, so two panels open side by side keep separate notes. */

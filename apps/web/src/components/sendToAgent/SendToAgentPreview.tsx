@@ -5,7 +5,15 @@
  * the person wrote is lost.
  */
 import { SEND_REQUEST_MAX_CHARS, type SendRequestAction } from "@bibcode/contracts";
-import { useCallback, useId, useState, type ReactNode, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 
 import { useSendToAgentStore } from "~/sendToAgentStore";
 import type { SendOutcome } from "~/state/sendRequests";
@@ -65,6 +73,13 @@ function PreviewBody(props: SendToAgentPreviewProps) {
   const setNote = useSendToAgentStore((state) => state.setNote);
   const clearNote = useSendToAgentStore((state) => state.clearNote);
   const [attachments, setAttachments] = useState(() => [...props.initialAttachments]);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [sending, setSending] = useState(false);
   const [failure, setFailure] = useState<Extract<SendOutcome, { kind: "failed" }> | null>(null);
 
@@ -84,10 +99,13 @@ function PreviewBody(props: SendToAgentPreviewProps) {
       note,
       attachments: attachments.map(({ label, text }) => ({ label, text })),
     });
+    // A custom `submit` does not settle the store, so the note is cleared here too, but only
+    // the text that was sent: a preview reopened since owns whatever it holds now.
+    if (outcome.kind === "sent") clearNote(source.key, note);
+    // Cancel closed this preview while the send ran: a newer one may be open, so touch nothing.
+    if (!mounted.current) return;
     setSending(false);
     if (outcome.kind === "sent") {
-      // A custom `submit` does not settle the store, so the note is cleared here too.
-      clearNote(source.key);
       onClose();
     } else {
       setFailure(outcome);
