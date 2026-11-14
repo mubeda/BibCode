@@ -7,6 +7,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   AGENT_MESSAGE_MAX_CHARACTERS,
   AgentMessageReason,
+  AgentMessageReplyInput,
   AgentMessageSendInput,
   AgentMessageStatus,
   AgentMessagingErrorTag,
@@ -17,6 +18,7 @@ import {
 const strict = { onExcessProperty: "error" } as const;
 const decodeSummary = Schema.decodeUnknownSync(AgentSummary);
 const decodeSend = Schema.decodeUnknownSync(AgentMessageSendInput);
+const decodeReply = Schema.decodeUnknownSync(AgentMessageReplyInput);
 const decodeActor = Schema.decodeUnknownSync(OrchestrationHostedAgentActor);
 
 const summary = {
@@ -90,6 +92,17 @@ describe("agentMessaging", () => {
       text: "hi",
       clientRequestId: "r1",
     });
+  });
+
+  it("the text limit counts Unicode characters, not UTF-16 units", () => {
+    // Each emoji is one character and two UTF-16 units.
+    const emoji = "\u{1F600}";
+    const longest = emoji.repeat(16_000);
+    expect(decodeSend({ to: "thread:t2", text: longest }).text).toBe(longest);
+    expect(decodeReply({ inReplyTo: "m1", text: longest }).text).toBe(longest);
+    expect(() => decodeSend({ to: "thread:t2", text: emoji.repeat(16_001) })).toThrow();
+    expect(() => decodeReply({ inReplyTo: "m1", text: emoji.repeat(16_001) })).toThrow();
+    expect(() => decodeReply({ inReplyTo: "m1", text: "" })).toThrow();
   });
 
   it("a hosted-agent actor decodes with its address and label", () => {
