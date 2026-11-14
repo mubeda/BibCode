@@ -18,6 +18,13 @@ export type OutOfTokensHint =
   | { kind: "context-full"; text: string }
   | { kind: "usage-limit"; text: string; resetsAt: Date | null };
 
+/**
+ * A usage snapshot older than this is not trusted. The server marks one unavailable after the
+ * same 30 minutes (`STALE_THRESHOLD_MS` in `provider_usage/mod.rs`) but only when it is read, so
+ * a copy the client holds can outlive it. The server constant is not shared with the web.
+ */
+export const USAGE_SNAPSHOT_FRESH_MS = 30 * 60_000;
+
 const OUT_OF_USAGE = "Out of usage";
 const OUT_OF_USAGE_UNTIL = `${OUT_OF_USAGE} until `;
 
@@ -75,9 +82,14 @@ export function resolveOutOfTokensHint(input: {
     (entry) => entry.provider === provider && entry.status === "ok",
   );
   if (snapshot === undefined) return null;
+  const nowMs = input.now.getTime();
+  if (nowMs - DateTime.toEpochMillis(snapshot.updatedAt) > USAGE_SNAPSHOT_FRESH_MS) return null;
+  // A window whose reset time has passed is no longer at its limit.
   const limited = [snapshot.session, snapshot.weekly, snapshot.fableWeekly].filter(
     (window): window is ServerProviderUsageWindow =>
-      window !== null && clampPercent(window.usedPercent) === 100,
+      window !== null &&
+      clampPercent(window.usedPercent) === 100 &&
+      (window.resetsAt === null || DateTime.toEpochMillis(window.resetsAt) > nowMs),
   );
   if (limited.length === 0) return null;
   let resetsAt: Date | null = null;
