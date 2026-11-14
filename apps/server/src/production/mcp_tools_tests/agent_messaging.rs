@@ -3394,3 +3394,254 @@ mod messaging_off {
         harness.shutdown().await;
     }
 }
+
+// ---- Task 6.5: hop limit for chat senders ----
+
+mod hop_limit {
+    use super::*;
+
+    const HOP_LIMIT: &str = "This exchange has reached the limit of 8 agent-to-agent hops. A person has to write in a thread before agents can continue.";
+
+    impl Harness {
+        /// `thread_id` runs turn `turn_id`, which an agent message of hop `hop` started, linked
+        /// by the turn the message recorded, by the turn's marker, or by both.
+        async fn turn_started_by(
+            &self,
+            thread_id: &'static str,
+            turn_id: &'static str,
+            hop: u32,
+            recorded: bool,
+            marker: bool,
+        ) -> String {
+            self.provider_turn(thread_id, turn_id, "working", false)
+                .await;
+            let message_id = format!("trigger-{turn_id}");
+            let stored_id = message_id.clone();
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    let delivery_message_id = format!("delivery-{turn_id}");
+                    let tx = connection.transaction()?;
+                    crate::agent_messaging::store::insert_message(
+                        &tx,
+                        &crate::agent_messaging::store::NewAgentMessage {
+                            message_id: stored_id.clone(),
+                            conversation_id: "c1".to_owned(),
+                            sender_address: "thread:p".to_owned(),
+                            sender_kind: crate::agent_messaging::store::SenderKind::Agent,
+                            recipient_address: format!("thread:{thread_id}"),
+                            in_reply_to: None,
+                            hop,
+                            text: "hello".to_owned(),
+                            status: crate::agent_messaging::store::AgentMessageStatus::Consumed,
+                            reason: None,
+                            accepted_at: CREATED_AT.to_owned(),
+                            sender_runtime_mode: Some("full-access".to_owned()),
+                            recipient_terminal_generation: None,
+                            send_request_id: None,
+                            client_request_id: None,
+                            delivery_command_id: None,
+                            delivery_message_id: Some(delivery_message_id.clone()),
+                        },
+                    )?;
+                    if recorded {
+                        crate::agent_messaging::store::set_recipient_turn(
+                            &tx, &stored_id, turn_id,
+                        )?;
+                    }
+                    if marker {
+                        tx.execute(
+                            "UPDATE projection_turns SET pending_message_id = ?3 WHERE thread_id = ?1 AND turn_id = ?2",
+                            [thread_id, turn_id, delivery_message_id.as_str()],
+                        )?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await
+                .expect("the trigger");
+            message_id
+        }
+
+        async fn hop_of(&self, result: &Value) -> u64 {
+            assert_ne!(result["isError"], true, "{result}");
+            structured(result)["hop"].as_u64().expect("hop")
+        }
+    }
+
+    fn assert_hop_limit(result: &Value) {
+        assert_eq!(error_tag(result), "AgentMessagingHopLimitError", "{result}");
+        assert_eq!(result["structuredContent"]["error"]["message"], HOP_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn ping_pong_stops() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("b", "turn-b", "done", true).await;
+        let first = harness
+            .agent_send("a", send_arguments("thread:b", "ping"))
+            .await;
+        assert_eq!(harness.hop_of(&first).await, 1);
+        let mut last = structured(&first)["messageId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        for hop in 2..=9_u64 {
+            let (from, to) = if hop % 2 == 0 { ("b", "a") } else { ("a", "b") };
+            let turn = format!("turn-{from}-{hop}");
+            harness.until_status(&last, "delivered").await;
+            harness.provider_turn(from, &turn, "working", false).await;
+            harness.until_status(&last, "consumed").await;
+            if hop == 9 {
+                let stored = harness.agent_messages().await.len();
+                let outbox = harness.outbox_states("b").await.len();
+
+                assert_hop_limit(&harness.reply(from, &last, "pong").await);
+                assert_hop_limit(
+                    &harness
+                        .agent_send(from, send_arguments(&format!("thread:{to}"), "ping"))
+                        .await,
+                );
+                assert_eq!(harness.agent_messages().await.len(), stored);
+                assert_eq!(harness.outbox_states("b").await.len(), outbox);
+                break;
+            }
+            let reply = harness.reply(from, &last, "pong").await;
+            assert_eq!(harness.hop_of(&reply).await, hop, "{from} to {to}");
+            last = structured(&reply)["messageId"]
+                .as_str()
+                .expect("id")
+                .to_owned();
+            harness.provider_turn(from, &turn, "working", true).await;
+        }
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_person_resets_the_chain() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.turn_started_by("a", "turn-a", 8, true, true).await;
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.provider_turn("a", "turn-a", "done", true).await;
+
+        let person = harness.person_queues("a").await;
+        harness.until_entry(&person, "delivered").await;
+        harness
+            .provider_turn("a", "turn-person", "working", false)
+            .await;
+
+        let result = harness
+            .agent_send("a", send_arguments("thread:b", "ping"))
+            .await;
+        assert_eq!(harness.hop_of(&result).await, 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_exchange_does_not_reset_itself() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let trigger = harness.turn_started_by("a", "turn-a", 8, true, true).await;
+        harness
+            .repositories
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE agent_messages SET accepted_at = '2026-11-13T23:00:00.000Z', updated_at = '2026-11-13T23:00:00.000Z' WHERE message_id = ?1",
+                    [&trigger],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("an hour ago");
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_first_message_in_a_turn_a_person_started_is_hop_one() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let person = harness.person_queues("a").await;
+        harness.until_entry(&person, "delivered").await;
+        harness
+            .provider_turn("a", "turn-person", "working", false)
+            .await;
+
+        let result = harness
+            .agent_send("a", send_arguments("thread:b", "ping"))
+            .await;
+
+        assert_eq!(harness.hop_of(&result).await, 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_counts_one_more_than_the_message_it_answers() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("b", "turn-b", "done", true).await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "delivered").await;
+        harness.provider_turn("b", "turn-b2", "working", false).await;
+        harness.until_status(&m1, "consumed").await;
+
+        let reply = harness.reply("b", &m1, "pong").await;
+
+        assert_eq!(harness.hop_of(&reply).await, 2);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hop_8_is_accepted_and_hop_9_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.turn_started_by("a", "turn-a7", 7, true, true).await;
+        let eighth = harness
+            .agent_send("a", send_arguments("thread:b", "ping"))
+            .await;
+        assert_eq!(harness.hop_of(&eighth).await, 8);
+
+        harness.turn_started_by("a", "turn-a8", 8, true, true).await;
+        let stored = harness.agent_messages().await.len();
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        assert_eq!(harness.agent_messages().await.len(), stored);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_hop_is_found_when_the_turn_marker_never_bound() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        harness.turn_started_by("a", "turn-a", 8, true, false).await;
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.turn_started_by("a", "turn-a2", 8, false, true).await;
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.shutdown().await;
+    }
+}
