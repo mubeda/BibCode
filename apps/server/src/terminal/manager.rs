@@ -169,6 +169,15 @@ pub struct TerminalSessionLaunch<'a> {
     pub ai_terminal: bool,
 }
 
+/// The variables that carry a launch hook's credentials and where they are sent. No prepared
+/// environment may set them, whatever value the caller supplied.
+const SESSION_CREDENTIAL_KEYS: [&str; 4] = [
+    crate::open_url::TOKEN_ENV,
+    crate::open_url::ENDPOINT_ENV,
+    crate::agent_messaging::terminal_credential::AUTH_ENV,
+    crate::agent_messaging::terminal_credential::ENDPOINT_ENV,
+];
+
 /// See [`TerminalManagerOptions::session_env`].
 pub type TerminalSessionEnv = Arc<
     dyn for<'a> Fn(
@@ -2372,6 +2381,9 @@ impl TerminalManager {
                 })
                 .map(|(key, _)| key.clone())
                 .collect();
+            // The credential keys stay the hook's even when the caller already held the same
+            // value, which the comparison above cannot see.
+            session_keys.extend(SESSION_CREDENTIAL_KEYS.map(str::to_owned));
         }
         let prepared_may_set = |key: &String| {
             !session_keys
