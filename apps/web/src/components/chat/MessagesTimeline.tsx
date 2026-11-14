@@ -1375,6 +1375,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       <MessageProvenance
         actor={row.message.actor}
         sourceThreadId={row.message.sourceThreadId}
+        personSend={row.message.personSend}
         environmentId={ctx.activeThreadEnvironmentId}
       />
       <div className="relative max-w-[80%] rounded-2xl border border-border bg-secondary p-3">

@@ -452,9 +452,12 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   onImplementPlanInNewThread: () => void;
   /** The History menu, first in the group; a slot so the memoized footer keeps stable props. */
   historyMenu?: ReactNode;
+  /** The Send to agent control, before History; a slot for the same reason. */
+  sendToAgentControl?: ReactNode;
 }) {
   return (
     <>
+      {props.sendToAgentControl}
       {props.historyMenu}
       <Tooltip>
         <TooltipTrigger
@@ -681,6 +684,8 @@ export interface ChatComposerProps {
    * stay stable. The approval footer leaves it out.
    */
   historyMenu?: ReactNode;
+  /** The Send to agent control, before History; memoized by the host like `historyMenu`. */
+  sendToAgentControl?: ReactNode;
 }
 
 // --------------------------------------------------------------------------
@@ -763,6 +768,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onExpandImage,
     onPageTimeline,
     historyMenu,
+    sendToAgentControl,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
   // While the environment is not connected the composer stays editable (the draft is local),
@@ -2978,6 +2984,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onInterrupt={handleInterruptPrimaryAction}
                   onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
                   historyMenu={historyMenu}
+                  sendToAgentControl={sendToAgentControl}
                 />
               </div>
             </div>
