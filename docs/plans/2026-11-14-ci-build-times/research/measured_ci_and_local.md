@@ -124,3 +124,48 @@ Run 43523947929, attempt 2: `running 10 tests` at 02:01:33; the four tests that 
 first each failed after exactly 10 s (`Elapsed`), and the other six passed within the next 5 s.
 The same step normally finishes in 3.7 to 4.6 s on Windows arm64 and 2.4 to 3.0 s on x64
 (9 other runs).
+
+## 6. The pull request's measured run (2026-11-14, manual full run on the branch)
+
+Every job passed except Secrets, which failed because a manual run scanned the branch's whole
+history (fixed in the same pull request).
+
+| Job                                   | Before (run 43562279474 unless noted) | This run |
+| ------------------------------------- | ------------------------------------- | -------- |
+| Native desktop, Windows x64           | 89 min                                | 46 min   |
+| Native desktop, Windows arm64         | 103 min                               | 59 min   |
+| Native desktop, Linux x64             | 48 min                                | 31 min   |
+| Native desktop, Linux arm64           | 52 min                                | 35 min   |
+| Native desktop, macOS arm64           | 115 min                               | 90 min   |
+| Native desktop, macOS x64             | 132 min                               | 93 min   |
+| Server tests, Windows x64 (new job)   | inside the native row                 | 27 min   |
+| Server tests, Windows arm64 (new job) | inside the native row                 | 34 min   |
+
+Cargo time of the bundle build (the `Finished` line):
+
+| Row           | Before                         | This run            | Rust cache in this run |
+| ------------- | ------------------------------ | ------------------- | ---------------------- |
+| Linux x64     | about 29 min, nothing restored | 17 min 55 s         | full match             |
+| Linux arm64   | 25 to 33 min for the step      | 16 min 41 s         | nothing restored       |
+| Windows x64   | about 42 min                   | 30 min 12 s         | full match             |
+| Windows arm64 | 36 min 15 s                    | 28 min for the step | not read               |
+| macOS arm64   | 87 min 51 s, nothing restored  | 59 min 18 s         | nothing restored       |
+| macOS x64     | 69 to 101 min for the step     | 54 min 53 s         | nothing restored       |
+
+- On the two rows with a full cache match the whole job log holds 6 `Compiling` lines, so the
+  per-package override left the dependency artifacts usable.
+- macOS arm64 heartbeat: free memory fell to about 2,000 to 5,000 pages from minute 16 to minute
+  45, swap in use rose from 33 MB to 975 MB, and the largest `rustc` held only 1.6 to 3.6 GB
+  resident while the same compile holds 8.7 to 12 GB on a machine with enough memory. The
+  runner is short of memory for this compile. `dsymutil` appeared in one sample at 108 MB.
+- macOS x64 heartbeat (14 GB): the largest `rustc` reached 7.7 GB resident, swap in use peaked at
+  327 MB.
+- Linux x64 heartbeat (16 GB): the largest `rustc` reached about 6.3 GB with 8 GB available.
+- No `dump_syms` CFI error was logged in this run.
+- The new `shim_timeout_` test passed on both Windows architectures (11 tests in the step).
+
+Windows arm64 VM (6 cores), same day: the shim test file passed (24 tests), Clippy and
+`cargo check --all-targets` with warnings denied passed, the test failed as intended when the
+collected output was dropped from its message, and 30 runs of the review prompt tests under four
+busy processes gave 0 failures. Those runs were warm, so this does not reproduce the cold first
+spawn seen in CI.
