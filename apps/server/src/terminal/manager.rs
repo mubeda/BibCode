@@ -11415,6 +11415,9 @@ mod tests {
         manager.shutdown().await;
     }
 
+    const TEST_AGENT_ENDPOINT: &str = "http://127.0.0.1:3773/api/agent/call";
+    const TEST_OPEN_URL_ENDPOINT: &str = "http://127.0.0.1:3773/api/preview/open-url";
+
     fn credential_manager(
         backend: Arc<HistoryTestBackend>,
         launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
@@ -11435,7 +11438,15 @@ mod tests {
                 session_env: Some(TerminalManagerOptions::session_env_hook(
                     move |launch, env| {
                         let credentials = hook_credentials.clone();
-                        Box::pin(async move { credentials.issue(&launch, env).await })
+                        Box::pin(async move {
+                            crate::open_url::OpenUrlSession {
+                                endpoint: TEST_OPEN_URL_ENDPOINT.to_owned(),
+                                token: format!("open-url-{}", launch.terminal_id),
+                                shim_dir: PathBuf::from("/state/runtime/open-url"),
+                            }
+                            .apply(env);
+                            credentials.issue(&launch, env).await;
+                        })
                     },
                 )),
                 ..TerminalManagerOptions::default()
@@ -11550,6 +11561,14 @@ mod tests {
                             "BIBCODE_AGENT_AUTH".to_owned(),
                             "chosen-by-the-project".to_owned(),
                         ),
+                        (
+                            "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_OPEN_URL_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
                     ]),
                     // A private key that names a launch variable is refused before the spawn.
                     private_env: std::collections::BTreeMap::new(),
@@ -11570,23 +11589,43 @@ mod tests {
         let (manager, credentials) =
             credential_manager(backend.clone(), Some(Arc::new(OverlayPreparer)));
 
-        manager
-            .open(ai_terminal_input(root.path(), "term-ai"))
-            .await
-            .unwrap();
+        // A caller's environment that already holds the server's own endpoints must not leave
+        // them open to the overlay.
+        for (terminal_id, caller_holds_the_endpoints) in [("term-ai", false), ("term-pre", true)] {
+            let mut input = ai_terminal_input(root.path(), terminal_id);
+            if caller_holds_the_endpoints {
+                input.env.insert(
+                    "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                    TEST_AGENT_ENDPOINT.to_owned(),
+                );
+                input.env.insert(
+                    "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                    TEST_OPEN_URL_ENDPOINT.to_owned(),
+                );
+            }
+            manager.open(input).await.unwrap();
 
-        let spawn = backend.spawns().pop().expect("a spawn");
-        assert_eq!(
-            spawn.env["BIBCODE_AGENT_ENDPOINT"],
-            "http://127.0.0.1:3773/api/agent/call"
-        );
-        assert!(
-            credentials
-                .verify(&spawn.env["BIBCODE_AGENT_AUTH"])
-                .await
-                .is_some(),
-            "the spawned credential is the one the server issued"
-        );
+            let spawn = backend.spawns().pop().expect("a spawn");
+            assert_eq!(
+                spawn.env["BIBCODE_AGENT_ENDPOINT"], TEST_AGENT_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_ENDPOINT"], TEST_OPEN_URL_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_AUTH"],
+                format!("open-url-{terminal_id}")
+            );
+            assert!(
+                credentials
+                    .verify(&spawn.env["BIBCODE_AGENT_AUTH"])
+                    .await
+                    .is_some(),
+                "{terminal_id}: the spawned credential is the one the server issued"
+            );
+        }
         manager.shutdown().await;
     }
 
