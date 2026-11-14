@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::{Inner, McpControl, ToolCall, ToolSpec, invalid_argument, now_iso};
 use crate::{
-    agent_messaging::{MessageOutcome, OutcomeSink},
+    agent_messaging::{AdmissionHook, MessageOutcome, OutcomeSink},
     auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
     orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
     persistence::Database,
@@ -719,48 +719,110 @@ pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, Agent
         stop.clone(),
         dropped.clone(),
     ));
-    let sink: OutcomeSink = Arc::new(move |outcome| {
-        // A closed writer drops it silently: the runtime is stopping.
-        if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(agent_message_row(outcome))
-        {
-            dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+    let sink: OutcomeSink = {
+        let (sender, dropped) = (sender.clone(), dropped.clone());
+        Arc::new(move |outcome| enqueue(&sender, &dropped, Queued::of(outcome)))
+    };
     (
         sink,
         AgentMessageWriter {
             stop,
             task: Mutex::new(Some(task)),
+            sender,
+            dropped,
         },
     )
 }
 
 /// Rows an agent message writer queues at most.
 const MESSAGE_QUEUE: usize = 1_024;
+/// Messages being admitted at most; past it every held row is written and the holds end, so an
+/// end marker the full queue dropped never keeps rows forever.
+const MOST_ADMITTING: usize = 1_024;
+
+/// One item for the writer: a row, or a marker of a message's admission.
+enum Queued {
+    Row {
+        message_id: Option<String>,
+        delivery: bool,
+        row: NewActivity,
+    },
+    AdmissionStarted(String),
+    AdmissionEnded(String),
+}
+
+impl Queued {
+    fn of(outcome: MessageOutcome) -> Self {
+        Self::Row {
+            message_id: outcome.message_id.clone(),
+            delivery: outcome.tool == "agent_message_delivery",
+            row: agent_message_row(outcome),
+        }
+    }
+}
+
+/// Queues `item` without waiting; past the bound it is dropped and counted.
+fn enqueue(sender: &mpsc::Sender<Queued>, dropped: &AtomicUsize, item: Queued) {
+    // A closed writer drops it silently: the runtime is stopping.
+    if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(item) {
+        dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 async fn write_agent_messages(
     activity: McpActivity,
-    mut receiver: mpsc::Receiver<NewActivity>,
+    mut receiver: mpsc::Receiver<Queued>,
     stop: CancellationToken,
     dropped: Arc<AtomicUsize>,
 ) {
+    // The delivery rows of each message being admitted, written once its admission ends: after
+    // its send's own row, which arrives before the end marker.
+    let mut admitting: HashMap<String, Vec<NewActivity>> = HashMap::new();
     loop {
-        let row = tokio::select! {
+        let queued = tokio::select! {
             biased;
-            row = receiver.recv() => row,
+            queued = receiver.recv() => queued,
             () = stop.cancelled() => {
                 receiver.close();
                 receiver.recv().await
             }
         };
-        let Some(row) = row else {
+        let Some(queued) = queued else {
             break;
         };
-        activity.record(row).await;
+        match queued {
+            Queued::AdmissionStarted(id) => {
+                if admitting.len() >= MOST_ADMITTING {
+                    for row in admitting.drain().flat_map(|(_, rows)| rows) {
+                        activity.record(row).await;
+                    }
+                }
+                admitting.insert(id, Vec::new());
+            }
+            Queued::Row {
+                message_id,
+                delivery,
+                row,
+            } => match message_id
+                .filter(|_| delivery)
+                .and_then(|id| admitting.get_mut(&id))
+            {
+                Some(held) => held.push(row),
+                None => activity.record(row).await,
+            },
+            Queued::AdmissionEnded(id) => {
+                for row in admitting.remove(&id).unwrap_or_default() {
+                    activity.record(row).await;
+                }
+            }
+        }
         let count = dropped.swap(0, Ordering::Relaxed);
         if count > 0 {
             tracing::warn!(count, "agent message activity rows were dropped: the writer fell behind");
         }
+    }
+    for row in admitting.into_values().flatten() {
+        activity.record(row).await;
     }
 }
 
@@ -768,9 +830,26 @@ async fn write_agent_messages(
 pub(crate) struct AgentMessageWriter {
     stop: CancellationToken,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sender: mpsc::Sender<Queued>,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl AgentMessageWriter {
+    /// The hook a send uses so its message's delivery rows wait behind its own row: through
+    /// the sink's queue, so a marker keeps its place among the rows.
+    pub(crate) fn admissions(&self) -> AdmissionHook {
+        let (sender, dropped) = (self.sender.clone(), self.dropped.clone());
+        Arc::new(move |message_id: &str, started: bool| {
+            let message_id = message_id.to_owned();
+            let item = if started {
+                Queued::AdmissionStarted(message_id)
+            } else {
+                Queued::AdmissionEnded(message_id)
+            };
+            enqueue(&sender, &dropped, item);
+        })
+    }
+
     /// Refuses new rows, writes every queued one and waits for the writer to end.
     pub(crate) async fn close(&self) {
         self.stop.cancel();
@@ -1691,7 +1770,10 @@ mod tests {
             watch::channel(true).1,
             tracker.clone(),
         );
-        let messaging = tools.messaging_untracked(true).with_outcomes(gated);
+        let messaging = tools
+            .messaging_untracked(true)
+            .with_outcomes(gated)
+            .with_admissions(writer.admissions());
 
         let receipt = messaging
             .send(
@@ -1737,12 +1819,9 @@ mod tests {
     async fn rows_of_a_message_being_admitted_wait_for_its_send() {
         let activity = McpActivity::new(migrated().await);
         let (sink, writer) = agent_message_writer(activity.clone());
-        let marker = |outcome: &str, id: &str| MessageOutcome {
-            outcome: outcome.to_owned(),
-            ..message_outcome("agent_message_send", "", "", Some(id))
-        };
-        sink(marker(crate::agent_messaging::ADMISSION_STARTED, "m1"));
-        sink(marker(crate::agent_messaging::ADMISSION_STARTED, "m2"));
+        let admissions = writer.admissions();
+        admissions("m1", true);
+        admissions("m2", true);
         for id in ["m1", "m2", "m3"] {
             sink(message_outcome(
                 "agent_message_delivery",
@@ -1757,8 +1836,8 @@ mod tests {
             "thread:b",
             Some("m1"),
         ));
-        sink(marker(crate::agent_messaging::ADMISSION_ENDED, "m1"));
-        sink(marker(crate::agent_messaging::ADMISSION_ENDED, "m2"));
+        admissions("m1", false);
+        admissions("m2", false);
         writer.close().await;
 
         let rows = activity.recent().await.unwrap();

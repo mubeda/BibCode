@@ -853,7 +853,8 @@ impl ProductionRuntime {
                 Some(workspace_availability.clone()),
                 attachment_uploads.clone(),
             ))
-            .with_outcomes(agent_message_outcomes.clone()),
+            .with_outcomes(agent_message_outcomes.clone())
+            .with_admissions(agent_message_writer.admissions()),
         );
 
         // Late, so a failed start leaves no follower running.
