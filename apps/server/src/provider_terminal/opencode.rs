@@ -3783,8 +3783,7 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
                     return Ok(data);
                 };
                 self.pending.extend(
-                    self.normalizer
-                        .normalize(&event)
+                    normalize_opencode_v2_for_terminal(&mut self.normalizer, &event)
                         .iter()
                         .filter_map(|event| serde_json::to_vec(event).ok()),
                 );
@@ -3795,6 +3794,14 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
     fn next_dormant_data(&mut self) -> DormantEventData<'_> {
         Box::pin(async move { self.next_data().await.map(Some) })
     }
+}
+
+/// One OpenCode 2 event as the OpenCode 1 events the terminal observer reads.
+fn normalize_opencode_v2_for_terminal(
+    normalizer: &mut opencode::v2_activity::V2ActivityNormalizer,
+    event: &Value,
+) -> Vec<Value> {
+    normalizer.normalize(event)
 }
 
 impl OpenCodeRemoteClient for SystemOpenCodeRemoteClient {
@@ -4055,6 +4062,98 @@ async fn read_bounded_json(mut response: reqwest::Response) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
+    /// The OpenCode 2 events of a committed fixture, and its root session.
+    fn opencode_2_fixture(name: &str) -> (Vec<Value>, String) {
+        let path = format!(
+            "{}/tests/fixtures/opencode-v2/{name}.events.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let events: Vec<Value> = std::fs::read_to_string(path)
+            .expect("fixture")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("fixture event"))
+            .collect();
+        let root = events
+            .iter()
+            .find(|event| event["type"] == "session.created")
+            .and_then(|event| event.pointer("/data/sessionID"))
+            .and_then(Value::as_str)
+            .expect("root session")
+            .to_owned();
+        (events, root)
+    }
+
+    /// Replays OpenCode 2 events through the terminal stream's normalization and the status
+    /// observer, live (decoded) or dormant (raw bytes), and returns the root's last status.
+    fn replay_opencode_2_status(
+        events: &[Value],
+        root: &str,
+        dormant: bool,
+    ) -> Option<super::super::TerminalAgentObservation> {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        let mut normalizer = opencode::v2_activity::V2ActivityNormalizer::default();
+        for event in events {
+            for v1 in normalize_opencode_v2_for_terminal(&mut normalizer, event) {
+                if dormant {
+                    publish_opencode_agent_status(
+                        &lease,
+                        root,
+                        &serde_json::to_vec(&v1).expect("encode"),
+                    );
+                } else {
+                    OpenCodeStatusEvent::from_value(&v1).publish(&lease, root);
+                }
+            }
+        }
+        *lease.subscribe_agent_status().borrow()
+    }
+
+    #[test]
+    fn opencode_2_turn_outcome_makes_the_terminal_ready_only_after_success() {
+        let (hello, hello_root) = opencode_2_fixture("hello");
+        let (fail, fail_root) = opencode_2_fixture("fail");
+        let early = json!({"sessionID": "ses_early"});
+        let failed_before_a_step = vec![
+            json!({"type": "session.created", "data": early}),
+            json!({"type": "session.execution.started", "data": early}),
+            json!({"type": "session.execution.failed", "data": {"sessionID": "ses_early", "error": {"message": "x"}}}),
+        ];
+        for (name, events, root, failed, ready) in [
+            ("hello", &hello, hello_root.as_str(), false, true),
+            ("fail", &fail, fail_root.as_str(), true, false),
+            ("failed before a step", &failed_before_a_step, "ses_early", true, false),
+        ] {
+            for dormant in [false, true] {
+                let status = replay_opencode_2_status(events, root, dormant)
+                    .unwrap_or_else(|| panic!("{name}: no status"));
+                assert_eq!(
+                    (status.state, status.failed, status.ready_for_prompt),
+                    (TerminalAgentState::Done, failed, ready),
+                    "{name} (dormant: {dormant})"
+                );
+            }
+        }
+    }
+
+
+    #[test]
+    fn opencode_2_a_child_session_ending_leaves_the_root_not_ready() {
+        let (events, root) = opencode_2_fixture("child");
+        let child_done = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.execution.succeeded"
+                    && event.pointer("/data/sessionID").and_then(Value::as_str) != Some(&root)
+            })
+            .expect("the child session succeeds");
+        let status = replay_opencode_2_status(&events[..=child_done], &root, false).unwrap();
+        assert_eq!(status.state, TerminalAgentState::Working);
+        assert!(!status.ready_for_prompt, "a child's end made the root ready");
+        let status = replay_opencode_2_status(&events, &root, false).unwrap();
+        assert!(status.ready_for_prompt, "the root's own end makes it ready");
+    }
 
     #[cfg(all(feature = "hermetic-test-guard", unix))]
     #[tokio::test]
