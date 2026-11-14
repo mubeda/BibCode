@@ -1501,6 +1501,38 @@ async fn an_early_provider_event_still_ties_the_message_to_its_own_turn() {
 }
 
 #[tokio::test]
+async fn an_early_settled_item_still_ties_the_message_to_its_own_turn() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    harness.provider_turn("a", "turn-a", "done", true).await;
+    harness.stop_delivery().await;
+    let message_id = harness.sent_untracked("b", "thread:a").await;
+    harness
+        .delivery_moves(&message_id, &[("pending", "sending")])
+        .await;
+
+    // The provider's first item for the turn arrives settled, before its running event.
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.message.assistant.complete", "commandId": "early-complete",
+            "threadId": "a", "messageId": "early-settled", "turnId": "turn-t",
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("early settled item");
+    harness.provider_turn("a", "turn-t", "Port", false).await;
+    harness
+        .delivery_moves(&message_id, &[("sending", "delivered")])
+        .await;
+
+    let row = harness.reconciled_status(&message_id).await;
+    assert_eq!(row.recipient_turn_id.as_deref(), Some("turn-t"));
+    assert_eq!(row.status.as_str(), "consumed");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_message_whose_turn_is_unknown_is_never_given_another_turn() {
     let harness = Harness::new().await;
     harness.messaging_threads().await;
