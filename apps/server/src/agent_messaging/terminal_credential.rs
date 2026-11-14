@@ -517,6 +517,36 @@ mod tests {
         assert!(credentials.verify(&new[AUTH_ENV]).await.is_some());
     }
 
+    #[tokio::test]
+    async fn a_sweep_keeps_a_token_issued_before_its_process_is_live() {
+        let (credentials, live) = credentials(PathBuf::from("/state/runtime/agent"));
+        launch(
+            &credentials,
+            &live,
+            "term-1",
+            &generation("boot-1", 1),
+            true,
+        )
+        .await;
+        let mut env = BTreeMap::new();
+        credentials
+            .issue(
+                &TerminalSessionLaunch {
+                    thread_id: "thread-a",
+                    terminal_id: "term-1",
+                    generation: &generation("boot-1", 2),
+                    ai_terminal: true,
+                },
+                &mut env,
+            )
+            .await;
+
+        // A delayed sweep runs while the older process is still the live one.
+        credentials.sweep("thread-a", "term-1").await;
+        live.set("thread-a", "term-1", Some(generation("boot-1", 2)));
+        assert!(credentials.verify(&env[AUTH_ENV]).await.is_some());
+    }
+
     #[test]
     fn parse_terminal_address_round_trips_and_refuses_a_thread_address() {
         let identity = TerminalIdentity {

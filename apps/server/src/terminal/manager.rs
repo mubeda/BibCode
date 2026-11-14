@@ -2344,7 +2344,12 @@ impl TerminalManager {
             carry_over = session.carry_over();
         }
         let mut input = input;
+        // The keys the server's hook sets, which no prepared environment may replace: a
+        // project's version manager `[env]` must not redirect a terminal's credential. `PATH`
+        // stays open, since a prepared launch pins its own tools there.
+        let mut session_keys = Vec::new();
         if let Some(session_env) = self.inner.options.session_env.as_ref() {
+            let caller_env = input.env.clone();
             let ai_terminal = input
                 .command
                 .as_ref()
@@ -2359,7 +2364,20 @@ impl TerminalManager {
                 &mut input.env,
             )
             .await;
+            session_keys = input
+                .env
+                .iter()
+                .filter(|(key, value)| {
+                    !key.eq_ignore_ascii_case("PATH") && caller_env.get(*key) != Some(*value)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
         }
+        let prepared_may_set = |key: &String| {
+            !session_keys
+                .iter()
+                .any(|session_key| environment_keys_equal(Platform::current(), session_key, key))
+        };
 
         // The provider's native form of the command applies to observed and unobserved
         // launches alike, so it replaces the requested one first. Only the spawn uses it: the
@@ -2389,7 +2407,12 @@ impl TerminalManager {
             .await
             {
                 native_args = Some(native.args);
-                input.env.extend(native.env);
+                input.env.extend(
+                    native
+                        .env
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key)),
+                );
             }
         }
 
@@ -2509,7 +2532,12 @@ impl TerminalManager {
                 });
                 diagnostic_values.dedup();
                 let mut env = input.env.clone();
-                env.extend(prepared.env_overlay);
+                env.extend(
+                    prepared
+                        .env_overlay
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key)),
+                );
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
                 if let Err(observer) = generation.install_observer(observer) {
@@ -11389,6 +11417,7 @@ mod tests {
 
     fn credential_manager(
         backend: Arc<HistoryTestBackend>,
+        launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
     ) -> (
         TerminalManager,
         crate::agent_messaging::terminal_credential::TerminalCredentials,
@@ -11402,6 +11431,7 @@ mod tests {
             backend,
             TerminalManagerOptions {
                 subprocess_poll_interval: Duration::ZERO,
+                launch_preparer,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
                     move |launch, env| {
                         let credentials = hook_credentials.clone();
@@ -11445,7 +11475,7 @@ mod tests {
     async fn terminal_env_agent_credential_only_for_ai_terminals() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
-        let (manager, credentials) = credential_manager(backend.clone());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
 
         manager
             .open(ai_terminal_input(root.path(), "term-ai"))
@@ -11477,12 +11507,95 @@ mod tests {
         manager.shutdown().await;
     }
 
+    /// Prepares every AI Terminal with environment a project could choose, such as a version
+    /// manager's `[env]`.
+    struct OverlayPreparer;
+
+    impl TerminalLaunchPreparer for OverlayPreparer {
+        fn native_command(
+            &self,
+            input: &TerminalLaunchPreparationInput,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Option<crate::provider_terminal::NativeTerminalCommand>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::ready(Some(
+                crate::provider_terminal::NativeTerminalCommand {
+                    args: input.args.clone(),
+                    env: std::collections::BTreeMap::from([(
+                        "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                        "http://example.test/native".to_owned(),
+                    )]),
+                },
+            )))
+        }
+
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::from([
+                        (
+                            "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_AGENT_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
+                    ]),
+                    // A private key that names a launch variable is refused before the spawn.
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(LeaseSlot::default())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_prepared_environment_cannot_replace_the_agent_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) =
+            credential_manager(backend.clone(), Some(Arc::new(OverlayPreparer)));
+
+        manager
+            .open(ai_terminal_input(root.path(), "term-ai"))
+            .await
+            .unwrap();
+
+        let spawn = backend.spawns().pop().expect("a spawn");
+        assert_eq!(
+            spawn.env["BIBCODE_AGENT_ENDPOINT"],
+            "http://127.0.0.1:3773/api/agent/call"
+        );
+        assert!(
+            credentials
+                .verify(&spawn.env["BIBCODE_AGENT_AUTH"])
+                .await
+                .is_some(),
+            "the spawned credential is the one the server issued"
+        );
+        manager.shutdown().await;
+    }
+
     #[tokio::test]
     async fn terminal_env_credential_is_refused_after_close_exit_restart_and_replacement() {
         for ending in ["close", "exit", "restart", "replacement"] {
             let root = tempfile::tempdir().unwrap();
             let backend = Arc::new(HistoryTestBackend::default());
-            let (manager, credentials) = credential_manager(backend.clone());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
             let shutdown = CancellationToken::new();
             let revoker = credentials.spawn_revoker(manager.subscribe_events(), shutdown.clone());
             let ended = ai_terminal_input(root.path(), "term-c");
@@ -11544,7 +11657,7 @@ mod tests {
         for exit_first in [true, false] {
             let root = tempfile::tempdir().unwrap();
             let backend = Arc::new(HistoryTestBackend::default());
-            let (manager, credentials) = credential_manager(backend.clone());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
             let input = ai_terminal_input(root.path(), "term-c");
             manager.open(input.clone()).await.unwrap();
             let old = last_agent_token(&backend);
