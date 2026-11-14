@@ -1463,4 +1463,169 @@ mod tests {
         assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
         tools.shutdown().await;
     }
+
+    async fn dispatch(tools: &crate::production::mcp_tools_tests::Harness, value: Value) {
+        tools
+            .engine
+            .dispatch(serde_json::from_value(value).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Threads `a` "Caller" (approval required) and `b` "Recipient" (full access) of `p1`.
+    async fn caller_and_recipient(tools: &crate::production::mcp_tools_tests::Harness) {
+        for (thread_id, title, mode) in [
+            ("a", "Caller", "approval-required"),
+            ("b", "Recipient", "full-access"),
+        ] {
+            dispatch(
+                tools,
+                json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": mode, "createdAt": "2026-11-14T00:00:00.000Z",
+                }),
+            )
+            .await;
+        }
+    }
+
+    fn scope(thread_id: &str) -> crate::production::connect_mcp::PreviewScope {
+        crate::production::connect_mcp::PreviewScope {
+            environment_id: "local".to_owned(),
+            thread_id: thread_id.to_owned(),
+            owner_thread_id: thread_id.to_owned(),
+            provider_session_id: format!("session-{thread_id}"),
+            provider_instance_id: "codex".to_owned(),
+        }
+    }
+
+    /// A refusal names the sender, and the recipient only once the send resolved it as a live
+    /// thread of the caller's project. Every other recipient (never there, another project's,
+    /// deleted) gives a row of one shape that names nothing it found.
+    #[tokio::test]
+    async fn a_refusal_keeps_the_titles_it_resolved_and_hides_the_rest() {
+        let tools = crate::production::mcp_tools_tests::Harness::new().await;
+        caller_and_recipient(&tools).await;
+        let other = tempfile::tempdir().unwrap();
+        dispatch(
+            &tools,
+            json!({
+                "type": "project.create", "commandId": "create-p2", "projectId": "p2",
+                "title": "Other", "workspaceRoot": other.path(),
+                "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "createdAt": "2026-11-14T00:00:00.000Z",
+            }),
+        )
+        .await;
+        for (thread_id, project_id) in [("x", "p2"), ("d", "p1")] {
+            dispatch(
+                &tools,
+                json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": project_id, "title": "SECRET-TITLE",
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "approval-required", "createdAt": "2026-11-14T00:00:00.000Z",
+                }),
+            )
+            .await;
+        }
+        dispatch(
+            &tools,
+            json!({ "type": "thread.delete", "commandId": "delete-d", "threadId": "d" }),
+        )
+        .await;
+        let messaging = tools
+            .messaging(true)
+            .with_outcomes(agent_message_sink(tools.control.activity().clone()));
+        let refusals = ["thread:b", "thread:gone", "thread:x", "thread:d"];
+        for to in refusals {
+            let result = crate::mcp::tools::agent_messaging::run(
+                scope("a"),
+                "agent_message_send",
+                json!({ "to": to, "text": "hello" }),
+                Some(&messaging),
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{result}");
+        }
+
+        let rows = rows_after(tools.control.activity(), refusals.len()).await;
+
+        let ceiling = &rows[3];
+        assert_eq!(ceiling["outcome"], "AgentMessagingModeCeilingError");
+        assert_eq!(ceiling["label"], "Caller");
+        assert_eq!(
+            ceiling["target"],
+            json!({ "recipient": "thread:b", "recipientTitle": "Recipient" })
+        );
+        for (row, to) in rows[..3].iter().rev().zip(&refusals[1..]) {
+            assert_eq!(row["outcome"], "AgentMessagingUnknownRecipientError", "{row}");
+            assert_eq!(row["label"], "Caller", "{row}");
+            assert_eq!(row["target"], json!({ "recipient": to }), "{row}");
+        }
+        assert!(!serde_json::to_string(&rows).unwrap().contains("SECRET"));
+        tools.shutdown().await;
+    }
+
+    /// A send or reply refused before the service reads anything (messaging off, an argument
+    /// the tool rejects) still leaves one row: the tool, the caller and the tag, no argument.
+    #[tokio::test]
+    async fn a_call_refused_at_the_tool_records_one_row_without_its_arguments() {
+        let tools = crate::production::mcp_tools_tests::Harness::new().await;
+        caller_and_recipient(&tools).await;
+        let sink = agent_message_sink(tools.control.activity().clone());
+        let off = tools.messaging_untracked(false).with_outcomes(sink.clone());
+        let on = tools.messaging(true).with_outcomes(sink);
+        let calls = [
+            (
+                &off,
+                "agent_message_send",
+                json!({ "to": "thread:b", "text": "ARG-CANARY" }),
+                "AgentMessagingDisabledError",
+            ),
+            (
+                &off,
+                "agent_message_reply",
+                json!({ "inReplyTo": "ARG-CANARY", "text": "ARG-CANARY" }),
+                "AgentMessagingDisabledError",
+            ),
+            (
+                &on,
+                "agent_message_send",
+                json!({ "to": "thread:b", "text": "ARG-CANARY", "from": "thread:b" }),
+                "AgentMessagingInvalidArgumentError",
+            ),
+            (
+                &on,
+                "agent_message_reply",
+                json!({ "inReplyTo": 7, "text": "ARG-CANARY" }),
+                "AgentMessagingInvalidArgumentError",
+            ),
+        ];
+        for (messaging, tool, arguments, _) in &calls {
+            let result = crate::mcp::tools::agent_messaging::run(
+                scope("a"),
+                tool,
+                arguments.clone(),
+                Some(messaging),
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{result}");
+        }
+
+        let rows = rows_after(tools.control.activity(), calls.len()).await;
+
+        assert_eq!(rows.len(), calls.len(), "one row per call: {rows:?}");
+        for (row, (_, tool, _, tag)) in rows.iter().rev().zip(&calls) {
+            assert_eq!(row["tool"], *tool, "{row}");
+            assert_eq!(row["outcome"], *tag, "{row}");
+            assert_eq!(row["clientId"], "thread:a", "{row}");
+            assert_eq!(row["label"], "Caller", "{row}");
+            assert_eq!(row["target"], json!({}), "{row}");
+        }
+        assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
+        tools.shutdown().await;
+    }
 }
