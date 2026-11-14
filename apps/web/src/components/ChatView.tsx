@@ -339,10 +339,16 @@ import {
   useCancelSendRequest,
   useDismissSendRequest,
   useGetHandoffText,
+  useGetTerminalOutput,
   useSendRequest,
   useSendRequests,
 } from "../state/sendRequests";
 import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
+import {
+  TerminalSendToAgentContext,
+  type TerminalSendToAgentServices,
+} from "./sendToAgent/TerminalSendComposer";
+import { isAiTerminal, makeTerminalOutputLoader } from "./sendToAgent/terminalSource.logic";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
@@ -963,6 +969,16 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
     threadWorktreePath,
   ]);
 
+  const aiTerminalIds = useMemo(
+    () =>
+      new Set(
+        knownTerminalSessions
+          .filter((session) => isAiTerminal(session.state.summary))
+          .map((session) => session.target.terminalId),
+      ),
+    [knownTerminalSessions],
+  );
+
   if (!project || !cwd) return null;
 
   return (
@@ -997,6 +1013,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       onAddTerminalContext={onAddTerminalContext}
       terminalLabelsById={terminalLabelsById}
       terminalLaunchLocationsById={terminalLaunchLocationsById}
+      aiTerminalIds={aiTerminalIds}
       keybindings={keybindings}
     />
   );
@@ -5202,6 +5219,7 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const sendReview = useSendRequest(environmentId);
   const getHandoffText = useGetHandoffText(environmentId);
+  const getTerminalOutput = useGetTerminalOutput(environmentId);
   // A Review to a new panel: the panel starts with the review's modes and guard like the Code
   // review button's, but its first message is the tracked request, not a bare turn.
   const startNewPanelReview = useLatestHandler(
@@ -5269,13 +5287,12 @@ function ChatViewContent(props: ChatViewProps) {
       return buildHandOffContent({ source: choice.source, loadHandoff });
     }
     if (choice.action === "take-over") {
-      // A terminal's text needs `sendRequests.getTerminalOutput` (task 9.1), so no loader yet.
       return choice.target.kind === "agent"
         ? buildTakeOverContent({
             source: choice.source,
             picked: choice.target.row,
             loadHandoff,
-            loadTerminalOutput: null,
+            loadTerminalOutput: makeTerminalOutputLoader(getTerminalOutput, choice.source.threadId),
           })
         : null;
     }
@@ -5333,6 +5350,27 @@ function ChatViewContent(props: ChatViewProps) {
       createSendPanel,
       revealSendPanel,
       isServerThread,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
+      sendRequestsSupported,
+    ],
+  );
+  // What every AI Terminal control under this chat needs; null outside a stored thread.
+  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
+    () =>
+      isServerThread
+        ? {
+            serverSupported: sendRequestsSupported,
+            newPanelProvidersFor: sendNewPanelProvidersFor,
+            createPanel: createSendPanel,
+            revealPanel: revealSendPanel,
+            previewContentFor: sendPreviewContentFor,
+          }
+        : null,
+    [
+      createSendPanel,
+      isServerThread,
+      revealSendPanel,
       sendNewPanelProvidersFor,
       sendPreviewContentFor,
       sendRequestsSupported,
@@ -7819,24 +7857,26 @@ function ChatViewContent(props: ChatViewProps) {
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "terminal" ? (
-      <PersistentThreadTerminalPanel
-        threadRef={activeThreadRef}
-        surface={activeRightPanelSurface}
-        launchContext={null}
-        focusRequestId={terminalFocusRequestId}
-        keybindings={keybindings}
-        onAddTerminalContext={addTerminalContextToDraft}
-        onSplitTerminal={splitPanelTerminal}
-        onSplitTerminalVertical={splitPanelTerminalVertical}
-        onNewTerminal={addTerminalSurface}
-        onActiveTerminalChange={activatePanelTerminal}
-        onCloseTerminal={closePanelTerminal}
-        splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
-        splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
-        newShortcutLabel={newTerminalShortcutLabel ?? undefined}
-        closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
-        workspaceUnavailable={workspaceUnavailable}
-      />
+      <TerminalSendToAgentContext.Provider value={terminalSendServices}>
+        <PersistentThreadTerminalPanel
+          threadRef={activeThreadRef}
+          surface={activeRightPanelSurface}
+          launchContext={null}
+          focusRequestId={terminalFocusRequestId}
+          keybindings={keybindings}
+          onAddTerminalContext={addTerminalContextToDraft}
+          onSplitTerminal={splitPanelTerminal}
+          onSplitTerminalVertical={splitPanelTerminalVertical}
+          onNewTerminal={addTerminalSurface}
+          onActiveTerminalChange={activatePanelTerminal}
+          onCloseTerminal={closePanelTerminal}
+          splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
+          splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
+          newShortcutLabel={newTerminalShortcutLabel ?? undefined}
+          closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+          workspaceUnavailable={workspaceUnavailable}
+        />
+      </TerminalSendToAgentContext.Provider>
     ) : activeRightPanelSurface?.kind === "diff" ? (
       diffSurfaceThreadRef !== null && diffSurfaceThread === null ? (
         <PanelDiffPendingState
@@ -8242,60 +8282,64 @@ function ChatViewContent(props: ChatViewProps) {
           );
 
           return !isPanel && activeThreadRef ? (
-            <LiveCenterPanelWorkspace
-              workspaceRef={centerPanelWorkspaceRef}
-              state={centerPanelState}
-              hostLabel={centerHostLabel}
-              terminalLabelsById={activeTerminalLabelsById}
-              renderFocusedActions={(density) => (
-                <ChatHeaderActions
-                  density={density}
-                  activeThreadEnvironmentId={activeThread.environmentId}
-                  activeThreadId={activeThread.id}
-                  {...(routeKind === "draft" && draftId ? { draftId } : {})}
-                  activeProjectName={activeProject?.title}
-                  openInCwd={gitCwd}
-                  activeProjectScripts={activeProject?.scripts}
-                  preferredScriptId={
-                    activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-                  }
-                  keybindings={keybindings}
-                  availableEditors={availableEditors}
-                  reserveTitlebarControls={reserveCenterTitlebarControls}
-                  gitCwd={gitCwd}
-                  providerStatuses={providerStatuses as ServerProvider[]}
-                  settings={settings}
-                  canCreatePanel={centerPanelLaunchContext !== null}
-                  onCreateChatPanel={handleCreateChatPanel}
-                  onCreateSideChat={handleCreateSideChatFromMenu}
-                  sideChatUnavailableReason={sideChatUnavailableReason}
-                  onReopenChatPanel={handleReopenChatPanel}
-                  onOpenTerminalPanel={handleOpenTerminalPanel}
-                  onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-                  onRunProjectScript={runProjectScript}
-                  onAddProjectScript={saveProjectScript}
-                  onUpdateProjectScript={updateProjectScript}
-                  onDeleteProjectScript={deleteProjectScript}
-                  workspaceUnavailable={workspaceUnavailable}
-                />
-              )}
-              hostChatSurfaceBody={hostChatSurfaceBody}
-              hostThreadRef={activeThreadRef}
-              centerTerminalLaunchContext={centerTerminalLaunchContext}
-              keybindings={keybindings}
-              terminalFocusRequestId={terminalFocusRequestId}
-              onAddTerminalContext={addTerminalContextToDraft}
-              onFocusGroup={focusCenterPanelGroup}
-              onActivate={activateCenterPanelSurface}
-              onCloseSurface={closeCenterPanelSurface}
-              onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-              onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-              onCloseAllSurfaces={closeAllCenterPanelSurfaces}
-              onDropSurface={dropCenterPanelSurface}
-              onMergeGroup={mergeCenterPanelGroup}
-              onSetSplitRatio={setCenterPanelSplitRatio}
-              workspaceUnavailable={workspaceUnavailable}
-            />
+            <TerminalSendToAgentContext.Provider value={terminalSendServices}>
+              <LiveCenterPanelWorkspace
+                workspaceRef={centerPanelWorkspaceRef}
+                state={centerPanelState}
+                hostLabel={centerHostLabel}
+                terminalLabelsById={activeTerminalLabelsById}
+                renderFocusedActions={(density) => (
+                  <ChatHeaderActions
+                    density={density}
+                    activeThreadEnvironmentId={activeThread.environmentId}
+                    activeThreadId={activeThread.id}
+                    {...(routeKind === "draft" && draftId ? { draftId } : {})}
+                    activeProjectName={activeProject?.title}
+                    openInCwd={gitCwd}
+                    activeProjectScripts={activeProject?.scripts}
+                    preferredScriptId={
+                      activeProject
+                        ? (lastInvokedScriptByProjectId[activeProject.id] ?? null)
+                        : null
+                    }
+                    keybindings={keybindings}
+                    availableEditors={availableEditors}
+                    reserveTitlebarControls={reserveCenterTitlebarControls}
+                    gitCwd={gitCwd}
+                    providerStatuses={providerStatuses as ServerProvider[]}
+                    settings={settings}
+                    canCreatePanel={centerPanelLaunchContext !== null}
+                    onCreateChatPanel={handleCreateChatPanel}
+                    onCreateSideChat={handleCreateSideChatFromMenu}
+                    sideChatUnavailableReason={sideChatUnavailableReason}
+                    onReopenChatPanel={handleReopenChatPanel}
+                    onOpenTerminalPanel={handleOpenTerminalPanel}
+                    onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+                    onRunProjectScript={runProjectScript}
+                    onAddProjectScript={saveProjectScript}
+                    onUpdateProjectScript={updateProjectScript}
+                    onDeleteProjectScript={deleteProjectScript}
+                    workspaceUnavailable={workspaceUnavailable}
+                  />
+                )}
+                hostChatSurfaceBody={hostChatSurfaceBody}
+                hostThreadRef={activeThreadRef}
+                centerTerminalLaunchContext={centerTerminalLaunchContext}
+                keybindings={keybindings}
+                terminalFocusRequestId={terminalFocusRequestId}
+                onAddTerminalContext={addTerminalContextToDraft}
+                onFocusGroup={focusCenterPanelGroup}
+                onActivate={activateCenterPanelSurface}
+                onCloseSurface={closeCenterPanelSurface}
+                onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+                onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+                onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+                onDropSurface={dropCenterPanelSurface}
+                onMergeGroup={mergeCenterPanelGroup}
+                onSetSplitRatio={setCenterPanelSplitRatio}
+                workspaceUnavailable={workspaceUnavailable}
+              />
+            </TerminalSendToAgentContext.Provider>
           ) : (
             hostChatSurfaceBody
           );

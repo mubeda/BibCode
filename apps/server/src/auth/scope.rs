@@ -211,7 +211,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
         // A person's requests to agents. An outside agent holds these scopes too; every
         // handler's `require_person` refuses it.
-        "sendRequests.send" | "sendRequests.cancel" | "sendRequests.dismiss" => {
+        // Terminal output is as private as the terminal, so reading it needs operate.
+        "sendRequests.send"
+        | "sendRequests.cancel"
+        | "sendRequests.dismiss"
+        | "sendRequests.getTerminalOutput" => {
             Some(SCOPE_ORCHESTRATION_OPERATE)
         }
         "sendRequests.getAnswer" | "sendRequests.getHandoffText" | "sendRequests.subscribe" => {

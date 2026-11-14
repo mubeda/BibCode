@@ -73,6 +73,89 @@ pub(crate) struct SendRequestsGetHandoffTextResult {
     pub(crate) included_messages: usize,
 }
 
+/// The wire input of `sendRequests.getTerminalOutput`: the thread the person clicked in, and the
+/// terminal to read with its owner thread.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SendRequestsGetTerminalOutputInput {
+    pub(crate) source_thread_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) source: TerminalTextSource,
+    // Both parts read the same tail until phase 10 adds the conversation readers.
+    #[allow(dead_code)]
+    pub(crate) part: TerminalTextPart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalTextSource {
+    Output,
+    Conversation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalTextPart {
+    LastAnswer,
+    Handoff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendRequestsGetTerminalOutputResult {
+    pub(crate) thread_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+    pub(crate) used_source: TerminalTextSource,
+    pub(crate) fell_back: bool,
+    pub(crate) start_missing: bool,
+}
+
+/// The most terminal output one read returns, in Unicode scalar values.
+pub(crate) const TERMINAL_OUTPUT_MAX_CHARS: usize = 16_000;
+
+/// The last output of a terminal, without escape sequences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalTail {
+    pub(crate) text: String,
+    /// Older output exists that the text leaves out.
+    pub(crate) truncated: bool,
+}
+
+/// Read access to a terminal's retained output. It has no way to write to the terminal.
+pub(crate) trait TerminalOutputSource: Send + Sync {
+    fn tail<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+        max_chars: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<TerminalTail, crate::terminal::TerminalError>>;
+}
+
+impl TerminalOutputSource for crate::terminal::TerminalManager {
+    fn tail<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+        max_chars: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<TerminalTail, crate::terminal::TerminalError>>
+    {
+        Box::pin(async move {
+            let read = self
+                .read_history(owner_thread_id, terminal_id, None, max_chars)
+                .await?;
+            // An escape cut at the window's start or end is dropped with the rest of its bytes.
+            let (text, _open) = crate::ansi::strip_escapes(&read.window.text);
+            Ok(TerminalTail {
+                text,
+                truncated: read.window.start > 0,
+            })
+        })
+    }
+}
+
 /// Sends one stream event; false when the stream was cancelled or closed.
 async fn send_event(
     sender: &mpsc::Sender<RpcStreamChunk>,
@@ -239,6 +322,7 @@ pub(crate) struct SendRequestsService {
     repositories: Repositories,
     dispatcher: ServerCommandDispatcher,
     changes: broadcast::Sender<RequestChange>,
+    terminal_output: Option<std::sync::Arc<dyn TerminalOutputSource>>,
     /// Held across a dispatch, and by a cancel that finds no delivery yet, so a cancelled
     /// request is never queued afterwards.
     // shortcut: one gate for every request; a per-request lock if person sends ever contend.
@@ -259,9 +343,21 @@ impl SendRequestsService {
             repositories,
             dispatcher,
             changes: broadcast::channel(256).0,
+            terminal_output: None,
             dispatch_gate: std::sync::Arc::default(),
             publish_order: std::sync::Arc::default(),
         }
+    }
+
+    // Production attaches the terminal manager in `production/runtime.rs`, which this change
+    // could not edit; until then only tests call it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn with_terminal_output(
+        mut self,
+        source: std::sync::Arc<dyn TerminalOutputSource>,
+    ) -> Self {
+        self.terminal_output = Some(source);
+        self
     }
 
     pub(crate) fn subscribe_changes(&self) -> broadcast::Receiver<RequestChange> {
@@ -645,6 +741,53 @@ impl SendRequestsService {
             text: handoff.render(),
             left_out: handoff.left_out,
             included_messages: handoff.tail.len() + usize::from(handoff.first_message.is_some()),
+        })
+    }
+
+    /// The last output of an AI Terminal, for a terminal source's preview. It only reads, logs ids
+    /// and sizes, and never the text. The CLI conversation has no reader yet, so that source falls
+    /// back to the output.
+    pub(crate) async fn get_terminal_output(
+        &self,
+        context: &RpcSessionContext,
+        input: SendRequestsGetTerminalOutputInput,
+    ) -> Result<SendRequestsGetTerminalOutputResult, Value> {
+        require_person(context)?;
+        let source = self.live_thread(&input.source_thread_id).await?;
+        let owner = self.live_thread(&input.thread_id).await?;
+        if owner.project_id != source.project_id {
+            return Err(refusal(
+                "other_project",
+                "This terminal belongs to another project.",
+            ));
+        }
+        let reader = self
+            .terminal_output
+            .as_ref()
+            .ok_or_else(|| refusal("not_found", "This terminal's output is not available."))?;
+        let owner_id = owner
+            .host_thread_id
+            .clone()
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| input.thread_id.clone());
+        let tail = reader
+            .tail(&owner_id, &input.terminal_id, TERMINAL_OUTPUT_MAX_CHARS)
+            .await
+            .map_err(|_| refusal("not_found", "This terminal is no longer available."))?;
+        tracing::debug!(
+            terminal_id = %input.terminal_id,
+            chars = tail.text.chars().count(),
+            truncated = tail.truncated,
+            "a terminal's output was read for a send request"
+        );
+        Ok(SendRequestsGetTerminalOutputResult {
+            thread_id: input.thread_id,
+            terminal_id: input.terminal_id,
+            text: tail.text,
+            truncated: tail.truncated,
+            used_source: TerminalTextSource::Output,
+            fell_back: input.source == TerminalTextSource::Conversation,
+            start_missing: false,
         })
     }
 

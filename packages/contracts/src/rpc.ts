@@ -123,6 +123,8 @@ import {
   SendRequestsGetAnswerResult,
   SendRequestsGetHandoffTextInput,
   SendRequestsGetHandoffTextResult,
+  SendRequestsGetTerminalOutputInput,
+  SendRequestsGetTerminalOutputResult,
   SendRequestsSendInput,
   SendRequestsStreamEvent,
   SendRequestsSubscribeInput,
@@ -665,6 +667,7 @@ export const WS_METHODS = {
   sendRequestsSubscribe: "sendRequests.subscribe",
   sendRequestsGetAnswer: "sendRequests.getAnswer",
   sendRequestsGetHandoffText: "sendRequests.getHandoffText",
+  sendRequestsGetTerminalOutput: "sendRequests.getTerminalOutput",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -2283,6 +2286,16 @@ export const WsSendRequestsGetHandoffTextRpc = Rpc.make(WS_METHODS.sendRequestsG
   error: Schema.Union([SendRequestError, EnvironmentRpcError]),
 });
 
+/** The last output of an AI Terminal for a terminal source; only reads. `orchestration:operate`. */
+export const WsSendRequestsGetTerminalOutputRpc = Rpc.make(
+  WS_METHODS.sendRequestsGetTerminalOutput,
+  {
+    payload: SendRequestsGetTerminalOutputInput,
+    success: SendRequestsGetTerminalOutputResult,
+    error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+  },
+);
+
 /** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
 export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
   payload: WebhooksListInput,
@@ -2553,6 +2566,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSendRequestsSubscribeRpc,
   WsSendRequestsGetAnswerRpc,
   WsSendRequestsGetHandoffTextRpc,
+  WsSendRequestsGetTerminalOutputRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

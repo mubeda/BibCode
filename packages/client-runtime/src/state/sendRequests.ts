@@ -107,6 +107,10 @@ export function createSendRequestsEnvironmentAtoms<R, E>(
       label: "environment-data:send-requests:get-handoff-text",
       tag: WS_METHODS.sendRequestsGetHandoffText,
     }),
+    getTerminalOutput: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:send-requests:get-terminal-output",
+      tag: WS_METHODS.sendRequestsGetTerminalOutput,
+    }),
     requests: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:send-requests:requests",
       subscribe: (input: Record<string, never>) =>

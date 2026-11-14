@@ -141,6 +141,7 @@ import {
   type TerminalThemeMode,
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
+import { TerminalSendComposer } from "./sendToAgent/TerminalSendComposer";
 
 const terminalInputRegistry = createTerminalInputSchedulerRegistry();
 const terminalInputBindings = new Map<string, TerminalInputBinding>();
@@ -903,6 +904,8 @@ interface TerminalViewportProps {
   autoFocus: boolean;
   keybindings: ResolvedKeybindingsConfig;
   workspaceUnavailable?: string | null;
+  /** Reports how to read this terminal's current selection, and null when it goes away. */
+  onSelectionReaderChange?: (terminalId: string, read: (() => string) | null) => void;
 }
 
 interface TerminalLaunchLocation {
@@ -941,6 +944,7 @@ export function TerminalViewport({
   autoFocus,
   keybindings,
   workspaceUnavailable = null,
+  onSelectionReaderChange,
 }: TerminalViewportProps) {
   const { resolvedTheme: appTheme, resolvedThemeId } = useTheme();
   const terminalThemePreference = usePrimarySettings(
@@ -998,6 +1002,14 @@ export function TerminalViewport({
   } | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [inputReattaching, setInputReattaching] = useState(false);
+  // Send to agent reads the selection when the person chooses, without a re-render per change.
+  useEffect(() => {
+    if (!onSelectionReaderChange) return;
+    onSelectionReaderChange(terminalId, () =>
+      (terminalRef.current?.getSelection() ?? "").replace(/\r\n/g, "\n").replace(/^\n+|\n+$/g, ""),
+    );
+    return () => onSelectionReaderChange(terminalId, null);
+  }, [onSelectionReaderChange, terminalId]);
   const [imagePastesPending, setImagePastesPending] = useState(0);
   const cancelImagePastesRef = useRef<() => void>(() => undefined);
   const openInPreferredEditor = useOpenInPreferredEditor(
@@ -3067,7 +3079,13 @@ interface ThreadTerminalPanelProps {
   /** Prefer per-session launch locations when the server already knows a terminal. */
   terminalLaunchLocationsById?: ReadonlyMap<string, TerminalLaunchLocation>;
   workspaceUnavailable?: string | null;
+  /** The AI Terminals among `terminalIds`; only these show Send to agent. */
+  aiTerminalIds?: ReadonlySet<string>;
 }
+
+// The control's icon button is sized for the composer; the toolbars are about 22px tall.
+const TOOLBAR_SEND_CLASS =
+  "inline-flex items-center [&_button]:size-5 [&_button]:rounded-none [&_svg]:size-3.25";
 
 interface TerminalActionButtonProps {
   label: string;
@@ -3142,6 +3160,7 @@ export default function ThreadTerminalPanel({
   terminalCommandsById,
   terminalLaunchLocationsById,
   workspaceUnavailable = null,
+  aiTerminalIds,
 }: ThreadTerminalPanelProps) {
   const normalizedTerminalIds = useMemo(() => {
     const normalizedIds: string[] = [];
@@ -3293,6 +3312,24 @@ export default function ThreadTerminalPanel({
   const hasTerminalToolbarActions = Boolean(
     onSplitTerminal || onSplitTerminalVertical || onNewTerminal,
   );
+  const selectionReadersRef = useRef(new Map<string, () => string>());
+  const onSelectionReaderChange = useCallback((terminalId: string, read: (() => string) | null) => {
+    if (read === null) selectionReadersRef.current.delete(terminalId);
+    else selectionReadersRef.current.set(terminalId, read);
+  }, []);
+  const readActiveSelection = useCallback(
+    () => selectionReadersRef.current.get(resolvedActiveTerminalId)?.() ?? "",
+    [resolvedActiveTerminalId],
+  );
+  const sendToAgentControl = aiTerminalIds?.has(resolvedActiveTerminalId) ? (
+    <TerminalSendComposer
+      threadRef={threadRef}
+      terminalId={resolvedActiveTerminalId}
+      terminalLabel={terminalLabelById.get(resolvedActiveTerminalId) ?? "Terminal"}
+      readSelection={readActiveSelection}
+    />
+  ) : null;
+  const hasToolbar = hasTerminalToolbarActions || sendToAgentControl !== null;
   const onSplitTerminalAction = useCallback(() => {
     if (workspaceUnavailable || hasReachedSplitLimit || !onSplitTerminal) return;
     onSplitTerminal();
@@ -3336,12 +3373,20 @@ export default function ThreadTerminalPanel({
       data-terminal-owner={owner}
       className="thread-terminal-panel relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
     >
-      {!hasTerminalSidebar && hasTerminalToolbarActions ? (
+      {!hasTerminalSidebar && hasToolbar ? (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
           <div
             data-terminal-toolbar="floating"
             className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70"
           >
+            {sendToAgentControl ? (
+              <>
+                <div className={TOOLBAR_SEND_CLASS}>{sendToAgentControl}</div>
+                {hasTerminalToolbarActions ? (
+                  <div data-terminal-toolbar-separator className="h-4 w-px bg-border/80" />
+                ) : null}
+              </>
+            ) : null}
             {onSplitTerminal ? (
               <>
                 <TerminalActionButton
@@ -3454,6 +3499,7 @@ export default function ThreadTerminalPanel({
                           autoFocus={focusEligible && terminalId === resolvedActiveTerminalId}
                           keybindings={keybindings}
                           workspaceUnavailable={workspaceUnavailable}
+                          onSelectionReaderChange={onSelectionReaderChange}
                         />
                       </div>
                     </div>
@@ -3486,6 +3532,7 @@ export default function ThreadTerminalPanel({
                   autoFocus={focusEligible}
                   keybindings={keybindings}
                   workspaceUnavailable={workspaceUnavailable}
+                  onSelectionReaderChange={onSelectionReaderChange}
                 />
               </div>
             )}
@@ -3493,12 +3540,15 @@ export default function ThreadTerminalPanel({
 
           {hasTerminalSidebar && (
             <aside className="flex w-36 min-w-36 flex-col border border-border/70 bg-muted/10">
-              {hasTerminalToolbarActions ? (
+              {hasToolbar ? (
                 <div
                   data-terminal-toolbar="sidebar"
                   className="flex h-[22px] items-stretch justify-end border-b border-panel-separator"
                 >
                   <div className="inline-flex h-full items-stretch">
+                    {sendToAgentControl ? (
+                      <div className={`${TOOLBAR_SEND_CLASS} h-full`}>{sendToAgentControl}</div>
+                    ) : null}
                     {onSplitTerminal ? (
                       <TerminalActionButton
                         className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
