@@ -430,7 +430,12 @@ jobs:
           peak="$RUNNER_TEMP/bundle-peak-kb"
           echo 0 > "$peak"
           (
-            while sleep 60; do
+            # An interruptible wait, so the EXIT trap below leaves no sleep holding the log open.
+            trap 'kill "$nap" 2>/dev/null || true; exit 0' TERM
+            while :; do
+              sleep 60 &
+              nap=$!
+              wait "$nap" || true
               line="heartbeat $((SECONDS - start))s"
               if [ "$RUNNER_OS" != Windows ]; then
                 top="$(ps -Ao rss=,comm= 2>/dev/null | awk '$2 ~ /(^|\/)(rustc|ld|lld|ld64|rust-lld|dsymutil)$/' | sort -rn | head -4 || true)"
@@ -446,7 +451,7 @@ jobs:
             done
           ) &
           heartbeat=$!
-          trap 'kill "$heartbeat" 2>/dev/null || true; echo "::notice title=Bundle build::${RUNNER_OS} ${RUNNER_ARCH} took $((SECONDS - start)) s, peak single compiler or linker process $(($(cat "$peak") / 1024)) MB"' EXIT
+          trap 'kill "$heartbeat" 2>/dev/null || true; wait "$heartbeat" 2>/dev/null || true; echo "::notice title=Bundle build::${RUNNER_OS} ${RUNNER_ARCH} took $((SECONDS - start)) s, peak single compiler or linker process $(($(cat "$peak") / 1024)) MB"' EXIT
           node scripts/build-desktop-artifact.ts \
             --platform "${{ matrix.platform }}" \
             --target "${{ matrix.target }}" \

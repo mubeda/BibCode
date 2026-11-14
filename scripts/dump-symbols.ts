@@ -210,8 +210,9 @@ export function dumpSymbols(input: DumpSymbolsInput, dumpSyms = "dump_syms"): st
         encoding: "utf8",
         maxBuffer: 64 * 1024 * 1024,
       });
+      // First, so a run that failed (an overflowing log included) still shows what it logged.
+      if (result.stderr) process.stderr.write(result.stderr);
       if (result.error) throw result.error;
-      process.stderr.write(result.stderr);
       if (result.status !== 0) {
         throw new DumpSymbolsError(`dump_syms exited with ${result.status ?? result.signal}.`);
       }
