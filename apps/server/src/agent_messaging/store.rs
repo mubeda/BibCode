@@ -312,6 +312,46 @@ pub(crate) fn apply_relink(
     Ok(changed == 1)
 }
 
+/// Records the recipient's turn that took the message.
+pub(crate) fn set_recipient_turn(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE agent_messages SET recipient_turn_id = ?2 WHERE message_id = ?1",
+        params![message_id, turn_id],
+    )?;
+    Ok(())
+}
+
+const OPEN: &str = "status NOT IN ('completed', 'cancelled', 'failed')";
+
+/// The messages to `recipient_address` whose status is not final, in acceptance order.
+pub(crate) fn list_open_for_thread(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages WHERE recipient_address = ?1 AND {OPEN} ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![recipient_address], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every message whose status is not final, in acceptance order.
+pub(crate) fn list_open(connection: &rusqlite::Connection) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages WHERE {OPEN} ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map([], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Whether queue entry `command_id` delivering `message_id` is an agent's message: the server
 /// stored its row in the queue entry's own transaction, so no text a person sends makes it one.
 pub(crate) fn is_agent_message_delivery(

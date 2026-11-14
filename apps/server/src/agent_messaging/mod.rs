@@ -2,6 +2,7 @@
 //! provider tools. Off unless `agentMessaging.enabled` is on. An agent's identity is the thread
 //! of its credential, never an argument, and it reaches only agents of its own project.
 
+pub(crate) mod delivery;
 pub(crate) mod directory;
 pub(crate) mod envelope;
 pub mod store;

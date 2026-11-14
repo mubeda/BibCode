@@ -73,6 +73,8 @@ pub(crate) struct Harness {
     state_dir: std::path::PathBuf,
     _state: tempfile::TempDir,
     _secrets: tempfile::TempDir,
+    tracker: CancellationToken,
+    tracker_started: std::sync::atomic::AtomicBool,
 }
 
 impl Harness {
@@ -178,6 +180,8 @@ impl Harness {
             state_dir: state.path().to_path_buf(),
             _state: state,
             _secrets: secrets,
+            tracker: CancellationToken::new(),
+            tracker_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -286,8 +290,27 @@ impl Harness {
         }
     }
 
-    /// The messaging service over this harness's engine, on or off.
+    /// The messaging service over this harness's engine, on or off, with the status tracker
+    /// running (started once per harness).
     pub(crate) fn messaging(&self, enabled: bool) -> crate::agent_messaging::AgentMessaging {
+        if !self
+            .tracker_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            crate::agent_messaging::delivery::AgentMessageTracker::start(
+                self.engine.clone(),
+                None,
+                self.tracker.clone(),
+            );
+        }
+        self.messaging_untracked(enabled)
+    }
+
+    /// [`Self::messaging`] without starting the status tracker.
+    pub(crate) fn messaging_untracked(
+        &self,
+        enabled: bool,
+    ) -> crate::agent_messaging::AgentMessaging {
         crate::agent_messaging::AgentMessaging::new(self.engine.clone(), watch::channel(enabled).1)
             .with_starter(super::orchestration_rpc::server_turn_starter(
                 self.engine.clone(),
@@ -300,6 +323,7 @@ impl Harness {
     }
 
     pub(crate) async fn shutdown(self) {
+        self.tracker.cancel();
         self.delivery.shutdown().await;
         self.provider.shutdown().await.expect("provider shutdown");
         self.engine.shutdown().await;

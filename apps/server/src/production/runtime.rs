@@ -119,6 +119,8 @@ pub struct ProductionRuntime {
     webhooks: crate::webhooks::Webhooks,
     /// Stops the follower that moves send requests through their states.
     send_requests_follower: CancellationToken,
+    /// Stops the tracker that moves agent messages through their states.
+    agent_message_tracker: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -846,12 +848,19 @@ impl ProductionRuntime {
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
+        let agent_message_tracker = CancellationToken::new();
+        crate::agent_messaging::delivery::AgentMessageTracker::start(
+            orchestration.clone(),
+            None,
+            agent_message_tracker.clone(),
+        );
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,
             send_requests_follower,
+            agent_message_tracker,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1049,6 +1058,9 @@ impl ProductionRuntime {
         // A stopped follower resumes from its first sweep on the next start.
         self.send_requests_follower.cancel();
         steps.mark("send-requests-follower");
+        // A stopped tracker resumes from its first reconciliation on the next start.
+        self.agent_message_tracker.cancel();
+        steps.mark("agent-message-tracker");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
