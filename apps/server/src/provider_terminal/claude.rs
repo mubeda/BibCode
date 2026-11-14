@@ -4840,4 +4840,52 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn an_authenticated_hook_refused_for_capacity_withdraws_readiness() {
+        // Mutation caught: a hook refused because every request slot is busy returning before
+        // it withdraws readiness, so the prompt it carried leaves the terminal ready.
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let status = generation.observation().subscribe_agent_status();
+        let state = status_only_hook_state(&generation);
+        send_status_hook(&state, Body::from(idle_prompt_hook().to_string())).await;
+        let mut forged = authenticated_hook_headers();
+        forged.insert("authorization", "Bearer wrong".parse().unwrap());
+        let forged = capture_claude_hook(
+            State(state.clone()),
+            forged,
+            Body::from(json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string()),
+        )
+        .await
+        .into_response()
+        .status();
+        assert_eq!(forged, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status
+                .borrow()
+                .map(|observation| observation.ready_for_prompt),
+            Some(true),
+            "an unauthenticated request withdrew readiness"
+        );
+        let _busy = state
+            .request_permits
+            .clone()
+            .try_acquire_many_owned(4)
+            .expect("every request slot");
+
+        let refused = send_status_hook(
+            &state,
+            Body::from(json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string()),
+        )
+        .await;
+
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            status
+                .borrow()
+                .map(|observation| observation.ready_for_prompt),
+            Some(false),
+            "a hook refused for capacity left the terminal ready"
+        );
+    }
 }
