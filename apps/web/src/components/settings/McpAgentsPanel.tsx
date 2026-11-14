@@ -55,6 +55,10 @@ export function activityTargetText(row: McpActivityRow): string | null {
     target.fileCount !== undefined
       ? `${target.fileCount} ${target.fileCount === 1 ? "file" : "files"}`
       : null,
+    target.recipient !== undefined
+      ? `to ${target.recipientTitle?.trim() || "another agent"}`
+      : null,
+    target.status ?? null,
   ].filter((part) => part !== null);
   return parts.length === 0 ? null : parts.join(" · ");
 }

@@ -670,6 +670,60 @@ async fn measure_one_page_over_5000_large_events() {
     database.close().await;
 }
 
+/// Agent messaging rows are the activity log's, not the outside agents' feed: no `agent.call`
+/// entry, so no webhook event, though the log's head moves past them.
+#[tokio::test]
+async fn agent_message_rows_are_not_in_the_change_feed() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let cursor = head(&harness, &agent).await;
+    let sink = crate::mcp::activity::agent_message_sink(harness.control.activity().clone());
+    for (tool, outcome) in [
+        ("agent_message_send", "accepted"),
+        ("agent_message_reply", "accepted"),
+        ("agent_message_delivery", "delivered"),
+    ] {
+        sink(crate::agent_messaging::MessageOutcome {
+            sender_address: "thread:a".to_owned(),
+            recipient_address: "thread:b".to_owned(),
+            tool,
+            outcome: outcome.to_owned(),
+            message_id: Some("m1".to_owned()),
+            conversation_id: Some("c1".to_owned()),
+            hop: None,
+            reason: None,
+            sender_title: Some("Caller".to_owned()),
+            recipient_title: Some("Recipient".to_owned()),
+        });
+    }
+    // An outside agent's own call, recorded after them.
+    for _ in 0..200 {
+        if harness.control.activity().recent().await.unwrap().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    activity_row(&harness, None).await;
+
+    let page = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+
+    assert_eq!(kinds(&page), ["agent.call"], "{page}");
+    assert_eq!(page["entries"][0]["tool"], "git_commit");
+    // The log's head moved past the three message rows and the outside call: 4 rows.
+    assert_eq!(
+        positions(page["cursor"].as_str().unwrap()).1,
+        positions(&cursor).1 + 4
+    );
+    let events: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| crate::webhooks::events::from_feed_entry(entry, None))
+        .collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_cursor_older_than_the_oldest_activity_row_reports_it_dropped() {
     let harness = Harness::new().await;
