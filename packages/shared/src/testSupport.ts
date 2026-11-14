@@ -49,6 +49,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     conversationOnlyRewind: false,
     threadDeleteOnlyIfUnused: false,
     hostMetrics: false,
+    sendRequests: false,
     ...overrides,
   };
 }

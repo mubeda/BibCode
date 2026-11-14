@@ -514,6 +514,31 @@ describe("applyThreadDetailEvent", () => {
       expect(reply.kind === "updated" && reply.thread.messages[0]?.actor).toBeUndefined();
     });
 
+    it("a thread.message-sent event keeps personSend on the message", () => {
+      const personSend = {
+        requestId: "request-1",
+        action: "review" as const,
+        sourceAddress: "thread:thread-a",
+      };
+      const result = applyThreadDetailEvent(
+        baseThread,
+        event("thread.message-sent", {
+          messageId: MessageId.make("person-send:request-1"),
+          role: "user",
+          text: "Please review.",
+          turnId: null,
+          streaming: false,
+          personSend,
+          createdAt: "2026-04-01T06:00:00.000Z",
+          updatedAt: "2026-04-01T06:00:00.000Z",
+        }),
+      );
+      expect(result.kind === "updated" && result.thread.messages[0]?.personSend).toEqual(
+        personSend,
+      );
+      expect(result.kind === "updated" && result.thread.messages[0]?.actor).toBeUndefined();
+    });
+
     it("appends a new message", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,

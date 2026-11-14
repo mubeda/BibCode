@@ -4,6 +4,7 @@ export * from "./mcpActivity.ts";
 export * from "./mcpClients.ts";
 export * from "./uiIntents.ts";
 export * from "./webhooks.ts";
+export * from "./sendRequests.ts";
 export * from "./activity.ts";
 export * from "./agentSessions.ts";
 export * from "./environment.ts";

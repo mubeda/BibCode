@@ -214,6 +214,47 @@ describe("conversation compaction contracts", () => {
     expect(Object.hasOwn(decoded, "resendOf")).toBe(false);
   });
 
+  it("a message carries personSend", () => {
+    const personSend = {
+      requestId: "request-1",
+      action: "second-opinion",
+      sourceAddress: "thread:thread-a",
+    };
+    expect(decodeOrchestrationMessageSync({ ...message, personSend }).personSend).toEqual(
+      personSend,
+    );
+    expect(
+      Object.hasOwn(decodeOrchestrationMessageSync(message), "personSend"),
+      "a message without it decodes unchanged",
+    ).toBe(false);
+  });
+
+  it("the client turn-start command refuses personSend", () => {
+    const strict = { onExcessProperty: "error" } as const;
+    const start = {
+      type: "thread.turn.start",
+      commandId: "command-1",
+      threadId: "thread-1",
+      message: { messageId: "message-1", role: "user", text: "next task", attachments: [] },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: "2026-11-13T00:00:00Z",
+    };
+    const withPersonSend = {
+      ...start,
+      message: {
+        ...start.message,
+        personSend: { requestId: "request-1", action: "review", sourceAddress: "thread:thread-a" },
+      },
+    };
+    expect(() => decodeClientOrchestrationCommandSync(withPersonSend, strict)).toThrow();
+    expect(decodeClientOrchestrationCommandSync(start, strict)).toEqual(start);
+    const server = decodeOrchestrationCommandSync(withPersonSend, strict);
+    expect(server.type === "thread.turn.start" && server.message.personSend).toEqual(
+      withPersonSend.message.personSend,
+    );
+  });
+
   it("dispatches thread.compact as a client command", () => {
     const command = {
       type: "thread.compact",

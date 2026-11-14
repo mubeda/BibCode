@@ -24,6 +24,7 @@ import {
 } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
+import { PersonSend } from "./sendRequests.ts";
 
 /** Longest stored review prompt (user or project), in UTF-16 units (#293). */
 export const CODE_REVIEW_PROMPT_MAX_LENGTH = 7_680;
@@ -406,6 +407,8 @@ export const OrchestrationMessage = Schema.Struct({
   actor: Schema.optional(OrchestrationActor),
   /** The thread this message came from (a chat panel's provenance, slice X4). */
   sourceThreadId: Schema.optional(ThreadId),
+  /** A person's request to this agent (`sendRequests.send`); absent for any other message. */
+  personSend: Schema.optional(PersonSend),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1154,6 +1157,8 @@ export const ThreadTurnStartCommand = Schema.Struct({
     ),
     /** The live thread of the same project this message came from (slice X4). */
     sourceThreadId: Schema.optional(ThreadId),
+    /** Set only by the server's `sendRequests.send`; public dispatch refuses it. */
+    personSend: Schema.optional(PersonSend),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -1618,6 +1623,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
   streaming: Schema.Boolean,
   resendOf: Schema.optional(MessageId),
   sourceThreadId: Schema.optional(ThreadId),
+  personSend: Schema.optional(PersonSend),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

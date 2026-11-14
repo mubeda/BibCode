@@ -275,6 +275,7 @@ export function applyThreadDetailEvent(
         ...(event.payload.sourceThreadId !== undefined
           ? { sourceThreadId: event.payload.sourceThreadId }
           : {}),
+        ...(event.payload.personSend !== undefined ? { personSend: event.payload.personSend } : {}),
         createdAt: event.payload.createdAt,
         updatedAt: event.payload.updatedAt,
       };

@@ -69,6 +69,10 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).codeReviews).toBe(false);
     expect(decodeTerminalCapabilities({ codeReviews: true }).codeReviews).toBe(true);
   });
+  it("sendRequests defaults to false and decodes true", () => {
+    expect(decodeTerminalCapabilities({}).sendRequests).toBe(false);
+    expect(decodeTerminalCapabilities({ sendRequests: true }).sendRequests).toBe(true);
+  });
   it("reads host metrics as off for an older server and keeps advertised support", () => {
     expect(decodeTerminalCapabilities({}).hostMetrics).toBe(false);
     expect(decodeTerminalCapabilities({ hostMetrics: true }).hostMetrics).toBe(true);
