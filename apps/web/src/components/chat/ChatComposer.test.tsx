@@ -1322,6 +1322,17 @@ describe("ChatComposer rendering", () => {
     );
   });
 
+  it("the footer renders the sendToAgentControl slot before the History menu", () => {
+    const { markup } = renderComposer({
+      historyMenu: <span data-history-menu="true" />,
+      sendToAgentControl: <span data-send-to-agent="true" />,
+    });
+    expect(markup).toContain('data-send-to-agent="true"');
+    expect(markup.indexOf('data-send-to-agent="true"')).toBeLessThan(
+      markup.indexOf('data-history-menu="true"'),
+    );
+  });
+
   it("leaves History out of the approval footer", () => {
     const { markup } = renderComposer({
       historyMenu: <span data-history-menu="true" />,
