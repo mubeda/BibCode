@@ -98,14 +98,14 @@ describe("RPC wire fixture exporter", () => {
         },
       },
     ]);
-    expect(manifest.methods).toHaveLength(203);
+    expect(manifest.methods).toHaveLength(204);
     expect(manifest.protocolVersion).toBe("effect-4.0.0-beta.107");
     expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(31);
     expect(manifest.streamMethodCount).toBe(31);
     expect(manifest.expectedTopLevelStreamShapes).toBe(100);
     expect(manifest.expectedOrchestrationEventShapes).toBe(27);
     expect(manifest.streamShapeFixtures).toHaveLength(100);
-    expect(manifest.typedFailureFixtures).toHaveLength(423);
+    expect(manifest.typedFailureFixtures).toHaveLength(425);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
