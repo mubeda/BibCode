@@ -121,6 +121,10 @@ pub struct ProductionRuntime {
     send_requests_follower: CancellationToken,
     /// Stops the tracker that moves agent messages through their states.
     agent_message_tracker: CancellationToken,
+    /// AI Terminal credentials for agent messaging.
+    terminal_credentials: Arc<crate::agent_messaging::terminal_credential::TerminalCredentials>,
+    /// Stops the task that revokes the credentials of ended terminal processes.
+    terminal_credential_revoker: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -175,6 +179,14 @@ pub fn finalize_rpc_registry(
 impl ProductionRuntime {
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
         self.provider_runtime.attach_connect_mcp(service).await;
+    }
+
+    /// The AI Terminal credentials, which lifecycle binds to the agent call route.
+    #[must_use]
+    pub fn terminal_credentials(
+        &self,
+    ) -> Arc<crate::agent_messaging::terminal_credential::TerminalCredentials> {
+        self.terminal_credentials.clone()
     }
 
     /// The outside-agent MCP tools, for the `/mcp` endpoint.
@@ -469,16 +481,29 @@ impl ProductionRuntime {
         let open_url =
             crate::open_url::OpenUrlEnvironment::new(state_paths.open_url_shim_dir.clone());
         let terminal_open_url = open_url.clone();
+        // Bound to its endpoint and the terminal manager by lifecycle; until then AI Terminals
+        // launch without one. The hook holds it weakly: once bound it holds the manager.
+        let terminal_credentials = Arc::new(
+            crate::agent_messaging::terminal_credential::TerminalCredentials::new(
+                config.environment_id.clone(),
+                state_paths.state_dir.join("runtime/agent"),
+            ),
+        );
+        let hook_credentials = Arc::downgrade(&terminal_credentials);
         let terminal_manager = TerminalManager::with_process_attribution(
             Arc::new(PortablePtyBackend),
             TerminalManagerOptions {
                 launch_preparer: provider_terminal_preparer,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
-                    move |thread_id, env| {
+                    move |launch, env| {
                         let open_url = terminal_open_url.clone();
+                        let credentials = hook_credentials.upgrade();
                         Box::pin(async move {
-                            if let Some(session) = open_url.issue(thread_id).await {
+                            if let Some(session) = open_url.issue(launch.thread_id).await {
                                 session.apply(env);
+                            }
+                            if let Some(credentials) = credentials {
+                                credentials.issue(&launch, env).await;
                             }
                         })
                     },
@@ -487,6 +512,7 @@ impl ProductionRuntime {
             },
             process_attribution.clone(),
         );
+        let terminal_credential_events = terminal_manager.subscribe_events();
         let diagnostic_bundle = DiagnosticBundleService::new(
             &state_paths.logs_dir,
             DiagnosticBundleIdentity {
@@ -852,6 +878,11 @@ impl ProductionRuntime {
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
+        let terminal_credential_revoker = CancellationToken::new();
+        terminal_credentials.spawn_revoker(
+            terminal_credential_events,
+            terminal_credential_revoker.clone(),
+        );
         let agent_message_tracker = CancellationToken::new();
         crate::agent_messaging::delivery::AgentMessageTracker::start(
             orchestration.clone(),
@@ -865,6 +896,8 @@ impl ProductionRuntime {
             webhooks,
             send_requests_follower,
             agent_message_tracker,
+            terminal_credentials,
+            terminal_credential_revoker,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1065,6 +1098,8 @@ impl ProductionRuntime {
         // A stopped tracker resumes from its first reconciliation on the next start.
         self.agent_message_tracker.cancel();
         steps.mark("agent-message-tracker");
+        self.terminal_credential_revoker.cancel();
+        steps.mark("terminal-credential-revoker");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");

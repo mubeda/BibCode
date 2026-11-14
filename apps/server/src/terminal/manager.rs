@@ -154,15 +154,25 @@ pub struct TerminalManagerOptions {
     pub subprocess_inspector: Option<Arc<dyn TerminalSubprocessInspector>>,
     pub launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
     /// Server-owned variables merged into every spawn's environment after the caller's, so
-    /// they win. Called with the thread id once per process start, never for an open that
-    /// finds the terminal running.
+    /// they win. Called once per process start, before the session is published, never for
+    /// an open that finds the terminal running.
     pub session_env: Option<TerminalSessionEnv>,
+}
+
+/// The process a [`TerminalSessionEnv`] hook launches.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalSessionLaunch<'a> {
+    pub thread_id: &'a str,
+    pub terminal_id: &'a str,
+    pub generation: &'a TerminalGeneration,
+    /// True when the launch command runs a provider CLI (`command.activity` is set).
+    pub ai_terminal: bool,
 }
 
 /// See [`TerminalManagerOptions::session_env`].
 pub type TerminalSessionEnv = Arc<
     dyn for<'a> Fn(
-            &'a str,
+            TerminalSessionLaunch<'a>,
             &'a mut std::collections::BTreeMap<String, String>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
         + Send
@@ -198,7 +208,7 @@ impl TerminalManagerOptions {
     pub fn session_env_hook<F>(hook: F) -> TerminalSessionEnv
     where
         F: for<'a> Fn(
-                &'a str,
+                TerminalSessionLaunch<'a>,
                 &'a mut std::collections::BTreeMap<String, String>,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
             + Send
@@ -2334,7 +2344,20 @@ impl TerminalManager {
         }
         let mut input = input;
         if let Some(session_env) = self.inner.options.session_env.as_ref() {
-            session_env(&input.thread_id, &mut input.env).await;
+            let ai_terminal = input
+                .command
+                .as_ref()
+                .is_some_and(|command| command.activity.is_some());
+            session_env(
+                TerminalSessionLaunch {
+                    thread_id: &input.thread_id,
+                    terminal_id: &input.terminal_id,
+                    generation: &generation.id,
+                    ai_terminal,
+                },
+                &mut input.env,
+            )
+            .await;
         }
 
         // The provider's native form of the command applies to observed and unobserved
@@ -4518,6 +4541,23 @@ impl TerminalManager {
                 .then_with(|| left.terminal_id.cmp(&right.terminal_id))
         });
         TerminalMetadataAttachment { initial, events }
+    }
+
+    /// The generation of the terminal's process while it runs.
+    pub async fn live_generation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<TerminalGeneration> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let session = session.lock().await;
+        (session.status == TerminalStatus::Running).then(|| session.generation.id.clone())
     }
 
     pub fn subscribe_events(&self) -> TerminalEventReceiver {
@@ -11182,6 +11222,216 @@ mod tests {
         manager.shutdown().await;
     }
 
+    fn credential_manager(
+        backend: Arc<HistoryTestBackend>,
+    ) -> (
+        TerminalManager,
+        crate::agent_messaging::terminal_credential::TerminalCredentials,
+    ) {
+        let credentials = crate::agent_messaging::terminal_credential::TerminalCredentials::new(
+            "env-1".to_owned(),
+            PathBuf::from("/state/runtime/agent"),
+        );
+        let hook_credentials = credentials.clone();
+        let manager = TerminalManager::new(
+            backend,
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                session_env: Some(TerminalManagerOptions::session_env_hook(
+                    move |launch, env| {
+                        let credentials = hook_credentials.clone();
+                        Box::pin(async move { credentials.issue(&launch, env).await })
+                    },
+                )),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        credentials.bind(
+            "http://127.0.0.1:3773/api/agent/call".to_owned(),
+            Arc::new(manager.clone()),
+        );
+        (manager, credentials)
+    }
+
+    fn ai_terminal_input(root: &Path, terminal_id: &str) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new("thread-a", terminal_id, root.to_path_buf(), 80, 24);
+        input.command = Some(TerminalLaunchCommand {
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: "claudeAgent".to_owned(),
+                provider_instance_id: "claudeAgent".to_owned(),
+            }),
+            env: None,
+        });
+        input
+    }
+
+    fn last_agent_token(backend: &HistoryTestBackend) -> String {
+        backend
+            .spawns()
+            .last()
+            .and_then(|spawn| spawn.env.get("BIBCODE_AGENT_AUTH").cloned())
+            .expect("assertion failed: env contains BIBCODE_AGENT_AUTH")
+    }
+
+    #[tokio::test]
+    async fn terminal_env_agent_credential_only_for_ai_terminals() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone());
+
+        manager
+            .open(ai_terminal_input(root.path(), "term-ai"))
+            .await
+            .unwrap();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-a",
+                "term-plain",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+
+        let spawns = backend.spawns();
+        assert_eq!(
+            spawns[0].env["BIBCODE_AGENT_ENDPOINT"],
+            "http://127.0.0.1:3773/api/agent/call"
+        );
+        let identity = credentials
+            .verify(&spawns[0].env["BIBCODE_AGENT_AUTH"])
+            .await
+            .expect("verify returned None, expected Some(terminal:thread-a/term-ai)");
+        assert_eq!(identity.address(), "terminal:thread-a/term-ai");
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_AUTH"));
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_ENDPOINT"));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_credential_is_refused_after_close_exit_restart_and_replacement() {
+        for ending in ["close", "exit", "restart", "replacement"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone());
+            let shutdown = CancellationToken::new();
+            let revoker = credentials.spawn_revoker(manager.subscribe_events(), shutdown.clone());
+            let ended = ai_terminal_input(root.path(), "term-c");
+            manager.open(ended.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_process = backend.latest();
+            manager
+                .open(ai_terminal_input(root.path(), "term-e"))
+                .await
+                .unwrap();
+            let sibling = last_agent_token(&backend);
+            let before = manager.live_generation("thread-a", "term-c").await.unwrap();
+
+            match ending {
+                "close" => manager.close("thread-a", Some("term-c")).await.unwrap(),
+                "restart" => {
+                    manager.restart(ended.clone()).await.unwrap();
+                }
+                _ => {
+                    old_process.exit(0);
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while manager
+                            .live_generation("thread-a", "term-c")
+                            .await
+                            .is_some()
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("the process exit is published");
+                    if ending == "replacement" {
+                        manager.open(ended.clone()).await.unwrap();
+                    }
+                }
+            }
+
+            assert_eq!(credentials.verify(&old).await, None, "{ending}");
+            assert!(credentials.verify(&sibling).await.is_some(), "{ending}");
+            if matches!(ending, "restart" | "replacement") {
+                let after = manager.live_generation("thread-a", "term-c").await.unwrap();
+                assert_eq!(after.process, before.process + 2, "{ending}");
+                assert!(
+                    credentials
+                        .verify(&last_agent_token(&backend))
+                        .await
+                        .is_some(),
+                    "{ending}: the new process's token verifies"
+                );
+            }
+            shutdown.cancel();
+            revoker.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_the_new_token_survives_a_restart_and_a_delayed_old_exit() {
+        for exit_first in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone());
+            let input = ai_terminal_input(root.path(), "term-c");
+            manager.open(input.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_generation = manager.live_generation("thread-a", "term-c").await.unwrap();
+            let snapshot = manager.restart(input).await.unwrap();
+            let new = last_agent_token(&backend);
+            assert_eq!(
+                manager.live_generation("thread-a", "term-c").await,
+                snapshot.generation
+            );
+
+            let exited = TerminalEvent::Exited {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 1,
+                exit_code: Some(0),
+                exit_signal: None,
+                generation: Some(old_generation),
+            };
+            let restarted = TerminalEvent::Restarted {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 2,
+                snapshot,
+            };
+            let (sender, receiver) = broadcast::channel(8);
+            let events = if exit_first {
+                [exited, restarted]
+            } else {
+                [restarted, exited]
+            };
+            for event in events {
+                sender.send(event).unwrap();
+            }
+            drop(sender);
+            credentials
+                .spawn_revoker(
+                    TerminalEventReceiver::new(receiver, false),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                credentials.verify(&new).await.is_some(),
+                "the new token was revoked (exit first: {exit_first})"
+            );
+            assert_eq!(credentials.verify(&old).await, None);
+            manager.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
@@ -11193,11 +11443,11 @@ mod tests {
             TerminalManagerOptions {
                 subprocess_poll_interval: Duration::ZERO,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
-                    move |thread_id, env| {
+                    move |launch, env| {
                         let issued = hook_issued.clone();
                         Box::pin(async move {
                             let mut issued = issued.lock().unwrap();
-                            let token = format!("{thread_id}-token-{}", issued.len());
+                            let token = format!("{}-token-{}", launch.thread_id, issued.len());
                             issued.push(token.clone());
                             crate::open_url::OpenUrlSession {
                                 endpoint: "http://127.0.0.1:3773/api/preview/open-url".to_owned(),

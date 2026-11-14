@@ -3533,3 +3533,92 @@ async fn an_open_url_credential_is_not_an_mcp_credential() {
 
     assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED);
 }
+
+/// The credential an AI Terminal gets for `bibcode agent` reaches no `sendRequests.*` method:
+/// it is no MCP bearer and no session of a person, so neither `/mcp` nor RPC accepts it.
+#[tokio::test]
+async fn a_terminal_generation_credential_is_refused_every_send_request_method() {
+    use crate::agent_messaging::terminal_credential::{
+        AUTH_ENV, LiveGenerations, TerminalCredentials,
+    };
+    use crate::terminal::{TerminalGeneration, TerminalSessionLaunch};
+
+    struct AlwaysLive(TerminalGeneration);
+    impl LiveGenerations for AlwaysLive {
+        fn live_generation<'a>(
+            &'a self,
+            _thread_id: &'a str,
+            _terminal_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<TerminalGeneration>> + Send + 'a>,
+        > {
+            Box::pin(async { Some(self.0.clone()) })
+        }
+    }
+
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let generation = TerminalGeneration {
+        boot: "boot-1".to_owned(),
+        process: 1,
+    };
+    let credentials = TerminalCredentials::new("env-1".to_owned(), "/state/runtime/agent".into());
+    credentials.bind(
+        "http://127.0.0.1:3773/api/agent/call".to_owned(),
+        Arc::new(AlwaysLive(generation.clone())),
+    );
+    let mut env = std::collections::BTreeMap::new();
+    credentials
+        .issue(
+            &TerminalSessionLaunch {
+                thread_id: "thread",
+                terminal_id: "term-1",
+                generation: &generation,
+                ai_terminal: true,
+            },
+            &mut env,
+        )
+        .await;
+    let token = env.remove(AUTH_ENV).expect("a terminal credential");
+    assert!(credentials.verify(&token).await.is_some());
+
+    for (id, method) in [
+        "sendRequests.send",
+        "sendRequests.cancel",
+        "sendRequests.dismiss",
+        "sendRequests.subscribe",
+        "sendRequests.getAnswer",
+        "sendRequests.getHandoffText",
+        "sendRequests.getTerminalOutput",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = service
+            .mcp(
+                Method::POST,
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                    "params":{"name":method,"arguments":{}}}))
+                .unwrap(),
+                context(bearer(&token)),
+            )
+            .await;
+        assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED, "{method}");
+    }
+    for transport in [
+        crate::auth::SessionTransport::Plain,
+        crate::auth::SessionTransport::E2ee,
+    ] {
+        assert!(
+            tools
+                .auth
+                .authenticate_token(&token, transport)
+                .await
+                .is_err(),
+            "a terminal credential is a person's RPC principal"
+        );
+    }
+    assert!(tools.auth.authenticate_mcp_client(&token).await.is_err());
+    tools.shutdown().await;
+}
