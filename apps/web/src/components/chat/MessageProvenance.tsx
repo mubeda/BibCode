@@ -74,7 +74,7 @@ export const MessageProvenance = memo(function MessageProvenance({
       {sourceThreadId ? (
         <SourceThreadLabel environmentId={environmentId} threadId={sourceThreadId} />
       ) : null}
-      {actor ? <AgentActorChip label={actor.label} /> : null}
+      {actor ? <AgentActorChip kind={actor.kind} label={actor.label} /> : null}
     </div>
   );
 });

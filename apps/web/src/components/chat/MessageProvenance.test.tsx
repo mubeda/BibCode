@@ -45,6 +45,42 @@ afterEach(() => {
 });
 
 describe("MessageProvenance", () => {
+  describe("an agent message", () => {
+    const hosted = { kind: "hosted-agent" as const, address: "thread:t1", label: "API refactor" };
+    const renderHosted = (a: typeof hosted | undefined) =>
+      render(
+        <MessageProvenance actor={a} sourceThreadId={undefined} environmentId={environmentId} />,
+      );
+
+    it("shows the hosted chip for an agent message", async () => {
+      const container = await renderHosted(hosted);
+      const chips = container.querySelectorAll('[data-agent-chip="hosted-agent"]');
+      expect(chips).toHaveLength(1);
+      expect(chips[0]?.textContent).toBe("From agent · API refactor");
+    });
+
+    it("a person's message shows no chip", async () => {
+      const container = await renderHosted(undefined);
+      expect(container.querySelector("[data-agent-chip]")).toBeNull();
+    });
+
+    it("an outside agent keeps its own chip", async () => {
+      const container = await render(
+        <MessageProvenance
+          actor={actor}
+          sourceThreadId={undefined}
+          environmentId={environmentId}
+        />,
+      );
+      expect(container.querySelector("[data-agent-chip]")?.textContent).toBe("Agent · Claude Code");
+    });
+
+    it("a hosted agent message names no outside agent", async () => {
+      const container = await renderHosted(hosted);
+      expect(container.textContent).not.toContain("Agent · ");
+    });
+  });
+
   it("names the panel a message came from beside the agent chip", async () => {
     shells.set("panel-1", { title: "Review panel" });
     const container = await render(
