@@ -83,9 +83,19 @@ export const AgentsListResult = Schema.Struct({
 });
 export type AgentsListResult = typeof AgentsListResult.Type;
 
+// The server counts Unicode scalar values, so the limit counts code points, not UTF-16 units.
 const AgentMessageText = Schema.String.check(
   Schema.isMinLength(1),
-  Schema.isMaxLength(AGENT_MESSAGE_MAX_CHARACTERS),
+  Schema.makeFilter(
+    (value: string) => {
+      let characters = 0;
+      for (const _ of value) {
+        if (++characters > AGENT_MESSAGE_MAX_CHARACTERS) return false;
+      }
+      return true;
+    },
+    { expected: `a text of at most ${AGENT_MESSAGE_MAX_CHARACTERS} characters` },
+  ),
 );
 
 export const AgentMessageSendInput = Schema.Struct({
