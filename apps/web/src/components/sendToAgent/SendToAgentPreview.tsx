@@ -46,6 +46,8 @@ export interface SendToAgentPreviewProps {
   target: { title: string; providerLabel: string | null; newPanel: boolean };
   leadIn: string;
   initialAttachments: ReadonlyArray<PreviewAttachment>;
+  /** Read once when the preview opens, and again on Retry; Send waits for it. */
+  loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
   extraContent?: ReactNode;
   warning?: string | null;
   onClose: () => void;
@@ -56,6 +58,8 @@ export interface SendToAgentPreviewProps {
 }
 
 const formatCount = (count: number) => count.toLocaleString("en-US");
+
+export const LOAD_FAILED_MESSAGE = "BiBCode could not read the messages to attach. Try again.";
 
 export function SendToAgentPreview(props: SendToAgentPreviewProps) {
   return (
@@ -82,9 +86,46 @@ function PreviewBody(props: SendToAgentPreviewProps) {
   }, []);
   const [sending, setSending] = useState(false);
   const [failure, setFailure] = useState<Extract<SendOutcome, { kind: "failed" }> | null>(null);
+  const { loadAttachments } = props;
+  const [loading, setLoading] = useState<"loading" | "failed" | "done">(
+    loadAttachments === undefined ? "done" : "loading",
+  );
+  const [retried, setRetried] = useState(false);
+  const retryRef = useRef<HTMLButtonElement | null>(null);
+  const noteRef = useRef<HTMLTextAreaElement | null>(null);
+  // Only the latest read may change the preview: a slow earlier one is ignored.
+  const loadGeneration = useRef(0);
+  const runLoad = useCallback(() => {
+    if (loadAttachments === undefined) return;
+    const generation = (loadGeneration.current += 1);
+    const current = () => mounted.current && generation === loadGeneration.current;
+    loadAttachments().then(
+      (loaded) => {
+        if (!current()) return;
+        setAttachments((shown) => [...shown, ...loaded]);
+        setLoading("done");
+        // The Retry button goes away with the failure; focus moves on to the note.
+        if (retryRef.current !== null && document.activeElement === retryRef.current) {
+          noteRef.current?.focus();
+        }
+      },
+      () => {
+        if (current()) setLoading("failed");
+      },
+    );
+  }, [loadAttachments]);
+  useEffect(() => {
+    runLoad();
+  }, [runLoad]);
+  const retryLoad = useCallback(() => {
+    setLoading("loading");
+    setRetried(true);
+    runLoad();
+  }, [runLoad]);
 
   const actionLabel = SEND_TO_AGENT_ACTIONS.find((entry) => entry.action === action)?.label ?? "";
   const verdict = canSend({ action, note, attachments, sending });
+  const sendAllowed = verdict.allowed && loading === "done";
   const total =
     countCharacters(note) +
     attachments.reduce((sum, attachment) => sum + countCharacters(attachment.text), 0);
@@ -123,6 +164,7 @@ function PreviewBody(props: SendToAgentPreviewProps) {
           From {source.title} to {target.title}
           {target.providerLabel ? ` (${target.providerLabel})` : ""}
           {target.newPanel ? ", in a new panel" : ""}
+          {action === "take-over" ? `. Nothing is sent to ${source.title}.` : ""}
         </DialogDescription>
       </DialogHeader>
       <DialogPanel className="flex flex-col gap-4">
@@ -136,6 +178,7 @@ function PreviewBody(props: SendToAgentPreviewProps) {
             {action === "message" ? "Message" : "Note (optional)"}
           </label>
           <Textarea
+            ref={noteRef}
             id={noteId}
             autoFocus
             value={note}
@@ -170,9 +213,29 @@ function PreviewBody(props: SendToAgentPreviewProps) {
           {formatCount(total)} of {formatCount(SEND_REQUEST_MAX_CHARS)} characters
           {verdict.reason ? `. ${verdict.reason}` : ""}
         </p>
-        <div role="alert" className="text-destructive-foreground text-sm">
-          {described ? described.message : null}
+        {/* Both regions stay mounted, so a screen reader announces each change of their text. */}
+        <div className="flex flex-col gap-1 text-sm">
+          <p role="status" className="text-muted-foreground">
+            {loading === "loading" ? "Reading the messages to attach" : ""}
+          </p>
+          <div role="alert" className="text-destructive-foreground">
+            {loading === "failed" ? LOAD_FAILED_MESSAGE : described ? described.message : null}
+          </div>
         </div>
+        {/* Stays mounted while a retry loads, so focus stays on it. */}
+        {loading === "failed" || (loading === "loading" && retried) ? (
+          <Button
+            ref={retryRef}
+            size="xs"
+            variant="outline"
+            // Button styles native `disabled` only; this one stays focusable while it retries.
+            className={loading === "loading" ? "self-start opacity-64" : "self-start"}
+            aria-disabled={loading === "loading" ? "true" : undefined}
+            onClick={loading === "failed" ? retryLoad : undefined}
+          >
+            {loading === "loading" ? "Retrying" : "Retry"}
+          </Button>
+        ) : null}
       </DialogPanel>
       <DialogFooter>
         {described?.next === "pick-another" ? (
@@ -183,7 +246,7 @@ function PreviewBody(props: SendToAgentPreviewProps) {
         <Button variant="outline" onClick={props.onClose}>
           Cancel
         </Button>
-        <Button onClick={() => void send()} disabled={!verdict.allowed}>
+        <Button onClick={() => void send()} disabled={!sendAllowed}>
           {sending ? "Sending" : "Send"}
         </Button>
       </DialogFooter>
@@ -221,6 +284,7 @@ function AttachmentEditor(props: {
       {attachment.leftOut ? (
         <p className="text-muted-foreground text-xs">Left out: {attachment.leftOut}</p>
       ) : null}
+      {attachment.note ? <p className="text-muted-foreground text-xs">{attachment.note}</p> : null}
       <Textarea
         id={id}
         value={attachment.text}

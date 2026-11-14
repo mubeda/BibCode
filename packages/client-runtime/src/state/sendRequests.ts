@@ -79,7 +79,7 @@ function project(
   return [next, [next]];
 }
 
-/** A person's requests to agents: four commands and the live list of one environment. */
+/** A person's requests to agents: five commands and the live list of one environment. */
 export function createSendRequestsEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
@@ -102,6 +102,10 @@ export function createSendRequestsEnvironmentAtoms<R, E>(
     getAnswer: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:send-requests:get-answer",
       tag: WS_METHODS.sendRequestsGetAnswer,
+    }),
+    getHandoffText: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:send-requests:get-handoff-text",
+      tag: WS_METHODS.sendRequestsGetHandoffText,
     }),
     requests: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:send-requests:requests",

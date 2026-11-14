@@ -20,6 +20,13 @@ import { SendToAgentButton, type SendToAgentButtonProps } from "./SendToAgentBut
 import { resolveCodeReviewPrompt } from "~/codeReview";
 import { buildReviewPreviewContent } from "./ReviewScopePicker";
 import { buildSecondOpinionContent } from "./attachments.logic";
+import {
+  buildHandOffContent,
+  buildTakeOverContent,
+  HAND_OFF_LEAD_IN,
+  TAKE_OVER_LEAD_IN,
+  type HandoffLoader,
+} from "./handoff.logic";
 import { buildReviewContent, buildReviewScopeOptions } from "./review.logic";
 import { sendChoiceKey, type SendChoice, type SendToAgentSource } from "./sendToAgent.logic";
 
@@ -517,5 +524,262 @@ describe("SendToAgentButton", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send.mock.calls[0]![0].requestId).toBe(send.mock.calls[1]![0].requestId);
     expect(send.mock.calls[1]![0].target).toBe("thread:panel-1");
+  });
+
+  it("a new panel is revealed only after its request was sent", async () => {
+    const send = vi
+      .fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>()
+      .mockResolvedValueOnce({ kind: "failed", reason: "storage", message: "busy" })
+      .mockResolvedValueOnce({ kind: "sent" });
+    const revealPanel = vi.fn();
+    render(
+      baseProps({
+        send,
+        createPanel: () => Promise.resolve(ThreadId.make("panel-1")),
+        revealPanel,
+        previewContentFor: () => ({ leadIn: "", attachments: [] }),
+      }),
+    );
+    await openAction("Second opinion");
+    await act(async () => exactItem("Codex")!.click());
+    await flush();
+    await act(async () => find("button", "Send")!.click());
+    await flush();
+    expect(revealPanel).not.toHaveBeenCalled();
+    await act(async () => find("button", "Send")!.click());
+    await flush();
+    expect(revealPanel.mock.calls).toEqual([[ThreadId.make("panel-1")]]);
+  });
+
+  it("a send that finishes after its preview was cancelled and another opened reveals nothing", async () => {
+    let finish: (outcome: SendOutcome) => void = () => undefined;
+    const send = vi.fn(
+      () =>
+        new Promise<SendOutcome>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const revealPanel = vi.fn();
+    render(
+      baseProps({
+        send,
+        createPanel: () => Promise.resolve(ThreadId.make("panel-1")),
+        revealPanel,
+        previewContentFor: () => ({ leadIn: "", attachments: [] }),
+      }),
+    );
+    await openAction("Second opinion");
+    await act(async () => exactItem("Codex")!.click());
+    await flush();
+    await act(async () => find("button", "Send")!.click());
+    await flush();
+    await act(async () => find("button", "Cancel")!.click());
+    await flush();
+    await openAction("Second opinion");
+    await act(async () => exactItem("Codex")!.click());
+    await flush();
+    await act(async () => finish({ kind: "sent" }));
+    await flush();
+    expect(revealPanel).not.toHaveBeenCalled();
+    expect(document.body.querySelector("textarea")).not.toBeNull();
+  });
+
+  describe("out-of-tokens hint", () => {
+    const hint = {
+      kind: "usage-limit",
+      text: "Out of usage until 3:30 PM",
+      resetsAt: new Date("2026-11-13T15:30:00.000Z"),
+    } as const;
+    const hintFor = (row: { shell: { title: string } }) =>
+      row.shell.title === "beta" ? hint : null;
+    const hintedProps = () =>
+      baseProps({
+        hintFor,
+        previewContentFor: (choice) =>
+          choice.target.kind === "agent" && choice.action === "take-over"
+            ? buildTakeOverContent({
+                source: choice.source,
+                picked: choice.target.row,
+                loadHandoff: () => Promise.resolve({ text: "x", leftOut: 0, includedMessages: 1 }),
+                loadTerminalOutput: null,
+              })
+            : { leadIn: "", attachments: [] },
+      });
+
+    it("the hint is shown beside the agent and is part of its accessible name", async () => {
+      render(hintedProps());
+      await openAction("Message");
+      const beta = menuItem("beta")!;
+      expect(beta.textContent).toContain("Out of usage until 3:30 PM");
+      expect(beta.getAttribute("aria-label")).toBeNull();
+      expect(beta.getAttribute("aria-disabled")).toBeNull();
+      expect(menuItem("alpha")!.textContent).not.toContain("Out of usage");
+    });
+
+    it("picking a hinted agent for Message shows the may-not-answer warning in the preview and Send stays enabled", async () => {
+      render(hintedProps());
+      await openAction("Message");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain("This agent may not answer until 3:30 PM.");
+      const note = document.body.querySelector<HTMLTextAreaElement>("textarea")!;
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!;
+        setter.call(note, "are you there?");
+        note.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(find("button", "Send")!.hasAttribute("disabled")).toBe(false);
+    });
+
+    it("the hint can come from the live inputs of the open menu", async () => {
+      const props = baseProps({ previewContentFor: () => ({ leadIn: "", attachments: [] }) });
+      render({
+        ...props,
+        renderLive: (renderMenu) => renderMenu({ source: props.source, rows, hintFor }),
+      });
+      await openAction("Take over from");
+      const items = [...document.body.querySelectorAll('[role="menuitem"]')].map(
+        (item) => item.textContent ?? "",
+      );
+      const beta = items.findIndex((text) => text.includes("beta"));
+      expect(items[beta]).toContain("Out of usage until 3:30 PM");
+      expect(beta).toBeLessThan(items.findIndex((text) => text.includes("alpha")));
+    });
+
+    it("picking a hinted agent for Take over from shows no may-not-answer warning", async () => {
+      render(hintedProps());
+      await openAction("Take over from");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain("Nothing is sent to beta.");
+      expect(document.body.textContent).not.toContain("may not answer");
+    });
+  });
+
+  describe("Hand off and Take over from", () => {
+    const handoffText = "[user] fix the parser\n[assistant] done";
+    const loadHandoff = (text = handoffText) =>
+      vi.fn<HandoffLoader>(() => Promise.resolve({ text, leftOut: 0, includedMessages: 2 }));
+    const sender = () =>
+      vi.fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>(() =>
+        Promise.resolve({ kind: "sent" }),
+      );
+    const typeInto = async (area: HTMLTextAreaElement, value: string) => {
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!;
+        setter.call(area, value);
+        area.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+
+    it("Hand off: the source keeps running: only sendRequests.send is called, no interrupt, stop or archive", async () => {
+      const send = sender();
+      const createPanel = vi.fn(() => Promise.resolve(null));
+      const load = loadHandoff();
+      const source = sourceOf("source");
+      render(
+        baseProps({
+          source,
+          send,
+          createPanel,
+          newId: () => "request-1",
+          previewContentFor: (choice) =>
+            buildHandOffContent({ source: choice.source, loadHandoff: load }),
+        }),
+      );
+      await openAction("Hand off");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      await act(async () => find("button", "Send")!.click());
+      await flush();
+      expect(load.mock.calls).toEqual([[ThreadId.make("source")]]);
+      expect(createPanel).not.toHaveBeenCalled();
+      expect(send.mock.calls).toEqual([
+        [
+          {
+            requestId: "request-1",
+            action: "hand-off",
+            source: "thread:source",
+            target: "thread:beta",
+            leadIn: HAND_OFF_LEAD_IN,
+            note: "",
+            attachments: [{ label: "Handoff from Panel source", text: handoffText }],
+          },
+        ],
+      ]);
+    });
+
+    it("Take over from: only getHandoffText for the picked agent and send for the source are called, nothing is sent to the picked agent", async () => {
+      const send = sender();
+      const load = loadHandoff();
+      render(
+        baseProps({
+          send,
+          newId: () => "request-1",
+          previewContentFor: (choice) =>
+            choice.target.kind === "agent"
+              ? buildTakeOverContent({
+                  source: choice.source,
+                  picked: choice.target.row,
+                  loadHandoff: load,
+                  loadTerminalOutput: null,
+                })
+              : null,
+        }),
+      );
+      await openAction("Take over from");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      expect(document.body.textContent).toContain(
+        "From beta to this agent. Nothing is sent to beta.",
+      );
+      await act(async () => find("button", "Send")!.click());
+      await flush();
+      expect(load.mock.calls).toEqual([[ThreadId.make("beta")]]);
+      expect(send).toHaveBeenCalledTimes(1);
+      const sent = send.mock.calls[0]![0];
+      expect(sent).toMatchObject({
+        action: "take-over",
+        source: "thread:source",
+        target: "thread:source",
+        takenOver: "thread:beta",
+        leadIn: TAKE_OVER_LEAD_IN,
+        attachments: [{ label: "Handoff from beta", text: handoffText }],
+      });
+    });
+
+    it("trimming: removing the oldest part of an 18,000 character handoff text sends the shortened text and the note", async () => {
+      const text = `${"old ".repeat(2_000)}${"new ".repeat(2_500)}`;
+      expect(text.length).toBe(18_000);
+      const send = sender();
+      const load = loadHandoff(text);
+      render(
+        baseProps({
+          send,
+          previewContentFor: (choice) =>
+            buildHandOffContent({ source: choice.source, loadHandoff: load }),
+        }),
+      );
+      await openAction("Hand off");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      const [note, attached] = [...document.body.querySelectorAll<HTMLTextAreaElement>("textarea")];
+      expect(attached!.value).toBe(text);
+      await typeInto(note!, "start from the new part");
+      await typeInto(attached!, text.slice(8_000));
+      await act(async () => find("button", "Send")!.click());
+      await flush();
+      const sent = send.mock.calls[0]![0];
+      expect(sent.note).toBe("start from the new part");
+      expect(sent.attachments).toEqual([
+        { label: "Handoff from Panel source", text: text.slice(8_000) },
+      ]);
+    });
   });
 });

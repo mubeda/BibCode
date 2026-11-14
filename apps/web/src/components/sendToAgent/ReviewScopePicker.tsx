@@ -137,10 +137,10 @@ export function buildReviewPreviewContent(input: {
     attachments: [],
     extraContent,
     warning: contentFor(initial).warning ?? null,
-    submit: async (draft) => {
+    submit: async (draft, isCurrent) => {
       const scope = resolveScope(options, chosen.kind) ?? initial;
       const content = contentFor(scope);
-      const outcome = await content.submit!({ ...draft, leadIn: content.leadIn });
+      const outcome = await content.submit!({ ...draft, leadIn: content.leadIn }, isCurrent);
       // Forget the pick only while it is still the one this send used.
       if (outcome.kind === "sent" && pickedKinds.get(pickKey) === scope.kind) {
         pickedKinds.delete(pickKey);

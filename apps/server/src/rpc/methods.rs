@@ -167,6 +167,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("sendRequests.cancel"),
     mutation_unary("sendRequests.dismiss"),
     read_unary("sendRequests.getAnswer"),
+    read_unary("sendRequests.getHandoffText"),
     mutation_unary("sendRequests.send"),
     read_stream("sendRequests.subscribe"),
     mutation_unary("server.claimDiagnosticLogsRelay"),
