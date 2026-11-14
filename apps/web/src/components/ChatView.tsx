@@ -342,6 +342,7 @@ import {
 } from "../state/sendRequests";
 import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
+import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
 import { buildReviewPreviewContent } from "./sendToAgent/ReviewScopePicker";
 import {
   buildReviewContent,
@@ -5234,6 +5235,8 @@ function ChatViewContent(props: ChatViewProps) {
   // preview. Stable, so an open preview keeps its content while the git status refreshes.
   const sendPreviewContentFor = useLatestHandler((choice: SendChoice): PreviewContent | null => {
     if (choice.action === "message") return EMPTY_SEND_CONTENT;
+    if (choice.action === "second-opinion")
+      return buildSecondOpinionContent(choice.source.messages);
     if (choice.action !== "review") return null;
     const pickKey = sendChoiceKey(choice);
     const { target } = choice;

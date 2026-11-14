@@ -19,6 +19,7 @@ import { buildAgentRows } from "../sidebar/agentsSection.logic";
 import { SendToAgentButton, type SendToAgentButtonProps } from "./SendToAgentButton";
 import { resolveCodeReviewPrompt } from "~/codeReview";
 import { buildReviewPreviewContent } from "./ReviewScopePicker";
+import { buildSecondOpinionContent } from "./attachments.logic";
 import { buildReviewContent, buildReviewScopeOptions } from "./review.logic";
 import { sendChoiceKey, type SendChoice, type SendToAgentSource } from "./sendToAgent.logic";
 
@@ -314,6 +315,68 @@ describe("SendToAgentButton", () => {
       attachments: [],
     });
     expect(document.body.querySelector("textarea")).toBeNull();
+  });
+
+  describe("Second opinion", () => {
+    const longAnswer = `${"old ".repeat(2_000)}${"b".repeat(40_000)}`;
+    const opinionSource = sourceOf("source", {
+      messages: [
+        { id: "m1", role: "user", text: "How do I retry?", streaming: false },
+        { id: "m2", role: "assistant", text: longAnswer, streaming: false },
+      ] as never,
+    });
+    const props = (send?: SendToAgentButtonProps["send"]) =>
+      baseProps({
+        source: opinionSource,
+        ...(send === undefined ? {} : { send }),
+        newId: () => "request-1",
+        previewContentFor: (choice) => buildSecondOpinionContent(choice.source.messages),
+      });
+    const editAttachment = async (label: string, text: string) => {
+      const area = document.body.querySelector<HTMLTextAreaElement>(
+        `[data-attachment="last-answer"] textarea`,
+      )!;
+      expect(label).toBe("last-answer");
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!;
+        setter.call(area, text);
+        area.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+
+    it("a Second opinion preview shows both attachments with their sizes", async () => {
+      render(props());
+      await openAction("Second opinion");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      const user = document.body.querySelector('[data-attachment="last-user-message"]')!;
+      const answer = document.body.querySelector('[data-attachment="last-answer"]')!;
+      expect(user.textContent).toContain("15 characters");
+      expect(answer.textContent).toContain("16,000 characters");
+      expect(answer.textContent).toContain("32,000 characters left out");
+    });
+
+    it("trimming: removing the oldest part of the cut answer in a Second opinion preview sends the shortened text", async () => {
+      const send = vi.fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>(() =>
+        Promise.resolve({ kind: "sent" }),
+      );
+      render(props(send));
+      await openAction("Second opinion");
+      await act(async () => menuItem("beta")!.click());
+      await flush();
+      await editAttachment("last-answer", "b".repeat(100));
+      await act(async () => find("button", "Send")!.click());
+      await flush();
+      const sent = send.mock.calls[0]![0];
+      expect(sent.action).toBe("second-opinion");
+      expect(sent.attachments).toEqual([
+        { label: "The user's last message", text: "How do I retry?" },
+        { label: "The agent's last finished answer", text: "b".repeat(100) },
+      ]);
+    });
   });
 
   describe("Review", () => {
