@@ -1731,46 +1731,248 @@ async fn state_deleting_the_source_drops_its_requests() {
     harness.shutdown().await;
 }
 
+/// One server run on the database file at `path`: its engine and a send requests service
+/// whose dispatcher hands commands to that engine. It has no delivery worker and no provider.
+struct FileServer {
+    database: Database,
+    engine: crate::orchestration::OrchestrationEngine,
+    service: SendRequestsService,
+}
+
+impl FileServer {
+    async fn open(path: &std::path::Path, workspace: &std::path::Path) -> Self {
+        let first = !path.exists();
+        let database = if first {
+            Database::create_new(path).await.unwrap()
+        } else {
+            Database::open_existing(path).await.unwrap()
+        };
+        migrated(database.clone()).await;
+        let engine = crate::orchestration::OrchestrationEngine::start(
+            database.clone(),
+            crate::orchestration::engine::EngineOptions::default(),
+        )
+        .await
+        .unwrap();
+        let dispatcher: crate::production::orchestration_rpc::ServerCommandDispatcher = {
+            let engine = engine.clone();
+            // A turn start stores its queued delivery, as the production dispatcher's admission does.
+            std::sync::Arc::new(move |command, _, _| {
+                let engine = engine.clone();
+                Box::pin(async move {
+                    use crate::orchestration::{
+                        CommandAdmission, NewProviderTurnDelivery, TurnDeliveryMode,
+                        TurnDeliveryState, canonical_command_digest,
+                    };
+                    let value = serde_json::to_value(&command).unwrap();
+                    let text = |key: &str| value[key].as_str().unwrap_or_default().to_owned();
+                    let admission = CommandAdmission {
+                        payload_digest: canonical_command_digest(&command).unwrap(),
+                        attachment_refs: Vec::new(),
+                        provider_turn: Some(NewProviderTurnDelivery {
+                            command_id: text("commandId"),
+                            thread_id: text("threadId"),
+                            message_id: value["message"]["messageId"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            provider_instance_id: "codex".into(),
+                            provider_kind: "codex".into(),
+                            provider_session_id: None,
+                            delivery_key: text("commandId"),
+                            payload: value.clone(),
+                            state: TurnDeliveryState::Queued,
+                            mode: TurnDeliveryMode::Start,
+                            created_at: text("createdAt"),
+                        }),
+                    };
+                    engine
+                        .dispatch_with_admission(command, admission, || {})
+                        .await
+                        .map(|_| json!({}))
+                        .map_err(|error| json!({ "_tag": "Refused", "message": error.to_string() }))
+                })
+            })
+        };
+        let service = SendRequestsService::new(
+            database.clone(),
+            crate::persistence::Repositories::new(database.clone()),
+            dispatcher,
+        );
+        let server = Self {
+            database,
+            engine,
+            service,
+        };
+        if first {
+            server.dispatch(json!({
+                "type": "project.create", "commandId": "project-create", "projectId": "p1",
+                "title": "Project", "workspaceRoot": workspace,
+                "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "createdAt": AT,
+            }))
+            .await;
+            for thread_id in ["a", "b"] {
+                server.dispatch(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": thread_id,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
+                    "worktreePath": null, "createdAt": AT,
+                }))
+                .await;
+            }
+        }
+        server
+    }
+
+    async fn dispatch(&self, value: Value) {
+        self.engine
+            .dispatch(serde_json::from_value(value).expect("command decodes"))
+            .await
+            .expect("dispatched");
+    }
+
+    async fn delivery_state(&self, message_id: &'static str) -> Option<String> {
+        use rusqlite::OptionalExtension as _;
+        self.database
+            .call(move |connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT state FROM provider_turn_outbox WHERE message_id = ?",
+                        [message_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn stored(&self, request_id: &str) -> SendRequestRow {
+        SendRequestStore::new(self.database.clone())
+            .get(request_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{request_id} is stored"))
+    }
+
+    async fn shut_down(self, stop: CancellationToken) {
+        stop.cancel();
+        self.engine.shutdown().await;
+        drop(self.service);
+        self.database.checkpoint_wal().await.unwrap();
+        self.database.close().await;
+    }
+}
+
 #[tokio::test]
 async fn state_survives_a_restart() {
-    let harness = harness().await;
-    let before = harness.send_requests();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let before = FileServer::open(&path, dir.path()).await;
     let stop = CancellationToken::new();
-    before.start_follower(harness.engine.clone(), stop.clone());
-    send_with(&before, input("r1", "review", "thread:a", "thread:b")).await;
-    // The delivery's own events end before the restart, so only a sweep can see the answer.
-    for _ in 0..200 {
-        if outbox_state(&harness, "person-send:r1").await.as_deref() == Some("delivered") {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        outbox_state(&harness, "person-send:r1").await.as_deref(),
-        Some("delivered")
-    );
-    stop.cancel();
-    drop(before);
-    // Lets the stopped follower finish a read it had begun.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // The turn runs and ends while no follower runs.
-    harness
-        .provider_turn("b", "t1", "Answered while away", true)
+    before
+        .service
+        .start_follower(before.engine.clone(), stop.clone());
+    // A running turn on the target keeps the request queued until after the restart.
+    before
+        .dispatch(json!({
+            "type": "thread.session.set", "commandId": "session-busy", "threadId": "b",
+            "session": {
+                "threadId": "b", "status": "running", "providerName": "codex",
+                "providerInstanceId": "codex", "runtimeMode": "full-access",
+                "activeTurnId": "turn-before", "lastError": null, "updatedAt": AT,
+            },
+            "createdAt": AT,
+        }))
         .await;
+    send_with(
+        &before.service,
+        input("r1", "review", "thread:a", "thread:b"),
+    )
+    .await;
+    assert_eq!(before.stored("r1").await.state, SendState::Queued);
     assert_eq!(
-        stored_request(&harness, "r1").await.state,
-        SendState::Queued
+        before.delivery_state("person-send:r1").await.as_deref(),
+        Some("queued")
+    );
+    before.shut_down(stop).await;
+
+    let after = FileServer::open(&path, dir.path()).await;
+    assert_eq!(after.stored("r1").await.state, SendState::Queued);
+    assert_eq!(
+        after.delivery_state("person-send:r1").await.as_deref(),
+        Some("queued"),
+        "the delivery is still queued after the restart"
     );
 
-    let after = harness.send_requests();
+    // Before the follower starts, the earlier turn ends and the request's turn starts.
+    let session = |status: &str, turn_id: Option<&str>| {
+        json!({
+            "type": "thread.session.set",
+            "commandId": format!("session-{status}-{}", uuid::Uuid::new_v4()), "threadId": "b",
+            "session": {
+                "threadId": "b", "status": status, "providerName": "codex",
+                "providerInstanceId": "codex", "runtimeMode": "full-access",
+                "activeTurnId": turn_id, "lastError": null, "updatedAt": AT,
+            },
+            "createdAt": AT,
+        })
+    };
+    after.dispatch(session("ready", None)).await;
+    let promote = json!({
+        "type": "thread.turn.promote", "commandId": "promote-r1", "threadId": "b",
+        "messageId": "person-send:r1", "createdAt": AT,
+    });
+    after.dispatch(promote).await;
+    after.dispatch(session("running", Some("t1"))).await;
+    let mut changes = after.service.subscribe_changes();
     let stop = CancellationToken::new();
-    after.start_follower(harness.engine.clone(), stop.clone());
+    after
+        .service
+        .start_follower(after.engine.clone(), stop.clone());
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+        .await
+        .expect("the first sweep changes r1")
+        .expect("the first sweep's change");
+    let RequestChange::Upsert(read) = read else {
+        panic!("the first sweep updates r1: {read:?}");
+    };
+    assert_eq!(read.state, SendState::Read, "the first sweep resumes r1");
 
-    let row = until_state(&harness, &after, "r1", SendState::Answered).await;
-    assert_eq!(row.answer_text.as_deref(), Some("Answered while away"));
-    stop.cancel();
-    harness.shutdown().await;
+    for value in [
+        json!({
+            "type": "thread.message.assistant.delta", "commandId": "delta-t1", "threadId": "b",
+            "messageId": "reply-t1", "delta": "Answered after a restart", "turnId": "t1",
+            "createdAt": AT,
+        }),
+        json!({
+            "type": "thread.message.assistant.complete", "commandId": "complete-t1",
+            "threadId": "b", "messageId": "reply-t1", "turnId": "t1", "createdAt": AT,
+        }),
+        session("ready", None),
+    ] {
+        after.dispatch(value).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let row = loop {
+        let row = after.stored("r1").await;
+        if row.state == SendState::Answered {
+            break row;
+        }
+        assert!(
+            tokio::time::timeout_at(deadline, changes.recv())
+                .await
+                .is_ok(),
+            "r1 never answered: {:?}",
+            row.state
+        );
+    };
+    assert_eq!(row.answer_text.as_deref(), Some("Answered after a restart"));
+    assert_eq!(row.answering_turn_id.as_deref(), Some("t1"));
+    after.shut_down(stop).await;
 }
 
 #[tokio::test]
