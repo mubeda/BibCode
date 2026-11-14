@@ -4785,6 +4785,13 @@ mod recovery {
         assert!(pause_changed(&result), "{result:?}");
         assert_eq!(harness.agent_messages().await.len(), rows);
         assert_eq!(harness.outbox_states("b").await.len(), entries);
+
+        // The sender's one retry, under the same command id, is admitted held.
+        let retried = harness.admit_decided("stale-start", true).await;
+
+        assert!(retried.is_ok(), "{retried:?}");
+        assert_eq!(harness.agent_messages().await.len(), rows + 1);
+        assert_eq!(harness.held_views("stale-start").await, [Some(true); 4]);
         harness.shutdown().await;
     }
 
