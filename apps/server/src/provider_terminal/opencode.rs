@@ -4204,6 +4204,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn opencode_2_an_interrupted_turn_ends_ready() {
+        let (events, root) = opencode_2_fixture("interrupt");
+        for dormant in [false, true] {
+            let status = replay_opencode_2_status(&events, &root, dormant).expect("a status");
+            assert_eq!(
+                (status.state, status.failed, status.ready_for_prompt),
+                (TerminalAgentState::Done, false, true),
+                "an interrupted turn left the prompt not ready (dormant: {dormant})"
+            );
+        }
+    }
+
     /// A server whose root session turns busy as soon as the observer subscribes, as a prompt
     /// typed while the observer attaches would.
     struct AttachingRemote {
@@ -4211,18 +4224,49 @@ mod tests {
         stream_opens: bool,
         /// Opening a stream never completes, as a replacement that is still connecting.
         open_hangs: bool,
+        /// Events the opened stream holds after `server.connected`.
+        queued: Vec<Vec<u8>>,
+        /// `statuses()` answered busy.
+        reported_busy: bool,
     }
 
-    /// An old stream that still holds events while its replacement connects.
+    impl AttachingRemote {
+        fn new(stream_opens: bool, open_hangs: bool) -> Self {
+            Self {
+                subscribed: false,
+                stream_opens,
+                open_hangs,
+                queued: Vec::new(),
+                reported_busy: false,
+            }
+        }
+    }
+
+    /// An old stream that still holds events while its replacement connects, then waits, or
+    /// fails once they are read.
     struct DormantStream {
         events: VecDeque<Vec<u8>>,
+        fails: bool,
+    }
+
+    impl DormantStream {
+        fn next(&mut self) -> Option<Result<Vec<u8>, String>> {
+            match self.events.pop_front() {
+                Some(data) => Some(Ok(data)),
+                None if self.fails => Some(Err("old stream lost".to_owned())),
+                None => None,
+            }
+        }
     }
 
     impl OpenCodeEventStream for DormantStream {
         fn discard_next(
             &mut self,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-            unreachable!("the replacement reads the old stream's status")
+            match self.next() {
+                Some(next) => Box::pin(std::future::ready(next.map(|_| ()))),
+                None => Box::pin(std::future::pending()),
+            }
         }
 
         fn next_data(
@@ -4232,15 +4276,16 @@ mod tests {
         }
 
         fn next_dormant_data(&mut self) -> DormantEventData<'_> {
-            match self.events.pop_front() {
-                Some(data) => Box::pin(std::future::ready(Ok(Some(data)))),
+            match self.next() {
+                Some(next) => Box::pin(std::future::ready(next.map(Some))),
                 None => Box::pin(std::future::pending()),
             }
         }
     }
 
+    /// A stream that sends `server.connected`, then its queued events, then waits.
     struct ConnectedStream {
-        connected: bool,
+        events: VecDeque<Vec<u8>>,
     }
 
     impl OpenCodeEventStream for ConnectedStream {
@@ -4253,12 +4298,10 @@ mod tests {
         fn next_data(
             &mut self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
-            if std::mem::replace(&mut self.connected, true) {
-                return Box::pin(std::future::pending());
+            match self.events.pop_front() {
+                Some(data) => Box::pin(std::future::ready(Ok(data))),
+                None => Box::pin(std::future::pending()),
             }
-            Box::pin(std::future::ready(Ok(
-                br#"{"type":"server.connected","properties":{}}"#.to_vec(),
-            )))
         }
     }
 
@@ -4292,6 +4335,7 @@ mod tests {
         }
 
         fn statuses(&mut self) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+            self.reported_busy = self.subscribed;
             let statuses = if self.subscribed {
                 json!({"root": {"type": "busy"}})
             } else {
@@ -4322,8 +4366,11 @@ mod tests {
                 return Box::pin(std::future::ready(Err("down".to_owned())));
             }
             self.subscribed = true;
+            let mut events =
+                VecDeque::from([br#"{"type":"server.connected","properties":{}}"#.to_vec()]);
+            events.extend(self.queued.drain(..));
             Box::pin(std::future::ready(Ok(
-                Box::new(ConnectedStream { connected: false }) as Box<dyn OpenCodeEventStream>,
+                Box::new(ConnectedStream { events }) as Box<dyn OpenCodeEventStream>
             )))
         }
     }
@@ -4332,11 +4379,7 @@ mod tests {
     async fn opencode_attach_reads_the_root_status_after_subscribing() {
         let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
         let lease = generation.observation();
-        let mut remote = AttachingRemote {
-            subscribed: false,
-            stream_opens: true,
-            open_hangs: false,
-        };
+        let mut remote = AttachingRemote::new(true, false);
 
         let stream =
             attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1)).await;
@@ -4356,11 +4399,7 @@ mod tests {
         let lease = generation.observation();
         lease.publish_agent_status(TerminalAgentState::Done, false);
         lease.mark_ready_for_prompt();
-        let mut remote = AttachingRemote {
-            subscribed: false,
-            stream_opens: false,
-            open_hangs: false,
-        };
+        let mut remote = AttachingRemote::new(false, false);
 
         let stream =
             attach_opencode_root(&mut remote, &lease, "root", Duration::from_millis(20)).await;
@@ -4380,16 +4419,13 @@ mod tests {
         let lease = generation.observation();
         lease.publish_agent_status(TerminalAgentState::Done, false);
         lease.mark_ready_for_prompt();
-        let mut remote = AttachingRemote {
-            subscribed: false,
-            stream_opens: true,
-            open_hangs: true,
-        };
+        let mut remote = AttachingRemote::new(true, true);
         let mut old = DormantStream {
             events: VecDeque::from([
                 br#"{"type":"session.status","properties":{"sessionID":"root","status":{"type":"busy"}}}"#
                     .to_vec(),
             ]),
+            fails: false,
         };
         let activity = TerminalAgentActivityControl::enabled();
         let expected = activity.snapshot();
@@ -4417,6 +4453,99 @@ mod tests {
         assert!(
             !status.ready_for_prompt,
             "a turn that began during the handoff went unseen"
+        );
+    }
+
+    const ROOT_BUSY: &[u8] =
+        br#"{"type":"session.status","properties":{"sessionID":"root","status":{"type":"busy"}}}"#;
+    const ROOT_IDLE: &[u8] = br#"{"type":"session.idle","properties":{"sessionID":"root"}}"#;
+
+    /// Runs a replacement of `old` against `remote` from a terminal that reads ready.
+    async fn replace_from_ready(
+        remote: &mut AttachingRemote,
+        old: &mut DormantStream,
+    ) -> (
+        OpenCodeReplacementOutcome,
+        super::super::TerminalAgentObservation,
+    ) {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let activity = TerminalAgentActivityControl::enabled();
+        let expected = activity.snapshot();
+        let mut changes = activity.subscribe();
+        let outcome = prepare_opencode_replacement(
+            remote,
+            old,
+            &mut changes,
+            expected,
+            &lease,
+            "root",
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        (outcome, status)
+    }
+
+    #[tokio::test]
+    async fn opencode_a_replacement_that_connects_at_once_withdraws_readiness() {
+        let mut remote = AttachingRemote::new(true, false);
+        let mut old = DormantStream {
+            events: VecDeque::from([ROOT_BUSY.to_vec()]),
+            fails: false,
+        };
+
+        let (outcome, status) = replace_from_ready(&mut remote, &mut old).await;
+
+        assert!(matches!(outcome, OpenCodeReplacementOutcome::Connected(_)));
+        assert!(
+            !status.ready_for_prompt,
+            "the old stream's unread busy was dropped and the terminal still reads ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_losing_the_old_stream_during_a_replacement_withdraws_readiness() {
+        let mut remote = AttachingRemote::new(true, true);
+        let mut old = DormantStream {
+            events: VecDeque::new(),
+            fails: true,
+        };
+
+        let (outcome, status) = replace_from_ready(&mut remote, &mut old).await;
+
+        assert!(matches!(
+            outcome,
+            OpenCodeReplacementOutcome::Failed {
+                dormant_stream_healthy: false
+            }
+        ));
+        assert!(
+            !status.ready_for_prompt,
+            "a terminal that lost its only stream still reads ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_a_queued_idle_never_overrides_a_newer_busy_status() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        let mut remote = AttachingRemote::new(true, false);
+        remote.queued.push(ROOT_IDLE.to_vec());
+
+        let mut stream = attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1))
+            .await
+            .expect("a stream");
+        let queued = stream.next_data().await.expect("the queued idle");
+        OpenCodeStatusEvent::from_value(&serde_json::from_slice(&queued).expect("an event"))
+            .publish(&lease, "root");
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert!(
+            !(status.ready_for_prompt && remote.reported_busy),
+            "an idle queued before the server reported busy made the terminal ready"
         );
     }
 
