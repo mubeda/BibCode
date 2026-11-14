@@ -14,6 +14,7 @@ mod git_reads;
 mod panels;
 mod previews;
 mod pull_requests;
+mod send_requests;
 mod terminals;
 mod thread_actions;
 mod threads;
@@ -67,6 +68,8 @@ pub(crate) struct Harness {
     pub(crate) settings: watch::Sender<McpServerSettings>,
     delivery: Arc<TurnDeliveryService>,
     provider: Arc<ProviderRuntimeSupervisor>,
+    uploads: crate::transfer::staging::UploadRegistry,
+    state_dir: std::path::PathBuf,
     _state: tempfile::TempDir,
     _secrets: tempfile::TempDir,
 }
@@ -145,7 +148,7 @@ impl Harness {
         );
         super::uploads_rpc::register_uploads_rpc(
             &mut registry,
-            uploads,
+            uploads.clone(),
             state.path().join("pastes"),
         );
         register(&mut registry, receiver.clone());
@@ -170,6 +173,8 @@ impl Harness {
             settings,
             delivery,
             provider,
+            uploads,
+            state_dir: state.path().to_path_buf(),
             _state: state,
             _secrets: secrets,
         }

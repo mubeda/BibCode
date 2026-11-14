@@ -804,6 +804,21 @@ impl ProductionRuntime {
             ));
         webhooks.wake_on(auth.subscribe_access());
         crate::webhooks::register_webhooks_rpc(&mut registry, webhooks.clone());
+        crate::send_requests::rpc::register_send_requests_rpc(
+            &mut registry,
+            crate::send_requests::service::SendRequestsService::new(
+                repositories.database().clone(),
+                repositories.clone(),
+                crate::production::orchestration_rpc::server_command_dispatcher(
+                    orchestration.clone(),
+                    provider_runtime.clone(),
+                    config.state_dir(),
+                    turn_delivery.clone(),
+                    Some(workspace_availability.clone()),
+                    attachment_uploads.clone(),
+                ),
+            ),
+        );
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),

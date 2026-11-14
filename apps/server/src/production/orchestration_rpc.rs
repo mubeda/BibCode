@@ -308,6 +308,113 @@ fn register_orchestration_rpc_inner(
     );
 }
 
+/// Who a server-built command acts for. The server dispatcher stamps the admission claim from
+/// it; no caller passes raw actor JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServerActor {
+    /// A signed-in person (`sendRequests.*`): nothing is stamped.
+    Person,
+    /// An agent BiBCode hosts (agent messaging).
+    #[allow(dead_code)] // Agent messaging (phase 5) is its first sender.
+    HostedAgent { address: String, label: String },
+}
+
+/// The server-only entry point for commands the server builds itself. It shares the inner
+/// dispatch functions with the public `orchestration.dispatchCommand` handler, which keeps its
+/// own decoding, refusals and actor stamping.
+pub(crate) type ServerCommandDispatcher = Arc<
+    dyn Fn(
+            OrchestrationCommand,
+            UploadOwner,
+            ServerActor,
+        ) -> futures_util::future::BoxFuture<'static, Result<Value, Value>>
+        + Send
+        + Sync,
+>;
+
+const SERVER_DISPATCH_TAG: &str = "server.dispatchCommand";
+
+pub(crate) fn server_command_dispatcher(
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> ServerCommandDispatcher {
+    let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
+    let registration = ProviderRegistration {
+        provider,
+        settings_root,
+        attachments,
+        turn_delivery,
+        uploads,
+    };
+    let availability = availability
+        .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
+    Arc::new(move |command, owner, actor| {
+        let engine = engine.clone();
+        let registration = registration.clone();
+        let availability = availability.clone();
+        Box::pin(async move {
+            let carries_person_send = matches!(
+                &command,
+                OrchestrationCommand::ThreadTurnStart { message, .. } if message.person_send.is_some()
+            );
+            if carries_person_send && matches!(actor, ServerActor::HostedAgent { .. }) {
+                return Err(invalid_request(
+                    SERVER_DISPATCH_TAG,
+                    "an agent's message cannot carry a person's request",
+                ));
+            }
+            let payload_digest = canonical_command_digest(&command)
+                .map_err(|error| invalid_request(SERVER_DISPATCH_TAG, error))?;
+            let command_claim = engine
+                .acquire_command_admission(command.command_id())
+                .await
+                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            if let ServerActor::HostedAgent { address, label } = &actor {
+                command_claim.attribute_to(json!({
+                    "kind": "hosted-agent",
+                    "address": address,
+                    "label": label,
+                }));
+            }
+            if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+                let workspace_admission = match &availability {
+                    Some(availability) => Some(
+                        availability
+                            .acquire_thread(thread_id, std::iter::empty())
+                            .await
+                            .map_err(workspace_admission_error)?,
+                    ),
+                    None => None,
+                };
+                return dispatch_turn_command(
+                    engine,
+                    registration,
+                    command,
+                    payload_digest,
+                    SERVER_DISPATCH_TAG.to_owned(),
+                    workspace_admission,
+                    command_claim,
+                    &owner,
+                )
+                .await;
+            }
+            dispatch_prepared_command(
+                engine,
+                Some(registration),
+                command,
+                payload_digest,
+                SERVER_DISPATCH_TAG.to_owned(),
+                command_claim,
+            )
+            .await
+        })
+    })
+}
+
 /// Decodes the public orchestration wire shape and resolves the small amount of
 /// server-owned context that ordinary commands need. Worktree policy, identity,
 /// lifecycle kind, and adopted-owner deletion are deliberately not part of this
@@ -330,6 +437,12 @@ pub(crate) async fn decode_public_orchestration_command(
     }
 
     const DEDICATED_AUTHORITY: &str = "worktree authority requires a dedicated server-resolved RPC";
+    // Only `sendRequests.send` stamps a person's request, through the server dispatcher.
+    if let OrchestrationCommand::ThreadTurnStart { message, .. } = &command
+        && message.person_send.is_some()
+    {
+        return Err("person-send requires a dedicated server-resolved RPC".to_owned());
+    }
     match &command {
         OrchestrationCommand::ProjectMetaUpdate {
             worktree_discovery: Some(_),
@@ -698,6 +811,7 @@ async fn dispatch_reserved_turn_command(
     let mut delivery_state = crate::orchestration::TurnDeliveryState::Pending;
     if let OrchestrationCommand::ThreadTurnStart {
         thread_id,
+        message,
         queued,
         model_selection,
         bootstrap,
@@ -718,7 +832,18 @@ async fn dispatch_reserved_turn_command(
                 .get_thread_session(thread_id.clone())
                 .await
                 .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            // A person's request always waits behind a pending approval, an open question, a
+            // held queue or an errored session, so it never answers them or skips a paused queue.
+            let person_send_waits = message.person_send.is_some()
+                && dispatch
+                    .repositories()
+                    .thread_blocks_new_turn(thread_id.clone())
+                    .await
+                    .map_err(|error| {
+                        orchestration_error("OrchestrationDispatchCommandError", error)
+                    })?;
             let resolved = compacting
+                || person_send_waits
                 || session.is_some_and(|session| {
                     matches!(session.status.as_str(), "running" | "starting")
                 });
@@ -2518,6 +2643,9 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                     if let Some(source_thread_id) = &row.source_thread_id {
                         message["sourceThreadId"] = json!(source_thread_id);
                     }
+                    if let Some(person_send) = &row.person_send {
+                        message["personSend"] = person_send.clone();
+                    }
                     message
                 })
                 .collect(),
@@ -3332,6 +3460,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
                 },
@@ -3353,6 +3482,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
                 },
@@ -3374,6 +3504,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
                 },
@@ -3395,6 +3526,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
                 },
@@ -3416,6 +3548,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
                 },
@@ -3437,6 +3570,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
@@ -3620,6 +3754,7 @@ mod tests {
             resend_of_message_id: None,
             actor: None,
             source_thread_id: None,
+            person_send: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
         }

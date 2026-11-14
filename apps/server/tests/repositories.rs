@@ -1310,6 +1310,7 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         resend_of_message_id: None,
         actor: None,
         source_thread_id: None,
+        person_send: None,
         message_id: "message-a".to_owned(),
         thread_id: "thread-conversation".to_owned(),
         turn_id: Some("turn-a".to_owned()),

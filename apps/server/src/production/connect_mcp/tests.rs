@@ -3326,3 +3326,69 @@ async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
     );
     tools.shutdown().await;
 }
+
+/// A provider's MCP credential reaches no `sendRequests.*` method: none is listed, and a call
+/// of each spelling fails. Task 8.1 owes the same test for the credential it adds.
+#[tokio::test]
+async fn a_provider_credential_is_refused_every_send_request_method() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+
+    let listed = names(
+        &rpc(
+            &service,
+            initialize(&service, &issued).await,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|name| !name.to_ascii_lowercase().contains("sendrequests")),
+        "{listed:?}"
+    );
+    for (id, name) in [(2, "sendRequests.send"), (3, "sendRequests_send")] {
+        let called = rpc(
+            &service,
+            initialize(&service, &issued).await,
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{
+                "requestId": "r1", "action": "review", "source": "thread:thread",
+                "target": "thread:other", "leadIn": "", "note": "n", "attachments": [],
+            }}}),
+        )
+        .await;
+        assert!(
+            called["result"]["isError"] == true || called["error"].is_object(),
+            "{name}: {called}"
+        );
+    }
+    tools.shutdown().await;
+}
+
+/// The token a terminal gets for `bibcode open-url` is not an MCP bearer.
+#[tokio::test]
+async fn an_open_url_credential_is_not_an_mcp_credential() {
+    let connect = harness(4, 4).await;
+    let issued = connect
+        .service
+        .issue_open_url_credential("thread")
+        .await
+        .unwrap();
+
+    let refused = connect
+        .service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(),
+            context(bearer(&issued.token)),
+        )
+        .await;
+
+    assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED);
+}

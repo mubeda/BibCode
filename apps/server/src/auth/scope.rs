@@ -209,6 +209,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // Outbound webhooks (#139 slice X8): settings an outside agent's `mcp-client` session,
         // which never holds `access:*`, cannot read or change.
         "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
+        // A person's request to an agent. An outside agent holds this scope too; the handler's
+        // `require_person` refuses it.
+        "sendRequests.send" => Some(SCOPE_ORCHESTRATION_OPERATE),
         // Connect an agent (#139): a person's own tool configuration, which an outside
         // agent's credential can neither read nor change.
         "mcpClients.getRegistrations" => Some(SCOPE_ACCESS_READ),

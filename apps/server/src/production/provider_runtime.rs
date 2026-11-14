@@ -8432,6 +8432,7 @@ mod context_handoff_tests {
             resend_of_message_id: None,
             actor: None,
             source_thread_id: None,
+            person_send: None,
             created_at: format!("2026-01-01T00:00:{id:02}Z"),
             updated_at: format!("2026-01-01T00:00:{id:02}Z"),
         }

@@ -211,6 +211,7 @@ fn message_row(
         resend_of_message_id: None,
         actor: None,
         source_thread_id: None,
+        person_send: None,
         created_at: at.clone(),
         updated_at: at,
     }

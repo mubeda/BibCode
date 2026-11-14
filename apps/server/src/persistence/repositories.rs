@@ -1171,6 +1171,30 @@ impl Repositories {
             .await
     }
 
+    /// Whether a new turn on `thread_id` must wait although the thread is not running: it has
+    /// a pending approval, an open question, a held queued delivery, or a session that ended in
+    /// `error`. A person's send is queued then, so it never answers the approval or question
+    /// and never starts ahead of a paused queue.
+    pub async fn thread_blocks_new_turn(&self, thread_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let open_user_inputs = open_user_input_requests_sql("?1");
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM projection_pending_approvals WHERE thread_id = ?1 AND status = 'pending')
+                               OR EXISTS({open_user_inputs})
+                               OR EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state = 'queued' AND held = 1)
+                               OR EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = ?1 AND status = 'error')"
+                        ),
+                        params![thread_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     /// OpenCode deliveries dismissed while uncertain whose pending turn marker still holds the
     /// queue: they are released once OpenCode shows the session idle.
     pub(crate) async fn list_dismissed_uncertain_opencode_markers(
@@ -3698,6 +3722,10 @@ pub struct ProjectionThreadMessage {
     /// The thread this message came from (a chat panel's provenance, slice X4).
     #[serde(default)]
     pub source_thread_id: Option<String>,
+    /// A person's request this message carries (`sendRequests.send`): `requestId`, `action`
+    /// and `sourceAddress`.
+    #[serde(default)]
+    pub person_send: Option<Value>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -4191,7 +4219,7 @@ pub struct AuthSession {
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt FROM projection_projects";
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id, person_send_json FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
@@ -5192,6 +5220,7 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         resend_of_message_id: row.get(16)?,
         actor: decode_optional_json(row.get(17)?, "actor_json")?,
         source_thread_id: row.get(18)?,
+        person_send: decode_optional_json(row.get(19)?, "person_send_json")?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })

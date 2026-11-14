@@ -113,6 +113,7 @@ import {
   WebhooksUpsertInput,
   WebhooksUpsertResult,
 } from "./webhooks.ts";
+import { SendRequest, SendRequestError, SendRequestsSendInput } from "./sendRequests.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -643,6 +644,9 @@ export const WS_METHODS = {
   reviewReadFileVersion: "review.readFileVersion",
   reviewListDiffTools: "review.listDiffTools",
   reviewOpenDiffTool: "review.openDiffTool",
+
+  // A person's request to an agent
+  sendRequestsSend: "sendRequests.send",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -2218,6 +2222,13 @@ export const WsSubscribeUiIntentsRpc = Rpc.make(WS_METHODS.subscribeUiIntents, {
   stream: true,
 });
 
+/** A signed-in person's request to a specific agent. An agent's credential is refused. */
+export const WsSendRequestsSendRpc = Rpc.make(WS_METHODS.sendRequestsSend, {
+  payload: SendRequestsSendInput,
+  success: SendRequest,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
 /** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
 export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
   payload: WebhooksListInput,
@@ -2482,6 +2493,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsReviewReadFileVersionRpc,
   WsReviewListDiffToolsRpc,
   WsReviewOpenDiffToolRpc,
+  WsSendRequestsSendRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

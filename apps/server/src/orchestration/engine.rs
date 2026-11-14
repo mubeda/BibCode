@@ -178,7 +178,29 @@ pub struct ThreadMessageInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub source_thread_id: Option<String>,
+    /// A person's request this message carries. Only the server's `sendRequests.send` sets
+    /// it: public dispatch refuses it, and a claim whose actor is any agent kind may not
+    /// carry it.
+    #[serde(
+        rename = "personSend",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub person_send: Option<PersonSend>,
 }
+
+/// The provenance of a person's request on its message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PersonSend {
+    pub request_id: String,
+    pub action: String,
+    /// The agent the request came from; for a take-over, the agent whose work is taken over.
+    pub source_address: String,
+}
+
+/// The actor kinds of agents. A claim with one of them may never carry `personSend`.
+const AGENT_ACTOR_KINDS: &[&str] = &["mcp-client"];
 
 /// The longest `purpose` a created thread may carry.
 pub const MAX_THREAD_PURPOSE_CHARS: usize = 200;
@@ -4035,13 +4057,22 @@ async fn process_envelope(
         }
         _ => ProjectionMode::Legacy,
     };
+    // Who the claim's server-stamped actor is: only an outside agent names a source thread,
+    // and no agent kind carries a person's request.
+    let actor_kind = command_claim
+        .actor()
+        .and_then(|actor| actor.get("kind"))
+        .and_then(Value::as_str);
+    let from_outside_agent = actor_kind == Some("mcp-client");
+    let from_any_agent = actor_kind.is_some_and(|kind| AGENT_ACTOR_KINDS.contains(&kind));
     let mut planned = match plan_command(
         repositories,
         model,
         &command,
         &prepared_worktree,
         &occurred_at,
-        command_claim.actor().is_some(),
+        from_outside_agent,
+        from_any_agent,
     )
     .await
     {
@@ -4478,7 +4509,8 @@ async fn plan_command(
     command: &OrchestrationCommand,
     prepared_worktree: &PreparedWorktreeCommand,
     occurred_at: &str,
-    from_agent: bool,
+    from_outside_agent: bool,
+    from_any_agent: bool,
 ) -> Result<Vec<NewOrchestrationEvent>, OrchestrationError> {
     let metadata = Value::Object(Default::default());
     match command {
@@ -5312,7 +5344,7 @@ async fn plan_command(
             // source, so the claim must carry the server-stamped actor, and the source must
             // share the target's worktree (the same host thread, or one hosts the other).
             if let Some(source_thread_id) = &message.source_thread_id {
-                if !from_agent {
+                if !from_outside_agent {
                     return invariant(
                         command,
                         "Only an outside agent's panel message may name a source thread."
@@ -5339,11 +5371,57 @@ async fn plan_command(
                     );
                 }
             }
+            // A person's request (`sendRequests.send`): never from an agent, never beside a
+            // source thread, and its source a live thread of the target's project.
+            if let Some(person_send) = &message.person_send {
+                if from_any_agent {
+                    return invariant(
+                        command,
+                        "Only a person's request may carry personSend.".to_owned(),
+                    );
+                }
+                if message.source_thread_id.is_some() {
+                    return invariant(
+                        command,
+                        "A person's request names no source thread.".to_owned(),
+                    );
+                }
+                let source_thread_id =
+                    person_send
+                        .source_address
+                        .strip_prefix("thread:")
+                        .or_else(|| {
+                            person_send
+                                .source_address
+                                .strip_prefix("terminal:")
+                                .and_then(|rest| rest.split_once('/'))
+                                .map(|(thread, _)| thread)
+                        });
+                let same_project = source_thread_id.is_some_and(|source_thread_id| {
+                    model.threads.get(source_thread_id).is_some_and(|source| {
+                        source.deleted_at.is_none() && source.project_id == thread.project_id
+                    })
+                });
+                if !same_project {
+                    return invariant(
+                        command,
+                        format!(
+                            "The request's source '{}' is not a live agent of this thread's project.",
+                            person_send.source_address
+                        ),
+                    );
+                }
+            }
             let mut user_payload = json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at});
             insert_optional(
                 &mut user_payload,
                 "sourceThreadId",
                 message.source_thread_id.as_ref().map(|v| json!(v)),
+            );
+            insert_optional(
+                &mut user_payload,
+                "personSend",
+                message.person_send.as_ref().map(|v| json!(v)),
             );
             let user = make_event(
                 "thread.message-sent",
@@ -8062,8 +8140,8 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id, written_sequence) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id, person_send_json, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
            written_sequence = excluded.written_sequence, thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
@@ -8071,7 +8149,8 @@ fn apply_messages_projector_tx(
            is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
            resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id), \
            actor_json = COALESCE(excluded.actor_json, projection_thread_messages.actor_json), \
-           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id)",
+           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id), \
+           person_send_json = COALESCE(excluded.person_send_json, projection_thread_messages.person_send_json)",
         params![
             required_str(payload, "messageId")?,
             required_str(payload, "threadId")?,
@@ -8092,6 +8171,7 @@ fn apply_messages_projector_tx(
                 .map(json_string)
                 .transpose()?,
             optional_string(payload.get("sourceThreadId")),
+            payload.get("personSend").map(json_string).transpose()?,
             event.sequence,
         ],
     )?;
@@ -15496,5 +15576,163 @@ mod tests {
         }
         engine.set_checkpoint_hold_limit(None);
         engine.shutdown().await;
+    }
+
+    mod person_send_admission {
+        use super::*;
+
+        async fn engine() -> OrchestrationEngine {
+            let database = Database::open_in_memory().await.expect("database");
+            database
+                .call(|connection| {
+                    run_migrations(connection, None)?;
+                    Ok(())
+                })
+                .await
+                .expect("migrations");
+            let engine = OrchestrationEngine::start(database, EngineOptions::default())
+                .await
+                .expect("engine");
+            engine
+                .dispatch(project_create_command("person-send-project", "p"))
+                .await
+                .expect("project");
+            for thread_id in ["source", "target"] {
+                engine
+                    .dispatch(
+                        serde_json::from_value(json!({
+                            "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                            "threadId": thread_id, "projectId": "p", "title": thread_id,
+                            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "branch": null, "worktreePath": null,
+                            "createdAt": "2026-08-01T00:00:00Z",
+                        }))
+                        .expect("thread command"),
+                    )
+                    .await
+                    .expect("thread");
+            }
+            engine
+        }
+
+        fn turn(command_id: &str, message: Value) -> OrchestrationCommand {
+            let mut message_value = json!({
+                "messageId": command_id, "role": "user", "text": "Please review", "attachments": [],
+            });
+            if let (Value::Object(base), Value::Object(extra)) = (&mut message_value, message) {
+                base.extend(extra);
+            }
+            serde_json::from_value(json!({
+                "type": "thread.turn.start", "commandId": command_id, "threadId": "target",
+                "message": message_value, "runtimeMode": "full-access",
+                "interactionMode": "default", "queued": true,
+                "createdAt": "2026-08-01T00:00:01Z",
+            }))
+            .expect("turn command")
+        }
+
+        async fn dispatch_as(
+            engine: &OrchestrationEngine,
+            command: OrchestrationCommand,
+            actor: Option<Value>,
+        ) -> Result<DispatchResult, OrchestrationError> {
+            let claim = engine
+                .acquire_command_admission(command.command_id())
+                .await
+                .expect("claim");
+            if let Some(actor) = actor {
+                claim.attribute_to(actor);
+            }
+            engine.dispatch_with_command_claim(command, claim).await
+        }
+
+        fn detail(result: Result<DispatchResult, OrchestrationError>) -> String {
+            match result {
+                Err(OrchestrationError::Invariant { detail, .. }) => detail,
+                other => panic!("an invariant refusal, not {other:?}"),
+            }
+        }
+
+        fn mcp_client() -> Value {
+            json!({ "kind": "mcp-client", "clientId": "session", "label": "MCP · test" })
+        }
+
+        fn person_send() -> Value {
+            json!({ "personSend": {
+                "requestId": "r", "action": "review", "sourceAddress": "thread:source",
+            } })
+        }
+
+        #[tokio::test]
+        async fn person_send_is_refused_for_an_mcp_client_claim() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(&engine, turn("agent", person_send()), Some(mcp_client()));
+            assert!(detail(refused.await).contains("Only a person's request may carry personSend"));
+            // A person's request never names a source thread: the source-thread rule refuses it
+            // first today, and the person-send rule would refuse it too.
+            let both = json!({
+                "personSend": person_send()["personSend"].clone(),
+                "sourceThreadId": "source",
+            });
+            detail(dispatch_as(&engine, turn("both", both), None).await);
+            let elsewhere = json!({ "personSend": {
+                "requestId": "r", "action": "review", "sourceAddress": "thread:missing",
+            } });
+            assert!(
+                detail(dispatch_as(&engine, turn("elsewhere", elsewhere), None).await)
+                    .contains("is not a live agent of this thread's project")
+            );
+            dispatch_as(&engine, turn("person", person_send()), None)
+                .await
+                .expect("a person's request is admitted");
+            let stored = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT person_send_json FROM projection_thread_messages WHERE message_id = 'person'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?)
+                })
+                .await
+                .expect("the message is projected");
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored).unwrap(),
+                person_send()["personSend"]
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn source_thread_id_is_still_admitted_only_for_an_mcp_client_claim() {
+            let engine = engine().await;
+            let source = json!({ "sourceThreadId": "source" });
+            for actor in [
+                None,
+                Some(json!({ "kind": "hosted-agent", "address": "thread:source", "label": "a" })),
+            ] {
+                assert!(
+                    detail(
+                        dispatch_as(
+                            &engine,
+                            turn(&format!("refused-{}", actor.is_some()), source.clone()),
+                            actor
+                        )
+                        .await
+                    )
+                    .contains("Only an outside agent's panel message may name a source thread"),
+                );
+            }
+            // An outside agent passes the actor rule and reaches the worktree rule: these two
+            // threads do not share a worktree.
+            assert!(
+                detail(dispatch_as(&engine, turn("outside", source), Some(mcp_client())).await)
+                    .contains("is not another thread of this thread's worktree")
+            );
+            engine.shutdown().await;
+        }
     }
 }

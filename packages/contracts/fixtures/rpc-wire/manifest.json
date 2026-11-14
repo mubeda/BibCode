@@ -422,6 +422,10 @@
       "mode": "unary"
     },
     {
+      "name": "sendRequests.send",
+      "mode": "unary"
+    },
+    {
       "name": "server.claimDiagnosticLogsRelay",
       "mode": "unary"
     },
@@ -1101,6 +1105,8 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/sendRequests__send-00.json",
+    "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",
     "typed-failures/server__claimDiagnosticLogsRelay-01.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
@@ -1549,6 +1555,8 @@
     "typed-failures/review__readFileVersion-00.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/review__readFileVersion-01.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/review__readFileVersion-02.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/sendRequests__send-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
+    "typed-failures/sendRequests__send-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json": "685a31ed25a91248b90c7b17d501f68c20523a70cc7dafa2da7412984f83a4c3",
     "typed-failures/server__claimDiagnosticLogsRelay-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/server__consumeCodexRateLimitReset-00.json": "6e23dade8593c0a59319f4ff081d53d3261c82f9223eed493544c12438f8a17c",
@@ -2169,6 +2177,8 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/sendRequests__send-00.json",
+    "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",
     "typed-failures/server__claimDiagnosticLogsRelay-01.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
