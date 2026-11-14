@@ -12,6 +12,7 @@ import {
   type CenterPanelSurfaceHostsHandle,
   useCenterPanelBodyTargets,
 } from "./CenterPanelSurfaceHosts";
+import { useCenterSurfaceVisible } from "./centerSurfaceVisibility";
 
 interface RectInput {
   readonly left: number;
@@ -201,6 +202,28 @@ describe("CenterPanelSurfaceHosts", () => {
         .querySelector('[data-center-surface-host="chat:host"]')
         ?.getAttribute("data-visible"),
     ).toBe("false");
+  });
+
+  it("tells a surface whether it is the one shown", async () => {
+    const rects = new Map([["group-left", { left: 10, top: 20, width: 320, height: 360 }]]);
+    const Probe = ({ id }: { readonly id: string }) => (
+      <i data-probe={id} data-seen={String(useCenterSurfaceVisible())} />
+    );
+    await act(async () => {
+      root.render(
+        <CenterPanelSurfaceHosts
+          state={stateWithInactiveHost}
+          rects={targets(rects)}
+          readBodyRect={(groupId) => rects.get(groupId) ?? null}
+          onFocusGroup={vi.fn()}
+          renderSurface={(surface) => <Probe id={surface.id} />}
+        />,
+      );
+    });
+    const seen = (id: string) =>
+      container.querySelector(`[data-probe="${id}"]`)?.getAttribute("data-seen");
+    expect(seen("chat:host")).toBe("false");
+    expect(seen("terminal:term-1")).toBe("true");
   });
 
   it("updates wrapper geometry imperatively without rerendering surface content", async () => {

@@ -563,6 +563,17 @@ describe("centerPanelStore", () => {
     });
   });
 
+  describe("reserved panels that stay inactive", () => {
+    it("adds the tab and keeps the active surface, so the surface that asked stays mounted", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      store().reserveChatPanel(HOST, ThreadId.make("review-panel"), "Code review", {
+        activate: false,
+      });
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, "chat:review-panel"]);
+      expect(selectActiveCenterSurface(store().byThreadKey, HOST)?.id).toBe(`chat:${PANEL_A}`);
+    });
+  });
+
   describe("thread cleanup", () => {
     it("removes a stored thread and preserves absent state identity", () => {
       store().openChatPanel(HOST, PANEL_A);

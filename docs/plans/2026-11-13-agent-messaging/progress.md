@@ -19,19 +19,19 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 | 2.2 | Preview and Message send | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
 | 2.3 | Person-send label in the transcript | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
 | 2.4 | Request state row | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
-| 3.1 | Review action | 3 | In progress | lane 3 | |
-| 3.2 | Second opinion attachments | 3 | In progress | lane 3 | |
-| 3.3 | Answer notice and Bring back | 3 | In progress | lane 3 | |
-| 4.1 | One handoff builder and on-demand handoff text | 4 | Open | | |
-| 4.2 | Hand off and Take over from actions | 4 | Open | | |
-| 4.3 | Out-of-tokens hint | 4 | Open | | |
-| 5.1 | Agent message store | 5 | Open | | |
-| 5.2 | Agent messaging setting | 5 | Open | | |
-| 5.3 | Agent directory tool | 5 | Open | | |
+| 3.1 | Review action | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
+| 3.2 | Second opinion attachments | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
+| 3.3 | Answer notice and Bring back | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
+| 4.1 | One handoff builder and on-demand handoff text | 4 | In progress | lane 4 | |
+| 4.2 | Hand off and Take over from actions | 4 | In progress | lane 4 | |
+| 4.3 | Out-of-tokens hint | 4 | In progress | lane 4 | |
+| 5.1 | Agent message store | 5 | In progress | lane 5A | |
+| 5.2 | Agent messaging setting | 5 | In progress | lane 5A | |
+| 5.3 | Agent directory tool | 5 | In progress | lane 5A | |
 | 5.4 | Sending with identity and scope | 5 | Open | | |
 | 5.5 | Delivery and status tracking | 5 | Open | | |
 | 5.6 | Reply, correlation and status tool | 5 | Open | | |
-| 5.7 | Envelope and literal delivery | 5 | Open | | |
+| 5.7 | Envelope and literal delivery | 5 | In progress | lane 5A | |
 | 6.1 | Runtime-mode ceiling and the claim gate | 6 | Open | | |
 | 6.2 | No user authority | 6 | Open | | |
 | 6.3 | Idempotent sends | 6 | Open | | |
@@ -75,3 +75,8 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-14 02:38 3.1, 3.2, 3.3 In progress. Owner: lane 3 (sonnet, medium), based on lane 2R's branch.
 - 2026-11-14 02:50 1.1, 1.2, 1.3, 1.4, 1.5, 1.6 Closed. Evidence: lane 1C fixed the 3 accepted points with failing tests first; cargo test -p bibcode-server --lib -j 2 gave 5558 passed, 0 failed; -- send_requests 80 passed five times; --test orchestration 24 passed; cargo fmt --all --check and clippy -D warnings exit 0 (lane report). Commits: df6ef1248..72f55e3ef, fast-forwarded into the Branch line's branch.
 - 2026-11-14 02:50 Follow-up (outside phase 1's files): a Cursor chunk that arrives after turn.completed gets no turn id (provider/cursor/runtime.rs clears active_turn_id first), so it never joins the answer; and mcp/wait.rs treats a completed turn as settled while its message still streams. Both to be fixed in this run in a later lane.
+- 2026-11-14 02:55 Phase 2's lane branch merged into the Branch line's branch (23f6a4272). 5.1, 5.2, 5.3, 5.7 In progress. Owner: lane 5A (opus, medium).
+- 2026-11-14 03:05 Lane 3 reported 3.1 to 3.3 on branch worktree-agent-ab4028d8cc1c0678c (193aa3612..a115914ed); checkpoint 158 tests passed (lane report). Codex review (gpt-6-astra, high): 5 findings, all accepted (a second panel after a lost creation response; the source preview unmounts when the new panel activates; a hidden notice marked opened; opened ids pruned by a first-page snapshot; a late completion changes the scope a reopened preview sends). Fix round: lane 3R (sonnet, medium).
+- 2026-11-14 03:20 3.1, 3.2, 3.3 Closed. Evidence: lane 3R fixed the 5 accepted findings, each failing test committed before its fix; the coordinator ran in the lane worktree from apps/web: vp test run --project unit src/components/sendToAgent src/centerPanelStore.test.ts src/centerPanelActions.test.ts src/components/CenterPanel: 19 files, 279 tests passed; vp check --no-fmt: no warnings or lint errors in 2471 files; vp fmt --check on the 16 changed files: correct. Commits: 193aa3612..525225670, merged into the Branch line's branch.
+- 2026-11-14 03:20 Ruling: lane 3R edited centerPanelStore.ts, CenterPanelSurfaceHosts.tsx and added centerSurfaceVisibility.ts (outside phase 3's Owns), because a review panel must be reserved inactive and a notice must know whether its surface is visible. Cost if wrong: two small optional parameters to revert.
+- 2026-11-14 03:20 4.1, 4.2, 4.3 In progress. Owner: lane 4 (opus, medium), started while phase 5 runs; both touch production/provider_runtime.rs in different regions, merged by the coordinator.
