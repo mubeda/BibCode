@@ -41,11 +41,11 @@ function LiveSendInputsReader(props: {
 export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props: {
   readonly threadRef: ScopedThreadRef;
   readonly serverSupported: boolean;
-  readonly newPanelProviders: ReadonlyArray<NewPanelProvider>;
+  readonly newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
   readonly createPanel: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
 }) {
-  const { threadRef, newPanelProviders } = props;
+  const { threadRef, newPanelProvidersFor } = props;
   const shell = useThreadShell(threadRef);
   const projects = useProjects();
   const send = useSendRequest(threadRef.environmentId);
@@ -72,7 +72,6 @@ export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props
           },
     [projectId, projectRootByProjectId, threadRef, title, worktreePath],
   );
-  const newPanelProvidersFor = useCallback(() => newPanelProviders, [newPanelProviders]);
   const renderLive = useCallback(
     (render: (live: LiveSendInputs) => ReactNode) =>
       source === null ? null : (

@@ -62,7 +62,7 @@ function render(serverSupported = true) {
       <ChatSendToAgentControl
         threadRef={threadRef}
         serverSupported={serverSupported}
-        newPanelProviders={[]}
+        newPanelProvidersFor={() => []}
         createPanel={createPanel}
         previewContentFor={previewContentFor}
       />,

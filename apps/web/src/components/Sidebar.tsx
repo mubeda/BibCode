@@ -186,6 +186,7 @@ import {
 } from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { AgentsUnreadTracker } from "./sidebar/AgentsUnreadTracker";
+import { SendRequestsUnreadTracker } from "./sendToAgent/SendRequestsUnreadTracker";
 import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import {
@@ -5584,6 +5585,7 @@ export default function Sidebar() {
         environments={environments}
         availability={shellSummary.statuses}
       />
+      <SendRequestsUnreadTracker />
 
       {isOnSettings ? (
         <SettingsSidebarNav pathname={pathname} />

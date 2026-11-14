@@ -114,7 +114,16 @@ interface CenterPanelStoreState {
   releaseClosingChatPanel: (ref: ScopedThreadRef, reshow: boolean) => void;
   clearReshowChatPanels: (keys: ReadonlySet<string>) => void;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
-  reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  /**
+   * Adds the panel's tab and makes it active. With `activate: false` it is added inactive, so the
+   * surface that asked for it stays mounted (an inactive chat panel is unmounted).
+   */
+  reserveChatPanel: (
+    ref: ScopedThreadRef,
+    threadId: ThreadId,
+    providerLabel?: string,
+    options?: { readonly activate?: boolean },
+  ) => void;
   releaseChatPanelReservation: (ref: ScopedThreadRef) => void;
   validateTerminalPanelPlacement: (
     ref: ScopedThreadRef,
@@ -595,11 +604,13 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
               insertSurface(current, chatSurface(threadId, providerLabel)),
             ),
           ),
-        reserveChatPanel: (ref, threadId, providerLabel) =>
+        reserveChatPanel: (ref, threadId, providerLabel, options) =>
           set((state) => {
             const panelKey = scopedThreadKey({ environmentId: ref.environmentId, threadId });
             const updated = withUpdatedThread(state, ref, (current) =>
-              insertSurface(current, chatSurface(threadId, providerLabel)),
+              options?.activate === false
+                ? appendInactiveSurface(current, chatSurface(threadId, providerLabel))
+                : insertSurface(current, chatSurface(threadId, providerLabel)),
             );
             if (
               updated.byThreadKey === state.byThreadKey &&

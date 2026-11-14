@@ -1,4 +1,5 @@
 import { cn } from "~/lib/utils";
+import { CenterSurfaceVisibleContext } from "./centerSurfaceVisibility";
 import {
   HOST_SURFACE_ID,
   type CenterSurface,
@@ -63,11 +64,15 @@ interface CenterPanelSurfaceContentProps {
 const CenterPanelSurfaceContent = memo(function CenterPanelSurfaceContent(
   props: CenterPanelSurfaceContentProps,
 ) {
-  return props.renderSurface(props.surface, {
-    groupId: props.groupId,
-    visible: props.visible,
-    focused: props.focused,
-  });
+  return (
+    <CenterSurfaceVisibleContext value={props.visible}>
+      {props.renderSurface(props.surface, {
+        groupId: props.groupId,
+        visible: props.visible,
+        focused: props.focused,
+      })}
+    </CenterSurfaceVisibleContext>
+  );
 });
 
 function sameRect(left: CenterPanelBodyRect, right: CenterPanelBodyRect): boolean {
