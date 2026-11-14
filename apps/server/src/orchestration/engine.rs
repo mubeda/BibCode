@@ -6287,10 +6287,10 @@ struct PersistCommandOutcome {
     result_sequence: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
 const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
 const STALE_AGENT_MESSAGE_RELINK: &str = "agent-message-relink-stale";
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
     hooks: &TestHooks,

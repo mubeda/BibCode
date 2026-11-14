@@ -166,6 +166,10 @@ pub struct AgentMessageRow {
 
 /// The message row written in the same transaction as its queue entry.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per admitted command, moved once; the Insert form is the interface tasks 5.4 and 6.4 build"
+)]
 pub enum AgentMessageCompanion {
     Insert(NewAgentMessage),
     Relink(RelinkAgentMessage),
