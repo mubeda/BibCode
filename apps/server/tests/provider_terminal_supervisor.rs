@@ -5704,8 +5704,9 @@ async fn codex_attach_takes_readiness_only_from_events_after_its_resume() {
             "terminal-attach-root",
             root.path(),
         ));
-    // The resume answers idle, and an idle that arrived while it was in flight is buffered:
-    // neither is ordered after the other, so neither proves the prompt waits now.
+    // The resume answers working, and an idle that arrived while it was in flight is buffered:
+    // the idle is not ordered after the answer, so it may report Done but not readiness. (The
+    // reconnect test covers a resume that answers idle.)
     remote_state
         .resume_responses
         .lock()
@@ -5715,7 +5716,7 @@ async fn codex_attach_takes_readiness_only_from_events_after_its_resume() {
                 "id": "terminal-attach-root",
                 "parentThreadId": null,
                 "turns": [],
-                "status": {"type": "idle"},
+                "status": {"type": "active", "activeFlags": []},
             },
         })));
     remote_state
@@ -5819,6 +5820,9 @@ async fn codex_reconnect_withdraws_readiness_until_an_event_after_its_resume() {
         (TerminalAgentStatusState::Done, true),
     )
     .await;
+    // With activity off no enable barrier follows the reconnect, so only the resume decides.
+    let disabled = manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
     let connections_before = remote_state
         .endpoints
         .lock()
