@@ -3094,7 +3094,10 @@ impl Harness {
     }
 
     /// Holds the message for `messaging_off` as the tracker would, with no tracker running.
-    async fn hold_untracked(&self, message_id: &str) -> crate::agent_messaging::store::AgentMessageRow {
+    async fn hold_untracked(
+        &self,
+        message_id: &str,
+    ) -> crate::agent_messaging::store::AgentMessageRow {
         let held_id = message_id.to_owned();
         self.repositories
             .database()
@@ -3202,7 +3205,11 @@ mod messaging_off {
         let off = harness.messaging(false);
         for (caller, tool, arguments) in [
             ("a", "agents_list", json!({})),
-            ("a", "agent_message_send", send_arguments("thread:b", "again")),
+            (
+                "a",
+                "agent_message_send",
+                send_arguments("thread:b", "again"),
+            ),
             (
                 "b",
                 "agent_message_reply",
@@ -3361,7 +3368,10 @@ mod messaging_off {
         let entries = harness.requeued_entries(&m1).await;
         assert_eq!(entries.len(), 1, "{entries:?}");
         let row = harness.message_row(&m1).await;
-        assert_eq!(row.delivery_command_id.as_deref(), Some(entries[0].as_str()));
+        assert_eq!(
+            row.delivery_command_id.as_deref(),
+            Some(entries[0].as_str())
+        );
         assert_eq!(row.status.as_str(), "queued");
         assert_eq!(
             harness
@@ -3467,9 +3477,8 @@ mod hop_limit {
             self.repositories
                 .database()
                 .call(|connection| {
-                    Ok(connection.query_row("SELECT COUNT(*) FROM agent_messages", [], |row| {
-                        row.get(0)
-                    })?)
+                    Ok(connection
+                        .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))?)
                 })
                 .await
                 .expect("count")
@@ -3606,7 +3615,9 @@ mod hop_limit {
         harness.provider_turn("b", "turn-b", "done", true).await;
         let m1 = harness.sent("a", "thread:b").await;
         harness.until_status(&m1, "delivered").await;
-        harness.provider_turn("b", "turn-b2", "working", false).await;
+        harness
+            .provider_turn("b", "turn-b2", "working", false)
+            .await;
         harness.until_status(&m1, "consumed").await;
 
         let reply = harness.reply("b", &m1, "pong").await;
@@ -3648,7 +3659,9 @@ mod hop_limit {
                 .agent_send("a", send_arguments("thread:b", "ping"))
                 .await,
         );
-        harness.turn_started_by("a", "turn-a2", 8, false, true).await;
+        harness
+            .turn_started_by("a", "turn-a2", 8, false, true)
+            .await;
         assert_hop_limit(
             &harness
                 .agent_send("a", send_arguments("thread:b", "ping"))

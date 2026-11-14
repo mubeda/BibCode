@@ -429,7 +429,11 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         if let Some(receipt) = self
-            .replay(&format!("thread:{sender_thread_id}"), &request.to, &outgoing)
+            .replay(
+                &format!("thread:{sender_thread_id}"),
+                &request.to,
+                &outgoing,
+            )
             .await?
         {
             return Ok((receipt, (String::new(), String::new())));

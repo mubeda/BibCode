@@ -393,7 +393,12 @@ async fn reconcile(
             let recipient = scope.as_deref();
             let now = crate::mcp::control::now_iso();
             if messaging == Some(false) {
-                hold_waiting(connection, recipient, AgentMessageReason::MessagingOff, &now)?;
+                hold_waiting(
+                    connection,
+                    recipient,
+                    AgentMessageReason::MessagingOff,
+                    &now,
+                )?;
             }
             hold_above_ceiling(connection, recipient, &now)?;
             let open = match recipient {
@@ -563,9 +568,9 @@ pub(crate) async fn requeue(
         .map_err(storage)?;
     // Behind whatever waits, and behind a turn that runs or an open ask, as a send would be.
     let queued = waiting
-        || thread
-            .as_ref()
-            .is_none_or(|thread| super::admission_for(thread, session.as_ref()) == super::TurnAdmission::Queue);
+        || thread.as_ref().is_none_or(|thread| {
+            super::admission_for(thread, session.as_ref()) == super::TurnAdmission::Queue
+        });
     let command_id = format!("agent-message:{}:{}", message.message_id, earlier + 1);
     let delivery_message_id = uuid::Uuid::new_v4().to_string();
     let now = crate::mcp::control::now_iso();
@@ -586,10 +591,11 @@ pub(crate) async fn requeue(
             serde_json::json!(delivery_message_id),
         );
     }
-    let command: OrchestrationCommand = serde_json::from_value(payload.clone()).map_err(|error| {
-        tracing::warn!(error = %error, "a held agent message's turn start did not build");
-        AgentMessagingError::Storage
-    })?;
+    let command: OrchestrationCommand =
+        serde_json::from_value(payload.clone()).map_err(|error| {
+            tracing::warn!(error = %error, "a held agent message's turn start did not build");
+            AgentMessagingError::Storage
+        })?;
     let payload_digest = canonical_command_digest(&command).map_err(|error| {
         tracing::warn!(error = %error, "a held agent message's turn start has no digest");
         AgentMessagingError::Storage
