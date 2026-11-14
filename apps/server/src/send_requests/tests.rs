@@ -11,7 +11,7 @@ use crate::{
         rpc::register_send_requests_rpc,
         service::{
             ANSWER_TEXT_MAX_CHARS, RequestChange, SendRequestAttachment, SendRequestsSendInput,
-            SendRequestsService, compose_message_text, require_person,
+            SendRequestsService, compose_message_text, require_person, turn_command,
         },
         store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange},
     },
@@ -1146,7 +1146,7 @@ async fn followed() -> (Harness, SendRequestsService, CancellationToken) {
     (harness, service, stop)
 }
 
-async fn request(harness: &Harness, request_id: &str) -> SendRequestRow {
+async fn stored_request(harness: &Harness, request_id: &str) -> SendRequestRow {
     SendRequestStore::new(harness.repositories.database().clone())
         .get(request_id)
         .await
@@ -1164,7 +1164,7 @@ async fn until(
     let mut changes = service.subscribe_changes();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let row = request(harness, request_id).await;
+        let row = stored_request(harness, request_id).await;
         if check(&row) {
             return row;
         }
@@ -1251,7 +1251,7 @@ async fn proposed_plan(harness: &Harness, turn_id: &str, markdown: &str) {
 async fn state_read_when_the_target_turn_starts() {
     let (harness, service, stop) = followed().await;
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
-    assert_eq!(request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
 
     harness.provider_turn("b", "t1", "Working", false).await;
 
@@ -1372,7 +1372,7 @@ async fn state_a_queue_held_behind_a_running_turn_that_errors_waits() {
     session(&harness, "b", "running").await;
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
     service.sweep().await;
-    assert_eq!(request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
 
     session(&harness, "b", "error").await;
 
@@ -1414,7 +1414,7 @@ async fn state_a_request_behind_an_open_approval_stays_queued() {
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
 
     service.sweep().await;
-    let row = request(&harness, "r1").await;
+    let row = stored_request(&harness, "r1").await;
     assert_eq!(
         (row.state, row.reason),
         (SendState::Queued, None),
@@ -1545,7 +1545,7 @@ async fn state_the_target_is_deleted() {
 
     let row = until_state(&harness, &service, "open", SendState::NotAnswered).await;
     assert_eq!(row.reason.as_deref(), Some("target_deleted"));
-    let done = request(&harness, "done").await;
+    let done = stored_request(&harness, "done").await;
     assert_eq!(done.state, SendState::Answered);
     assert_eq!(done.answer_text.as_deref(), Some("The answer"));
     stop.cancel();
@@ -1572,7 +1572,7 @@ async fn state_a_delivery_that_fails_is_not_answered() {
 
     service.sweep().await;
 
-    let row = request(&harness, "r1").await;
+    let row = stored_request(&harness, "r1").await;
     assert_eq!(row.state, SendState::NotAnswered);
     assert_eq!(row.reason.as_deref(), Some("delivery_failed"));
     stop.cancel();
@@ -1665,7 +1665,7 @@ async fn state_deleting_the_source_drops_its_requests() {
             .unwrap(),
         None
     );
-    assert_eq!(request(&harness, "kept").await.state, SendState::Queued);
+    assert_eq!(stored_request(&harness, "kept").await.state, SendState::Queued);
     stop.cancel();
     harness.shutdown().await;
 }
@@ -1682,7 +1682,7 @@ async fn state_survives_a_restart() {
 
     // The turn runs and ends while no follower runs.
     harness.provider_turn("b", "t1", "Answered while away", true).await;
-    assert_eq!(request(&harness, "r1").await.state, SendState::Queued);
+    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
 
     let after = harness.send_requests();
     let stop = CancellationToken::new();
@@ -1729,5 +1729,359 @@ async fn state_a_lagging_follower_resweeps() {
     assert_eq!(row.answer_text.as_deref(), Some("R1"));
     stop.cancel();
     following.await.unwrap();
+    harness.shutdown().await;
+}
+
+// Retry and replay of a person's send (task 1.5).
+
+/// The row a first attempt of `input` (thread `a` to thread `b`) stored.
+fn first_attempt_row(input: &SendRequestsSendInput) -> SendRequestRow {
+    let mut stored = row(&input.request_id, "a", AT);
+    stored.args_digest = crate::orchestration::canonical_command_digest(input).unwrap();
+    stored.source_address = input.source.clone();
+    stored.target_address = input.target.clone();
+    stored.target_thread_id = "b".to_owned();
+    stored
+}
+
+async fn receipt(harness: &Harness, command_id: &str) -> Option<(String, Option<String>)> {
+    use rusqlite::OptionalExtension as _;
+    let command_id = command_id.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT status, error FROM orchestration_command_receipts WHERE command_id = ?",
+                    [command_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
+        })
+        .await
+        .unwrap()
+}
+
+/// Stores `input`'s row and reserves its command's receipt, as a first attempt that stopped
+/// after the reservation does.
+async fn reserved_first_attempt(harness: &Harness, input: &SendRequestsSendInput) {
+    let stored = insert(
+        &SendRequestStore::new(harness.repositories.database().clone()),
+        first_attempt_row(input),
+    )
+    .await;
+    let command = turn_command(
+        &stored,
+        compose_message_text(&input.lead_in, &input.note, &[]),
+    )
+    .unwrap();
+    let digest = crate::orchestration::canonical_command_digest(&command).unwrap();
+    let claim = harness
+        .engine
+        .acquire_command_admission(command.command_id())
+        .await
+        .unwrap();
+    harness
+        .engine
+        .reserve_generic_command_admission(&claim, &command, &digest)
+        .await
+        .unwrap();
+    drop(claim);
+    assert_eq!(
+        receipt(harness, "person-send:r1").await.map(|receipt| receipt.0),
+        Some("reserved".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn retry_the_same_request_id_with_the_same_arguments_delivers_once() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let request = input("r1", "review", "thread:a", "thread:b");
+
+    let first = service.send(&person(), request.clone()).await.unwrap();
+    let second = service.send(&person(), request).await.unwrap();
+
+    assert_eq!(second, first, "the repeat returns the stored result");
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_a_lost_response_delivers_once() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let request = input("r1", "review", "thread:a", "thread:b");
+    // The turn is queued, then the response never reaches the client.
+    drop(service.send(&person(), request.clone()).await);
+
+    let retried = service.send(&person(), request).await.unwrap();
+
+    assert_eq!(retried.request_id, "r1");
+    assert_eq!(retried.state, "queued");
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_the_row_was_stored_but_before_the_turn_was_queued_delivers_once() {
+    let harness = harness().await;
+    let request = input("r1", "review", "thread:a", "thread:b");
+    insert(
+        &SendRequestStore::new(harness.repositories.database().clone()),
+        first_attempt_row(&request),
+    )
+    .await;
+    assert_eq!(stored(&harness).await, (1, 0, 0));
+
+    harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .unwrap();
+
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_a_reserved_receipt_dispatches_the_identical_command_again() {
+    let harness = harness().await;
+    let request = input("r1", "review", "thread:a", "thread:b");
+    reserved_first_attempt(&harness, &request).await;
+
+    harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .unwrap_or_else(|error| panic!("the replay is accepted: {error}"));
+
+    assert_eq!(
+        receipt(&harness, "person-send:r1").await.map(|receipt| receipt.0),
+        Some("accepted".to_owned())
+    );
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_a_mode_change_replays_the_original_command() {
+    let harness = harness().await;
+    let request = input("r1", "review", "thread:a", "thread:b");
+    reserved_first_attempt(&harness, &request).await;
+    dispatch(
+        &harness,
+        json!({
+            "type": "thread.runtime-mode.set", "commandId": "mode-b", "threadId": "b",
+            "runtimeMode": "approval-required", "createdAt": AT,
+        }),
+    )
+    .await;
+    dispatch(
+        &harness,
+        json!({
+            "type": "thread.interaction-mode.set", "commandId": "interaction-b",
+            "threadId": "b", "interactionMode": "plan", "createdAt": AT,
+        }),
+    )
+    .await;
+
+    harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .unwrap_or_else(|error| panic!("the replay keeps the first modes: {error}"));
+
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_a_rejected_receipt_reports_the_failure_it_was() {
+    let harness = harness().await;
+    let request = input("r1", "review", "thread:a", "thread:b");
+    insert(
+        &SendRequestStore::new(harness.repositories.database().clone()),
+        first_attempt_row(&request),
+    )
+    .await;
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) \
+                 VALUES ('person-send:r1', 'thread', 'b', '2026-10-30T00:00:00.000Z', 0, 'rejected', 'The source is not a live agent.', NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .expect_err("a rejected request is reported");
+
+    assert_eq!(error["_tag"], "SendRequestError", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("The source is not a live agent.")),
+        "{error}"
+    );
+    let row = stored_request(&harness, "r1").await;
+    assert_eq!(row.state, SendState::NotAnswered);
+    assert_eq!(row.reason.as_deref(), Some("delivery_failed"));
+    assert_eq!(stored(&harness).await, (1, 0, 0), "nothing is queued");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_the_same_request_id_with_other_arguments_is_a_conflict() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    service
+        .send(&person(), input("r1", "review", "thread:a", "thread:b"))
+        .await
+        .unwrap();
+    let before = stored_request(&harness, "r1").await;
+    let mut other = input("r1", "review", "thread:a", "thread:b");
+    other.note = "Another note.".to_owned();
+
+    assert_eq!(refused(&harness, &person(), other).await, "request_conflict");
+
+    assert_eq!(stored_request(&harness, "r1").await, before);
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_two_simultaneous_calls_with_one_request_id_deliver_once() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    let context = person();
+    for index in 0..5 {
+        let request = input(&format!("r{index}"), "review", "thread:a", "thread:b");
+        let (first, second) = tokio::join!(
+            service.send(&context, request.clone()),
+            service.send(&context, request)
+        );
+        assert_eq!(
+            first.unwrap().request_id,
+            second.unwrap().request_id,
+            "both calls return the request"
+        );
+    }
+    assert_eq!(stored(&harness).await, (5, 5, 5));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_after_the_target_was_deleted_replays_without_validating_the_target() {
+    let harness = harness().await;
+    let service = harness.send_requests();
+    deletable_thread(&harness).await;
+    session(&harness, "d", "running").await;
+    let request = input("r1", "review", "thread:a", "thread:d");
+    service.send(&person(), request.clone()).await.unwrap();
+    delete_thread(&harness, "d").await;
+
+    let replayed = service
+        .send(&person(), request)
+        .await
+        .unwrap_or_else(|error| panic!("the replay is not validated again: {error}"));
+
+    assert_eq!(replayed.request_id, "r1");
+    assert_eq!(stored(&harness).await, (1, 1, 1));
+    harness.shutdown().await;
+}
+
+/// The harness's send service whose dispatcher runs `before` first.
+fn service_with(
+    harness: &Harness,
+    before: impl Fn(crate::orchestration::OrchestrationEngine) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+) -> SendRequestsService {
+    let real = harness.server_dispatcher();
+    let engine = harness.engine.clone();
+    let before = std::sync::Arc::new(before);
+    SendRequestsService::new(
+        harness.repositories.database().clone(),
+        harness.repositories.clone(),
+        std::sync::Arc::new(move |command, owner, actor| {
+            let real = real.clone();
+            let before = before.clone();
+            let engine = engine.clone();
+            Box::pin(async move {
+                before(engine).await;
+                real(command, owner, actor).await
+            })
+        }),
+    )
+}
+
+
+#[tokio::test]
+async fn retry_a_first_attempt_the_engine_rejected_ends_not_answered() {
+    let harness = harness().await;
+    deletable_thread(&harness).await;
+    // The source is deleted after the send validated it, so the engine refuses the command.
+    let service = service_with(&harness, |engine| {
+        Box::pin(async move {
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type": "thread.delete", "commandId": "delete-d", "threadId": "d",
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        })
+    });
+
+    let error = service
+        .send(&person(), input("r1", "review", "thread:d", "thread:b"))
+        .await
+        .expect_err("the engine refuses it");
+
+    assert_eq!(error["_tag"], "SendRequestError", "{error}");
+    assert_eq!(
+        receipt(&harness, "person-send:r1").await.map(|receipt| receipt.0),
+        Some("rejected".to_owned())
+    );
+    let row = stored_request(&harness, "r1").await;
+    assert_eq!(row.state, SendState::NotAnswered);
+    assert_eq!(row.reason.as_deref(), Some("delivery_failed"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_a_first_attempt_that_failed_without_a_receipt_stays_replayable() {
+    let harness = harness().await;
+    let failing = SendRequestsService::new(
+        harness.repositories.database().clone(),
+        harness.repositories.clone(),
+        std::sync::Arc::new(|_, _, _| {
+            Box::pin(async { Err(json!({ "_tag": "WorkspaceUnavailable" })) })
+        }),
+    );
+    let request = input("r1", "review", "thread:a", "thread:b");
+    failing
+        .send(&person(), request.clone())
+        .await
+        .expect_err("the dispatch failed");
+    assert_eq!(stored_request(&harness, "r1").await.state, SendState::Queued);
+
+    harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .unwrap();
+
+    assert_eq!(stored(&harness).await, (1, 1, 1));
     harness.shutdown().await;
 }

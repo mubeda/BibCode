@@ -243,6 +243,8 @@ impl SendRequestsService {
     ) {
         loop {
             let event = tokio::select! {
+                // A stopped follower reads no further event, even one already waiting.
+                biased;
                 () = shutdown.cancelled() => return,
                 event = events.recv() => event,
             };
@@ -382,6 +384,13 @@ impl SendRequestsService {
         if input.request_id.trim().is_empty() {
             return Err(invalid("The request needs an id."));
         }
+        let args_digest = canonical_command_digest(&input)
+            .map_err(|_| invalid("BiBCode could not read this request."))?;
+        // A repeat replays the stored request without validating it again: its target may be
+        // gone by now, and the first attempt already passed every check.
+        if let Some(row) = self.store.get(&input.request_id).await.map_err(storage)? {
+            return self.replay(context, row, &args_digest, &input).await;
+        }
         let action = SendAction::parse(&input.action)
             .ok_or_else(|| invalid("This action is not one BiBCode knows."))?;
         let source = parse_address(&input.source)
@@ -464,8 +473,6 @@ impl SendRequestsService {
             ));
         }
 
-        let args_digest = canonical_command_digest(&input)
-            .map_err(|_| invalid("BiBCode could not read this request."))?;
         let command_id = format!("person-send:{}", input.request_id);
         let now = crate::mcp::control::now_iso();
         let (row, created) = self
@@ -479,7 +486,7 @@ impl SendRequestsService {
                 target_address: input.target.clone(),
                 target_thread_id: target.thread_id.clone(),
                 taken_over_address: input.taken_over.clone(),
-                args_digest,
+                args_digest: args_digest.clone(),
                 note_chars: i64::try_from(note_chars).unwrap_or(i64::MAX),
                 attachment_chars: i64::try_from(attachment_chars).unwrap_or(i64::MAX),
                 target_message_id: Some(command_id.clone()),
@@ -500,47 +507,121 @@ impl SendRequestsService {
             .await
             .map_err(storage)?;
         if !created {
-            // shortcut: every repeated request id is a conflict; task 1.5 adds the replay.
+            // A simultaneous call with the same id stored it first.
+            return self.replay(context, row, &args_digest, &input).await;
+        }
+        self.dispatch(context, &row, &input).await?;
+        Ok(SendRequest::from(&row))
+    }
+
+    /// A repeat of a stored request. Other arguments are a conflict. Otherwise the command's
+    /// receipt says what the first attempt reached: accepted means the turn is queued, so
+    /// nothing is sent again; rejected is reported as the failure it was; none or reserved
+    /// means the identical command is dispatched again, which the engine admits once.
+    async fn replay(
+        &self,
+        context: &RpcSessionContext,
+        row: SendRequestRow,
+        args_digest: &str,
+        input: &SendRequestsSendInput,
+    ) -> Result<SendRequest, Value> {
+        if row.args_digest != args_digest {
             return Err(refusal(
                 "request_conflict",
-                "A request with this id was already sent.",
+                "A request with this id was already sent with other content.",
             ));
         }
+        let receipt = self
+            .repositories
+            .get_command_receipt(row.command_id.clone().unwrap_or_default())
+            .await
+            .map_err(storage)?;
+        match receipt {
+            Some(receipt) if receipt.status == "accepted" => {}
+            Some(receipt) if !matches!(receipt.status.as_str(), "reserved" | "prepared") => {
+                return Err(self.rejected(&row, receipt.error).await);
+            }
+            _ => self.dispatch(context, &row, input).await?,
+        }
+        let current = self.store.get(&row.request_id).await.map_err(storage)?;
+        Ok(SendRequest::from(current.as_ref().unwrap_or(&row)))
+    }
 
+    /// Queues the request's turn, built from its stored row and the caller's text, so every
+    /// attempt builds the same command.
+    async fn dispatch(
+        &self,
+        context: &RpcSessionContext,
+        row: &SendRequestRow,
+        input: &SendRequestsSendInput,
+    ) -> Result<(), Value> {
         let attachments = input
             .attachments
             .iter()
             .map(|attachment| (attachment.label.clone(), attachment.text.clone()))
             .collect::<Vec<_>>();
         let command = turn_command(
-            &row,
+            row,
             compose_message_text(&input.lead_in, &input.note, &attachments),
         )
         .map_err(|_| invalid("BiBCode could not build this request."))?;
-        (self.dispatcher)(
+        let Err(error) = (self.dispatcher)(
             command,
             UploadOwner::from_context(context),
             ServerActor::Person,
         )
         .await
-        .map_err(|error| {
-            tracing::warn!(
-                request_id = %row.request_id,
-                error = %error["_tag"],
-                "a send request could not be queued"
-            );
-            refusal(
-                "invalid",
-                "BiBCode could not queue this request on the agent. Try again.",
-            )
-        })?;
-        Ok(SendRequest::from(&row))
+        else {
+            return Ok(());
+        };
+        tracing::warn!(
+            request_id = %row.request_id,
+            error = %error["_tag"],
+            "a send request could not be queued"
+        );
+        // Only a rejection the engine stored is final; any other failure stays replayable.
+        let receipt = self
+            .repositories
+            .get_command_receipt(row.command_id.clone().unwrap_or_default())
+            .await
+            .map_err(storage)?;
+        if let Some(receipt) = receipt.filter(|receipt| receipt.status == "rejected") {
+            return Err(self.rejected(row, receipt.error).await);
+        }
+        Err(refusal(
+            "invalid",
+            "BiBCode could not queue this request on the agent. Try again.",
+        ))
+    }
+
+    /// Ends a request whose command the engine rejected, and returns that rejection.
+    async fn rejected(&self, row: &SendRequestRow, error: Option<String>) -> Value {
+        let change = StateChange {
+            to: SendState::NotAnswered,
+            reason: Some("delivery_failed".to_owned()),
+            answering_turn_id: None,
+            answer_message_id: None,
+            answer_text: None,
+            answer_truncated: false,
+            dismiss: false,
+            at: crate::mcp::control::now_iso(),
+        };
+        if let Err(error) = self.apply(&row.request_id, &OPEN, change).await {
+            tracing::warn!(request_id = %row.request_id, %error, "a rejected send request was kept open");
+        }
+        refusal(
+            "invalid",
+            &format!(
+                "The agent did not accept this request: {}",
+                error.as_deref().unwrap_or("it was refused.")
+            ),
+        )
     }
 }
 
 /// The `thread.turn.start` a request queues, built only from its stored row and its text, so
 /// a replay builds the same command.
-fn turn_command(row: &SendRequestRow, text: String) -> Result<OrchestrationCommand, String> {
+pub(super) fn turn_command(row: &SendRequestRow, text: String) -> Result<OrchestrationCommand, String> {
     // A take-over is labelled with the agent whose work it takes over.
     let source_address = row
         .taken_over_address
