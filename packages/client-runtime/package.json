@@ -47,6 +47,10 @@
       "types": "./src/state/mcpActivity.ts",
       "default": "./src/state/mcpActivity.ts"
     },
+    "./state/sendRequests": {
+      "types": "./src/state/sendRequests.ts",
+      "default": "./src/state/sendRequests.ts"
+    },
     "./state/mcpClients": {
       "types": "./src/state/mcpClients.ts",
       "default": "./src/state/mcpClients.ts"
