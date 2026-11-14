@@ -119,6 +119,9 @@
           "providerSessionDefaults": {},
           "terminal": {
             "webglEnabled": true
+          },
+          "agentMessaging": {
+            "enabled": false
           }
         }
       }
