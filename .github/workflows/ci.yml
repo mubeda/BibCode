@@ -315,13 +315,16 @@ jobs:
             platform: win
             target: nsis
             arch: x64
-            jobTimeoutMinutes: 120
+            # Without a Rust cache this row took 108 minutes on 2026-11-13.
+            jobTimeoutMinutes: 180
           - label: Windows arm64
             runner: windows-11-vs2026-arm
             platform: win
             target: nsis
             arch: arm64
-            jobTimeoutMinutes: 120
+            # Without a Rust cache this row took 113 minutes on a pull request on
+            # 2026-11-13, and was cancelled at its 120-minute limit on main.
+            jobTimeoutMinutes: 180
     steps: &native_desktop_steps
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

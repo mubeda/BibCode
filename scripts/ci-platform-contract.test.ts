@@ -332,7 +332,9 @@ describe("cross-platform CI contract", () => {
       // macOS builds the unoptimized host test graph and the optimized native
       // package with its symbols.
       // With a Rust cache the macOS rows took 215 and 228 minutes on 2026-11-13.
-      const minimum = row.platform === "mac" ? 330 : 120;
+      // Without a Rust cache the Windows rows took 108 and 113 minutes on the
+      // same day, and Windows arm64 was then cancelled at 120 minutes on main.
+      const minimum = row.platform === "mac" ? 330 : row.platform === "win" ? 180 : 120;
       expect(row.jobTimeoutMinutes, String(row.label)).toBeGreaterThanOrEqual(minimum);
     }
   });

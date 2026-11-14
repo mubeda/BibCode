@@ -140,7 +140,8 @@ the merge.
   path on every pull request; the job installs `dump_syms` 2.3.9 for it, and
   Rust Cache keeps the binary in `~/.cargo/bin`.
   Each matrix row declares its complete-job budget:
-  330 minutes for each macOS row and 120 minutes for the other four targets.
+  330 minutes for each macOS row, 180 minutes for each Windows row, and 120
+  minutes for each Linux row.
   That budget includes setup, host tests, the macOS optimized exception-recovery
   probe, and native packaging without shortening any check or test-owned deadline.
   Debug host tests cannot warm the optimized artifacts. The exception probe is
@@ -258,7 +259,7 @@ recently used entries above that. Which workflow saves which entry:
 
 A job cancelled by `timeout-minutes` or by a newer run skips the cache post
 step, so the Check and Test budgets above include a cold compile. Native
-desktop keeps its 120-minute and 330-minute row budgets.
+desktop keeps its 120-minute, 180-minute and 330-minute row budgets.
 
 Six native-desktop entries of about 1.6 GB each are about 10 GB on their own,
 before Check, Test, Crash smoke, Linux Git, and the setup-vp caches. Eviction
