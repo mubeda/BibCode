@@ -1,6 +1,20 @@
-use crate::persistence::Database;
-use crate::send_requests::store::{
-    SendAction, SendRequestRow, SendRequestStore, SendState, StateChange,
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    auth::Principal,
+    mcp::control::McpAccess,
+    persistence::Database,
+    production::{mcp_tools_tests::Harness, orchestration_rpc::ServerActor},
+    rpc::{RpcRegistry, RpcSessionContext},
+    send_requests::{
+        rpc::register_send_requests_rpc,
+        service::{
+            SendRequestAttachment, SendRequestsSendInput, compose_message_text, require_person,
+        },
+        store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange},
+    },
+    transfer::staging::UploadOwner,
 };
 
 async fn migrated(database: Database) -> SendRequestStore {
@@ -307,706 +321,684 @@ async fn store_an_open_request_survives_reopening_the_database() {
     assert_eq!(open[0].state, SendState::Queued);
 }
 
-mod send {
-    use serde_json::{Value, json};
-    use tokio_util::sync::CancellationToken;
+const AT: &str = "2026-10-30T00:00:00.000Z";
 
-    use crate::{
-        auth::Principal,
-        mcp::control::McpAccess,
-        production::{mcp_tools_tests::Harness, orchestration_rpc::ServerActor},
-        rpc::{RpcRegistry, RpcSessionContext},
-        send_requests::{
-            rpc::register_send_requests_rpc,
-            service::{
-                SendRequestAttachment, SendRequestsSendInput, compose_message_text, require_person,
+fn input(request_id: &str, action: &str, source: &str, target: &str) -> SendRequestsSendInput {
+    SendRequestsSendInput {
+        request_id: request_id.to_owned(),
+        action: action.to_owned(),
+        source: source.to_owned(),
+        target: target.to_owned(),
+        taken_over: None,
+        lead_in: "Please review the work below.".to_owned(),
+        note: "Look at the parser.".to_owned(),
+        attachments: Vec::new(),
+    }
+}
+
+fn person() -> RpcSessionContext {
+    RpcSessionContext::unauthenticated()
+}
+
+async fn harness() -> Harness {
+    let harness = Harness::new().await;
+    harness.send_request_threads().await;
+    harness
+}
+
+async fn dispatch(harness: &Harness, value: Value) {
+    harness
+        .engine
+        .dispatch(serde_json::from_value(value).expect("command decodes"))
+        .await
+        .expect("dispatched");
+}
+
+async fn session(harness: &Harness, thread_id: &str, status: &str) {
+    dispatch(
+        harness,
+        json!({
+            "type": "thread.session.set",
+            "commandId": format!("session-{thread_id}-{status}-{}", uuid::Uuid::new_v4()),
+            "threadId": thread_id,
+            "session": {
+                "threadId": thread_id, "status": status, "providerName": "codex",
+                "providerInstanceId": "codex", "runtimeMode": "full-access",
+                "activeTurnId": if status == "running" { Some("turn-running") } else { None },
+                "lastError": null, "updatedAt": AT,
             },
-        },
-        transfer::staging::UploadOwner,
-    };
+            "createdAt": AT,
+        }),
+    )
+    .await;
+}
 
-    const AT: &str = "2026-10-30T00:00:00.000Z";
+async fn ask(harness: &Harness, thread_id: &str, kind: &str) {
+    dispatch(
+        harness,
+        json!({
+            "type": "thread.activity.append", "commandId": format!("ask-{kind}"),
+            "threadId": thread_id,
+            "activity": {
+                "id": format!("ask-{kind}"), "tone": "approval", "kind": kind,
+                "summary": "request", "payload": { "requestId": "request-open" },
+                "turnId": null, "createdAt": AT,
+            },
+            "createdAt": AT,
+        }),
+    )
+    .await;
+}
 
-    fn input(request_id: &str, action: &str, source: &str, target: &str) -> SendRequestsSendInput {
-        SendRequestsSendInput {
-            request_id: request_id.to_owned(),
-            action: action.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-            taken_over: None,
-            lead_in: "Please review the work below.".to_owned(),
-            note: "Look at the parser.".to_owned(),
-            attachments: Vec::new(),
-        }
-    }
+async fn count(harness: &Harness, sql: &'static str) -> i64 {
+    harness
+        .repositories
+        .database()
+        .call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?))
+        .await
+        .unwrap()
+}
 
-    fn person() -> RpcSessionContext {
-        RpcSessionContext::unauthenticated()
-    }
-
-    async fn harness() -> Harness {
-        let harness = Harness::new().await;
-        harness.send_request_threads().await;
-        harness
-    }
-
-    async fn dispatch(harness: &Harness, value: Value) {
-        harness
-            .engine
-            .dispatch(serde_json::from_value(value).expect("command decodes"))
-            .await
-            .expect("dispatched");
-    }
-
-    async fn session(harness: &Harness, thread_id: &str, status: &str) {
-        dispatch(
-            harness,
-            json!({
-                "type": "thread.session.set",
-                "commandId": format!("session-{thread_id}-{status}-{}", uuid::Uuid::new_v4()),
-                "threadId": thread_id,
-                "session": {
-                    "threadId": thread_id, "status": status, "providerName": "codex",
-                    "providerInstanceId": "codex", "runtimeMode": "full-access",
-                    "activeTurnId": if status == "running" { Some("turn-running") } else { None },
-                    "lastError": null, "updatedAt": AT,
-                },
-                "createdAt": AT,
-            }),
-        )
-        .await;
-    }
-
-    async fn ask(harness: &Harness, thread_id: &str, kind: &str) {
-        dispatch(
-            harness,
-            json!({
-                "type": "thread.activity.append", "commandId": format!("ask-{kind}"),
-                "threadId": thread_id,
-                "activity": {
-                    "id": format!("ask-{kind}"), "tone": "approval", "kind": kind,
-                    "summary": "request", "payload": { "requestId": "request-open" },
-                    "turnId": null, "createdAt": AT,
-                },
-                "createdAt": AT,
-            }),
-        )
-        .await;
-    }
-
-    async fn count(harness: &Harness, sql: &'static str) -> i64 {
-        harness
-            .repositories
-            .database()
-            .call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?))
-            .await
-            .unwrap()
-    }
-
-    /// The outbox row of a message: `(state, held)`.
-    async fn outbox(harness: &Harness, message_id: &str) -> Option<(String, bool)> {
-        use rusqlite::OptionalExtension as _;
-        let message_id = message_id.to_owned();
-        harness
-            .repositories
-            .database()
-            .call(move |connection| {
-                Ok(connection
-                    .query_row(
-                        "SELECT state, held FROM provider_turn_outbox WHERE message_id = ?",
-                        [message_id],
-                        |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
-                    )
-                    .optional()?)
-            })
-            .await
-            .unwrap()
-    }
-
-    /// A stored message: `(thread_id, text, person_send_json, actor_json, source_thread_id)`.
-    type Message = (
-        String,
-        String,
-        Option<Value>,
-        Option<String>,
-        Option<String>,
-    );
-
-    async fn message(harness: &Harness, message_id: &str) -> Option<Message> {
-        use rusqlite::OptionalExtension as _;
-        let message_id = message_id.to_owned();
-        harness
-            .repositories
-            .database()
-            .call(move |connection| {
-                Ok(connection
-                    .query_row(
-                        "SELECT thread_id, text, person_send_json, actor_json, source_thread_id \
-                         FROM projection_thread_messages WHERE message_id = ?",
-                        [message_id],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get::<_, Option<String>>(2)?.map(|json| {
-                                    serde_json::from_str(&json).expect("person send json")
-                                }),
-                                row.get(3)?,
-                                row.get(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?)
-            })
-            .await
-            .unwrap()
-    }
-
-    /// How many requests, outbox rows and person-send messages exist.
-    async fn stored(harness: &Harness) -> (i64, i64, i64) {
-        (
-            count(harness, "SELECT COUNT(*) FROM send_requests").await,
-            count(harness, "SELECT COUNT(*) FROM provider_turn_outbox").await,
-            count(
-                harness,
-                "SELECT COUNT(*) FROM projection_thread_messages WHERE message_id LIKE 'person-send:%'",
-            )
-            .await,
-        )
-    }
-
-    async fn refused(
-        harness: &Harness,
-        context: &RpcSessionContext,
-        input: SendRequestsSendInput,
-    ) -> String {
-        let error = harness
-            .send_requests()
-            .send(context, input)
-            .await
-            .expect_err("the send is refused");
-        assert_eq!(error["_tag"], "SendRequestError", "{error}");
-        error["reason"].as_str().unwrap_or_default().to_owned()
-    }
-
-    async fn send_ok(harness: &Harness, input: SendRequestsSendInput) {
-        let id = input.request_id.clone();
-        harness
-            .send_requests()
-            .send(&person(), input)
-            .await
-            .unwrap_or_else(|error| panic!("{id} is accepted: {error}"));
-    }
-
-    async fn outbox_state(harness: &Harness, message_id: &str) -> Option<String> {
-        outbox(harness, message_id).await.map(|row| row.0)
-    }
-
-    #[tokio::test]
-    async fn send_an_idle_target_starts_a_turn_with_the_note_and_the_attachment() {
-        let harness = harness().await;
-        let mut request = input("r1", "review", "thread:a", "thread:b");
-        request.attachments = vec![SendRequestAttachment {
-            label: "Diff".to_owned(),
-            text: "+ a changed line".to_owned(),
-        }];
-
-        let sent = harness
-            .send_requests()
-            .send(&person(), request)
-            .await
-            .expect("the send is accepted");
-
-        assert_eq!(sent.state, "queued");
-        assert_eq!(sent.target_message_id.as_deref(), Some("person-send:r1"));
-        let (thread_id, text, person_send, _, _) = message(&harness, "person-send:r1")
-            .await
-            .expect("the message is stored");
-        assert_eq!(thread_id, "b");
-        assert_eq!(
-            text,
-            "Please review the work below.\n\nLook at the parser.\n\n=== Diff ===\n+ a changed line"
-        );
-        assert_eq!(
-            text,
-            compose_message_text(
-                "Please review the work below.",
-                "Look at the parser.",
-                &[("Diff".to_owned(), "+ a changed line".to_owned())]
-            )
-        );
-        assert_eq!(
-            person_send,
-            Some(json!({ "requestId": "r1", "action": "review", "sourceAddress": "thread:a" }))
-        );
-        let state = outbox_state(&harness, "person-send:r1")
-            .await
-            .expect("an outbox row");
-        assert_ne!(state, "queued", "an idle target starts the turn");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_a_busy_target_queues_behind_the_running_turn() {
-        let harness = harness().await;
-        session(&harness, "b", "running").await;
-
-        send_ok(&harness, input("r1", "review", "thread:a", "thread:b")).await;
-
-        assert_eq!(
-            outbox_state(&harness, "person-send:r1").await.as_deref(),
-            Some("queued")
-        );
-        harness.shutdown().await;
-    }
-
-    async fn queued_behind_an_ask(kind: &str) {
-        let harness = harness().await;
-        session(&harness, "b", "running").await;
-        ask(&harness, "b", kind).await;
-        session(&harness, "b", "ready").await;
-
-        send_ok(
-            &harness,
-            input("r1", "second-opinion", "thread:a", "thread:b"),
-        )
-        .await;
-
-        assert_eq!(
-            outbox_state(&harness, "person-send:r1").await.as_deref(),
-            Some("queued"),
-            "the session is ready but the {kind} holds the request"
-        );
-        let open = if kind == "approval.requested" {
-            count(
-                &harness,
-                "SELECT COUNT(*) FROM projection_pending_approvals WHERE thread_id = 'b' AND status = 'pending'",
-            )
-            .await
-        } else {
-            count(
-                &harness,
-                "SELECT COUNT(*) FROM projection_thread_activities WHERE thread_id = 'b' AND kind = 'user-input.requested'",
-            )
-            .await
-        };
-        assert_eq!(open, 1, "the {kind} stays open");
-        let answered = count(
-            &harness,
-            "SELECT COUNT(*) FROM projection_thread_activities WHERE thread_id = 'b' AND kind IN ('approval.resolved', 'user-input.resolved')",
-        )
-        .await;
-        assert_eq!(answered, 0, "nothing answers the {kind}");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_to_a_ready_target_with_a_pending_approval_queues_and_is_not_its_answer() {
-        queued_behind_an_ask("approval.requested").await;
-    }
-
-    #[tokio::test]
-    async fn send_to_a_ready_target_with_a_pending_question_queues_and_is_not_its_answer() {
-        queued_behind_an_ask("user-input.requested").await;
-    }
-
-    #[tokio::test]
-    async fn send_to_a_target_whose_last_turn_errored_is_queued_and_not_started() {
-        let harness = harness().await;
-        session(&harness, "b", "running").await;
-        session(&harness, "b", "error").await;
-
-        send_ok(&harness, input("r1", "review", "thread:a", "thread:b")).await;
-
-        assert_eq!(
-            outbox_state(&harness, "person-send:r1").await.as_deref(),
-            Some("queued")
-        );
-        assert_eq!(
-            count(
-                &harness,
-                "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.turn-start-requested' AND stream_id = 'b'",
-            )
-            .await,
-            0,
-            "no turn starts"
-        );
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_to_a_target_with_a_held_queue_is_queued_behind_it() {
-        let harness = harness().await;
-        session(&harness, "b", "running").await;
-        send_ok(&harness, input("first", "review", "thread:a", "thread:b")).await;
-        harness
-            .repositories
-            .database()
-            .call(|connection| {
-                connection.execute("UPDATE provider_turn_outbox SET held = 1", [])?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        session(&harness, "b", "ready").await;
-
-        send_ok(&harness, input("second", "review", "thread:a", "thread:b")).await;
-
-        assert_eq!(
-            outbox(&harness, "person-send:second").await,
-            Some(("queued".to_owned(), false))
-        );
-        assert_eq!(
-            outbox(&harness, "person-send:first").await,
-            Some(("queued".to_owned(), true)),
-            "the held head stays held"
-        );
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_ignores_the_agent_messaging_rules() {
-        // Target `b` is full-access, source `a` approval-required, and messaging is off.
-        let harness = harness().await;
-
-        send_ok(&harness, input("r1", "message", "thread:a", "thread:b")).await;
-
-        let (_, _, _, actor, source_thread_id) =
-            message(&harness, "person-send:r1").await.expect("stored");
-        assert_eq!(actor, None, "a person's message has no actor");
-        assert_eq!(source_thread_id, None);
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_across_worktrees_of_one_project_is_accepted_and_attributed() {
-        let harness = harness().await;
-
-        let sent = harness
-            .send_requests()
-            .send(&person(), input("r1", "hand-off", "thread:b", "thread:a"))
-            .await
-            .expect("accepted");
-
-        assert_eq!(
-            (sent.source.as_str(), sent.target.as_str()),
-            ("thread:b", "thread:a")
-        );
-        assert_eq!(sent.project_id, "p1");
-        let (thread_id, _, person_send, _, _) =
-            message(&harness, "person-send:r1").await.expect("stored");
-        assert_eq!(thread_id, "a");
-        assert_eq!(person_send.unwrap()["sourceAddress"], "thread:b");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_refuses_another_project_for_source_target_and_taken_over() {
-        let harness = harness().await;
-        let mut taken_over = input("r3", "take-over", "thread:a", "thread:a");
-        taken_over.taken_over = Some("thread:c".to_owned());
-        for request in [
-            input("r1", "review", "thread:c", "thread:a"),
-            input("r2", "review", "thread:a", "thread:c"),
-            taken_over,
-        ] {
-            let id = request.request_id.clone();
-            assert_eq!(
-                refused(&harness, &person(), request).await,
-                "other_project",
-                "{id}"
-            );
-        }
-        assert_eq!(stored(&harness).await, (0, 0, 0), "nothing is kept");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_refuses_an_unknown_target_and_keeps_nothing() {
-        let harness = harness().await;
-        dispatch(
-            &harness,
-            json!({
-                "type": "thread.create", "commandId": "create-gone", "threadId": "gone",
-                "projectId": "p1", "title": "gone",
-                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
-                "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
-                "worktreePath": null, "createdAt": AT,
-            }),
-        )
-        .await;
-        dispatch(
-            &harness,
-            json!({ "type": "thread.delete", "commandId": "delete-gone", "threadId": "gone" }),
-        )
-        .await;
-        for target in ["thread:missing", "thread:gone"] {
-            assert_eq!(
-                refused(
-                    &harness,
-                    &person(),
-                    input("r1", "review", "thread:a", target)
+/// The outbox row of a message: `(state, held)`.
+async fn outbox(harness: &Harness, message_id: &str) -> Option<(String, bool)> {
+    use rusqlite::OptionalExtension as _;
+    let message_id = message_id.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT state, held FROM provider_turn_outbox WHERE message_id = ?",
+                    [message_id],
+                    |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
                 )
-                .await,
-                "unknown_thread",
-                "{target}"
-            );
-        }
-        assert_eq!(stored(&harness).await, (0, 0, 0));
-        harness.shutdown().await;
-    }
+                .optional()?)
+        })
+        .await
+        .unwrap()
+}
 
-    #[tokio::test]
-    async fn send_refuses_a_terminal_target_until_it_can_be_notified() {
-        let harness = harness().await;
+/// A stored message: `(thread_id, text, person_send_json, actor_json, source_thread_id)`.
+type Message = (
+    String,
+    String,
+    Option<Value>,
+    Option<String>,
+    Option<String>,
+);
+
+async fn message(harness: &Harness, message_id: &str) -> Option<Message> {
+    use rusqlite::OptionalExtension as _;
+    let message_id = message_id.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT thread_id, text, person_send_json, actor_json, source_thread_id \
+                     FROM projection_thread_messages WHERE message_id = ?",
+                    [message_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get::<_, Option<String>>(2)?
+                                .map(|json| serde_json::from_str(&json).expect("person send json")),
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?)
+        })
+        .await
+        .unwrap()
+}
+
+/// How many requests, outbox rows and person-send messages exist.
+async fn stored(harness: &Harness) -> (i64, i64, i64) {
+    (
+        count(harness, "SELECT COUNT(*) FROM send_requests").await,
+        count(harness, "SELECT COUNT(*) FROM provider_turn_outbox").await,
+        count(
+            harness,
+            "SELECT COUNT(*) FROM projection_thread_messages WHERE message_id LIKE 'person-send:%'",
+        )
+        .await,
+    )
+}
+
+async fn refused(
+    harness: &Harness,
+    context: &RpcSessionContext,
+    input: SendRequestsSendInput,
+) -> String {
+    let error = harness
+        .send_requests()
+        .send(context, input)
+        .await
+        .expect_err("the send is refused");
+    assert_eq!(error["_tag"], "SendRequestError", "{error}");
+    error["reason"].as_str().unwrap_or_default().to_owned()
+}
+
+async fn send_ok(harness: &Harness, input: SendRequestsSendInput) {
+    let id = input.request_id.clone();
+    harness
+        .send_requests()
+        .send(&person(), input)
+        .await
+        .unwrap_or_else(|error| panic!("{id} is accepted: {error}"));
+}
+
+async fn outbox_state(harness: &Harness, message_id: &str) -> Option<String> {
+    outbox(harness, message_id).await.map(|row| row.0)
+}
+
+#[tokio::test]
+async fn send_an_idle_target_starts_a_turn_with_the_note_and_the_attachment() {
+    let harness = harness().await;
+    let mut request = input("r1", "review", "thread:a", "thread:b");
+    request.attachments = vec![SendRequestAttachment {
+        label: "Diff".to_owned(),
+        text: "+ a changed line".to_owned(),
+    }];
+
+    let sent = harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .expect("the send is accepted");
+
+    assert_eq!(sent.state, "queued");
+    assert_eq!(sent.target_message_id.as_deref(), Some("person-send:r1"));
+    let (thread_id, text, person_send, _, _) = message(&harness, "person-send:r1")
+        .await
+        .expect("the message is stored");
+    assert_eq!(thread_id, "b");
+    assert_eq!(
+        text,
+        "Please review the work below.\n\nLook at the parser.\n\n=== Diff ===\n+ a changed line"
+    );
+    assert_eq!(
+        text,
+        compose_message_text(
+            "Please review the work below.",
+            "Look at the parser.",
+            &[("Diff".to_owned(), "+ a changed line".to_owned())]
+        )
+    );
+    assert_eq!(
+        person_send,
+        Some(json!({ "requestId": "r1", "action": "review", "sourceAddress": "thread:a" }))
+    );
+    let state = outbox_state(&harness, "person-send:r1")
+        .await
+        .expect("an outbox row");
+    assert_ne!(state, "queued", "an idle target starts the turn");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_a_busy_target_queues_behind_the_running_turn() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+
+    send_ok(&harness, input("r1", "review", "thread:a", "thread:b")).await;
+
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("queued")
+    );
+    harness.shutdown().await;
+}
+
+async fn queued_behind_an_ask(kind: &str) {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    ask(&harness, "b", kind).await;
+    session(&harness, "b", "ready").await;
+
+    send_ok(
+        &harness,
+        input("r1", "second-opinion", "thread:a", "thread:b"),
+    )
+    .await;
+
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("queued"),
+        "the session is ready but the {kind} holds the request"
+    );
+    let open = if kind == "approval.requested" {
+        count(
+            &harness,
+            "SELECT COUNT(*) FROM projection_pending_approvals WHERE thread_id = 'b' AND status = 'pending'",
+        )
+        .await
+    } else {
+        count(
+            &harness,
+            "SELECT COUNT(*) FROM projection_thread_activities WHERE thread_id = 'b' AND kind = 'user-input.requested'",
+        )
+        .await
+    };
+    assert_eq!(open, 1, "the {kind} stays open");
+    let answered = count(
+        &harness,
+        "SELECT COUNT(*) FROM projection_thread_activities WHERE thread_id = 'b' AND kind IN ('approval.resolved', 'user-input.resolved')",
+    )
+    .await;
+    assert_eq!(answered, 0, "nothing answers the {kind}");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_to_a_ready_target_with_a_pending_approval_queues_and_is_not_its_answer() {
+    queued_behind_an_ask("approval.requested").await;
+}
+
+#[tokio::test]
+async fn send_to_a_ready_target_with_a_pending_question_queues_and_is_not_its_answer() {
+    queued_behind_an_ask("user-input.requested").await;
+}
+
+#[tokio::test]
+async fn send_to_a_target_whose_last_turn_errored_is_queued_and_not_started() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    session(&harness, "b", "error").await;
+
+    send_ok(&harness, input("r1", "review", "thread:a", "thread:b")).await;
+
+    assert_eq!(
+        outbox_state(&harness, "person-send:r1").await.as_deref(),
+        Some("queued")
+    );
+    assert_eq!(
+        count(
+            &harness,
+            "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.turn-start-requested' AND stream_id = 'b'",
+        )
+        .await,
+        0,
+        "no turn starts"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_to_a_target_with_a_held_queue_is_queued_behind_it() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    send_ok(&harness, input("first", "review", "thread:a", "thread:b")).await;
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute("UPDATE provider_turn_outbox SET held = 1", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    session(&harness, "b", "ready").await;
+
+    send_ok(&harness, input("second", "review", "thread:a", "thread:b")).await;
+
+    assert_eq!(
+        outbox(&harness, "person-send:second").await,
+        Some(("queued".to_owned(), false))
+    );
+    assert_eq!(
+        outbox(&harness, "person-send:first").await,
+        Some(("queued".to_owned(), true)),
+        "the held head stays held"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_ignores_the_agent_messaging_rules() {
+    // Target `b` is full-access, source `a` approval-required, and messaging is off.
+    let harness = harness().await;
+
+    send_ok(&harness, input("r1", "message", "thread:a", "thread:b")).await;
+
+    let (_, _, _, actor, source_thread_id) =
+        message(&harness, "person-send:r1").await.expect("stored");
+    assert_eq!(actor, None, "a person's message has no actor");
+    assert_eq!(source_thread_id, None);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_across_worktrees_of_one_project_is_accepted_and_attributed() {
+    let harness = harness().await;
+
+    let sent = harness
+        .send_requests()
+        .send(&person(), input("r1", "hand-off", "thread:b", "thread:a"))
+        .await
+        .expect("accepted");
+
+    assert_eq!(
+        (sent.source.as_str(), sent.target.as_str()),
+        ("thread:b", "thread:a")
+    );
+    assert_eq!(sent.project_id, "p1");
+    let (thread_id, _, person_send, _, _) =
+        message(&harness, "person-send:r1").await.expect("stored");
+    assert_eq!(thread_id, "a");
+    assert_eq!(person_send.unwrap()["sourceAddress"], "thread:b");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_refuses_another_project_for_source_target_and_taken_over() {
+    let harness = harness().await;
+    let mut taken_over = input("r3", "take-over", "thread:a", "thread:a");
+    taken_over.taken_over = Some("thread:c".to_owned());
+    for request in [
+        input("r1", "review", "thread:c", "thread:a"),
+        input("r2", "review", "thread:a", "thread:c"),
+        taken_over,
+    ] {
+        let id = request.request_id.clone();
+        assert_eq!(
+            refused(&harness, &person(), request).await,
+            "other_project",
+            "{id}"
+        );
+    }
+    assert_eq!(stored(&harness).await, (0, 0, 0), "nothing is kept");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_refuses_an_unknown_target_and_keeps_nothing() {
+    let harness = harness().await;
+    dispatch(
+        &harness,
+        json!({
+            "type": "thread.create", "commandId": "create-gone", "threadId": "gone",
+            "projectId": "p1", "title": "gone",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
+            "worktreePath": null, "createdAt": AT,
+        }),
+    )
+    .await;
+    dispatch(
+        &harness,
+        json!({ "type": "thread.delete", "commandId": "delete-gone", "threadId": "gone" }),
+    )
+    .await;
+    for target in ["thread:missing", "thread:gone"] {
         assert_eq!(
             refused(
                 &harness,
                 &person(),
-                input("r1", "review", "thread:a", "terminal:b/term-1")
+                input("r1", "review", "thread:a", target)
             )
             .await,
-            "target_not_notifiable"
+            "unknown_thread",
+            "{target}"
         );
-        assert_eq!(stored(&harness).await, (0, 0, 0));
-        harness.shutdown().await;
     }
+    assert_eq!(stored(&harness).await, (0, 0, 0));
+    harness.shutdown().await;
+}
 
-    #[tokio::test]
-    async fn send_refuses_a_note_and_attachments_over_48000_characters() {
-        let harness = harness().await;
-        // A non-BMP character is one scalar value and two UTF-16 units.
-        let wide = |count: usize| "\u{1F600}".repeat(count);
-        let mut at_limit = input("fits", "review", "thread:a", "thread:b");
-        at_limit.note = wide(40_000);
-        at_limit.attachments = vec![SendRequestAttachment {
-            label: "Log".to_owned(),
-            text: wide(8_000),
-        }];
-        send_ok(&harness, at_limit.clone()).await;
-        let mut over = at_limit;
-        over.request_id = "over".to_owned();
-        over.attachments[0].text = wide(8_001);
-        assert_eq!(refused(&harness, &person(), over).await, "too_long");
-        let mut lead_in = input("lead-in", "review", "thread:a", "thread:b");
-        lead_in.lead_in = "x".repeat(16_001);
-        assert_eq!(refused(&harness, &person(), lead_in).await, "too_long");
+#[tokio::test]
+async fn send_refuses_a_terminal_target_until_it_can_be_notified() {
+    let harness = harness().await;
+    assert_eq!(
+        refused(
+            &harness,
+            &person(),
+            input("r1", "review", "thread:a", "terminal:b/term-1")
+        )
+        .await,
+        "target_not_notifiable"
+    );
+    assert_eq!(stored(&harness).await, (0, 0, 0));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_refuses_a_note_and_attachments_over_48000_characters() {
+    let harness = harness().await;
+    // A non-BMP character is one scalar value and two UTF-16 units.
+    let wide = |count: usize| "\u{1F600}".repeat(count);
+    let mut at_limit = input("fits", "review", "thread:a", "thread:b");
+    at_limit.note = wide(40_000);
+    at_limit.attachments = vec![SendRequestAttachment {
+        label: "Log".to_owned(),
+        text: wide(8_000),
+    }];
+    send_ok(&harness, at_limit.clone()).await;
+    let mut over = at_limit;
+    over.request_id = "over".to_owned();
+    over.attachments[0].text = wide(8_001);
+    assert_eq!(refused(&harness, &person(), over).await, "too_long");
+    let mut lead_in = input("lead-in", "review", "thread:a", "thread:b");
+    lead_in.lead_in = "x".repeat(16_001);
+    assert_eq!(refused(&harness, &person(), lead_in).await, "too_long");
+    assert_eq!(
+        stored(&harness).await.0,
+        1,
+        "only the request that fits is kept"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_take_over_stores_the_taken_over_address_and_labels_the_message_from_it() {
+    let harness = harness().await;
+    let mut request = input("r1", "take-over", "thread:b", "thread:b");
+    request.taken_over = Some("thread:a".to_owned());
+
+    let sent = harness
+        .send_requests()
+        .send(&person(), request)
+        .await
+        .expect("accepted");
+
+    assert_eq!(sent.taken_over.as_deref(), Some("thread:a"));
+    let (thread_id, _, person_send, _, _) =
+        message(&harness, "person-send:r1").await.expect("stored");
+    assert_eq!(thread_id, "b", "queued on the agent that takes over");
+    assert_eq!(person_send.unwrap()["sourceAddress"], "thread:a");
+    assert_eq!(
+        count(
+            &harness,
+            "SELECT COUNT(*) FROM provider_turn_outbox WHERE thread_id = 'a'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &harness,
+            "SELECT COUNT(*) FROM orchestration_events WHERE stream_id = 'a' AND command_id LIKE 'person-send:%'",
+        )
+        .await,
+        0,
+        "thread a gets no event"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_take_over_refuses_a_missing_or_self_taken_over_thread() {
+    let harness = harness().await;
+    let missing = input("r1", "take-over", "thread:b", "thread:b");
+    let mut itself = input("r2", "take-over", "thread:b", "thread:b");
+    itself.taken_over = Some("thread:b".to_owned());
+    let mut elsewhere = input("r3", "take-over", "thread:b", "thread:a");
+    elsewhere.taken_over = Some("thread:a".to_owned());
+    let mut not_a_take_over = input("r4", "review", "thread:b", "thread:a");
+    not_a_take_over.taken_over = Some("thread:a".to_owned());
+    for request in [missing, itself, elsewhere, not_a_take_over] {
+        let id = request.request_id.clone();
         assert_eq!(
-            stored(&harness).await.0,
-            1,
-            "only the request that fits is kept"
+            refused(&harness, &person(), request).await,
+            "invalid",
+            "{id}"
         );
-        harness.shutdown().await;
     }
+    assert_eq!(stored(&harness).await, (0, 0, 0));
+    harness.shutdown().await;
+}
 
-    #[tokio::test]
-    async fn send_take_over_stores_the_taken_over_address_and_labels_the_message_from_it() {
-        let harness = harness().await;
-        let mut request = input("r1", "take-over", "thread:b", "thread:b");
-        request.taken_over = Some("thread:a".to_owned());
+#[tokio::test]
+async fn send_refuses_an_outside_agent_session() {
+    let harness = harness().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    assert!(
+        agent
+            .principal
+            .scopes
+            .iter()
+            .any(|scope| scope == "orchestration:operate"),
+        "an outside agent holds the method's scope: {:?}",
+        agent.principal.scopes
+    );
+    let context = RpcSessionContext::authenticated(agent.principal.clone(), harness.auth.clone());
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, harness.send_requests());
 
-        let sent = harness
-            .send_requests()
-            .send(&person(), request)
-            .await
-            .expect("accepted");
-
-        assert_eq!(sent.taken_over.as_deref(), Some("thread:a"));
-        let (thread_id, _, person_send, _, _) =
-            message(&harness, "person-send:r1").await.expect("stored");
-        assert_eq!(thread_id, "b", "queued on the agent that takes over");
-        assert_eq!(person_send.unwrap()["sourceAddress"], "thread:a");
-        assert_eq!(
-            count(
-                &harness,
-                "SELECT COUNT(*) FROM provider_turn_outbox WHERE thread_id = 'a'"
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count(
-                &harness,
-                "SELECT COUNT(*) FROM orchestration_events WHERE stream_id = 'a' AND command_id LIKE 'person-send:%'",
-            )
-            .await,
-            0,
-            "thread a gets no event"
-        );
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_take_over_refuses_a_missing_or_self_taken_over_thread() {
-        let harness = harness().await;
-        let missing = input("r1", "take-over", "thread:b", "thread:b");
-        let mut itself = input("r2", "take-over", "thread:b", "thread:b");
-        itself.taken_over = Some("thread:b".to_owned());
-        let mut elsewhere = input("r3", "take-over", "thread:b", "thread:a");
-        elsewhere.taken_over = Some("thread:a".to_owned());
-        let mut not_a_take_over = input("r4", "review", "thread:b", "thread:a");
-        not_a_take_over.taken_over = Some("thread:a".to_owned());
-        for request in [missing, itself, elsewhere, not_a_take_over] {
-            let id = request.request_id.clone();
-            assert_eq!(
-                refused(&harness, &person(), request).await,
-                "invalid",
-                "{id}"
-            );
-        }
-        assert_eq!(stored(&harness).await, (0, 0, 0));
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_refuses_an_outside_agent_session() {
-        let harness = harness().await;
-        let (agent, _) = harness.agent(McpAccess::FullAccess).await;
-        assert!(
-            agent
-                .principal
-                .scopes
-                .iter()
-                .any(|scope| scope == "orchestration:operate"),
-            "an outside agent holds the method's scope: {:?}",
-            agent.principal.scopes
-        );
-        let context =
-            RpcSessionContext::authenticated(agent.principal.clone(), harness.auth.clone());
-        let mut registry = RpcRegistry::empty();
-        register_send_requests_rpc(&mut registry, harness.send_requests());
-
-        let error = registry
-            .invoke_local(
-                "sendRequests.send",
-                serde_json::to_value(input("r1", "review", "thread:a", "thread:b")).unwrap(),
-                context.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("an outside agent is refused");
-
-        assert_eq!(error["_tag"], "SendRequestError");
-        assert_eq!(error["reason"], "person_only");
-        assert_eq!(
-            require_person(&context).unwrap_err()["reason"],
-            "person_only"
-        );
-        assert_eq!(stored(&harness).await, (0, 0, 0), "nothing is stored");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_accepts_a_paired_person_session_and_an_unauthenticated_server() {
-        let harness = harness().await;
-        let mut registry = RpcRegistry::empty();
-        register_send_requests_rpc(&mut registry, harness.send_requests());
-        let paired = |subject: &str| {
-            RpcSessionContext::authenticated(
-                Principal {
-                    session_id: format!("session-{subject}"),
-                    subject: subject.to_owned(),
-                    method: "test".to_owned(),
-                    scopes: vec!["*".to_owned()],
-                    proof_key_thumbprint: None,
-                    expires_at_ms: i64::MAX,
-                },
-                harness.auth.clone(),
-            )
-        };
-        // A paired session's principal is not a live auth session here, so the registry would
-        // refuse it before the handler; the operation itself sees the principal.
-        for (request_id, context) in [
-            ("desktop", paired("desktop-bootstrap")),
-            ("paired", paired("one-time-token")),
-        ] {
-            let sent = harness
-                .send_requests()
-                .send(
-                    &context,
-                    input(request_id, "review", "thread:a", "thread:b"),
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{request_id}: {error}"));
-            assert_eq!(
-                (sent.request_id.as_str(), sent.state),
-                (request_id, "queued")
-            );
-        }
-        let sent = registry
-            .invoke_local(
-                "sendRequests.send",
-                serde_json::to_value(input("open", "review", "thread:a", "thread:b")).unwrap(),
-                RpcSessionContext::unauthenticated(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap_or_else(|error| panic!("open: {error}"));
-        assert_eq!(sent["requestId"], "open");
-        assert_eq!(sent["state"], "queued");
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_over_public_dispatch_is_refused() {
-        let harness = harness().await;
-        let error = harness
-            .control
-            .registry()
-            .invoke_local(
-                "orchestration.dispatchCommand",
-                json!({
-                    "type": "thread.turn.start", "commandId": "person-send:forged", "threadId": "b",
-                    "message": {
-                        "messageId": "person-send:forged", "role": "user", "text": "forged",
-                        "attachments": [],
-                        "personSend": { "requestId": "forged", "action": "review", "sourceAddress": "thread:a" },
-                    },
-                    "runtimeMode": "full-access", "interactionMode": "default", "createdAt": AT,
-                }),
-                person(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("public dispatch refuses personSend");
-        assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|message| message
-                    .contains("person-send requires a dedicated server-resolved RPC")),
-            "{error}"
-        );
-        assert_eq!(stored(&harness).await, (0, 0, 0));
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn send_dispatcher_refuses_person_send_for_a_hosted_agent_actor() {
-        let harness = harness().await;
-        let command = serde_json::from_value(json!({
-            "type": "thread.turn.start", "commandId": "person-send:hosted", "threadId": "b",
-            "message": {
-                "messageId": "person-send:hosted", "role": "user", "text": "from an agent",
-                "attachments": [],
-                "personSend": { "requestId": "hosted", "action": "review", "sourceAddress": "thread:a" },
-            },
-            "runtimeMode": "full-access", "interactionMode": "default", "queued": true, "createdAt": AT,
-        }))
-        .unwrap();
-
-        let error = (harness.server_dispatcher())(
-            command,
-            UploadOwner::from_context(&person()),
-            ServerActor::HostedAgent {
-                address: "thread:a".to_owned(),
-                label: "Agent a".to_owned(),
-            },
+    let error = registry
+        .invoke_local(
+            "sendRequests.send",
+            serde_json::to_value(input("r1", "review", "thread:a", "thread:b")).unwrap(),
+            context.clone(),
+            CancellationToken::new(),
         )
         .await
-        .expect_err("a hosted agent cannot carry personSend");
+        .expect_err("an outside agent is refused");
 
-        assert_eq!(error["_tag"], "InvalidRequest", "{error}");
-        assert_eq!(stored(&harness).await, (0, 0, 0));
-        harness.shutdown().await;
+    assert_eq!(error["_tag"], "SendRequestError");
+    assert_eq!(error["reason"], "person_only");
+    assert_eq!(
+        require_person(&context).unwrap_err()["reason"],
+        "person_only"
+    );
+    assert_eq!(stored(&harness).await, (0, 0, 0), "nothing is stored");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_accepts_a_paired_person_session_and_an_unauthenticated_server() {
+    let harness = harness().await;
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, harness.send_requests());
+    let paired = |subject: &str| {
+        RpcSessionContext::authenticated(
+            Principal {
+                session_id: format!("session-{subject}"),
+                subject: subject.to_owned(),
+                method: "test".to_owned(),
+                scopes: vec!["*".to_owned()],
+                proof_key_thumbprint: None,
+                expires_at_ms: i64::MAX,
+            },
+            harness.auth.clone(),
+        )
+    };
+    // A paired session's principal is not a live auth session here, so the registry would
+    // refuse it before the handler; the operation itself sees the principal.
+    for (request_id, context) in [
+        ("desktop", paired("desktop-bootstrap")),
+        ("paired", paired("one-time-token")),
+    ] {
+        let sent = harness
+            .send_requests()
+            .send(
+                &context,
+                input(request_id, "review", "thread:a", "thread:b"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{request_id}: {error}"));
+        assert_eq!(
+            (sent.request_id.as_str(), sent.state),
+            (request_id, "queued")
+        );
     }
+    let sent = registry
+        .invoke_local(
+            "sendRequests.send",
+            serde_json::to_value(input("open", "review", "thread:a", "thread:b")).unwrap(),
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("open: {error}"));
+    assert_eq!(sent["requestId"], "open");
+    assert_eq!(sent["state"], "queued");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_over_public_dispatch_is_refused() {
+    let harness = harness().await;
+    let error = harness
+        .control
+        .registry()
+        .invoke_local(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.turn.start", "commandId": "person-send:forged", "threadId": "b",
+                "message": {
+                    "messageId": "person-send:forged", "role": "user", "text": "forged",
+                    "attachments": [],
+                    "personSend": { "requestId": "forged", "action": "review", "sourceAddress": "thread:a" },
+                },
+                "runtimeMode": "full-access", "interactionMode": "default", "createdAt": AT,
+            }),
+            person(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("public dispatch refuses personSend");
+    assert!(
+        error["message"].as_str().is_some_and(
+            |message| message.contains("person-send requires a dedicated server-resolved RPC")
+        ),
+        "{error}"
+    );
+    assert_eq!(stored(&harness).await, (0, 0, 0));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_dispatcher_refuses_person_send_for_a_hosted_agent_actor() {
+    let harness = harness().await;
+    let command = serde_json::from_value(json!({
+        "type": "thread.turn.start", "commandId": "person-send:hosted", "threadId": "b",
+        "message": {
+            "messageId": "person-send:hosted", "role": "user", "text": "from an agent",
+            "attachments": [],
+            "personSend": { "requestId": "hosted", "action": "review", "sourceAddress": "thread:a" },
+        },
+        "runtimeMode": "full-access", "interactionMode": "default", "queued": true, "createdAt": AT,
+    }))
+    .unwrap();
+
+    let error = (harness.server_dispatcher())(
+        command,
+        UploadOwner::from_context(&person()),
+        ServerActor::HostedAgent {
+            address: "thread:a".to_owned(),
+            label: "Agent a".to_owned(),
+        },
+    )
+    .await
+    .expect_err("a hosted agent cannot carry personSend");
+
+    assert_eq!(error["_tag"], "InvalidRequest", "{error}");
+    assert_eq!(stored(&harness).await, (0, 0, 0));
+    harness.shutdown().await;
 }
