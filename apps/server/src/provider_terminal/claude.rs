@@ -1485,9 +1485,37 @@ struct ClaudeHookState {
     request_permits: Arc<Semaphore>,
     /// Where the main agent's state goes, whatever the activity setting says (#187).
     status: TerminalObserverGenerationLease,
+    status_order: Arc<Mutex<ClaudeStatusOrder>>,
+}
+
+/// The order the main agent's state follows. Hooks are numbered as they arrive, before their
+/// bodies are read, because concurrent bodies complete in any order.
+#[derive(Debug, Default)]
+struct ClaudeStatusOrder {
     /// The main session the state follows: the first one heard, then each new `SessionStart`
     /// (`/clear` and resume begin a new session).
-    status_session: Arc<Mutex<Option<String>>>,
+    session: Option<String>,
+    /// The number of the newest authenticated hook.
+    accepted: u64,
+    /// The number of the newest hook whose state was published.
+    applied: u64,
+}
+
+impl ClaudeHookState {
+    fn status_order(&self) -> std::sync::MutexGuard<'_, ClaudeStatusOrder> {
+        self.status_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Numbers an authenticated hook before its body is read and withdraws readiness: until
+    /// the observer reads it, the hook may carry a prompt or an ask.
+    fn accept_hook(&self) -> u64 {
+        let mut order = self.status_order();
+        order.accepted += 1;
+        self.status.clear_ready_for_prompt();
+        order.accepted
+    }
 }
 
 async fn run_claude_observer(
@@ -1518,7 +1546,7 @@ async fn run_claude_observer(
         requests: request_sender,
         request_permits: Arc::new(Semaphore::new(CLAUDE_HOOK_REQUEST_CAPACITY)),
         status: generation.clone(),
-        status_session: Arc::new(Mutex::new(None)),
+        status_order: Arc::default(),
     };
     let router = Router::new()
         .route("/claude-hook", post(capture_claude_hook))
@@ -1861,12 +1889,18 @@ async fn capture_claude_hook(
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
+    let authenticated = authorized(&headers, &state.token, &state.correlation);
     let Ok(_permit) = state.request_permits.clone().try_acquire_owned() else {
+        // A refused hook is lost, so whatever it said goes unseen.
+        if authenticated {
+            state.accept_hook();
+        }
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    if !authorized(&headers, &state.token, &state.correlation) {
+    if !authenticated {
         return StatusCode::FORBIDDEN;
     }
+    let arrival = state.accept_hook();
     // Activity admission is taken before the body arrives, so a body that spans a disable and
     // re-enable never creates activity under the new admission.
     let admission = state.activity.admit();
@@ -1904,7 +1938,7 @@ async fn capture_claude_hook(
     let Ok(hook) = serde_json::from_slice::<ClaudeStatusHook>(&bytes) else {
         return rejected();
     };
-    publish_claude_hook_status(&state, &hook);
+    publish_claude_hook_status(&state, &hook, arrival);
     if hook
         .hook_event_name
         .as_deref()
@@ -2032,30 +2066,31 @@ enum ClaudeAgentReport {
     ToolFinished,
 }
 
-/// Publishes the main agent's state a hook reports, for the main session only.
-fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) {
+/// Publishes the main agent's state a hook reports, for the main session only, in the order
+/// the hooks arrived: a hook older than one already published changes nothing, and only the
+/// newest hook can make the terminal ready.
+fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook, arrival: u64) {
     let Some(report) = claude_hook_agent_status(hook) else {
         return;
     };
     let Some(session_id) = safe_text(hook.session_id.as_deref()) else {
         return;
     };
-    {
-        let mut bound = state
-            .status_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match bound.as_deref() {
-            Some(root) if root == session_id => {}
-            Some(_) if hook.hook_event_name.as_deref() != Some("SessionStart") => return,
-            _ => *bound = Some(session_id.to_owned()),
-        }
+    let mut order = state.status_order();
+    if arrival < order.applied {
+        return;
     }
+    match order.session.as_deref() {
+        Some(root) if root == session_id => {}
+        Some(_) if hook.hook_event_name.as_deref() != Some("SessionStart") => return,
+        _ => order.session = Some(session_id.to_owned()),
+    }
+    order.applied = arrival;
     match report {
-        // Claude's hooks are its only stream and carry no snapshot, so each one is fresh.
+        // Claude's hooks are its only stream and carry no snapshot, so the newest is fresh.
         ClaudeAgentReport::Set(agent_state, failed) => state.status.report_agent_evidence(
             TerminalAgentReport::Set(agent_state, failed),
-            claude_hook_ready_for_prompt(hook),
+            claude_hook_ready_for_prompt(hook) && arrival == order.accepted,
             PromptEvidence::Fresh,
         ),
         ClaudeAgentReport::ToolFinished => {
@@ -4529,7 +4564,7 @@ mod tests {
             requests,
             request_permits: Arc::new(Semaphore::new(4)),
             status: generation.observation(),
-            status_session: Arc::new(Mutex::new(None)),
+            status_order: Arc::default(),
         };
 
         for (event, notification, expected) in [
@@ -4592,7 +4627,7 @@ mod tests {
             requests,
             request_permits: Arc::new(Semaphore::new(4)),
             status: generation.observation(),
-            status_session: Arc::new(Mutex::new(None)),
+            status_order: Arc::default(),
         };
         let send = |token: &str, body: Value| {
             let mut headers = HeaderMap::new();
@@ -4723,7 +4758,7 @@ mod tests {
             requests,
             request_permits: Arc::new(Semaphore::new(4)),
             status: generation.observation(),
-            status_session: Arc::new(Mutex::new(None)),
+            status_order: Arc::default(),
         }
     }
 
@@ -4781,9 +4816,7 @@ mod tests {
                 async move {
                     send_status_hook(
                         &state,
-                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
-                            idle_chunks,
-                        )),
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(idle_chunks)),
                     )
                     .await
                 }
