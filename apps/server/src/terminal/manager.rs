@@ -4612,6 +4612,10 @@ impl TerminalManager {
             .get(&(thread_id.to_owned(), terminal_id.to_owned()))
             .cloned()?;
         let session = session.lock().await;
+        // Shutdown may have begun while this waited for the session.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
         (session.status == TerminalStatus::Running
             && !session.generation.is_closing()
             && !session.generation.is_invalidated())
@@ -4629,6 +4633,11 @@ impl TerminalManager {
 
     async fn shutdown_with_report(&self) -> ProcessCleanupReport {
         self.inner.cancellation.cancel();
+        // Attachment cleanup can wait on session locks a credential check also waits on: every
+        // generation stops verifying before that wait.
+        for generation in self.inner.generations.snapshot_live() {
+            generation.begin_closing();
+        }
         {
             let _registrations = self
                 .inner
