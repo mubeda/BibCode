@@ -9,19 +9,19 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 
 | Task | Title | Phase | State | Owner | Note |
 |---|---|---|---|---|---|
-| 1.1 | Send request record and store | 1 | Open | | |
-| 1.2 | Person-only send operation | 1 | Open | | |
-| 1.3 | Request states from turn events | 1 | Open | | |
-| 1.4 | Contracts for send requests | 1 | Open | | |
-| 1.5 | Retry and replay of a person's send | 1 | Open | | |
-| 1.6 | Cancel, dismiss, subscribe and answer retrieval | 1 | Open | | |
-| 2.1 | Control, menu and agent list | 2 | Open | | |
-| 2.2 | Preview and Message send | 2 | Open | | |
-| 2.3 | Person-send label in the transcript | 2 | Open | | |
-| 2.4 | Request state row | 2 | Open | | |
-| 3.1 | Review action | 3 | Open | | |
-| 3.2 | Second opinion attachments | 3 | Open | | |
-| 3.3 | Answer notice and Bring back | 3 | Open | | |
+| 1.1 | Send request record and store | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 1.2 | Person-only send operation | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 1.3 | Request states from turn events | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 1.4 | Contracts for send requests | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 1.5 | Retry and replay of a person's send | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 1.6 | Cancel, dismiss, subscribe and answer retrieval | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
+| 2.1 | Control, menu and agent list | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
+| 2.2 | Preview and Message send | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
+| 2.3 | Person-send label in the transcript | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
+| 2.4 | Request state row | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
+| 3.1 | Review action | 3 | In progress | lane 3 | |
+| 3.2 | Second opinion attachments | 3 | In progress | lane 3 | |
+| 3.3 | Answer notice and Bring back | 3 | In progress | lane 3 | |
 | 4.1 | One handoff builder and on-demand handoff text | 4 | Open | | |
 | 4.2 | Hand off and Take over from actions | 4 | Open | | |
 | 4.3 | Out-of-tokens hint | 4 | Open | | |
@@ -60,3 +60,18 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 ## Log
 - 2026-11-13 Plan written and reviewed twice by Codex; see reviews/.
 - 2026-11-13 Plan written. `rust-best-practices` installed at user level for Claude Code; it loads in a new session.
+- 2026-11-13 21:55 Executor set to mstack-codex-review-workflow on branch claude/bibcode-inter-agent-communication-1bc0ff. Reviewer: Codex gpt-6-astra, high.
+- 2026-11-13 21:55 1.1, 1.4, 1.2 In progress. Owner: lane 1A (opus, medium), pilot lane.
+- 2026-11-13 23:10 Lane 1A reported 1.1, 1.4, 1.2 done on branch worktree-agent-a655398898037c18b (df6ef1248..92ec44d29); lib suite 5508 passed (lane report). Codex review (gpt-6-astra, high): 2 findings, both verified and accepted: person-send blockers not rechecked at admission; malformed input echoed into the refusal. Fix round goes to lane 1B.
+- 2026-11-13 23:10 Ruling: fix rounds run as fresh isolated agents based on the lane branch, because a messaged lane loses its worktree. Cost if wrong: one extra agent start per fix round.
+- 2026-11-13 23:10 1.3, 1.5, 1.6 In progress. Owner: lane 1B (opus, medium), based on lane 1A's branch.
+- 2026-11-14 01:50 Lane 1B reported the two fixes and 1.3, 1.5, 1.6 on branch worktree-agent-a8fa0454192ccb706 (20056c4b0..efff18d8f); lib suite 5555 passed (lane report); three open questions. Codex review running.
+- 2026-11-14 01:50 2.1 to 2.4 In progress. Owner: lane 2 (sonnet, medium), based on lane 1B's branch, started before phase 1's review closed because it touches no server file.
+- 2026-11-14 01:58 Codex review of lane 1B (gpt-6-astra, high): 2 findings accepted (a request can finalize before its answer is complete; a new queued request is not published to subscribers), 1 coverage point accepted (restart test), 1 rejected (force both outcomes of the claim race: the loser side has a deterministic test). No cancel-and-deliver race and no agent bypass found. Fix round: lane 1C (opus, medium).
+- 2026-11-14 01:58 Ruling: a cancel after the delivery is sending returns cancelled false although the row still shows queued until the turn starts, because a sent delivery cannot be withdrawn. Cost if wrong: a short window where Cancel reports too late.
+- 2026-11-14 01:58 Ruling: engine Cancel also withdraws a pending delivery whose message carries personSend (needed by the cancel invariant of 1.6). Task 11.1 owes the one-line update in rpc-and-orchestration.md. Cost if wrong: a person could withdraw a pending person request through the public resolve command, which they may already do through sendRequests.cancel.
+- 2026-11-14 02:25 Lane 2 reported 2.1 to 2.4 on branch worktree-agent-a2786c94f187a55d1 (6578809b6..0cf299213); checkpoint 240 tests passed (lane report). Codex review (gpt-6-astra, high): 4 findings; 3 accepted (a stale send completion clears a newer draft; string comparison of variable-precision timestamps; the closed control stays subscribed to messages and the agent list), 1 rejected (hide the control on an unsupported server: task 2.1 and UI.md ask for a disabled control that says why). Fix round: lane 2R (sonnet, medium).
+- 2026-11-14 02:38 2.1, 2.2, 2.3, 2.4 Closed. Evidence: lane 2R fixed the 3 accepted findings with a failing test first for each; from apps/web the phase checkpoint plus ChatView.test.tsx gave 10 files, 420 tests passed; client-runtime sendRequests 12 passed; vp check --no-fmt, vp check on changed files and vp run typecheck exit 0 (lane report; fix diff read by the coordinator). Commits: 6578809b6..d1104d4a1 on branch worktree-agent-a2389b1ddd118699a, not integrated yet.
+- 2026-11-14 02:38 3.1, 3.2, 3.3 In progress. Owner: lane 3 (sonnet, medium), based on lane 2R's branch.
+- 2026-11-14 02:50 1.1, 1.2, 1.3, 1.4, 1.5, 1.6 Closed. Evidence: lane 1C fixed the 3 accepted points with failing tests first; cargo test -p bibcode-server --lib -j 2 gave 5558 passed, 0 failed; -- send_requests 80 passed five times; --test orchestration 24 passed; cargo fmt --all --check and clippy -D warnings exit 0 (lane report). Commits: df6ef1248..72f55e3ef, fast-forwarded into the Branch line's branch.
+- 2026-11-14 02:50 Follow-up (outside phase 1's files): a Cursor chunk that arrives after turn.completed gets no turn id (provider/cursor/runtime.rs clears active_turn_id first), so it never joins the answer; and mcp/wait.rs treats a completed turn as settled while its message still streams. Both to be fixed in this run in a later lane.
