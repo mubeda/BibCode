@@ -1435,7 +1435,6 @@ async fn run_opencode_observer(
             }
             OpenCodeObserverEvent::ActivityChanged(true) => {
                 let mut state = *activity.borrow();
-                let mut replacing = false;
                 loop {
                     if !state.enabled {
                         live_state = None;
@@ -1450,10 +1449,6 @@ async fn run_opencode_observer(
 
                     live_state = None;
                     mode = OpenCodeObserverMode::Dormant;
-                    // The old stream's events are discarded while the replacement connects, so
-                    // readiness waits for the state read once a stream is subscribed again.
-                    generation.clear_ready_for_prompt();
-                    replacing = true;
                     let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
                     let outcome = {
                         let dormant_stream =
@@ -1464,6 +1459,7 @@ async fn run_opencode_observer(
                             &mut activity,
                             state,
                             &generation,
+                            &root_session_id,
                             deadline,
                         )
                         .await
@@ -1534,9 +1530,6 @@ async fn run_opencode_observer(
                             return;
                         }
                     }
-                }
-                if replacing && stream.is_some() {
-                    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
                 }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
@@ -1909,6 +1902,7 @@ async fn prepare_opencode_replacement(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     expected_state: TerminalAgentActivityState,
     generation: &TerminalObserverGenerationLease,
+    root_session_id: &str,
     deadline: tokio::time::Instant,
 ) -> OpenCodeReplacementOutcome {
     let mut dormant_stream_healthy = true;
@@ -1945,9 +1939,15 @@ async fn prepare_opencode_replacement(
                     }
                 }
             }
-            discarded = dormant_stream.discard_next(), if dormant_stream_healthy => {
-                if discarded.is_err() {
-                    dormant_stream_healthy = false;
+            // The old stream keeps reporting the root's state until the replacement, already
+            // subscribed, takes over, so no turn goes unseen in between.
+            data = dormant_stream.next_dormant_data(), if dormant_stream_healthy => {
+                match data {
+                    Ok(Some(data)) => {
+                        publish_opencode_agent_status(generation, root_session_id, &data);
+                    }
+                    Ok(None) => {}
+                    Err(_) => dormant_stream_healthy = false,
                 }
             }
         }
@@ -1978,9 +1978,13 @@ async fn prepare_opencode_replacement(
                     };
                 }
                 is_connected = &mut connected => break is_connected,
-                discarded = dormant_stream.discard_next(), if dormant_stream_healthy => {
-                    if discarded.is_err() {
-                        dormant_stream_healthy = false;
+                data = dormant_stream.next_dormant_data(), if dormant_stream_healthy => {
+                    match data {
+                        Ok(Some(data)) => {
+                            publish_opencode_agent_status(generation, root_session_id, &data);
+                        }
+                        Ok(None) => {}
+                        Err(_) => dormant_stream_healthy = false,
                     }
                 }
             }
