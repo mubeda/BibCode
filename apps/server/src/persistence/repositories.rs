@@ -121,6 +121,21 @@ impl Repositories {
         let _ = self.agent_claims.gate.set(gate);
     }
 
+    /// Whether the claim gate would make entry `command_id` wait (an open ask on its recipient,
+    /// or a row it cannot read), so the delivery worker skips it instead of claiming it again.
+    /// Reads only; a hold is still decided and written by the claim.
+    pub(crate) async fn agent_claim_waits(&self, command_id: String) -> Result<bool> {
+        let Some(gate) = self.agent_claims.gate.get().cloned() else {
+            return Ok(false);
+        };
+        self.database
+            .call(move |connection| {
+                Ok(gate(connection, &command_id)
+                    == crate::agent_messaging::policy::ClaimDecision::Wait)
+            })
+            .await
+    }
+
     /// Wakes once after each hold the claim gate decided, so the entry can be withdrawn.
     pub(crate) async fn agent_claim_held(&self) {
         self.agent_claims.holds.notified().await;
@@ -1413,8 +1428,11 @@ impl Repositories {
                     }
                 }
             }
+            // An agent message's turn runs in its recipient's mode of now, which the gate has just
+            // checked against its sender's, never in the mode it was admitted or requeued in (R6).
+            // A person's message keeps the mode it was sent with.
             connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ?, payload_json = CASE WHEN EXISTS(SELECT 1 FROM agent_messages WHERE delivery_command_id = provider_turn_outbox.command_id AND sender_kind = 'agent') THEN COALESCE((SELECT json_set(provider_turn_outbox.payload_json, '$.runtimeMode', thread.runtime_mode) FROM projection_threads AS thread WHERE thread.thread_id = provider_turn_outbox.thread_id), payload_json) ELSE payload_json END WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map(|claimed| (claimed, false)).map_err(Into::into)
         }).await;
         let result = result.map(|(claimed, held)| {

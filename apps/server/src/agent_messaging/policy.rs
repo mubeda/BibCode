@@ -135,7 +135,8 @@ fn decide(
         ));
     }
     // Whatever made the entry pending (Send now, a retry, a recovery copy), it never runs past
-    // an open ask (R9); answering it wakes delivery, and the next claim asks again.
+    // an open ask (R9). The delivery worker skips a waiting entry and checks it again on its
+    // next pass, at the latest after a short delay.
     if let Some(thread_id) = recipient_address.strip_prefix("thread:")
         && super::store::has_open_ask(connection, thread_id)?
     {
