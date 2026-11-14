@@ -1369,6 +1369,10 @@ struct SessionGeneration {
     /// Runs on the writer's thread before a guarded write's guard.
     #[cfg(test)]
     write_guard_pause: std::sync::Mutex<Option<Arc<GuardPause>>>,
+    /// Held for writing by a test, it stops the status mirror before it reads the next report,
+    /// so the reports published meanwhile coalesce.
+    #[cfg(test)]
+    mirror_pause: tokio::sync::RwLock<()>,
 }
 
 #[cfg(test)]
@@ -1419,6 +1423,8 @@ impl SessionGeneration {
             output_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             write_guard_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            mirror_pause: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -3429,6 +3435,8 @@ impl TerminalManager {
                     () = generation.cancellation.cancelled() => return,
                     changed = reports.changed() => if changed.is_err() { return; },
                 }
+                #[cfg(test)]
+                drop(generation.mirror_pause.read().await);
                 let Some(observation) = *reports.borrow_and_update() else {
                     continue;
                 };
@@ -12108,6 +12116,135 @@ mod tests {
             );
             manager.shutdown().await;
         }
+    }
+
+    /// A draft typed during a turn stays a draft when the mirror sees only a later progress report
+    /// of that turn: the coalesced report never moves the turn's start past the draft.
+    #[tokio::test]
+    async fn write_when_ready_keeps_a_draft_typed_before_coalesced_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        let current = manager.inner.sessions.read().await
+            [&("thread-a".to_owned(), "term-1".to_owned())]
+            .lock()
+            .await
+            .generation
+            .clone();
+        let paused = current.mirror_pause.write().await;
+        lease.publish_agent_status(TerminalAgentState::Working, false);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        manager
+            .write_from("thread-a", "term-1", "draft", TerminalInputOrigin::User("w"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        lease.publish_agent_progress();
+        drop(paused);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Working
+            })
+        })
+        .await;
+        mark_ready(&lease);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady,
+            "the pointer was typed into a draft"
+        );
+        assert_eq!(backend.latest().writes(), ["draft"]);
+        manager.shutdown().await;
+    }
+
+    /// The caller's guard is read with the session lock held: mail that stops being wanted while
+    /// the writer waits for that lock gets no pointer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_reads_the_callers_guard_under_the_session_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        let process = backend.latest();
+        let gate = Arc::new(WriteGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let session = manager.inner.sessions.read().await
+            [&("thread-a".to_owned(), "term-1".to_owned())]
+            .clone();
+        {
+            let pause = gate.clone();
+            *session
+                .lock()
+                .await
+                .generation
+                .write_guard_pause
+                .lock()
+                .unwrap() = Some(Arc::new(GuardPause(Box::new(move || pause.pass()))));
+        }
+        let unwanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pointer = tokio::spawn({
+            let manager = manager.clone();
+            let unwanted = unwanted.clone();
+            async move {
+                manager
+                    .write_when_ready(
+                        "thread-a",
+                        "term-1",
+                        &generation,
+                        "pointer",
+                        Box::new(move || !unwanted.load(std::sync::atomic::Ordering::Acquire)),
+                    )
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || gate.wait_entered()
+        })
+        .await
+        .unwrap();
+        let held = session.lock().await;
+        gate.open();
+        // The writer reaches the session lock and waits on it while the mail stops being wanted.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        unwanted.store(true, std::sync::atomic::Ordering::Release);
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+            .await
+            .expect("the pointer write answers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, WriteWhenReady::NotReady);
+        assert!(
+            !process.writes().iter().any(|write| write == "pointer"),
+            "the pointer was typed for mail nobody wants"
+        );
+        manager.shutdown().await;
     }
 
     const TEST_AGENT_ENDPOINT: &str = "http://127.0.0.1:3773/api/agent/call";

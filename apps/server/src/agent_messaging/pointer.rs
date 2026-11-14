@@ -2289,6 +2289,63 @@ mod tests {
         fixture.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ending_a_terminal_whose_write_is_stuck_delays_no_other_terminal() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let gate = Arc::new(WriteGate::default());
+        *fixture.terminals.gate.lock().unwrap() = Some(("term-1".to_owned(), gate.clone()));
+        fixture.start();
+        fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.terminals.set_ready("t", "term-1");
+        tokio::time::timeout(Duration::from_secs(5), gate.written.notified())
+            .await
+            .expect("term-1's write is stuck");
+        // Its end waits for the stuck write's exclusion.
+        fixture.terminals.set_generation("t", "term-1", None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let other = fixture.send("c", "terminal:t/term-2").await.unwrap();
+        fixture.terminals.set_ready("t", "term-2");
+        // Well inside the stuck write's own limit.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.row(&other.message_id).await.status != AgentMessageStatus::Delivered {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("term-2 got its pointer while term-1's end waited");
+        gate.release.notify_one();
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_setting_holds_no_mail_while_a_pointer_write_holds_its_terminal() {
+        let fixture = fixture().await;
+        fixture.start();
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.until_attempts("term-1", 1).await;
+        let park = Arc::new(WriteGate::default());
+        *fixture.terminals.guard_park.lock().unwrap() = Some(park.clone());
+        fixture.terminals.set_ready("t", "term-1");
+        tokio::time::timeout(Duration::from_secs(5), park.written.notified())
+            .await
+            .expect("the pointer write reached the terminal");
+        fixture.enabled.send(false).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Queued,
+            "the mail changed under a pointer write that read it as eligible"
+        );
+        fixture.enabled.send(true).unwrap();
+        park.release.notify_one();
+        fixture
+            .until_status(&receipt.message_id, AgentMessageStatus::Delivered)
+            .await;
+        assert_eq!(fixture.terminals.writes("t", "term-1").len(), 1);
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn an_ended_generation_cannot_fetch_its_mail() {
         let fixture = fixture().await;
