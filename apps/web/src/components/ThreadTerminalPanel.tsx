@@ -906,6 +906,8 @@ interface TerminalViewportProps {
   workspaceUnavailable?: string | null;
   /** Reports how to read this terminal's current selection, and null when it goes away. */
   onSelectionReaderChange?: (terminalId: string, read: (() => string) | null) => void;
+  /** Reports the element that holds this terminal's focus, and null when it goes away. */
+  onFocusTargetChange?: (terminalId: string, target: (() => HTMLElement | null) | null) => void;
 }
 
 interface TerminalLaunchLocation {
@@ -945,6 +947,7 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
   onSelectionReaderChange,
+  onFocusTargetChange,
 }: TerminalViewportProps) {
   const { resolvedTheme: appTheme, resolvedThemeId } = useTheme();
   const terminalThemePreference = usePrimarySettings(
@@ -1010,6 +1013,13 @@ export function TerminalViewport({
     );
     return () => onSelectionReaderChange(terminalId, null);
   }, [onSelectionReaderChange, terminalId]);
+  // Send to agent returns focus here when its preview closes. Focusing xterm's own textarea
+  // writes nothing to the terminal.
+  useEffect(() => {
+    if (!onFocusTargetChange) return;
+    onFocusTargetChange(terminalId, () => terminalRef.current?.textarea ?? null);
+    return () => onFocusTargetChange(terminalId, null);
+  }, [onFocusTargetChange, terminalId]);
   const [imagePastesPending, setImagePastesPending] = useState(0);
   const cancelImagePastesRef = useRef<() => void>(() => undefined);
   const openInPreferredEditor = useOpenInPreferredEditor(
@@ -3317,6 +3327,18 @@ export default function ThreadTerminalPanel({
     if (read === null) selectionReadersRef.current.delete(terminalId);
     else selectionReadersRef.current.set(terminalId, read);
   }, []);
+  const focusTargetsRef = useRef(new Map<string, () => HTMLElement | null>());
+  const onFocusTargetChange = useCallback(
+    (terminalId: string, target: (() => HTMLElement | null) | null) => {
+      if (target === null) focusTargetsRef.current.delete(terminalId);
+      else focusTargetsRef.current.set(terminalId, target);
+    },
+    [],
+  );
+  const activeViewportFocusTarget = useCallback(
+    () => focusTargetsRef.current.get(resolvedActiveTerminalId)?.() ?? null,
+    [resolvedActiveTerminalId],
+  );
   const readActiveSelection = useCallback(
     () => selectionReadersRef.current.get(resolvedActiveTerminalId)?.() ?? "",
     [resolvedActiveTerminalId],
@@ -3327,6 +3349,8 @@ export default function ThreadTerminalPanel({
       terminalId={resolvedActiveTerminalId}
       terminalLabel={terminalLabelById.get(resolvedActiveTerminalId) ?? "Terminal"}
       readSelection={readActiveSelection}
+      viewportFocusTarget={activeViewportFocusTarget}
+      inCenterPanel={owner === "center-panel"}
     />
   ) : null;
   const hasToolbar = hasTerminalToolbarActions || sendToAgentControl !== null;
@@ -3500,6 +3524,7 @@ export default function ThreadTerminalPanel({
                           keybindings={keybindings}
                           workspaceUnavailable={workspaceUnavailable}
                           onSelectionReaderChange={onSelectionReaderChange}
+                          onFocusTargetChange={onFocusTargetChange}
                         />
                       </div>
                     </div>
@@ -3533,6 +3558,7 @@ export default function ThreadTerminalPanel({
                   keybindings={keybindings}
                   workspaceUnavailable={workspaceUnavailable}
                   onSelectionReaderChange={onSelectionReaderChange}
+                  onFocusTargetChange={onFocusTargetChange}
                 />
               </div>
             )}

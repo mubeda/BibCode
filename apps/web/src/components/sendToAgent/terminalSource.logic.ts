@@ -92,3 +92,15 @@ export function makeTerminalOutputLoader(
     };
   };
 }
+
+/**
+ * Whether a panel made for a send becomes the active tab at once. It stays inactive while
+ * activating it would unmount the source and its open preview: a panel that is not the host, or a
+ * terminal in the center panel. The caller reveals it after the send succeeded.
+ */
+export function shouldActivateSendPanel(input: {
+  hostThreadId: ThreadId | null;
+  sourceUnmountsOnActivate: boolean;
+}): boolean {
+  return input.hostThreadId === null && !input.sourceUnmountsOnActivate;
+}

@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 
 import { useProjects, useThreadShell } from "~/state/entities";
@@ -49,7 +50,11 @@ import {
 export interface TerminalSendToAgentServices {
   readonly serverSupported: boolean;
   readonly newPanelProvidersFor: (action: SendChoice["action"]) => ReadonlyArray<NewPanelProvider>;
-  readonly createPanel: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
+  /** `sourceUnmountsOnActivate` keeps the new panel inactive until `revealPanel`. */
+  readonly createPanel: (
+    selection: DefaultAgentSelection,
+    options?: { readonly sourceUnmountsOnActivate: boolean },
+  ) => Promise<ThreadId | null>;
   readonly revealPanel: (panel: ThreadId) => void;
   /** The content of Review, Message and Take over from; the terminal supplies the other two. */
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
@@ -63,7 +68,8 @@ const NO_MESSAGES: SendToAgentSource["messages"] = [];
 // Until a terminal can be notified (task 9.2), no terminal is offered as a target.
 const canNotifyTerminal = () => false;
 
-type LoadOutput = () => Promise<TerminalOutputText | null>;
+/** Rejects when the output could not be read. */
+type LoadOutput = () => Promise<TerminalOutputText>;
 
 /** Mounted while the menu is open: the only reader of the agent directory and the output. */
 function LiveTerminalInputsReader(props: {
@@ -85,20 +91,26 @@ function LiveTerminalInputsReader(props: {
   );
   const [selection] = useState(readSelection);
   const hasSelection = terminalHasText(selection, null);
-  // `undefined` while the output is loading, `null` when it could not be read.
-  const [output, setOutput] = useState<TerminalOutputText | null | undefined>(undefined);
+  // `undefined` while the output is loading, `"failed"` when it could not be read.
+  const [output, setOutput] = useState<TerminalOutputText | "failed" | undefined>(undefined);
   useEffect(() => {
     if (hasSelection) return;
     let current = true;
-    void loadOutput().then((loaded) => {
-      if (current) setOutput(loaded);
-    });
+    loadOutput().then(
+      (loaded) => {
+        if (current) setOutput(loaded);
+      },
+      () => {
+        if (current) setOutput("failed");
+      },
+    );
     return () => {
       current = false;
     };
   }, [hasSelection, loadOutput]);
-  // Until the output is known the entries stay enabled, so they do not flash a reason.
-  const hasText = hasSelection || output === undefined || terminalHasText(null, output);
+  // Loading and failed keep the entries enabled: only a read that found nothing says so. A failed
+  // read shows the preview's error and Retry when an entry is chosen.
+  const hasText = hasSelection || typeof output !== "object" || terminalHasText(null, output);
   const source = useMemo(() => ({ ...base, terminalHasText: hasText }), [base, hasText]);
   return props.render({ source, rows, hintFor });
 }
@@ -109,8 +121,18 @@ function TerminalSendComposerBody(props: {
   readonly terminalId: string;
   readonly terminalLabel: string;
   readonly readSelection: () => string;
+  readonly viewportFocusTarget: (() => HTMLElement | null) | undefined;
+  readonly inCenterPanel: boolean;
 }) {
-  const { services, threadRef, terminalId, terminalLabel, readSelection } = props;
+  const {
+    services,
+    threadRef,
+    terminalId,
+    terminalLabel,
+    readSelection,
+    viewportFocusTarget,
+    inCenterPanel,
+  } = props;
   const { environmentId, threadId } = threadRef;
   const shell = useThreadShell(threadRef);
   const projects = useProjects();
@@ -156,9 +178,7 @@ function TerminalSendComposerBody(props: {
       source: "output",
       part: "handoff",
     };
-    const read = getTerminalOutput(input)
-      .then((result): TerminalOutputText => result)
-      .catch(() => null);
+    const read = getTerminalOutput(input).then((result): TerminalOutputText => result);
     outputRef.current = read;
     return read;
   }, [getTerminalOutput, terminalId, threadId]);
@@ -181,7 +201,12 @@ function TerminalSendComposerBody(props: {
         leadIn,
         attachments: [],
         loadAttachments: async () => {
-          const output = await (outputRef.current ?? loadOutput());
+          const read = outputRef.current ?? loadOutput();
+          // A failed read is not reused: Retry reads again.
+          const output = await read.catch((error: unknown) => {
+            if (outputRef.current === read) outputRef.current = null;
+            throw error;
+          });
           const attachment = terminalAttachment({ selection: null, output, terminalLabel });
           return attachment === null ? [] : [attachment];
         },
@@ -203,6 +228,23 @@ function TerminalSendComposerBody(props: {
       ),
     [environmentId, loadOutput, readSelection, source],
   );
+  const createPanel = useCallback(
+    (selection: DefaultAgentSelection) =>
+      services.createPanel(selection, { sourceUnmountsOnActivate: inCenterPanel }),
+    [inCenterPanel, services],
+  );
+  // Closing the preview gives focus back to the terminal's viewport, never to its input.
+  const viewportFocus = useMemo<RefObject<HTMLElement | null> | undefined>(
+    () =>
+      viewportFocusTarget === undefined
+        ? undefined
+        : {
+            get current() {
+              return viewportFocusTarget();
+            },
+          },
+    [viewportFocusTarget],
+  );
   if (source === null) return null;
   return (
     <SendToAgentButton
@@ -215,7 +257,8 @@ function TerminalSendComposerBody(props: {
       canNotifyTerminal={canNotifyTerminal}
       previewContentFor={previewContentFor}
       send={send}
-      createPanel={services.createPanel}
+      createPanel={createPanel}
+      {...(viewportFocus === undefined ? {} : { finalFocus: viewportFocus })}
       revealPanel={services.revealPanel}
     />
   );
@@ -227,7 +270,21 @@ export const TerminalSendComposer = memo(function TerminalSendComposer(props: {
   readonly terminalLabel: string;
   /** The terminal's current selection, normalized; empty when nothing is selected. */
   readonly readSelection: () => string;
+  /** The terminal's focusable viewport; the preview returns focus to it. */
+  readonly viewportFocusTarget?: () => HTMLElement | null;
+  /** The terminal lives in the center panel, where activating another panel unmounts it. */
+  readonly inCenterPanel?: boolean;
 }) {
   const services = useContext(TerminalSendToAgentContext);
-  return services === null ? null : <TerminalSendComposerBody services={services} {...props} />;
+  return services === null ? null : (
+    <TerminalSendComposerBody
+      services={services}
+      threadRef={props.threadRef}
+      terminalId={props.terminalId}
+      terminalLabel={props.terminalLabel}
+      readSelection={props.readSelection}
+      viewportFocusTarget={props.viewportFocusTarget}
+      inCenterPanel={props.inCenterPanel ?? false}
+    />
+  );
 });

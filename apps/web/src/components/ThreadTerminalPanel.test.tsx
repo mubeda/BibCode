@@ -112,8 +112,22 @@ vi.mock("~/components/ui/popover", () => ({
 }));
 
 vi.mock("./sendToAgent/TerminalSendComposer", () => ({
-  TerminalSendComposer: ({ terminalId }: { terminalId: string }) => (
-    <button type="button" aria-label="Send to agent" data-send-terminal={terminalId} />
+  TerminalSendComposer: ({
+    terminalId,
+    inCenterPanel,
+    viewportFocusTarget,
+  }: {
+    terminalId: string;
+    inCenterPanel?: boolean;
+    viewportFocusTarget?: unknown;
+  }) => (
+    <button
+      type="button"
+      aria-label="Send to agent"
+      data-send-terminal={terminalId}
+      data-in-center-panel={String(inCenterPanel)}
+      data-has-focus-target={String(typeof viewportFocusTarget === "function")}
+    />
   ),
 }));
 
@@ -933,6 +947,16 @@ describe("ThreadTerminalPanel Send to agent", () => {
     );
     expect(markup).toContain('data-send-terminal="term-2"');
     expect(markup).not.toContain('data-send-terminal="term-1"');
+  });
+
+  it("tells the control when its terminal lives in the center panel and where focus returns", () => {
+    const render = (owner: PanelProps["owner"]) =>
+      renderToStaticMarkup(
+        <ThreadTerminalPanel {...panelProps({ owner, aiTerminalIds: new Set(["term-1"]) })} />,
+      );
+    expect(render("center-panel")).toContain('data-in-center-panel="true"');
+    expect(render("right-panel")).toContain('data-in-center-panel="false"');
+    expect(render("right-panel")).toContain('data-has-focus-target="true"');
   });
 
   it("shows the control even when the host omits the split and new actions", () => {

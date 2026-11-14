@@ -147,7 +147,8 @@ async function choose(action: string, target: string) {
   await act(async () => find('[role="menuitem"]', action)!.click());
   await flush();
   const items = [...document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')];
-  const item = items.find((entry) => entry.textContent === target) ?? find('[role="menuitem"]', target)!;
+  const item =
+    items.find((entry) => entry.textContent === target) ?? find('[role="menuitem"]', target)!;
   await act(async () => item.click());
   await flush();
 }
@@ -295,9 +296,8 @@ describe("TerminalSendComposer with the real menu and preview", () => {
     await typeNote("hello");
     await close.Send();
     await flush();
-    expect(createPanel).toHaveBeenCalledWith(
-      expect.objectContaining({ instanceId: "codex" }),
-      { sourceUnmountsOnActivate: true },
-    );
+    expect(createPanel).toHaveBeenCalledWith(expect.objectContaining({ instanceId: "codex" }), {
+      sourceUnmountsOnActivate: true,
+    });
   });
 });

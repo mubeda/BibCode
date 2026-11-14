@@ -348,7 +348,11 @@ import {
   TerminalSendToAgentContext,
   type TerminalSendToAgentServices,
 } from "./sendToAgent/TerminalSendComposer";
-import { isAiTerminal, makeTerminalOutputLoader } from "./sendToAgent/terminalSource.logic";
+import {
+  isAiTerminal,
+  makeTerminalOutputLoader,
+  shouldActivateSendPanel,
+} from "./sendToAgent/terminalSource.logic";
 import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
@@ -5170,7 +5174,10 @@ function ChatViewContent(props: ChatViewProps) {
     [codeReviewAgentActions],
   );
   const createSendPanel = useLatestHandler(
-    async (selection: DefaultAgentSelection): Promise<ThreadId | null> => {
+    async (
+      selection: DefaultAgentSelection,
+      options?: { readonly sourceUnmountsOnActivate: boolean },
+    ): Promise<ThreadId | null> => {
       const entry = codeReviewAgentActions.find(
         (action) => action.kind === "chat" && action.entry.instanceId === selection.instanceId,
       )?.entry;
@@ -5192,16 +5199,20 @@ function ChatViewContent(props: ChatViewProps) {
         branch: activeThread.branch ?? null,
         modelSelection: resolution.modelSelection,
         providerLabel: entry.displayName,
-        // A send from a panel other than the host keeps its own tab active until the send
-        // succeeds (`revealSendPanel`): an inactive chat panel unmounts, and its preview with it.
-        activate: !activeThread.hostThreadId,
+        // A send from a panel other than the host, or from a center terminal, keeps its own
+        // surface active until the send succeeds (`revealSendPanel`): activating another panel
+        // unmounts the source and its preview with it.
+        activate: shouldActivateSendPanel({
+          hostThreadId: activeThread.hostThreadId ?? null,
+          sourceUnmountsOnActivate: options?.sourceUnmountsOnActivate ?? false,
+        }),
       });
     },
   );
   const revealSendPanel = useLatestHandler((panelThreadId: ThreadId) => {
-    if (!activeThread?.hostThreadId) return;
+    if (!activeThread) return;
     void centerPanelActions.openPanelThread(
-      scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId),
+      scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId ?? activeThread.id),
       panelThreadId,
       // A panel's title is its tab label.
       readThreadShell(scopeThreadRef(activeThread.environmentId, panelThreadId))?.title ?? "",
