@@ -22,9 +22,9 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 | 3.1 | Review action | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
 | 3.2 | Second opinion attachments | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
 | 3.3 | Answer notice and Bring back | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
-| 4.1 | One handoff builder and on-demand handoff text | 4 | In progress | lane 4 | |
-| 4.2 | Hand off and Take over from actions | 4 | In progress | lane 4 | |
-| 4.3 | Out-of-tokens hint | 4 | In progress | lane 4 | |
+| 4.1 | One handoff builder and on-demand handoff text | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
+| 4.2 | Hand off and Take over from actions | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
+| 4.3 | Out-of-tokens hint | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
 | 5.1 | Agent message store | 5 | In progress | lane 5A | |
 | 5.2 | Agent messaging setting | 5 | In progress | lane 5A | |
 | 5.3 | Agent directory tool | 5 | In progress | lane 5A | |
@@ -88,3 +88,6 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-14 04:45 Lane 4 reported 4.1, 4.2, 4.3 done on branch worktree-agent-af4e6b1855ce63843 (ddf4a6a81..f33db9376); lib suite 5579 passed, sendToAgent 153 tests passed (lane report). Codex review running.
 - 2026-11-14 04:45 Ruling: execute-plan.md line 52 no longer names two Codex helper models, because the sensitive-data guard's hash list matched one of them (a false positive on a public model name). The file is the start prompt, not a task, so no task changes. Cost if wrong: none; the executor already has the models.
 - 2026-11-14 04:45 Open for task 11.1: docs/architecture/providers.md still describes the side chat seed and the context handoff as the last 40 messages only (D107 adds the first message), and says only a slash turn skips the context handoff (an agent envelope skips it too; Claude marks envelopes client_composed).
+- 2026-11-14 04:50 Codex review of lane 4 (gpt-6-astra, high): 3 findings, all accepted (the first message is chosen in timestamp-string order; a delayed send activates its panel and unmounts a newer preview; a stale usage snapshot still shows out of usage). Fix round: lane 4R (sonnet, medium).
+- 2026-11-14 05:20 4.1, 4.2, 4.3 Closed. Evidence: lane 4R fixed the 3 accepted findings, each failing test committed before its fix; cargo test -p bibcode-server --lib -j 2 -- thread_context context_handoff send_requests: 118 passed; cargo fmt and clippy -D warnings clean; vp run typecheck exit 0 (lane report). On the integrated branch the coordinator ran from apps/web: vp test run --project unit src/components/sendToAgent src/sendToAgentStore.test.ts src/state/sendRequests.test.ts: 14 files, 168 tests passed. Commits: ddf4a6a81..0807010a4, merged (4ce68a660).
+- 2026-11-14 05:20 Follow-up: list_messages_by_thread in persistence/repositories.rs orders by created_at text, which misorders messages whose timestamps differ in fractional precision; the handoff builder now sorts by instant itself. To fix at the source in a later lane of this run.
