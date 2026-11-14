@@ -147,12 +147,17 @@ pub(crate) enum TurnAdmission {
     Queue,
 }
 
-/// `Queue` while the recipient's session runs or starts a turn, `Start` otherwise (no session
-/// at all included, so a never-started recipient is not stranded in the queue).
+/// `Queue` while the recipient's session runs or starts a turn, and while it has an open
+/// approval or question whatever its session (a restart recovers a ready session's asks), so a
+/// message never reaches a turn that waits for a person's answer (R9). `Start` otherwise, no
+/// session at all included, so a never-started recipient is not stranded in the queue.
 pub(crate) fn admission_for(
-    _thread: &ProjectionThread,
+    thread: &ProjectionThread,
     session: Option<&ProjectionThreadSession>,
 ) -> TurnAdmission {
+    if thread.pending_approval_count > 0 || thread.pending_user_input_count > 0 {
+        return TurnAdmission::Queue;
+    }
     match session.map(|session| session.status.as_str()) {
         Some("running" | "starting") => TurnAdmission::Queue,
         _ => TurnAdmission::Start,
@@ -518,11 +523,10 @@ impl AgentMessaging {
             tracing::warn!(error = %error, "an agent message command did not build");
             AgentMessagingError::Storage
         })?;
-        // The dispatch path reads the session again and queues only while it still runs, so a
-        // turn that ended since this read starts the message; neither admission forces it.
-        let force_queue = match admission_for(&route.recipient, route.session.as_ref()) {
-            TurnAdmission::Start | TurnAdmission::Queue => false,
-        };
+        // A queued message waits for the promotion gate, which admits it only once no turn runs
+        // and no approval or question is open; one that ended since this read is promoted then.
+        let force_queue = admission_for(&route.recipient, route.session.as_ref())
+            == TurnAdmission::Queue;
         let companion = AgentMessageCompanion::Insert(NewAgentMessage {
             message_id: outgoing.message_id.to_owned(),
             conversation_id: outgoing.conversation_id.to_owned(),
