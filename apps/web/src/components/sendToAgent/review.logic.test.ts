@@ -280,6 +280,33 @@ describe("buildReviewContent", () => {
     expect(useSendToAgentStore.getState().panels).toEqual({});
   });
 
+  it("a creation whose outcome is unknown keeps its panel id, so the retry sends there and creates nothing", async () => {
+    const send = vi.fn<(input: SendRequestsSendInput) => Promise<SendOutcome>>(() =>
+      Promise.resolve({ kind: "sent" }),
+    );
+    // The launcher's creation response was lost: the panel id is known, the panel may exist.
+    const startNewPanelReview = vi.fn(
+      (): Promise<PromptedPanelResult> =>
+        Promise.resolve({
+          threadId: ThreadId.make("panel-1"),
+          created: false,
+          messageId: null,
+          sent: "not-sent",
+        }),
+    );
+    const content = build({ startNewPanelReview }, send);
+    const draft = { leadIn: content.leadIn, note: "look", attachments: [] };
+    const first = await content.submit!(draft);
+    expect(first).toMatchObject({ kind: "failed", message: REVIEW_PANEL_NOT_OPENED_MESSAGE });
+    expect(send).not.toHaveBeenCalled();
+    const second = await content.submit!(draft);
+    expect(second).toEqual({ kind: "sent" });
+    expect(startNewPanelReview).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![0].target).toBe("thread:panel-1");
+    expect(useSendToAgentStore.getState().panels).toEqual({});
+  });
+
   it("a panel that could not be created keeps the preview and says so", async () => {
     const content = build();
     const outcome = await content.submit!({ leadIn: content.leadIn, note: "", attachments: [] });
