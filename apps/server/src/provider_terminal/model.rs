@@ -734,6 +734,68 @@ pub enum PromptEvidence {
     Stale,
 }
 
+/// When a Codex or OpenCode observer may make its terminal ready for a prompt (R-6): only at the
+/// moment it waits on its live stream with nothing left to read, from the latest root event it
+/// read. Any other awaited work withdraws readiness first; a transition also forgets what was read.
+#[derive(Debug, Default)]
+pub struct PromptReadiness {
+    /// The latest root event read says the CLI waits for a prompt, and it was read fresh.
+    idle: bool,
+}
+
+impl PromptReadiness {
+    /// Reports what one root event says about the agent and keeps whether it says the CLI waits.
+    /// It never makes the terminal ready: the next [`Self::wait`] does.
+    pub fn observe(
+        &mut self,
+        generation: &TerminalObserverGenerationLease,
+        report: TerminalAgentReport,
+        ready: bool,
+        evidence: PromptEvidence,
+    ) {
+        generation.report_agent_status(report);
+        self.idle = ready && evidence == PromptEvidence::Fresh;
+    }
+
+    /// Withdraws readiness before awaited work that is not the wait on the live stream; what the
+    /// observer read still decides the next wait.
+    pub fn suspend(&self, generation: &TerminalObserverGenerationLease) {
+        generation.clear_ready_for_prompt();
+    }
+
+    /// Withdraws readiness at a transition (an attach, a replaced or lost stream, a snapshot,
+    /// dropped events) and forgets what was read before it.
+    pub fn reset(&mut self, generation: &TerminalObserverGenerationLease) {
+        self.idle = false;
+        generation.clear_ready_for_prompt();
+    }
+
+    /// Awaits the next read on the live stream. Only once that read is pending, so nothing is
+    /// immediately readable, does it make the terminal ready, and only if the latest root event
+    /// read says the CLI waits.
+    pub async fn wait<T>(
+        &self,
+        generation: &TerminalObserverGenerationLease,
+        next: impl Future<Output = T>,
+    ) -> T {
+        let mut next = std::pin::pin!(next);
+        let mut published = false;
+        std::future::poll_fn(|context| {
+            let polled = next.as_mut().poll(context);
+            // A read refused for the task's exhausted budget is not an empty stream; Tokio wakes
+            // the task at once, and the next poll decides.
+            if polled.is_pending() && !published && tokio::task::coop::has_budget_remaining() {
+                published = true;
+                if self.idle {
+                    generation.mark_ready_for_prompt();
+                }
+            }
+            polled
+        })
+        .await
+    }
+}
+
 /// One status observation: the state, whether the turn that ended failed, and when the
 /// observer saw it on this server's clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -987,9 +1049,8 @@ impl TerminalObserverGenerationLease {
     }
 
     /// Marks the current observation ready for a prompt, only when it is done and did not fail,
-    /// atomically. Observers reach it through [`Self::report_agent_evidence`], and the Codex
-    /// observer also after a reconciliation that lost nothing and left nothing unread about the
-    /// root, to restore the readiness it withdrew at the reconciliation's start.
+    /// atomically. The Claude observer reaches it through [`Self::report_agent_evidence`]; the
+    /// Codex and OpenCode observers only through [`PromptReadiness::wait`].
     pub fn mark_ready_for_prompt(&self) {
         if !self.is_current() {
             return;
@@ -1010,9 +1071,8 @@ impl TerminalObserverGenerationLease {
     }
 
     /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
-    /// that buffers events, a lost connection or stream, the observer's end) until fresh
-    /// evidence returns, or, for a Codex reconciliation, until it ends having lost nothing.
-    /// The state stays as last reported. Returns whether it was ready.
+    /// that buffers events, a lost connection or stream, the observer's end) or before awaited
+    /// work. The state stays as last reported. Returns whether it was ready.
     pub fn clear_ready_for_prompt(&self) -> bool {
         self.inner
             .agent_status

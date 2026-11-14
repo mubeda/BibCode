@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::model::{
-    PromptEvidence, TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease,
+    PromptEvidence, PromptReadiness, TerminalAgentReport, TerminalAgentState,
+    TerminalObserverGenerationLease,
 };
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
@@ -1407,8 +1408,13 @@ async fn run_codex_observer_inner(
         break resumed;
     };
     // The left panel learns the root agent's state as soon as the observer attaches (#187).
-    let mut stale =
-        publish_codex_resumed_status(generation, &mut *client, resumed.thread.status.as_ref());
+    let mut readiness = PromptReadiness::default();
+    let mut stale = publish_codex_resumed_status(
+        generation,
+        &mut readiness,
+        &mut *client,
+        resumed.thread.status.as_ref(),
+    );
 
     let initial_state = *activity.borrow_and_update();
     let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
@@ -1489,8 +1495,13 @@ async fn run_codex_observer_inner(
     'owner: loop {
         if recovering {
             let recovery_deadline = tokio::time::Instant::now() + inner.reattach_timeout;
-            let recovery =
-                reconnect_attached_codex_client(inner, generation, &root, recovery_deadline);
+            let recovery = reconnect_attached_codex_client(
+                inner,
+                generation,
+                &mut readiness,
+                &root,
+                recovery_deadline,
+            );
             tokio::pin!(recovery);
             let outcome = tokio::select! {
                 biased;
@@ -1575,13 +1586,20 @@ async fn run_codex_observer_inner(
             // The barrier resets activity, which drops what is still buffered.
             report_dropped_codex_notifications(
                 generation,
+                &mut readiness,
                 &root,
                 &mut stale,
                 &mut reconciled,
                 &mut *client,
             );
             let outcome = {
-                let barrier = cross_codex_enable_barrier(&mut *client, generation, &root, deadline);
+                let barrier = cross_codex_enable_barrier(
+                    &mut *client,
+                    generation,
+                    &mut readiness,
+                    &root,
+                    deadline,
+                );
                 tokio::pin!(barrier);
                 tokio::select! {
                     biased;
@@ -1598,6 +1616,7 @@ async fn run_codex_observer_inner(
                 CodexObserverWait::ActivityChanged(true) => {
                     report_dropped_codex_notifications(
                         generation,
+                        &mut readiness,
                         &root,
                         &mut stale,
                         &mut reconciled,
@@ -1726,7 +1745,7 @@ async fn run_codex_observer_inner(
                 continue;
             }
             // Its requests buffer the notifications that arrive meanwhile and may drop some.
-            let was_ready = generation.clear_ready_for_prompt();
+            readiness.suspend(generation);
             let outcome = {
                 let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
                 let reconciliation = reconcile_codex_terminal(
@@ -1754,6 +1773,7 @@ async fn run_codex_observer_inner(
                 CodexObserverWait::ActivityChanged(true) => {
                     report_dropped_codex_notifications(
                         generation,
+                        &mut readiness,
                         &root,
                         &mut stale,
                         &mut reconciled,
@@ -1787,20 +1807,23 @@ async fn run_codex_observer_inner(
                 CodexObserverWait::Completed(()) => {
                     reconciliation_sequence = reconciliation_sequence.saturating_add(1);
                     let buffered = client.drain_request_buffered_notifications();
-                    // Codex reports the root idle before the turn/completed that starts this
-                    // reconciliation, so nothing may follow to make the terminal ready again.
-                    // The readiness held before it still holds when the requests lost nothing
-                    // and nothing still unread is about the root.
-                    if !client.take_lost_notifications()
-                        && was_ready
-                        && !reconciled
-                            .iter()
-                            .chain(&buffered)
-                            .any(|envelope| codex_root_agent_status(envelope, &root).is_some())
-                    {
-                        generation.mark_ready_for_prompt();
+                    if client.take_lost_notifications() {
+                        // A dropped turn or ask leaves the root's state unknown, and what was
+                        // kept cannot be ordered against it.
+                        readiness.reset(generation);
+                        for envelope in buffered {
+                            report_codex_root(
+                                generation,
+                                &mut readiness,
+                                &envelope,
+                                &root,
+                                PromptEvidence::Stale,
+                            );
+                        }
+                    } else {
+                        // Read in order before the next wait, as if the connection held them.
+                        reconciled.extend(buffered);
                     }
-                    reconciled.extend(buffered);
                 }
             }
             continue;
@@ -1847,7 +1870,13 @@ async fn run_codex_observer_inner(
                     pending_barrier = Some(desired);
                 }
             }
-            (envelope, evidence) = next_codex_envelope(&mut stale, &mut reconciled, &mut *client) => {
+            (envelope, evidence) = next_codex_envelope(
+                generation,
+                &readiness,
+                &mut stale,
+                &mut reconciled,
+                &mut *client,
+            ) => {
                 let envelope = match envelope {
                     Ok(Some(envelope)) => envelope,
                     Ok(None) | Err(_) => {
@@ -1860,14 +1889,19 @@ async fn run_codex_observer_inner(
                         pending_reconciliation = false;
                         retry_at = None;
                         recovering = true;
-                        publish_codex_observation_lost(&inner.activity, generation, epoch);
+                        publish_codex_observation_lost(
+                            &inner.activity,
+                            generation,
+                            &mut readiness,
+                            epoch,
+                        );
                         continue;
                     }
                 };
-                withdraw_if_codex_notifications_lost(generation, &mut *client);
+                withdraw_if_codex_notifications_lost(generation, &mut readiness, &mut *client);
                 // The root agent's state goes to the left panel whatever the activity setting
                 // says (#187).
-                report_codex_root(generation, &envelope, &root, evidence);
+                report_codex_root(generation, &mut readiness, &envelope, &root, evidence);
                 let desired = inner.activity.snapshot();
                 if live_state != Some(desired)
                     || epoch != inner.connection_epoch.load(Ordering::Acquire)
@@ -1883,6 +1917,9 @@ async fn run_codex_observer_inner(
                     || epoch != inner.connection_epoch.load(Ordering::Acquire)
                 {
                     continue;
+                }
+                if !output.mutations.is_empty() {
+                    readiness.suspend(generation);
                 }
                 apply_activity_output(
                     inner,
@@ -2009,15 +2046,16 @@ async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receiv
 }
 
 /// Crosses the activity enable barrier. Notifications that arrive while it waits are dropped
-/// for activity, and readiness is withdrawn: they still report the root's state, never as
-/// ready, and only an event after the barrier makes the terminal ready again.
+/// for activity, and readiness is reset: they still report the root's state, never as ready,
+/// and only an event after the barrier makes the terminal ready again.
 async fn cross_codex_enable_barrier(
     client: &mut dyn CodexRemoteClient,
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     root: &str,
     deadline: tokio::time::Instant,
 ) -> bool {
-    generation.clear_ready_for_prompt();
+    readiness.reset(generation);
     let response = tokio::select! {
         biased;
         _ = generation.cancelled() => return false,
@@ -2030,22 +2068,30 @@ async fn cross_codex_enable_barrier(
         ) => response,
     };
     for envelope in client.drain_request_buffered_notifications() {
-        report_codex_root(generation, &envelope, root, PromptEvidence::Stale);
+        report_codex_root(
+            generation,
+            readiness,
+            &envelope,
+            root,
+            PromptEvidence::Stale,
+        );
     }
-    withdraw_if_codex_notifications_lost(generation, client);
+    withdraw_if_codex_notifications_lost(generation, readiness, client);
     matches!(response, Ok(Ok(_)))
 }
 
-/// Reports the root agent's state one notification carries; only fresh evidence makes the
-/// terminal ready.
+/// Reports the root agent's state one notification carries; the next wait makes the terminal
+/// ready if it was the latest and fresh.
 fn report_codex_root(
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     envelope: &Value,
     root: &str,
     evidence: PromptEvidence,
 ) {
     if let Some(report) = codex_root_agent_status(envelope, root) {
-        generation.report_agent_evidence(
+        readiness.observe(
+            generation,
             report,
             codex_root_ready_for_prompt(envelope, root),
             evidence,
@@ -2056,36 +2102,47 @@ fn report_codex_root(
 /// Notifications activity drops still report the root's state, never as ready.
 fn report_dropped_codex_notifications(
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     root: &str,
     stale: &mut VecDeque<Value>,
     reconciled: &mut VecDeque<Value>,
     client: &mut dyn CodexRemoteClient,
 ) {
+    readiness.reset(generation);
     for envelope in stale
         .drain(..)
         .chain(reconciled.drain(..))
         .chain(client.drain_request_buffered_notifications())
     {
-        report_codex_root(generation, &envelope, root, PromptEvidence::Stale);
+        report_codex_root(
+            generation,
+            readiness,
+            &envelope,
+            root,
+            PromptEvidence::Stale,
+        );
     }
-    withdraw_if_codex_notifications_lost(generation, client);
+    withdraw_if_codex_notifications_lost(generation, readiness, client);
 }
 
 /// A request that dropped notifications leaves the root's state unknown: a turn or ask among
 /// them went unseen.
 fn withdraw_if_codex_notifications_lost(
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     client: &mut dyn CodexRemoteClient,
 ) {
     if client.take_lost_notifications() {
-        generation.clear_ready_for_prompt();
+        readiness.reset(generation);
     }
 }
 
 /// The next notification: first those buffered while the resume was in flight, which are stale,
-/// then those a completed reconciliation buffered, then the connection's own. A reconciliation
-/// withdraws readiness first, so what it buffered is read in order after that, as fresh.
+/// then those a completed reconciliation buffered, then the connection's own. Only a read of the
+/// connection itself is a wait, where the terminal may become ready (R-6).
 async fn next_codex_envelope(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &PromptReadiness,
     stale: &mut VecDeque<Value>,
     reconciled: &mut VecDeque<Value>,
     client: &mut dyn CodexRemoteClient,
@@ -2095,20 +2152,24 @@ async fn next_codex_envelope(
     }
     match reconciled.pop_front() {
         Some(envelope) => (Ok(Some(envelope)), PromptEvidence::Fresh),
-        None => (client.next().await, PromptEvidence::Fresh),
+        None => (
+            readiness.wait(generation, client.next()).await,
+            PromptEvidence::Fresh,
+        ),
     }
 }
 
-/// Publishes the state a `thread/resume` response reports, which withdraws readiness: the
+/// Publishes the state a `thread/resume` response reports, which resets readiness: the
 /// response is a snapshot, and the notifications that arrived while it was in flight are not
 /// ordered after it either. Returns those notifications, to be read as stale before the
 /// connection's next ones.
 fn publish_codex_resumed_status(
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     client: &mut dyn CodexRemoteClient,
     status: Option<&ReconciliationThreadStatus>,
 ) -> VecDeque<Value> {
-    generation.clear_ready_for_prompt();
+    readiness.reset(generation);
     if let Some((state, failed)) = codex_resumed_agent_status(status) {
         generation.publish_agent_status(state, failed);
     }
@@ -2123,9 +2184,10 @@ fn publish_codex_resumed_status(
 pub(super) fn publish_codex_observation_lost(
     activity: &TerminalAgentActivityControl,
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     epoch: u64,
 ) {
-    generation.clear_ready_for_prompt();
+    readiness.reset(generation);
     activity.mark_observed(TerminalAgentActivityObservation {
         state: activity.snapshot(),
         epoch,
@@ -2136,6 +2198,7 @@ pub(super) fn publish_codex_observation_lost(
 async fn reconnect_attached_codex_client(
     inner: &CodexObserverInner,
     generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
     root: &str,
     deadline: tokio::time::Instant,
 ) -> Option<(Box<dyn CodexRemoteClient>, VecDeque<Value>)> {
@@ -2156,7 +2219,7 @@ async fn reconnect_attached_codex_client(
         .pointer("/thread/status")
         .cloned()
         .and_then(|status| serde_json::from_value::<ReconciliationThreadStatus>(status).ok());
-    let stale = publish_codex_resumed_status(generation, &mut *client, status.as_ref());
+    let stale = publish_codex_resumed_status(generation, readiness, &mut *client, status.as_ref());
     Some((client, stale))
 }
 
