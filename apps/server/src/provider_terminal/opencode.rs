@@ -4224,6 +4224,36 @@ mod tests {
         }
     }
 
+    /// The idle event the terminal appends after an interrupt changes no activity: the
+    /// activity tracker still reads the turn as cancelled from the abort before it.
+    #[test]
+    fn opencode_2_the_idle_after_an_interrupt_leaves_activity_as_it_was() {
+        let (events, root) = opencode_2_fixture("interrupt");
+        let replay = |terminal: bool| {
+            let mut normalizer = opencode::v2_activity::V2ActivityNormalizer::default();
+            let mut tracker = OpenCodeActivityTracker::new(&root);
+            let mut mutations = Vec::new();
+            let mut cancelled = false;
+            for event in &events {
+                let normalized = if terminal {
+                    normalize_opencode_v2_for_terminal(&mut normalizer, event)
+                } else {
+                    normalizer.normalize(event)
+                };
+                for v1 in normalized {
+                    cancelled |= v1.pointer("/properties/error/name")
+                        == Some(&json!("MessageAbortedError"));
+                    mutations.extend(tracker.handle_observed_event_at(&v1, 1).mutations);
+                }
+            }
+            (mutations, cancelled)
+        };
+
+        let (with_idle, cancelled) = replay(true);
+        assert!(cancelled, "the interrupt still reaches the tracker as an abort");
+        assert_eq!(with_idle, replay(false).0);
+    }
+
     #[test]
     fn opencode_2_an_interrupted_turn_ends_ready() {
         let (events, root) = opencode_2_fixture("interrupt");
@@ -4496,6 +4526,12 @@ mod tests {
         let mut stream = attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1))
             .await
             .expect("a stream");
+        let snapshot = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(
+            (snapshot.state, snapshot.ready_for_prompt),
+            (TerminalAgentState::Done, false),
+            "the status read at attach made the terminal ready"
+        );
         let queued = stream.next_data().await.expect("the queued idle");
         OpenCodeStatusEvent::from_value(&serde_json::from_slice(&queued).expect("an event"))
             .publish(&lease, "root", PromptEvidence::Fresh);
@@ -4504,6 +4540,10 @@ mod tests {
         assert!(
             !(status.ready_for_prompt && remote.reported_busy),
             "an idle queued before the server reported busy made the terminal ready"
+        );
+        assert!(
+            status.ready_for_prompt,
+            "an idle the stream carries after attach is fresh and makes the terminal ready"
         );
     }
 

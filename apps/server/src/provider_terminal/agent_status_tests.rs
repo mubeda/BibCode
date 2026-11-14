@@ -339,3 +339,33 @@ fn a_lost_codex_connection_withdraws_readiness() {
         Some(super::TerminalAgentActivityObservationKind::Unavailable)
     );
 }
+
+/// Only fresh evidence that says the CLI waits makes a terminal ready; any other report,
+/// stale or not, withdraws readiness.
+#[test]
+fn readiness_needs_fresh_evidence_and_any_other_report_withdraws_it() {
+    use super::model::PromptEvidence::{Fresh, Stale};
+    let idle = TerminalAgentReport::Set(Done, false);
+    for (report, says_ready, evidence, ready) in [
+        (idle, true, Fresh, true),
+        (idle, true, Stale, false),
+        (idle, false, Fresh, false),
+        (TerminalAgentReport::Set(Done, true), true, Fresh, false),
+        (TerminalAgentReport::Set(Working, false), false, Stale, false),
+        (TerminalAgentReport::Progress, false, Fresh, false),
+    ] {
+        let generation =
+            super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        lease.publish_agent_status(Done, false);
+        lease.mark_ready_for_prompt();
+
+        lease.report_agent_evidence(report, says_ready, evidence);
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(
+            status.ready_for_prompt, ready,
+            "{report:?} saying ready {says_ready} as {evidence:?}"
+        );
+    }
+}

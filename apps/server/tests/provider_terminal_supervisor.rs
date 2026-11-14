@@ -5780,6 +5780,114 @@ async fn codex_attach_takes_readiness_only_from_events_after_its_resume() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reconnect_withdraws_readiness_until_an_event_after_its_resume() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-reconnect-root",
+            root.path(),
+        ));
+    let (manager, projection, scope) = open_codex_fixture_terminal_with_reattach_timeout(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-reconnect",
+        Some(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-reconnect-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-reconnect",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    let connections_before = remote_state
+        .endpoints
+        .lock()
+        .expect("Codex endpoints")
+        .len();
+    // The reconnect's resume answers idle: a snapshot, which must not make it ready again.
+    remote_state
+        .resume_responses
+        .lock()
+        .expect("resume responses")
+        .push_back(Ok(serde_json::json!({
+            "thread": {
+                "id": "terminal-reconnect-root",
+                "parentThreadId": null,
+                "turns": [],
+                "status": {"type": "idle"},
+            },
+        })));
+
+    remote_state
+        .next_errors
+        .lock()
+        .expect("next errors")
+        .push_back("Codex remote read failed: connection reset".to_owned());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while remote_state
+            .endpoints
+            .lock()
+            .expect("Codex endpoints")
+            .len()
+            == connections_before
+            || remote_state.completed_resume_responses.load(Ordering::Acquire) < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer reconnects and resumes");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        terminal_readiness(&manager, "terminal-reconnect").await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "a reconnect kept or restored readiness without a fresh event"
+    );
+
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-reconnect-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-reconnect",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-reconnect"))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_enable_barrier_keeps_a_turn_that_starts_during_it() {
     own_process!(isolated);
     let fixture = codex_remote_fixture();
@@ -5835,11 +5943,13 @@ async fn codex_enable_barrier_keeps_a_turn_that_starts_during_it() {
     let enabled = manager.set_agent_activity_enabled(true).await;
     assert_eq!((enabled.resumed, enabled.failed), (1, 0));
 
-    assert_eq!(
-        terminal_readiness(&manager, "terminal-barrier").await,
-        Some((TerminalAgentStatusState::Working, false)),
-        "a turn that started during the enable barrier was dropped"
-    );
+    // A turn that started during the enable barrier must not be dropped.
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-barrier",
+        (TerminalAgentStatusState::Working, false),
+    )
+    .await;
     remote_state
         .events
         .lock()
@@ -14725,6 +14835,87 @@ async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_o
         &fixture.manager,
         "terminal-opencode-toggle",
         TerminalAgentStatusState::Blocked,
+    )
+    .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_terminal_reads_ready_only_after_a_fresh_idle_on_its_live_stream() {
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let terminal = "terminal-opencode-toggle";
+    let idle = || {
+        opencode_fixture_event_frame(serde_json::json!({
+            "type": "session.idle",
+            "properties": {"sessionID": "root-tui-session"},
+        }))
+    };
+    // The status read at attach is a snapshot: the terminal is done but not ready.
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+
+    let stream = fixture
+        .remote_state
+        .active_streams
+        .lock()
+        .expect("active OpenCode streams")
+        .first()
+        .cloned()
+        .expect("the live OpenCode stream");
+    stream
+        .frames
+        .lock()
+        .expect("OpenCode stream frames")
+        .push_back(Err("stream lost".to_owned()));
+    stream.notify.notify_one();
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .remote_state
+            .opened_stream_count
+            .load(Ordering::Acquire)
+            < 2
+            || fixture
+                .remote_state
+                .active_streams
+                .lock()
+                .expect("active OpenCode streams")
+                .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer opens a new stream");
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
     )
     .await;
     fixture.finish().await;

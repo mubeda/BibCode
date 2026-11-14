@@ -4519,6 +4519,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_idle_notification_makes_a_claude_terminal_ready() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let status = generation.observation().subscribe_agent_status();
+        let (requests, _request_receiver) = mpsc::channel(4);
+        let state = ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+            status_session: Arc::new(Mutex::new(None)),
+        };
+
+        for (event, notification, expected) in [
+            ("UserPromptSubmit", None, (TerminalAgentState::Working, false)),
+            ("Stop", None, (TerminalAgentState::Done, false)),
+            (
+                "Notification",
+                Some("idle_prompt"),
+                (TerminalAgentState::Done, true),
+            ),
+            ("UserPromptSubmit", None, (TerminalAgentState::Working, false)),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer token".parse().unwrap());
+            headers.insert(
+                CLAUDE_HOOK_CORRELATION_HEADER,
+                "correlation".parse().unwrap(),
+            );
+            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let body = json!({
+                "hook_event_name": event,
+                "session_id": "s",
+                "notification_type": notification,
+            });
+            let response =
+                capture_claude_hook(State(state.clone()), headers, Body::from(body.to_string()))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{event}");
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| (observation.state, observation.ready_for_prompt)),
+                Some(expected),
+                "{event} {notification:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn status_hooks_publish_with_activity_off_and_never_reach_the_activity_worker() {
         let generation = TerminalObserverGeneration::new(
             "thread-status-only".to_owned(),
