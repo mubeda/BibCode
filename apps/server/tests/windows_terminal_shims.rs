@@ -705,10 +705,11 @@ async fn assert_review_prompt_reaches_node(sample: &str) {
 async fn shim_timeout_reports_the_collected_output() {
     let directory = tempfile::tempdir().unwrap();
     let shim = directory.path().join("slow.cmd");
-    // `ping` waits without a console input handle, which `timeout` needs.
+    // Prints a line about once a second and never the marker. `ping` waits without a console
+    // input handle, which `timeout` needs.
     std::fs::write(
         &shim,
-        "@echo off\r\necho BEFORE\r\nping -n 16 127.0.0.1 >nul\r\necho NEVER_REACHED_MARKER\r\n",
+        "@echo off\r\n:again\r\necho BEFORE\r\nping -n 2 127.0.0.1 >nul\r\ngoto again\r\n",
     )
     .unwrap();
     let process = PortablePtyBackend
@@ -724,6 +725,11 @@ async fn shim_timeout_reports_the_collected_output() {
     let mut output = process.subscribe_output();
     let mut exit = process.subscribe_exit();
 
+    // A first spawn can take many seconds on a loaded runner (#367), so the timed part starts
+    // only once the shim is known to be printing.
+    wait_for_marker(&mut output, &mut exit, "BEFORE", Duration::from_secs(120))
+        .await
+        .unwrap_or_else(|timed_out| panic!("{timed_out}"));
     let timed_out = wait_for_marker(
         &mut output,
         &mut exit,
@@ -731,7 +737,7 @@ async fn shim_timeout_reports_the_collected_output() {
         Duration::from_secs(5),
     )
     .await
-    .expect_err("the shim prints the marker only after the deadline");
+    .expect_err("the shim never prints the marker");
 
     process.kill().unwrap();
     assert!(
