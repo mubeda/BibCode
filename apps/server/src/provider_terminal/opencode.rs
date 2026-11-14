@@ -1378,15 +1378,18 @@ async fn run_opencode_observer(
                         }
                         // Dormant activity still reads the root agent's state (#187).
                         data = current_stream.next_dormant_data() => {
-                            OpenCodeObserverEvent::Discard(data.map(|data| {
-                                if let Some(data) = data {
-                                    publish_opencode_agent_status(
+                            OpenCodeObserverEvent::Discard(data.and_then(|data| match data {
+                                Some(data)
+                                    if !publish_opencode_agent_status(
                                         &generation,
                                         &root_session_id,
                                         &data,
                                         PromptEvidence::Fresh,
-                                    );
+                                    ) =>
+                                {
+                                    Err("malformed OpenCode event".to_owned())
                                 }
+                                _ => Ok(()),
                             }))
                         }
                     }
@@ -1440,6 +1443,7 @@ async fn run_opencode_observer(
             }
             OpenCodeObserverEvent::ActivityChanged(true) => {
                 let mut state = *activity.borrow();
+                let mut replacement_started = false;
                 loop {
                     if !state.enabled {
                         live_state = None;
@@ -1454,6 +1458,7 @@ async fn run_opencode_observer(
 
                     live_state = None;
                     mode = OpenCodeObserverMode::Dormant;
+                    replacement_started = true;
                     let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
                     let outcome = {
                         let dormant_stream =
@@ -1496,6 +1501,7 @@ async fn run_opencode_observer(
                             );
                             if promoted {
                                 scope_retry = None;
+                                replacement_started = false;
                                 break;
                             }
                             state = inner.activity.snapshot();
@@ -1535,6 +1541,11 @@ async fn run_opencode_observer(
                         }
                     }
                 }
+                // The old stream's events were discarded while the replacement ran, and those it
+                // still holds predate it: only a new attachment observes fresh again.
+                if replacement_started && stream.take().is_some() {
+                    epoch = epoch.saturating_add(1);
+                }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
                 let Some(state) = live_state else {
@@ -1551,7 +1562,7 @@ async fn run_opencode_observer(
                     generation: &generation,
                     state,
                 };
-                let (admission, output) = match decode_and_track_opencode_live_data(
+                let decoded = match decode_and_track_opencode_live_data(
                     fence,
                     &mut tracker,
                     &data,
@@ -1564,16 +1575,20 @@ async fn run_opencode_observer(
                         );
                     },
                 ) {
-                    OpenCodeLiveData::Undecoded => {
-                        publish_opencode_agent_status(
+                    OpenCodeLiveData::Undecoded
+                        if !publish_opencode_agent_status(
                             &generation,
                             &root_session_id,
                             &data,
                             PromptEvidence::Fresh,
-                        );
-                        continue;
+                        ) =>
+                    {
+                        OpenCodeLiveData::Malformed
                     }
-                    OpenCodeLiveData::Stale => continue,
+                    decoded => decoded,
+                };
+                let (admission, output) = match decoded {
+                    OpenCodeLiveData::Undecoded | OpenCodeLiveData::Stale => continue,
                     OpenCodeLiveData::Malformed => {
                         generation.clear_ready_for_prompt();
                         stream = None;
@@ -1670,14 +1685,22 @@ async fn hydrate_opencode_root_status(
 
 /// Publishes the root session's state an OpenCode event reports, for the left panel (#187). It
 /// decodes only the fields that state needs, so no prompt or message text is read or kept.
+///
+/// Returns false for data that is not JSON: an event the stream lost, which the caller treats
+/// as a broken stream, as the live path's `Malformed` does. JSON of an unexpected shape is only
+/// ignored.
 fn publish_opencode_agent_status(
     generation: &TerminalObserverGenerationLease,
     root_session_id: &str,
     data: &[u8],
     evidence: PromptEvidence,
-) {
-    if let Ok(event) = serde_json::from_slice::<OpenCodeStatusEvent>(data) {
-        event.publish(generation, root_session_id, evidence);
+) -> bool {
+    match serde_json::from_slice::<OpenCodeStatusEvent>(data) {
+        Ok(event) => {
+            event.publish(generation, root_session_id, evidence);
+            true
+        }
+        Err(error) => error.is_data(),
     }
 }
 

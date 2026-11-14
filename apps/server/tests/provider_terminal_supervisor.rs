@@ -15767,14 +15767,15 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_activity_toggle_opencode_failed_handoff_stays_dormant() {
+async fn agent_activity_toggle_opencode_failed_handoff_reattaches_a_fresh_stream() {
+    // The old stream's events were discarded during the handoff and those it still holds
+    // predate it, so a failed handoff closes it and attaches again instead of reading it.
     own_process!(isolated);
     let fixture = OpenCodeToggleFixture::open(vec![
         OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
         OpenCodeFixtureStreamScript::new([Err("injected replacement stream failure".to_owned())]),
     ])
     .await;
-    let unary_before = opencode_history_call_count(&fixture.remote_state);
     fixture.manager.set_agent_activity_enabled(false).await;
 
     let failed = fixture.manager.set_agent_activity_enabled(true).await;
@@ -15782,24 +15783,19 @@ async fn agent_activity_toggle_opencode_failed_handoff_stays_dormant() {
         (failed.resumed, failed.failed, failed.unavailable),
         (0, 1, 1)
     );
-    assert_eq!(
-        fixture.remote_state.open_streams.load(Ordering::Acquire),
-        1,
-        "failed replacement is dropped while the dormant stream remains"
-    );
-    push_raw_dormant_frame(&fixture.remote_state, b"data: still-not-json\n\n");
-    wait_for_opencode_discard_count(&fixture.remote_state, 1).await;
-    assert_eq!(
-        fixture
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
             .remote_state
-            .decoded_activity_events
-            .load(Ordering::Acquire),
-        0
-    );
-    assert_eq!(
-        opencode_history_call_count(&fixture.remote_state),
-        unary_before
-    );
+            .opened_stream_count
+            .load(Ordering::Acquire)
+            < 3
+            || fixture.remote_state.open_streams.load(Ordering::Acquire) != 1
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer closes the old stream and attaches a new one");
     assert!(!fixture.backend.latest().killed.load(Ordering::Acquire));
     fixture.finish().await;
     isolated.complete();
