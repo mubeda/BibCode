@@ -587,11 +587,7 @@ async fn a_hosted_agents_running_turn_is_not_an_outside_agents() {
     harness
         .repositories
         .database()
-        .call(|connection| {
-            Ok(crate::mcp::activity::attributed_running_turn_count(
-                connection,
-            )?)
-        })
+        .call(|connection| crate::mcp::activity::attributed_running_turn_count(connection))
         .await
         .map(|count| assert_eq!(count, 0, "no outside agent's turn"))
         .expect("the running turns read without error");
