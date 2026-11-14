@@ -2245,3 +2245,219 @@ mod no_user_authority {
         harness.shutdown().await;
     }
 }
+
+// ---- Task 6.3: idempotent sends ----
+
+mod idempotent_sends {
+    use super::*;
+
+    fn with_id(to: &str, text: &str, id: &str) -> Value {
+        json!({ "to": to, "text": text, "clientRequestId": id })
+    }
+
+    impl Harness {
+        /// The rows of `agent_messages`, the queue entries of `thread_id` and the projected
+        /// user messages of `thread_id`.
+        async fn stored_counts(&self, thread_id: &'static str) -> (usize, usize, i64) {
+            let projected = self
+                .repositories
+                .database()
+                .call(move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM projection_thread_messages WHERE thread_id = ?1 AND role = 'user'",
+                        [thread_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .expect("projected messages");
+            (
+                self.agent_messages().await.len(),
+                self.outbox_states(thread_id).await.len(),
+                projected,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_a_timeout() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        let first = harness
+            .agent_send("a", with_id("thread:b", "Which port?", "k"))
+            .await;
+        let retry = harness
+            .agent_send("a", with_id("thread:b", "Which port?", "k"))
+            .await;
+
+        assert_eq!(structured(&first)["messageId"], structured(&retry)["messageId"]);
+        assert_eq!(
+            structured(&first)["conversationId"],
+            structured(&retry)["conversationId"]
+        );
+        assert_eq!(harness.stored_counts("b").await, (1, 1, 1));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_id_other_arguments() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let first = harness
+            .agent_send("a", with_id("thread:b", "Which port?", "k"))
+            .await;
+        let m1 = structured(&first)["messageId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let to_a = harness.sent("b", "thread:a").await;
+
+        for (label, result) in [
+            (
+                "other text",
+                harness
+                    .agent_send("a", with_id("thread:b", "Which host?", "k"))
+                    .await,
+            ),
+            (
+                "other recipient",
+                harness
+                    .agent_send("a", with_id("thread:p", "Which port?", "k"))
+                    .await,
+            ),
+            (
+                "a reply",
+                harness
+                    .agent_tool(
+                        "a",
+                        "agent_message_reply",
+                        json!({ "inReplyTo": to_a, "text": "Which port?", "clientRequestId": "k" }),
+                    )
+                    .await,
+            ),
+        ] {
+            assert_eq!(error_tag(&result), "AgentMessagingConflictError", "{label}");
+            assert_eq!(
+                result["structuredContent"]["error"]["message"],
+                "This clientRequestId was already used for a different message. Use a new id.",
+                "{label}"
+            );
+        }
+        let stored = harness.agent_messages().await;
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert_eq!(stored[0].message_id, m1);
+        assert!(harness.outbox_states("p").await.is_empty());
+        assert_eq!(harness.outbox_states("b").await.len(), 1);
+        assert_eq!(harness.outbox_states("a").await.len(), 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_retry_is_idempotent() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        let arguments = json!({ "inReplyTo": m1, "text": "Port 5173", "clientRequestId": "k" });
+
+        let first = harness
+            .agent_tool("b", "agent_message_reply", arguments.clone())
+            .await;
+        let retry = harness
+            .agent_tool("b", "agent_message_reply", arguments)
+            .await;
+
+        assert_eq!(structured(&first)["messageId"], structured(&retry)["messageId"]);
+        assert_eq!(harness.agent_messages().await.len(), 2, "m1 and one reply");
+        assert_eq!(harness.outbox_states("a").await.len(), 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_id_belongs_to_one_sender() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        let from_a = harness
+            .agent_send("a", with_id("thread:b", "Which port?", "k"))
+            .await;
+        let from_p = harness
+            .agent_send("p", with_id("thread:b", "Which host?", "k"))
+            .await;
+
+        assert_ne!(from_p["isError"], true, "{from_p}");
+        assert_ne!(
+            structured(&from_a)["messageId"],
+            structured(&from_p)["messageId"]
+        );
+        assert_eq!(harness.agent_messages().await.len(), 2);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_with_one_id_store_one_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging(true);
+
+        let (first, second) = tokio::join!(
+            run(
+                scope("a"),
+                "agent_message_send",
+                with_id("thread:b", "Which port?", "k"),
+                Some(&messaging)
+            ),
+            run(
+                scope("a"),
+                "agent_message_send",
+                with_id("thread:b", "Which port?", "k"),
+                Some(&messaging)
+            ),
+        );
+
+        assert_eq!(
+            structured(&first)["messageId"],
+            structured(&second)["messageId"]
+        );
+        assert_eq!(
+            harness.stored_counts("b").await,
+            (1, 1, 1),
+            "the losing call leaves no queue entry and no projected message"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn no_id_means_no_deduplication() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        harness.sent("a", "thread:b").await;
+        harness.sent("a", "thread:b").await;
+
+        assert_eq!(harness.agent_messages().await.len(), 2);
+        assert_eq!(harness.outbox_states("b").await.len(), 2);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_retry_while_messaging_is_off_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let first = harness
+            .agent_send("a", with_id("thread:b", "Which port?", "k"))
+            .await;
+        assert_ne!(first["isError"], true, "{first}");
+
+        let retry = run(
+            scope("a"),
+            "agent_message_send",
+            with_id("thread:b", "Which port?", "k"),
+            Some(&harness.messaging(false)),
+        )
+        .await;
+
+        assert_eq!(error_tag(&retry), "AgentMessagingDisabledError");
+        harness.shutdown().await;
+    }
+}
