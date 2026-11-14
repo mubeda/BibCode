@@ -704,8 +704,9 @@ pub(crate) fn agent_message_sink(activity: McpActivity) -> OutcomeSink {
     agent_message_writer(activity).0
 }
 
-/// Records each agent messaging outcome as one content-free row: ids, the two thread titles
-/// and a state name, never message text. The sink maps the outcome to its row in the caller,
+/// Records each agent messaging outcome as one row of ids, addresses, the two thread titles and
+/// a state name, never message text; a title is free text a person or an agent wrote. The
+/// sink maps the outcome to its row in the caller,
 /// so the queue never holds a caller's raw input, and never waits: past
 /// [`MESSAGE_QUEUE`] rows it drops the row and counts it. One task writes the rows in the
 /// order they arrive, until [`AgentMessageWriter::close`]. Call it inside a Tokio runtime.
@@ -734,11 +735,8 @@ pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, Agent
     )
 }
 
-/// Rows an agent message writer queues at most.
+/// Rows and admission markers an agent message writer queues at most.
 const MESSAGE_QUEUE: usize = 1_024;
-/// Messages being admitted at most; past it every held row is written and the holds end, so an
-/// end marker the full queue dropped never keeps rows forever.
-const MOST_ADMITTING: usize = 1_024;
 
 /// One item for the writer: a row, or a marker of a message's admission.
 enum Queued {
@@ -792,11 +790,6 @@ async fn write_agent_messages(
         };
         match queued {
             Queued::AdmissionStarted(id) => {
-                if admitting.len() >= MOST_ADMITTING {
-                    for row in admitting.drain().flat_map(|(_, rows)| rows) {
-                        activity.record(row).await;
-                    }
-                }
                 admitting.insert(id, Vec::new());
             }
             Queued::Row {
@@ -842,14 +835,34 @@ impl AgentMessageWriter {
     /// the sink's queue, so a marker keeps its place among the rows.
     pub(crate) fn admissions(&self) -> AdmissionHook {
         let (sender, dropped) = (self.sender.clone(), self.dropped.clone());
+        // The place of each admission's end, reserved when it starts, so a full queue never
+        // drops an end and parks the message's rows. At most one per queue place.
+        let ends: Mutex<HashMap<String, mpsc::OwnedPermit<Queued>>> = Mutex::default();
         Arc::new(move |message_id: &str, started: bool| {
-            let message_id = message_id.to_owned();
-            let item = if started {
-                Queued::AdmissionStarted(message_id)
-            } else {
-                Queued::AdmissionEnded(message_id)
-            };
-            enqueue(&sender, &dropped, item);
+            let mut ends = ends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !started {
+                if let Some(end) = ends.remove(message_id) {
+                    end.send(Queued::AdmissionEnded(message_id.to_owned()));
+                }
+                return;
+            }
+            match (
+                sender.clone().try_reserve_owned(),
+                sender.clone().try_reserve_owned(),
+            ) {
+                (Ok(start), Ok(end)) => {
+                    start.send(Queued::AdmissionStarted(message_id.to_owned()));
+                    ends.insert(message_id.to_owned(), end);
+                }
+                // No room: no hold, so the message's rows are written as they come.
+                (Err(mpsc::error::TrySendError::Full(_)), _)
+                | (_, Err(mpsc::error::TrySendError::Full(_))) => {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
         })
     }
 
