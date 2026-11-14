@@ -659,7 +659,8 @@ impl Harness {
     /// Moves the message's queue entry through `steps`, as the turn queue would. The harness's
     /// own queue service may promote or claim the entry first: a step waits until the entry
     /// is in its `from` state and is skipped when the entry already reached or passed its `to`
-    /// state.
+    /// state. A step out of `queued` only waits: promotion is the queue's own command, which
+    /// also writes the turn marker that ties the message to the turn it starts.
     async fn delivery_moves(&self, message_id: &str, steps: &[(&str, &str)]) {
         let row = self.message_row(message_id).await;
         let command_id = row.delivery_command_id.expect("queue entry");
@@ -699,6 +700,7 @@ impl Harness {
                     break;
                 }
                 if entry.state == state(from)
+                    && *from != "queued"
                     && self
                         .engine
                         .transition_turn_delivery(TurnDeliveryTransition {
