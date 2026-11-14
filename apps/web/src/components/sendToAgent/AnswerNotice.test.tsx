@@ -42,6 +42,7 @@ vi.mock("~/state/sendRequests", () => ({
 }));
 
 import { useSendRequestOpenedStore } from "~/sendRequestOpenedStore";
+import { CenterSurfaceVisibleContext } from "../centerSurfaceVisibility";
 import { AnswerNotice, ANSWER_READ_FAILED } from "./AnswerNotice";
 import { SendRequestRows } from "./SendRequestRow";
 
@@ -219,6 +220,18 @@ describe("AnswerNotice", () => {
 
   it("showing the notice marks its request opened", () => {
     render();
+    expect(useSendRequestOpenedStore.getState().openedIds).toEqual(["request-1"]);
+  });
+
+  it("a notice on a hidden surface is not opened until the surface is shown", () => {
+    const tree = (visible: boolean) => (
+      <CenterSurfaceVisibleContext value={visible}>
+        <AnswerNotice request={request()} hostRef={HOST} onOpen={vi.fn()} onDismiss={vi.fn()} />
+      </CenterSurfaceVisibleContext>
+    );
+    act(() => root.render(tree(false)));
+    expect(useSendRequestOpenedStore.getState().openedIds).toEqual([]);
+    act(() => root.render(tree(true)));
     expect(useSendRequestOpenedStore.getState().openedIds).toEqual(["request-1"]);
   });
 });
