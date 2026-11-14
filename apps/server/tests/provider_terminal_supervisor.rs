@@ -4804,6 +4804,9 @@ struct CodexFixtureRemoteState {
     /// Full-history `thread/read` results by thread, served as Codex serves them: metadata for a
     /// read without turns, then `thread/turns/list` pages.
     histories: Mutex<BTreeMap<String, Value>>,
+    /// How many notifications a request buffers, as the real client bounds them: a full buffer
+    /// drops its oldest and reports the loss.
+    request_buffer_limit: Mutex<Option<usize>>,
 }
 
 struct CodexFixtureResumeRequestGuard {
@@ -4833,6 +4836,7 @@ struct CodexFixtureRemoteClient {
     state: Arc<CodexFixtureRemoteState>,
     events: Arc<Mutex<VecDeque<Value>>>,
     request_buffered_events: VecDeque<Value>,
+    lost_notifications: bool,
 }
 
 impl Drop for CodexFixtureRemoteClient {
@@ -4892,7 +4896,18 @@ impl CodexFixtureRemoteClient {
             .get_mut(&method)
             .and_then(VecDeque::pop_front)
         {
-            self.request_buffered_events.extend(events);
+            let limit = *self
+                .state
+                .request_buffer_limit
+                .lock()
+                .expect("request buffer limit lock");
+            for event in events {
+                if Some(self.request_buffered_events.len()) == limit {
+                    self.request_buffered_events.pop_front();
+                    self.lost_notifications = true;
+                }
+                self.request_buffered_events.push_back(event);
+            }
         }
         if let Some(error) = self
             .state
@@ -5065,6 +5080,10 @@ impl CodexRemoteClient for CodexFixtureRemoteClient {
         self.request_buffered_events.drain(..).collect()
     }
 
+    fn take_lost_notifications(&mut self) -> bool {
+        std::mem::take(&mut self.lost_notifications)
+    }
+
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + '_>> {
         Box::pin(async move {
             loop {
@@ -5156,6 +5175,7 @@ impl CodexRemoteClientFactory for CodexFixtureRemoteFactory {
                 state: self.state.clone(),
                 events,
                 request_buffered_events: VecDeque::new(),
+                lost_notifications: false,
             }) as Box<dyn CodexRemoteClient>)
         })
     }
@@ -5887,6 +5907,173 @@ async fn codex_reconnect_withdraws_readiness_until_an_event_after_its_resume() {
     .await;
     manager
         .close("thread-codex", Some("terminal-reconnect"))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// Opens a live Codex terminal whose root went idle, so it reads ready.
+#[cfg(unix)]
+async fn open_ready_codex_terminal(
+    terminal_id: &str,
+) -> (
+    tempfile::TempDir,
+    TerminalManager,
+    Arc<CodexFixtureRemoteState>,
+    String,
+) {
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let root_id = format!("{terminal_id}-root");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(&fixture, &root_id, root.path()));
+    let (manager, projection, scope) = open_codex_fixture_terminal_with_reattach_timeout(
+        &root,
+        &configured,
+        remote_state.clone(),
+        terminal_id,
+        Some(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(&root_id, serde_json::json!({"type": "idle"})));
+    wait_for_terminal_readiness(&manager, terminal_id, (TerminalAgentStatusState::Done, true))
+        .await;
+    (root, manager, remote_state, root_id)
+}
+
+/// Makes the reconciliation a completed root turn starts drop a `turn/started`: its first
+/// request buffers that turn and then two unrelated notifications into a buffer of two.
+#[cfg(unix)]
+fn script_codex_reconciliation_dropping_a_turn(state: &CodexFixtureRemoteState, root_id: &str) {
+    *state
+        .request_buffer_limit
+        .lock()
+        .expect("request buffer limit") = Some(2);
+    let unrelated = || codex_root_status("another-thread", serde_json::json!({"type": "idle"}));
+    state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("thread/backgroundTerminals/list".to_owned())
+        .or_default()
+        .push_back(vec![
+            serde_json::json!({
+                "method": "turn/started",
+                "params": {"threadId": root_id, "turn": {"id": "turn-2"}},
+            }),
+            unrelated(),
+            unrelated(),
+        ]);
+}
+
+#[cfg(unix)]
+fn codex_turn_completed(root_id: &str) -> Value {
+    serde_json::json!({
+        "method": "turn/completed",
+        "params": {"threadId": root_id, "turn": {"id": "turn-1", "status": "completed"}},
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reconciliation_that_drops_a_turn_leaves_the_terminal_not_ready() {
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-loss";
+    let (_root, manager, remote_state, root_id) = open_ready_codex_terminal(terminal).await;
+    script_codex_reconciliation_dropping_a_turn(&remote_state, &root_id);
+    let reconciliations = count_codex_method_calls(&remote_state, "thread/list");
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&root_id));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while count_codex_method_calls(&remote_state, "thread/list") == reconciliations
+            || remote_state
+                .request_buffered_deliveries
+                .load(Ordering::Acquire)
+                < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reconciliation runs and its buffered notifications are read");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        terminal_readiness(&manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "a reconciliation that dropped a turn left the terminal ready"
+    );
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(&root_id, serde_json::json!({"type": "idle"})));
+    wait_for_terminal_readiness(&manager, terminal, (TerminalAgentStatusState::Done, true)).await;
+    manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reconciliation_interrupted_by_an_activity_change_leaves_the_terminal_not_ready() {
+    // Mutation caught: a reconciliation interrupted by an activity change draining its buffered
+    // notifications without the loss they reported, so a dropped turn/started leaves a busy
+    // terminal ready on a quiet connection.
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-interrupted";
+    let (_root, manager, remote_state, root_id) = open_ready_codex_terminal(terminal).await;
+    script_codex_reconciliation_dropping_a_turn(&remote_state, &root_id);
+    remote_state
+        .request_delays
+        .lock()
+        .expect("request delays")
+        .entry("thread/list".to_owned())
+        .or_default()
+        .push_back(std::time::Duration::from_secs(5));
+    let reconciliations = count_codex_method_calls(&remote_state, "thread/list");
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&root_id));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while count_codex_method_calls(&remote_state, "thread/list") == reconciliations {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reconciliation holds its thread/list request");
+
+    let disabled = manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        terminal_readiness(&manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "an interrupted reconciliation that dropped a turn left the terminal ready"
+    );
+    manager
+        .close("thread-codex", Some(terminal))
         .await
         .expect("close Codex terminal");
     manager.shutdown().await;
@@ -13326,6 +13513,10 @@ struct OpenCodeFixtureRemoteState {
     timeline: Arc<Mutex<Vec<&'static str>>>,
     root_session_id: Mutex<String>,
     root_session_ids: Mutex<VecDeque<String>>,
+    /// How many of the next event stream openings fail at once.
+    open_stream_failures: AtomicUsize,
+    /// Dormant streams hand their data to the status reader, as the real streams do.
+    dormant_reads_data: AtomicBool,
     #[cfg(unix)]
     exit_helper_on_create_root: Mutex<Option<Arc<ActualExitedOpenCodeHelperLauncher>>>,
 }
@@ -13452,6 +13643,18 @@ impl OpenCodeEventStream for OpenCodeFixtureEventStream {
                     .expect("OpenCode remote calls")
                     .push("sse".to_owned());
                 return Ok(data);
+            }
+        })
+    }
+
+    fn next_dormant_data(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+        Box::pin(async move {
+            if self.state.dormant_reads_data.load(Ordering::Acquire) {
+                self.next_data().await.map(Some)
+            } else {
+                self.discard_next().await.map(|()| None)
             }
         })
     }
@@ -13658,6 +13861,14 @@ impl OpenCodeRemoteClient for OpenCodeFixtureRemoteClient {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>> + Send + '_>>
     {
         Box::pin(async move {
+            if self
+                .state
+                .open_stream_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| left.checked_sub(1))
+                .is_ok()
+            {
+                return Err("injected OpenCode event stream failure".to_owned());
+            }
             let script = self
                 .state
                 .stream_scripts
@@ -14955,6 +15166,139 @@ async fn opencode_terminal_reads_ready_only_after_a_fresh_idle_on_its_live_strea
         &fixture.manager,
         terminal,
         (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+fn opencode_root_idle_frame() -> Vec<u8> {
+    opencode_fixture_event_frame(serde_json::json!({
+        "type": "session.idle",
+        "properties": {"sessionID": "root-tui-session"},
+    }))
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_failed_replacement_never_restores_readiness_from_the_old_stream() {
+    // Mutation caught: a replacement that fails while the old stream is healthy keeping that
+    // stream and reading an idle it queued before the transition as fresh evidence.
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    fixture
+        .remote_state
+        .dormant_reads_data
+        .store(true, Ordering::Release);
+    let terminal = "terminal-opencode-toggle";
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The old stream holds an idle the observer has not read yet when the replacement starts.
+    fixture
+        .remote_state
+        .active_streams
+        .lock()
+        .expect("active OpenCode streams")
+        .first()
+        .expect("the status-only OpenCode stream")
+        .frames
+        .lock()
+        .expect("OpenCode stream frames")
+        .push_back(Ok(opencode_root_idle_frame()));
+    assert_eq!(
+        terminal_readiness(&fixture.manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "the queued idle was read before the replacement"
+    );
+    fixture
+        .remote_state
+        .open_stream_failures
+        .store(1, Ordering::Release);
+
+    fixture
+        .projection
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    fixture.manager.set_agent_activity_enabled(true).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture
+            .remote_state
+            .open_stream_failures
+            .load(Ordering::Acquire)
+            > 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the replacement tries to open its stream");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        terminal_readiness(&fixture.manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "an idle from before the failed replacement made the terminal ready"
+    );
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_malformed_data_withdraws_readiness_with_activity_off() {
+    // Mutation caught: the dormant stream ignoring an event it cannot decode, so an event the
+    // observer lost leaves the terminal ready.
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    fixture
+        .remote_state
+        .dormant_reads_data
+        .store(true, Ordering::Release);
+    let terminal = "terminal-opencode-toggle";
+    // A read that began before the switch still discards: give it a frame of its own.
+    push_raw_dormant_frame(&fixture.remote_state, &opencode_fixture_connected_frame());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture
+            .remote_state
+            .active_streams
+            .lock()
+            .expect("active OpenCode streams")
+            .first()
+            .is_some_and(|stream| !stream.frames.lock().expect("frames").is_empty())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dormant reader takes its frame");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    push_raw_dormant_frame(&fixture.remote_state, &opencode_root_idle_frame());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+
+    push_raw_dormant_frame(&fixture.remote_state, b"data: {not json\n\n");
+
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
     )
     .await;
     fixture.finish().await;
