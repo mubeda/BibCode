@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## [v0.16.0] - 2026-11-14
+
+BiBCode v0.16.0 adds custom themes, a Host dashboard for each environment, a Review changes button in Source Control and editable rendered Markdown, stops background status reads from taking Git's index lock, keeps terminal sizes correct across panels, displays and windows, and lists this computer's private addresses in Share this host. This release includes PRs #349, #359, #365 and #369 since v0.15.3.
 
 ### Diagnostics
 
@@ -71,6 +73,10 @@
 - **Fit to this window** now says when the server already holds the size, and a terminal no longer shows a transient size change of a few rows right after you return to it. (#353)
 - A new terminal tries the WebGL renderer again after an earlier terminal fell back to the standard one. (#353)
 - A client uses the typed-last size hand-over only with a server that says it has it, so a client and a server of different versions keep working. (#358)
+
+### Providers
+
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.323.
 
 ## [v0.15.3] - 2026-11-08
 
