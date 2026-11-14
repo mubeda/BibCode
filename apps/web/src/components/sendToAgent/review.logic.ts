@@ -170,7 +170,9 @@ async function submitToNewPanel(
       selection,
       send: async (panel) => (sent.outcome = await sendTo(panel)),
     });
-    if (result.threadId !== null && result.created && sent.outcome?.kind === "failed") {
+    // A created panel whose send failed, or one whose creation outcome is unknown (the response
+    // was lost; the panel may exist): the retry goes to this panel, never to a second one.
+    if (result.threadId !== null && sent.outcome?.kind !== "sent") {
       useSendToAgentStore.getState().rememberPanel(panelKey, result.threadId);
     }
   }
