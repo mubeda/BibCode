@@ -2644,51 +2644,46 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
     engine.shutdown().await;
     runtime.shutdown().await;
 
-    let summary: Vec<(&str, &str, Option<&str>)> = rows
-        .iter()
-        .rev()
-        .map(|row| {
-            (
-                row["tool"].as_str().unwrap(),
-                row["outcome"].as_str().unwrap(),
-                row["target"]["status"].as_str(),
-            )
-        })
-        .collect();
+    // The delivery service and the tracker run beside the calls, so each row is found on its
+    // own, never by its place among the others.
+    let count = |tool: &str, outcome: &str, status: &[Option<&str>], message: Option<&str>| {
+        rows.iter()
+            .filter(|row| {
+                row["tool"] == tool
+                    && row["outcome"] == outcome
+                    && status.contains(&row["target"]["status"].as_str())
+                    && row["target"]["messageId"].as_str() == message
+            })
+            .count()
+    };
+    let message = Some(message_id.as_str());
     assert_eq!(
-        summary[..3],
-        [
-            ("agent_message_send", "success", Some("accepted")),
-            (
-                "agent_message_send",
-                "AgentMessagingUnknownRecipientError",
-                None
-            ),
-            (
-                "agent_message_send",
-                "AgentMessagingInvalidArgumentError",
-                None
-            ),
-        ],
+        count(
+            "agent_message_send",
+            "success",
+            &[Some("accepted")],
+            message
+        ),
+        1,
         "{rows:?}"
     );
-    let deliveries = &summary[3..];
+    for tag in [
+        "AgentMessagingUnknownRecipientError",
+        "AgentMessagingInvalidArgumentError",
+    ] {
+        assert_eq!(
+            count("agent_message_send", tag, &[None], None),
+            1,
+            "{tag}: {rows:?}"
+        );
+    }
     assert!(
-        !deliveries.is_empty()
-            && deliveries.iter().all(|row| matches!(
-                row,
-                (
-                    "agent_message_delivery",
-                    "success",
-                    Some("delivered" | "consumed")
-                )
-            )),
-        "{rows:?}"
-    );
-    assert!(
-        rows[..deliveries.len()]
-            .iter()
-            .all(|row| row["target"]["messageId"] == message_id.as_str()),
+        count(
+            "agent_message_delivery",
+            "success",
+            &[Some("delivered"), Some("consumed")],
+            message
+        ) > 0,
         "{rows:?}"
     );
     let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
