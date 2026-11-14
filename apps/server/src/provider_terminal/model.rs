@@ -722,6 +722,18 @@ pub enum TerminalAgentReport {
     Progress,
 }
 
+/// Whether a provider event may make its terminal ready for a prompt. Only fresh evidence can;
+/// every observer transition withdraws readiness until fresh evidence returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptEvidence {
+    /// Read on the observer's active stream after that stream's last transition and after any
+    /// snapshot it took, so nothing the observer holds is newer.
+    Fresh,
+    /// A snapshot, an event buffered across a request or a transition, or one the observer drops:
+    /// its state is reported, which withdraws readiness, but never makes the terminal ready.
+    Stale,
+}
+
 /// One status observation: the state, whether the turn that ended failed, and when the
 /// observer saw it on this server's clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -731,6 +743,9 @@ pub struct TerminalAgentObservation {
     pub observed_at: std::time::Instant,
     /// The same moment on the wall clock: the evidence token clients age from their receipt.
     pub observed_wall: std::time::SystemTime,
+    /// The CLI waits for a prompt: set by [`TerminalObserverGenerationLease::mark_ready_for_prompt`]
+    /// on a done, unfailed observation; every new report starts without it.
+    pub ready_for_prompt: bool,
 }
 
 /// Lightweight generation identity shared with provider observer workers.
@@ -909,6 +924,7 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             }));
     }
 
@@ -950,9 +966,60 @@ impl TerminalObserverGenerationLease {
                 failed,
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
+                ready_for_prompt: false,
             });
             true
         });
+    }
+
+    /// Reports what one provider event says, then marks the terminal ready only when the event
+    /// says its CLI waits for a prompt and the evidence is fresh.
+    pub fn report_agent_evidence(
+        &self,
+        report: TerminalAgentReport,
+        ready: bool,
+        evidence: PromptEvidence,
+    ) {
+        self.report_agent_status(report);
+        if ready && evidence == PromptEvidence::Fresh {
+            self.mark_ready_for_prompt();
+        }
+    }
+
+    /// Marks the current observation ready for a prompt, only when it is done and did not fail,
+    /// atomically. Observers reach it through [`Self::report_agent_evidence`].
+    pub fn mark_ready_for_prompt(&self) {
+        if !self.is_current() {
+            return;
+        }
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation)
+                    if observation.state == TerminalAgentState::Done
+                        && !observation.failed
+                        && !observation.ready_for_prompt =>
+                {
+                    observation.ready_for_prompt = true;
+                    true
+                }
+                _ => false,
+            });
+    }
+
+    /// Withdraws readiness at an observer transition (attach, a stream replacement, a request
+    /// that buffers events, a lost connection or stream, the observer's end) until fresh
+    /// evidence returns. The state stays as last reported.
+    pub fn clear_ready_for_prompt(&self) {
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation) if observation.ready_for_prompt => {
+                    observation.ready_for_prompt = false;
+                    true
+                }
+                _ => false,
+            });
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it
@@ -1266,10 +1333,21 @@ pub trait TerminalLaunchPreparer: Send + Sync {
 }
 
 /// Replacement arguments for a provider terminal command, and environment entries to set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NativeTerminalCommand {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+/// Environment values can carry credentials, so only their keys are printed.
+impl fmt::Debug for NativeTerminalCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeTerminalCommand")
+            .field("args", &self.args)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 pub enum TerminalLaunchPreparation {

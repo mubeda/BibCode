@@ -5,9 +5,10 @@ use serde_json::{Value, json};
 
 use super::{
     TerminalAgentState::{Blocked, Done, Waiting, Working},
-    codex::{codex_resumed_agent_status, codex_root_agent_status},
+    claude::claude_hook_ready_for_prompt,
+    codex::{codex_resumed_agent_status, codex_root_agent_status, codex_root_ready_for_prompt},
     model::TerminalAgentReport,
-    opencode::opencode_root_agent_status,
+    opencode::{opencode_root_agent_status, opencode_root_ready_for_prompt},
 };
 use crate::provider::codex::model::ReconciliationThreadStatus;
 
@@ -193,4 +194,183 @@ fn opencode_root_events_map_to_the_main_agent_state() {
         ),
         None
     );
+}
+
+/// Which provider events say the CLI waits for a prompt. A fresh agent sends none of these
+/// before its first turn ends, so it reads not ready until then; its inbox still works.
+#[test]
+fn ready_for_prompt_follows_each_provider_event() {
+    let claude = |event: &str, notification: Option<&str>| {
+        let hook = serde_json::from_value(json!({
+            "hook_event_name": event,
+            "session_id": "session-1",
+            "tool_name": "Bash",
+            "notification_type": notification,
+        }))
+        .expect("a Claude status hook");
+        claude_hook_ready_for_prompt(&hook)
+    };
+    for (event, notification, ready) in [
+        ("SessionStart", None, false),
+        ("UserPromptSubmit", None, false),
+        ("PermissionRequest", None, false),
+        ("Elicitation", None, false),
+        ("PreToolUse", None, false),
+        // A project's own Stop hook can block the stop, and Claude then continues without a
+        // new prompt; only the idle notification proves the prompt waits.
+        ("Stop", None, false),
+        ("StopFailure", None, false),
+        ("SessionEnd", None, false),
+        ("Notification", Some("idle_prompt"), true),
+        ("Notification", Some("permission_prompt"), false),
+        ("Notification", Some("elicitation_dialog"), false),
+    ] {
+        assert_eq!(
+            claude(event, notification),
+            ready,
+            "Claude {event} {notification:?}"
+        );
+    }
+
+    let codex = |envelope: Value| codex_root_ready_for_prompt(&envelope, "root");
+    let status = |status: Value| json!({"method":"thread/status/changed","params":{"threadId":"root","status":status}});
+    let request = |method: &str| json!({"id":7,"method":method,"params":{"threadId":"root"}});
+    for (row, envelope, ready) in [
+        ("idle", status(json!({"type":"idle"})), true),
+        ("systemError", status(json!({"type":"systemError"})), false),
+        (
+            "active",
+            status(json!({"type":"active","activeFlags":[]})),
+            false,
+        ),
+        (
+            "waitingOnApproval",
+            status(json!({"type":"active","activeFlags":["waitingOnApproval"]})),
+            false,
+        ),
+        (
+            "waitingOnUserInput",
+            status(json!({"type":"active","activeFlags":["waitingOnUserInput"]})),
+            false,
+        ),
+        (
+            "turn/started",
+            json!({"method":"turn/started","params":{"threadId":"root"}}),
+            false,
+        ),
+        (
+            "turn/completed completed",
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"status":"completed"}}}),
+            true,
+        ),
+        (
+            "turn/completed failed",
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"status":"failed"}}}),
+            false,
+        ),
+        (
+            "approval",
+            request("item/commandExecution/requestApproval"),
+            false,
+        ),
+        (
+            "requestUserInput",
+            request("item/tool/requestUserInput"),
+            false,
+        ),
+        (
+            "a subagent's idle",
+            json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"idle"}}}),
+            false,
+        ),
+    ] {
+        assert_eq!(codex(envelope), ready, "Codex {row}");
+    }
+    // A `thread/resume` status is a snapshot: it reports a state and never makes the terminal
+    // ready (`codex_attach_takes_readiness_only_from_events_after_its_resume`).
+
+    let opencode = |event_type: &str, properties: Value| {
+        opencode_root_ready_for_prompt(
+            &json!({ "type": event_type, "properties": properties }),
+            "root",
+        )
+    };
+    let session_status = |kind: &str| json!({"sessionID":"root","status":{"type":kind}});
+    for (event_type, properties, ready) in [
+        ("session.idle", json!({"sessionID":"root"}), true),
+        ("session.status", session_status("idle"), true),
+        ("session.status", session_status("busy"), false),
+        ("session.status", session_status("retry"), false),
+        ("session.error", json!({"sessionID":"root"}), false),
+        ("permission.asked", json!({"sessionID":"root"}), false),
+        ("question.asked", json!({"sessionID":"root"}), false),
+        ("session.idle", json!({"sessionID":"child"}), false),
+    ] {
+        assert_eq!(
+            opencode(event_type, properties.clone()),
+            ready,
+            "OpenCode {event_type} {properties}"
+        );
+    }
+}
+
+/// A lost Codex connection cannot see the agent's next turn or approval, so a terminal that was
+/// idle stops reading ready while its state stays as last reported.
+#[test]
+fn a_lost_codex_connection_withdraws_readiness() {
+    let generation = super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+    let lease = generation.observation();
+    lease.publish_agent_status(Done, false);
+    lease.mark_ready_for_prompt();
+    let activity = super::TerminalAgentActivityControl::enabled();
+
+    super::codex::publish_codex_observation_lost(&activity, &lease, 3);
+
+    let status = lease.subscribe_agent_status().borrow().expect("a status");
+    assert_eq!(status.state, Done);
+    assert!(
+        !status.ready_for_prompt,
+        "a lost connection still reads ready"
+    );
+    assert_eq!(
+        activity
+            .latest_observation()
+            .map(|observation| observation.kind),
+        Some(super::TerminalAgentActivityObservationKind::Unavailable)
+    );
+}
+
+/// Only fresh evidence that says the CLI waits makes a terminal ready; any other report,
+/// stale or not, withdraws readiness.
+#[test]
+fn readiness_needs_fresh_evidence_and_any_other_report_withdraws_it() {
+    use super::model::PromptEvidence::{Fresh, Stale};
+    let idle = TerminalAgentReport::Set(Done, false);
+    for (report, says_ready, evidence, ready) in [
+        (idle, true, Fresh, true),
+        (idle, true, Stale, false),
+        (idle, false, Fresh, false),
+        (TerminalAgentReport::Set(Done, true), true, Fresh, false),
+        (
+            TerminalAgentReport::Set(Working, false),
+            false,
+            Stale,
+            false,
+        ),
+        (TerminalAgentReport::Progress, false, Fresh, false),
+    ] {
+        let generation =
+            super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        lease.publish_agent_status(Done, false);
+        lease.mark_ready_for_prompt();
+
+        lease.report_agent_evidence(report, says_ready, evidence);
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(
+            status.ready_for_prompt, ready,
+            "{report:?} saying ready {says_ready} as {evidence:?}"
+        );
+    }
 }

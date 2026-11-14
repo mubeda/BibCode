@@ -37,7 +37,9 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
-use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
+use super::model::{
+    PromptEvidence, TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease,
+};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -194,7 +196,7 @@ impl fmt::Debug for ClaudeShimResolution {
 }
 
 /// A launch of a multi-call shim, as the terminal would start it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ClaudeShimRequest<'a> {
     /// The path the terminal invokes, such as `~/.local/share/mise/shims/claude`.
     pub invoked: &'a Path,
@@ -203,6 +205,23 @@ pub struct ClaudeShimRequest<'a> {
     pub cwd: &'a Path,
     pub launch_env: &'a BTreeMap<String, String>,
     pub process_attribution: &'a ProcessAttributionRegistry,
+}
+
+/// The launch environment carries the terminal's credential, so only its keys are printed.
+impl fmt::Debug for ClaudeShimRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeShimRequest")
+            .field("invoked", &self.invoked)
+            .field("manager", &self.manager)
+            .field("cwd", &self.cwd)
+            .field(
+                "launch_env_keys",
+                &self.launch_env.keys().collect::<Vec<_>>(),
+            )
+            .field("process_attribution", &self.process_attribution)
+            .finish()
+    }
 }
 
 /// Finds the real install behind a multi-call shim. Its answer is untrusted: preparation
@@ -1552,6 +1571,8 @@ async fn drive_claude_observer(
             }
         }
     }
+    // No hook can arrive now, so the next turn or ask would go unseen.
+    generation.clear_ready_for_prompt();
     publish_claude_listener_unavailable(&inner);
     interrupt_claude_activity(&inner, &active_actors, &active_work_items, event_sequence).await;
     // A hook server that ended on its own leaves the process running its pinned copy with its
@@ -1989,7 +2010,7 @@ const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
 /// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
 /// prompt, message and tool content included.
 #[derive(Debug, Default, serde::Deserialize)]
-struct ClaudeStatusHook {
+pub(super) struct ClaudeStatusHook {
     #[serde(default)]
     hook_event_name: Option<String>,
     #[serde(default)]
@@ -2031,9 +2052,12 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
         }
     }
     match report {
-        ClaudeAgentReport::Set(agent_state, failed) => {
-            state.status.publish_agent_status(agent_state, failed);
-        }
+        // Claude's hooks are its only stream and carry no snapshot, so each one is fresh.
+        ClaudeAgentReport::Set(agent_state, failed) => state.status.report_agent_evidence(
+            TerminalAgentReport::Set(agent_state, failed),
+            claude_hook_ready_for_prompt(hook),
+            PromptEvidence::Fresh,
+        ),
         ClaudeAgentReport::ToolFinished => {
             state
                 .status
@@ -2042,6 +2066,16 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
                 })
         }
     }
+}
+
+/// Whether a Claude hook proves the CLI waits for the user's next prompt: only Claude's
+/// `idle_prompt` notification does, sent once the prompt has waited for input a while. `Stop`
+/// does not: a Stop hook of the project or the user runs beside this one and can block the
+/// stop, and Claude then continues without a new prompt and without another hook to say so.
+pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
+    safe_text(hook.session_id.as_deref()).is_some()
+        && safe_text(hook.hook_event_name.as_deref()) == Some("Notification")
+        && safe_text(hook.notification_type.as_deref()) == Some("idle_prompt")
 }
 
 /// The main agent's state a Claude hook reports, for the left panel (#187). A subagent's own
@@ -4254,6 +4288,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hook_server_that_ends_withdraws_readiness() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let generation = TerminalObserverGeneration::new(
+            "thread-hook-exit".to_owned(),
+            "terminal-hook-exit".to_owned(),
+        );
+        let root = tempfile::tempdir().expect("observer resources");
+        let generation_dir = root.path().join("generation");
+        std::fs::create_dir(&generation_dir).expect("generation directory");
+        let inner = Arc::new(ClaudeObserverInner {
+            resources: Arc::new(ClaudeObserverResources {
+                listener: Mutex::new(None),
+                overlay_path: generation_dir.join("settings.json"),
+                runtime_dir: root.path().to_path_buf(),
+                generation_dir,
+                cleaned: AtomicBool::new(false),
+            }),
+            publisher: TerminalGenerationActivityPublisher::new(
+                generation.clone(),
+                projection,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+            provider_instance_id: "claudeAgent".to_owned(),
+            token: Arc::new("unused".to_owned()),
+            correlation: Arc::new("unused".to_owned()),
+            spawned: AtomicBool::new(true),
+            activity: Arc::new(TerminalAgentActivityControl::enabled()),
+            listener_lifecycle: AtomicU64::new(pack_claude_listener_lifecycle(
+                ClaudeListenerLifecycle {
+                    ready: true,
+                    epoch: 1,
+                },
+            )),
+        });
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let (_requests, receiver) = mpsc::channel(1);
+
+        drive_claude_observer(inner, lease.clone(), receiver, Box::pin(async {})).await;
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Done);
+        assert!(
+            !status.ready_for_prompt,
+            "a terminal whose hooks can no longer arrive reads ready"
+        );
+    }
+
+    #[tokio::test]
     async fn dormant_shutdown_reconciliation_does_not_publish_interruptions() {
         let database = Database::open_in_memory().await.expect("database");
         database
@@ -4422,6 +4514,66 @@ mod tests {
         let kept = format!("{hook:?}");
         for private in ["private prompt", "private tool", "transcript"] {
             assert!(!kept.contains(private), "{kept}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_idle_notification_makes_a_claude_terminal_ready() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let status = generation.observation().subscribe_agent_status();
+        let (requests, _request_receiver) = mpsc::channel(4);
+        let state = ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+            status_session: Arc::new(Mutex::new(None)),
+        };
+
+        for (event, notification, expected) in [
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
+            ("Stop", None, (TerminalAgentState::Done, false)),
+            (
+                "Notification",
+                Some("idle_prompt"),
+                (TerminalAgentState::Done, true),
+            ),
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer token".parse().unwrap());
+            headers.insert(
+                CLAUDE_HOOK_CORRELATION_HEADER,
+                "correlation".parse().unwrap(),
+            );
+            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let body = json!({
+                "hook_event_name": event,
+                "session_id": "s",
+                "notification_type": notification,
+            });
+            let response =
+                capture_claude_hook(State(state.clone()), headers, Body::from(body.to_string()))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{event}");
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| (observation.state, observation.ready_for_prompt)),
+                Some(expected),
+                "{event} {notification:?}"
+            );
         }
     }
 

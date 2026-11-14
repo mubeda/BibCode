@@ -318,6 +318,11 @@ export const TerminalAgentStatus = Schema.Struct({
   ageMs: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /** When the observer reported it, on the server's clock: changes with every new report. */
   observedAt: Schema.optional(Schema.String.check(Schema.isMaxLength(64))),
+  /**
+   * The agent finished its turn and its CLI waits for a prompt: only a done state the observer
+   * reported, never a fresh or exited agent. Absent means not ready.
+   */
+  readyForPrompt: Schema.optional(Schema.Boolean),
 });
 export type TerminalAgentStatus = typeof TerminalAgentStatus.Type;
 

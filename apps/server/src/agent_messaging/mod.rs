@@ -7,6 +7,7 @@ pub(crate) mod directory;
 pub(crate) mod envelope;
 pub(crate) mod policy;
 pub mod store;
+pub mod terminal_credential;
 
 use std::sync::Arc;
 

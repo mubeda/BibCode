@@ -5650,6 +5650,335 @@ async fn agent_activity_toggle_codex_retains_connection_and_crosses_ordered_barr
     isolated.complete();
 }
 
+fn codex_root_status(root_id: &str, status: Value) -> Value {
+    serde_json::json!({
+        "method": "thread/status/changed",
+        "params": {"threadId": root_id, "status": status},
+    })
+}
+
+/// The terminal's current agent state and whether it reads ready for a prompt.
+async fn terminal_readiness(
+    manager: &TerminalManager,
+    terminal_id: &str,
+) -> Option<(TerminalAgentStatusState, bool)> {
+    manager
+        .subscribe_metadata()
+        .await
+        .initial
+        .iter()
+        .find(|summary| summary.terminal_id == terminal_id)
+        .and_then(|summary| summary.agent_status.as_ref())
+        .map(|status| (status.state, status.ready_for_prompt))
+}
+
+async fn wait_for_terminal_readiness(
+    manager: &TerminalManager,
+    terminal_id: &str,
+    expected: (TerminalAgentStatusState, bool),
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while terminal_readiness(manager, terminal_id).await != Some(expected) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{terminal_id} never reported {expected:?}"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_attach_takes_readiness_only_from_events_after_its_resume() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-attach-root",
+            root.path(),
+        ));
+    // The resume answers working, and an idle that arrived while it was in flight is buffered:
+    // the idle is not ordered after the answer, so it may report Done but not readiness. (The
+    // reconnect test covers a resume that answers idle.)
+    remote_state
+        .resume_responses
+        .lock()
+        .expect("resume responses")
+        .push_back(Ok(serde_json::json!({
+            "thread": {
+                "id": "terminal-attach-root",
+                "parentThreadId": null,
+                "turns": [],
+                "status": {"type": "active", "activeFlags": []},
+            },
+        })));
+    remote_state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("thread/resume".to_owned())
+        .or_default()
+        .push_back(vec![codex_root_status(
+            "terminal-attach-root",
+            serde_json::json!({"type": "idle"}),
+        )]);
+    let (manager, projection, scope) = open_codex_fixture_terminal_with_reattach_timeout(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-attach",
+        Some(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while remote_state
+            .request_buffered_deliveries
+            .load(Ordering::Acquire)
+            == 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the buffered idle is delivered");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(
+        terminal_readiness(&manager, "terminal-attach").await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "a resume snapshot or an idle buffered with it made the terminal ready"
+    );
+
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-attach-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-attach",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-attach"))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reconnect_withdraws_readiness_until_an_event_after_its_resume() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-reconnect-root",
+            root.path(),
+        ));
+    let (manager, projection, scope) = open_codex_fixture_terminal_with_reattach_timeout(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-reconnect",
+        Some(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-reconnect-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-reconnect",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    // With activity off no enable barrier follows the reconnect, so only the resume decides.
+    let disabled = manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
+    let connections_before = remote_state
+        .endpoints
+        .lock()
+        .expect("Codex endpoints")
+        .len();
+    // The reconnect's resume answers idle: a snapshot, which must not make it ready again.
+    remote_state
+        .resume_responses
+        .lock()
+        .expect("resume responses")
+        .push_back(Ok(serde_json::json!({
+            "thread": {
+                "id": "terminal-reconnect-root",
+                "parentThreadId": null,
+                "turns": [],
+                "status": {"type": "idle"},
+            },
+        })));
+
+    remote_state
+        .next_errors
+        .lock()
+        .expect("next errors")
+        .push_back("Codex remote read failed: connection reset".to_owned());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while remote_state
+            .endpoints
+            .lock()
+            .expect("Codex endpoints")
+            .len()
+            == connections_before
+            || remote_state
+                .completed_resume_responses
+                .load(Ordering::Acquire)
+                < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer reconnects and resumes");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        terminal_readiness(&manager, "terminal-reconnect").await,
+        Some((TerminalAgentStatusState::Done, false)),
+        "a reconnect kept or restored readiness without a fresh event"
+    );
+
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-reconnect-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-reconnect",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-reconnect"))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_enable_barrier_keeps_a_turn_that_starts_during_it() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-barrier-root",
+            root.path(),
+        ));
+    let (manager, projection, scope) = open_codex_fixture_terminal_with_reattach_timeout(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-barrier",
+        Some(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-barrier-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-barrier",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+
+    let disabled = manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
+    remote_state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("account/read".to_owned())
+        .or_default()
+        .push_back(vec![serde_json::json!({
+            "method": "turn/started",
+            "params": {"threadId": "terminal-barrier-root", "turn": {"id": "turn-2"}},
+        })]);
+    let enabled = manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+
+    // A turn that started during the enable barrier must not be dropped.
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-barrier",
+        (TerminalAgentStatusState::Working, false),
+    )
+    .await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_status(
+            "terminal-barrier-root",
+            serde_json::json!({"type": "idle"}),
+        ));
+    wait_for_terminal_readiness(
+        &manager,
+        "terminal-barrier",
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-barrier"))
+        .await
+        .expect("close Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_activity_toggle_codex_status_only_launch_publishes_activity_once_enabled() {
@@ -14513,6 +14842,119 @@ async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_o
         &fixture.manager,
         "terminal-opencode-toggle",
         TerminalAgentStatusState::Blocked,
+    )
+    .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_terminal_reads_ready_only_after_a_fresh_idle_on_its_live_stream() {
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let terminal = "terminal-opencode-toggle";
+    let idle = || {
+        opencode_fixture_event_frame(serde_json::json!({
+            "type": "session.idle",
+            "properties": {"sessionID": "root-tui-session"},
+        }))
+    };
+    // The status read at attach is a snapshot: the terminal is done but not ready.
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+
+    let stream = fixture
+        .remote_state
+        .active_streams
+        .lock()
+        .expect("active OpenCode streams")
+        .first()
+        .cloned()
+        .expect("the live OpenCode stream");
+    stream
+        .frames
+        .lock()
+        .expect("OpenCode stream frames")
+        .push_back(Err("stream lost".to_owned()));
+    stream.notify.notify_one();
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .remote_state
+            .opened_stream_count
+            .load(Ordering::Acquire)
+            < 2
+            || fixture
+                .remote_state
+                .active_streams
+                .lock()
+                .expect("active OpenCode streams")
+                .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observer opens a new stream");
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
+    )
+    .await;
+
+    // Turning activity off keeps the stream; turning it on replaces it, which withdraws
+    // readiness until the new stream carries an idle.
+    let disabled = fixture.manager.set_agent_activity_enabled(false).await;
+    assert_eq!((disabled.stopped, disabled.dormant), (1, 1));
+    let opened_before = fixture
+        .remote_state
+        .opened_stream_count
+        .load(Ordering::Acquire);
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    assert!(
+        fixture
+            .remote_state
+            .opened_stream_count
+            .load(Ordering::Acquire)
+            > opened_before,
+        "enabling activity replaced the stream"
+    );
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, false),
+    )
+    .await;
+    push_raw_dormant_frame(&fixture.remote_state, &idle());
+    wait_for_terminal_readiness(
+        &fixture.manager,
+        terminal,
+        (TerminalAgentStatusState::Done, true),
     )
     .await;
     fixture.finish().await;
