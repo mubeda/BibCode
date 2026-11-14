@@ -450,6 +450,12 @@ pub trait CodexRemoteClient: Send {
 
     fn drain_request_buffered_notifications(&mut self) -> Vec<Value>;
 
+    /// Whether a request dropped notifications it could not buffer since the last call. A
+    /// dropped turn or ask leaves the root's state unknown.
+    fn take_lost_notifications(&mut self) -> bool {
+        false
+    }
+
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + '_>>;
 }
 
@@ -5273,6 +5279,64 @@ mod tests {
             result.is_err(),
             "oversized WebSocket messages must fail before serde allocates their JSON graph"
         );
+        drop(client);
+        server.await.expect("UDS server");
+    }
+
+    /// Notifications a request buffers past the bound are dropped, oldest first; the client says
+    /// so once, so the observer can withdraw readiness for the turn or ask it may have missed.
+    #[tokio::test]
+    async fn system_remote_client_reports_notifications_it_dropped_during_a_request() {
+        let root = tempfile::tempdir().expect("UDS directory");
+        let socket_path = root.path().join("overflow-app-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind UDS");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept UDS client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket");
+            let request = socket
+                .next()
+                .await
+                .expect("request frame")
+                .expect("request message")
+                .into_text()
+                .expect("text request");
+            let request: Value = serde_json::from_str(&request).expect("request JSON");
+            for sequence in 0..=CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
+                let notification = json!({"method": "item/agentMessage/delta", "params": {"n": sequence}});
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        notification.to_string().into(),
+                    ))
+                    .await
+                    .expect("notification");
+            }
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id": request["id"], "result": {}}).to_string().into(),
+                ))
+                .await
+                .expect("response");
+            // Keep the socket open until the client is done.
+            let _ = socket.next().await;
+        });
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let mut client = SystemCodexRemoteClientFactory
+            .connect(&endpoint)
+            .await
+            .expect("connect real UDS");
+
+        client
+            .request("thread/read", json!({}))
+            .await
+            .expect("response");
+
+        assert!(
+            client.take_lost_notifications(),
+            "a notification the request dropped went unreported"
+        );
+        assert!(!client.take_lost_notifications(), "the loss is reported once");
         drop(client);
         server.await.expect("UDS server");
     }
