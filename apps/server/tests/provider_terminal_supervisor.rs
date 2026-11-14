@@ -6142,6 +6142,8 @@ struct ProbedCodexTerminal {
     root_id: String,
     database: Database,
     readiness: Arc<ReadinessProbe>,
+    projection: ActivityProjection,
+    scope: ActivityScopeRef,
 }
 
 #[cfg(unix)]
@@ -6215,6 +6217,8 @@ async fn open_probed_ready_codex_terminal(terminal_id: &str) -> ProbedCodexTermi
         root_id,
         database,
         readiness,
+        projection,
+        scope,
     }
 }
 
@@ -6346,6 +6350,59 @@ async fn codex_terminal_never_reads_ready_from_a_replayed_turn_a_newer_turn_supe
         ready_writes.load(Ordering::Acquire),
         0,
         "the terminal read ready while it published activity with turn-3's start still buffered"
+    );
+    probed
+        .manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    probed.manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_lossy_reconciliation_still_publishes_the_activity_it_kept() {
+    // Mutation caught: a reconciliation that dropped notifications discarding the ones it kept,
+    // so their activity never reaches the projection.
+    own_process!(isolated);
+    let terminal = "terminal-reconcile-lossy-activity";
+    let probed = open_probed_ready_codex_terminal(terminal).await;
+    *probed
+        .remote_state
+        .request_buffer_limit
+        .lock()
+        .expect("request buffer limit") = Some(2);
+    probed
+        .remote_state
+        .request_events
+        .lock()
+        .expect("Codex request events")
+        .entry("thread/backgroundTerminals/list".to_owned())
+        .or_default()
+        .push_back(vec![
+            codex_turn("turn/started", &probed.root_id, "turn-2", None),
+            codex_detail_notification(&probed.root_id, "kept-item", "kept-detail"),
+            codex_root_status("another-thread", serde_json::json!({"type": "idle"})),
+        ]);
+    probed
+        .remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_turn_completed(&probed.root_id));
+
+    wait_for_codex_root_detail(
+        &probed.projection,
+        &probed.scope,
+        &probed.root_id,
+        "kept-detail",
+    )
+    .await;
+    assert_ne!(
+        terminal_readiness(&probed.manager, terminal).await,
+        Some((TerminalAgentStatusState::Done, true)),
+        "a reconciliation that dropped a turn left the terminal ready"
     );
     probed
         .manager
