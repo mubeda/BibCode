@@ -1309,7 +1309,7 @@ async fn state_the_right_answer() {
     user_message(&harness, "b", "later-2").await;
     harness.provider_turn("b", "t2", "R2", true).await;
     user_message(&harness, "b", "later-3").await;
-    harness.provider_turn("b", "t3", "R3", true).await;
+    harness.provider_turn("b", "turn-third", "R3", true).await;
 
     // The follower starts after all three turns, so it must find the request's own turn.
     let stop = CancellationToken::new();
