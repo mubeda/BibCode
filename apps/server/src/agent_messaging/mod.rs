@@ -77,6 +77,8 @@ pub(crate) enum AgentMessagingError {
     Conflict,
     /// The exchange reached the hop limit; a person has to write before agents continue.
     HopLimit,
+    /// The message was already handed to its recipient, or its status is final.
+    NotCancellable,
     /// The sender sent its allowance of agent messages in the rate window.
     RateLimit,
     /// The recipient has its allowance of agent messages it has not read.
@@ -96,6 +98,7 @@ impl AgentMessagingError {
             Self::ModeCeiling { .. } => "AgentMessagingModeCeilingError",
             Self::Conflict => "AgentMessagingConflictError",
             Self::HopLimit => "AgentMessagingHopLimitError",
+            Self::NotCancellable => "AgentMessagingNotCancellableError",
             Self::RateLimit => "AgentMessagingRateLimitError",
             Self::BacklogLimit => "AgentMessagingBacklogLimitError",
             Self::Storage => "McpStorageError",
@@ -122,6 +125,9 @@ impl AgentMessagingError {
                 "This exchange has reached the limit of {} agent-to-agent hops. A person has to write in a thread before agents can continue.",
                 policy::HOP_LIMIT
             ),
+            Self::NotCancellable => {
+                "That message was already delivered, so it cannot be cancelled.".to_owned()
+            }
             Self::RateLimit => format!(
                 "You have sent {} agent messages in the last {} seconds, which is the limit. Wait before sending more.",
                 policy::RATE_LIMIT,
@@ -174,16 +180,23 @@ pub(crate) enum TurnAdmission {
     Start,
     /// Wait behind the turn that runs.
     Queue,
+    /// Wait in the recipient's paused queue until a person releases it (R18).
+    Hold,
 }
 
-/// `Queue` while the recipient's session runs or starts a turn, and while it has an open
-/// approval or question whatever its session (a restart recovers a ready session's asks), so a
-/// message never reaches a turn that waits for a person's answer (R9). `Start` otherwise, no
-/// session at all included, so a never-started recipient is not stranded in the queue.
+/// `Hold` while the recipient's last turn ended in an error or an interrupt, which pauses its
+/// queue, so a message never restarts its session. `Queue` while the recipient's session runs
+/// or starts a turn, and while it has an open approval or question whatever its session (a
+/// restart recovers a ready session's asks), so a message never reaches a turn that waits for a
+/// person's answer (R9). `Start` otherwise, no session at all included, so a never-started
+/// recipient is not stranded in the queue.
 pub(crate) fn admission_for(
     thread: &ProjectionThread,
     session: Option<&ProjectionThreadSession>,
 ) -> TurnAdmission {
+    if session.is_some_and(|session| matches!(session.status.as_str(), "error" | "interrupted")) {
+        return TurnAdmission::Hold;
+    }
     if thread.pending_approval_count > 0 || thread.pending_user_input_count > 0 {
         return TurnAdmission::Queue;
     }
@@ -580,8 +593,17 @@ impl AgentMessaging {
         })?;
         // A queued message waits for the promotion gate, which admits it only once no turn runs
         // and no approval or question is open; one that ended since this read is promoted then.
-        let force_queue =
-            admission_for(&route.recipient, route.session.as_ref()) == TurnAdmission::Queue;
+        let admission = admission_for(&route.recipient, route.session.as_ref());
+        let force_queue = admission != TurnAdmission::Start;
+        // A paused queue holds the message, with its entry, until a person releases the queue.
+        let (status, reason) = if admission == TurnAdmission::Hold {
+            (
+                AgentMessageStatus::Held,
+                Some(AgentMessageReason::RecipientQueueHeld),
+            )
+        } else {
+            (AgentMessageStatus::Accepted, None)
+        };
         let companion = AgentMessageCompanion::Insert(
             NewAgentMessage {
                 message_id: outgoing.message_id.to_owned(),
@@ -592,8 +614,8 @@ impl AgentMessaging {
                 in_reply_to: outgoing.in_reply_to.map(str::to_owned),
                 hop: outgoing.hop,
                 text: outgoing.text.to_owned(),
-                status: AgentMessageStatus::Accepted,
-                reason: None,
+                status,
+                reason,
                 accepted_at: now,
                 sender_runtime_mode: Some(sender_mode.clone()),
                 recipient_terminal_generation: None,
@@ -658,7 +680,7 @@ impl AgentMessaging {
         Ok(MessageReceipt {
             message_id: outgoing.message_id.to_owned(),
             conversation_id: outgoing.conversation_id.to_owned(),
-            status: AgentMessageStatus::Accepted,
+            status,
             hop: outgoing.hop,
         })
     }
@@ -720,6 +742,54 @@ impl AgentMessaging {
             status: stored.status,
             hop: stored.hop,
         }))
+    }
+
+    /// Cancels a message the agent of `caller_thread_id` sent, while it is accepted, queued or
+    /// held and its entry was not handed to the recipient's provider (R20). Any other caller's
+    /// message reads as one that does not exist. Not refused while messaging is off.
+    pub(crate) async fn cancel(
+        &self,
+        caller_thread_id: &str,
+        message_id: &str,
+    ) -> Result<AgentMessageStatus, AgentMessagingError> {
+        let message = self
+            .message(message_id)
+            .await?
+            .filter(|message| message.sender_address == format!("thread:{caller_thread_id}"))
+            .ok_or(AgentMessagingError::UnknownMessage)?;
+        if message.status == AgentMessageStatus::Cancelled {
+            return Ok(AgentMessageStatus::Cancelled);
+        }
+        let id = message_id.to_owned();
+        let cancelled = self
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                store::cancel_waiting(connection, &id, &crate::mcp::control::now_iso())
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "agent_message_cancel could not write");
+                AgentMessagingError::Storage
+            })?;
+        // Re-read: a concurrent cancel may have won, and a release may have moved the entry.
+        let message = self
+            .message(message_id)
+            .await?
+            .ok_or(AgentMessagingError::UnknownMessage)?;
+        if !cancelled {
+            return match message.status {
+                AgentMessageStatus::Cancelled => Ok(AgentMessageStatus::Cancelled),
+                _ => Err(AgentMessagingError::NotCancellable),
+            };
+        }
+        // The claim gate never claims a cancelled message, and the tracker withdraws an entry
+        // this leaves behind.
+        if !delivery::withdraw_from_queue(&self.engine, &message).await? {
+            tracing::debug!(message_id = %message.message_id, "a cancelled message's entry is left to the tracker");
+        }
+        Ok(AgentMessageStatus::Cancelled)
     }
 
     /// Puts a held message back at the end of its recipient's queue under a new entry; false

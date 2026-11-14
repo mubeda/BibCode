@@ -20,6 +20,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec::provider("agent_message_send", SCOPE_ORCHESTRATION_OPERATE),
     ToolSpec::provider("agent_message_reply", SCOPE_ORCHESTRATION_OPERATE),
     ToolSpec::provider("agent_message_status", SCOPE_ORCHESTRATION_OPERATE).reads(),
+    ToolSpec::provider("agent_message_cancel", SCOPE_ORCHESTRATION_OPERATE),
 ];
 
 pub(crate) const FAMILY: Family = Family {
@@ -48,6 +49,8 @@ const AGENT_MESSAGE_SEND: &str = "Send a message to another agent of your projec
 const AGENT_MESSAGE_REPLY: &str = "Reply to an agent message you received (inReplyTo is its message-id from the envelope). The reply goes to its sender in the same conversation and returns at once with messageId, conversationId, status and hop. Text of 1 to 16000 characters; clientRequestId is optional.";
 
 const AGENT_MESSAGE_STATUS: &str = "Read the status of a message you sent: accepted, queued, held, delivered, consumed, completed, cancelled or failed, with reason for held and failed, updatedAt, and replyMessageId once the recipient replied. It never waits.";
+
+const AGENT_MESSAGE_CANCEL: &str = "Cancel a message you sent that is still queued or held, so it is never delivered. Returns status cancelled, also when it was already cancelled. A message already handed to its recipient cannot be cancelled. Works while agent messaging is off.";
 
 /// The descriptors a provider's `tools/list` adds for this family.
 pub(crate) fn tool_descriptors() -> Vec<Value> {
@@ -117,6 +120,21 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "openWorldHint": false,
             }),
         ),
+        tool_descriptor(
+            "agent_message_cancel",
+            AGENT_MESSAGE_CANCEL,
+            object_schema(
+                json!({ "messageId": { "type": "string", "minLength": 1 } }),
+                &["messageId"],
+            ),
+            json!({
+                "title": "Cancel an agent message",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false,
+            }),
+        ),
     ]
 }
 
@@ -146,6 +164,16 @@ async fn status(
     let object = strict_object("agent_message_status", arguments, &["messageId"])?;
     let message_id = string_field(object, "messageId", true)?.unwrap_or_default();
     messaging.status(&scope.thread_id, &message_id).await
+}
+
+async fn cancel(
+    scope: &PreviewScope,
+    arguments: &Value,
+    messaging: &AgentMessaging,
+) -> Result<crate::agent_messaging::store::AgentMessageStatus, AgentMessagingError> {
+    let object = strict_object("agent_message_cancel", arguments, &["messageId"])?;
+    let message_id = string_field(object, "messageId", true)?.unwrap_or_default();
+    messaging.cancel(&scope.thread_id, &message_id).await
 }
 
 fn status_result(report: &StatusReport) -> Value {
@@ -285,6 +313,11 @@ pub(crate) async fn run(
                 Err(error) => failure(&error),
             }
         }
+        // Cancel works while messaging is off, so a sender can still take a message back.
+        "agent_message_cancel" => match cancel(&scope, &arguments, messaging).await {
+            Ok(status) => tool_result(json!({ "status": status.as_str() }), &[]),
+            Err(error) => failure(&error),
+        },
         _ => typed_tool_failure("McpUnknownToolError", "Unknown tool."),
     }
 }

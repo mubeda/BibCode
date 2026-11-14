@@ -4335,3 +4335,359 @@ mod limits {
         harness.shutdown().await;
     }
 }
+
+// ---- Task 6.7: held, failed, restart and cancel ----
+
+mod recovery {
+    use super::*;
+
+    const NOT_CANCELLABLE: &str = "That message was already delivered, so it cannot be cancelled.";
+
+    impl Harness {
+        async fn cancel(&self, caller: &str, message_id: &str) -> Value {
+            self.agent_tool(
+                caller,
+                "agent_message_cancel",
+                json!({ "messageId": message_id }),
+            )
+            .await
+        }
+
+        /// The queue entries of `message_id` that are still live: not delivered or dismissed.
+        async fn live_entries(&self, message_id: &str) -> Vec<(String, String)> {
+            let prefix = format!("agent-message:{message_id}%");
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT command_id, state FROM provider_turn_outbox
+                          WHERE command_id LIKE ?1 AND state NOT IN ('dismissed', 'delivered')",
+                    )?;
+                    let rows = statement
+                        .query_map([&prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .await
+                .expect("entries")
+        }
+
+        async fn entry_held(&self, command_id: &str) -> bool {
+            let command_id = command_id.to_owned();
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT held FROM provider_turn_outbox WHERE command_id = ?1",
+                        [&command_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .expect("held flag")
+        }
+    }
+
+    fn cancelled(result: &Value) -> bool {
+        structured(result)["status"] == "cancelled"
+    }
+
+    #[tokio::test]
+    async fn recipient_errored() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.session_ends("b", "error").await;
+
+        let result = harness
+            .agent_send("a", send_arguments("thread:b", "hello"))
+            .await;
+
+        assert_eq!(structured(&result)["status"], "held", "{result}");
+        let m1 = structured(&result)["messageId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let status = harness.status_of("a", &m1).await;
+        assert_eq!(structured(&status)["status"], "held");
+        assert_eq!(structured(&status)["reason"], "recipient_queue_held");
+        let entry = harness.entry_of(&m1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(harness.entry_state(&entry).await, "queued", "not started");
+        assert!(harness.entry_held(&entry).await);
+
+        harness.send_now("b", &entry).await;
+
+        harness.until_entry(&entry, "delivered").await;
+        harness.until_status(&m1, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_with_a_queued_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+
+        crate::production::provider_runtime::reconcile_abandoned_provider_sessions(&harness.engine)
+            .await
+            .expect("abandoned sessions settled");
+        crate::agent_messaging::delivery::reconcile_all(&harness.engine, None)
+            .await
+            .expect("reconciled");
+
+        let status = harness.status_of("a", &m1).await;
+        assert_eq!(structured(&status)["status"], "held", "{status}");
+        assert_eq!(structured(&status)["reason"], "recipient_queue_held");
+        assert_eq!(
+            harness.entry_state(&harness.entry_of(&m1).await).await,
+            "queued"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_with_an_idle_recipient() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("b", "turn-b", "done", true).await;
+        harness.stop_delivery().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        let entry = harness.entry_of(&m1).await;
+        assert_eq!(harness.entry_state(&entry).await, "pending");
+
+        crate::production::provider_runtime::reconcile_abandoned_provider_sessions(&harness.engine)
+            .await
+            .expect("abandoned sessions settled");
+        crate::agent_messaging::delivery::reconcile_all(&harness.engine, None)
+            .await
+            .expect("reconciled");
+
+        assert_eq!(
+            harness.entry_state(&entry).await,
+            "pending",
+            "keeps its place"
+        );
+        let router: crate::production::turn_delivery::DeliveryRouter =
+            std::sync::Arc::new(|_| Box::pin(async { Ok(()) }));
+        let restarted = crate::production::turn_delivery::TurnDeliveryService::start_with_router(
+            harness.engine.clone(),
+            1,
+            router,
+        );
+        harness.until_status(&m1, "delivered").await;
+        restarted.shutdown().await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_recipient_deleted_before_delivery_fails() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+
+        harness
+            .engine
+            .dispatch(command(
+                json!({"type": "thread.delete", "commandId": "delete-b", "threadId": "b"}),
+            ))
+            .await
+            .expect("deleted");
+
+        harness.until_status(&m1, "failed").await;
+        let status = harness.status_of("a", &m1).await;
+        assert_eq!(structured(&status)["reason"], "recipient_gone");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_held_message_has_no_live_queue_entry_after_a_restart_between_hold_and_withdrawal() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let person = harness.person_queues("b").await;
+        // The failure was written, then the server stopped before the entry was withdrawn.
+        let failed_id = m1.clone();
+        harness
+            .repositories
+            .database()
+            .call(move |connection| {
+                crate::agent_messaging::store::set_status(
+                    connection,
+                    &failed_id,
+                    crate::agent_messaging::store::AgentMessageStatus::Failed,
+                    Some(AgentMessageReason::DeliveryFailed),
+                    CREATED_AT,
+                )
+            })
+            .await
+            .expect("failed");
+
+        crate::agent_messaging::delivery::reconcile_all(&harness.engine, None)
+            .await
+            .expect("startup reconciliation");
+
+        assert!(harness.live_entries(&m1).await.is_empty());
+        harness.provider_turn("b", "turn-b", "working", true).await;
+        harness.until_entry(&person, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_racing_a_cancel_leaves_no_live_entry() {
+        // The cancel wins: the release is stale and adds nothing.
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging_untracked(true);
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let held = harness.hold_untracked(&m1).await;
+        assert_eq!(
+            messaging.cancel("a", &m1).await,
+            Ok(crate::agent_messaging::store::AgentMessageStatus::Cancelled)
+        );
+        assert!(!messaging.requeue(&held).await.expect("stale"));
+        assert!(harness.requeued_entries(&m1).await.is_empty());
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "cancelled");
+        assert!(harness.live_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+
+        // The cancel loses: it withdraws the entry the release made.
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging_untracked(true);
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let held = harness.hold_untracked(&m1).await;
+        assert!(messaging.requeue(&held).await.expect("released"));
+        assert_eq!(
+            messaging.cancel("a", &m1).await,
+            Ok(crate::agent_messaging::store::AgentMessageStatus::Cancelled)
+        );
+        assert_eq!(harness.requeued_entries(&m1).await.len(), 1);
+        assert!(harness.live_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+
+        // Both at once.
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let messaging = harness.messaging_untracked(true);
+        let m1 = harness.sent_untracked("a", "thread:b").await;
+        let held = harness.hold_untracked(&m1).await;
+        let (_, cancel) = tokio::join!(messaging.requeue(&held), messaging.cancel("a", &m1));
+        assert_eq!(
+            cancel,
+            Ok(crate::agent_messaging::store::AgentMessageStatus::Cancelled)
+        );
+        assert!(harness.live_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn too_late_to_cancel() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:p").await;
+        harness.until_status(&m1, "delivered").await;
+        harness.provider_turn("p", "turn-p", "Port", false).await;
+        harness.until_status(&m1, "consumed").await;
+
+        let result = harness.cancel("a", &m1).await;
+
+        assert_eq!(error_tag(&result), "AgentMessagingNotCancellableError");
+        assert_eq!(
+            result["structuredContent"]["error"]["message"],
+            NOT_CANCELLABLE
+        );
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "consumed");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_a_queued_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        let entry = harness.entry_of(&m1).await;
+        let person = harness.person_queues("b").await;
+
+        let result = harness.cancel("a", &m1).await;
+
+        assert!(cancelled(&result), "{result}");
+        assert_eq!(harness.entry_state(&entry).await, "dismissed");
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&person, "delivered").await;
+        assert_eq!(harness.entry_state(&entry).await, "dismissed");
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "cancelled");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_a_held_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+
+        assert!(cancelled(&harness.cancel("a", &m1).await));
+        harness.messaging_enabled.send_replace(true);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "cancelled");
+        assert!(harness.requeued_entries(&m1).await.is_empty());
+        assert!(harness.live_entries(&m1).await.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn only_the_sender_may_cancel() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+
+        let not_mine = harness.cancel("p", &m1).await;
+        let made_up = harness.cancel("p", "no-such-message").await;
+
+        assert_eq!(error_tag(&not_mine), "AgentMessagingUnknownMessageError");
+        assert_eq!(not_mine, made_up);
+        assert_ne!(harness.message_row(&m1).await.status.as_str(), "cancelled");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_still_works_while_messaging_is_off() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.messaging_enabled.send_replace(false);
+
+        let result = run(
+            scope("a"),
+            "agent_message_cancel",
+            json!({ "messageId": m1 }),
+            Some(&harness.messaging(false)),
+        )
+        .await;
+
+        assert!(cancelled(&result), "{result}");
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "cancelled");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_twice_returns_cancelled() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+
+        assert!(cancelled(&harness.cancel("a", &m1).await));
+        let again = harness.cancel("a", &m1).await;
+
+        assert!(cancelled(&again), "{again}");
+        harness.shutdown().await;
+    }
+}

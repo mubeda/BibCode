@@ -335,6 +335,26 @@ pub(crate) fn set_status(
     Ok(changed == 1)
 }
 
+/// Cancels `message_id` in one compare and set: only while it is accepted, queued or held (an
+/// uncertain delivery may have reached the provider, so not that hold) and its queue entry was
+/// not claimed, so a message the recipient may have read is never reported cancelled.
+pub(crate) fn cancel_waiting(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let changed = connection.execute(
+        "UPDATE agent_messages SET status = 'cancelled', reason = NULL, updated_at = ?2
+          WHERE message_id = ?1 AND status IN ('accepted', 'queued', 'held')
+            AND reason IS NOT 'delivery_uncertain'
+            AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS entry
+                            WHERE entry.command_id = agent_messages.delivery_command_id
+                              AND entry.state IN ('sending', 'delivered', 'uncertain'))",
+        params![message_id, updated_at],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Returns false when the row is not in the expected status with the expected delivery command,
 /// or its status is terminal. The new queue entry starts a new turn, so the recorded one is
 /// cleared.

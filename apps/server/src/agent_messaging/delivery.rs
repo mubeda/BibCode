@@ -173,27 +173,35 @@ pub(crate) fn derive_chat_status(
             });
         }
     }
-    let outbox: Option<String> = connection
+    let outbox: Option<(String, bool)> = connection
         .query_row(
-            "SELECT state FROM provider_turn_outbox WHERE command_id = ?1",
+            "SELECT state, held FROM provider_turn_outbox WHERE command_id = ?1",
             [command_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(match outbox.as_deref() {
-        Some("queued") => Derived::of(AgentMessageStatus::Queued, None),
-        Some("pending" | "sending") => Derived::of(AgentMessageStatus::Accepted, None),
-        Some("delivered") => Derived::of(AgentMessageStatus::Delivered, None),
-        Some("uncertain") => Derived::of(
-            AgentMessageStatus::Held,
-            Some(AgentMessageReason::DeliveryUncertain),
-        ),
-        Some("failed" | "dismissed") => Derived::of(
-            AgentMessageStatus::Failed,
-            Some(AgentMessageReason::DeliveryFailed),
-        ),
-        _ => unchanged,
-    })
+    Ok(
+        match outbox.as_ref().map(|(state, held)| (state.as_str(), *held)) {
+            // A paused queue (an errored or interrupted session, or a restart) holds the entry until
+            // a person releases it.
+            Some(("queued", true)) => Derived::of(
+                AgentMessageStatus::Held,
+                Some(AgentMessageReason::RecipientQueueHeld),
+            ),
+            Some(("queued", false)) => Derived::of(AgentMessageStatus::Queued, None),
+            Some(("pending" | "sending", _)) => Derived::of(AgentMessageStatus::Accepted, None),
+            Some(("delivered", _)) => Derived::of(AgentMessageStatus::Delivered, None),
+            Some(("uncertain", _)) => Derived::of(
+                AgentMessageStatus::Held,
+                Some(AgentMessageReason::DeliveryUncertain),
+            ),
+            Some(("failed" | "dismissed", _)) => Derived::of(
+                AgentMessageStatus::Failed,
+                Some(AgentMessageReason::DeliveryFailed),
+            ),
+            _ => unchanged,
+        },
+    )
 }
 
 /// The place of a status in the forward order of a delivery; `None` for one outside it.
@@ -208,8 +216,10 @@ fn stage(status: AgentMessageStatus) -> Option<u8> {
     }
 }
 
-/// Whether `derived` replaces the stored status: never a final one, never a held one this task
-/// does not own, and never a step back (a promoted row that reads `pending` keeps `queued`).
+/// Whether `derived` replaces the stored status: never a final one, never a hold for the
+/// setting or the mode ceiling (their entries are withdrawn and would read failed), and never a
+/// step back (a promoted row that reads `pending` keeps `queued`). A hold the queue entry shows
+/// (an uncertain delivery, a paused queue) follows the entry, as a person's release moves it.
 fn applies(stored: &AgentMessageRow, derived: &Derived) -> bool {
     if stored.status.is_terminal()
         || (derived.status == stored.status && derived.reason == stored.reason)
@@ -217,7 +227,10 @@ fn applies(stored: &AgentMessageRow, derived: &Derived) -> bool {
         return false;
     }
     if stored.status == AgentMessageStatus::Held {
-        return stored.reason == Some(AgentMessageReason::DeliveryUncertain);
+        return matches!(
+            stored.reason,
+            Some(AgentMessageReason::DeliveryUncertain | AgentMessageReason::RecipientQueueHeld)
+        );
     }
     match (stage(stored.status), stage(derived.status)) {
         (Some(stored), Some(derived)) => derived > stored,
@@ -562,11 +575,15 @@ pub(crate) async fn requeue(
         })
         .await
         .map_err(storage)?;
-    // Behind whatever waits, and behind a turn that runs or an open ask, as a send would be.
-    let queued = waiting
-        || thread.as_ref().is_none_or(|thread| {
-            super::admission_for(thread, session.as_ref()) == super::TurnAdmission::Queue
+    // Behind whatever waits, and behind a turn that runs or an open ask, as a send would be; a
+    // paused queue holds it there until a person releases the queue.
+    let admission = thread
+        .as_ref()
+        .map_or(super::TurnAdmission::Queue, |thread| {
+            super::admission_for(thread, session.as_ref())
         });
+    let queued = waiting || admission != super::TurnAdmission::Start;
+    let held = admission == super::TurnAdmission::Hold;
     let command_id = format!("agent-message:{}:{}", message.message_id, earlier + 1);
     let delivery_message_id = uuid::Uuid::new_v4().to_string();
     let now = crate::mcp::control::now_iso();
@@ -623,10 +640,20 @@ pub(crate) async fn requeue(
         "address": message.sender_address,
         "label": label,
     }));
-    let (state, status) = if queued {
-        (TurnDeliveryState::Queued, AgentMessageStatus::Queued)
+    let (state, status, reason) = if held {
+        (
+            TurnDeliveryState::Queued,
+            AgentMessageStatus::Held,
+            Some(AgentMessageReason::RecipientQueueHeld),
+        )
+    } else if queued {
+        (TurnDeliveryState::Queued, AgentMessageStatus::Queued, None)
     } else {
-        (TurnDeliveryState::Pending, AgentMessageStatus::Accepted)
+        (
+            TurnDeliveryState::Pending,
+            AgentMessageStatus::Accepted,
+            None,
+        )
     };
     let admission = CommandAdmission {
         payload_digest,
@@ -651,7 +678,7 @@ pub(crate) async fn requeue(
             delivery_command_id: command_id,
             delivery_message_id,
             status,
-            reason: None,
+            reason,
         })),
     };
     let waker = engine.clone();
@@ -832,12 +859,25 @@ mod tests {
             &Derived::of(Failed, Some(AgentMessageReason::RecipientTurnFailed))
         ));
         assert!(
-            !applies(
+            applies(
                 &row(Held, Some(AgentMessageReason::RecipientQueueHeld)),
                 &to(Queued)
             ),
-            "a held message this task does not own is left alone"
+            "a person's release of a paused queue moves its message"
         );
+        for reason in [
+            AgentMessageReason::MessagingOff,
+            AgentMessageReason::RecipientModeAboveSender,
+        ] {
+            assert!(
+                !applies(
+                    &row(Held, Some(reason)),
+                    &Derived::of(Failed, Some(AgentMessageReason::DeliveryFailed))
+                ),
+                "a hold for {} is left alone",
+                reason.as_str()
+            );
+        }
         assert!(applies(
             &row(Held, Some(AgentMessageReason::DeliveryUncertain)),
             &to(Delivered)

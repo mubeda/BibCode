@@ -6321,6 +6321,24 @@ const AGENT_MESSAGE_WAITS_FOR_ANSWER: &str =
 const AGENT_MESSAGE_NOT_RETRIED: &str =
     "A failed agent message is not sent again. Its sender can send it again.";
 
+/// An agent message admitted into its recipient's paused queue holds its entry there, as the
+/// pause holds every queued entry, so only a person's release sends it (R18).
+fn hold_agent_message_entry(
+    transaction: &Transaction<'_>,
+    status: crate::agent_messaging::store::AgentMessageStatus,
+    command_id: Option<&str>,
+) -> Result<(), PersistenceError> {
+    if status == crate::agent_messaging::store::AgentMessageStatus::Held
+        && let Some(command_id) = command_id
+    {
+        transaction.execute(
+            "UPDATE provider_turn_outbox SET held = 1 WHERE command_id = ? AND state = 'queued'",
+            [command_id],
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
@@ -6614,12 +6632,14 @@ async fn persist_command(
                             return Ok(Err(refusal.detail()));
                         }
                         crate::agent_messaging::store::insert_message(&transaction, &message)?;
+                        hold_agent_message_entry(&transaction, message.status, message.delivery_command_id.as_deref())?;
                     }
                     Some(AgentMessageCompanion::Relink(relink)) => {
                         let updated_at = event_list.last().map(|event| event.occurred_at.as_str()).unwrap_or_default();
                         if !crate::agent_messaging::store::apply_relink(&transaction, &relink, updated_at)? {
                             return Ok(Err(STALE_AGENT_MESSAGE_RELINK));
                         }
+                        hold_agent_message_entry(&transaction, relink.status, Some(&relink.delivery_command_id))?;
                     }
                     None => {}
                 }
