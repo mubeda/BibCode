@@ -39,6 +39,7 @@ pub mod pull_requests;
 pub mod remote_update;
 pub mod review;
 mod rpc;
+pub(crate) mod send_requests;
 pub mod server_settings;
 mod service_manager;
 pub mod signed_token;

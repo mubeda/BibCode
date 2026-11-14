@@ -675,6 +675,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(72, "WorktreeCreationRecords", migration_072),
     Migration::new(73, "ProjectCodeReviewPrompt", migration_073),
     Migration::new(74, "ProjectionThreadCodeReview", migration_074),
+    Migration::new(75, "SendRequests", migration_075),
 ];
 
 impl Migration {
@@ -3066,6 +3067,64 @@ fn migration_073(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_075(transaction: &Transaction<'_>) -> Result<()> {
+    // A person's request to an agent: one row per request id. It keeps the sizes of the note
+    // and attachments, never their text, and only the target's answer text. Guarded like the
+    // migrations before it: a ledger rolled back below 75 runs it again.
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS send_requests (
+          request_id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          source_address TEXT NOT NULL,
+          source_thread_id TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (action IN ('review', 'second-opinion', 'hand-off', 'take-over', 'message')),
+          target_address TEXT NOT NULL,
+          target_thread_id TEXT NOT NULL,
+          taken_over_address TEXT,
+          args_digest TEXT NOT NULL,
+          note_chars INTEGER NOT NULL,
+          attachment_chars INTEGER NOT NULL,
+          target_message_id TEXT,
+          command_id TEXT,
+          runtime_mode TEXT NOT NULL,
+          interaction_mode TEXT NOT NULL,
+          answering_turn_id TEXT,
+          answer_message_id TEXT,
+          answer_text TEXT,
+          answer_truncated INTEGER NOT NULL DEFAULT 0,
+          terminal_generation INTEGER,
+          state TEXT NOT NULL CHECK (state IN ('queued', 'waiting', 'delivered', 'read', 'answered', 'not_answered', 'cancelled')),
+          reason TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          dismissed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_send_requests_source_thread
+          ON send_requests (source_thread_id, dismissed_at);
+        CREATE INDEX IF NOT EXISTS idx_send_requests_target_message
+          ON send_requests (target_thread_id, target_message_id);
+        CREATE INDEX IF NOT EXISTS idx_send_requests_open_target
+          ON send_requests (target_thread_id)
+          WHERE state IN ('queued', 'waiting', 'delivered', 'read');
+        "#,
+    )?;
+    // The provenance of a person's send on its message. Guarded like 074: a trusted-ledger
+    // restore may not carry this rebuildable projection table.
+    if table_exists(transaction, "projection_thread_messages")?
+        && !table_has_column(
+            transaction,
+            "projection_thread_messages",
+            "person_send_json",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_thread_messages ADD COLUMN person_send_json TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
 fn migration_074(transaction: &Transaction<'_>) -> Result<()> {
     // A chat panel started as a code review (#293), kept like `side_chat`. Guarded like 067: a
     // trusted-ledger restore may not carry this rebuildable projection table.
@@ -3327,7 +3386,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+                59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
             ]
         );
         let (state, outcome) = connection.query_row(
@@ -3361,7 +3420,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+            [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3397,7 +3456,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+            [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3439,7 +3498,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68, 69, 70, 71, 72, 73, 74]
+            [66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3470,7 +3529,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [69, 70, 71, 72, 73, 74]
+            [69, 70, 71, 72, 73, 74, 75]
         );
         let index_sql: String = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
@@ -3515,7 +3574,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [70, 71, 72, 73, 74]
+            [70, 71, 72, 73, 74, 75]
         );
         let unnamed: (Option<String>, Option<String>) = connection.query_row(
             "SELECT (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = 'l'), (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = 's')",
@@ -3564,7 +3623,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [71, 72, 73, 74]
+            [71, 72, 73, 74, 75]
         );
         let taken_over: Option<String> = connection.query_row(
             "SELECT taken_over_at FROM mcp_named_clients WHERE client_id = 'nc_1'",
@@ -3592,7 +3651,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [73, 74]
+            [73, 74, 75]
         );
         let prompt: String = connection.query_row(
             "SELECT code_review_prompt FROM projection_projects WHERE project_id = 'p'",
@@ -3621,7 +3680,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [74]
+            [74, 75]
         );
         let code_review: i64 = connection.query_row(
             "SELECT code_review FROM projection_threads WHERE thread_id = 't'",
@@ -3633,6 +3692,87 @@ mod tests {
         let transaction = connection.transaction()?;
         super::migration_074(&transaction)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_75_creates_send_requests_and_the_message_provenance_column() -> rusqlite::Result<()>
+    {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(74))?;
+        connection.execute_batch(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-13T00:00:00Z', '2026-11-13T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('m', 't', 'user', 'hi', 0, '2026-11-13T00:00:00Z', '2026-11-13T00:00:00Z');",
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [75]
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(send_requests)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            columns,
+            [
+                "request_id",
+                "project_id",
+                "source_address",
+                "source_thread_id",
+                "action",
+                "target_address",
+                "target_thread_id",
+                "taken_over_address",
+                "args_digest",
+                "note_chars",
+                "attachment_chars",
+                "target_message_id",
+                "command_id",
+                "runtime_mode",
+                "interaction_mode",
+                "answering_turn_id",
+                "answer_message_id",
+                "answer_text",
+                "answer_truncated",
+                "terminal_generation",
+                "state",
+                "reason",
+                "created_at",
+                "updated_at",
+                "dismissed_at",
+            ]
+        );
+        for forbidden in ["text", "note", "body", "attachments"] {
+            assert!(
+                !columns.iter().any(|column| column == forbidden),
+                "send_requests must not store {forbidden}"
+            );
+        }
+        let person_send: Option<String> = connection.query_row(
+            "SELECT person_send_json FROM projection_thread_messages WHERE message_id = 'm'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(person_send, None);
+        let bogus = connection.execute(
+            "INSERT INTO send_requests (request_id, project_id, source_address, source_thread_id, action, target_address, target_thread_id, args_digest, note_chars, attachment_chars, runtime_mode, interaction_mode, state, created_at, updated_at) \
+             VALUES ('r', 'p', 'thread:t', 't', 'review', 'thread:u', 'u', 'd', 0, 0, 'full-access', 'default', 'bogus', '2026-11-13T00:00:00Z', '2026-11-13T00:00:00Z')",
+            [],
+        );
+        assert!(bogus.is_err(), "a state outside SendState is refused");
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_075(&transaction)?;
+        transaction.commit()?;
+        let again = connection
+            .prepare("PRAGMA table_info(send_requests)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(again, columns);
         Ok(())
     }
 
@@ -3652,7 +3792,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [72, 73, 74]
+            [72, 73, 74, 75]
         );
         let columns = connection
             .prepare("PRAGMA table_info(worktree_creation_records)")?
@@ -3710,7 +3850,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68, 69, 70, 71, 72, 73, 74]
+            [68, 69, 70, 71, 72, 73, 74, 75]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3738,7 +3878,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68, 69, 70, 71, 72, 73, 74]
+            [67, 68, 69, 70, 71, 72, 73, 74, 75]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -3764,7 +3904,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3819,7 +3959,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+            [
+                60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
+            ]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3865,7 +4007,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+                55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
             ]
         );
         connection.execute(
@@ -3908,7 +4050,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(74));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(75));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4640,7 +4782,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=74).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=75).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4719,6 +4861,7 @@ mod tests {
                 (72, "WorktreeCreationRecords"),
                 (73, "ProjectCodeReviewPrompt"),
                 (74, "ProjectionThreadCodeReview"),
+                (75, "SendRequests"),
             ],
         );
         assert_eq!(
@@ -4869,7 +5012,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 58);
+        assert_eq!(second.len(), 59);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4892,7 +5035,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 41);
+        assert_eq!(application_table_count, 42);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -4989,7 +5132,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
             ]
         );
         let policy = connection.query_row(
@@ -5029,7 +5172,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
             ]
         );
         let pin = connection.query_row(
@@ -5060,7 +5203,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75
             ]
         );
         let pin = connection.query_row(
@@ -5203,7 +5346,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-                69, 70, 71, 72, 73, 74
+                69, 70, 71, 72, 73, 74, 75
             ]
         );
         assert_eq!(
@@ -5233,7 +5376,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 41);
+        assert_eq!(applied.len(), 42);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
