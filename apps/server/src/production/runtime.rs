@@ -3851,6 +3851,105 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// A send whose future is suspended after its message was admitted, before it reports,
+    /// never holds up the stop: the stop reaches the profiler's teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiesce_completes_while_a_send_is_suspended_before_its_report() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({ "agentMessaging": { "enabled": true } }),
+        );
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let workspace = TempDir::new().expect("workspace");
+        let mut commands = vec![json!({
+            "type": "project.create", "commandId": "project-create", "projectId": "p1",
+            "title": "Project", "workspaceRoot": workspace.path(),
+            "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "createdAt": "2026-11-14T00:00:00.000Z",
+        })];
+        for thread_id in ["a", "b"] {
+            commands.push(json!({
+                "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                "threadId": thread_id, "projectId": "p1", "title": thread_id,
+                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+            }));
+        }
+        for command in commands {
+            runtime
+                .orchestration
+                .dispatch(serde_json::from_value(command).expect("command"))
+                .await
+                .expect("dispatch");
+        }
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        let mut send = Box::pin(messaging.send(
+            "a",
+            crate::agent_messaging::SendRequest {
+                to: "thread:b".to_owned(),
+                text: "hello".to_owned(),
+                client_request_id: None,
+            },
+        ));
+        // Polled by hand until its message is admitted, then never again.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let admitted: i64 = database
+                    .call(|connection| {
+                        Ok(connection.query_row(
+                            "SELECT COUNT(*) FROM agent_messages",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .await
+                    .expect("messages are readable");
+                if admitted > 0 {
+                    break;
+                }
+                assert!(
+                    send.as_mut().poll(&mut context).is_pending(),
+                    "the send stays suspended until its admission is seen"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the message is admitted");
+
+        tokio::time::timeout(Duration::from_secs(30), runtime.quiesce_for_update())
+            .await
+            .expect("the stop never waits on the suspended send")
+            .expect("the stop succeeds");
+
+        drop(send);
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
         let state = TempDir::new().expect("temporary state directory");
