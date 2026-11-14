@@ -10,7 +10,8 @@ pub(crate) fn register_send_requests_rpc(registry: &mut RpcRegistry, service: Se
         let service = service.clone();
         async move {
             let input = serde_json::from_value::<SendRequestsSendInput>(request.payload)
-                .map_err(|error| refusal("invalid", &format!("Invalid request: {error}")))?;
+                // The decode error quotes input values (note or attachment text), so it stays out.
+                .map_err(|_| refusal("invalid", "This is not a valid send request."))?;
             let request = service.send(&context, input).await?;
             serde_json::to_value(request)
                 .map_err(|error| refusal("invalid", &format!("Invalid response: {error}")))

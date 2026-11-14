@@ -3800,14 +3800,19 @@ fn spawn_worker(
 /// for, so nothing is admitted ahead of the copy a recovery sends or with a marker the
 /// compaction turn could take. The RPC checks this early too, but a recovery can begin between
 /// that check and admission; here it runs on the worker, which serializes it with the command
-/// that begins one.
+/// that begins one. A person's request (`personSend`) is queued the same way while the thread
+/// blocks a new turn (a pending approval or question, a held queue, an errored session), which
+/// can also begin after the RPC's own check.
 async fn queue_start_behind_unsettled_compaction(
     repositories: &Repositories,
     command: &mut OrchestrationCommand,
     admission: Option<&mut CommandAdmission>,
 ) -> Result<(), OrchestrationError> {
     let OrchestrationCommand::ThreadTurnStart {
-        thread_id, queued, ..
+        thread_id,
+        queued,
+        message,
+        ..
     } = command
     else {
         return Ok(());
@@ -3828,7 +3833,13 @@ async fn queue_start_behind_unsettled_compaction(
         .await
         .map_err(wrap_persistence)?
         .is_some();
-    if compacting {
+    let person_send_waits = !compacting
+        && message.person_send.is_some()
+        && repositories
+            .thread_blocks_new_turn(thread_id.clone())
+            .await
+            .map_err(wrap_persistence)?;
+    if compacting || person_send_waits {
         *queued = Some(true);
         turn.state = TurnDeliveryState::Queued;
         if let Some(payload) = turn.payload.as_object_mut() {

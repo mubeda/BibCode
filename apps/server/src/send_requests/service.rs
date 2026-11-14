@@ -285,7 +285,8 @@ impl SendRequestsService {
             ));
         }
 
-        let args_digest = canonical_command_digest(&input).map_err(|error| invalid(&error))?;
+        let args_digest = canonical_command_digest(&input)
+            .map_err(|_| invalid("BiBCode could not read this request."))?;
         let command_id = format!("person-send:{}", input.request_id);
         let now = crate::mcp::control::now_iso();
         let (row, created) = self
@@ -336,7 +337,7 @@ impl SendRequestsService {
             &row,
             compose_message_text(&input.lead_in, &input.note, &attachments),
         )
-        .map_err(|error| invalid(&error))?;
+        .map_err(|_| invalid("BiBCode could not build this request."))?;
         (self.dispatcher)(
             command,
             UploadOwner::from_context(context),
