@@ -34,6 +34,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
       - name: Check capture caller
         run: node --test apps/web/visual/typography/*.node-test.mjs
@@ -74,6 +75,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
       - name: Check capture caller
         run: node --test apps/web/visual/typography/*.node-test.mjs

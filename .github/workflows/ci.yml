@@ -83,6 +83,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Sensitive-data guard (commit messages)
@@ -108,6 +109,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Setup Rust
@@ -209,6 +211,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Setup Rust
@@ -282,6 +285,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Exercise release-only workflow steps
@@ -315,15 +319,16 @@ jobs:
             platform: win
             target: nsis
             arch: x64
-            # Without a Rust cache this row took 108 minutes on 2026-11-13.
+            # This row took 89 to 112 minutes on 2026-11-13 and 11-14, most of it five
+            # builds of bibcode-server; its server tests now run in server_tests_windows.
             jobTimeoutMinutes: 180
           - label: Windows arm64
             runner: windows-11-vs2026-arm
             platform: win
             target: nsis
             arch: arm64
-            # Without a Rust cache this row took 113 minutes on a pull request on
-            # 2026-11-13, and was cancelled at its 120-minute limit on main.
+            # This row took 103 to 113 minutes on 2026-11-13 and 11-14 and was cancelled
+            # at a 120-minute limit on main; see the Windows x64 row for where it went.
             jobTimeoutMinutes: 180
     steps: &native_desktop_steps
       - name: Checkout
@@ -334,6 +339,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: false
 
       - name: Setup Rust
@@ -405,64 +411,50 @@ jobs:
         if: matrix.platform == 'win'
         run: vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts
 
-      - name: Check Windows server test targets compile
-        if: matrix.platform == 'win'
-        run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
-
-      # Linux runs these in Test; Windows and macOS Git (LFS, hooks, NUL) differ (#283).
-      - name: Run Git system configuration tests (Windows)
-        if: matrix.platform == 'win'
-        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_system_config -j 2
-
-      # #341 was reported on Windows: background Git must not lock the index there either.
-      - name: Run background Git index lock tests (Windows)
-        if: matrix.platform == 'win'
-        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- background_status_ git_stop_ index_lock_cleanup_
-
-      # #293: a review prompt reaches node through an npm-style .cmd shim with every class intact.
-      - name: Run review prompt argument tests (Windows)
-        if: matrix.platform == 'win'
-        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -j 2 -- review_prompt_shim_
-
-      # #292: the host collector, its exit with a disk read held, and its runtime start and
-      # quiesce. Each command fails the step when its filter matches no test.
-      - name: Run host metrics tests (Windows)
-        if: matrix.platform == 'win'
-        shell: bash
-        run: |
-          counted() {
-            local expected="$1"; shift
-            local log; log="$(mktemp)"
-            "$@" 2>&1 | tee "$log"
-            local passed
-            passed="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" | awk '{ total += $1 } END { print total + 0 }')"
-            if [ "$expected" = exactly-one ] && [ "$passed" -ne 1 ]; then
-              echo "::error::expected exactly 1 passed test, got $passed"; exit 1
-            fi
-            if [ "$passed" -lt 1 ]; then
-              echo "::error::the filter matched no test"; exit 1
-            fi
-          }
-          counted at-least-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- host_metrics::
-          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
-          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
-
       # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
       # keeps ~/.cargo/bin, so a restored runner skips the compile.
       - name: Install dump_syms
         run: node scripts/run-msvc.mjs cargo install dump_syms --locked --version 2.3.9
 
-      # --symbols is the release build (release.yml build_desktop): the same
-      # profile, so the cache it saves is the one Release restores.
+      # --symbols is the release symbol build (release.yml build_desktop), so the dependency
+      # cache it saves is the one Release restores.
+      # --workspace-codegen-units 16 is CI only: the shipped single unit compiles bibcode-server
+      # on one core (23 to 107 minutes of this step). It is a per-package override, so no
+      # dependency fingerprint changes and the cache stays the one Release restores.
+      # The heartbeat shows where time and memory go (#363): the macOS arm64 runner has 7 GB
+      # and the bibcode-server compile peaked above 8 GB locally. It never fails the step.
       - name: Build native bundle without publishing
-        run: >
-          node scripts/build-desktop-artifact.ts
-          --platform "${{ matrix.platform }}"
-          --target "${{ matrix.target }}"
-          --arch "${{ matrix.arch }}"
-          --output-dir native-artifacts
-          --symbols
-          --verbose
+        shell: bash
+        run: |
+          start=$SECONDS
+          peak="$RUNNER_TEMP/bundle-peak-kb"
+          echo 0 > "$peak"
+          (
+            while sleep 60; do
+              line="heartbeat $((SECONDS - start))s"
+              if [ "$RUNNER_OS" != Windows ]; then
+                top="$(ps -Ao rss=,comm= 2>/dev/null | awk '$2 ~ /(^|\/)(rustc|ld|lld|ld64|rust-lld|dsymutil)$/' | sort -rn | head -4 || true)"
+                kb="$(printf '%s\n' "$top" | awk 'NR == 1 { print $1 + 0 }' || true)"
+                if [ "${kb:-0}" -gt "$(cat "$peak")" ]; then echo "$kb" > "$peak"; fi
+                line="$line; $(printf '%s\n' "$top" | awk 'NF { n = split($2, part, "/"); printf "%s %d MB, ", part[n], $1 / 1024 }' || true)"
+              fi
+              case "$RUNNER_OS" in
+                macOS) line="$line $(sysctl -n vm.swapusage 2>/dev/null || true); free pages $(vm_stat 2>/dev/null | awk '/Pages free/ { print $3 + 0 }' || true)" ;;
+                Linux) line="$line $(awk '/MemAvailable|SwapFree/ { printf "%s %d MB ", $1, $2 / 1024 }' /proc/meminfo 2>/dev/null || true)" ;;
+              esac
+              echo "$line"
+            done
+          ) &
+          heartbeat=$!
+          trap 'kill "$heartbeat" 2>/dev/null || true; echo "::notice title=Bundle build::${RUNNER_OS} ${RUNNER_ARCH} took $((SECONDS - start)) s, peak single compiler or linker process $(($(cat "$peak") / 1024)) MB"' EXIT
+          node scripts/build-desktop-artifact.ts \
+            --platform "${{ matrix.platform }}" \
+            --target "${{ matrix.target }}" \
+            --arch "${{ matrix.arch }}" \
+            --output-dir native-artifacts \
+            --symbols \
+            --workspace-codegen-units 16 \
+            --verbose
 
   # The macOS legs take 1-5 hours on a 5-job macOS concurrency cap, so pull
   # requests skip them unless labelled ci:full. Main pushes and manual runs
@@ -560,6 +552,85 @@ jobs:
           counted exactly-one cargo test -p bibcode-server --test host_metrics_exit -j 2 -- --exact a_held_disk_read_does_not_block_exit
           counted exactly-one cargo test -p bibcode-server --lib -j 2 -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
 
+  # Linux runs these server tests in Test and macOS in server_tests_macos. They left the Windows
+  # native desktop rows because a row compiled bibcode-server five times (host tests, this
+  # check, two test builds, the bundle): 76 of 103 minutes on 2026-11-14, against about 2
+  # minutes of running tests. Nothing else runs beside the compiler here, so no -j 2.
+  # The cache is the native desktop one, restored and never saved.
+  server_tests_windows:
+    name: Server tests - ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            runner: windows-2025
+          - label: Windows arm64
+            runner: windows-11-vs2026-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The shim tests run node, and run-msvc.mjs is a Node script; no workspace install.
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@68f39c78aaf39be468cabd2afb09c162574c84af # v1.21.2
+        with:
+          node-version-file: package.json
+          run-install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+
+      - name: Restore Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-desktop
+          save-if: "false"
+          workspaces: |
+            . -> target
+
+      # Clippy's --all-targets pass runs on Linux alone, so Unix-only test helpers or imports
+      # that are unused on Windows fail here under -D warnings.
+      - name: Check Windows server test targets compile
+        run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
+
+      # Linux runs these in Test; Windows and macOS Git (LFS, hooks, NUL) differ (#283).
+      - name: Run Git system configuration tests (Windows)
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_system_config
+
+      # #341 was reported on Windows: background Git must not lock the index there either.
+      - name: Run background Git index lock tests (Windows)
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -- background_status_ git_stop_ index_lock_cleanup_
+
+      # #293: a review prompt reaches node through an npm-style .cmd shim with every class intact.
+      # shim_timeout_ proves that a timeout prints what the terminal showed (#367).
+      - name: Run review prompt argument tests (Windows)
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -- review_prompt_shim_ shim_timeout_
+
+      # #292: the host collector, its exit with a disk read held, and its runtime start and
+      # quiesce. Each command fails the step when its filter matches no test.
+      - name: Run host metrics tests (Windows)
+        shell: bash
+        run: |
+          counted() {
+            local expected="$1"; shift
+            local log; log="$(mktemp)"
+            "$@" 2>&1 | tee "$log"
+            local passed
+            passed="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" | awk '{ total += $1 } END { print total + 0 }')"
+            if [ "$expected" = exactly-one ] && [ "$passed" -ne 1 ]; then
+              echo "::error::expected exactly 1 passed test, got $passed"; exit 1
+            fi
+            if [ "$passed" -lt 1 ]; then
+              echo "::error::the filter matched no test"; exit 1
+            fi
+          }
+          counted at-least-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -- host_metrics::
+          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --test host_metrics_exit -- --exact a_held_disk_read_does_not_block_exit
+          counted exactly-one node scripts/run-msvc.mjs cargo test -p bibcode-server --lib -- --exact production::runtime::tests::host_metrics_start_with_the_runtime_and_stop_in_quiesce
+
   # A real native crash under the crash monitor on every OS, symbolicated with symbols dumped
   # the way the release pipeline dumps them.
   # macos-26 runs on main, manual runs, and ci:full pull requests only.
@@ -586,6 +657,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: false
 
       - name: Setup Rust
