@@ -107,6 +107,7 @@ async fn enqueue_as(engine: &OrchestrationEngine, id: &str, queued: bool, provid
                     mode: TurnDeliveryMode::Start,
                     created_at: TIME.into(),
                 }),
+                agent_message: None,
             },
             || {},
         )
@@ -967,6 +968,7 @@ async fn restart_settles_every_unsettled_compaction_as_interrupted() {
                             mode: TurnDeliveryMode::Start,
                             created_at: TIME.into(),
                         }),
+                        agent_message: None,
                     },
                     || {},
                 )

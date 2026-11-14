@@ -3513,6 +3513,7 @@ mod workspace_loss_tests {
                         mode: TurnDeliveryMode::Start,
                         created_at: BEFORE_LOSS.into(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )
@@ -3671,6 +3672,7 @@ mod workspace_loss_tests {
                             mode: TurnDeliveryMode::Start,
                             created_at: BEFORE_LOSS.into(),
                         }),
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -4325,6 +4327,7 @@ mod workspace_loss_tests {
                     mode: TurnDeliveryMode::Start,
                     created_at: BEFORE_LOSS.into(),
                 }),
+                agent_message: None,
             };
             f.engine
                 .dispatch_with_admission(command, admission, || {})
@@ -4366,6 +4369,7 @@ mod workspace_loss_tests {
                 mode: TurnDeliveryMode::Start,
                 created_at: BEFORE_LOSS.into(),
             }),
+            agent_message: None,
         };
         f.engine
             .dispatch_with_admission(command, admission, || {})
@@ -4447,6 +4451,7 @@ mod workspace_loss_tests {
                 mode: TurnDeliveryMode::Start,
                 created_at: BEFORE_LOSS.into(),
             }),
+            agent_message: None,
         };
         f.engine
             .dispatch_with_admission(command, admission, || {})
@@ -5140,6 +5145,7 @@ mod workspace_loss_tests {
                         mode: TurnDeliveryMode::Start,
                         created_at: BEFORE_LOSS.into(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )

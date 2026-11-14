@@ -481,6 +481,7 @@ async fn send_message(engine: &OrchestrationEngine, thread: &str, id: &str) {
                     mode: TurnDeliveryMode::Start,
                     created_at: T_LAST.into(),
                 }),
+                agent_message: None,
             },
             || {},
         )

@@ -1112,6 +1112,7 @@ async fn dispatch(
                 payload_digest,
                 attachment_refs: Vec::new(),
                 provider_turn: None,
+                agent_message: None,
             },
             claim,
             cancellation,

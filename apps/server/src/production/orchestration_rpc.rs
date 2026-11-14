@@ -641,6 +641,7 @@ async fn dispatch_prepared_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 move || {
@@ -743,6 +744,7 @@ async fn dispatch_turn_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 || {},
@@ -900,6 +902,7 @@ async fn dispatch_reserved_turn_command(
             payload: delivery_payload,
             created_at,
         }),
+        agent_message: None,
     };
     let turn_delivery = provider.turn_delivery.clone();
     let on_commit = move || {
@@ -5241,6 +5244,7 @@ mod tests {
                         payload: serde_json::to_value(&command).expect("command payload"),
                         created_at: CREATED_AT.to_owned(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )

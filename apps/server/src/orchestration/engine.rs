@@ -21,6 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::agent_messaging::store::AgentMessageCompanion;
 use crate::orchestration::delivery::{
     CommandAdmission, TurnDeliveryFailureReason, TurnDeliveryState, TurnDeliveryTransition,
 };
@@ -6287,6 +6288,9 @@ struct PersistCommandOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
+const STALE_AGENT_MESSAGE_RELINK: &str = "agent-message-relink-stale";
+
 async fn persist_command(
     repositories: &Repositories,
     hooks: &TestHooks,
@@ -6407,7 +6411,7 @@ async fn persist_command(
                     &mut copy_receipts,
                 )?;
                 match applied {
-                    CompactionStepOutcome::Stale => return Ok(None),
+                    CompactionStepOutcome::Stale => return Ok(Err(STALE_QUEUED_DELIVERY)),
                     // The failure is being recovered: the queued messages follow the copy.
                     CompactionStepOutcome::RecoveryBegun => hold = None,
                     CompactionStepOutcome::Applied => {}
@@ -6417,7 +6421,7 @@ async fn persist_command(
                 // Recheck inside the event transaction: another owner may have cancelled,
                 // promoted, interrupted, or started a turn since command planning.
                 if !can_promote_queued_provider_turn_on(&transaction, &thread_id, &message_id, automatic)? {
-                    return Ok(None);
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
                 }
                 transaction.execute("UPDATE provider_turn_outbox SET state = 'pending', mode = 'start', held = 0, last_error = NULL, updated_at = ? WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
                     params![created_at, thread_id, message_id])?;
@@ -6425,7 +6429,7 @@ async fn persist_command(
             if let Some((thread_id, message_id, created_at, turn_id)) = steering {
                 let head = crate::persistence::queued_provider_turn_head_on(&transaction, &thread_id)?;
                 if !head.is_some_and(|row| row.message_id == message_id && crate::provider::supports_turn_steer(&row.provider_kind)) {
-                    return Ok(None);
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
                 }
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = 'pending', mode = 'steer', held = 0, last_error = NULL, updated_at = ?
@@ -6433,7 +6437,7 @@ async fn persist_command(
                        AND EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status = 'running' AND active_turn_id = ?)",
                     params![created_at, thread_id, message_id, turn_id],
                 )?;
-                if updated != 1 { return Ok(None); }
+                if updated != 1 { return Ok(Err(STALE_QUEUED_DELIVERY)); }
             }
             if let Some((thread_id, updated_at)) = hold {
                 for delivery_id in hold_queued_provider_turns(&transaction, &thread_id, &updated_at)? {
@@ -6557,6 +6561,19 @@ async fn persist_command(
                         params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at],
                     )?;
                 }
+                // The agent message and its queue entry commit together or not at all.
+                match admission.agent_message {
+                    Some(AgentMessageCompanion::Insert(message)) => {
+                        crate::agent_messaging::store::insert_message(&transaction, &message)?;
+                    }
+                    Some(AgentMessageCompanion::Relink(relink)) => {
+                        let updated_at = event_list.last().map(|event| event.occurred_at.as_str()).unwrap_or_default();
+                        if !crate::agent_messaging::store::apply_relink(&transaction, &relink, updated_at)? {
+                            return Ok(Err(STALE_AGENT_MESSAGE_RELINK));
+                        }
+                    }
+                    None => {}
+                }
             }
             hooks.maybe_pause_before_command_finalization();
             let _commit_permit = commit_fence
@@ -6565,14 +6582,17 @@ async fn persist_command(
                 .transpose()?;
             hooks.maybe_pause_after_command_finalization();
             transaction.commit()?;
-            Ok(Some(PersistCommandOutcome {
+            Ok(Ok(PersistCommandOutcome {
                 committed,
                 result_sequence,
             }))
         })
         .await
         .map_err(wrap_persistence)?
-        .ok_or_else(|| OrchestrationError::Invariant { command_type: command.command_type().to_owned(), detail: "Queued delivery changed before promotion or steering.".to_owned() })?;
+        .map_err(|detail| OrchestrationError::Invariant {
+            command_type: command.command_type().to_owned(),
+            detail: detail.to_owned(),
+        })?;
     Ok(committed)
 }
 
@@ -11015,11 +11035,13 @@ mod tests {
                 payload_digest: canonical_command_digest(&first_payload).expect("first digest"),
                 attachment_refs: Vec::new(),
                 provider_turn: None,
+                agent_message: None,
             };
             let second_admission = CommandAdmission {
                 payload_digest: canonical_command_digest(&second_payload).expect("second digest"),
                 attachment_refs: Vec::new(),
                 provider_turn: None,
+                agent_message: None,
             };
 
             let (first, second) = tokio::join!(
@@ -12107,6 +12129,7 @@ mod tests {
                 payload: serde_json::to_value(command).expect("payload"),
                 created_at: created_at.to_owned(),
             }),
+            agent_message: None,
         }
     }
 
@@ -13484,6 +13507,7 @@ mod tests {
                 payload: serde_json::to_value(&command).expect("payload"),
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
             }),
+            agent_message: None,
         };
         let pause = hooks.pause_after_next_admission_commit();
         let dispatch_engine = engine.clone();
@@ -13649,6 +13673,7 @@ mod tests {
                 payload: serde_json::to_value(&command).expect("payload"),
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
             }),
+            agent_message: None,
         };
         let pending_engine = engine.clone();
         let pending = tokio::spawn(async move {
@@ -13852,6 +13877,7 @@ mod tests {
                         payload_digest: "generic-project-payload".to_owned(),
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -13939,6 +13965,7 @@ mod tests {
                         payload_digest: "generic-project-payload".to_owned(),
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -14179,6 +14206,7 @@ mod tests {
                         payload_digest: digest,
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     claim,
                     || {},

@@ -100,6 +100,7 @@ async fn enqueue_as(
                     mode: TurnDeliveryMode::Start,
                     created_at: TIME.into(),
                 }),
+                agent_message: None,
             },
             || {},
         )
@@ -1442,6 +1443,7 @@ async fn enqueue_bootstrapped(engine: &OrchestrationEngine, thread: &str, id: &s
                     mode: TurnDeliveryMode::Start,
                     created_at: TIME.into(),
                 }),
+                agent_message: None,
             },
             || {},
         )
@@ -3383,4 +3385,226 @@ async fn a_revert_waits_for_a_delivery_in_flight_then_refuses_its_running_turn()
     );
     service.shutdown().await;
     fixture.shutdown().await;
+}
+
+mod agent_message {
+    use super::*;
+    use crate::agent_messaging::store::{
+        AgentMessageCompanion, AgentMessageStatus, NewAgentMessage, RelinkAgentMessage, SenderKind,
+    };
+
+    fn new_message(message_id: &str, delivery_command_id: &str) -> NewAgentMessage {
+        NewAgentMessage {
+            message_id: message_id.to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            sender_address: "thread:a".to_owned(),
+            sender_kind: SenderKind::Agent,
+            recipient_address: "thread:t".to_owned(),
+            in_reply_to: None,
+            hop: 1,
+            text: "Which port does the dev server use?".to_owned(),
+            status: AgentMessageStatus::Accepted,
+            reason: None,
+            accepted_at: TIME.to_owned(),
+            sender_runtime_mode: Some("full-access".to_owned()),
+            recipient_terminal_generation: None,
+            send_request_id: None,
+            client_request_id: None,
+            delivery_command_id: Some(delivery_command_id.to_owned()),
+            delivery_message_id: Some(delivery_command_id.to_owned()),
+        }
+    }
+
+    /// Dispatches a queued `thread.turn.start` for thread `t` whose admission carries `companion`.
+    async fn dispatch_queued_with(
+        engine: &OrchestrationEngine,
+        id: &str,
+        companion: AgentMessageCompanion,
+    ) -> Result<
+        crate::orchestration::engine::DispatchResult,
+        crate::orchestration::OrchestrationError,
+    > {
+        let command = command(
+            json!({"type":"thread.turn.start", "commandId":id, "threadId":"t", "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "queued":true, "createdAt":TIME}),
+        );
+        engine
+            .dispatch_with_admission(
+                command.clone(),
+                CommandAdmission {
+                    payload_digest: canonical_command_digest(&command).unwrap(),
+                    attachment_refs: Vec::new(),
+                    provider_turn: Some(NewProviderTurnDelivery {
+                        command_id: id.into(),
+                        thread_id: "t".into(),
+                        message_id: id.into(),
+                        provider_instance_id: "codex".into(),
+                        provider_kind: "codex".into(),
+                        provider_session_id: None,
+                        delivery_key: id.into(),
+                        payload: serde_json::to_value(&command).unwrap(),
+                        state: TurnDeliveryState::Queued,
+                        mode: TurnDeliveryMode::Start,
+                        created_at: TIME.into(),
+                    }),
+                    agent_message: Some(companion),
+                },
+                || {},
+            )
+            .await
+    }
+
+    fn count(connection: &rusqlite::Connection, sql: &str, id: &str) -> i64 {
+        connection.query_row(sql, [id], |row| row.get(0)).unwrap()
+    }
+
+    fn outbox_rows(connection: &rusqlite::Connection, id: &str) -> i64 {
+        count(
+            connection,
+            "SELECT COUNT(*) FROM provider_turn_outbox WHERE command_id = ?1",
+            id,
+        )
+    }
+
+    fn message_sent_events(connection: &rusqlite::Connection, id: &str) -> i64 {
+        count(
+            connection,
+            "SELECT COUNT(*) FROM orchestration_events WHERE command_id = ?1 AND event_type = 'thread.message-sent'",
+            id,
+        )
+    }
+
+    fn accepted_receipts(connection: &rusqlite::Connection, id: &str) -> i64 {
+        count(
+            connection,
+            "SELECT COUNT(*) FROM orchestration_command_receipts WHERE command_id = ?1 AND status = 'accepted'",
+            id,
+        )
+    }
+
+    async fn file_engine(path: &std::path::Path) -> OrchestrationEngine {
+        engine_on(
+            Database::create_new(path).await.unwrap(),
+            crate::orchestration::engine::TestHooks::default(),
+        )
+        .await
+    }
+
+    async fn stored(
+        engine: &OrchestrationEngine,
+    ) -> Option<crate::agent_messaging::store::AgentMessageRow> {
+        engine
+            .repositories()
+            .database()
+            .call(|connection| crate::agent_messaging::store::get_message(connection, "m1"))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_message_and_queue_entry_commit_together() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("agent-message.sqlite3");
+        let engine = file_engine(&path).await;
+        dispatch_queued_with(
+            &engine,
+            "agent-message:m1",
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+        )
+        .await
+        .unwrap();
+
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        let (status, delivery_command_id): (String, String) = reopened
+            .query_row(
+                "SELECT status, delivery_command_id FROM agent_messages WHERE message_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+        let outbox: Vec<(String, String)> = reopened
+            .prepare("SELECT command_id, state FROM provider_turn_outbox WHERE thread_id = 't'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            outbox,
+            [("agent-message:m1".to_owned(), "queued".to_owned())]
+        );
+        assert_eq!(delivery_command_id, outbox[0].0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_message_insert_leaves_no_queue_entry() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("agent-message.sqlite3");
+        let engine = file_engine(&path).await;
+        let existing = new_message("m1", "earlier");
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                crate::agent_messaging::store::insert_message(&tx, &existing)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let result = dispatch_queued_with(
+            &engine,
+            "agent-message:m1",
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+        )
+        .await;
+
+        assert!(result.is_err(), "a duplicate message id fails the command");
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(outbox_rows(&reopened, "agent-message:m1"), 0);
+        assert_eq!(message_sent_events(&reopened, "agent-message:m1"), 0);
+        assert_eq!(accepted_receipts(&reopened, "agent-message:m1"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stale_relink_rolls_back_the_new_queue_entry() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("agent-message.sqlite3");
+        let engine = file_engine(&path).await;
+        dispatch_queued_with(
+            &engine,
+            "agent-message:m1",
+            AgentMessageCompanion::Insert(new_message("m1", "agent-message:m1")),
+        )
+        .await
+        .unwrap();
+        let before = stored(&engine).await;
+
+        let result = dispatch_queued_with(
+            &engine,
+            "agent-message:m1:2",
+            AgentMessageCompanion::Relink(RelinkAgentMessage {
+                message_id: "m1".to_owned(),
+                expected_status: AgentMessageStatus::Held,
+                expected_delivery_command_id: Some("agent-message:m1".to_owned()),
+                delivery_command_id: "agent-message:m1:2".to_owned(),
+                delivery_message_id: "agent-message:m1:2".to_owned(),
+                status: AgentMessageStatus::Queued,
+                reason: None,
+            }),
+        )
+        .await;
+
+        let error = result.expect_err("a relink from a status the row does not have fails");
+        assert!(
+            error.to_string().contains("agent-message-relink-stale"),
+            "{error}"
+        );
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(outbox_rows(&reopened, "agent-message:m1:2"), 0);
+        assert_eq!(message_sent_events(&reopened, "agent-message:m1:2"), 0);
+        assert_eq!(stored(&engine).await, before);
+    }
 }
