@@ -42,6 +42,10 @@ const ACCESS_DESCRIPTION =
 const CAPABILITIES_TITLE = "What agents can use";
 const CAPABILITIES_DESCRIPTION =
   "Turn whole sets of tools on or off for MCP agents. A change applies to their next call.";
+const AGENT_MESSAGING_TITLE = "Agent messaging";
+const AGENT_MESSAGING_DESCRIPTION =
+  "Let agents in the same project message each other and read the replies. Off by default. Every message names its sender and shows in the recipient's thread. Your own Send to agent works either way.";
+const AGENT_MESSAGING_OLDER_SERVER_MESSAGE = "Update this server to use agent messaging.";
 const OLDER_SERVER_MESSAGE = "Update this server to use outside agents.";
 const SERVER_OFF_MESSAGE = "Turn on MCP server first.";
 const FULL_ACCESS_FIRST_MESSAGE = "Set Agents may to Full access first.";
@@ -93,6 +97,7 @@ const selectEnabled = (settings: UnifiedSettings) => settings.enableMcpServer;
 const selectWebhooksEnabled = (settings: UnifiedSettings) => settings.enableWebhooks;
 const selectAccess = (settings: UnifiedSettings) => settings.mcpServerAccess;
 const selectCapabilities = (settings: UnifiedSettings) => settings.mcpCapabilities;
+const selectAgentMessaging = (settings: UnifiedSettings) => settings.agentMessaging.enabled;
 
 type McpSettingsPatch = {
   enableMcpServer?: boolean;
@@ -398,6 +403,17 @@ function EnvironmentMcpServer({
         resettable={supported}
         onChange={(patch) => void save({ mcpCapabilities: patch })}
       />
+      <AgentMessagingRow
+        environmentId={environmentId}
+        label={label}
+        reason={
+          serverConfig === null
+            ? `Connecting to ${label}…`
+            : serverConfig.environment.capabilities.agentMessaging
+              ? null
+              : AGENT_MESSAGING_OLDER_SERVER_MESSAGE
+        }
+      />
       {supported && serverConfig?.mcpLaunch ? (
         <ConnectAgentRow
           environmentId={environmentId}
@@ -479,6 +495,69 @@ function CapabilitiesRow({
         })}
       </ul>
     </SettingsRow>
+  );
+}
+
+/**
+ * Whether agents in one project may message each other. Independent of the MCP server switch:
+ * it governs BiBCode's own agents. A reversible switch, so it applies without asking.
+ */
+function AgentMessagingRow({
+  environmentId,
+  label,
+  reason,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  /** Why the switch is disabled; `null` when the server supports it. */
+  readonly reason: string | null;
+}) {
+  const enabled = useEnvironmentSettings(environmentId, selectAgentMessaging);
+  const updateSettings = useUpdateEnvironmentSettings(environmentId);
+  const reasonId = useId();
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const save = async (next: boolean) => {
+    setSaveError(null);
+    const result = await updateSettings({
+      agentMessaging: { enabled: next },
+    } as Partial<UnifiedSettings>);
+    if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+    const failure = squashAtomCommandFailure(result);
+    const detail =
+      failure instanceof Error && failure.message.trim().length > 0
+        ? failure.message
+        : `Check the connection to ${label}.`;
+    setSaveError(`Could not save the agent messaging setting. ${detail} Try again.`);
+  };
+  return (
+    <SettingsRow
+      title={AGENT_MESSAGING_TITLE}
+      description={AGENT_MESSAGING_DESCRIPTION}
+      resetAction={
+        reason === null && enabled ? (
+          <SettingResetButton label="agent messaging" onClick={() => void save(false)} />
+        ) : null
+      }
+      status={
+        saveError !== null ? (
+          <div role="alert" className="flex items-start gap-1.5 text-destructive">
+            <TriangleAlertIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+            <span>{saveError}</span>
+          </div>
+        ) : reason === null ? null : (
+          <ReasonLine id={reasonId} text={reason} />
+        )
+      }
+      control={
+        <Switch
+          checked={reason === null && enabled}
+          disabled={reason !== null}
+          onCheckedChange={(checked) => void save(checked)}
+          aria-label={AGENT_MESSAGING_TITLE}
+          aria-describedby={reason === null ? undefined : reasonId}
+        />
+      }
+    />
   );
 }
 

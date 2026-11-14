@@ -204,7 +204,7 @@ function environment(overrides: Partial<FakeEnvironment> = {}): FakeEnvironment 
     label: "This Mac",
     connection: { phase: "connected" },
     serverConfig: {
-      environment: { capabilities: {} },
+      environment: { capabilities: { agentMessaging: true } },
       mcpLaunch: {
         argv: [
           "/Applications/BiBCode.app/Contents/MacOS/BiBCode",
@@ -223,6 +223,7 @@ function settings(overrides: Record<string, unknown> = {}): Record<string, unkno
     enableMcpServer: true,
     mcpServerAccess: "approval-required",
     mcpCapabilities: DEFAULT_CAPABILITIES,
+    agentMessaging: { enabled: false },
     ...overrides,
   };
 }
@@ -345,6 +346,79 @@ describe("AgentIntegrationsSection", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toBe(
       "Could not save the MCP server setting. The server refused the change. Try again.",
     );
+  });
+
+  describe("agent messaging", () => {
+    const messagingSwitch = (container: HTMLElement) =>
+      capabilitySwitch(container, "Agent messaging");
+
+    it("agent messaging is off by default and says what it does", async () => {
+      const container = await render();
+      const toggle = messagingSwitch(container);
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(toggle.disabled).toBe(false);
+      expect(container.textContent).toContain(
+        "Let agents in the same project message each other and read the replies. Off by default. Every message names its sender and shows in the recipient's thread. Your own Send to agent works either way.",
+      );
+    });
+
+    it("turns agent messaging on without asking and writes only its own key", async () => {
+      const container = await render();
+      await act(async () => messagingSwitch(container).click());
+      expect(h.updates).toEqual([
+        { environmentId: "local", patch: { agentMessaging: { enabled: true } } },
+      ]);
+      expect(container.querySelector('[role="dialog"], [role="alertdialog"]')).toBeNull();
+    });
+
+    it("offers a reset while it is on", async () => {
+      h.settings = settings({ agentMessaging: { enabled: true } });
+      const container = await render();
+      expect(messagingSwitch(container).getAttribute("aria-checked")).toBe("true");
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>('[aria-label="Reset agent messaging to default"]')!
+          .click(),
+      );
+      expect(h.updates).toEqual([
+        { environmentId: "local", patch: { agentMessaging: { enabled: false } } },
+      ]);
+    });
+
+    it("offers no reset while it is off", async () => {
+      const container = await render();
+      expect(container.querySelector('[aria-label="Reset agent messaging to default"]')).toBeNull();
+    });
+
+    it("disables the switch and says why on a server that lacks the capability", async () => {
+      h.environments = [
+        environment({
+          serverConfig: {
+            environment: { capabilities: { agentMessaging: false } },
+            mcpLaunch: { argv: ["/bin/bibcode", "mcp"] },
+          },
+        }),
+      ];
+      const container = await render();
+      const toggle = messagingSwitch(container);
+      expect(toggle.disabled).toBe(true);
+      expect(describedText(container, toggle)).toBe("Update this server to use agent messaging.");
+    });
+
+    it("says what failed when the change is not saved", async () => {
+      h.updateResult = AsyncResult.failure(Cause.fail(new Error("The server refused the change.")));
+      const container = await render();
+      await act(async () => messagingSwitch(container).click());
+      expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+        "Could not save the agent messaging setting. The server refused the change. Try again.",
+      );
+    });
+
+    it("the MCP server switch does not control it", async () => {
+      h.settings = settings({ enableMcpServer: false });
+      const container = await render();
+      expect(messagingSwitch(container).disabled).toBe(false);
+    });
   });
 
   it("explains why an older server's rows are disabled", async () => {
