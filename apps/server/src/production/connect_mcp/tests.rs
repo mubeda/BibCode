@@ -2312,18 +2312,147 @@ impl std::io::Write for CapturedLog {
     }
 }
 
-/// Message text reaches neither the log, the profiler nor the activity log, whether the send
-/// was accepted, refused or cut. In a process of its own: the tracing capture and the profiler
-/// handle are process-global.
-#[tokio::test]
+/// A provider driver that keeps the text each delivery hands it, so the test can prove the
+/// envelope crossed the delivery path to the driver.
+#[derive(Clone, Default)]
+struct EnvelopeDriver {
+    delivered: Arc<std::sync::Mutex<Vec<String>>>,
+    stop: CancellationToken,
+}
+
+impl crate::production::provider_runtime::ProviderDriverFactory for EnvelopeDriver {
+    fn create(
+        &self,
+        _request: crate::production::provider_runtime::ProviderLaunchRequest,
+    ) -> crate::production::provider_runtime::BoxRuntimeFuture<
+        '_,
+        Result<
+            Arc<dyn crate::production::provider_runtime::ProviderDriver>,
+            crate::production::provider_runtime::ProviderRuntimeError,
+        >,
+    > {
+        let driver = self.clone();
+        Box::pin(async move {
+            Ok(Arc::new(driver) as Arc<dyn crate::production::provider_runtime::ProviderDriver>)
+        })
+    }
+}
+
+type DriverResult<'a, T> = crate::production::provider_runtime::BoxRuntimeFuture<
+    'a,
+    Result<T, crate::production::provider_runtime::ProviderRuntimeError>,
+>;
+
+impl crate::production::provider_runtime::ProviderDriver for EnvelopeDriver {
+    fn start(&self) -> DriverResult<'_, crate::production::provider_runtime::StartedSession> {
+        Box::pin(async {
+            Ok(crate::production::provider_runtime::StartedSession {
+                resume_cursor: Some(json!({ "threadId": "native-session" })),
+                ..crate::production::provider_runtime::StartedSession::default()
+            })
+        })
+    }
+
+    fn send(
+        &self,
+        text: String,
+        _attachments: Vec<Value>,
+        _interaction_mode: String,
+    ) -> DriverResult<'_, Option<String>> {
+        self.delivered.lock().unwrap().push(text);
+        Box::pin(async { Ok(Some("turn-1".to_owned())) })
+    }
+
+    fn interrupt(&self, _turn_id: Option<String>) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn approve(&self, _request_id: String, _decision: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn answer(&self, _request_id: String, _answers: Value) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_mode(&self, _mode: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_model(&self, _model: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_options(&self, _options: Vec<Value>) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rollback(&self, _turn_count: i64, _rewind_key: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(
+        &self,
+    ) -> crate::production::provider_runtime::BoxRuntimeFuture<
+        '_,
+        Option<crate::production::provider_runtime::ProviderEvent>,
+    > {
+        Box::pin(async {
+            self.stop.cancelled().await;
+            None
+        })
+    }
+
+    fn shutdown(&self) -> DriverResult<'_, ()> {
+        self.stop.cancel();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The status of the one stored agent message, once it is delivered or past it.
+async fn delivered_status(engine: &crate::orchestration::OrchestrationEngine) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status: Option<String> = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    Ok(connection
+                        .query_row("SELECT status FROM agent_messages", [], |row| row.get(0))
+                        .ok())
+                })
+                .await
+                .unwrap();
+            if let Some(status) = status.filter(|status| status != "accepted" && status != "queued")
+            {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the message is delivered")
+}
+
+/// Message text reaches neither the log, the trace, the profiler nor the activity log, whether
+/// the send was accepted and delivered through the real turn delivery to a provider driver, or
+/// refused. In a process of its own: the tracing subscriber and the profiler are global.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_log_and_the_profiler_never_see_agent_message_text() {
+    use crate::{
+        agent_messaging::{AgentMessaging, delivery::AgentMessageTracker, policy},
+        mcp::control::{McpAccess, McpControl, McpServerSettings},
+        orchestration::{OrchestrationEngine, engine::EngineOptions},
+        persistence::{Database, Repositories, run_migrations},
+    };
     let Some(child) = crate::test_support::in_own_process(
         "production::connect_mcp::tests::the_log_and_the_profiler_never_see_agent_message_text",
     ) else {
         return;
     };
     let log = CapturedLog::default();
-    let _logging = tracing::subscriber::set_default(
+    // Global, so the database worker's and every runtime thread's records are captured too.
+    tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
@@ -2332,7 +2461,8 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
                 move || log.clone()
             })
             .finish(),
-    );
+    )
+    .expect("the only subscriber of this process");
     let state = tempfile::tempdir().expect("profiler state");
     let (_enabled, enabled) = tokio::sync::watch::channel(true);
     let runtime = crate::diagnostics::profiler::runtime::ProfilerRuntime::start(
@@ -2348,66 +2478,199 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
     .await
     .expect("the profiler turns on");
 
-    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    // The server's own services, with a provider driver behind the real turn delivery.
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+        .await
+        .expect("engine");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut commands = vec![json!({
+        "type": "project.create", "commandId": "project-create", "projectId": "p1",
+        "title": "Project", "workspaceRoot": workspace.path(),
+        "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+        "createdAt": "2026-11-14T00:00:00.000Z",
+    })];
     for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
-        tools
-            .engine
-            .dispatch(
-                serde_json::from_value(json!({
-                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
-                    "threadId": thread_id, "projectId": "p1", "title": title,
-                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
-                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
-                }))
-                .unwrap(),
-            )
+        commands.push(json!({
+            "type": "thread.create", "commandId": format!("create-{thread_id}"),
+            "threadId": thread_id, "projectId": "p1", "title": title,
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+        }));
+    }
+    for command in commands {
+        engine
+            .dispatch(serde_json::from_value(command).unwrap())
             .await
             .unwrap();
     }
-    let sink = crate::mcp::activity::agent_message_sink(tools.control.activity().clone());
+    let driver = EnvelopeDriver::default();
+    let provider = Arc::new(
+        crate::production::provider_runtime::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(driver.clone()),
+            crate::activity::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                database.clone(),
+            )),
+            crate::production::provider_runtime::SupervisorOptions::default(),
+        ),
+    );
+    let delivery = Arc::new(
+        crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            provider.clone(),
+            workspace.path().to_path_buf(),
+        ),
+    );
+    let uploads = crate::transfer::staging::UploadRegistry::new(
+        workspace.path().join("uploads"),
+        crate::transfer::staging::UploadLimits::default(),
+        Arc::new(tokio::time::Instant::now),
+    );
+    let secrets = tempfile::tempdir().expect("secrets");
+    let auth = crate::auth::AuthService::new_with_persistence(
+        &crate::ServerConfig::new(".").with_bind("127.0.0.1", 3773),
+        vec![7_u8; 32],
+        crate::auth::SecretStore::new(secrets.path())
+            .await
+            .expect("secret store"),
+        Repositories::new(database.clone()),
+    )
+    .await
+    .expect("auth");
+    let (_settings, settings) = tokio::sync::watch::channel(McpServerSettings {
+        enabled: true,
+        access: McpAccess::FullAccess,
+        ..McpServerSettings::default()
+    });
+    let control = McpControl::new(
+        crate::rpc::RpcRegistry::empty(),
+        auth,
+        engine.clone(),
+        settings,
+    );
+    let (sink, writer) = crate::mcp::activity::agent_message_writer(control.activity().clone());
+    let (_messaging, messaging_on) = tokio::sync::watch::channel(true);
+    engine
+        .repositories()
+        .set_agent_claim_gate(policy::claim_gate(messaging_on.clone()));
     let tracker = CancellationToken::new();
-    crate::agent_messaging::delivery::AgentMessageTracker::start(
-        tools.engine.clone(),
+    let tracking = AgentMessageTracker::start(
+        engine.clone(),
         Some(sink.clone()),
-        tokio::sync::watch::channel(true).1,
+        messaging_on.clone(),
         tracker.clone(),
     );
-    tools
-        .control
-        .attach_agent_messaging(tools.messaging_untracked(true).with_outcomes(sink));
+    control.attach_agent_messaging(
+        AgentMessaging::new(engine.clone(), messaging_on)
+            .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+                engine.clone(),
+                provider.clone(),
+                workspace.path().to_path_buf(),
+                delivery.clone(),
+                None,
+                uploads,
+            ))
+            .with_outcomes(sink)
+            .with_admissions(writer.admissions()),
+    );
     let connect = harness(4, 4).await;
-    let service = connect.service.clone().with_control(tools.control.clone());
+    let service = connect.service.clone().with_control(control.clone());
     let issued = service
         .issue_mcp_credential("a", "a", "codex")
         .await
         .unwrap();
     let headers = initialize(&service, &issued).await;
-    let long = format!("LONG-CANARY{}", "x".repeat(16_000));
+
+    let mut results = Vec::new();
     for (id, to, text) in [
         (2, "thread:b", "SEND-CANARY-31337".to_owned()),
         (3, "thread:gone", "REFUSED-CANARY-31337".to_owned()),
-        (4, "thread:b", long),
+        (4, "thread:b", format!("LONG-CANARY{}", "x".repeat(16_000))),
     ] {
-        rpc(
+        let response = rpc(
             &service,
             headers.clone(),
             json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":to,"text":text}}}),
         )
         .await;
+        results.push(response["result"].clone());
     }
-    // Let the sink write its rows, then read them back.
-    let mut rows = Vec::new();
-    for _ in 0..500 {
-        rows = tools.control.activity().recent().await.unwrap();
-        if rows.len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_ne!(results[0]["isError"], true, "{}", results[0]);
+    assert_eq!(results[0]["structuredContent"]["status"], "accepted");
+    let message_id = results[0]["structuredContent"]["messageId"]
+        .as_str()
+        .expect("a message id")
+        .to_owned();
+    for (result, tag) in results[1..].iter().zip([
+        "AgentMessagingUnknownRecipientError",
+        "AgentMessagingInvalidArgumentError",
+    ]) {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"]["_tag"], tag, "{result}");
     }
+    // The driver took the turn, so the message reads delivered, or consumed once the tracker
+    // ties it to the driver's turn.
+    let status = delivered_status(&engine).await;
+    assert!(matches!(status.as_str(), "delivered" | "consumed"), "{status}");
+    // The positive control: the envelope crossed the delivery path to the driver.
+    let delivered = driver.delivered.lock().unwrap().clone();
+    assert!(
+        delivered.len() == 1 && delivered[0].contains("SEND-CANARY-31337"),
+        "the driver got the envelope"
+    );
+    // Every row is written before the rows are read.
     tracker.cancel();
-    tools.shutdown().await;
+    tracking.await.unwrap();
+    writer.close().await;
+    let rows = control.activity().recent().await.unwrap();
+    delivery.shutdown().await;
+    provider.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
     runtime.shutdown().await;
 
+    let summary: Vec<(&str, &str, Option<&str>)> = rows
+        .iter()
+        .rev()
+        .map(|row| {
+            (
+                row["tool"].as_str().unwrap(),
+                row["outcome"].as_str().unwrap(),
+                row["target"]["status"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary[..3],
+        [
+            ("agent_message_send", "success", Some("accepted")),
+            ("agent_message_send", "AgentMessagingUnknownRecipientError", None),
+            ("agent_message_send", "AgentMessagingInvalidArgumentError", None),
+        ],
+        "{rows:?}"
+    );
+    let deliveries = &summary[3..];
+    assert!(
+        !deliveries.is_empty()
+            && deliveries.iter().all(|row| matches!(
+                row,
+                ("agent_message_delivery", "success", Some("delivered" | "consumed"))
+            )),
+        "{rows:?}"
+    );
+    assert!(
+        rows[..deliveries.len()]
+            .iter()
+            .all(|row| row["target"]["messageId"] == message_id.as_str()),
+        "{rows:?}"
+    );
     let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
     assert!(
         log.contains("MCP tool call failed") && log.contains("AgentMessagingUnknownRecipientError"),
