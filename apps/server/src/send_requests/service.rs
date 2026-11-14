@@ -1,14 +1,18 @@
 //! `sendRequests.send`: a signed-in person's request to a specific chat agent. The request is
 //! stored once per request id, then queued on the target as that person's own message with
-//! its provenance (`message.personSend`), through the server-only command dispatcher.
+//! its provenance (`message.personSend`), through the server-only command dispatcher. A
+//! follower moves each request through its states from the target's turn events.
 
+use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
-use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState};
+use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange};
 use crate::{
-    orchestration::{OrchestrationCommand, canonical_command_digest},
-    persistence::{Database, ProjectionThread, Repositories},
+    orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
+    persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
     production::orchestration_rpc::{ServerActor, ServerCommandDispatcher},
     rpc::RpcSessionContext,
     transfer::staging::UploadOwner,
@@ -18,6 +22,24 @@ use crate::{
 pub(crate) const PERSON_REQUEST_MAX_CHARS: usize = 48_000;
 /// The lead-in the client writes before the note, in Unicode scalar values.
 pub(crate) const LEAD_IN_MAX_CHARS: usize = 16_000;
+/// The answer text a request keeps, in Unicode scalar values.
+pub(crate) const ANSWER_TEXT_MAX_CHARS: usize = 48_000;
+
+const OPEN: [SendState; 4] = [
+    SendState::Queued,
+    SendState::Waiting,
+    SendState::Delivered,
+    SendState::Read,
+];
+
+/// One change of a stored request, as `sendRequests.subscribe` sends it on.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // sendRequests.subscribe (task 1.6) reads it.
+pub(crate) enum RequestChange {
+    Upsert(SendRequestRow),
+    /// The request was removed with its source thread.
+    Remove(String),
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -164,6 +186,7 @@ pub(crate) struct SendRequestsService {
     store: SendRequestStore,
     repositories: Repositories,
     dispatcher: ServerCommandDispatcher,
+    changes: broadcast::Sender<RequestChange>,
 }
 
 impl SendRequestsService {
@@ -176,7 +199,163 @@ impl SendRequestsService {
             store: SendRequestStore::new(database),
             repositories,
             dispatcher,
+            changes: broadcast::channel(256).0,
         }
+    }
+
+    #[allow(dead_code)] // sendRequests.subscribe (task 1.6) reads it.
+    pub(crate) fn subscribe_changes(&self) -> broadcast::Receiver<RequestChange> {
+        self.changes.subscribe()
+    }
+
+    /// Stores one state change (a compare and set from `from`) and publishes it. Every request
+    /// transition goes through here. `None` when the stored state is not in `from`.
+    pub(crate) async fn apply(
+        &self,
+        request_id: &str,
+        from: &[SendState],
+        change: StateChange,
+    ) -> crate::persistence::Result<Option<SendRequestRow>> {
+        let row = self.store.transition(request_id, from, change).await?;
+        if let Some(row) = &row {
+            let _ = self.changes.send(RequestChange::Upsert(row.clone()));
+        }
+        Ok(row)
+    }
+
+    /// Spawns the follower: one sweep of every open request, then the target threads' events.
+    pub(crate) fn start_follower(&self, engine: OrchestrationEngine, shutdown: CancellationToken) {
+        // Subscribed before the sweep, so no event between the two is missed.
+        let events = engine.subscribe_events();
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.sweep().await;
+            service.follow(events, shutdown).await;
+        });
+    }
+
+    /// Re-reads the requests an event may concern. The broadcast is lossy, so an event only
+    /// names a thread to read again, and a lag reads every open request again.
+    pub(crate) async fn follow(
+        &self,
+        mut events: broadcast::Receiver<OrchestrationEvent>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let event = tokio::select! {
+                () = shutdown.cancelled() => return,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(event) => self.on_event(&event).await,
+                Err(broadcast::error::RecvError::Lagged(_)) => self.sweep().await,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
+    async fn on_event(&self, event: &OrchestrationEvent) {
+        let event = &event.event;
+        if event.aggregate_kind != "thread" {
+            return;
+        }
+        // A streamed assistant chunk changes no request; the completed message does.
+        if event.event_type == "thread.message-sent"
+            && event.payload.get("streaming").and_then(Value::as_bool) == Some(true)
+        {
+            return;
+        }
+        let thread_id = event.aggregate_id.as_str();
+        if event.event_type == "thread.deleted" {
+            match self.store.delete_for_source_thread(thread_id).await {
+                Ok(removed) => {
+                    for request_id in removed {
+                        let _ = self.changes.send(RequestChange::Remove(request_id));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "the send requests of a deleted thread were kept");
+                }
+            }
+        }
+        self.refresh_where(|row| row.target_thread_id == thread_id)
+            .await;
+    }
+
+    /// Reads every open request again.
+    pub(crate) async fn sweep(&self) {
+        self.refresh_where(|_| true).await;
+    }
+
+    async fn refresh_where(&self, concerned: impl Fn(&SendRequestRow) -> bool) {
+        let open = match self.store.list_open().await {
+            Ok(open) => open,
+            Err(error) => {
+                tracing::warn!(%error, "the open send requests could not be read");
+                return;
+            }
+        };
+        for row in open.iter().filter(|row| concerned(row)) {
+            if let Err(error) = self.refresh(row).await {
+                tracing::warn!(
+                    request_id = %row.request_id,
+                    %error,
+                    "a send request's state could not be updated"
+                );
+            }
+        }
+    }
+
+    /// Reads the target's state for one open request and stores the state it implies.
+    async fn refresh(&self, row: &SendRequestRow) -> crate::persistence::Result<()> {
+        let Some(message_id) = row.target_message_id.clone() else {
+            return Ok(());
+        };
+        let view = read_target(
+            self.repositories.database(),
+            row.target_thread_id.clone(),
+            message_id,
+            row.command_id.clone(),
+        )
+        .await?;
+        let next = decide(view);
+        if next.state == row.state && next.reason == row.reason.as_deref() {
+            return Ok(());
+        }
+        let from: &[SendState] = match next.state {
+            SendState::Queued => &[SendState::Waiting],
+            SendState::Waiting => &[SendState::Queued],
+            SendState::Read => &[SendState::Queued, SendState::Waiting, SendState::Delivered],
+            _ => &OPEN,
+        };
+        let (answer_message_id, answer_text, answer_truncated) = match next.answer {
+            Some((message_id, text)) => {
+                let (text, truncated) = cut_answer(text);
+                (message_id, Some(text), truncated)
+            }
+            None => (None, None, false),
+        };
+        self.apply(
+            &row.request_id,
+            from,
+            StateChange {
+                to: next.state,
+                reason: next.reason.map(str::to_owned),
+                answering_turn_id: next.turn_id,
+                answer_message_id,
+                answer_text,
+                answer_truncated,
+                // A message, hand-off or take-over needs nothing more once the target read it.
+                dismiss: next.read
+                    && matches!(
+                        row.action,
+                        SendAction::Message | SendAction::HandOff | SendAction::TakeOver
+                    ),
+                at: crate::mcp::control::now_iso(),
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     /// A live thread, or `unknown_thread`.
@@ -388,4 +567,221 @@ fn turn_command(row: &SendRequestRow, text: String) -> Result<OrchestrationComma
         "createdAt": row.created_at,
     }))
     .map_err(|error| error.to_string())
+}
+
+/// What the target shows for one request's message.
+#[derive(Debug, Default)]
+struct TargetView {
+    deleted: bool,
+    /// The message's delivery: its state and whether it is held.
+    outbox: Option<(String, bool)>,
+    session_status: Option<String>,
+    /// An older delivery of the thread failed or is uncertain, so this one is never claimed.
+    behind_failed: bool,
+    turn: Option<TurnView>,
+    /// The proposed plan the turn ended with.
+    plan: Option<String>,
+    assistant_text: Option<String>,
+    /// The engine rejected the request's command.
+    rejected: bool,
+}
+
+#[derive(Debug)]
+struct TurnView {
+    turn_id: Option<String>,
+    state: String,
+    started: bool,
+    assistant_message_id: Option<String>,
+}
+
+async fn read_target(
+    database: &Database,
+    thread_id: String,
+    message_id: String,
+    command_id: Option<String>,
+) -> crate::persistence::Result<TargetView> {
+    database
+        .call(move |connection| {
+            let deleted = connection
+                .query_row(
+                    "SELECT deleted_at IS NOT NULL FROM projection_threads WHERE thread_id = ?",
+                    [&thread_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(true);
+            let outbox = connection
+                .query_row(
+                    "SELECT state, held, created_at, command_id FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
+                    params![thread_id, message_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let behind_failed = match &outbox {
+                Some((_, _, created_at, delivery_command_id)) => connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state IN ('failed', 'uncertain') AND (created_at, command_id) < (?2, ?3))",
+                    params![thread_id, created_at, delivery_command_id],
+                    |row| row.get(0),
+                )?,
+                None => false,
+            };
+            let session_status = connection
+                .query_row(
+                    "SELECT status FROM projection_thread_sessions WHERE thread_id = ?",
+                    [&thread_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // The turn the message started, found as `read_wait_state` finds it.
+            let turn = connection
+                .query_row(
+                    "SELECT turn_id, state, started_at IS NOT NULL, assistant_message_id FROM projection_turns
+                      WHERE thread_id = ?1 AND (pending_message_id = ?2
+                         OR turn_id = (SELECT turn_id FROM projection_thread_messages WHERE message_id = ?2 AND thread_id = ?1))
+                      ORDER BY (turn_id IS NULL) ASC, requested_at DESC LIMIT 1",
+                    params![thread_id, message_id],
+                    |row| {
+                        Ok(TurnView {
+                            turn_id: row.get(0)?,
+                            state: row.get(1)?,
+                            started: row.get(2)?,
+                            assistant_message_id: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let mut view = TargetView {
+                deleted,
+                outbox: outbox.map(|(state, held, _, _)| (state, held)),
+                session_status,
+                behind_failed,
+                ..TargetView::default()
+            };
+            if let Some(turn) = turn.as_ref().filter(|turn| turn.state == "completed") {
+                if let Some(turn_id) = &turn.turn_id {
+                    view.plan = connection
+                        .query_row(
+                            "SELECT plan_markdown FROM projection_thread_proposed_plans WHERE thread_id = ? AND turn_id = ? ORDER BY updated_at DESC, plan_id DESC LIMIT 1",
+                            params![thread_id, turn_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                }
+                if let Some(assistant_message_id) = &turn.assistant_message_id {
+                    view.assistant_text = connection
+                        .query_row(
+                            "SELECT text FROM projection_thread_messages WHERE message_id = ? AND thread_id = ?",
+                            params![assistant_message_id, thread_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                }
+            }
+            if view.outbox.is_none()
+                && let Some(command_id) = &command_id
+            {
+                view.rejected = connection
+                    .query_row(
+                        "SELECT status = 'rejected' FROM orchestration_command_receipts WHERE command_id = ?",
+                        [command_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+            }
+            view.turn = turn;
+            Ok(view)
+        })
+        .await
+}
+
+/// The state a request is in, given what its target shows.
+#[derive(Debug, PartialEq, Eq)]
+struct Next {
+    state: SendState,
+    reason: Option<&'static str>,
+    turn_id: Option<String>,
+    /// The answer's message (none for a plan) and its text.
+    answer: Option<(Option<String>, String)>,
+    /// The target's turn for the request started.
+    read: bool,
+}
+
+fn decide(view: TargetView) -> Next {
+    let next = |state, reason| Next {
+        state,
+        reason,
+        turn_id: None,
+        answer: None,
+        read: false,
+    };
+    if view.deleted {
+        return next(SendState::NotAnswered, Some("target_deleted"));
+    }
+    if let Some(turn) = view.turn {
+        let settled = |state, reason, answer| Next {
+            state,
+            reason,
+            turn_id: turn.turn_id.clone(),
+            answer,
+            read: turn.started,
+        };
+        match turn.state.as_str() {
+            // A reviewer in plan mode ends its turn with a proposed plan, which is the answer.
+            "completed" => {
+                return match (view.plan, view.assistant_text) {
+                    (Some(plan), _) => settled(SendState::Answered, None, Some((None, plan))),
+                    (None, Some(text)) => settled(
+                        SendState::Answered,
+                        None,
+                        Some((turn.assistant_message_id.clone(), text)),
+                    ),
+                    (None, None) => settled(SendState::NotAnswered, Some("no_answer"), None),
+                };
+            }
+            "error" => return settled(SendState::NotAnswered, Some("turn_failed"), None),
+            "interrupted" => {
+                return settled(SendState::NotAnswered, Some("turn_interrupted"), None);
+            }
+            _ if turn.started => return settled(SendState::Read, None, None),
+            _ => {}
+        }
+    }
+    let paused_session = matches!(
+        view.session_status.as_deref(),
+        Some("error" | "interrupted" | "stopped")
+    );
+    match view.outbox {
+        Some((state, _)) if matches!(state.as_str(), "failed" | "uncertain") => {
+            next(SendState::NotAnswered, Some("delivery_failed"))
+        }
+        // Withdrawn before a turn started: a cancel whose own state change was not stored.
+        Some((state, _)) if state == "dismissed" => next(SendState::Cancelled, None),
+        Some((state, held)) if state == "queued" && (held || paused_session) => {
+            next(SendState::Waiting, Some("queue_paused"))
+        }
+        Some((state, _)) if state == "pending" && view.behind_failed => {
+            next(SendState::Waiting, Some("queue_paused"))
+        }
+        None if view.rejected => next(SendState::NotAnswered, Some("delivery_failed")),
+        _ => next(SendState::Queued, None),
+    }
+}
+
+/// `text` cut at [`ANSWER_TEXT_MAX_CHARS`] Unicode scalar values, and whether it was cut.
+fn cut_answer(mut text: String) -> (String, bool) {
+    match text.char_indices().nth(ANSWER_TEXT_MAX_CHARS) {
+        Some((index, _)) => {
+            text.truncate(index);
+            (text, true)
+        }
+        None => (text, false),
+    }
 }

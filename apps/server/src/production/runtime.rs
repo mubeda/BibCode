@@ -117,6 +117,8 @@ pub struct ProductionRuntime {
     mcp_control: crate::mcp::control::McpControl,
     /// Outbound webhooks and their dispatcher (#139 slice X8).
     webhooks: crate::webhooks::Webhooks,
+    /// Stops the follower that moves send requests through their states.
+    send_requests_follower: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -804,21 +806,19 @@ impl ProductionRuntime {
             ));
         webhooks.wake_on(auth.subscribe_access());
         crate::webhooks::register_webhooks_rpc(&mut registry, webhooks.clone());
-        crate::send_requests::rpc::register_send_requests_rpc(
-            &mut registry,
-            crate::send_requests::service::SendRequestsService::new(
-                repositories.database().clone(),
-                repositories.clone(),
-                crate::production::orchestration_rpc::server_command_dispatcher(
-                    orchestration.clone(),
-                    provider_runtime.clone(),
-                    config.state_dir(),
-                    turn_delivery.clone(),
-                    Some(workspace_availability.clone()),
-                    attachment_uploads.clone(),
-                ),
+        let send_requests = crate::send_requests::service::SendRequestsService::new(
+            repositories.database().clone(),
+            repositories.clone(),
+            crate::production::orchestration_rpc::server_command_dispatcher(
+                orchestration.clone(),
+                provider_runtime.clone(),
+                config.state_dir(),
+                turn_delivery.clone(),
+                Some(workspace_availability.clone()),
+                attachment_uploads.clone(),
             ),
         );
+        crate::send_requests::rpc::register_send_requests_rpc(&mut registry, send_requests.clone());
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),
@@ -829,11 +829,15 @@ impl ProductionRuntime {
         );
         mcp_control.attach_terminals(mcp_terminals);
 
+        // Late, so a failed start leaves no follower running.
+        let send_requests_follower = CancellationToken::new();
+        send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,
+            send_requests_follower,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1028,6 +1032,9 @@ impl ProductionRuntime {
         // the profiler's teardown.
         self.webhooks.shutdown().await;
         steps.mark("webhooks");
+        // A stopped follower resumes from its first sweep on the next start.
+        self.send_requests_follower.cancel();
+        steps.mark("send-requests-follower");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
