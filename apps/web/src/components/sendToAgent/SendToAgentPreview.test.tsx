@@ -324,4 +324,51 @@ describe("SendToAgentPreview", () => {
       useSendToAgentStore.getState().notes[sendChoiceKey(choiceOf("message"))],
     ).toBeUndefined();
   });
+  describe("a send that finishes after Cancel and a reopen", () => {
+    const key = sendChoiceKey(choiceOf("message"));
+    const reopen = () =>
+      act(async () => document.querySelector<HTMLElement>("[data-reopen]")!.click());
+
+    it.each([
+      ["the default submit", false],
+      ["a custom submit", true],
+    ])("leaves the new preview, its note and its pending id alone (%s)", async (_name, custom) => {
+      let finish: (outcome: SendOutcome) => void = () => undefined;
+      const delayed = () =>
+        new Promise<SendOutcome>((resolve) => {
+          finish = resolve;
+        });
+      const onClose = vi.fn();
+      render(custom ? { onClose, onSend: delayed } : { onClose, send: delayed });
+      await typeInto(textareas()[0]!, "first note");
+      await click(button("Send"));
+      await click(button("Cancel"));
+      expect(onClose).toHaveBeenCalledTimes(1);
+      await reopen();
+      await typeInto(textareas()[0]!, "second note");
+
+      await act(async () => finish({ kind: "sent" }));
+      await flush();
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(textareas()[0]!.value).toBe("second note");
+      expect(useSendToAgentStore.getState().notes[key]).toBe("second note");
+    });
+
+    it("still clears the note it sent when nothing was typed since", async () => {
+      let finish: (outcome: SendOutcome) => void = () => undefined;
+      const send = () =>
+        new Promise<SendOutcome>((resolve) => {
+          finish = resolve;
+        });
+      render({ send });
+      await typeInto(textareas()[0]!, "first note");
+      await click(button("Send"));
+      await click(button("Cancel"));
+      await act(async () => finish({ kind: "sent" }));
+      await flush();
+      expect(useSendToAgentStore.getState().notes[key]).toBeUndefined();
+      expect(useSendToAgentStore.getState().pending[key]).toBeUndefined();
+    });
+  });
 });
