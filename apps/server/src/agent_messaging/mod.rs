@@ -196,6 +196,10 @@ pub(crate) struct MessageOutcome {
 
 pub(crate) type OutcomeSink = Arc<dyn Fn(MessageOutcome) + Send + Sync>;
 
+/// An accepted send or reply: its receipt and, unless it replays a stored one, the sender's and
+/// the recipient's thread titles.
+type Accepted = (MessageReceipt, Option<(String, String)>);
+
 /// The sender and recipient threads of a send that passed every check.
 struct Route {
     sender: ProjectionThread,
@@ -253,7 +257,7 @@ impl AgentMessaging {
         tool: &'static str,
         sender_thread_id: &str,
         recipient_address: &str,
-        result: &Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError>,
+        result: &Result<Accepted, AgentMessagingError>,
     ) {
         let Some(outcomes) = &self.outcomes else {
             return;
@@ -304,7 +308,7 @@ impl AgentMessaging {
         sender_thread_id: &str,
         request: &ReplyRequest,
         recipient_address: &mut String,
-    ) -> Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError> {
+    ) -> Result<Accepted, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
@@ -408,7 +412,7 @@ impl AgentMessaging {
         &self,
         sender_thread_id: &str,
         request: &SendRequest,
-    ) -> Result<(MessageReceipt, Option<(String, String)>), AgentMessagingError> {
+    ) -> Result<Accepted, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
