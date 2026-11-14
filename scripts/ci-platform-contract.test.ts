@@ -706,6 +706,8 @@ describe("cross-platform release contract", () => {
         expect(runCiTestLookup(fixture), JSON.stringify(fixture)).toBe("");
       }
     },
+    // Eleven bash and jq runs: about 4.4 s on an idle machine, past the 5 s default under load.
+    30_000,
   );
 
   it("skips the preflight test run only when CI's Test passed for the same commit", () => {
