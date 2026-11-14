@@ -668,17 +668,21 @@ pub(crate) fn has_open_ask(connection: &rusqlite::Connection, thread_id: &str) -
 
 const TERMINAL_RECIPIENT: &str = "substr(recipient_address, 1, 9) = 'terminal:'";
 
+fn queued_terminal_mail_sql() -> String {
+    format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE {TERMINAL_RECIPIENT} AND status = 'queued' AND (sender_kind = 'person' OR ?1)
+          ORDER BY rowid"
+    )
+}
+
 /// The `queued` mail of every terminal, in acceptance order: a person's request always, an
 /// agent's message only while messaging is `enabled`.
 pub(crate) fn list_queued_terminal_mail(
     connection: &rusqlite::Connection,
     enabled: bool,
 ) -> Result<Vec<AgentMessageRow>> {
-    let mut statement = connection.prepare_cached(&format!(
-        "SELECT {COLUMNS} FROM agent_messages
-          WHERE {TERMINAL_RECIPIENT} AND status = 'queued' AND (sender_kind = 'person' OR ?1)
-          ORDER BY rowid"
-    ))?;
+    let mut statement = connection.prepare_cached(&queued_terminal_mail_sql())?;
     let rows = statement
         .query_map(params![enabled], decode)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -790,17 +794,21 @@ pub(crate) fn fail_unconsumed_for_generation(
     Ok(ids)
 }
 
+fn open_terminal_generations_sql() -> String {
+    format!(
+        "SELECT recipient_address, recipient_terminal_generation FROM agent_messages
+          WHERE {TERMINAL_RECIPIENT} AND recipient_terminal_generation IS NOT NULL AND {OPEN}
+          GROUP BY recipient_address, recipient_terminal_generation
+          ORDER BY MIN(rowid)"
+    )
+}
+
 /// Each terminal generation that still has mail whose status is not final, consumed mail
 /// included, as `(recipient address, generation key)`, in acceptance order of its first row.
 pub(crate) fn list_open_terminal_generations(
     connection: &rusqlite::Connection,
 ) -> Result<Vec<(String, String)>> {
-    let mut statement = connection.prepare_cached(&format!(
-        "SELECT recipient_address, recipient_terminal_generation FROM agent_messages
-          WHERE {TERMINAL_RECIPIENT} AND recipient_terminal_generation IS NOT NULL AND {OPEN}
-          GROUP BY recipient_address, recipient_terminal_generation
-          ORDER BY MIN(rowid)"
-    ))?;
+    let mut statement = connection.prepare_cached(&open_terminal_generations_sql())?;
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1111,5 +1119,72 @@ mod tests {
 
         turn_started(&connection, "t3", "person", None);
         assert_eq!(trigger_hop(&connection, "a").unwrap(), None);
+    }
+
+    fn terminal_message(message_id: &str) -> NewAgentMessage {
+        NewAgentMessage {
+            recipient_address: "terminal:t/term-1".to_owned(),
+            status: AgentMessageStatus::Queued,
+            reason: None,
+            recipient_terminal_generation: Some("boot-1:1".to_owned()),
+            client_request_id: None,
+            delivery_command_id: None,
+            delivery_message_id: None,
+            ..message(message_id)
+        }
+    }
+
+    #[test]
+    fn a_failed_inbox_batch_consumes_nothing() {
+        let mut connection = connection();
+        insert(&mut connection, &terminal_message("m1"));
+        insert(&mut connection, &terminal_message("m2"));
+        connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_second BEFORE UPDATE ON agent_messages
+                   WHEN OLD.message_id = 'm2' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        assert!(
+            consume_for_generation(&connection, "terminal:t/term-1", "boot-1:1", true, "now")
+                .is_err()
+        );
+        assert_eq!(
+            get_message(&connection, "m1").unwrap().unwrap().status,
+            AgentMessageStatus::Queued,
+            "a batch that returned an error kept a row consumed"
+        );
+    }
+
+    /// The `detail` column of `sql`'s query plan, one step per line.
+    fn query_plan(connection: &rusqlite::Connection, sql: &str) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let count = statement.parameter_count();
+        let parameters: Vec<bool> = vec![true; count];
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn terminal_mail_queries_read_only_pending_rows_through_an_index() {
+        let connection = connection();
+        for (name, sql) in [
+            ("queued mail", queued_terminal_mail_sql()),
+            ("open generations", open_terminal_generations_sql()),
+        ] {
+            let plan = query_plan(&connection, &sql);
+            assert!(
+                plan.contains("INDEX idx_agent_messages_terminal_pending"),
+                "{name}: {plan}"
+            );
+        }
     }
 }

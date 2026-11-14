@@ -11746,10 +11746,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_when_ready_refuses_once_a_person_typed_after_the_ready_evidence() {
+    async fn write_when_ready_refuses_a_draft_until_the_agent_starts_working() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
         let (manager, slot) = write_when_ready_manager(backend.clone());
+        let mut events = manager.subscribe_metadata().await.events;
         manager
             .open(ai_terminal_input(root.path(), "term-1"))
             .await
@@ -11773,8 +11774,6 @@ mod tests {
                 .unwrap(),
             WriteWhenReady::NotReady
         );
-        assert_eq!(backend.latest().writes(), ["half a prompt"]);
-        // The next turn's end is fresh evidence after the typing.
         tokio::time::sleep(Duration::from_millis(2)).await;
         mark_ready(&lease);
         assert_eq!(
@@ -11782,7 +11781,112 @@ mod tests {
                 .write_when_ready("thread-a", "term-1", &generation, "pointer")
                 .await
                 .unwrap(),
-            WriteWhenReady::Written
+            WriteWhenReady::NotReady,
+            "newer readiness evidence does not show the draft was submitted"
+        );
+        assert_eq!(backend.latest().writes(), ["half a prompt"]);
+        lease.publish_agent_status(TerminalAgentState::Working, false);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Working
+            })
+        })
+        .await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::Written,
+            "a turn start shows the draft was submitted"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_treats_unmarked_input_as_a_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        // An older client's typing and the MCP terminal_write tool both arrive unmarked.
+        manager.write("thread-a", "term-1", "older").await.unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        assert_eq!(backend.latest().writes(), ["older"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_never_queues_the_pointer_behind_earlier_input() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        // The terminal's own reply, which leaves the input line clean, is stuck in the PTY.
+        let earlier = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .write_from(
+                        "thread-a",
+                        "term-1",
+                        "\x1b[0n",
+                        TerminalInputOrigin::Automatic,
+                    )
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || gate.wait_entered()
+        })
+        .await
+        .unwrap();
+        let pointer = tokio::spawn({
+            let manager = manager.clone();
+            let generation = generation.clone();
+            async move {
+                manager
+                    .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lease.publish_agent_status(TerminalAgentState::Blocked, false);
+        gate.open();
+        earlier.await.unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+            .await
+            .expect("the pointer write answers")
+            .unwrap()
+            .unwrap();
+        assert_ne!(outcome, WriteWhenReady::Written);
+        assert_eq!(
+            backend.latest().writes(),
+            ["\x1b[0n"],
+            "the pointer reached an approval prompt"
         );
         manager.shutdown().await;
     }

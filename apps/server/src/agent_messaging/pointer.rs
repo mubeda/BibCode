@@ -653,8 +653,11 @@ mod tests {
     struct Scripted {
         terminals: StdMutex<HashMap<(String, String), FakeTerminal>>,
         metadata: broadcast::Sender<TerminalMetadataEvent>,
-        /// When set, a write that typed parks until released, as a slow PTY write does.
-        gate: StdMutex<Option<Arc<WriteGate>>>,
+        /// When set, a write to the named terminal that typed parks until released, as a slow PTY
+        /// write does.
+        gate: StdMutex<Option<(String, Arc<WriteGate>)>>,
+        /// When set, the live-generation read after `skip` more reads parks until released.
+        live_park: StdMutex<Option<(usize, Arc<WriteGate>)>>,
     }
 
     #[derive(Default)]
@@ -680,6 +683,7 @@ mod tests {
                 terminals: StdMutex::new(HashMap::new()),
                 metadata: broadcast::channel(256).0,
                 gate: StdMutex::new(None),
+                live_park: StdMutex::new(None),
             })
         }
 
@@ -831,7 +835,13 @@ mod tests {
                 WriteWhenReady::Written
             };
             drop(terminals);
-            let gate = self.gate.lock().unwrap().clone();
+            let gate = self
+                .gate
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|(gated, _)| gated == terminal_id)
+                .map(|(_, gate)| gate);
             Box::pin(async move {
                 if outcome == WriteWhenReady::Written
                     && let Some(gate) = gate
@@ -854,7 +864,24 @@ mod tests {
                 .unwrap()
                 .get(&key(thread_id, terminal_id))
                 .and_then(|terminal| terminal.generation.clone());
-            Box::pin(std::future::ready(live))
+            let park = {
+                let mut armed = self.live_park.lock().unwrap();
+                match armed.as_mut() {
+                    Some((0, _)) => armed.take().map(|(_, gate)| gate),
+                    Some((skip, _)) => {
+                        *skip -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            Box::pin(async move {
+                if let Some(park) = park {
+                    park.written.notify_one();
+                    park.release.notified().await;
+                }
+                live
+            })
         }
 
         fn person_input_count<'a>(
@@ -1847,7 +1874,7 @@ mod tests {
         for cancel in [false, true] {
             let fixture = fixture().await;
             let gate = Arc::new(WriteGate::default());
-            *fixture.terminals.gate.lock().unwrap() = Some(gate.clone());
+            *fixture.terminals.gate.lock().unwrap() = Some(("term-1".to_owned(), gate.clone()));
             fixture.start();
             let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
             fixture.terminals.set_ready("t", "term-1");
@@ -1894,6 +1921,134 @@ mod tests {
             );
             fixture.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn mail_that_stops_being_eligible_before_the_write_gets_no_pointer() {
+        for change in ["cancel", "fetch", "messaging off"] {
+            let fixture = fixture().await;
+            fixture.start();
+            let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+            fixture.until_attempts("term-1", 1).await;
+            // The pass's ended-generation sweep reads the live generation first; the pointer's
+            // own read after it parks, once it has read the waiting mail.
+            let park = Arc::new(WriteGate::default());
+            *fixture.terminals.live_park.lock().unwrap() = Some((1, park.clone()));
+            fixture.terminals.set_ready("t", "term-1");
+            tokio::time::timeout(Duration::from_secs(5), park.written.notified())
+                .await
+                .expect("the pointer read the waiting mail");
+            match change {
+                "cancel" => assert_eq!(
+                    fixture.messaging.cancel("a", &receipt.message_id).await,
+                    Ok(AgentMessageStatus::Cancelled)
+                ),
+                "fetch" => assert_eq!(
+                    ids(&fixture.inbox("term-1").await),
+                    [receipt.message_id.as_str()]
+                ),
+                _ => fixture.enabled.send(false).unwrap(),
+            }
+            park.release.notify_one();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                fixture.terminals.writes("t", "term-1").is_empty(),
+                "{change}: a pointer was typed for mail nobody can fetch"
+            );
+            fixture.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_whose_input_is_stuck_holds_up_no_other_terminal() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        fixture.terminals.add("t", "term-3", 1, true);
+        let gate = Arc::new(WriteGate::default());
+        *fixture.terminals.gate.lock().unwrap() = Some(("term-1".to_owned(), gate.clone()));
+        let task = fixture.start();
+        fixture.send("a", "terminal:t/term-1").await.unwrap();
+        fixture.terminals.set_ready("t", "term-1");
+        tokio::time::timeout(Duration::from_secs(5), gate.written.notified())
+            .await
+            .expect("term-1's write is stuck");
+        let other = fixture.send("c", "terminal:t/term-2").await.unwrap();
+        let ended = fixture.send("c", "terminal:t/term-3").await.unwrap();
+        fixture.terminals.set_ready("t", "term-2");
+        fixture
+            .until_status(&other.message_id, AgentMessageStatus::Delivered)
+            .await;
+        fixture.terminals.set_generation("t", "term-3", None);
+        fixture
+            .until_status(&ended.message_id, AgentMessageStatus::Failed)
+            .await;
+        fixture.stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the pointer task stops while a write is stuck")
+            .expect("the pointer task did not panic");
+        gate.release.notify_one();
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ended_generation_cannot_fetch_its_mail() {
+        let fixture = fixture().await;
+        let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
+        let old = fixture.identity("term-1");
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let fetched = fixture
+            .pointer
+            .inbox(&fixture.messaging, &old)
+            .await
+            .unwrap_or_default();
+        assert!(fetched.is_empty(), "the old generation fetched its mail");
+        assert_ne!(
+            fixture.row(&receipt.message_id).await.status,
+            AgentMessageStatus::Consumed
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_generation_end_sink_is_not_called_again_after_a_server_restart() {
+        let fixture = fixture().await;
+        fixture.send("a", "terminal:t/term-1").await.unwrap();
+        assert_eq!(fixture.inbox("term-1").await.len(), 1);
+        fixture.start();
+        fixture.terminals.set_generation("t", "term-1", None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.ended.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the end of the generation is reported");
+        fixture.stop.cancel();
+        // A restarted server: a new pointer, with nothing in memory, over the same store.
+        let ended = fixture.ended.clone();
+        let restarted = TerminalPointer::new(
+            fixture.harness.engine.repositories().database().clone(),
+            fixture.terminals.clone(),
+        )
+        .with_generation_end_sink(Arc::new(
+            move |thread_id, terminal_id, generation_key| {
+                ended.lock().unwrap().push((
+                    thread_id.to_owned(),
+                    terminal_id.to_owned(),
+                    generation_key.to_owned(),
+                ));
+            },
+        ));
+        let stop = CancellationToken::new();
+        restarted.start(fixture.messaging.clone(), stop.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.cancel();
+        assert_eq!(
+            fixture.ended.lock().unwrap().clone(),
+            [("t".to_owned(), "term-1".to_owned(), "boot-1:1".to_owned())]
+        );
+        fixture.shutdown().await;
     }
 
     #[tokio::test]
