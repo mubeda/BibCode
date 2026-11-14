@@ -169,3 +169,27 @@ Windows arm64 VM (6 cores), same day: the shim test file passed (24 tests), Clip
 collected output was dropped from its message, and 30 runs of the review prompt tests under four
 busy processes gave 0 failures. Those runs were warm, so this does not reproduce the cold first
 spawn seen in CI.
+
+## 7. #367 reproduced and fixed on fresh Windows arm64 runners (2026-11-14)
+
+A temporary workflow on a branch that is not merged built the shim test binary once and ran the
+ten review prompt tests as the first terminal spawn of a fresh `windows-11-vs2026-arm` runner,
+then once more warm.
+
+| Run                                            | Deadline | Cold runs | Failed | First-spawn time of the ten tests           | Warm         |
+| ---------------------------------------------- | -------- | --------- | ------ | ------------------------------------------- | ------------ |
+| 1 (with the 5 s timeout test in the same step) | 10 s     | 30        | 0      | 8.4 to 13.3 s for the step                  | 5.8 to 6.5 s |
+| 2                                              | 10 s     | 80        | 1      | 3.8 to 6.7 s, and 19.8 s in the failing run | 0.9 to 1.3 s |
+| 3                                              | 60 s     | 240       | 0      | 3.6 to 10.4 s, median 4.5 s                 | about 1 s    |
+
+- The failing run of run 2 showed the issue's symptom exactly: the four tests libtest started
+  first timed out at 10 s and the six started after them passed.
+- Its timeout message read `output="\u{1b}[?9001h\u{1b}[?1004h", exit=None`: the pseudoconsole
+  was up and had sent its start-up sequences, and the shim had neither printed nor exited.
+- Identical spawns started seconds later in the same process passed, and the whole batch took
+  19.8 s, so the runner stalled process start-up for roughly 20 seconds. What stalls it is not
+  known.
+- 240 cold runs is the count chosen in advance for a 1 in 80 rate (the chance that all pass while
+  the failure is still there is at most 5%). None failed. No run in run 3 showed a 20-second
+  stall, so the stall is rarer than run 2 suggested, and the fix was not seen turning a stalled
+  run into a pass.
