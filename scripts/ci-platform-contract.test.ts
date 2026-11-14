@@ -483,6 +483,17 @@ describe("cross-platform CI contract", () => {
     );
   });
 
+  it("scans only what a manually run branch adds to main for secrets", () => {
+    // A manual run has no base or before commit. Scanning the whole history of the branch
+    // failed every `gh workflow run ci.yml --ref <branch>` on findings already in the history.
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const select = requireJob(workflow, "secrets").steps?.find(
+      (step) => step.name === "Select commit range",
+    );
+    expect(select?.run).toContain('range="origin/main..$PUSH_SHA"');
+    expect(select?.run).toContain('range="$PR_BASE..$PR_HEAD"');
+  });
+
   it("runs the Windows server tests off the native desktop rows, without saving a cache", () => {
     // A native row compiled bibcode-server five times; the test builds were two of them and
     // ran before the bundle on the same runner. Clippy with --all-targets runs on Linux only,

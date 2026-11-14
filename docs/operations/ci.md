@@ -68,8 +68,8 @@ the merge.
 ## Jobs
 
 - **Secrets** runs the gitleaks 8.30.1 CLI (release tarball pinned by SHA-256) over
-  every commit a pull request (`base..head`) or push (`before..sha`; the full
-  history for a new branch) adds, merged branches included, with `.gitleaks.toml`.
+  every commit a pull request (`base..head`) or push (`before..sha`) adds; a
+  manual run or a new branch scans `origin/main..sha`, merged branches included, with `.gitleaks.toml`.
   It then runs `scripts/no-sensitive-data.test.ts` with `BIBCODE_SENSITIVE_RANGE`
   set to the same range, which checks every commit message against the hashed
   banned values. It allowlists `.repos/` and the fixture hash manifests, posts

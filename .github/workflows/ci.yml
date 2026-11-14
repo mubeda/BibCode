@@ -37,8 +37,10 @@ jobs:
 
       # Pull requests scan base..head and pushes scan before..sha, so commits from
       # merged branches and beyond the first API page are covered (the action
-      # listed one page and used --first-parent --no-merges). A new branch or an
-      # unreachable `before` (force push) scans the whole history of the commit.
+      # listed one page and used --first-parent --no-merges). A manual run, a new
+      # branch or an unreachable `before` (force push) scans what the commit adds to
+      # main: scanning its whole history failed every manual run on findings that
+      # were already in the history. Only main itself still scans the whole history.
       - name: Select commit range
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -52,6 +54,9 @@ jobs:
             range="$PR_BASE..$PR_HEAD"
           elif [ "$EVENT_NAME" = "push" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
             range="$PUSH_BEFORE..$PUSH_SHA"
+          elif git rev-parse --verify --quiet origin/main >/dev/null && [ "$(git rev-parse origin/main)" != "$PUSH_SHA" ]; then
+            # A manual run, or the first push of a branch: what the branch adds to main.
+            range="origin/main..$PUSH_SHA"
           else
             range="$PUSH_SHA"
           fi
