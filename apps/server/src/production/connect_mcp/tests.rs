@@ -2581,8 +2581,7 @@ async fn the_log_and_the_profiler_never_see_agent_message_text() {
                 None,
                 uploads,
             ))
-            .with_outcomes(sink)
-            .with_admissions(writer.admissions()),
+            .with_outcomes(sink),
     );
     let connect = harness(4, 4).await;
     let service = connect.service.clone().with_control(control.clone());

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::{Inner, McpControl, ToolCall, ToolSpec, invalid_argument, now_iso};
 use crate::{
-    agent_messaging::{AdmissionHook, MessageOutcome, OutcomeSink},
+    agent_messaging::{MessageOutcome, OutcomeSink},
     auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
     orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
     persistence::Database,
@@ -706,10 +706,12 @@ pub(crate) fn agent_message_sink(activity: McpActivity) -> OutcomeSink {
 
 /// Records each agent messaging outcome as one row of ids, addresses, the two thread titles and
 /// a state name, never message text; a title is free text a person or an agent wrote. The
-/// sink maps the outcome to its row in the caller,
-/// so the queue never holds a caller's raw input, and never waits: past
-/// [`MESSAGE_QUEUE`] rows it drops the row and counts it. One task writes the rows in the
-/// order they arrive, until [`AgentMessageWriter::close`]. Call it inside a Tokio runtime.
+/// sink maps the outcome to its row in the caller, so the queue never holds a caller's raw
+/// input, and never waits: past [`MESSAGE_QUEUE`] rows it drops the row and counts it. One task
+/// writes the rows in the order they arrive, until [`AgentMessageWriter::close`]. A message's
+/// send row and its delivery rows come from independent parts of the server, so in a rare
+/// scheduling its `delivered` row is written before its `accepted` row; each row carries its own
+/// state and time. Call it inside a Tokio runtime.
 pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, AgentMessageWriter) {
     let (sender, receiver) = mpsc::channel(MESSAGE_QUEUE);
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -720,95 +722,45 @@ pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, Agent
         stop.clone(),
         dropped.clone(),
     ));
-    let sink: OutcomeSink = {
-        let (sender, dropped) = (sender.clone(), dropped.clone());
-        Arc::new(move |outcome| enqueue(&sender, &dropped, Queued::of(outcome)))
-    };
+    let sink: OutcomeSink = Arc::new(move |outcome| {
+        // A closed writer drops the row silently: the runtime is stopping.
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            sender.try_send(agent_message_row(outcome))
+        {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     (
         sink,
         AgentMessageWriter {
             stop,
             task: Mutex::new(Some(task)),
-            sender,
-            dropped,
         },
     )
 }
 
-/// Rows and admission markers an agent message writer queues at most.
+/// Rows an agent message writer queues at most.
 const MESSAGE_QUEUE: usize = 1_024;
-
-/// One item for the writer: a row, or a marker of a message's admission.
-enum Queued {
-    Row {
-        message_id: Option<String>,
-        delivery: bool,
-        row: NewActivity,
-    },
-    AdmissionStarted(String),
-    AdmissionEnded(String),
-}
-
-impl Queued {
-    fn of(outcome: MessageOutcome) -> Self {
-        Self::Row {
-            message_id: outcome.message_id.clone(),
-            delivery: outcome.tool == "agent_message_delivery",
-            row: agent_message_row(outcome),
-        }
-    }
-}
-
-/// Queues `item` without waiting; past the bound it is dropped and counted.
-fn enqueue(sender: &mpsc::Sender<Queued>, dropped: &AtomicUsize, item: Queued) {
-    // A closed writer drops it silently: the runtime is stopping.
-    if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(item) {
-        dropped.fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 async fn write_agent_messages(
     activity: McpActivity,
-    mut receiver: mpsc::Receiver<Queued>,
+    mut receiver: mpsc::Receiver<NewActivity>,
     stop: CancellationToken,
     dropped: Arc<AtomicUsize>,
 ) {
-    // The delivery rows of each message being admitted, written once its admission ends: after
-    // its send's own row, which arrives before the end marker.
-    let mut admitting: HashMap<String, Vec<NewActivity>> = HashMap::new();
     loop {
-        let queued = tokio::select! {
+        let row = tokio::select! {
             biased;
-            queued = receiver.recv() => queued,
+            row = receiver.recv() => row,
             () = stop.cancelled() => {
                 receiver.close();
                 receiver.recv().await
             }
         };
-        let Some(queued) = queued else {
+        let Some(row) = row else {
             break;
         };
-        match queued {
-            Queued::AdmissionStarted(id) => {
-                admitting.insert(id, Vec::new());
-            }
-            Queued::Row {
-                message_id,
-                delivery,
-                row,
-            } => match message_id
-                .filter(|_| delivery)
-                .and_then(|id| admitting.get_mut(&id))
-            {
-                Some(held) => held.push(row),
-                None => activity.record(row).await,
-            },
-            Queued::AdmissionEnded(id) => {
-                for row in admitting.remove(&id).unwrap_or_default() {
-                    activity.record(row).await;
-                }
-            }
-        }
+        activity.record(row).await;
         let count = dropped.swap(0, Ordering::Relaxed);
         if count > 0 {
             tracing::warn!(
@@ -817,55 +769,15 @@ async fn write_agent_messages(
             );
         }
     }
-    for row in admitting.into_values().flatten() {
-        activity.record(row).await;
-    }
 }
 
 /// The writer of agent message rows, which the runtime closes in its stop.
 pub(crate) struct AgentMessageWriter {
     stop: CancellationToken,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    sender: mpsc::Sender<Queued>,
-    dropped: Arc<AtomicUsize>,
 }
 
 impl AgentMessageWriter {
-    /// The hook a send uses so its message's delivery rows wait behind its own row: through
-    /// the sink's queue, so a marker keeps its place among the rows.
-    pub(crate) fn admissions(&self) -> AdmissionHook {
-        let (sender, dropped) = (self.sender.clone(), self.dropped.clone());
-        // The place of each admission's end, reserved when it starts, so a full queue never
-        // drops an end and parks the message's rows. At most one per queue place.
-        let ends: Mutex<HashMap<String, mpsc::OwnedPermit<Queued>>> = Mutex::default();
-        Arc::new(move |message_id: &str, started: bool| {
-            let mut ends = ends
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !started {
-                if let Some(end) = ends.remove(message_id) {
-                    end.send(Queued::AdmissionEnded(message_id.to_owned()));
-                }
-                return;
-            }
-            match (
-                sender.clone().try_reserve_owned(),
-                sender.clone().try_reserve_owned(),
-            ) {
-                (Ok(start), Ok(end)) => {
-                    start.send(Queued::AdmissionStarted(message_id.to_owned()));
-                    ends.insert(message_id.to_owned(), end);
-                }
-                // No room: no hold, so the message's rows are written as they come.
-                (Err(mpsc::error::TrySendError::Full(_)), _)
-                | (_, Err(mpsc::error::TrySendError::Full(_))) => {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
-            }
-        })
-    }
-
     /// Whether [`Self::close`] ended the writer.
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
@@ -875,7 +787,8 @@ impl AgentMessageWriter {
             .is_none()
     }
 
-    /// Refuses new rows, writes every queued one and waits for the writer to end.
+    /// Refuses new rows, writes every queued one and waits for the writer to end. It never
+    /// waits on a send in flight: that send's row, reported later, is dropped.
     pub(crate) async fn close(&self) {
         self.stop.cancel();
         let task = self
@@ -1671,59 +1584,6 @@ mod tests {
         assert_eq!(activity.recent().await.unwrap().len(), 50);
     }
 
-    /// An admission that ends while the queue is full still ends: its message's later rows are
-    /// written, not held until another thousand admissions or the shutdown.
-    #[tokio::test]
-    async fn a_stalled_database_never_parks_a_message_whose_admission_ended() {
-        let database = migrated().await;
-        let activity = McpActivity::new(database.clone());
-        let (sink, writer) = agent_message_writer(activity.clone());
-        let admissions = writer.admissions();
-        let (release, stalled) = std::sync::mpsc::channel::<()>();
-        let stall = tokio::spawn(async move {
-            database
-                .call(move |_| {
-                    let _ = stalled.recv();
-                    Ok(())
-                })
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        admissions("m1", true);
-        // The queue fills while the admission runs, so its end finds no room.
-        for index in 0..2 * MESSAGE_QUEUE {
-            sink(message_outcome(
-                "agent_message_send",
-                "accepted",
-                "thread:b",
-                Some(&format!("other-{index}")),
-            ));
-        }
-        admissions("m1", false);
-        release.send(()).unwrap();
-        stall.await.unwrap().unwrap();
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                // Sent again until the draining queue has room for it.
-                sink(message_outcome(
-                    "agent_message_delivery",
-                    "delivered",
-                    "thread:b",
-                    Some("m1"),
-                ));
-                let rows = activity.recent().await.unwrap();
-                if rows.iter().any(|row| row["target"]["messageId"] == "m1") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the delivery row is written, not held behind an ended admission");
-        drop(writer);
-    }
-
     /// With the database worker stalled, the sink never blocks its caller and keeps a bounded
     /// number of rows; the rest are dropped.
     #[tokio::test]
@@ -1795,149 +1655,6 @@ mod tests {
             .unwrap();
         assert!(written > 0, "rows before the bound are written");
         assert!(written < 2_000, "{written} of {sent} rows were kept");
-    }
-
-    /// A send whose future is suspended after its admission committed, here at its report,
-    /// which waits until the tracker reported the delivery, still records its acceptance before
-    /// the delivery.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_delivery_row_never_precedes_its_acceptance() {
-        let tools = crate::production::mcp_tools_tests::Harness::new().await;
-        for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
-            dispatch(
-                &tools,
-                json!({
-                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
-                    "threadId": thread_id, "projectId": "p1", "title": title,
-                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
-                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
-                }),
-            )
-            .await;
-        }
-        let (sink, writer) = agent_message_writer(tools.control.activity().clone());
-        let delivered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let gated: OutcomeSink = {
-            let delivered = delivered.clone();
-            Arc::new(move |outcome: MessageOutcome| {
-                let delivery =
-                    outcome.tool == "agent_message_delivery" && outcome.outcome == "delivered";
-                if outcome.tool == "agent_message_send" && outcome.outcome == "accepted" {
-                    let (seen, changed) = &*delivered;
-                    let (_seen, waited) = changed
-                        .wait_timeout_while(seen.lock().unwrap(), Duration::from_secs(10), |seen| {
-                            !*seen
-                        })
-                        .unwrap();
-                    assert!(
-                        !waited.timed_out(),
-                        "the tracker reports the delivery while the send waits"
-                    );
-                }
-                sink(outcome);
-                if delivery {
-                    *delivered.0.lock().unwrap() = true;
-                    delivered.1.notify_all();
-                }
-            })
-        };
-        let tracker = CancellationToken::new();
-        let tracking = crate::agent_messaging::delivery::AgentMessageTracker::start(
-            tools.engine.clone(),
-            Some(gated.clone()),
-            watch::channel(true).1,
-            tracker.clone(),
-        );
-        let messaging = tools
-            .messaging_untracked(true)
-            .with_outcomes(gated)
-            .with_admissions(writer.admissions());
-
-        let receipt = messaging
-            .send(
-                "a",
-                crate::agent_messaging::SendRequest {
-                    to: "thread:b".to_owned(),
-                    text: "hello".to_owned(),
-                    client_request_id: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        tracker.cancel();
-        tracking.await.unwrap();
-        writer.close().await;
-        let rows = tools.control.activity().recent().await.unwrap();
-        let states: Vec<(&str, &str)> = rows
-            .iter()
-            .rev()
-            .filter(|row| row["target"]["messageId"] == receipt.message_id.as_str())
-            .map(|row| {
-                (
-                    row["tool"].as_str().unwrap(),
-                    row["target"]["status"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            states[..2],
-            [
-                ("agent_message_send", "accepted"),
-                ("agent_message_delivery", "delivered")
-            ],
-            "{rows:?}"
-        );
-        tools.shutdown().await;
-    }
-
-    /// Rows of a message being admitted wait behind its send's row; another message's do not,
-    /// and an admission that ends without a row (a dropped call) lets them through.
-    #[tokio::test]
-    async fn rows_of_a_message_being_admitted_wait_for_its_send() {
-        let activity = McpActivity::new(migrated().await);
-        let (sink, writer) = agent_message_writer(activity.clone());
-        let admissions = writer.admissions();
-        admissions("m1", true);
-        admissions("m2", true);
-        for id in ["m1", "m2", "m3"] {
-            sink(message_outcome(
-                "agent_message_delivery",
-                "delivered",
-                "thread:b",
-                Some(id),
-            ));
-        }
-        sink(message_outcome(
-            "agent_message_send",
-            "accepted",
-            "thread:b",
-            Some("m1"),
-        ));
-        admissions("m1", false);
-        admissions("m2", false);
-        writer.close().await;
-
-        let rows = activity.recent().await.unwrap();
-        let order: Vec<(&str, &str)> = rows
-            .iter()
-            .rev()
-            .map(|row| {
-                (
-                    row["target"]["messageId"].as_str().unwrap(),
-                    row["target"]["status"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            order,
-            [
-                ("m3", "delivered"),
-                ("m1", "accepted"),
-                ("m1", "delivered"),
-                ("m2", "delivered"),
-            ]
-        );
     }
 
     async fn dispatch(tools: &crate::production::mcp_tools_tests::Harness, value: Value) {

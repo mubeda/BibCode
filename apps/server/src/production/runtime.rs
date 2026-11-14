@@ -853,8 +853,7 @@ impl ProductionRuntime {
                 Some(workspace_availability.clone()),
                 attachment_uploads.clone(),
             ))
-            .with_outcomes(agent_message_outcomes.clone())
-            .with_admissions(agent_message_writer.admissions()),
+            .with_outcomes(agent_message_outcomes.clone()),
         );
 
         // Late, so a failed start leaves no follower running.
@@ -1074,7 +1073,9 @@ impl ProductionRuntime {
         // A stopped follower resumes from its first sweep on the next start.
         self.send_requests_follower.cancel();
         steps.mark("send-requests-follower");
-        // A stopped tracker resumes from its first reconciliation on the next start.
+        // A stopped tracker resumes from its first reconciliation on the next start. Its join is
+        // bounded by the database and the engine, the only things it waits on, which both run
+        // until the `orchestration` step below.
         self.agent_message_tracker.cancel();
         let tracker = self
             .agent_message_tracker_task

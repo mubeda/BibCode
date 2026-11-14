@@ -227,39 +227,11 @@ pub(crate) struct MessageOutcome {
 
 pub(crate) type OutcomeSink = Arc<dyn Fn(MessageOutcome) + Send + Sync>;
 
-/// Told when the admission of message `id` starts (`true`) and ends (`false`), around its send's
-/// own outcome, so the sink keeps the message's later outcomes behind that one.
-pub(crate) type AdmissionHook = Arc<dyn Fn(&str, bool) + Send + Sync>;
-
-/// Started before a message's admission can make its delivery runnable; dropped after its send
-/// reported, or with the call's future when the call is dropped, which ends the admission.
-struct AdmissionHold {
-    hook: AdmissionHook,
-    message_id: String,
-}
-
-impl AdmissionHold {
-    fn start(hook: &AdmissionHook, message_id: &str) -> Self {
-        hook(message_id, true);
-        Self {
-            hook: Arc::clone(hook),
-            message_id: message_id.to_owned(),
-        }
-    }
-}
-
-impl Drop for AdmissionHold {
-    fn drop(&mut self) {
-        (self.hook)(&self.message_id, false);
-    }
-}
-
 /// What one send or reply call learned about who it involves, for its activity row: both thread
 /// titles once it resolved the recipient as a live thread of the sender's project, never before.
 #[derive(Default)]
 struct Attribution {
     titles: Option<(String, String)>,
-    hold: Option<AdmissionHold>,
 }
 
 /// The sender and recipient threads of a send that passed every check.
@@ -278,7 +250,6 @@ pub(crate) struct AgentMessaging {
     enabled: watch::Receiver<bool>,
     starter: Option<ServerTurnStarter>,
     outcomes: Option<OutcomeSink>,
-    admissions: Option<AdmissionHook>,
 }
 
 impl AgentMessaging {
@@ -288,7 +259,6 @@ impl AgentMessaging {
             enabled,
             starter: None,
             outcomes: None,
-            admissions: None,
         }
     }
 
@@ -299,11 +269,6 @@ impl AgentMessaging {
 
     pub(crate) fn with_outcomes(mut self, outcomes: OutcomeSink) -> Self {
         self.outcomes = Some(outcomes);
-        self
-    }
-
-    pub(crate) fn with_admissions(mut self, admissions: AdmissionHook) -> Self {
-        self.admissions = Some(admissions);
         self
     }
 
@@ -359,8 +324,7 @@ impl AgentMessaging {
         let Some(outcomes) = &self.outcomes else {
             return;
         };
-        let Attribution { titles, hold } = attribution;
-        let titles = match titles {
+        let titles = match attribution.titles {
             Some((sender, recipient)) => (Some(sender), Some(recipient)),
             // The caller's own thread: its title tells it nothing about any other.
             None => (self.own_title(sender_thread_id).await, None),
@@ -381,8 +345,6 @@ impl AgentMessaging {
             sender_title: titles.0,
             recipient_title: titles.1,
         });
-        // Only now may the message's later outcomes follow.
-        drop(hold);
     }
 
     /// The title of the caller's own thread, unless it is deleted or unreadable.
@@ -479,9 +441,6 @@ impl AgentMessaging {
             hop: self.next_hop(sender_thread_id).await?,
             ..outgoing
         };
-        // Before the admission can make the delivery runnable, so its rows follow this call's.
-        attribution.hold = (self.admissions.as_ref())
-            .map(|admissions| AdmissionHold::start(admissions, &message_id));
         self.deliver(&route, outgoing).await
     }
 
@@ -578,9 +537,6 @@ impl AgentMessaging {
             hop: self.next_hop(sender_thread_id).await?,
             ..outgoing
         };
-        // Before the admission can make the delivery runnable, so its rows follow this call's.
-        attribution.hold = (self.admissions.as_ref())
-            .map(|admissions| AdmissionHold::start(admissions, &message_id));
         self.deliver(&route, outgoing).await
     }
 

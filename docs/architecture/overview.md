@@ -3091,10 +3091,12 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   a rejected argument) writes one row with the tool, the caller and the tag.
   The sink maps each outcome to its row in the caller and queues at most 1,024
   rows without waiting; past that it drops the row and logs one warning with
-  the count. A send holds its message's delivery rows until its own row is
-  written, so the delivery never precedes the acceptance. The runtime closes
-  the writer in its stop, after the tracker and before the profiler's
-  teardown, and every queued row is written. The change feed and webhooks skip
+  the count. The send and the tracker report independently, so in a rare
+  scheduling a message's `delivered` row is written before its `accepted` row;
+  each row carries the message id, its state and its own time. The runtime
+  closes the writer in its stop, after the tracker and before the profiler's
+  teardown: every queued row is written, the stop never waits on a send in
+  flight, and a row reported after that is dropped. The change feed and webhooks skip
   these rows, and the feed's cursor moves past them.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
   the activity log by a monotonic cursor without reading payload text other than
