@@ -2687,7 +2687,17 @@ mod safety_review {
             Some(copy_command.as_str()),
             failed.delivery_command_id.as_deref()
         );
-        assert!(harness.is_agent_delivery(copy_command, copy_message).await);
+        assert!(
+            harness
+                .is_agent_delivery(copy_command, copy_message.clone())
+                .await
+        );
+        let (_, actor) = harness.projected_message(copy_message).await;
+        assert_eq!(
+            actor,
+            json!({ "kind": "hosted-agent", "address": "thread:a", "label": "Claude thread" }),
+            "the copy shows the agent that sent it"
+        );
         assert_eq!(
             row.recipient_turn_id, None,
             "the failed turn is not its turn"
@@ -3453,6 +3463,38 @@ mod messaging_off {
         harness.shutdown().await;
     }
 
+    /// Review P3: messages held for different reasons rejoin the queue in acceptance order.
+    #[tokio::test]
+    async fn held_messages_are_released_in_acceptance_order_across_reasons() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.set_mode("a", "auto-accept-edits").await;
+        harness.set_mode("b", "auto-accept-edits").await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.set_mode("b", "full-access").await;
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientModeAboveSender)
+            .await;
+        let m2 = harness.sent("p", "thread:b").await;
+        harness.until_status(&m2, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m2, AgentMessageReason::MessagingOff)
+            .await;
+        harness.set_mode("b", "auto-accept-edits").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        harness.until_status(&m1, "queued").await;
+        harness.until_status(&m2, "queued").await;
+        let (first, second) = (harness.entry_of(&m1).await, harness.entry_of(&m2).await);
+        harness.b_takes_its_next_turn("turn-b").await;
+        harness.until_entry(&first, "delivered").await;
+        assert_eq!(harness.entry_state(&second).await, "queued");
+        harness.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_stale_release_after_a_restart_does_nothing() {
         let harness = Harness::new().await;
@@ -3738,6 +3780,210 @@ mod hop_limit {
                 .agent_send("a", send_arguments("thread:b", "ping"))
                 .await,
         );
+        harness.shutdown().await;
+    }
+
+    impl Harness {
+        /// A real send from B to the idle A, delivered, whose stored hop is then 8.
+        async fn hop_8_delivered_to_a(&self) -> String {
+            self.provider_turn("a", "turn-a", "done", true).await;
+            let message_id = self.sent("b", "thread:a").await;
+            let stored = message_id.clone();
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE agent_messages SET hop = 8 WHERE message_id = ?1",
+                        [&stored],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("hop 8");
+            self.until_status(&message_id, "delivered").await;
+            message_id
+        }
+    }
+
+    /// Review P2: the turn a hop-8 message started has ended and no person wrote since.
+    #[tokio::test]
+    async fn a_send_between_turns_continues_the_chain() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let trigger = harness.hop_8_delivered_to_a().await;
+        harness
+            .provider_turn("a", "turn-a2", "Port", true)
+            .await;
+        harness.until_status(&trigger, "completed").await;
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        assert_hop_limit(&harness.reply("a", &trigger, "pong").await);
+        harness.shutdown().await;
+    }
+
+    /// Review P2: the hop-8 message was handed to A's provider, which has not reported the
+    /// turn running yet.
+    #[tokio::test]
+    async fn a_send_before_the_turn_is_reported_running_continues_the_chain() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.hop_8_delivered_to_a().await;
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.shutdown().await;
+    }
+}
+
+// ---- Review findings on tasks 6.1 to 6.5 (lane 6C) ----
+
+mod claim_review {
+    use super::*;
+
+    impl Harness {
+        /// Send now on `thread_id`'s queued entry `command_id`, as a person clicks it.
+        async fn send_now(&self, thread_id: &str, command_id: &str) {
+            let message_id = self
+                .repositories
+                .get_provider_turn_delivery(command_id.to_owned())
+                .await
+                .expect("readable")
+                .expect("entry")
+                .message_id;
+            self.engine
+                .dispatch(command(json!({
+                    "type": "thread.turn.promote",
+                    "commandId": format!("send-now-{}", uuid::Uuid::new_v4()),
+                    "threadId": thread_id, "messageId": message_id, "createdAt": CREATED_AT,
+                })))
+                .await
+                .expect("Send now");
+        }
+
+        /// B's provider session stops with the queue paused for the test's own steps; then a
+        /// person presses Send now on `command_id` and the claim takes it.
+        async fn stopped_then_claimed(
+            &self,
+            command_id: &str,
+        ) -> crate::orchestration::ProviderTurnDelivery {
+            self.stop_delivery().await;
+            self.session_ends("b", "stopped").await;
+            self.send_now("b", command_id).await;
+            self.engine
+                .repositories()
+                .claim_provider_turn(command_id.to_owned(), CREATED_AT.to_owned())
+                .await
+                .expect("claim")
+                .expect("claimed")
+        }
+    }
+
+    /// P1: a message requeued while B ran in full-access launches in B's lower mode of now.
+    #[tokio::test]
+    async fn a_requeued_message_launches_in_the_recipients_current_mode() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.messaging_enabled.send_replace(true);
+        harness.until_status(&m1, "queued").await;
+        let entry = harness.entry_of(&m1).await;
+        assert_ne!(entry, format!("agent-message:{m1}"), "requeued");
+
+        harness.set_mode("b", "approval-required").await;
+        let claimed = harness.stopped_then_claimed(&entry).await;
+
+        assert_eq!(claimed.payload["runtimeMode"], "approval-required");
+        harness.shutdown().await;
+    }
+
+    /// P1: a message queued in full-access and never held launches in B's lower mode of now.
+    #[tokio::test]
+    async fn a_queued_message_launches_in_the_recipients_current_mode() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        let entry = harness.entry_of(&m1).await;
+
+        harness.set_mode("b", "approval-required").await;
+        let claimed = harness.stopped_then_claimed(&entry).await;
+
+        assert_eq!(claimed.payload["runtimeMode"], "approval-required");
+        harness.shutdown().await;
+    }
+
+    /// P1: a person's own queued message keeps the mode it was sent with, as before.
+    #[tokio::test]
+    async fn a_persons_queued_message_keeps_its_own_mode() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let person = harness.person_queues("b").await;
+        assert_eq!(harness.entry_state(&person).await, "queued");
+
+        harness.set_mode("b", "approval-required").await;
+        let claimed = harness.stopped_then_claimed(&person).await;
+
+        assert_eq!(claimed.payload["runtimeMode"], "full-access");
+        harness.shutdown().await;
+    }
+
+    /// P5: an agent entry waiting for an open approval is not claimed again and again, a
+    /// person's message behind it is delivered meanwhile, and the answer lets it through.
+    #[tokio::test]
+    async fn a_waiting_agent_entry_neither_spins_nor_blocks_a_person() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("b", "turn-b", "working", true).await;
+        harness.provider_asks("b", "approval", "r1").await;
+        let message_id = harness.sent_text("a", "thread:b", "approve it").await;
+        harness.until_status(&message_id, "queued").await;
+        let entry = harness.entry_of(&message_id).await;
+        // Made pending as Send now, a retry or a recovery copy would.
+        let pending = entry.clone();
+        harness
+            .repositories
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE provider_turn_outbox SET state = 'pending' WHERE command_id = ?1",
+                    [&pending],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("pending");
+        harness.delivery.wake();
+
+        let before = harness.engine.repositories().provider_turn_claims_for_test();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let claims = harness.engine.repositories().provider_turn_claims_for_test() - before;
+        assert!(claims <= 3, "{claims} claims in 500 ms while the ask is open");
+        assert_eq!(harness.entry_state(&entry).await, "pending");
+
+        let person = harness.person_queues("b").await;
+        harness.until_entry(&person, "delivered").await;
+        assert_eq!(harness.entry_state(&entry).await, "pending");
+
+        harness
+            .provider_resolves(
+                "b",
+                "approval",
+                json!({ "requestId": "r1", "decision": "accept" }),
+            )
+            .await;
+        harness.until_entry(&entry, "delivered").await;
         harness.shutdown().await;
     }
 }
