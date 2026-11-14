@@ -828,6 +828,10 @@ impl ProductionRuntime {
             mcp_activity,
         );
         mcp_control.attach_terminals(mcp_terminals);
+        mcp_control.attach_agent_messaging(crate::agent_messaging::AgentMessaging::new(
+            orchestration.clone(),
+            control.agent_messaging_enabled_signal(),
+        ));
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();

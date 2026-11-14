@@ -3,6 +3,7 @@
 //! provider is faked: its events are dispatched to the engine as a provider runtime would.
 //! Each tool family has its own file; this one holds the shared harness.
 
+mod agent_messaging;
 mod attribution;
 mod clone;
 mod diagnostics;
@@ -283,6 +284,11 @@ impl Harness {
                 .await
                 .expect("provider event");
         }
+    }
+
+    /// The messaging service over this harness's engine, on or off.
+    pub(crate) fn messaging(&self, enabled: bool) -> crate::agent_messaging::AgentMessaging {
+        crate::agent_messaging::AgentMessaging::new(self.engine.clone(), watch::channel(enabled).1)
     }
 
     pub(crate) async fn shutdown(self) {
