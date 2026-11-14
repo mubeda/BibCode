@@ -4391,6 +4391,59 @@ mod tests {
         assert_eq!(with_idle, replay(false).0);
     }
 
+    /// The live observer resets readiness before it publishes activity, so a turn ends ready
+    /// only if nothing after the root's last idle publishes activity.
+    #[test]
+    fn opencode_2_turns_end_ready_although_activity_publication_resets_readiness() {
+        for name in [
+            "hello",
+            "interrupt",
+            "child",
+            "children",
+            "shell",
+            "background",
+            "revert",
+        ] {
+            let (events, root) = opencode_2_fixture(name);
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let lease = generation.observation();
+            let mut readiness = PromptReadiness::default();
+            let mut normalizer = opencode::v2_activity::V2ActivityNormalizer::default();
+            let mut tracker = OpenCodeActivityTracker::new(&root);
+            for event in &events {
+                for v1 in normalize_opencode_v2_for_terminal(&mut normalizer, event) {
+                    OpenCodeStatusEvent::from_value(&v1).publish(
+                        &lease,
+                        &mut readiness,
+                        &root,
+                        PromptEvidence::Fresh,
+                    );
+                    if !tracker
+                        .handle_observed_event_at(&v1, 1)
+                        .mutations
+                        .is_empty()
+                    {
+                        readiness.reset(&lease);
+                    }
+                }
+            }
+            assert!(
+                futures_util::FutureExt::now_or_never(
+                    readiness.wait(&lease, std::future::pending::<()>())
+                )
+                .is_none()
+            );
+            assert!(
+                lease
+                    .subscribe_agent_status()
+                    .borrow()
+                    .is_some_and(|status| status.ready_for_prompt),
+                "the {name} turn ended not ready"
+            );
+        }
+    }
+
     #[test]
     fn opencode_2_an_interrupted_turn_ends_ready() {
         let (events, root) = opencode_2_fixture("interrupt");

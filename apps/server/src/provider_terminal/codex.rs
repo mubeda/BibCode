@@ -1808,18 +1808,11 @@ async fn run_codex_observer_inner(
                     reconciliation_sequence = reconciliation_sequence.saturating_add(1);
                     let buffered = client.drain_request_buffered_notifications();
                     if client.take_lost_notifications() {
-                        // A dropped turn or ask leaves the root's state unknown, and what was
-                        // kept cannot be ordered against it.
+                        // A dropped turn or ask leaves the root's state unknown, and nothing
+                        // still queued can be ordered against it: activity still reads it all,
+                        // but only an event read after it can make the terminal ready.
                         readiness.reset(generation);
-                        for envelope in buffered {
-                            report_codex_root(
-                                generation,
-                                &mut readiness,
-                                &envelope,
-                                &root,
-                                PromptEvidence::Stale,
-                            );
-                        }
+                        stale.extend(reconciled.drain(..).chain(buffered));
                     } else {
                         // Read in order before the next wait, as if the connection held them.
                         reconciled.extend(buffered);
