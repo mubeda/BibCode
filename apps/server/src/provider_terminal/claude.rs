@@ -1552,6 +1552,8 @@ async fn drive_claude_observer(
             }
         }
     }
+    // No hook can arrive now, so the next turn or ask would go unseen.
+    generation.clear_ready_for_prompt();
     publish_claude_listener_unavailable(&inner);
     interrupt_claude_activity(&inner, &active_actors, &active_work_items, event_sequence).await;
     // A hook server that ended on its own leaves the process running its pinned copy with its

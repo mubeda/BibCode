@@ -1435,6 +1435,7 @@ async fn run_opencode_observer(
             }
             OpenCodeObserverEvent::ActivityChanged(true) => {
                 let mut state = *activity.borrow();
+                let mut replacing = false;
                 loop {
                     if !state.enabled {
                         live_state = None;
@@ -1449,6 +1450,10 @@ async fn run_opencode_observer(
 
                     live_state = None;
                     mode = OpenCodeObserverMode::Dormant;
+                    // The old stream's events are discarded while the replacement connects, so
+                    // readiness waits for the state read once a stream is subscribed again.
+                    generation.clear_ready_for_prompt();
+                    replacing = true;
                     let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
                     let outcome = {
                         let dormant_stream =
@@ -1530,6 +1535,10 @@ async fn run_opencode_observer(
                         }
                     }
                 }
+                if replacing && stream.is_some() {
+                    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id)
+                        .await;
+                }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
                 let Some(state) = live_state else {
@@ -1608,15 +1617,22 @@ async fn publish_opencode_scope(
         .unwrap_or(false)
 }
 
-/// Opens the event stream and reads the root session's state.
+/// Opens the event stream, then reads the root session's state, so a change between the two
+/// still arrives as an event. Readiness is withdrawn while there is no stream: the observer
+/// cannot see the next turn or ask.
 async fn attach_opencode_root(
     remote: &mut dyn OpenCodeRemoteClient,
     generation: &TerminalObserverGenerationLease,
     root_session_id: &str,
     timeout: Duration,
 ) -> Option<Box<dyn OpenCodeEventStream>> {
+    generation.clear_ready_for_prompt();
+    let stream = establish_opencode_event_stream(remote, generation, timeout).await;
     hydrate_opencode_root_status(remote, generation, root_session_id).await;
-    establish_opencode_event_stream(remote, generation, timeout).await
+    if stream.is_none() {
+        generation.clear_ready_for_prompt();
+    }
+    stream
 }
 
 /// Reads the root session's state as the observer attaches or reattaches, which the events it

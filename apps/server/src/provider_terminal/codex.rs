@@ -1983,12 +1983,15 @@ async fn cross_codex_enable_barrier(
     matches!(response, Ok(Ok(_)))
 }
 
-/// The connection to the app server is gone: activity is unavailable until it reconnects.
+/// The connection to the app server is gone: activity is unavailable and the agent is not
+/// ready for a prompt until it reconnects, since a turn or approval in between goes unseen. The
+/// resume on reconnect subscribes and reports the status at once.
 pub(super) fn publish_codex_observation_lost(
     activity: &TerminalAgentActivityControl,
-    _generation: &TerminalObserverGenerationLease,
+    generation: &TerminalObserverGenerationLease,
     epoch: u64,
 ) {
+    generation.clear_ready_for_prompt();
     activity.mark_observed(TerminalAgentActivityObservation {
         state: activity.snapshot(),
         epoch,

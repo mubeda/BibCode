@@ -982,6 +982,20 @@ impl TerminalObserverGenerationLease {
             });
     }
 
+    /// Withdraws readiness when the observer can no longer see the agent's next turn or ask: a
+    /// lost connection or stream. The state stays as last reported.
+    pub fn clear_ready_for_prompt(&self) {
+        self.inner
+            .agent_status
+            .send_if_modified(|current| match current {
+                Some(observation) if observation.ready_for_prompt => {
+                    observation.ready_for_prompt = false;
+                    true
+                }
+                _ => false,
+            });
+    }
+
     /// The agent status this generation's observer publishes; the terminal manager mirrors it
     /// into the terminal's metadata summary.
     pub fn subscribe_agent_status(&self) -> watch::Receiver<Option<TerminalAgentObservation>> {
