@@ -1002,3 +1002,134 @@ async fn send_dispatcher_refuses_person_send_for_a_hosted_agent_actor() {
     assert_eq!(stored(&harness).await, (0, 0, 0));
     harness.shutdown().await;
 }
+
+/// Admits a person's `thread.turn.start` on `b` exactly as a send that passed the RPC-layer
+/// check would reach the engine: a pending delivery and `queued` resolved to false. That is
+/// what the race produces when the blocker appears after the RPC-layer check.
+async fn admit_as_resolved_to_start(harness: &Harness, request_id: &str) {
+    use crate::orchestration::{
+        CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, TurnDeliveryMode,
+        TurnDeliveryState, canonical_command_digest,
+    };
+    let message_id = format!("person-send:{request_id}");
+    let command: OrchestrationCommand = serde_json::from_value(json!({
+        "type": "thread.turn.start", "commandId": message_id, "threadId": "b",
+        "message": {
+            "messageId": message_id, "role": "user", "text": "Please review", "attachments": [],
+            "personSend": { "requestId": request_id, "action": "review", "sourceAddress": "thread:a" },
+        },
+        "runtimeMode": "full-access", "interactionMode": "default", "queued": false,
+        "createdAt": AT,
+    }))
+    .unwrap();
+    let admission = CommandAdmission {
+        payload_digest: canonical_command_digest(&command).unwrap(),
+        attachment_refs: Vec::new(),
+        provider_turn: Some(NewProviderTurnDelivery {
+            state: TurnDeliveryState::Pending,
+            mode: TurnDeliveryMode::Start,
+            command_id: message_id.clone(),
+            thread_id: "b".to_owned(),
+            message_id: message_id.clone(),
+            provider_instance_id: "codex".to_owned(),
+            provider_kind: "codex".to_owned(),
+            provider_session_id: None,
+            delivery_key: uuid::Uuid::new_v4().to_string(),
+            payload: serde_json::to_value(&command).unwrap(),
+            created_at: AT.to_owned(),
+        }),
+    };
+    harness
+        .engine
+        .dispatch_with_admission(command, admission, || {})
+        .await
+        .expect("admitted");
+}
+
+async fn assert_admitted_but_queued(harness: &Harness, message_id: &str) {
+    assert_eq!(
+        outbox_state(harness, message_id).await.as_deref(),
+        Some("queued"),
+        "the engine's admission rechecks the blocker"
+    );
+    assert_eq!(
+        count(
+            harness,
+            "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.turn-start-requested' AND stream_id = 'b'",
+        )
+        .await,
+        0,
+        "no turn starts"
+    );
+    let payload = harness
+        .repositories
+        .database()
+        .call({
+            let message_id = message_id.to_owned();
+            move |connection| {
+                Ok(connection.query_row(
+                    "SELECT payload_json FROM provider_turn_outbox WHERE message_id = ?",
+                    [message_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap()["queued"],
+        true,
+        "the stored payload agrees with the outbox state"
+    );
+}
+
+#[tokio::test]
+async fn send_an_error_that_appears_before_admission_still_queues_the_request() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    session(&harness, "b", "error").await;
+
+    admit_as_resolved_to_start(&harness, "raced").await;
+
+    assert_admitted_but_queued(&harness, "person-send:raced").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_an_approval_that_appears_before_admission_still_queues_the_request() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    ask(&harness, "b", "approval.requested").await;
+    session(&harness, "b", "ready").await;
+
+    admit_as_resolved_to_start(&harness, "raced").await;
+
+    assert_admitted_but_queued(&harness, "person-send:raced").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_a_malformed_input_is_refused_without_quoting_it() {
+    let harness = harness().await;
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, harness.send_requests());
+    let mut malformed = serde_json::to_value(input("r1", "review", "thread:a", "thread:b")).unwrap();
+    malformed["attachments"] = json!(["private marker text"]);
+
+    let error = registry
+        .invoke_local(
+            "sendRequests.send",
+            malformed,
+            person(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a malformed input is refused");
+
+    assert_eq!(error["reason"], "invalid", "{error}");
+    assert!(
+        !error.to_string().contains("private marker text"),
+        "the refusal quotes no input: {error}"
+    );
+    harness.shutdown().await;
+}
