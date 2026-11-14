@@ -8,8 +8,9 @@ use std::{
 };
 
 use base64::Engine as _;
-use bibcode_server::terminal::{PortablePtyBackend, PtyBackend, PtySpawnInput};
+use bibcode_server::terminal::{PortablePtyBackend, PtyBackend, PtyExit, PtySpawnInput};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use tokio::sync::{broadcast, watch};
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -28,6 +29,12 @@ const WINDOWS_CONSOLE_THEME_ENV: &str = "BIBCODE_WINDOWS_CONSOLE_THEME";
 const TRUSTED_CMD_FIXTURE_ENV: &str = "BIBCODE_TEST_TRUSTED_CMD_FIXTURE";
 const NATIVE_ARGV_MARKER: &str = "BIBCODE_NATIVE_ARGV";
 const TERMINAL_PROCESS_TREE_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a shim may take to print its marker and then to exit. These tests check what a
+/// shim receives, not how fast a runner starts processes: on a fresh Windows arm64 CI runner the
+/// first terminal spawns usually take 4 to 7 seconds, and in 1 of 80 cold runs they stalled for
+/// about 20 seconds, with the pseudoconsole up and the shim not yet printing (#367). A shim
+/// that never prints still fails, with what the terminal showed.
+const SHIM_DEADLINE: Duration = Duration::from_secs(60);
 
 struct OwnedHandle(HANDLE);
 
@@ -130,6 +137,46 @@ async fn assert_terminal_kills_descendant(input: PtySpawnInput, child_pid_file: 
     );
 }
 
+/// Collects terminal output until it holds `marker` or the terminal exits. On a timeout the
+/// error keeps what the terminal printed and whether it had exited: "late" and "never printed"
+/// need different fixes, and a bare `Elapsed` cannot tell them apart (#367).
+async fn wait_for_marker(
+    output: &mut broadcast::Receiver<String>,
+    exit: &mut watch::Receiver<Option<PtyExit>>,
+    marker: &str,
+    deadline: Duration,
+) -> Result<String, String> {
+    // Outside the timed future, so a timeout does not drop it.
+    let mut text = String::new();
+    let waited = tokio::time::timeout(deadline, async {
+        while !text.contains(marker) {
+            if exit.borrow().is_some() {
+                break;
+            }
+            tokio::select! {
+                received = output.recv() => {
+                    text.push_str(&received.expect("terminal output channel should stay open"));
+                }
+                changed = exit.changed() => {
+                    changed.expect("terminal exit channel should stay open");
+                    if exit.borrow().is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(()) => Ok(text),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for {marker}; output={text:?}, exit={:?}",
+            deadline.as_secs(),
+            exit.borrow().clone()
+        )),
+    }
+}
+
 async fn assert_shim_output(
     executable: &Path,
     arguments: &[String],
@@ -148,34 +195,15 @@ async fn assert_shim_output(
         .unwrap();
     let mut output = process.subscribe_output();
     let mut exit = process.subscribe_exit();
-    let text = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut text = String::new();
-        while !text.contains(marker) {
-            if exit.borrow().is_some() {
-                break;
-            }
-            tokio::select! {
-                received = output.recv() => {
-                    text.push_str(&received.expect("terminal output channel should stay open"));
-                }
-                changed = exit.changed() => {
-                    changed.expect("terminal exit channel should stay open");
-                    if exit.borrow().is_some() {
-                        break;
-                    }
-                }
-            }
-        }
-        text
-    })
-    .await
-    .unwrap();
+    let text = wait_for_marker(&mut output, &mut exit, marker, SHIM_DEADLINE)
+        .await
+        .unwrap_or_else(|timed_out| panic!("{timed_out}"));
     assert!(
         text.contains(marker),
         "terminal exited without the expected marker; output={text:?}, exit={:?}",
         exit.borrow().clone()
     );
-    tokio::time::timeout(Duration::from_secs(10), exit.changed())
+    tokio::time::timeout(SHIM_DEADLINE, exit.changed())
         .await
         .unwrap()
         .unwrap();
@@ -677,6 +705,53 @@ async fn assert_review_prompt_reaches_node(sample: &str) {
             "a redirect or second command created {redirect_target}"
         );
     }
+}
+
+#[tokio::test]
+async fn shim_timeout_reports_the_collected_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let shim = directory.path().join("slow.cmd");
+    // Prints a line about once a second and never the marker. `ping` waits without a console
+    // input handle, which `timeout` needs.
+    std::fs::write(
+        &shim,
+        "@echo off\r\n:again\r\necho BEFORE\r\nping -n 2 127.0.0.1 >nul\r\ngoto again\r\n",
+    )
+    .unwrap();
+    let process = PortablePtyBackend
+        .spawn(&PtySpawnInput {
+            executable: shim.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: directory.path().to_path_buf(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::new(),
+        })
+        .unwrap();
+    let mut output = process.subscribe_output();
+    let mut exit = process.subscribe_exit();
+
+    // A first spawn can take many seconds on a loaded runner (#367), so the timed part starts
+    // only once the shim is known to be printing.
+    wait_for_marker(&mut output, &mut exit, "BEFORE", Duration::from_secs(120))
+        .await
+        .unwrap_or_else(|timed_out| panic!("{timed_out}"));
+    let timed_out = wait_for_marker(
+        &mut output,
+        &mut exit,
+        "NEVER_REACHED_MARKER",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("the shim never prints the marker");
+
+    process.kill().unwrap();
+    assert!(
+        timed_out.contains("timed out after 5s waiting for NEVER_REACHED_MARKER"),
+        "{timed_out}"
+    );
+    assert!(timed_out.contains("BEFORE"), "{timed_out}");
+    assert!(timed_out.ends_with("exit=None"), "{timed_out}");
 }
 
 #[tokio::test]

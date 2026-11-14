@@ -156,6 +156,46 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect("compiles only the workspace crates with the requested codegen units", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const repoRoot = path.resolve("X:/repo");
+      const input = { platform: "win", target: "nsis", arch: "x64" } as const;
+      const host = { platform: "win32", arch: "x64" } as const;
+      const plain = yield* resolveTauriBuildPlan(input, {}, host, repoRoot);
+      const plan = yield* resolveTauriBuildPlan(
+        { ...input, workspaceCodegenUnits: 16 },
+        {},
+        host,
+        repoRoot,
+      );
+
+      // Everything after `--` goes to Cargo; a package override leaves dependencies untouched.
+      assert.deepStrictEqual(plan.buildCommand.args, [
+        ...plain.buildCommand.args,
+        "--",
+        "--config",
+        "profile.release.package.bibcode-server.codegen-units=16",
+        "--config",
+        "profile.release.package.bibcode-desktop.codegen-units=16",
+      ]);
+      assert.deepStrictEqual(plan.bundleCommand, plain.bundleCommand);
+    }),
+  );
+
+  it("reads --workspace-codegen-units as a whole number from 1 to 256", () => {
+    assert.deepStrictEqual(parseTauriArtifactCliArgs(["--workspace-codegen-units", "16"]), {
+      workspaceCodegenUnits: 16,
+    });
+    for (const value of ["0", "257", "1.5", "abc", ""]) {
+      assert.throws(
+        () => parseTauriArtifactCliArgs(["--workspace-codegen-units", value]),
+        /--workspace-codegen-units must be a whole number from 1 to 256\./,
+        value,
+      );
+    }
+  });
+
   it.effect("plans an updater-enabled macOS DMG build with the stable release overlay", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;

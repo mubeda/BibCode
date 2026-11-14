@@ -74,6 +74,13 @@ function hasLineRecords(sym: string | Buffer): boolean {
   return [..."0123456789abcdef"].some((digit) => sym.indexOf(`\n${digit}`) !== -1);
 }
 
+/** How many `STACK` records the `.sym` holds. */
+export function countStackRecords(sym: string | Buffer): number {
+  let count = sym.indexOf("STACK ") === 0 ? 1 : 0;
+  for (let at = sym.indexOf("\nSTACK "); at !== -1; at = sym.indexOf("\nSTACK ", at + 1)) count++;
+  return count;
+}
+
 /**
  * Fails unless the `.sym` can symbolicate a minidump: `STACK` records to unwind past the
  * crashing frame, and functions with source lines to name the frames. dump_syms reports a
@@ -194,21 +201,65 @@ export function dumpSymbols(input: DumpSymbolsInput, dumpSyms = "dump_syms"): st
       inputs.push(stage(dwarfFile(input.dsym), NodePath.join(work, "dsym"), input.moduleName));
     }
     const output = NodePath.join(work, "module.sym");
-    const result = NodeChildProcess.spawnSync(
-      dumpSyms,
-      ["--inlines", "--check-cfi", "--store", input.out, "--output", output, ...inputs],
-      { shell: false, stdio: ["ignore", "inherit", "inherit"] },
-    );
-    if (result.error) throw result.error;
-    if (result.status !== 0) {
-      throw new DumpSymbolsError(`dump_syms exited with ${result.status ?? result.signal}.`);
-    }
+    // Runs dump_syms, passes its log through, and says whether it logged an error: it exits 0
+    // after one.
+    const run = (args: ReadonlyArray<string>): boolean => {
+      const result = NodeChildProcess.spawnSync(dumpSyms, [...args], {
+        shell: false,
+        stdio: ["ignore", "inherit", "pipe"],
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      // First, so a run that failed (an overflowing log included) still shows what it logged.
+      if (result.stderr) process.stderr.write(result.stderr);
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        throw new DumpSymbolsError(`dump_syms exited with ${result.status ?? result.signal}.`);
+      }
+      return result.stderr.includes("[ERROR]");
+    };
+    const reportedError = run([
+      "--inlines",
+      "--check-cfi",
+      "--store",
+      input.out,
+      "--output",
+      output,
+      ...inputs,
+    ]);
     // Given several inputs, dump_syms logs a failed one and still exits 0.
     if (!NodeFS.existsSync(output)) {
       throw new DumpSymbolsError(`dump_syms wrote no symbols for ${input.binary}.`);
     }
     const bytes = NodeFS.readFileSync(output);
     assertUsableSymbols(bytes, input.binary);
+    if (reportedError) {
+      // dump_syms logs a failed unwind table and keeps the records written before it, so the
+      // log line alone cannot tell a harmless error from a truncated file. A dSYM's unwind
+      // section header points at no data and fails this way while the binary's tables, the
+      // only source of STACK records, are read in full; the binary dumped alone tells which.
+      if (input.dsym === undefined) {
+        throw new DumpSymbolsError(
+          `dump_syms reported an error for ${input.binary}; its symbols may be incomplete.`,
+        );
+      }
+      const binaryOnly = NodePath.join(work, "binary-only.sym");
+      if (run(["--check-cfi", "--output", binaryOnly, inputs[0]!])) {
+        throw new DumpSymbolsError(
+          `dump_syms reported an error while reading the unwind tables of the binary ${input.binary}.`,
+        );
+      }
+      const stored = countStackRecords(bytes);
+      const expected = countStackRecords(NodeFS.readFileSync(binaryOnly));
+      if (stored !== expected) {
+        throw new DumpSymbolsError(
+          `dump_syms reported an error and the stored symbols hold ${stored} STACK records, the binary ${expected}.`,
+        );
+      }
+      console.log(
+        `dump_syms reported an error for the dSYM; the binary's ${stored} STACK records are all stored.`,
+      );
+    }
     const storePath = symbolStorePath(bytes);
     if (input.zip !== undefined) writeZip(input.zip, [{ name: storePath, data: bytes }]);
     return NodePath.join(input.out, ...storePath.split("/"));

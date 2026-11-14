@@ -402,12 +402,17 @@ with hooks off. The repository pin beats both.
 The code review terminal argument tests (#293) send one argument per class
 (quotes, `%` and `%PATH%`, `&`, `^`, `|`, `<` with `>`, `!`, trailing
 backslashes, a backslash before a quote, and all of them combined) through an
-npm-style `%*` `.cmd` shim to `node` and compare what arrives. CI's Windows rows
-run them, and a native Windows pass runs the same command:
+npm-style `%*` `.cmd` shim to `node` and compare what arrives. CI's
+`Server tests - Windows` job runs them, with the server test target check, the
+Git system configuration tests, the background index lock tests and the host
+metrics tests, and a native Windows pass runs the same command:
 
 ```powershell
-node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -j 2 -- review_prompt_shim_
+node scripts/run-msvc.mjs cargo test -p bibcode-server --test windows_terminal_shims -- review_prompt_shim_ shim_timeout_
 ```
+
+The `shim_timeout_` test proves that a shim which misses its deadline fails
+with the terminal output it printed and its exit state (#367).
 
 Terminal reviews are on for Windows environments because these pass on real
 Windows; a failing class means they must go off again. Record the result in the
