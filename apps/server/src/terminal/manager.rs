@@ -4585,7 +4585,8 @@ impl TerminalManager {
         TerminalMetadataAttachment { initial, events }
     }
 
-    /// The generation of the terminal's process while it runs.
+    /// The generation of the terminal's process while it runs. A process a close, restart or
+    /// shutdown has begun to end is no longer live, though its session runs until cleanup.
     pub async fn live_generation(
         &self,
         thread_id: &str,
@@ -4599,7 +4600,10 @@ impl TerminalManager {
             .get(&(thread_id.to_owned(), terminal_id.to_owned()))
             .cloned()?;
         let session = session.lock().await;
-        (session.status == TerminalStatus::Running).then(|| session.generation.id.clone())
+        (session.status == TerminalStatus::Running
+            && !session.generation.is_closing()
+            && !session.generation.is_invalidated())
+        .then(|| session.generation.id.clone())
     }
 
     pub fn subscribe_events(&self) -> TerminalEventReceiver {
