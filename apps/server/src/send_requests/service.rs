@@ -162,12 +162,20 @@ impl TerminalOutputSource for crate::terminal::TerminalManager {
 
 /// How many raw characters to read so `plain_tail` can return `max_chars` of plain text.
 pub(crate) fn raw_window_chars(max_chars: usize) -> usize {
-    max_chars
+    // shortcut: an escape sequence longer than the extra window still leaks its payload when
+    // its start is cut off, until the history reader can start a window at a sequence boundary.
+    max_chars.saturating_mul(4)
 }
 
-/// The last `max_chars` of plain text in `raw`, the end of a terminal's retained output.
+/// The last `max_chars` of plain text in `raw`, the end of a terminal's retained output. Escape
+/// sequences are removed before the limit applies, so a long sequence cannot be cut in half. Tab
+/// and newline stay, every other C0 and C1 control character and DEL goes.
 pub(crate) fn plain_tail(raw: &str, older_exists: bool, max_chars: usize) -> TerminalTail {
-    let (text, _open) = crate::ansi::strip_escapes(raw);
+    let (stripped, _open) = crate::ansi::strip_escapes(raw);
+    let text: String = stripped
+        .chars()
+        .filter(|c| matches!(c, '\t' | '\n') || !c.is_control())
+        .collect();
     let count = text.chars().count();
     TerminalTail {
         text: text.chars().skip(count.saturating_sub(max_chars)).collect(),
