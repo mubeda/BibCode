@@ -5,8 +5,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
 import type { CodeReviewScope } from "../SourceControlPanel.logic";
-import { ReviewScopePicker } from "./ReviewScopePicker";
+import { buildReviewPreviewContent, ReviewScopePicker } from "./ReviewScopePicker";
 import type { ReviewScopeOption } from "./review.logic";
+import type { PreviewContent } from "./sendToAgent.logic";
+import type { SendOutcome } from "~/state/sendRequests";
 
 const branch: ReviewScopeOption = {
   scope: { kind: "branch", base: "origin/main" },
@@ -88,5 +90,37 @@ describe("ReviewScopePicker", () => {
     expect(document.activeElement).toBe(radio);
     await act(async () => radio.click());
     expect(seen).toEqual([]);
+  });
+});
+
+describe("buildReviewPreviewContent", () => {
+  it("a late completion of an earlier send leaves the scope a reopened preview picked", async () => {
+    const submitted: string[] = [];
+    const resolvers: Array<(outcome: SendOutcome) => void> = [];
+    const build = () =>
+      buildReviewPreviewContent({
+        options: [branch, uncommitted],
+        pickKey: "late-send-key",
+        contentFor: (scope): PreviewContent => ({
+          leadIn: scope.kind,
+          attachments: [],
+          submit: () => {
+            submitted.push(scope.kind);
+            return new Promise<SendOutcome>((resolve) => resolvers.push(resolve));
+          },
+        }),
+      });
+    const draft = { leadIn: "", note: "", attachments: [] };
+    const first = build();
+    const firstSend = first.submit!(draft);
+    const second = build();
+    act(() => root.render(<>{second.extraContent}</>));
+    await act(async () => radios()[1]!.click());
+    await flush();
+    expect(radios()[1]!.getAttribute("aria-checked")).toBe("true");
+    resolvers[0]!({ kind: "sent" } as SendOutcome);
+    await firstSend;
+    void second.submit!(draft);
+    expect(submitted).toEqual(["branch", "uncommitted"]);
   });
 });
