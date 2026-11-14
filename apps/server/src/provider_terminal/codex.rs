@@ -1813,12 +1813,7 @@ async fn run_codex_observer_inner(
                         pending_reconciliation = false;
                         retry_at = None;
                         recovering = true;
-                        let desired = inner.activity.snapshot();
-                        inner.activity.mark_observed(TerminalAgentActivityObservation {
-                            state: desired,
-                            epoch,
-                            kind: TerminalAgentActivityObservationKind::Unavailable,
-                        });
+                        publish_codex_observation_lost(&inner.activity, generation, epoch);
                         continue;
                     }
                 };
@@ -1986,6 +1981,19 @@ async fn cross_codex_enable_barrier(
     };
     client.drain_request_buffered_notifications();
     matches!(response, Ok(Ok(_)))
+}
+
+/// The connection to the app server is gone: activity is unavailable until it reconnects.
+pub(super) fn publish_codex_observation_lost(
+    activity: &TerminalAgentActivityControl,
+    _generation: &TerminalObserverGenerationLease,
+    epoch: u64,
+) {
+    activity.mark_observed(TerminalAgentActivityObservation {
+        state: activity.snapshot(),
+        epoch,
+        kind: TerminalAgentActivityObservationKind::Unavailable,
+    });
 }
 
 async fn reconnect_attached_codex_client(

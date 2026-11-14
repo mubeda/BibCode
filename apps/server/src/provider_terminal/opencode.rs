@@ -1240,9 +1240,13 @@ async fn run_opencode_observer(
     }
 
     let mut epoch = 0_u64;
-    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
-    let mut stream =
-        establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout).await;
+    let mut stream = attach_opencode_root(
+        &mut *remote,
+        &generation,
+        &root_session_id,
+        inner.handshake_timeout,
+    )
+    .await;
     let (mut mode, mut live_state) = if stream.is_some() {
         let state = inner.activity.snapshot();
         let mode = if !state.enabled {
@@ -1288,10 +1292,13 @@ async fn run_opencode_observer(
 
     loop {
         if stream.is_none() {
-            hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
-            stream =
-                establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout)
-                    .await;
+            stream = attach_opencode_root(
+                &mut *remote,
+                &generation,
+                &root_session_id,
+                inner.handshake_timeout,
+            )
+            .await;
             if generation.cancellation_reason().is_some() {
                 stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
                 return;
@@ -1599,6 +1606,17 @@ async fn publish_opencode_scope(
         )
         .await
         .unwrap_or(false)
+}
+
+/// Opens the event stream and reads the root session's state.
+async fn attach_opencode_root(
+    remote: &mut dyn OpenCodeRemoteClient,
+    generation: &TerminalObserverGenerationLease,
+    root_session_id: &str,
+    timeout: Duration,
+) -> Option<Box<dyn OpenCodeEventStream>> {
+    hydrate_opencode_root_status(remote, generation, root_session_id).await;
+    establish_opencode_event_stream(remote, generation, timeout).await
 }
 
 /// Reads the root session's state as the observer attaches or reattaches, which the events it
@@ -4160,6 +4178,142 @@ mod tests {
         }
     }
 
+
+    /// A server whose root session turns busy as soon as the observer subscribes, as a prompt
+    /// typed while the observer attaches would.
+    struct AttachingRemote {
+        subscribed: bool,
+        stream_opens: bool,
+    }
+
+    struct ConnectedStream {
+        connected: bool,
+    }
+
+    impl OpenCodeEventStream for ConnectedStream {
+        fn discard_next(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn next_data(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+            if std::mem::replace(&mut self.connected, true) {
+                return Box::pin(std::future::pending());
+            }
+            Box::pin(std::future::ready(Ok(
+                br#"{"type":"server.connected","properties":{}}"#.to_vec(),
+            )))
+        }
+    }
+
+    impl OpenCodeRemoteClient for AttachingRemote {
+        fn create_root(
+            &mut self,
+            _model: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+            unreachable!("attach creates no root")
+        }
+
+        fn cleanup_pre_spawn(
+            &mut self,
+            _root_session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            unreachable!("attach cleans nothing")
+        }
+
+        fn abort(
+            &mut self,
+            _root_session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            unreachable!("attach aborts nothing")
+        }
+
+        fn root(
+            &mut self,
+            _root_session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+            unreachable!("attach reads no root")
+        }
+
+        fn statuses(&mut self) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+            let statuses = if self.subscribed {
+                json!({"root": {"type": "busy"}})
+            } else {
+                json!({})
+            };
+            Box::pin(std::future::ready(Ok(statuses)))
+        }
+
+        fn children(
+            &mut self,
+            _session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+            unreachable!("attach reads no children")
+        }
+
+        fn messages(
+            &mut self,
+            _session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+            unreachable!("attach reads no messages")
+        }
+
+        fn open_event_stream(&mut self) -> OpenCodeEventStreamFuture<'_> {
+            if !self.stream_opens {
+                return Box::pin(std::future::ready(Err("down".to_owned())));
+            }
+            self.subscribed = true;
+            Box::pin(std::future::ready(Ok(
+                Box::new(ConnectedStream { connected: false }) as Box<dyn OpenCodeEventStream>
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_attach_reads_the_root_status_after_subscribing() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        let mut remote = AttachingRemote {
+            subscribed: false,
+            stream_opens: true,
+        };
+
+        let stream = attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1)).await;
+
+        assert!(stream.is_some());
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Working);
+        assert!(
+            !status.ready_for_prompt,
+            "a turn that began before the subscription read as ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_attach_without_a_stream_withdraws_readiness() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let mut remote = AttachingRemote {
+            subscribed: false,
+            stream_opens: false,
+        };
+
+        let stream =
+            attach_opencode_root(&mut remote, &lease, "root", Duration::from_millis(20)).await;
+
+        assert!(stream.is_none());
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Done);
+        assert!(
+            !status.ready_for_prompt,
+            "an observer without a stream reported ready"
+        );
+    }
 
     #[test]
     fn opencode_2_a_child_session_ending_leaves_the_root_not_ready() {

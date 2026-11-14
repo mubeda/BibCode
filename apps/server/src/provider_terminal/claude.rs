@@ -4270,6 +4270,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hook_server_that_ends_withdraws_readiness() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let generation = TerminalObserverGeneration::new(
+            "thread-hook-exit".to_owned(),
+            "terminal-hook-exit".to_owned(),
+        );
+        let root = tempfile::tempdir().expect("observer resources");
+        let generation_dir = root.path().join("generation");
+        std::fs::create_dir(&generation_dir).expect("generation directory");
+        let inner = Arc::new(ClaudeObserverInner {
+            resources: Arc::new(ClaudeObserverResources {
+                listener: Mutex::new(None),
+                overlay_path: generation_dir.join("settings.json"),
+                runtime_dir: root.path().to_path_buf(),
+                generation_dir,
+                cleaned: AtomicBool::new(false),
+            }),
+            publisher: TerminalGenerationActivityPublisher::new(
+                generation.clone(),
+                projection,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+            provider_instance_id: "claudeAgent".to_owned(),
+            token: Arc::new("unused".to_owned()),
+            correlation: Arc::new("unused".to_owned()),
+            spawned: AtomicBool::new(true),
+            activity: Arc::new(TerminalAgentActivityControl::enabled()),
+            listener_lifecycle: AtomicU64::new(pack_claude_listener_lifecycle(
+                ClaudeListenerLifecycle {
+                    ready: true,
+                    epoch: 1,
+                },
+            )),
+        });
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let (_requests, receiver) = mpsc::channel(1);
+
+        drive_claude_observer(inner, lease.clone(), receiver, Box::pin(async {})).await;
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Done);
+        assert!(
+            !status.ready_for_prompt,
+            "a terminal whose hooks can no longer arrive reads ready"
+        );
+    }
+
+    #[tokio::test]
     async fn dormant_shutdown_reconciliation_does_not_publish_interruptions() {
         let database = Database::open_in_memory().await.expect("database");
         database

@@ -319,3 +319,25 @@ fn ready_for_prompt_follows_each_provider_event() {
         );
     }
 }
+
+/// A lost Codex connection cannot see the agent's next turn or approval, so a terminal that was
+/// idle stops reading ready while its state stays as last reported.
+#[test]
+fn a_lost_codex_connection_withdraws_readiness() {
+    let generation =
+        super::TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+    let lease = generation.observation();
+    lease.publish_agent_status(Done, false);
+    lease.mark_ready_for_prompt();
+    let activity = super::TerminalAgentActivityControl::enabled();
+
+    super::codex::publish_codex_observation_lost(&activity, &lease, 3);
+
+    let status = lease.subscribe_agent_status().borrow().expect("a status");
+    assert_eq!(status.state, Done);
+    assert!(!status.ready_for_prompt, "a lost connection still reads ready");
+    assert_eq!(
+        activity.latest_observation().map(|observation| observation.kind),
+        Some(super::TerminalAgentActivityObservationKind::Unavailable)
+    );
+}
