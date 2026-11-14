@@ -1536,8 +1536,7 @@ async fn run_opencode_observer(
                     }
                 }
                 if replacing && stream.is_some() {
-                    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id)
-                        .await;
+                    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
                 }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
@@ -4180,7 +4179,13 @@ mod tests {
         for (name, events, root, failed, ready) in [
             ("hello", &hello, hello_root.as_str(), false, true),
             ("fail", &fail, fail_root.as_str(), true, false),
-            ("failed before a step", &failed_before_a_step, "ses_early", true, false),
+            (
+                "failed before a step",
+                &failed_before_a_step,
+                "ses_early",
+                true,
+                false,
+            ),
         ] {
             for dormant in [false, true] {
                 let status = replay_opencode_2_status(events, root, dormant)
@@ -4193,7 +4198,6 @@ mod tests {
             }
         }
     }
-
 
     /// A server whose root session turns busy as soon as the observer subscribes, as a prompt
     /// typed while the observer attaches would.
@@ -4283,7 +4287,7 @@ mod tests {
             }
             self.subscribed = true;
             Box::pin(std::future::ready(Ok(
-                Box::new(ConnectedStream { connected: false }) as Box<dyn OpenCodeEventStream>
+                Box::new(ConnectedStream { connected: false }) as Box<dyn OpenCodeEventStream>,
             )))
         }
     }
@@ -4297,7 +4301,8 @@ mod tests {
             stream_opens: true,
         };
 
-        let stream = attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1)).await;
+        let stream =
+            attach_opencode_root(&mut remote, &lease, "root", Duration::from_secs(1)).await;
 
         assert!(stream.is_some());
         let status = lease.subscribe_agent_status().borrow().expect("a status");
@@ -4343,7 +4348,10 @@ mod tests {
             .expect("the child session succeeds");
         let status = replay_opencode_2_status(&events[..=child_done], &root, false).unwrap();
         assert_eq!(status.state, TerminalAgentState::Working);
-        assert!(!status.ready_for_prompt, "a child's end made the root ready");
+        assert!(
+            !status.ready_for_prompt,
+            "a child's end made the root ready"
+        );
         let status = replay_opencode_2_status(&events, &root, false).unwrap();
         assert!(status.ready_for_prompt, "the root's own end makes it ready");
     }
