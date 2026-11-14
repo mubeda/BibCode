@@ -191,6 +191,7 @@ fn register_orchestration_rpc_inner(
                         workspace_admission,
                         command_claim,
                         &owner,
+                        None,
                     )
                     .await;
                 }
@@ -315,8 +316,65 @@ pub(crate) enum ServerActor {
     /// A signed-in person (`sendRequests.*`): nothing is stamped.
     Person,
     /// An agent BiBCode hosts (agent messaging).
-    #[allow(dead_code)] // Agent messaging (phase 5) is its first sender.
     HostedAgent { address: String, label: String },
+}
+
+/// An agent message's part of a server-built turn start: its row, committed with the queue
+/// entry, and whether the turn queues even when the recipient's session is not running.
+pub(crate) struct AgentTurn {
+    pub(crate) companion: crate::agent_messaging::store::AgentMessageCompanion,
+    pub(crate) force_queue: bool,
+}
+
+/// Starts or queues the turn of an agent message through the server dispatcher's own path.
+#[derive(Clone)]
+pub(crate) struct ServerTurnStarter {
+    engine: OrchestrationEngine,
+    registration: ProviderRegistration,
+    availability: Option<WorkspaceAdmissionController>,
+}
+
+impl ServerTurnStarter {
+    pub(crate) async fn queue_turn_start(
+        &self,
+        command: OrchestrationCommand,
+        actor: ServerActor,
+        agent: Option<AgentTurn>,
+    ) -> Result<Value, Value> {
+        dispatch_server_command(
+            self.engine.clone(),
+            self.registration.clone(),
+            self.availability.clone(),
+            command,
+            UploadOwner::Unauthenticated,
+            actor,
+            agent,
+        )
+        .await
+    }
+}
+
+pub(crate) fn server_turn_starter(
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> ServerTurnStarter {
+    let (registration, availability) = server_dispatch_parts(
+        &engine,
+        provider,
+        settings_root,
+        turn_delivery,
+        availability,
+        uploads,
+    );
+    ServerTurnStarter {
+        engine,
+        registration,
+        availability,
+    }
 }
 
 /// The server-only entry point for commands the server builds itself. It shares the inner
@@ -342,6 +400,35 @@ pub(crate) fn server_command_dispatcher(
     availability: Option<WorkspaceAvailabilityRegistry>,
     uploads: UploadRegistry,
 ) -> ServerCommandDispatcher {
+    let (registration, availability) = server_dispatch_parts(
+        &engine,
+        provider,
+        settings_root,
+        turn_delivery,
+        availability,
+        uploads,
+    );
+    Arc::new(move |command, owner, actor| {
+        Box::pin(dispatch_server_command(
+            engine.clone(),
+            registration.clone(),
+            availability.clone(),
+            command,
+            owner,
+            actor,
+            None,
+        ))
+    })
+}
+
+fn server_dispatch_parts(
+    engine: &OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> (ProviderRegistration, Option<WorkspaceAdmissionController>) {
     let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
     let registration = ProviderRegistration {
         provider,
@@ -352,67 +439,81 @@ pub(crate) fn server_command_dispatcher(
     };
     let availability = availability
         .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
-    Arc::new(move |command, owner, actor| {
-        let engine = engine.clone();
-        let registration = registration.clone();
-        let availability = availability.clone();
-        Box::pin(async move {
-            let carries_person_send = matches!(
-                &command,
-                OrchestrationCommand::ThreadTurnStart { message, .. } if message.person_send.is_some()
-            );
-            if carries_person_send && matches!(actor, ServerActor::HostedAgent { .. }) {
-                return Err(invalid_request(
-                    SERVER_DISPATCH_TAG,
-                    "an agent's message cannot carry a person's request",
-                ));
-            }
-            let payload_digest = canonical_command_digest(&command)
-                .map_err(|error| invalid_request(SERVER_DISPATCH_TAG, error))?;
-            let command_claim = engine
-                .acquire_command_admission(command.command_id())
-                .await
-                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-            if let ServerActor::HostedAgent { address, label } = &actor {
-                command_claim.attribute_to(json!({
-                    "kind": "hosted-agent",
-                    "address": address,
-                    "label": label,
-                }));
-            }
-            if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
-                let workspace_admission = match &availability {
-                    Some(availability) => Some(
-                        availability
-                            .acquire_thread(thread_id, std::iter::empty())
-                            .await
-                            .map_err(workspace_admission_error)?,
-                    ),
-                    None => None,
-                };
-                return dispatch_turn_command(
-                    engine,
-                    registration,
-                    command,
-                    payload_digest,
-                    SERVER_DISPATCH_TAG.to_owned(),
-                    workspace_admission,
-                    command_claim,
-                    &owner,
-                )
-                .await;
-            }
-            dispatch_prepared_command(
-                engine,
-                Some(registration),
-                command,
-                payload_digest,
-                SERVER_DISPATCH_TAG.to_owned(),
-                command_claim,
-            )
-            .await
-        })
-    })
+    (registration, availability)
+}
+
+/// The inner function of the server dispatcher and of [`ServerTurnStarter`]: the actor stamp,
+/// the person-request refusal and the shared dispatch path.
+async fn dispatch_server_command(
+    engine: OrchestrationEngine,
+    registration: ProviderRegistration,
+    availability: Option<WorkspaceAdmissionController>,
+    command: OrchestrationCommand,
+    owner: UploadOwner,
+    actor: ServerActor,
+    agent: Option<AgentTurn>,
+) -> Result<Value, Value> {
+    let carries_person_send = matches!(
+        &command,
+        OrchestrationCommand::ThreadTurnStart { message, .. } if message.person_send.is_some()
+    );
+    if carries_person_send && matches!(actor, ServerActor::HostedAgent { .. }) {
+        return Err(invalid_request(
+            SERVER_DISPATCH_TAG,
+            "an agent's message cannot carry a person's request",
+        ));
+    }
+    let payload_digest = canonical_command_digest(&command)
+        .map_err(|error| invalid_request(SERVER_DISPATCH_TAG, error))?;
+    let command_claim = engine
+        .acquire_command_admission(command.command_id())
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if let ServerActor::HostedAgent { address, label } = &actor {
+        command_claim.attribute_to(json!({
+            "kind": "hosted-agent",
+            "address": address,
+            "label": label,
+        }));
+    }
+    if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+        let workspace_admission = match &availability {
+            Some(availability) => Some(
+                availability
+                    .acquire_thread(thread_id, std::iter::empty())
+                    .await
+                    .map_err(workspace_admission_error)?,
+            ),
+            None => None,
+        };
+        return dispatch_turn_command(
+            engine,
+            registration,
+            command,
+            payload_digest,
+            SERVER_DISPATCH_TAG.to_owned(),
+            workspace_admission,
+            command_claim,
+            &owner,
+            agent,
+        )
+        .await;
+    }
+    if agent.is_some() {
+        return Err(invalid_request(
+            SERVER_DISPATCH_TAG,
+            "an agent message is delivered only by a turn start",
+        ));
+    }
+    dispatch_prepared_command(
+        engine,
+        Some(registration),
+        command,
+        payload_digest,
+        SERVER_DISPATCH_TAG.to_owned(),
+        command_claim,
+    )
+    .await
 }
 
 /// Decodes the public orchestration wire shape and resolves the small amount of
@@ -641,6 +742,7 @@ async fn dispatch_prepared_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 move || {
@@ -713,16 +815,27 @@ async fn dispatch_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
     owner: &UploadOwner,
+    agent: Option<AgentTurn>,
 ) -> RpcResult {
     let existing_receipt = dispatch
         .repositories()
         .get_command_receipt(command.command_id().to_owned())
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    // An agent message's row commits only with a new queue entry, which these paths never add.
+    let refuse_agent = |agent: &Option<AgentTurn>| {
+        agent.as_ref().map_or(Ok(()), |_| {
+            Err(invalid_request(
+                &request_tag,
+                "an agent message needs a new queue entry",
+            ))
+        })
+    };
     if existing_receipt
         .as_ref()
         .is_some_and(|receipt| receipt.payload_digest.is_none())
     {
+        refuse_agent(&agent)?;
         let result = dispatch
             .dispatch_with_command_claim(command, command_claim)
             .await
@@ -736,6 +849,7 @@ async fn dispatch_turn_command(
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     if !prepare_external {
+        refuse_agent(&agent)?;
         let result = dispatch
             .dispatch_with_admission_and_command_claim(
                 command,
@@ -743,6 +857,7 @@ async fn dispatch_turn_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 || {},
@@ -764,6 +879,7 @@ async fn dispatch_turn_command(
         workspace_admission,
         command_claim.clone(),
         owner,
+        agent,
     )
     .await;
     if result.is_err() {
@@ -788,7 +904,9 @@ async fn dispatch_reserved_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
     owner: &UploadOwner,
+    agent: Option<AgentTurn>,
 ) -> RpcResult {
+    let force_queue = agent.as_ref().is_some_and(|agent| agent.force_queue);
     let reusable = reusable_thread_attachments(&dispatch, &command, &request_tag).await?;
     let (mut command, prepared_batch) = prepare_attachments(
         &provider.attachments,
@@ -826,7 +944,7 @@ async fn dispatch_reserved_turn_command(
             .await
             .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
             .is_some();
-        if *queued == Some(true) || compacting {
+        if *queued == Some(true) || compacting || force_queue {
             let session = dispatch
                 .repositories()
                 .get_thread_session(thread_id.clone())
@@ -843,6 +961,7 @@ async fn dispatch_reserved_turn_command(
                         orchestration_error("OrchestrationDispatchCommandError", error)
                     })?;
             let resolved = compacting
+                || force_queue
                 || person_send_waits
                 || session.is_some_and(|session| {
                     matches!(session.status.as_str(), "running" | "starting")
@@ -900,6 +1019,7 @@ async fn dispatch_reserved_turn_command(
             payload: delivery_payload,
             created_at,
         }),
+        agent_message: agent.map(|agent| agent.companion),
     };
     let turn_delivery = provider.turn_delivery.clone();
     let on_commit = move || {
@@ -5241,6 +5361,7 @@ mod tests {
                         payload: serde_json::to_value(&command).expect("command payload"),
                         created_at: CREATED_AT.to_owned(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )
@@ -5308,6 +5429,7 @@ mod tests {
             workspace_admission,
             command_claim,
             owner,
+            None,
         )
         .await
     }

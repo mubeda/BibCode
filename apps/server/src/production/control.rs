@@ -319,6 +319,7 @@ pub struct NativeServerControl {
     automatic_git_fetch_interval: watch::Sender<Duration>,
     profiler_enabled: watch::Sender<bool>,
     device_previews_enabled: watch::Sender<bool>,
+    agent_messaging_enabled: watch::Sender<bool>,
     webhooks_enabled: watch::Sender<bool>,
     mcp_server: watch::Sender<crate::mcp::control::McpServerSettings>,
     settings_update_lock: Arc<Mutex<()>>,
@@ -418,6 +419,7 @@ impl NativeServerControl {
             watch::channel(automatic_git_fetch_interval(&settings));
         let (profiler_enabled, _) = watch::channel(enabled_setting(&settings));
         let (device_previews_enabled, _) = watch::channel(device_previews_setting(&settings));
+        let (agent_messaging_enabled, _) = watch::channel(agent_messaging_setting(&settings));
         let (webhooks_enabled, _) = watch::channel(webhooks_setting(&settings));
         let (mcp_server, _) = watch::channel(crate::mcp::control::mcp_server_settings(&settings));
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
@@ -445,6 +447,7 @@ impl NativeServerControl {
             automatic_git_fetch_interval,
             profiler_enabled,
             device_previews_enabled,
+            agent_messaging_enabled,
             webhooks_enabled,
             mcp_server,
             settings_update_lock: Arc::new(Mutex::new(())),
@@ -538,6 +541,11 @@ impl NativeServerControl {
     /// The committed `enableDevicePreviews`; changes as soon as a settings update commits.
     pub fn device_previews_enabled_signal(&self) -> watch::Receiver<bool> {
         self.device_previews_enabled.subscribe()
+    }
+
+    /// The committed `agentMessaging.enabled`; changes as soon as a settings update commits.
+    pub fn agent_messaging_enabled_signal(&self) -> watch::Receiver<bool> {
+        self.agent_messaging_enabled.subscribe()
     }
 
     /// The committed `enableWebhooks` (#139 slice X8); changes as soon as a settings update
@@ -712,6 +720,14 @@ impl NativeServerControl {
                 .send_if_modified(|current| {
                     let changed = *current != next_device_previews;
                     *current = next_device_previews;
+                    changed
+                });
+            let next_agent_messaging = agent_messaging_setting(&next);
+            commit_control
+                .agent_messaging_enabled
+                .send_if_modified(|current| {
+                    let changed = *current != next_agent_messaging;
+                    *current = next_agent_messaging;
                     changed
                 });
             let next_webhooks = webhooks_setting(&next);
@@ -2266,6 +2282,12 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
             .ok_or_else(|| "terminal must be an object".to_owned())?;
         validate_optional_bool(terminal, "webglEnabled")?;
     }
+    if let Some(agent_messaging) = object.get("agentMessaging") {
+        let agent_messaging = agent_messaging
+            .as_object()
+            .ok_or_else(|| "agentMessaging must be an object".to_owned())?;
+        validate_optional_bool(agent_messaging, "enabled")?;
+    }
     Ok(())
 }
 
@@ -2293,6 +2315,13 @@ fn mcp_launch_argv(config: &ServerConfig) -> Option<Vec<String>> {
 
 fn webhooks_setting(settings: &Value) -> bool {
     settings.get("enableWebhooks").and_then(Value::as_bool) == Some(true)
+}
+
+fn agent_messaging_setting(settings: &Value) -> bool {
+    settings
+        .pointer("/agentMessaging/enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn device_previews_setting(settings: &Value) -> bool {
@@ -2676,6 +2705,7 @@ fn apply_settings_defaults(settings: &mut Value) {
             "providerInstances": {},
             "providerSessionDefaults": {},
             "terminal": { "webglEnabled": true },
+            "agentMessaging": { "enabled": false },
         }),
     );
     let object = settings.as_object_mut().expect("settings object");
@@ -2907,6 +2937,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
     });
     // Outside the literal above, which is at `json!`'s recursion limit.
     capabilities["terminalUserInputClaim"] = json!(true);
+    capabilities["agentMessaging"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
         json!(crate::production::pipelines_rpc::pipelines_reads_registered());
@@ -5666,6 +5697,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_messaging_setting_defaults_off_validates_and_signals() {
+        let mut defaults = json!({});
+        apply_settings_defaults(&mut defaults);
+        assert_eq!(defaults["agentMessaging"]["enabled"], false);
+        assert!(!agent_messaging_setting(&defaults));
+        assert_eq!(
+            validate_settings_document(&json!({"agentMessaging": true})),
+            Err("agentMessaging must be an object".to_owned())
+        );
+        assert_eq!(
+            validate_settings_document(&json!({"agentMessaging": {"enabled": "yes"}})),
+            Err("enabled must be a boolean".to_owned())
+        );
+
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.agent_messaging_enabled_signal();
+        assert!(!*signal.borrow(), "agent messaging starts off");
+        control
+            .update_settings(json!({"patch":{"agentMessaging":{"enabled":true}}}))
+            .await
+            .expect("enable agent messaging");
+        signal.changed().await.expect("signal changes");
+        assert!(*signal.borrow());
+        control
+            .update_settings(json!({"patch":{"enableWebhooks":true}}))
+            .await
+            .expect("enable webhooks");
+        assert!(*signal.borrow(), "an unrelated patch leaves it on");
+        assert!(
+            !signal.has_changed().expect("signal open"),
+            "an unrelated patch publishes nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn webhooks_signal_follows_committed_setting() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
@@ -7594,6 +7663,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookQuestionEvents"], true);
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
+        assert_eq!(descriptor["capabilities"]["agentMessaging"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
         assert_eq!(descriptor["capabilities"]["hostMetrics"], true);

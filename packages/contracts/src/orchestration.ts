@@ -25,6 +25,7 @@ import {
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 import { PersonSend } from "./sendRequests.ts";
+import { OrchestrationHostedAgentActor } from "./agentMessaging.ts";
 
 /** Longest stored review prompt (user or project), in UTF-16 units (#293). */
 export const CODE_REVIEW_PROMPT_MAX_LENGTH = 7_680;
@@ -380,6 +381,13 @@ export const OrchestrationActor = Schema.Struct({
 });
 export type OrchestrationActor = typeof OrchestrationActor.Type;
 
+/** Who sent a user message: an outside agent over MCP, or an agent BiBCode hosts. */
+export const OrchestrationMessageActor = Schema.Union([
+  OrchestrationActor,
+  OrchestrationHostedAgentActor,
+]);
+export type OrchestrationMessageActor = typeof OrchestrationMessageActor.Type;
+
 /** The agent behind a thread it created, and why (untrusted text, at most 200 characters). */
 export const OrchestrationThreadRequester = Schema.Struct({
   actor: OrchestrationActor,
@@ -403,8 +411,8 @@ export const OrchestrationMessage = Schema.Struct({
    * context limit, admitted once the conversation was compacted. Absent from older servers.
    */
   resendOf: Schema.optional(MessageId),
-  /** The outside agent that sent this user message; absent for a person's. */
-  actor: Schema.optional(OrchestrationActor),
+  /** The agent that sent this user message; absent for a person's. */
+  actor: Schema.optional(OrchestrationMessageActor),
   /** The thread this message came from (a chat panel's provenance, slice X4). */
   sourceThreadId: Schema.optional(ThreadId),
   /** A person's request to this agent (`sendRequests.send`); absent for any other message. */
@@ -1758,8 +1766,8 @@ export const OrchestrationEventMetadata = Schema.Struct({
   adapterKey: Schema.optional(TrimmedNonEmptyString),
   requestId: Schema.optional(ApprovalRequestId),
   ingestedAt: Schema.optional(IsoDateTime),
-  /** The outside agent whose command planned this event (slice X1); absent for a person's. */
-  actor: Schema.optional(OrchestrationActor),
+  /** The agent whose command planned this event (slice X1); absent for a person's. */
+  actor: Schema.optional(OrchestrationMessageActor),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
 

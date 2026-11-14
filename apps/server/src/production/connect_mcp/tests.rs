@@ -470,7 +470,10 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     assert_eq!(operation_wire_name("recording_stop"), "recordingStop");
     assert_eq!(operation_wire_name("click"), "click");
     let tools = tool_descriptors(false);
-    assert_eq!(tools.len(), TOOL_OPERATIONS.len());
+    assert_eq!(
+        tools.len(),
+        TOOL_OPERATIONS.len() + crate::mcp::tools::agent_messaging::tool_descriptors().len()
+    );
     let status = tools
         .iter()
         .find(|tool| tool["name"] == "preview_status")
@@ -486,7 +489,11 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
         "../../../../../packages/contracts/fixtures/mcp-tools/preview-tools.json"
     ))
     .unwrap();
-    for tool in &tools {
+    for tool in tools.iter().filter(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("preview_"))
+    }) {
         let name = tool["name"].as_str().unwrap();
         assert_eq!(tool["inputSchema"], fixture[name]["inputSchema"], "{name}");
         assert_ne!(
@@ -514,10 +521,21 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
 /// silently; raise it only for a tool or argument that earns it.
 #[test]
 fn the_provider_preview_tools_stay_within_their_list_budget() {
-    let size = serde_json::to_string(&tool_descriptors(false))
+    let size = serde_json::to_string(&crate::mcp::tools::previews::preview_tool_descriptors())
         .unwrap()
         .len();
     assert!(size < 14_000, "the preview descriptors take {size} bytes");
+}
+
+#[test]
+fn the_agent_messaging_descriptors_stay_within_their_list_budget() {
+    let size = serde_json::to_string(&crate::mcp::tools::agent_messaging::tool_descriptors())
+        .unwrap()
+        .len();
+    assert!(
+        size < 6_000,
+        "the agent messaging descriptors take {size} bytes"
+    );
 }
 
 #[test]
@@ -1326,7 +1344,7 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     .await;
     assert_eq!(
         listed["result"]["tools"].as_array().unwrap().len(),
-        TOOL_OPERATIONS.len()
+        TOOL_OPERATIONS.len() + crate::mcp::tools::agent_messaging::tool_descriptors().len()
     );
 
     for name in ["unknown", "preview_unknown"] {
@@ -2147,7 +2165,10 @@ fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
         .map(|spec| spec.name)
         .collect();
     assert_eq!(listed, registered);
-    for name in &listed {
+    for name in listed
+        .iter()
+        .filter(|name| name.starts_with("preview_") || name.starts_with("device_"))
+    {
         let spec = tool_spec(PrincipalKind::Provider, name).unwrap();
         // They wait on a page or an emulator, so `mcp.<name>` is long-running.
         assert!(spec.long_running, "{name}");
@@ -2158,6 +2179,123 @@ fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
         assert_eq!(twin.kind, PrincipalKind::Client, "{name}");
         assert!(twin.long_running && !twin.holds_wait_slot, "{name}");
     }
+}
+
+#[test]
+fn agent_messaging_tools_have_no_client_twin() {
+    use crate::mcp::control::{PrincipalKind, tool_spec};
+    assert!(tool_spec(PrincipalKind::Client, "agents_list").is_none());
+    assert!(tool_spec(PrincipalKind::Provider, "agents_list").is_some());
+}
+
+#[tokio::test]
+async fn a_providers_tools_call_reaches_the_directory() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tools.control.attach_agent_messaging(tools.messaging(true));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let response = rpc(
+        &service,
+        headers,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}),
+    )
+    .await;
+
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let addresses: Vec<&str> = response["result"]["structuredContent"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|agent| agent["address"].as_str())
+        .collect();
+    assert!(addresses.contains(&"thread:b"), "{addresses:?}");
+    assert!(!addresses.contains(&"thread:a"), "{addresses:?}");
+    tools.shutdown().await;
+}
+
+/// A provider credential reaches send and status, and the sender is the credential's thread.
+#[tokio::test]
+async fn a_providers_send_and_status_calls_reach_the_messaging_service() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tools.control.attach_agent_messaging(tools.messaging(true));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let sent = rpc(
+        &service,
+        headers.clone(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":"thread:b","text":"Which port?","clientRequestId":"k1"}}}),
+    )
+    .await;
+    assert_ne!(sent["result"]["isError"], true, "{sent}");
+    let message_id = sent["result"]["structuredContent"]["messageId"]
+        .as_str()
+        .expect("message id")
+        .to_owned();
+    let status = rpc(
+        &service,
+        headers,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agent_message_status","arguments":{"messageId":message_id}}}),
+    )
+    .await;
+
+    assert_ne!(status["result"]["isError"], true, "{status}");
+    assert!(status["result"]["structuredContent"]["status"].is_string());
+    let sender: String = tools
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT sender_address FROM agent_messages WHERE message_id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(sender, "thread:a");
+    tools.shutdown().await;
 }
 
 #[test]
@@ -2895,7 +3033,10 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
     assert!(
         provider_tools
             .iter()
-            .all(|name| name.starts_with("preview_") || name.starts_with("device_"))
+            .all(|name| name.starts_with("preview_")
+                || name.starts_with("device_")
+                || name == "agents_list"
+                || name.starts_with("agent_message_"))
     );
 
     // Each kind's call to the other's tool is a scope refusal.

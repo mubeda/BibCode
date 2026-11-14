@@ -423,6 +423,18 @@ pub trait ProviderDriver: Send + Sync {
             }
         })
     }
+    /// [`Self::deliver`] for an agent message's envelope, which the server decided from the
+    /// message's stored row, never from its text. A driver whose provider would expand text the
+    /// person's way marks it here.
+    fn deliver_agent_message(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        interaction_mode: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        self.deliver(text, attachments, interaction_mode, delivery_key)
+    }
     fn steer(
         &self,
         _text: String,
@@ -3090,6 +3102,7 @@ mod workspace_loss_tests {
         /// provider took but did not reply to.
         compact_hangs: Arc<AtomicBool>,
         interrupts: Arc<AtomicUsize>,
+        agent_deliveries: Arc<AtomicUsize>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3132,6 +3145,17 @@ mod workspace_loss_tests {
                 self.native_returned.notify_one();
                 Ok((!self.unknown_turn_id.load(Ordering::SeqCst)).then(|| "turn-1".to_owned()))
             })
+        }
+
+        fn deliver_agent_message(
+            &self,
+            text: String,
+            attachments: Vec<Value>,
+            interaction_mode: String,
+            delivery_key: String,
+        ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+            self.agent_deliveries.fetch_add(1, Ordering::SeqCst);
+            self.deliver(text, attachments, interaction_mode, delivery_key)
         }
 
         fn steer(
@@ -3514,6 +3538,7 @@ mod workspace_loss_tests {
                         mode: TurnDeliveryMode::Start,
                         created_at: BEFORE_LOSS.into(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )
@@ -3672,6 +3697,7 @@ mod workspace_loss_tests {
                             mode: TurnDeliveryMode::Start,
                             created_at: BEFORE_LOSS.into(),
                         }),
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -4326,6 +4352,7 @@ mod workspace_loss_tests {
                     mode: TurnDeliveryMode::Start,
                     created_at: BEFORE_LOSS.into(),
                 }),
+                agent_message: None,
             };
             f.engine
                 .dispatch_with_admission(command, admission, || {})
@@ -4367,6 +4394,7 @@ mod workspace_loss_tests {
                 mode: TurnDeliveryMode::Start,
                 created_at: BEFORE_LOSS.into(),
             }),
+            agent_message: None,
         };
         f.engine
             .dispatch_with_admission(command, admission, || {})
@@ -4448,6 +4476,7 @@ mod workspace_loss_tests {
                 mode: TurnDeliveryMode::Start,
                 created_at: BEFORE_LOSS.into(),
             }),
+            agent_message: None,
         };
         f.engine
             .dispatch_with_admission(command, admission, || {})
@@ -4589,6 +4618,81 @@ mod workspace_loss_tests {
                 .is_none()
         );
         assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    /// The delivery path asks the driver for agent treatment only for a turn whose agent message
+    /// row the server stored, never for a person's turn that pastes the same envelope.
+    #[tokio::test]
+    async fn only_a_stored_agent_message_is_delivered_as_one() {
+        use crate::agent_messaging::{envelope, store};
+        let f = Fixture::new(true).await;
+        let text = envelope::build_envelope(&envelope::EnvelopeInput {
+            sender_title: "Sender",
+            provider: "codex",
+            sender_address: "thread:sender",
+            message_id: "a1",
+            conversation_id: "c1",
+            in_reply_to: None,
+            text: "@src/secret.txt",
+        });
+        f.engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let tx = connection.transaction()?;
+                store::insert_message(
+                    &tx,
+                    &store::NewAgentMessage {
+                        message_id: "a1".to_owned(),
+                        conversation_id: "c1".to_owned(),
+                        sender_address: "thread:sender".to_owned(),
+                        sender_kind: store::SenderKind::Agent,
+                        recipient_address: "thread:t1".to_owned(),
+                        in_reply_to: None,
+                        hop: 1,
+                        text: "@src/secret.txt".to_owned(),
+                        status: store::AgentMessageStatus::Accepted,
+                        reason: None,
+                        accepted_at: BEFORE_LOSS.to_owned(),
+                        sender_runtime_mode: None,
+                        recipient_terminal_generation: None,
+                        send_request_id: None,
+                        client_request_id: None,
+                        delivery_command_id: Some("agent-turn".to_owned()),
+                        delivery_message_id: Some("agent-turn".to_owned()),
+                    },
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        for (id, agent_deliveries) in [("pasted-turn", 0), ("agent-turn", 1)] {
+            let mut command = serde_json::to_value(turn(id, false)).unwrap();
+            command["message"]["text"] = json!(text);
+            let delivery = f
+                .supervisor
+                .deliver_turn(
+                    serde_json::from_value(command).unwrap(),
+                    format!("{id}-key"),
+                )
+                .await
+                .unwrap();
+            let outcome = timeout(Duration::from_secs(5), delivery.completion())
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+                "{id}: {outcome:?}"
+            );
+            assert_eq!(
+                f.driver.agent_deliveries.load(Ordering::SeqCst),
+                agent_deliveries,
+                "{id}"
+            );
+        }
         f.shutdown().await;
     }
 
@@ -5141,6 +5245,7 @@ mod workspace_loss_tests {
                         mode: TurnDeliveryMode::Start,
                         created_at: BEFORE_LOSS.into(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )
@@ -7883,6 +7988,47 @@ fn active_provider_session_id(
     Ok(session_id.to_owned())
 }
 
+/// What a durable delivery sends.
+#[derive(Debug, PartialEq)]
+enum DeliveryText {
+    /// An agent message: its envelope goes out whole, so a provider still sees it as one and
+    /// expands nothing in it, and an owed handoff waits for the next turn.
+    AgentMessage,
+    Turn(Option<TurnHandoff>),
+}
+
+/// An agent message is known from the row the server stored with its queue entry
+/// (`command_id`), never from its text, so a person's pasted envelope stays a person's message.
+async fn delivery_text(
+    repositories: &Repositories,
+    pending: &AtomicBool,
+    side_chat: Option<(&str, &AtomicBool)>,
+    thread_id: &str,
+    command_id: &str,
+    message: &ThreadMessageInput,
+) -> Result<DeliveryText, String> {
+    let (command_id, message_id) = (command_id.to_owned(), message.message_id.clone());
+    let agent_message = repositories
+        .database()
+        .call(move |connection| {
+            crate::agent_messaging::store::is_agent_message_delivery(
+                connection,
+                &command_id,
+                &message_id,
+            )
+        })
+        .await
+        .map_err(|error| {
+            delivery_detail(&ProviderRuntimeError::Persistence(error.to_string()), None)
+        })?;
+    if agent_message {
+        return Ok(DeliveryText::AgentMessage);
+    }
+    text_with_pending_context_handoff(repositories, pending, side_chat, thread_id, message)
+        .await
+        .map(DeliveryText::Turn)
+}
+
 async fn spawn_delivery(
     engine: &OrchestrationEngine,
     sessions: &mut HashMap<String, SessionEntry>,
@@ -7893,6 +8039,7 @@ async fn spawn_delivery(
     generation: u64,
 ) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
     let OrchestrationCommand::ThreadTurnStart {
+        command_id,
         thread_id,
         message,
         interaction_mode,
@@ -8003,19 +8150,30 @@ async fn spawn_delivery(
                 },
             }
         } else {
-            match text_with_pending_context_handoff(
+            match delivery_text(
                 &repositories,
                 &pending_context_handoff,
                 side_chat_seed_ref(&side_chat),
                 &terminal.thread_id,
+                &command_id,
                 &message,
             )
             .await
             {
-                // A side chat that owes its seed sends nothing without it; the delivery fails
-                // and its retry carries the seed.
+                // A side chat that owes its seed sends nothing without it, and an unreadable
+                // provenance sends nothing either; the delivery fails and its retry reads again.
                 Err(detail) => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
-                Ok(handoff) => {
+                Ok(DeliveryText::AgentMessage) => {
+                    driver
+                        .deliver_agent_message(
+                            message.text,
+                            message.attachments,
+                            interaction_mode,
+                            delivery_key,
+                        )
+                        .await
+                }
+                Ok(DeliveryText::Turn(handoff)) => {
                     let (text, carried) = match handoff {
                         Some(handoff) => (handoff.text, Some(handoff.side_chat_seed)),
                         None => (message.text, None),
@@ -19386,13 +19544,55 @@ impl ClaudeDriver {
     }
 }
 
+/// The stream-json line of a user turn. An agent message carries `client_composed`, with which
+/// Claude Code expands no `@path` in the text and still replays the line, so the delivery is
+/// acknowledged (probed on Claude Code 2.1.323; `isSynthetic` also stops the expansion but
+/// also the replay). A person's text never carries it, even a pasted envelope.
+fn claude_user_line(session_id: &str, content: Vec<Value>, agent_envelope: bool) -> Value {
+    let mut line = json!({
+        "type":"user",
+        "session_id":session_id,
+        "message":{"role":"user","content":content},
+        "parent_tool_use_id":null
+    });
+    if agent_envelope {
+        line["client_composed"] = Value::Bool(true);
+    }
+    line
+}
+
 impl ClaudeDriver {
+    /// A new turn's line; `agent_envelope` is the server's provenance, never the text's.
+    async fn deliver_turn_line(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        delivery_key: String,
+        agent_envelope: bool,
+    ) -> ProviderDeliveryOutcome {
+        let outcome = self
+            .deliver_user_line(text, attachments, None, delivery_key, agent_envelope)
+            .await;
+        if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
+            return outcome;
+        }
+        // Claude never took up the conversation, so this message failed for that reason, and
+        // sending it again to the same launch would fail the same way.
+        match self.launch_refusal().await {
+            Some(detail) => ProviderDeliveryOutcome::Rejected {
+                detail: detail.to_owned(),
+            },
+            None => outcome,
+        }
+    }
+
     async fn deliver_user_line(
         &self,
         text: String,
         attachments: Vec<Value>,
         expected_turn_id: Option<String>,
         delivery_key: String,
+        agent_envelope: bool,
     ) -> ProviderDeliveryOutcome {
         let (steer_cancellation, acknowledgement_cancellation, compacting) = {
             let runtime = self.runtime.lock().await;
@@ -19424,12 +19624,11 @@ impl ClaudeDriver {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
-        let bytes = match self.encode_json_line(json!({
-            "type":"user",
-            "session_id":self.session_id,
-            "message":{"role":"user","content":content},
-            "parent_tool_use_id":null
-        })) {
+        let bytes = match self.encode_json_line(claude_user_line(
+            &self.session_id,
+            content,
+            agent_envelope,
+        )) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return ProviderDeliveryOutcome::Rejected {
@@ -19709,7 +19908,8 @@ impl ProviderDriver for ClaudeDriver {
                     turn_id: turn_id.clone(),
                     input: text.clone(),
                 });
-            self.write_json(json!({"type":"user","session_id":self.session_id,"message":{"role":"user","content":content},"parent_tool_use_id":null})).await?;
+            self.write_json(claude_user_line(&self.session_id, content, false))
+                .await?;
             Ok(Some(turn_id))
         })
     }
@@ -19720,22 +19920,16 @@ impl ProviderDriver for ClaudeDriver {
         _: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(async move {
-            let outcome = self
-                .deliver_user_line(text, attachments, None, delivery_key)
-                .await;
-            if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
-                return outcome;
-            }
-            // Claude never took up the conversation, so this message failed for that reason, and
-            // sending it again to the same launch would fail the same way.
-            match self.launch_refusal().await {
-                Some(detail) => ProviderDeliveryOutcome::Rejected {
-                    detail: detail.to_owned(),
-                },
-                None => outcome,
-            }
-        })
+        Box::pin(self.deliver_turn_line(text, attachments, delivery_key, false))
+    }
+    fn deliver_agent_message(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(self.deliver_turn_line(text, attachments, delivery_key, true))
     }
     fn steer(
         &self,
@@ -19744,7 +19938,13 @@ impl ProviderDriver for ClaudeDriver {
         expected_turn_id: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(self.deliver_user_line(text, attachments, Some(expected_turn_id), delivery_key))
+        Box::pin(self.deliver_user_line(
+            text,
+            attachments,
+            Some(expected_turn_id),
+            delivery_key,
+            false,
+        ))
     }
     fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
         Box::pin(self.write_compaction(compaction_id))
@@ -33655,6 +33855,493 @@ done
                 .is_some(),
             "bounded cleanup must reap the stalled startup fixture"
         );
+    }
+
+    /// What the literal-delivery proofs send: the raw agent text (it starts with a slash command,
+    /// names a skill and references a file, and the two starts on their own) and its envelope.
+    fn literal_delivery_envelopes() -> Vec<(&'static str, String)> {
+        [
+            "/goal ship it $deploy-skill @src/secret.txt",
+            "/compact",
+            "@src/secret.txt",
+        ]
+        .into_iter()
+        .map(|text| {
+            let envelope = crate::agent_messaging::envelope::build_envelope(
+                &crate::agent_messaging::envelope::EnvelopeInput {
+                    sender_title: "Sender",
+                    provider: "codex",
+                    sender_address: "thread:sender",
+                    message_id: "message-1",
+                    conversation_id: "conversation-1",
+                    in_reply_to: None,
+                    text,
+                },
+            );
+            (text, envelope)
+        })
+        .collect()
+    }
+
+    /// `sent` is the whole envelope of `raw`, checked against the envelope's fixed form rather
+    /// than against `build_envelope`'s own output.
+    fn assert_sent_literally(provider: &str, sent: &Value, raw: &str) {
+        let sent = sent.as_str().unwrap_or_default();
+        assert!(
+            sent.starts_with("<bibcode_agent_message>\n")
+                && sent.ends_with("\n</bibcode_agent_message>"),
+            "{provider} gets the whole envelope: {sent:?}"
+        );
+        assert!(
+            sent.contains(&format!("\n---\n  {raw}\n")),
+            "{provider} gets the agent's characters: {sent:?}"
+        );
+        assert!(crate::agent_messaging::envelope::is_agent_envelope(sent));
+    }
+
+    fn captured_lines(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect()
+    }
+
+    /// Delivers each text through the turn queue's own entry points, the first `agent_messages`
+    /// as agent messages (`deliver_agent_message`) and the rest as a person's (`deliver`), and
+    /// waits until the fixture captured one more request matching `sent` after each, so the
+    /// order holds. A delivery may wait on an acknowledgement the fixture never sends, so it runs
+    /// on its own task and is dropped once its request is captured.
+    async fn deliver_and_capture(
+        driver: &Arc<dyn super::ProviderDriver>,
+        deadline: ProviderFixtureDeadline,
+        path: &std::path::Path,
+        texts: &[String],
+        agent_messages: usize,
+        sent: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut deliveries = Vec::new();
+        for (index, text) in texts.iter().enumerate() {
+            let delivering = driver.clone();
+            let text = text.clone();
+            deliveries.push(tokio::spawn(async move {
+                let key = format!("key-{index}");
+                if index < agent_messages {
+                    delivering
+                        .deliver_agent_message(text, Vec::new(), "default".to_owned(), key)
+                        .await
+                } else {
+                    delivering
+                        .deliver(text, Vec::new(), "default".to_owned(), key)
+                        .await
+                }
+            }));
+            deadline
+                .observe(async {
+                    while captured_lines(path)
+                        .iter()
+                        .filter(|line| sent(line))
+                        .count()
+                        <= index
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the provider fixture captured the delivery");
+        }
+        for delivery in deliveries {
+            delivery.abort();
+        }
+        captured_lines(path)
+            .into_iter()
+            .filter(|line| sent(line))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn literal_delivery_codex() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let capture_path = temp.path().join("codex-requests.jsonl");
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = executable_fixture(&temp, "codex-literal", CODEX_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        let driver = factory.create(request).await.expect("Codex driver");
+        deadline
+            .observe(driver.start())
+            .await
+            .expect("Codex starts in time")
+            .expect("Codex starts");
+        let cases = literal_delivery_envelopes();
+        let envelopes: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
+        let turns = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &envelopes,
+            envelopes.len(),
+            |request| request["method"] == "turn/start",
+        )
+        .await;
+        let requests = captured_lines(&capture_path);
+        driver.shutdown().await.expect("Codex shuts down");
+
+        assert_eq!(turns.len(), cases.len());
+        for (turn, (raw, _)) in turns.iter().zip(&cases) {
+            let input = turn["params"]["input"].as_array().expect("turn input");
+            assert_eq!(
+                input.len(),
+                1,
+                "one text item, no skill, mention or file item: {input:?}"
+            );
+            assert_eq!(input[0]["type"], "text");
+            assert_sent_literally("Codex", &input[0]["text"], raw);
+        }
+        for request in requests {
+            assert!(
+                !matches!(
+                    request["method"].as_str(),
+                    Some("thread/goal/set" | "thread/compact/start")
+                ),
+                "an envelope runs no Codex command: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_delivery_claude() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let capture_path = temp.path().join("claude-requests.jsonl");
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = executable_fixture(&temp, "claude-literal", CLAUDE_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.resume_cursor = Some(json!({"sessionId":"claude-session"}));
+        request.environment.insert(
+            "CLAUDE_CONFIG_DIR".to_owned(),
+            temp.path()
+                .join("claude-config")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        let driver = factory.create(request).await.expect("Claude driver");
+        deadline
+            .observe(driver.start())
+            .await
+            .expect("Claude starts in time")
+            .expect("Claude starts");
+        let cases = literal_delivery_envelopes();
+        let person_text = "@src/secret.txt is what I mean";
+        let mut texts: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
+        texts.push(person_text.to_owned());
+        // A person may paste a whole envelope; only the server's provenance makes it an agent's.
+        texts.push(cases[0].1.clone());
+        let users = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &texts,
+            cases.len(),
+            |request| request["type"] == "user",
+        )
+        .await;
+        driver.shutdown().await.expect("Claude shuts down");
+
+        assert_eq!(users.len(), texts.len());
+        for (user, (raw, _)) in users.iter().zip(&cases) {
+            let content = user["message"]["content"].as_array().expect("content");
+            assert_eq!(content.len(), 1, "one text block: {content:?}");
+            assert_eq!(content[0]["type"], "text");
+            assert_sent_literally("Claude", &content[0]["text"], raw);
+            assert_eq!(
+                user["client_composed"], true,
+                "an envelope is marked so Claude Code expands no @path in it: {user}"
+            );
+        }
+        let person = &users[cases.len()];
+        assert_eq!(person["message"]["content"][0]["text"], person_text);
+        assert!(
+            person.get("client_composed").is_none(),
+            "a person's text is never marked: {person}"
+        );
+        let pasted = &users[cases.len() + 1];
+        assert!(
+            pasted.get("client_composed").is_none(),
+            "a person's pasted envelope is never marked: {pasted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_delivery_opencode() {
+        let prompts = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let commands = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/global/health",
+                get(|| async { Json(json!({"healthy":true,"version":"1.18.32"})) }),
+            )
+            .route(
+                "/session",
+                post(|| async { Json(json!({"id":"literal-opencode-session"})) }),
+            )
+            .route("/event", get(|| async { "" }))
+            .route(
+                "/session/{session_id}/prompt_async",
+                post({
+                    let prompts = prompts.clone();
+                    move |Json(body): Json<Value>| {
+                        let prompts = prompts.clone();
+                        async move {
+                            prompts.lock().unwrap().push(body);
+                            Json(json!({}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/session/{session_id}/command",
+                post({
+                    let commands = commands.clone();
+                    move |Json(body): Json<Value>| {
+                        let commands = commands.clone();
+                        async move {
+                            commands.lock().unwrap().push(body);
+                            Json(json!({}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/session/{session_id}/message",
+                get(|| async { Json(json!({"data":[]})) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("OpenCode fixture should bind");
+        let address = listener.local_addr().expect("OpenCode fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("OpenCode fixture should serve");
+        });
+        let temp = TempDir::new().expect("OpenCode fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "opencode");
+        request.endpoint = Some(format!("http://{address}"));
+        request.server_password = Some("secret".to_owned());
+        let driver = factory.create(request).await.expect("OpenCode driver");
+        driver.start().await.expect("OpenCode starts");
+        let cases = literal_delivery_envelopes();
+        for (index, (_, envelope)) in cases.iter().enumerate() {
+            let delivering = driver.clone();
+            let envelope = envelope.clone();
+            let delivery = tokio::spawn(async move {
+                delivering
+                    .deliver_agent_message(
+                        envelope,
+                        Vec::new(),
+                        "default".to_owned(),
+                        format!("key-{index}"),
+                    )
+                    .await
+            });
+            deadline
+                .observe(async {
+                    while prompts.lock().unwrap().len() + commands.lock().unwrap().len() <= index {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the OpenCode fixture received the delivery");
+            delivery.abort();
+        }
+        driver.shutdown().await.expect("OpenCode shuts down");
+        server.abort();
+
+        assert!(
+            commands.lock().unwrap().is_empty(),
+            "an envelope runs no OpenCode command"
+        );
+        let prompts = prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), cases.len());
+        for (prompt, (raw, _)) in prompts.iter().zip(&cases) {
+            let parts = prompt["parts"].as_array().expect("parts");
+            assert_eq!(parts.len(), 1, "one text part, no file part: {parts:?}");
+            assert_eq!(parts[0]["type"], "text");
+            assert_sent_literally("OpenCode", &parts[0]["text"], raw);
+        }
+    }
+
+    async fn literal_delivery_acp(provider: &str, session_id: &'static str) {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let capture_path = temp.path().join("acp-requests.jsonl");
+        let mut request = native_launch(&temp, provider);
+        request.binary_path = executable_fixture(&temp, "acp-literal", ACP_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        if provider == "grok" {
+            request
+                .environment
+                .insert("XAI_API_KEY".to_owned(), "unit-key".to_owned());
+        }
+        let driver = factory.create(request).await.expect("ACP driver");
+        deadline
+            .observe(driver.start())
+            .await
+            .expect("the ACP driver starts in time")
+            .expect("the ACP driver starts");
+        let cases = literal_delivery_envelopes();
+        let envelopes: Vec<String> = cases.iter().map(|(_, envelope)| envelope.clone()).collect();
+        let prompts = deliver_and_capture(
+            &driver,
+            deadline,
+            &capture_path,
+            &envelopes,
+            envelopes.len(),
+            |request| {
+                request["method"] == "session/prompt"
+                    && request["params"]["sessionId"] == session_id
+            },
+        )
+        .await;
+        driver.shutdown().await.expect("the ACP driver shuts down");
+
+        assert_eq!(prompts.len(), cases.len());
+        for (prompt, (raw, _)) in prompts.iter().zip(&cases) {
+            let blocks = prompt["params"]["prompt"].as_array().expect("prompt");
+            assert_eq!(blocks.len(), 1, "{provider}: one text block: {blocks:?}");
+            assert_eq!(blocks[0]["type"], "text");
+            assert_sent_literally(provider, &blocks[0]["text"], raw);
+        }
+    }
+
+    /// The handoff builder never decides from text whether a turn is an agent's message.
+    #[tokio::test]
+    async fn a_persons_pasted_envelope_still_gets_the_context_handoff() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("database");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                connection.execute_batch(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('m1', 't', 'user', 'earlier', 0, '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z');",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("thread history");
+        let repositories = crate::persistence::Repositories::new(database);
+        let pending = std::sync::atomic::AtomicBool::new(true);
+        let message = |text: &str| -> crate::orchestration::engine::ThreadMessageInput {
+            serde_json::from_value(
+                json!({"messageId":"m2", "role":"user", "text":text, "attachments":[]}),
+            )
+            .expect("message")
+        };
+
+        // A person's message that pastes a whole envelope is still a person's message.
+        for (_, envelope) in literal_delivery_envelopes() {
+            let handoff = super::text_with_pending_context_handoff(
+                &repositories,
+                &pending,
+                None,
+                "t",
+                &message(&envelope),
+            )
+            .await
+            .expect("a pasted envelope is sent");
+            assert!(
+                handoff.is_some(),
+                "a person's pasted envelope gets the handoff"
+            );
+        }
+        let (_, envelope) = literal_delivery_envelopes().remove(0);
+        let delivered = |command_id: &'static str| {
+            let (repositories, pending, message) = (&repositories, &pending, message(&envelope));
+            async move {
+                super::delivery_text(repositories, pending, None, "t", command_id, &message)
+                    .await
+                    .expect("readable")
+            }
+        };
+        assert!(
+            matches!(
+                delivered("person-turn").await,
+                super::DeliveryText::Turn(Some(_))
+            ),
+            "with no stored agent message the pasted envelope is a person's turn"
+        );
+        repositories
+            .database()
+            .call(|connection| {
+                let tx = connection.transaction()?;
+                crate::agent_messaging::store::insert_message(
+                    &tx,
+                    &crate::agent_messaging::store::NewAgentMessage {
+                        message_id: "a1".to_owned(),
+                        conversation_id: "c1".to_owned(),
+                        sender_address: "thread:sender".to_owned(),
+                        sender_kind: crate::agent_messaging::store::SenderKind::Agent,
+                        recipient_address: "thread:t".to_owned(),
+                        in_reply_to: None,
+                        hop: 1,
+                        text: "hello".to_owned(),
+                        status: crate::agent_messaging::store::AgentMessageStatus::Accepted,
+                        reason: None,
+                        accepted_at: "2026-11-14T00:00:00Z".to_owned(),
+                        sender_runtime_mode: None,
+                        recipient_terminal_generation: None,
+                        send_request_id: None,
+                        client_request_id: None,
+                        delivery_command_id: Some("agent-message:a1".to_owned()),
+                        delivery_message_id: Some("m2".to_owned()),
+                    },
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("agent message stored");
+        assert_eq!(
+            delivered("agent-message:a1").await,
+            super::DeliveryText::AgentMessage,
+            "the stored row, not the text, makes it an agent's message"
+        );
+        assert!(matches!(
+            delivered("person-turn").await,
+            super::DeliveryText::Turn(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn literal_delivery_cursor() {
+        literal_delivery_acp("cursor", "cursor-session").await;
+    }
+
+    #[tokio::test]
+    async fn literal_delivery_grok() {
+        literal_delivery_acp("grok", "grok-session").await;
     }
 
     #[tokio::test]

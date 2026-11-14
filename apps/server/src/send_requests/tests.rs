@@ -1040,6 +1040,7 @@ async fn admit_as_resolved_to_start(harness: &Harness, request_id: &str) {
             payload: serde_json::to_value(&command).unwrap(),
             created_at: AT.to_owned(),
         }),
+        agent_message: None,
     };
     harness
         .engine
@@ -1786,6 +1787,7 @@ impl FileServer {
                             mode: TurnDeliveryMode::Start,
                             created_at: text("createdAt"),
                         }),
+                        agent_message: None,
                     };
                     engine
                         .dispatch_with_admission(command, admission, || {})

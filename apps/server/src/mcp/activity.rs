@@ -769,8 +769,17 @@ const RUNNING_TURNS_SQL: &str = "SELECT turn.thread_id, turn.turn_id,
    AND thread.deleted_at IS NULL
    AND message.message_id = turn.pending_message_id
    AND message.role = 'user' AND message.actor_json IS NOT NULL
+   AND COALESCE(json_extract(message.actor_json, '$.kind'), 'mcp-client') = 'mcp-client'
    AND (?1 IS NULL OR json_extract(message.actor_json, '$.clientId') = ?1
         OR (?2 IS NOT NULL AND json_extract(message.actor_json, '$.namedClientId') = ?2))";
+
+/// How many running turns are attributed to outside agents.
+#[cfg(test)]
+pub(crate) fn attributed_running_turn_count(
+    connection: &rusqlite::Connection,
+) -> crate::persistence::Result<usize> {
+    attributed_running_turns(connection, None, None).map(|turns| turns.len())
+}
 
 fn attributed_running_turns(
     connection: &rusqlite::Connection,

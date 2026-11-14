@@ -514,6 +514,49 @@ describe("applyThreadDetailEvent", () => {
       expect(reply.kind === "updated" && reply.thread.messages[0]?.actor).toBeUndefined();
     });
 
+    it("a hosted agent's actor stays on its message and makes no thread requester", () => {
+      const actor = {
+        kind: "hosted-agent" as const,
+        address: "thread:thread-a",
+        label: "API refactor",
+      };
+      const sent = applyThreadDetailEvent(baseThread, {
+        ...event("thread.message-sent", {
+          messageId: MessageId.make("msg-agent"),
+          role: "user",
+          text: "Which port?",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-04-01T06:00:00.000Z",
+          updatedAt: "2026-04-01T06:00:00.000Z",
+        }),
+        metadata: { actor },
+      });
+      expect(sent.kind === "updated" && sent.thread.messages[0]?.actor).toEqual(actor);
+      const created = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 1,
+        occurredAt: "2026-04-01T01:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-2"),
+        type: "thread.created",
+        payload: {
+          threadId: ThreadId.make("thread-2"),
+          projectId: ProjectId.make("project-1"),
+          title: "New Thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "main",
+          worktreePath: null,
+          createdAt: "2026-04-01T01:00:00.000Z",
+          updatedAt: "2026-04-01T01:00:00.000Z",
+        },
+        metadata: { actor },
+      });
+      expect(created.kind === "updated" && created.thread.requester).toBeUndefined();
+    });
+
     it("a thread.message-sent event keeps personSend on the message", () => {
       const personSend = {
         requestId: "request-1",

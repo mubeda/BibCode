@@ -119,6 +119,8 @@ pub struct ProductionRuntime {
     webhooks: crate::webhooks::Webhooks,
     /// Stops the follower that moves send requests through their states.
     send_requests_follower: CancellationToken,
+    /// Stops the tracker that moves agent messages through their states.
+    agent_message_tracker: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -380,6 +382,10 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
+        // Before any delivery can be claimed.
+        repositories.set_agent_claim_gate(crate::agent_messaging::policy::claim_gate(
+            control.agent_messaging_enabled_signal(),
+        ));
         let activity_projections = ActivityProjections::new(
             ActivityRepository::new(repositories.database().clone()),
             chat_activity_controller.clone(),
@@ -828,16 +834,38 @@ impl ProductionRuntime {
             mcp_activity,
         );
         mcp_control.attach_terminals(mcp_terminals);
+        mcp_control.attach_agent_messaging(
+            crate::agent_messaging::AgentMessaging::new(
+                orchestration.clone(),
+                control.agent_messaging_enabled_signal(),
+            )
+            .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+                orchestration.clone(),
+                provider_runtime.clone(),
+                config.state_dir(),
+                turn_delivery.clone(),
+                Some(workspace_availability.clone()),
+                attachment_uploads.clone(),
+            )),
+        );
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
+        let agent_message_tracker = CancellationToken::new();
+        crate::agent_messaging::delivery::AgentMessageTracker::start(
+            orchestration.clone(),
+            None,
+            control.agent_messaging_enabled_signal(),
+            agent_message_tracker.clone(),
+        );
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,
             send_requests_follower,
+            agent_message_tracker,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1035,6 +1063,9 @@ impl ProductionRuntime {
         // A stopped follower resumes from its first sweep on the next start.
         self.send_requests_follower.cancel();
         steps.mark("send-requests-follower");
+        // A stopped tracker resumes from its first reconciliation on the next start.
+        self.agent_message_tracker.cancel();
+        steps.mark("agent-message-tracker");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");

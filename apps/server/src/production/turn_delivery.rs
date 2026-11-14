@@ -48,6 +48,8 @@ const DELIVERY_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// The attempts a delivery that keeps ending not sent gets before it fails with its last error:
 /// about 8 minutes at the 30 s backoff cap. A Retry starts the count again.
 const DELIVERY_ATTEMPTS_MAX: i64 = 20;
+/// The longest an agent message's entry that waits for an open ask goes unchecked.
+const AGENT_MESSAGE_WAIT_RECHECK: Duration = Duration::from_secs(1);
 const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const FORCE_CANCEL_TASK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const RECONCILIATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1087,6 +1089,30 @@ async fn fill_available_slots(
             .entry(row.command_id.clone())
             .or_insert_with(|| persisted_delivery_retry(row, now));
     }
+    // An agent message's entry that waits for an open ask is skipped until the next fill, so
+    // its claim is not repeated in a loop and a person's message behind it is not blocked.
+    let mut waiting = HashSet::new();
+    let mut heads = HashSet::new();
+    for row in &rows {
+        if heads.contains(&row.thread_id) {
+            continue;
+        }
+        if row.state == TurnDeliveryState::Pending
+            && engine
+                .repositories()
+                .agent_claim_waits(row.command_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            waiting.insert(row.command_id.clone());
+            continue;
+        }
+        heads.insert(row.thread_id.clone());
+    }
+    let rows = rows
+        .into_iter()
+        .filter(|row| !waiting.contains(&row.command_id))
+        .collect();
     // There is only one candidate per thread, so each session is read once per fill.
     let mut candidates = Vec::new();
     for row in claimable_oldest_per_thread(rows) {
@@ -1220,6 +1246,12 @@ async fn fill_available_slots(
                 .await
         });
     }
+    // An answer, a mode or a setting change may come with no wake: a waiting entry is checked
+    // again after this delay at the latest.
+    let retry_delay = min_delay(
+        retry_delay,
+        (!waiting.is_empty()).then_some(AGENT_MESSAGE_WAIT_RECHECK),
+    );
     Ok(FillResult { retry_delay })
 }
 

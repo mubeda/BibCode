@@ -3,6 +3,7 @@
 //! provider is faked: its events are dispatched to the engine as a provider runtime would.
 //! Each tool family has its own file; this one holds the shared harness.
 
+mod agent_messaging;
 mod attribution;
 mod clone;
 mod diagnostics;
@@ -72,6 +73,10 @@ pub(crate) struct Harness {
     state_dir: std::path::PathBuf,
     _state: tempfile::TempDir,
     _secrets: tempfile::TempDir,
+    tracker: CancellationToken,
+    tracker_started: std::sync::atomic::AtomicBool,
+    /// `agentMessaging.enabled` as the claim gate reads it; on unless a test turns it off.
+    messaging_enabled: watch::Sender<bool>,
 }
 
 impl Harness {
@@ -177,6 +182,9 @@ impl Harness {
             state_dir: state.path().to_path_buf(),
             _state: state,
             _secrets: secrets,
+            tracker: CancellationToken::new(),
+            tracker_started: std::sync::atomic::AtomicBool::new(false),
+            messaging_enabled: watch::channel(true).0,
         }
     }
 
@@ -285,7 +293,45 @@ impl Harness {
         }
     }
 
+    /// The messaging service over this harness's engine, on or off, with the status tracker
+    /// running (started once per harness).
+    pub(crate) fn messaging(&self, enabled: bool) -> crate::agent_messaging::AgentMessaging {
+        if !self
+            .tracker_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            crate::agent_messaging::delivery::AgentMessageTracker::start(
+                self.engine.clone(),
+                None,
+                self.messaging_enabled.subscribe(),
+                self.tracker.clone(),
+            );
+        }
+        self.messaging_untracked(enabled)
+    }
+
+    /// [`Self::messaging`] without starting the status tracker. The claim gate, installed once,
+    /// reads [`Self::messaging_enabled`], not `enabled`.
+    pub(crate) fn messaging_untracked(
+        &self,
+        enabled: bool,
+    ) -> crate::agent_messaging::AgentMessaging {
+        self.engine.repositories().set_agent_claim_gate(
+            crate::agent_messaging::policy::claim_gate(self.messaging_enabled.subscribe()),
+        );
+        crate::agent_messaging::AgentMessaging::new(self.engine.clone(), watch::channel(enabled).1)
+            .with_starter(super::orchestration_rpc::server_turn_starter(
+                self.engine.clone(),
+                self.provider.clone(),
+                self.state_dir.clone(),
+                self.delivery.clone(),
+                None,
+                self.uploads.clone(),
+            ))
+    }
+
     pub(crate) async fn shutdown(self) {
+        self.tracker.cancel();
         self.delivery.shutdown().await;
         self.provider.shutdown().await.expect("provider shutdown");
         self.engine.shutdown().await;
