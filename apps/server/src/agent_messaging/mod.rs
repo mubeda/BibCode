@@ -268,10 +268,6 @@ impl AgentMessaging {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "task 7.2 supplies the activity sink")
-    )]
     pub(crate) fn with_outcomes(mut self, outcomes: OutcomeSink) -> Self {
         self.outcomes = Some(outcomes);
         self
@@ -809,6 +805,12 @@ impl AgentMessaging {
         let id = message_id.to_owned();
         // A terminal row has no queue entry; it stays cancellable until an inbox fetched it.
         let terminal = message.recipient_address.starts_with("terminal:");
+        // A pointer write holds the terminal's exclusion until its mail is marked, so a cancel
+        // never lands between the pointer's eligibility read and its write.
+        let _exclusive = match (&self.terminals, terminal) {
+            (Some(pointer), true) => Some(pointer.exclusive(&message.recipient_address).await),
+            _ => None,
+        };
         let cancelled = self
             .engine
             .repositories()

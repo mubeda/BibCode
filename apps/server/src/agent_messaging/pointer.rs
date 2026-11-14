@@ -6,9 +6,13 @@ use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, PoisonError},
+    time::Duration,
 };
 
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -24,9 +28,15 @@ use crate::{
     persistence::Database,
     terminal::{
         TerminalError, TerminalGeneration, TerminalManager, TerminalMetadataAttachment,
-        TerminalSummary, WriteWhenReady,
+        TerminalSummary, WriteGuard, WriteWhenReady,
     },
 };
+
+/// How long one pointer write may take before the pointer gives it up. Only a terminal whose
+/// program stopped reading input gets near it.
+const POINTER_WRITE_LIMIT: Duration = Duration::from_secs(2);
+/// How soon a terminal whose earlier input is still being written is tried again.
+const BUSY_RETRY: Duration = Duration::from_millis(250);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -38,6 +48,7 @@ pub trait PointerTerminals: Send + Sync {
         terminal_id: &'a str,
         generation: &'a TerminalGeneration,
         data: &'a str,
+        still_wanted: WriteGuard,
     ) -> BoxFuture<'a, Result<WriteWhenReady, TerminalError>>;
     fn live_generation<'a>(
         &'a self,
@@ -64,6 +75,7 @@ impl PointerTerminals for TerminalManager {
         terminal_id: &'a str,
         generation: &'a TerminalGeneration,
         data: &'a str,
+        still_wanted: WriteGuard,
     ) -> BoxFuture<'a, Result<WriteWhenReady, TerminalError>> {
         Box::pin(TerminalManager::write_when_ready(
             self,
@@ -71,6 +83,7 @@ impl PointerTerminals for TerminalManager {
             terminal_id,
             generation,
             data,
+            still_wanted,
         ))
     }
 
@@ -176,7 +189,7 @@ fn ledger_key(identity: &TerminalIdentity) -> String {
 }
 
 /// Stores agent mail for AI Terminals and tells each terminal about it. Clones share one wake,
-/// one hop ledger and one record of ended generations.
+/// one hop ledger, one record of ended generations and the per-terminal exclusion.
 #[derive(Clone)]
 pub struct TerminalPointer {
     database: Database,
@@ -186,6 +199,13 @@ pub struct TerminalPointer {
     hops: Arc<StdMutex<HashMap<String, HopLedger>>>,
     ended: Arc<StdMutex<HashSet<String>>>,
     generation_end: Option<GenerationEndSink>,
+    /// One lock per terminal address: a pointer write, from the eligibility read until its mail
+    /// is marked, excludes that terminal's inbox fetch, cancel and generation end.
+    /// shortcut: entries are never removed, one per terminal that got mail in this server run;
+    /// prune on generation end if terminals ever churn by the thousand.
+    exclusions: Arc<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// The addresses with a pointer attempt running, and whether a pass skipped one meanwhile.
+    in_flight: Arc<StdMutex<HashMap<String, bool>>>,
 }
 
 impl TerminalPointer {
@@ -197,7 +217,22 @@ impl TerminalPointer {
             hops: Arc::default(),
             ended: Arc::default(),
             generation_end: None,
+            exclusions: Arc::default(),
+            in_flight: Arc::default(),
         }
+    }
+
+    /// Holds `address`'s exclusion: no pointer write, fetch, cancel or generation end of that
+    /// terminal runs while it is held.
+    pub(crate) async fn exclusive(&self, address: &str) -> OwnedMutexGuard<()> {
+        let lock = self
+            .exclusions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(address.to_owned())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
     }
 
     #[cfg_attr(
@@ -286,7 +321,8 @@ impl TerminalPointer {
     /// generation has `queued` mail, and marks that mail `delivered`; ends the generations no
     /// process holds any more; until `shutdown`. It rescans on every terminal metadata change,
     /// every new message and every change of the setting, so a lost event only delays it. It
-    /// never pastes for a `held` row.
+    /// never pastes for a `held` row. Each terminal's write runs in its own bounded task, so a
+    /// terminal that stopped reading input holds up no other terminal, sweep or shutdown.
     pub(crate) fn start(
         &self,
         messaging: AgentMessaging,
@@ -299,8 +335,14 @@ impl TerminalPointer {
             let (mut setting_open, mut metadata_open) = (true, true);
             pointer.follow_setting(&messaging).await;
             loop {
-                pointer.sweep_ended(&messaging).await;
-                pointer.paste_waiting(&messaging).await;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = async {
+                        pointer.sweep_ended(&messaging).await;
+                        pointer.paste_waiting(&messaging, &shutdown).await;
+                    } => {}
+                }
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => return,
@@ -333,8 +375,9 @@ impl TerminalPointer {
         }
     }
 
-    /// One pass of [`Self::start`].
-    async fn paste_waiting(&self, messaging: &AgentMessaging) {
+    /// One pass of [`Self::start`]: starts a pointer attempt for each terminal with `queued` mail
+    /// that has none running. A terminal skipped because one runs is rescanned when it ends.
+    async fn paste_waiting(&self, messaging: &AgentMessaging, shutdown: &CancellationToken) {
         let enabled = messaging.is_enabled();
         let waiting = match self
             .database
@@ -347,59 +390,131 @@ impl TerminalPointer {
                 return;
             }
         };
-        let mut addresses: Vec<&str> = Vec::new();
-        for row in &waiting {
-            if !addresses.contains(&row.recipient_address.as_str()) {
-                addresses.push(&row.recipient_address);
+        let mut addresses: Vec<String> = Vec::new();
+        for row in waiting {
+            if !addresses.contains(&row.recipient_address) {
+                addresses.push(row.recipient_address);
             }
         }
         for address in addresses {
-            let Some((thread_id, terminal_id)) = parse_terminal_address(address) else {
-                continue;
-            };
-            let Some(generation) = self
-                .terminals
-                .live_generation(&thread_id, &terminal_id)
-                .await
-            else {
-                continue;
-            };
-            let key = generation_key(&generation);
-            let ids: Vec<String> = waiting
-                .iter()
-                .filter(|row| {
-                    row.recipient_address == address
-                        && row.recipient_terminal_generation.as_deref() == Some(key.as_str())
-                })
-                .map(|row| row.message_id.clone())
-                .collect();
-            if ids.is_empty() {
-                continue;
-            }
-            match self
-                .terminals
-                .write_when_ready(&thread_id, &terminal_id, &generation, &pointer_input())
-                .await
             {
-                Ok(WriteWhenReady::Written) => {}
-                Ok(WriteWhenReady::NotReady | WriteWhenReady::GenerationChanged) => continue,
-                Err(error) => {
-                    tracing::debug!(error = %error, "the pointer was not typed");
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(skipped) = in_flight.get_mut(&address) {
+                    *skipped = true;
                     continue;
                 }
+                in_flight.insert(address.clone(), false);
             }
-            let now = crate::mcp::control::now_iso();
-            match self
-                .database
-                .call(move |connection| store::deliver_queued(connection, &ids, &now))
-                .await
-            {
-                Ok(delivered) => self.report(messaging, &delivered, "delivered", None).await,
-                Err(error) => {
-                    tracing::warn!(error = %error, "terminal mail was not marked delivered")
+            let (pointer, messaging, shutdown) =
+                (self.clone(), messaging.clone(), shutdown.clone());
+            tokio::spawn(async move {
+                let busy = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => false,
+                    busy = pointer.try_terminal(&messaging, &address) => busy,
+                };
+                let skipped = pointer
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&address)
+                    .unwrap_or_default();
+                if busy {
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(BUSY_RETRY) => {}
+                    }
                 }
+                if busy || skipped {
+                    pointer.wake.notify_one();
+                }
+            });
+        }
+    }
+
+    /// One pointer attempt for `address`: under its exclusion, rereads the mail its live
+    /// generation can fetch, types the pointer only if the terminal grants the write permit at
+    /// the moment of the write, and marks that mail `delivered` only then. True when earlier
+    /// input was still pending, so the terminal is tried again soon.
+    async fn try_terminal(&self, messaging: &AgentMessaging, address: &str) -> bool {
+        let Some((thread_id, terminal_id)) = parse_terminal_address(address) else {
+            return false;
+        };
+        let Some(generation) = self
+            .terminals
+            .live_generation(&thread_id, &terminal_id)
+            .await
+        else {
+            return false;
+        };
+        let _exclusive = self.exclusive(address).await;
+        let (lookup, key) = (address.to_owned(), generation_key(&generation));
+        let enabled = messaging.is_enabled();
+        let eligible = match self
+            .database
+            .call(move |connection| {
+                store::eligible_terminal_mail(connection, &lookup, &key, enabled)
+            })
+            .await
+        {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                tracing::warn!(error = %error, "terminal mail could not be read");
+                return false;
+            }
+        };
+        if eligible.is_empty() {
+            return false;
+        }
+        // A person's request stays eligible while messaging is off; an agent's message does not.
+        let person = eligible
+            .iter()
+            .any(|message| message.sender_kind == SenderKind::Person);
+        let setting = messaging.enabled.clone();
+        let still_wanted: WriteGuard = Box::new(move || person || *setting.borrow());
+        let written = tokio::time::timeout(
+            POINTER_WRITE_LIMIT,
+            self.terminals.write_when_ready(
+                &thread_id,
+                &terminal_id,
+                &generation,
+                &pointer_input(),
+                still_wanted,
+            ),
+        )
+        .await;
+        match written {
+            Ok(Ok(WriteWhenReady::Written)) => {}
+            Ok(Ok(WriteWhenReady::Busy)) => return true,
+            Ok(Ok(WriteWhenReady::NotReady | WriteWhenReady::GenerationChanged)) => return false,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "the pointer was not typed");
+                return false;
+            }
+            Err(_) => {
+                tracing::warn!("a terminal did not take the pointer in time");
+                return false;
             }
         }
+        let ids: Vec<String> = eligible
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect();
+        let now = crate::mcp::control::now_iso();
+        match self
+            .database
+            .call(move |connection| store::deliver_queued(connection, &ids, &now))
+            .await
+        {
+            Ok(delivered) => self.report(messaging, &delivered, "delivered", None).await,
+            Err(error) => {
+                tracing::warn!(error = %error, "terminal mail was not marked delivered")
+            }
+        }
+        false
     }
 
     /// Ends each terminal generation with open mail that no process holds now, those of an
@@ -439,8 +554,9 @@ impl TerminalPointer {
         }
     }
 
-    /// Fails the unconsumed mail of an ended generation with `recipient_gone`, forgets its hop
-    /// ledger and tells the generation-end sink, once per generation.
+    /// Fails the unconsumed mail of an ended generation with `recipient_gone` and records the end
+    /// on its consumed mail, in one transaction under the terminal's exclusion; forgets its hop
+    /// ledger and tells the generation-end sink, once per generation across restarts.
     async fn end_generation(
         &self,
         messaging: &AgentMessaging,
@@ -449,20 +565,24 @@ impl TerminalPointer {
         generation_key: &str,
     ) {
         let address = format!("terminal:{thread_id}/{terminal_id}");
+        let _exclusive = self.exclusive(&address).await;
         let (lookup, key) = (address.clone(), generation_key.to_owned());
-        let failed = match self
+        let (failed, read) = match self
             .database
             .call(move |connection| {
-                let ids = store::fail_unconsumed_for_generation(connection, &lookup, &key)?;
+                let tx = connection.transaction()?;
+                let ids = store::fail_unconsumed_for_generation(&tx, &lookup, &key)?;
+                let read = store::end_consumed_for_generation(&tx, &lookup, &key)?;
                 let mut rows = Vec::with_capacity(ids.len());
                 for id in ids {
-                    rows.extend(store::get_message(connection, &id)?);
+                    rows.extend(store::get_message(&tx, &id)?);
                 }
-                Ok(rows)
+                tx.commit()?;
+                Ok((rows, read))
             })
             .await
         {
-            Ok(failed) => failed,
+            Ok(ended) => ended,
             Err(error) => {
                 tracing::warn!(error = %error, "an ended terminal's mail was not failed");
                 return;
@@ -492,7 +612,12 @@ impl TerminalPointer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(ended);
-        if first && let Some(sink) = &self.generation_end {
+        // A generation whose end an earlier run recorded changes no row and is not told again.
+        let recorded_now = !failed.is_empty() || read > 0;
+        if first
+            && recorded_now
+            && let Some(sink) = &self.generation_end
+        {
             sink(thread_id, terminal_id, generation_key);
         }
     }
@@ -548,6 +673,16 @@ impl TerminalPointer {
         identity: &TerminalIdentity,
     ) -> Result<Vec<InboxEntry>, AgentMessagingError> {
         let (address, key) = (identity.address(), identity.generation_key());
+        // Under the terminal's exclusion, so a generation end, a pointer write or a cancel never
+        // interleaves with this fetch; an ended generation fetches nothing.
+        let _exclusive = self.exclusive(&address).await;
+        let live = self
+            .terminals
+            .live_generation(&identity.thread_id, &identity.terminal_id)
+            .await;
+        if live.as_ref() != Some(&identity.generation) {
+            return Ok(Vec::new());
+        }
         let enabled = messaging.is_enabled();
         let consumed = self
             .database
@@ -821,13 +956,14 @@ mod tests {
             terminal_id: &'a str,
             generation: &'a TerminalGeneration,
             data: &'a str,
+            still_wanted: WriteGuard,
         ) -> BoxFuture<'a, Result<WriteWhenReady, TerminalError>> {
             let mut terminals = self.terminals.lock().unwrap();
             let terminal = terminals.get_mut(&key(thread_id, terminal_id)).unwrap();
             terminal.attempts += 1;
             let outcome = if terminal.generation.as_ref() != Some(generation) {
                 WriteWhenReady::GenerationChanged
-            } else if !terminal.ready {
+            } else if !terminal.ready || !still_wanted() {
                 WriteWhenReady::NotReady
             } else {
                 terminal.ready = false;
@@ -1869,58 +2005,122 @@ mod tests {
         fixture.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn a_pointer_paste_racing_a_fetch_or_a_cancel_never_delivers_the_message_again() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_or_a_cancel_waits_for_a_pointer_write_in_progress() {
         for cancel in [false, true] {
-            let fixture = fixture().await;
+            let fixture = Arc::new(fixture().await);
             let gate = Arc::new(WriteGate::default());
             *fixture.terminals.gate.lock().unwrap() = Some(("term-1".to_owned(), gate.clone()));
             fixture.start();
             let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
             fixture.terminals.set_ready("t", "term-1");
-            // The pointer is typed and its pass has not marked the mail yet.
+            // The pointer is typed and its attempt has not marked the mail yet.
             tokio::time::timeout(Duration::from_secs(5), gate.written.notified())
                 .await
                 .expect("the pointer is typed");
+            let racer = tokio::spawn({
+                let fixture = fixture.clone();
+                let message_id = receipt.message_id.clone();
+                async move {
+                    if cancel {
+                        assert_eq!(
+                            fixture.messaging.cancel("a", &message_id).await,
+                            Ok(AgentMessageStatus::Cancelled)
+                        );
+                    } else {
+                        assert_eq!(ids(&fixture.inbox("term-1").await), [message_id.as_str()]);
+                    }
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !racer.is_finished(),
+                "cancel {cancel}: it ran inside the write"
+            );
+            gate.release.notify_one();
+            racer.await.unwrap();
             let expected = if cancel {
-                assert_eq!(
-                    fixture.messaging.cancel("a", &receipt.message_id).await,
-                    Ok(AgentMessageStatus::Cancelled)
-                );
                 AgentMessageStatus::Cancelled
             } else {
-                assert_eq!(
-                    ids(&fixture.inbox("term-1").await),
-                    [receipt.message_id.as_str()]
-                );
                 AgentMessageStatus::Consumed
             };
-            gate.release.notify_one();
-            // A later message makes the next pass try the terminal: the racing pass ended.
-            let attempts = fixture.terminals.attempts("t", "term-1");
-            fixture.send("c", "terminal:t/term-1").await.unwrap();
-            fixture.until_attempts("term-1", attempts + 1).await;
             assert_eq!(
                 fixture.row(&receipt.message_id).await.status,
                 expected,
                 "cancel {cancel}"
             );
-            assert!(
-                !fixture
+            assert_eq!(
+                fixture
                     .outcomes
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|outcome| outcome.outcome == "delivered"
-                        && outcome.message_id.as_deref() == Some(&receipt.message_id)),
-                "cancel {cancel}"
+                    .filter(|outcome| outcome.outcome == "delivered"
+                        && outcome.message_id.as_deref() == Some(&receipt.message_id))
+                    .count(),
+                1,
+                "cancel {cancel}: delivered once, before the racer"
             );
             assert!(
                 !ids(&fixture.inbox("term-1").await).contains(&receipt.message_id.as_str()),
                 "cancel {cancel}"
             );
+            let Ok(fixture) = Arc::try_unwrap(fixture) else {
+                panic!("the racer released the fixture");
+            };
             fixture.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn the_production_wiring_reports_terminal_outcomes_through_the_sink() {
+        let fixture = fixture().await;
+        let outcomes = Arc::new(StdMutex::new(Vec::<MessageOutcome>::new()));
+        let sink = outcomes.clone();
+        let pointer = TerminalPointer::new(
+            fixture.harness.engine.repositories().database().clone(),
+            fixture.terminals.clone(),
+        );
+        let stop = CancellationToken::new();
+        let messaging = crate::production::runtime::start_terminal_messaging(
+            AgentMessaging::new(fixture.harness.engine.clone(), fixture.enabled.subscribe()),
+            &pointer,
+            Some(Arc::new(move |outcome| sink.lock().unwrap().push(outcome))),
+            stop.clone(),
+        );
+        let send = |from: &'static str| {
+            messaging.send(
+                from,
+                SendRequest {
+                    to: "terminal:t/term-1".to_owned(),
+                    text: BODY.to_owned(),
+                    client_request_id: None,
+                },
+            )
+        };
+        let reported = |outcome: &'static str, message_id: String| {
+            let outcomes = outcomes.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !outcomes.lock().unwrap().iter().any(|reported| {
+                        reported.outcome == outcome
+                            && reported.message_id.as_deref() == Some(&message_id)
+                    }) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("the sink hears {outcome}"));
+            }
+        };
+        let delivered = send("a").await.unwrap();
+        fixture.terminals.set_ready("t", "term-1");
+        reported("delivered", delivered.message_id).await;
+        let failed = send("c").await.unwrap();
+        fixture.terminals.set_generation("t", "term-1", None);
+        reported("failed", failed.message_id).await;
+        stop.cancel();
+        fixture.shutdown().await;
     }
 
     #[tokio::test]

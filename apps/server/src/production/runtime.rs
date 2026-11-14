@@ -877,8 +877,15 @@ impl ProductionRuntime {
             turn_delivery.clone(),
             Some(workspace_availability.clone()),
             attachment_uploads.clone(),
-        ))
-        .with_terminals(terminal_pointer.clone());
+        ));
+        let terminal_pointer_task = CancellationToken::new();
+        // The activity writer's sink goes in as the `outcomes` argument (`None` until it lands).
+        let agent_messaging = start_terminal_messaging(
+            agent_messaging,
+            &terminal_pointer,
+            None,
+            terminal_pointer_task.clone(),
+        );
         mcp_control.attach_agent_messaging(agent_messaging.clone());
 
         // Late, so a failed start leaves no follower running.
@@ -896,8 +903,6 @@ impl ProductionRuntime {
             control.agent_messaging_enabled_signal(),
             agent_message_tracker.clone(),
         );
-        let terminal_pointer_task = CancellationToken::new();
-        terminal_pointer.start(agent_messaging, terminal_pointer_task.clone());
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
@@ -1472,6 +1477,23 @@ struct GitReviewBackend;
 const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Gives `messaging` its terminal pointer and `outcomes`, then starts the pointer task with that
+/// same service, which it returns for every other caller. A sink added to the returned service
+/// afterwards would miss the pointer's copy, so the sink goes in here.
+pub(crate) fn start_terminal_messaging(
+    messaging: crate::agent_messaging::AgentMessaging,
+    pointer: &crate::agent_messaging::pointer::TerminalPointer,
+    outcomes: Option<crate::agent_messaging::OutcomeSink>,
+    shutdown: CancellationToken,
+) -> crate::agent_messaging::AgentMessaging {
+    let mut messaging = messaging.with_terminals(pointer.clone());
+    if let Some(outcomes) = outcomes {
+        messaging = messaging.with_outcomes(outcomes);
+    }
+    pointer.start(messaging.clone(), shutdown);
+    messaging
+}
+
 /// Each review preview source is bounded like a Git Manager commit diff.
 pub(super) const MAX_REVIEW_SOURCE_DIFF_BYTES: usize =
     crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;

@@ -28,7 +28,7 @@ use super::{
     TerminalSize, TerminalStatus, TerminalSummary,
     history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
-use super::{TerminalAgentStatus, TerminalAgentStatusState};
+use super::{TerminalAgentStatus, TerminalAgentStatusState, writer::WriteGuard};
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -284,8 +284,11 @@ pub enum TerminalError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteWhenReady {
     Written,
-    /// The agent is not waiting for a prompt, or a person typed since it was.
+    /// The agent is not waiting for a prompt, its input line holds a draft, or the caller's
+    /// guard refused at the moment of the write.
     NotReady,
+    /// Earlier input is still queued or being written: nothing was queued behind it.
+    Busy,
     /// Another process holds the terminal now, or none does.
     GenerationChanged,
 }
@@ -336,8 +339,12 @@ struct Session {
     /// goes to the one used last when its owner leaves several viewers (#348).
     user_input_order: HashMap<String, u64>,
     user_input_clock: u64,
-    /// When a person last typed: [`TerminalManager::write_when_ready`] never types over it.
-    last_person_input: Option<std::time::Instant>,
+    /// When input other than the terminal's own replies last reached it: a person, an older
+    /// client or the MCP `terminal_write` tool.
+    last_line_input: Option<std::time::Instant>,
+    /// When the agent last started a turn from idle: input before it was submitted, input after
+    /// it may still sit on the input line as a draft.
+    turn_started_at: Option<std::time::Instant>,
     /// Set while the size is un-owned because its owner left several viewers and none was used
     /// since: the hand-over waits for use, so an attach does not take the size, and only this
     /// viewer answers the terminal's queries meanwhile (#348).
@@ -407,6 +414,53 @@ impl SessionAgentStatus {
             ready_for_prompt: observation.is_some_and(|observation| observation.ready_for_prompt),
         }
     }
+}
+
+/// Why the server may not type into `session`'s `process` now; `None` grants the write permit's
+/// terminal items: the live generation reads ready for a prompt now and its input line is clean.
+fn refusal(
+    session: &Session,
+    generation: &Arc<SessionGeneration>,
+    process: &Arc<dyn PtyProcess>,
+) -> Option<WriteWhenReady> {
+    if generation.is_invalidated()
+        || generation.is_closing()
+        || !Arc::ptr_eq(&session.generation, generation)
+        || session.status != TerminalStatus::Running
+        || !session
+            .process
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, process))
+    {
+        return Some(WriteWhenReady::GenerationChanged);
+    }
+    (session.agent_status.is_none()
+        || !reads_ready_for_prompt(generation)
+        || !session.input_line_clean())
+    .then_some(WriteWhenReady::NotReady)
+}
+
+/// The observer's own readiness, not the mirrored summary. With [`end_ready_period`], the only
+/// use of the observer's readiness API in this file.
+fn reads_ready_for_prompt(generation: &SessionGeneration) -> bool {
+    generation
+        .observation
+        .observation()
+        .subscribe_agent_status()
+        .borrow()
+        .is_some_and(|observation| {
+            observation.ready_for_prompt
+                && observation.state == TerminalAgentState::Done
+                && !observation.failed
+        })
+}
+
+/// Ends the ready period a granted write used, so one write goes per period.
+fn end_ready_period(generation: &SessionGeneration) {
+    generation
+        .observation
+        .observation()
+        .clear_ready_for_prompt();
 }
 
 /// How often an unchanged Working report refreshes the published age: often enough that the
@@ -1312,9 +1366,30 @@ struct SessionGeneration {
     activity_completed: CancellationToken,
     #[cfg(test)]
     output_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
+    /// Runs on the writer's thread before a guarded write's guard.
+    #[cfg(test)]
+    write_guard_pause: std::sync::Mutex<Option<Arc<GuardPause>>>,
+}
+
+#[cfg(test)]
+struct GuardPause(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for GuardPause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuardPause")
+    }
 }
 
 impl SessionGeneration {
+    #[cfg(test)]
+    fn pause_before_write_guard(&self) {
+        let pause = self.write_guard_pause.lock().expect("pause lock").clone();
+        if let Some(pause) = pause {
+            (pause.0)();
+        }
+    }
+
     fn new(
         key: &SessionKey,
         observer_runtime: Option<tokio::runtime::Handle>,
@@ -1342,6 +1417,8 @@ impl SessionGeneration {
             activity_completed: CancellationToken::new(),
             #[cfg(test)]
             output_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            write_guard_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -1867,6 +1944,13 @@ impl Session {
         }
     }
 
+    /// No input reached the terminal since its agent last started a turn from idle, so nothing
+    /// typed can be waiting on its input line. A tie counts as typed after the start.
+    fn input_line_clean(&self) -> bool {
+        self.last_line_input
+            .is_none_or(|typed| self.turn_started_at.is_some_and(|started| typed < started))
+    }
+
     /// Input counts as use of a window unless it is the terminal's own reply: use ends the
     /// departed owner's claim to the size, and a user's input orders the windows (#348).
     fn note_input(&mut self, origin: TerminalInputOrigin<'_>) {
@@ -1875,9 +1959,9 @@ impl Session {
         }
         self.departed_owner = None;
         self.owner_unused_since_handoff = false;
+        self.last_line_input = Some(std::time::Instant::now());
         if let TerminalInputOrigin::User(claim) = origin {
             self.user_input_clock += 1;
-            self.last_person_input = Some(std::time::Instant::now());
             // Departed claims are pruned at each release; past the bound, the window typed in
             // longest ago is forgotten rather than this one.
             if let Some(order) = self.user_input_order.get_mut(claim) {
@@ -2828,7 +2912,8 @@ impl TerminalManager {
             owner_unused_since_handoff: false,
             user_input_order: HashMap::new(),
             user_input_clock: 0,
-            last_person_input: None,
+            last_line_input: None,
+            turn_started_at: None,
             handover_replier: None,
             refused_size: None,
             first_attachment_grant_used: false,
@@ -3335,6 +3420,9 @@ impl TerminalManager {
         let generation = generation.clone();
         tokio::spawn(async move {
             let mut published: Option<TerminalAgentObservation> = None;
+            // A fresh agent is idle; a Working report seen while idle starts a turn. A Working
+            // report the channel coalesced away leaves the input line dirty, never clean.
+            let mut idle = true;
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
@@ -3344,15 +3432,19 @@ impl TerminalManager {
                 let Some(observation) = *reports.borrow_and_update() else {
                     continue;
                 };
-                if published.is_some_and(|previous| {
-                    previous.state == observation.state
-                        && previous.failed == observation.failed
-                        && previous.ready_for_prompt == observation.ready_for_prompt
-                        && observation
-                            .observed_at
-                            .saturating_duration_since(previous.observed_at)
-                            < AGENT_STATUS_REFRESH_INTERVAL
-                }) {
+                let turn_start = idle && observation.state == TerminalAgentState::Working;
+                idle = observation.state == TerminalAgentState::Done;
+                if !turn_start
+                    && published.is_some_and(|previous| {
+                        previous.state == observation.state
+                            && previous.failed == observation.failed
+                            && previous.ready_for_prompt == observation.ready_for_prompt
+                            && observation
+                                .observed_at
+                                .saturating_duration_since(previous.observed_at)
+                                < AGENT_STATUS_REFRESH_INTERVAL
+                    })
+                {
                     continue;
                 }
                 let _publication = generation.publication.lock().await;
@@ -3366,6 +3458,9 @@ impl TerminalManager {
                     }
                     if session.agent_status.is_none() {
                         continue;
+                    }
+                    if turn_start {
+                        session.turn_started_at = Some(observation.observed_at);
                     }
                     session.agent_status = Some(SessionAgentStatus::Observed(observation));
                     session.summary()
@@ -4571,15 +4666,18 @@ impl TerminalManager {
         Some(session.lock().await.user_input_clock)
     }
 
-    /// Types `data` as the terminal's own input, only while `generation` runs, its agent's
-    /// latest observation is done and ready for a prompt, and no person typed since that
-    /// observation; then ends the ready period, so one write goes per period.
+    /// Types `data` as the terminal's own input under one write permit, decided again on the
+    /// writer's thread at the moment the bytes reach the process: `generation` still runs, its
+    /// agent reads ready for a prompt, nothing was typed since the agent last started a turn,
+    /// `still_wanted` holds, and no earlier input is pending. A granted write ends the ready
+    /// period, so one write goes per period. Dropping the future drops a write not yet started.
     pub async fn write_when_ready(
         &self,
         thread_id: &str,
         terminal_id: &str,
         generation: &TerminalGeneration,
         data: &str,
+        still_wanted: WriteGuard,
     ) -> Result<WriteWhenReady, TerminalError> {
         let session = self.require_session(thread_id, terminal_id).await?;
         let current = session.lock().await.generation.clone();
@@ -4588,45 +4686,46 @@ impl TerminalManager {
         }
         let mut pending = {
             let _publication = current.publication.lock().await;
-            if current.is_invalidated() || current.is_closing() {
-                return Ok(WriteWhenReady::GenerationChanged);
-            }
-            let mut session = session.lock().await;
-            if !Arc::ptr_eq(&session.generation, &current)
-                || session.status != TerminalStatus::Running
-            {
-                return Ok(WriteWhenReady::GenerationChanged);
-            }
-            let Some(process) = session.process.clone() else {
+            let locked = session.lock().await;
+            let Some(process) = locked.process.clone() else {
                 return Ok(WriteWhenReady::GenerationChanged);
             };
-            // Read from the observer itself, not the mirrored summary, with no await before the
-            // write is queued.
-            let lease = current.observation.observation();
-            let observation = *lease.subscribe_agent_status().borrow();
-            let ready = session.agent_status.is_some()
-                && observation.is_some_and(|observation| {
-                    observation.ready_for_prompt
-                        && observation.state == TerminalAgentState::Done
-                        && !observation.failed
-                        && session
-                            .last_person_input
-                            .is_none_or(|typed| typed < observation.observed_at)
-                });
-            if !ready {
-                return Ok(WriteWhenReady::NotReady);
+            if let Some(refusal) = refusal(&locked, &current, &process) {
+                return Ok(refusal);
             }
-            session.note_input(TerminalInputOrigin::Automatic);
-            drop(session);
-            let pending = current.writer.enqueue(&process, data, false)?;
-            lease.clear_ready_for_prompt();
+            drop(locked);
+            let (session, generation) = (session.clone(), current.clone());
+            let guard_process = process.clone();
+            let guard: WriteGuard = Box::new(move || {
+                #[cfg(test)]
+                generation.pause_before_write_guard();
+                // The mailbox first, then the terminal under its lock, with nothing slow between
+                // that read and the write. The lock is not held across the write: input that
+                // arrives after this check is queued behind the pointer.
+                if !still_wanted() {
+                    return false;
+                }
+                let locked = session.blocking_lock();
+                if refusal(&locked, &generation, &guard_process).is_some() {
+                    return false;
+                }
+                end_ready_period(&generation);
+                true
+            });
+            let Some(pending) = current.writer.enqueue_alone(&process, data, guard)? else {
+                return Ok(WriteWhenReady::Busy);
+            };
             current
                 .activity_wake
                 .store(true, std::sync::atomic::Ordering::Release);
             pending
         };
-        pending.wait().await?;
-        Ok(WriteWhenReady::Written)
+        match pending.wait().await {
+            Ok(()) => Ok(WriteWhenReady::Written),
+            // Refused at the write, or the generation ended first.
+            Err(TerminalError::PublicationCancelled) => Ok(WriteWhenReady::NotReady),
+            Err(error) => Err(error),
+        }
     }
 
     /// Terminal sessions whose process is starting or running.
@@ -11570,6 +11669,11 @@ mod tests {
         lease.mark_ready_for_prompt();
     }
 
+    /// A caller whose mail stays eligible.
+    fn wanted() -> WriteGuard {
+        Box::new(|| true)
+    }
+
     #[tokio::test]
     async fn write_when_ready_writes_once_per_ready_period_of_the_running_generation() {
         let root = tempfile::tempdir().unwrap();
@@ -11584,7 +11688,7 @@ mod tests {
         mark_ready(&lease);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::Written
@@ -11600,7 +11704,7 @@ mod tests {
         );
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::NotReady
@@ -11620,7 +11724,8 @@ mod tests {
             .unwrap();
         let lease = next_lease(&slot, None).await;
         let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
-        let write = || manager.write_when_ready("thread-a", "term-1", &generation, "pointer");
+        let write =
+            || manager.write_when_ready("thread-a", "term-1", &generation, "pointer", wanted());
         assert_eq!(
             write().await.unwrap(),
             WriteWhenReady::NotReady,
@@ -11659,7 +11764,7 @@ mod tests {
         let shell = manager.live_generation("thread-a", "shell").await.unwrap();
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "shell", &shell, "pointer")
+                .write_when_ready("thread-a", "shell", &shell, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::NotReady
@@ -11689,7 +11794,7 @@ mod tests {
         mark_ready(&lease);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &old, "pointer")
+                .write_when_ready("thread-a", "term-1", &old, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::GenerationChanged
@@ -11699,7 +11804,7 @@ mod tests {
         assert_ne!(new, old);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &new, "pointer")
+                .write_when_ready("thread-a", "term-1", &new, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::Written
@@ -11723,7 +11828,7 @@ mod tests {
         mark_ready(&lease);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::Written
@@ -11769,7 +11874,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::NotReady
@@ -11778,7 +11883,7 @@ mod tests {
         mark_ready(&lease);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::NotReady,
@@ -11795,7 +11900,7 @@ mod tests {
         mark_ready(&lease);
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::Written,
@@ -11820,7 +11925,7 @@ mod tests {
         manager.write("thread-a", "term-1", "older").await.unwrap();
         assert_eq!(
             manager
-                .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                 .await
                 .unwrap(),
             WriteWhenReady::NotReady
@@ -11869,7 +11974,7 @@ mod tests {
             let generation = generation.clone();
             async move {
                 manager
-                    .write_when_ready("thread-a", "term-1", &generation, "pointer")
+                    .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
                     .await
             }
         });
@@ -11882,13 +11987,118 @@ mod tests {
             .expect("the pointer write answers")
             .unwrap()
             .unwrap();
-        assert_ne!(outcome, WriteWhenReady::Written);
+        assert_eq!(outcome, WriteWhenReady::Busy);
         assert_eq!(
             backend.latest().writes(),
             ["\x1b[0n"],
             "the pointer reached an approval prompt"
         );
         manager.shutdown().await;
+    }
+
+    /// The write permit is decided again on the writer's thread: a change between the queueing
+    /// and the write refuses it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_decides_at_the_moment_of_the_write() {
+        for change in ["blocked", "draft", "unwanted", "restart"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, slot) = write_when_ready_manager(backend.clone());
+            manager
+                .open(ai_terminal_input(root.path(), "term-1"))
+                .await
+                .unwrap();
+            let lease = next_lease(&slot, None).await;
+            let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+            mark_ready(&lease);
+            let process = backend.latest();
+            let gate = Arc::new(WriteGate::default());
+            let _open = OpenOnDrop(gate.clone());
+            {
+                let sessions = manager.inner.sessions.read().await;
+                let session = sessions[&("thread-a".to_owned(), "term-1".to_owned())].clone();
+                let pause = gate.clone();
+                *session
+                    .lock()
+                    .await
+                    .generation
+                    .write_guard_pause
+                    .lock()
+                    .unwrap() = Some(Arc::new(GuardPause(Box::new(move || pause.pass()))));
+            }
+            let unwanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pointer = tokio::spawn({
+                let manager = manager.clone();
+                let generation = generation.clone();
+                let unwanted = unwanted.clone();
+                async move {
+                    manager
+                        .write_when_ready(
+                            "thread-a",
+                            "term-1",
+                            &generation,
+                            "pointer",
+                            Box::new(move || !unwanted.load(std::sync::atomic::Ordering::Acquire)),
+                        )
+                        .await
+                }
+            });
+            tokio::task::spawn_blocking({
+                let gate = gate.clone();
+                move || gate.wait_entered()
+            })
+            .await
+            .unwrap();
+            let typed = match change {
+                "blocked" => {
+                    lease.publish_agent_status(TerminalAgentState::Blocked, false);
+                    None
+                }
+                "draft" => Some(tokio::spawn({
+                    let manager = manager.clone();
+                    async move {
+                        manager
+                            .write_from("thread-a", "term-1", "x", TerminalInputOrigin::User("w"))
+                            .await
+                    }
+                })),
+                "unwanted" => {
+                    unwanted.store(true, std::sync::atomic::Ordering::Release);
+                    None
+                }
+                _ => {
+                    manager
+                        .restart(ai_terminal_input(root.path(), "term-1"))
+                        .await
+                        .unwrap();
+                    None
+                }
+            };
+            if typed.is_some() {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while manager.person_input_count("thread-a", "term-1").await != Some(1) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the person's input is queued behind the pointer");
+            }
+            gate.open();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+                .await
+                .expect("the pointer write answers")
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome, WriteWhenReady::NotReady, "{change}");
+            if let Some(typed) = typed {
+                typed.await.unwrap().unwrap();
+            }
+            assert!(
+                !process.writes().iter().any(|write| write == "pointer"),
+                "{change}: the pointer was typed"
+            );
+            manager.shutdown().await;
+        }
     }
 
     const TEST_AGENT_ENDPOINT: &str = "http://127.0.0.1:3773/api/agent/call";

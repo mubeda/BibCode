@@ -27,3 +27,4 @@ pub use model::{
 pub use pty::{
     ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
 };
+pub use writer::WriteGuard;
