@@ -3870,6 +3870,54 @@ mod hop_limit {
         );
         harness.shutdown().await;
     }
+
+    /// Review W2: a hosted agent with full access runs `bibcode thread send` on its own thread,
+    /// which sends through an outside client's credential. That turn is not a person's.
+    #[tokio::test]
+    async fn an_outside_clients_message_does_not_reset_the_chain() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.turn_started_by("a", "turn-a", 8, true, true).await;
+        harness.provider_turn("a", "turn-a", "done", true).await;
+        let (client, _) = harness.agent(McpAccess::FullAccess).await;
+
+        let sent = harness
+            .call(
+                &client,
+                "send_message",
+                json!({ "threadId": "a", "text": "keep going" }),
+            )
+            .await;
+        let message_id = structured(&sent)["messageId"]
+            .as_str()
+            .expect("message id")
+            .to_owned();
+        let (_, actor) = harness.projected_message(message_id.clone()).await;
+        assert_eq!(actor["kind"], "mcp-client", "{actor}");
+        let entry = harness
+            .repositories
+            .database()
+            .call(move |connection| {
+                Ok(connection.query_row(
+                    "SELECT command_id FROM provider_turn_outbox WHERE thread_id = 'a' AND message_id = ?1",
+                    [&message_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .expect("queue entry");
+        harness.until_entry(&entry, "delivered").await;
+        harness
+            .provider_turn("a", "turn-cli", "working", false)
+            .await;
+
+        assert_hop_limit(
+            &harness
+                .agent_send("a", send_arguments("thread:b", "ping"))
+                .await,
+        );
+        harness.shutdown().await;
+    }
 }
 
 // ---- Review findings on tasks 6.1 to 6.5 (lane 6C) ----
@@ -4364,6 +4412,50 @@ mod limits {
         assert!(accepted(&result), "{result}");
         harness.shutdown().await;
     }
+
+    /// Two calls with one `clientRequestId` race for the last slot: both get the receipt of
+    /// the one that took it.
+    async fn a_retry_takes_the_last_slot(harness: &Harness, to: &str) {
+        let arguments = json!({ "to": to, "text": "hello", "clientRequestId": "k" });
+        let (first, second) = tokio::join!(
+            harness.agent_send("a", arguments.clone()),
+            harness.agent_send("a", arguments.clone())
+        );
+        assert!(accepted(&first), "{first}");
+        assert!(accepted(&second), "{second}");
+        assert_eq!(
+            structured(&first)["messageId"],
+            structured(&second)["messageId"]
+        );
+    }
+
+    /// Review W3.
+    #[tokio::test]
+    async fn concurrent_retries_at_the_rate_limit_share_one_receipt() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.sends_from("a", 29).await;
+
+        a_retry_takes_the_last_slot(&harness, "thread:p").await;
+
+        assert_eq!(harness.rows_from("a").await, 30);
+        harness.shutdown().await;
+    }
+
+    /// Review W3.
+    #[tokio::test]
+    async fn concurrent_retries_at_the_backlog_limit_share_one_receipt() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        for sender in harness.more_agents(19).await {
+            assert!(accepted(&harness.send_to(&sender, "thread:b").await));
+        }
+
+        a_retry_takes_the_last_slot(&harness, "thread:b").await;
+
+        assert_eq!(harness.outbox_states("b").await.len(), 20);
+        harness.shutdown().await;
+    }
 }
 
 // ---- Task 6.7: held, failed, restart and cancel ----
@@ -4475,6 +4567,255 @@ mod recovery {
         assert_eq!(harness.entry_state(&entry).await, "queued", "not started");
         assert!(harness.entry_held(&entry).await);
         harness.shutdown().await;
+    }
+
+    impl Harness {
+        /// The held flag of `message_id`'s current entry as the outbox, the message
+        /// projection, a thread snapshot and the entry's last published event each read it.
+        async fn held_views(&self, message_id: &str) -> [Option<bool>; 4] {
+            let row = self.message_row(message_id).await;
+            let entry = row.delivery_command_id.expect("queue entry");
+            let delivered = row.delivery_message_id.expect("thread message");
+            let thread_id = row
+                .recipient_address
+                .trim_start_matches("thread:")
+                .to_owned();
+            let snapshot =
+                crate::orchestration::load_thread_snapshot(&self.repositories, &thread_id)
+                    .await
+                    .expect("snapshot")
+                    .messages
+                    .into_iter()
+                    .find(|message| message.message_id == delivered)
+                    .expect("the message is in the snapshot")
+                    .delivery_held;
+            let lookup = delivered.clone();
+            let (projected, published) = self
+                .repositories
+                .database()
+                .call(move |connection| {
+                    let projected: Option<bool> = connection.query_row(
+                        "SELECT delivery_held FROM projection_thread_messages WHERE message_id = ?1",
+                        [&lookup],
+                        |row| row.get(0),
+                    )?;
+                    let published: String = connection.query_row(
+                        "SELECT payload_json FROM orchestration_events
+                          WHERE event_type = 'thread.turn-delivery-updated'
+                            AND json_extract(payload_json, '$.messageId') = ?1
+                          ORDER BY sequence DESC LIMIT 1",
+                        [&lookup],
+                        |row| row.get(0),
+                    )?;
+                    Ok((projected, published))
+                })
+                .await
+                .expect("views");
+            let published: Value = serde_json::from_str(&published).expect("payload");
+            [
+                Some(self.entry_held(&entry).await),
+                projected,
+                snapshot,
+                published["delivery"]["held"].as_bool(),
+            ]
+        }
+    }
+
+    /// Review W4: the first admission into a paused queue.
+    #[tokio::test]
+    async fn a_message_admitted_into_a_paused_queue_reads_held_everywhere() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.session_ends("b", "error").await;
+
+        let m1 = harness.sent("a", "thread:b").await;
+
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "held");
+        assert_eq!(harness.held_views(&m1).await, [Some(true); 4]);
+        harness.shutdown().await;
+    }
+
+    /// Review W4: a release into a paused queue.
+    #[tokio::test]
+    async fn a_release_into_a_paused_queue_reads_held_everywhere() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.messaging_enabled.send_replace(false);
+        harness
+            .until_held_for(&m1, AgentMessageReason::MessagingOff)
+            .await;
+        harness.session_ends("b", "error").await;
+
+        harness.messaging_enabled.send_replace(true);
+
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientQueueHeld)
+            .await;
+        assert_eq!(harness.held_views(&m1).await, [Some(true); 4]);
+        harness.shutdown().await;
+    }
+
+    /// Review W1: B's queue was paused by `status` and B is `ready` again, but nobody released
+    /// m1. A new message waits behind it, held, and m1 stays where it is.
+    async fn a_message_waits_in_a_queue_paused_by(status: &str) {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.session_ends("b", status).await;
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientQueueHeld)
+            .await;
+        let first = harness.entry_of(&m1).await;
+        assert!(harness.entry_held(&first).await);
+        harness.session_ends("b", "ready").await;
+
+        let m2 = harness.sent("a", "thread:b").await;
+
+        let status = harness.status_of("a", &m2).await;
+        assert_eq!(structured(&status)["status"], "held", "{status}");
+        assert_eq!(structured(&status)["reason"], "recipient_queue_held");
+        let second = harness.entry_of(&m2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(harness.entry_state(&second).await, "queued", "not started");
+        assert!(harness.entry_held(&second).await);
+        assert_eq!(harness.entry_state(&first).await, "queued");
+        assert_eq!(harness.message_row(&m1).await.status.as_str(), "held");
+        assert_eq!(harness.held_views(&m2).await, [Some(true); 4]);
+        harness.shutdown().await;
+    }
+
+    impl Harness {
+        /// Admits an agent message from A to B straight through the turn starter, with the hold
+        /// a sender decided from an earlier read of B's queue.
+        async fn admit_decided(&self, message_id: &str, held: bool) -> Result<Value, Value> {
+            use crate::agent_messaging::store::{
+                AgentMessageCompanion, AgentMessageStatus, NewAgentMessage, SenderKind,
+            };
+            let command_id = format!("agent-message:{message_id}");
+            let delivery_message_id = uuid::Uuid::new_v4().to_string();
+            let (status, reason) = if held {
+                (
+                    AgentMessageStatus::Held,
+                    Some(AgentMessageReason::RecipientQueueHeld),
+                )
+            } else {
+                (AgentMessageStatus::Accepted, None)
+            };
+            super::super::super::orchestration_rpc::server_turn_starter(
+                self.engine.clone(),
+                self.provider.clone(),
+                self.state_dir.clone(),
+                self.delivery.clone(),
+                None,
+                self.uploads.clone(),
+            )
+            .queue_turn_start(
+                command(json!({
+                    "type": "thread.turn.start", "commandId": command_id, "threadId": "b",
+                    "message": {
+                        "messageId": delivery_message_id, "role": "user",
+                        "text": "hello", "attachments": [],
+                    },
+                    "runtimeMode": "full-access", "interactionMode": "default",
+                    "queued": true, "createdAt": CREATED_AT,
+                })),
+                super::super::super::orchestration_rpc::ServerActor::HostedAgent {
+                    address: "thread:a".to_owned(),
+                    label: "A".to_owned(),
+                },
+                Some(super::super::super::orchestration_rpc::AgentTurn {
+                    companion: AgentMessageCompanion::Insert(
+                        NewAgentMessage {
+                            message_id: message_id.to_owned(),
+                            conversation_id: "c1".to_owned(),
+                            sender_address: "thread:a".to_owned(),
+                            sender_kind: SenderKind::Agent,
+                            recipient_address: "thread:b".to_owned(),
+                            in_reply_to: None,
+                            hop: 1,
+                            text: "hello".to_owned(),
+                            status,
+                            reason,
+                            accepted_at: CREATED_AT.to_owned(),
+                            sender_runtime_mode: Some("full-access".to_owned()),
+                            recipient_terminal_generation: None,
+                            send_request_id: None,
+                            client_request_id: None,
+                            delivery_command_id: Some(command_id),
+                            delivery_message_id: Some(delivery_message_id),
+                        },
+                        None,
+                    ),
+                    force_queue: held,
+                }),
+            )
+            .await
+        }
+    }
+
+    fn pause_changed(result: &Result<Value, Value>) -> bool {
+        result.as_ref().is_err_and(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(|detail| detail.ends_with("agent-message-queue-pause-changed"))
+        })
+    }
+
+    /// Review W1: the queue paused after the sender read it. The admitting transaction refuses
+    /// the stale decision, and nothing of it is stored.
+    #[tokio::test]
+    async fn a_start_decided_before_the_queue_paused_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        let m1 = harness.sent("a", "thread:b").await;
+        harness.until_status(&m1, "queued").await;
+        harness.session_ends("b", "interrupted").await;
+        harness
+            .until_held_for(&m1, AgentMessageReason::RecipientQueueHeld)
+            .await;
+        harness.session_ends("b", "ready").await;
+        let rows = harness.agent_messages().await.len();
+        let entries = harness.outbox_states("b").await.len();
+
+        let result = harness.admit_decided("stale-start", false).await;
+
+        assert!(pause_changed(&result), "{result:?}");
+        assert_eq!(harness.agent_messages().await.len(), rows);
+        assert_eq!(harness.outbox_states("b").await.len(), entries);
+
+        // The sender's one retry, under the same command id, is admitted held.
+        let retried = harness.admit_decided("stale-start", true).await;
+
+        assert!(retried.is_ok(), "{retried:?}");
+        assert_eq!(harness.agent_messages().await.len(), rows + 1);
+        assert_eq!(harness.held_views("stale-start").await, [Some(true); 4]);
+        harness.shutdown().await;
+    }
+
+    /// Review W1: a person released the queue after the sender read it paused.
+    #[tokio::test]
+    async fn a_hold_decided_before_the_queue_was_released_is_refused() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+
+        let result = harness.admit_decided("stale-hold", true).await;
+
+        assert!(pause_changed(&result), "{result:?}");
+        assert!(harness.agent_messages().await.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_queue_paused_by_an_interrupt_holds_a_new_message_after_ready() {
+        a_message_waits_in_a_queue_paused_by("interrupted").await;
+    }
+
+    #[tokio::test]
+    async fn a_queue_paused_by_an_error_holds_a_new_message_after_ready() {
+        a_message_waits_in_a_queue_paused_by("error").await;
     }
 
     #[tokio::test]

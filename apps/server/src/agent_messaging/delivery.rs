@@ -551,7 +551,7 @@ pub(crate) async fn requeue(
             .to_owned(),
     );
     let lookup_thread = thread_id.clone();
-    let (earlier, waiting, label) = repositories
+    let (earlier, waiting, paused, label) = repositories
         .database()
         .call(move |connection| {
             let earlier: u32 = connection.query_row(
@@ -571,7 +571,8 @@ pub(crate) async fn requeue(
                     |row| row.get(0),
                 )
                 .optional()?;
-            Ok((earlier, waiting, title))
+            let paused = super::store::queue_paused(connection, &lookup_thread)?;
+            Ok((earlier, waiting, paused, title))
         })
         .await
         .map_err(storage)?;
@@ -580,7 +581,7 @@ pub(crate) async fn requeue(
     let admission = thread
         .as_ref()
         .map_or(super::TurnAdmission::Queue, |thread| {
-            super::admission_for(thread, session.as_ref())
+            super::admission_for(thread, session.as_ref(), paused)
         });
     let queued = waiting || admission != super::TurnAdmission::Start;
     let held = admission == super::TurnAdmission::Hold;

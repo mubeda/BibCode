@@ -184,8 +184,10 @@ pub(crate) enum TurnAdmission {
     Hold,
 }
 
-/// `Hold` while the recipient's last turn ended in an error or an interrupt, which pauses its
-/// queue, so a message never restarts its session. `Queue` while the recipient's session runs
+/// `Hold` while the recipient's queue is paused ([`store::queue_paused`]): its last turn ended in
+/// an error or an interrupt, or an entry a person has not released still waits, whatever the
+/// session reads now, so a message never restarts it or overtakes the held entries. The
+/// admitting transaction checks `paused` again. `Queue` while the recipient's session runs
 /// or starts a turn, and while it has an open approval or question whatever its session (a
 /// restart recovers a ready session's asks), so a message never reaches a turn that waits for a
 /// person's answer (R9). `Start` otherwise, no session at all included, so a never-started
@@ -193,8 +195,9 @@ pub(crate) enum TurnAdmission {
 pub(crate) fn admission_for(
     thread: &ProjectionThread,
     session: Option<&ProjectionThreadSession>,
+    paused: bool,
 ) -> TurnAdmission {
-    if session.is_some_and(|session| matches!(session.status.as_str(), "error" | "interrupted")) {
+    if paused {
         return TurnAdmission::Hold;
     }
     if thread.pending_approval_count > 0 || thread.pending_user_input_count > 0 {
@@ -265,6 +268,8 @@ struct Route {
     sender_provider: String,
     recipient: ProjectionThread,
     session: Option<ProjectionThreadSession>,
+    /// The recipient's queue is paused ([`store::queue_paused`]).
+    paused: bool,
 }
 
 #[derive(Clone)]
@@ -616,6 +621,12 @@ impl AgentMessaging {
             .get_thread_session(sender_thread_id.to_owned())
             .await
             .map_err(storage)?;
+        let lookup = recipient_thread_id.to_owned();
+        let paused = repositories
+            .database()
+            .call(move |connection| store::queue_paused(connection, &lookup))
+            .await
+            .map_err(storage)?;
         let sender_provider = sender_session
             .and_then(|session| session.provider_name)
             .or_else(|| {
@@ -631,6 +642,7 @@ impl AgentMessaging {
             sender_provider,
             recipient,
             session,
+            paused,
         })
     }
 
@@ -690,84 +702,107 @@ impl AgentMessaging {
             tracing::warn!(error = %error, "an agent message command did not build");
             AgentMessagingError::Storage
         })?;
-        // A queued message waits for the promotion gate, which admits it only once no turn runs
-        // and no approval or question is open; one that ended since this read is promoted then.
-        let admission = admission_for(&route.recipient, route.session.as_ref());
-        let force_queue = admission != TurnAdmission::Start;
-        // A paused queue holds the message, with its entry, until a person releases the queue.
-        let (status, reason) = if admission == TurnAdmission::Hold {
-            (
-                AgentMessageStatus::Held,
-                Some(AgentMessageReason::RecipientQueueHeld),
-            )
-        } else {
-            (AgentMessageStatus::Accepted, None)
-        };
-        let companion = AgentMessageCompanion::Insert(
-            NewAgentMessage {
-                message_id: outgoing.message_id.to_owned(),
-                conversation_id: outgoing.conversation_id.to_owned(),
-                sender_address: sender_address.clone(),
-                sender_kind: SenderKind::Agent,
-                recipient_address: recipient_address.clone(),
-                in_reply_to: outgoing.in_reply_to.map(str::to_owned),
-                hop: outgoing.hop,
-                text: outgoing.text.to_owned(),
-                status,
-                reason,
-                accepted_at: now,
-                sender_runtime_mode: Some(sender_mode.clone()),
-                recipient_terminal_generation: None,
-                send_request_id: None,
-                client_request_id: outgoing.client_request_id.map(str::to_owned),
-                delivery_command_id: Some(command_id),
-                delivery_message_id: Some(delivery_message_id),
-            },
-            Some(policy::AdmissionLimits::now()),
-        );
-        let admitted = starter
-            .queue_turn_start(
-                command,
-                ServerActor::HostedAgent {
-                    address: sender_address.clone(),
-                    label,
+        let mut paused = route.paused;
+        let mut rechecked = false;
+        let (admitted, status) = loop {
+            // A queued message waits for the promotion gate, which admits it only once no turn
+            // runs and no approval or question is open; one that ended since this read is
+            // promoted then.
+            let admission = admission_for(&route.recipient, route.session.as_ref(), paused);
+            let force_queue = admission != TurnAdmission::Start;
+            // A paused queue holds the message, with its entry, until a person releases the queue.
+            let (status, reason) = if admission == TurnAdmission::Hold {
+                (
+                    AgentMessageStatus::Held,
+                    Some(AgentMessageReason::RecipientQueueHeld),
+                )
+            } else {
+                (AgentMessageStatus::Accepted, None)
+            };
+            let companion = AgentMessageCompanion::Insert(
+                NewAgentMessage {
+                    message_id: outgoing.message_id.to_owned(),
+                    conversation_id: outgoing.conversation_id.to_owned(),
+                    sender_address: sender_address.clone(),
+                    sender_kind: SenderKind::Agent,
+                    recipient_address: recipient_address.clone(),
+                    in_reply_to: outgoing.in_reply_to.map(str::to_owned),
+                    hop: outgoing.hop,
+                    text: outgoing.text.to_owned(),
+                    status,
+                    reason,
+                    accepted_at: now.clone(),
+                    sender_runtime_mode: Some(sender_mode.clone()),
+                    recipient_terminal_generation: None,
+                    send_request_id: None,
+                    client_request_id: outgoing.client_request_id.map(str::to_owned),
+                    delivery_command_id: Some(command_id.clone()),
+                    delivery_message_id: Some(delivery_message_id.clone()),
                 },
-                Some(AgentTurn {
-                    companion,
-                    force_queue,
-                }),
-            )
-            .await
-            .map_err(|error| {
-                // A limit names itself in the refusal's detail, which quotes nothing else here.
-                let detail = error
+                Some(policy::AdmissionLimits::now()),
+            );
+            let admitted = starter
+                .queue_turn_start(
+                    command.clone(),
+                    ServerActor::HostedAgent {
+                        address: sender_address.clone(),
+                        label: label.clone(),
+                    },
+                    Some(AgentTurn {
+                        companion,
+                        force_queue,
+                    }),
+                )
+                .await;
+            // The queue paused or was released since `route` read it: read it again, once.
+            let pause_changed = admitted.as_ref().err().is_some_and(|error| {
+                error
                     .get("message")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                if detail.ends_with(policy::LimitRefusal::Rate.detail()) {
-                    return AgentMessagingError::RateLimit;
-                }
-                if detail.ends_with(policy::LimitRefusal::Backlog.detail()) {
-                    return AgentMessagingError::BacklogLimit;
-                }
-                // The refusal's tag only: its detail may quote the command.
-                tracing::warn!(
-                    tag = error
-                        .get("_tag")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown"),
-                    "an agent message was not admitted"
-                );
-                AgentMessagingError::Storage
+                    .is_some_and(|detail| detail.ends_with(policy::QUEUE_PAUSE_CHANGED))
             });
-        if let Err(error) = admitted {
-            if matches!(
-                error,
-                AgentMessagingError::RateLimit | AgentMessagingError::BacklogLimit
-            ) {
-                return Err(error);
+            if pause_changed && !rechecked {
+                rechecked = true;
+                let thread_id = route.recipient.thread_id.clone();
+                paused = self
+                    .engine
+                    .repositories()
+                    .database()
+                    .call(move |connection| store::queue_paused(connection, &thread_id))
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "agent messaging could not read a queue");
+                        AgentMessagingError::Storage
+                    })?;
+                continue;
             }
-            // Another call with the same id won the unique index: answer from its row.
+            break (admitted, status);
+        };
+        let admitted = admitted.map_err(|error| {
+            // A limit names itself in the refusal's detail, which quotes nothing else here.
+            let detail = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if detail.ends_with(policy::LimitRefusal::Rate.detail()) {
+                return AgentMessagingError::RateLimit;
+            }
+            if detail.ends_with(policy::LimitRefusal::Backlog.detail()) {
+                return AgentMessagingError::BacklogLimit;
+            }
+            // The refusal's tag only: its detail may quote the command.
+            tracing::warn!(
+                tag = error
+                    .get("_tag")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                "an agent message was not admitted"
+            );
+            AgentMessagingError::Storage
+        });
+        if let Err(error) = admitted {
+            // Another call with the same id won the unique index, or took the last slot of a
+            // limit first: answer from its row.
             return match self
                 .replay(&sender_address, &recipient_address, &outgoing)
                 .await?
