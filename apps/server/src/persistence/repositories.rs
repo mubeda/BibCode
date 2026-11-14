@@ -5076,8 +5076,12 @@ fn decode_transition(row: &Row<'_>) -> rusqlite::Result<TransitionRow> {
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
-    if event.metadata.get("actor").is_some() {
-        return "mcp-client";
+    if let Some(actor) = event.metadata.get("actor") {
+        return if actor.get("kind").and_then(Value::as_str) == Some("hosted-agent") {
+            "hosted-agent"
+        } else {
+            "mcp-client"
+        };
     }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",

@@ -1,10 +1,6 @@
 //! The envelope an agent message is delivered in. It names the sending agent, says the text did
 //! not come from the user, and quotes the text so it can neither close the envelope nor start
 //! the turn with a provider command (`/name`), a skill (`$name`) or a file reference (`@path`).
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 5.4's send path builds the envelope")
-)]
 
 const TAG: &str = "bibcode_agent_message";
 const OPEN: &str = "<bibcode_agent_message>";
@@ -51,6 +47,11 @@ pub(crate) fn build_envelope(input: &EnvelopeInput<'_>) -> String {
 }
 
 /// Whether `text` is a whole envelope `build_envelope` made, not text that merely contains one.
+/// It checks a form only: whether a delivery is an agent's message comes from the stored row.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "tests check the envelope's form with it")
+)]
 pub(crate) fn is_agent_envelope(text: &str) -> bool {
     text.starts_with(OPEN)
         && text[OPEN.len()..].starts_with('\n')

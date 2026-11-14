@@ -1,7 +1,7 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type {
   EnvironmentId,
-  OrchestrationActor,
+  OrchestrationMessageActor,
   PersonSend,
   SendRequestAction,
   ThreadId,
@@ -56,7 +56,7 @@ export const MessageProvenance = memo(function MessageProvenance({
   environmentId,
   personSend,
 }: {
-  readonly actor: OrchestrationActor | undefined;
+  readonly actor: OrchestrationMessageActor | undefined;
   readonly sourceThreadId: ThreadId | undefined;
   readonly environmentId: EnvironmentId;
   readonly personSend?: PersonSend | undefined;

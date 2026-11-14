@@ -201,7 +201,7 @@ pub struct PersonSend {
 }
 
 /// The actor kinds of agents. A claim with one of them may never carry `personSend`.
-const AGENT_ACTOR_KINDS: &[&str] = &["mcp-client"];
+const AGENT_ACTOR_KINDS: &[&str] = &["mcp-client", "hosted-agent"];
 
 /// The longest `purpose` a created thread may carry.
 pub const MAX_THREAD_PURPOSE_CHARS: usize = 200;
@@ -9048,8 +9048,12 @@ fn upsert_projection_state_tx(
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
-    if event.metadata.get("actor").is_some() {
-        return "mcp-client";
+    if let Some(actor) = event.metadata.get("actor") {
+        return if actor.get("kind").and_then(Value::as_str) == Some("hosted-agent") {
+            "hosted-agent"
+        } else {
+            "mcp-client"
+        };
     }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
@@ -15744,6 +15748,71 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<Value>(&stored).unwrap(),
                 person_send()["personSend"]
+            );
+            engine.shutdown().await;
+        }
+
+        fn hosted_agent() -> Value {
+            json!({ "kind": "hosted-agent", "address": "thread:source", "label": "Source" })
+        }
+
+        #[tokio::test]
+        async fn a_hosted_agent_cannot_name_a_source_thread() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(
+                &engine,
+                turn("hosted-source", json!({ "sourceThreadId": "source" })),
+                Some(hosted_agent()),
+            );
+            assert!(
+                detail(refused.await)
+                    .contains("Only an outside agent's panel message may name a source thread.")
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn person_send_is_refused_for_a_hosted_agent_claim() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(&engine, turn("hosted", person_send()), Some(hosted_agent()));
+            assert!(detail(refused.await).contains("Only a person's request may carry personSend"));
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn a_hosted_agent_actor_is_stored_as_its_own_kind() {
+            let engine = engine().await;
+            dispatch_as(&engine, turn("hosted", json!({})), Some(hosted_agent()))
+                .await
+                .expect("a hosted agent's message is admitted");
+            dispatch_as(&engine, turn("outside", json!({})), Some(mcp_client()))
+                .await
+                .expect("an outside agent's message is admitted");
+
+            let kinds = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT DISTINCT command_id, actor_kind FROM orchestration_events WHERE command_id IN ('hosted', 'outside') ORDER BY command_id",
+                    )?;
+                    let rows = statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .await
+                .expect("events");
+            assert_eq!(
+                kinds,
+                [
+                    ("hosted".to_owned(), "hosted-agent".to_owned()),
+                    ("outside".to_owned(), "mcp-client".to_owned()),
+                ]
             );
             engine.shutdown().await;
         }

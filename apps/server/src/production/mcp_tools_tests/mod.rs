@@ -289,6 +289,14 @@ impl Harness {
     /// The messaging service over this harness's engine, on or off.
     pub(crate) fn messaging(&self, enabled: bool) -> crate::agent_messaging::AgentMessaging {
         crate::agent_messaging::AgentMessaging::new(self.engine.clone(), watch::channel(enabled).1)
+            .with_starter(super::orchestration_rpc::server_turn_starter(
+                self.engine.clone(),
+                self.provider.clone(),
+                self.state_dir.clone(),
+                self.delivery.clone(),
+                None,
+                self.uploads.clone(),
+            ))
     }
 
     pub(crate) async fn shutdown(self) {

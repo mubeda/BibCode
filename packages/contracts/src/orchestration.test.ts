@@ -12,6 +12,7 @@ import {
   DispatchResult,
   ModelSelection,
   OrchestrationActor,
+  OrchestrationMessageActor,
   OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -2098,5 +2099,21 @@ describe("OrchestrationActor across versions", () => {
       decodeActor({ kind: "mcp-client", clientId: "s1", label: null, namedClientId: "nc_1" })
         .namedClientId,
     ).toBe("nc_1");
+  });
+});
+
+const decodeMessageActor = Schema.decodeUnknownSync(OrchestrationMessageActor);
+
+describe("OrchestrationMessageActor", () => {
+  it("a message actor may be an outside agent or a hosted agent", () => {
+    expect(decodeMessageActor({ kind: "mcp-client", clientId: "s1", label: "MCP" })).toEqual({
+      kind: "mcp-client",
+      clientId: "s1",
+      label: "MCP",
+    });
+    const hosted = { kind: "hosted-agent", address: "thread:t1", label: "API refactor" };
+    expect(decodeMessageActor(hosted)).toEqual(hosted);
+    expect(() => decodeMessageActor({ kind: "hosted-agent", address: "x", label: null })).toThrow();
+    expect(() => decodeMessageActor({ kind: "person" })).toThrow();
   });
 });
