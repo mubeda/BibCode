@@ -16,7 +16,7 @@ use super::{
     AgentMessagingError, MessageOutcome, OutcomeSink,
     store::{
         AgentMessageCompanion, AgentMessageReason, AgentMessageRow, AgentMessageStatus,
-        RelinkAgentMessage, hold_above_ceiling, hold_waiting, list_held_for,
+        RelinkAgentMessage, hold_above_ceiling, hold_waiting, list_held_for_release,
         list_needing_withdrawal, list_open, list_open_for_thread, set_recipient_turn, set_status,
     },
 };
@@ -418,18 +418,14 @@ async fn reconcile(
 }
 
 /// Requeues each held message of `recipient` (every one when `None`) whose hold no longer
-/// applies, in acceptance order per reason. A message whose recipient is gone fails, and one
-/// whose recipient still runs above its sender's mode stays held for that.
+/// applies, in acceptance order across both reasons. A message whose recipient is gone fails,
+/// and one whose recipient still runs above its sender's mode stays held for that.
 async fn release_held(engine: &OrchestrationEngine, recipient: Option<String>) -> Result<()> {
     let ready = engine
         .repositories()
         .database()
         .call(move |connection| {
-            let mut held = list_held_for(connection, AgentMessageReason::MessagingOff)?;
-            held.extend(list_held_for(
-                connection,
-                AgentMessageReason::RecipientModeAboveSender,
-            )?);
+            let held = list_held_for_release(connection)?;
             let now = crate::mcp::control::now_iso();
             let mut ready = Vec::new();
             for message in held {

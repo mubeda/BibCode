@@ -481,6 +481,23 @@ pub(crate) fn list_held_for(
     Ok(rows)
 }
 
+/// The agent messages held for the setting or the mode ceiling, in one acceptance order across
+/// both reasons, so a release requeues them in the order they were accepted (R13).
+pub(crate) fn list_held_for_release(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<AgentMessageRow>> {
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+          WHERE status = 'held' AND reason IN ('messaging_off', 'recipient_mode_above_sender')
+            AND sender_kind = 'agent'
+          ORDER BY rowid"
+    ))?;
+    let rows = statement
+        .query_map([], decode)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The messages that must not wait in a queue, whose entry still does: a final one, or one held
 /// for the setting or the mode ceiling (a message held for its recipient's paused queue or an
 /// uncertain delivery keeps its entry for a person). Acceptance order.
@@ -517,25 +534,36 @@ pub(crate) fn is_agent_message_delivery(
     )?)
 }
 
-/// The hop of the agent message that started the active turn of `sender_thread_id`'s session:
-/// the message whose recorded turn is that turn, or whose queue entry's thread message is the
-/// one that turn's marker bound. `None` when neither exists, as for a turn a person started.
+/// The hop the chain of `sender_thread_id` stands at: the hop of the agent message that started
+/// its latest agent-started turn (the message whose recorded turn it is, or whose thread message
+/// its marker names, a marker not yet bound to a turn included), unless a later turn of the
+/// thread started from a message that is not an agent's, which only a person writes. `None`
+/// when no agent message started a turn since. A turn with no known message resets nothing, and
+/// neither does the end of a turn or time (R14); turns are ordered by their row, never by time.
 pub(crate) fn trigger_hop(
     connection: &rusqlite::Connection,
     sender_thread_id: &str,
 ) -> Result<Option<u32>> {
     Ok(connection
         .query_row(
-            "SELECT MAX(message.hop)
-               FROM projection_thread_sessions AS session
-               JOIN agent_messages AS message
-                 ON message.recipient_address = 'thread:' || session.thread_id
-                AND message.sender_kind = 'agent'
-                AND (message.recipient_turn_id = session.active_turn_id
-                     OR message.delivery_message_id IN (
-                          SELECT turn.pending_message_id FROM projection_turns AS turn
-                           WHERE turn.thread_id = session.thread_id AND turn.turn_id = session.active_turn_id))
-              WHERE session.thread_id = ?1 AND session.active_turn_id IS NOT NULL",
+            "WITH started AS (
+               SELECT turn.row_id, message.hop
+                 FROM projection_turns AS turn
+                 JOIN agent_messages AS message
+                   ON message.recipient_address = 'thread:' || turn.thread_id
+                  AND message.sender_kind = 'agent'
+                  AND ((turn.turn_id IS NOT NULL AND message.recipient_turn_id = turn.turn_id)
+                       OR message.delivery_message_id = turn.pending_message_id)
+                WHERE turn.thread_id = ?1),
+             latest AS (SELECT MAX(row_id) AS row_id FROM started)
+             SELECT MAX(started.hop) FROM started JOIN latest ON started.row_id = latest.row_id
+              WHERE NOT EXISTS(
+                SELECT 1 FROM projection_turns AS later
+                 WHERE later.thread_id = ?1 AND later.row_id > latest.row_id
+                   AND later.pending_message_id IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM agent_messages AS agent
+                                   WHERE agent.delivery_message_id = later.pending_message_id
+                                     AND agent.sender_kind = 'agent'))",
             params![sender_thread_id],
             |row| row.get::<_, Option<u32>>(0),
         )
