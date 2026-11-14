@@ -175,7 +175,7 @@ A session that failed reads **Failed** in Done.
 
 **Which AI Terminals report a status.** On macOS and Linux, Claude, Codex and
 OpenCode AI Terminals report their agent's status. A Claude Terminal needs Claude
-Code 2.1.220 to 2.1.319, installed directly or through mise. A newer Claude Code
+Code 2.1.220 to 2.1.323, installed directly or through mise. A newer Claude Code
 reads **Status unavailable** until a BiBCode update verifies it. On macOS it must
 also be Anthropic's signed build. On a slow Linux disk, a Claude Terminal can
 also read **Status unavailable** when copying the build takes longer than
