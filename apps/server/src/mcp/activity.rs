@@ -698,43 +698,93 @@ fn target(arguments: &Map<String, Value>, content: &Value) -> Value {
     Value::Object(target)
 }
 
-/// Records each agent messaging outcome as one content-free row: ids, the two thread titles
-/// and a state name, never message text. The write is spawned, so a send never waits on the
-/// database. One task writes the rows in the order the outcomes arrive. Call it inside a Tokio
-/// runtime.
+/// [`agent_message_writer`]'s sink, its writer left to end with the last sender.
 #[cfg(test)]
 pub(crate) fn agent_message_sink(activity: McpActivity) -> OutcomeSink {
     agent_message_writer(activity).0
 }
 
-/// [`agent_message_sink`] and the handle the runtime stops its writer with.
+/// Records each agent messaging outcome as one content-free row: ids, the two thread titles
+/// and a state name, never message text. The sink maps the outcome to its row in the caller,
+/// so the queue never holds a caller's raw input, and never waits: past
+/// [`MESSAGE_QUEUE`] rows it drops the row and counts it. One task writes the rows in the
+/// order they arrive, until [`AgentMessageWriter::close`]. Call it inside a Tokio runtime.
 pub(crate) fn agent_message_writer(activity: McpActivity) -> (OutcomeSink, AgentMessageWriter) {
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let task = tokio::spawn(async move {
-        while let Some(outcome) = receiver.recv().await {
-            activity.record(agent_message_row(outcome)).await;
-        }
-    });
+    let (sender, receiver) = mpsc::channel(MESSAGE_QUEUE);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(write_agent_messages(
+        activity,
+        receiver,
+        stop.clone(),
+        dropped.clone(),
+    ));
     let sink: OutcomeSink = Arc::new(move |outcome| {
-        let _ = sender.send(outcome);
+        // A closed writer drops it silently: the runtime is stopping.
+        if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(agent_message_row(outcome))
+        {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
     });
     (
         sink,
         AgentMessageWriter {
+            stop,
             task: Mutex::new(Some(task)),
         },
     )
 }
 
+/// Rows an agent message writer queues at most.
+const MESSAGE_QUEUE: usize = 1_024;
+
+async fn write_agent_messages(
+    activity: McpActivity,
+    mut receiver: mpsc::Receiver<NewActivity>,
+    stop: CancellationToken,
+    dropped: Arc<AtomicUsize>,
+) {
+    loop {
+        let row = tokio::select! {
+            biased;
+            row = receiver.recv() => row,
+            () = stop.cancelled() => {
+                receiver.close();
+                receiver.recv().await
+            }
+        };
+        let Some(row) = row else {
+            break;
+        };
+        activity.record(row).await;
+        let count = dropped.swap(0, Ordering::Relaxed);
+        if count > 0 {
+            tracing::warn!(count, "agent message activity rows were dropped: the writer fell behind");
+        }
+    }
+}
+
 /// The writer of agent message rows, which the runtime closes in its stop.
 pub(crate) struct AgentMessageWriter {
-    #[expect(dead_code, reason = "joined once the writer can be closed")]
+    stop: CancellationToken,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AgentMessageWriter {
-    /// Not implemented yet.
-    pub(crate) async fn close(&self) {}
+    /// Refuses new rows, writes every queued one and waits for the writer to end.
+    pub(crate) async fn close(&self) {
+        self.stop.cancel();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "the agent message activity writer ended abnormally");
+        }
+    }
 }
 
 fn agent_message_row(outcome: MessageOutcome) -> NewActivity {
