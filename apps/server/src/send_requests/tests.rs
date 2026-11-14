@@ -1346,6 +1346,47 @@ async fn state_a_failed_or_interrupted_turn_is_not_answered_with_its_reason() {
     }
 }
 
+async fn assistant_output(harness: &Harness, turn_id: &str, delta: Option<&str>) {
+    let mut command = json!({
+        "type": "thread.message.assistant.complete",
+        "commandId": format!("output-{turn_id}-{}", uuid::Uuid::new_v4()),
+        "threadId": "b", "messageId": format!("reply-{turn_id}"),
+        "turnId": turn_id, "createdAt": AT,
+    });
+    if let Some(delta) = delta {
+        command["type"] = json!("thread.message.assistant.delta");
+        command["delta"] = json!(delta);
+    }
+    dispatch(harness, command).await;
+}
+
+#[tokio::test]
+async fn state_an_answer_still_streaming_when_its_turn_completes_is_stored_whole() {
+    let (harness, service, stop) = followed().await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    turn_session(&harness, "b", "t1", "running").await;
+    until_state(&harness, &service, "r1", SendState::Read).await;
+    assistant_output(&harness, "t1", Some("First half, ")).await;
+
+    // The provider runtime settles the session, which completes the turn, before it settles
+    // the turn's streaming message, and output can still arrive in between.
+    turn_session(&harness, "b", "t1", "ready").await;
+    service.sweep().await;
+    assert_eq!(
+        stored_request(&harness, "r1").await.state,
+        SendState::Read,
+        "an answer that still streams does not end the request"
+    );
+    assistant_output(&harness, "t1", Some("second half.")).await;
+    assistant_output(&harness, "t1", None).await;
+
+    let row = until_state(&harness, &service, "r1", SendState::Answered).await;
+    assert_eq!(row.answer_text.as_deref(), Some("First half, second half."));
+    assert_eq!(row.answer_message_id.as_deref(), Some("reply-t1"));
+    stop.cancel();
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn state_the_targets_queue_is_paused() {
     let (harness, service, stop) = followed().await;
@@ -2414,6 +2455,65 @@ async fn manage_subscribe_filters_by_source_thread_and_delivers_changes() {
     assert!(
         changes[0]["request"].get("answerText").is_none(),
         "a stream event carries no answer text"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_subscribe_hears_a_new_request_that_stays_queued() {
+    let harness = harness().await;
+    session(&harness, "b", "running").await;
+    ask(&harness, "b", "approval.requested").await;
+    session(&harness, "b", "ready").await;
+    let service = harness.send_requests();
+    let mut receiver = service.subscribe(&person(), Some("a".to_owned()), CancellationToken::new());
+    assert_eq!(
+        stream_events(&mut receiver).await,
+        [json!({ "type": "snapshot", "requests": [] })]
+    );
+
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+
+    let events = stream_events(&mut receiver).await;
+    assert_eq!(events.len(), 1, "one upsert for the new request: {events:?}");
+    assert_eq!(events[0]["type"], "upsert");
+    assert_eq!(events[0]["request"]["requestId"], "r1");
+    assert_eq!(events[0]["request"]["state"], "queued");
+
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    assert_eq!(
+        stream_events(&mut receiver).await,
+        Vec::<Value>::new(),
+        "a replay publishes nothing"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manage_subscribe_hears_a_new_request_before_its_turn_is_queued() {
+    let harness = harness().await;
+    let changes = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let published = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = service_with(&harness, {
+        let (changes, published) = (changes.clone(), published.clone());
+        move |_| {
+            let mut changes = changes.lock().unwrap();
+            let changes: &mut tokio::sync::broadcast::Receiver<RequestChange> =
+                changes.as_mut().unwrap();
+            while let Ok(RequestChange::Upsert(row)) = changes.try_recv() {
+                published.lock().unwrap().push(row.state);
+            }
+            Box::pin(async {})
+        }
+    });
+    *changes.lock().unwrap() = Some(service.subscribe_changes());
+
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+
+    assert_eq!(
+        *published.lock().unwrap(),
+        [SendState::Queued],
+        "the queued request is published before its turn is dispatched, so no later state of it can come first"
     );
     harness.shutdown().await;
 }
