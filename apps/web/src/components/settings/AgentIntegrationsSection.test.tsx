@@ -405,6 +405,31 @@ describe("AgentIntegrationsSection", () => {
       expect(describedText(container, toggle)).toBe("Update this server to use agent messaging.");
     });
 
+    it("disables the switch and says it is reconnecting while a connected server's transport is down", async () => {
+      // The config subscription keeps its last snapshot, so the capability is still reported.
+      h.environments = [environment({ connection: { phase: "reconnecting" } })];
+      const container = await render();
+      const toggle = messagingSwitch(container);
+      expect(toggle.disabled).toBe(true);
+      expect(describedText(container, toggle)).toContain("Reconnecting to This Mac");
+    });
+
+    it("lets a screen reader reach what enabling it permits from the switch", async () => {
+      const container = await render();
+      const ids = (messagingSwitch(container).getAttribute("aria-describedby") ?? "").split(" ");
+      const text = ids.map((id) => container.querySelector(`[id="${id}"]`)?.textContent ?? "");
+      expect(text.join(" ")).toContain("Let agents in the same project message each other");
+    });
+
+    it("references the explanation together with the reason while disabled", async () => {
+      h.environments = [environment({ connection: { phase: "reconnecting" } })];
+      const container = await render();
+      const ids = (messagingSwitch(container).getAttribute("aria-describedby") ?? "").split(" ");
+      const text = ids.map((id) => container.querySelector(`[id="${id}"]`)?.textContent ?? "");
+      expect(text.join(" ")).toContain("Let agents in the same project message each other");
+      expect(text.join(" ")).toContain("Reconnecting to This Mac");
+    });
+
     it("says what failed when the change is not saved", async () => {
       h.updateResult = AsyncResult.failure(Cause.fail(new Error("The server refused the change.")));
       const container = await render();
