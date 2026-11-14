@@ -871,4 +871,60 @@ mod tests {
             assert_eq!(get_message(&connection, &id).unwrap().unwrap(), before);
         }
     }
+
+    /// Thread `a` takes turn `turn_id`, started by its user message `message_id` whose actor
+    /// is `actor` (`None` for a person).
+    fn turn_started(
+        connection: &rusqlite::Connection,
+        turn_id: &str,
+        message_id: &str,
+        actor: Option<&str>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at, actor_json)
+                 VALUES (?1, 'a', 'user', 'hello', 0, '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z', ?2)",
+                params![message_id, actor],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, state, requested_at, checkpoint_files_json)
+                 VALUES ('a', ?1, ?2, 'completed', '2026-11-14T00:00:00Z', '[]')",
+                params![turn_id, message_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn only_a_persons_message_resets_the_hop_chain() {
+        let mut connection = connection();
+        let trigger = NewAgentMessage {
+            recipient_address: "thread:a".to_owned(),
+            sender_address: "thread:b".to_owned(),
+            hop: 8,
+            delivery_message_id: Some("dm8".to_owned()),
+            ..message("m8")
+        };
+        insert(&mut connection, &trigger);
+        turn_started(
+            &connection,
+            "t1",
+            "dm8",
+            Some(r#"{"kind":"hosted-agent","address":"thread:b","label":"B"}"#),
+        );
+        assert_eq!(trigger_hop(&connection, "a").unwrap(), Some(8));
+
+        // `bibcode thread send` from inside a hosted agent: an outside client's message.
+        turn_started(
+            &connection,
+            "t2",
+            "cli",
+            Some(r#"{"kind":"mcp-client","clientId":"session","label":"MCP"}"#),
+        );
+        assert_eq!(trigger_hop(&connection, "a").unwrap(), Some(8));
+
+        turn_started(&connection, "t3", "person", None);
+        assert_eq!(trigger_hop(&connection, "a").unwrap(), None);
+    }
 }
