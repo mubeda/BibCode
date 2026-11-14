@@ -2084,7 +2084,7 @@ mod no_user_authority {
 
     impl Harness {
         /// The provider of `thread_id` asks `kind` (`approval` or `user-input`) `request_id`.
-        async fn provider_asks(&self, thread_id: &str, kind: &str, request_id: &str) {
+        pub(super) async fn provider_asks(&self, thread_id: &str, kind: &str, request_id: &str) {
             let payload = match kind {
                 "approval" => json!({ "requestId": request_id, "requestKind": "command" }),
                 _ => {
@@ -2096,7 +2096,7 @@ mod no_user_authority {
         }
 
         /// The provider of `thread_id` reports `kind` `request_id` resolved with `payload`.
-        async fn provider_resolves(&self, thread_id: &str, kind: &str, payload: Value) {
+        pub(super) async fn provider_resolves(&self, thread_id: &str, kind: &str, payload: Value) {
             self.provider_activity(thread_id, &format!("{kind}.resolved"), payload)
                 .await;
         }
@@ -2187,7 +2187,7 @@ mod no_user_authority {
             assert_eq!(responses[0].1, "person-answer");
         }
 
-        async fn sent_text(&self, caller: &str, to: &str, text: &str) -> String {
+        pub(super) async fn sent_text(&self, caller: &str, to: &str, text: &str) -> String {
             let result = self.agent_send(caller, send_arguments(to, text)).await;
             assert_ne!(result["isError"], true, "{result}");
             structured(&result)["messageId"]
@@ -2509,5 +2509,521 @@ mod idempotent_sends {
 
         assert_eq!(error_tag(&retry), "AgentMessagingDisabledError");
         harness.shutdown().await;
+    }
+}
+
+// ---- Review findings on tasks 6.1 to 6.3 ----
+
+mod safety_review {
+    use super::*;
+    use crate::orchestration::{OrchestrationCommand, engine::resend_command_id};
+
+    impl Harness {
+        /// The queue entry of `message_id` was delivered into the saved conversation of
+        /// `thread_id`, its turn `turn_id` ran near the context limit and failed at it before any
+        /// output, so the failure is recovered by a compaction; returns that compaction's id.
+        async fn fails_at_the_context_limit(
+            &self,
+            thread_id: &str,
+            message_id: &str,
+            turn_id: &str,
+        ) -> String {
+            let command_id = self
+                .message_row(message_id)
+                .await
+                .delivery_command_id
+                .expect("queue entry");
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_turn_outbox SET state = 'delivered', attempts = 1, provider_session_id = 'conversation' WHERE command_id = ?1",
+                        [&command_id],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("delivered");
+            let session = |status: &str, active: Option<&str>| {
+                json!({
+                    "threadId": thread_id, "status": status, "providerName": "codex",
+                    "providerInstanceId": "codex", "runtimeMode": "full-access",
+                    "activeTurnId": active, "lastError": null, "updatedAt": CREATED_AT,
+                })
+            };
+            let mut failed = session("error", None);
+            failed["lastError"] = json!("The context window is full.");
+            failed["lastErrorClass"] = json!("context_limit");
+            for value in [
+                json!({
+                    "type": "thread.session.set", "commandId": format!("running-{turn_id}"),
+                    "threadId": thread_id, "session": session("running", Some(turn_id)),
+                    "createdAt": CREATED_AT,
+                }),
+                json!({
+                    "type": "thread.activity.append", "commandId": format!("reading-{turn_id}"),
+                    "threadId": thread_id,
+                    "activity": {
+                        "id": format!("reading-{turn_id}"), "tone": "info",
+                        "kind": "context-window.updated", "summary": "Context window updated",
+                        "payload": {
+                            "usedTokens": 961_230, "maxTokens": 1_000_000,
+                            "compactsAutomatically": true, "autoCompactTokens": 967_000,
+                            "providerInstanceId": "codex", "conversationId": "conversation",
+                        },
+                        "turnId": turn_id, "createdAt": CREATED_AT,
+                    },
+                    "createdAt": CREATED_AT,
+                }),
+                json!({
+                    "type": "thread.session.set", "commandId": format!("limit-{turn_id}"),
+                    "threadId": thread_id, "session": failed,
+                    "contextLimit": { "turnId": turn_id, "beforeOutput": true },
+                    "createdAt": CREATED_AT,
+                }),
+            ] {
+                self.engine
+                    .dispatch(command(value))
+                    .await
+                    .expect("provider event");
+            }
+            let compactions = self
+                .engine
+                .unsettled_thread_compactions()
+                .await
+                .expect("compactions");
+            assert_eq!(compactions.len(), 1, "one recovery: {compactions:?}");
+            compactions[0].compaction_id.clone()
+        }
+
+        async fn settle(&self, thread_id: &str, compaction_id: &str, outcome: &str) {
+            self.engine
+                .dispatch(OrchestrationCommand::ThreadCompactionSettle {
+                    command_id: format!("server:compaction-settle:{compaction_id}"),
+                    thread_id: thread_id.to_owned(),
+                    compaction_id: compaction_id.to_owned(),
+                    outcome: outcome.to_owned(),
+                    detail: None,
+                    restarted: false,
+                    created_at: CREATED_AT.to_owned(),
+                })
+                .await
+                .expect("settled");
+        }
+
+        async fn is_agent_delivery(&self, command_id: String, message_id: String) -> bool {
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    crate::agent_messaging::store::is_agent_message_delivery(
+                        connection,
+                        &command_id,
+                        &message_id,
+                    )
+                })
+                .await
+                .expect("readable")
+        }
+    }
+
+    /// N1: the copy a context-limit recovery sends is still the agent's message, so the claim
+    /// gate holds it while messaging is off.
+    #[tokio::test]
+    async fn a_context_limit_resend_is_held_while_messaging_is_off() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent("a", "thread:p").await;
+        let failed = harness.message_row(&message_id).await;
+        let compaction = harness
+            .fails_at_the_context_limit("p", &message_id, "turn-p")
+            .await;
+        harness.messaging_enabled.send_replace(false);
+
+        harness.settle("p", &compaction, "completed").await;
+
+        let copy = resend_command_id(&failed.delivery_message_id.expect("delivery message"));
+        let claimed = harness
+            .engine
+            .repositories()
+            .claim_provider_turn(copy.clone(), CREATED_AT.to_owned())
+            .await
+            .expect("claim");
+        assert!(claimed.is_none(), "the copy reached the provider");
+        let row = harness.message_row(&message_id).await;
+        assert_eq!(row.delivery_command_id.as_deref(), Some(copy.as_str()));
+        assert_eq!(row.status.as_str(), "held");
+        assert_eq!(row.reason, Some(AgentMessageReason::MessagingOff));
+        harness.shutdown().await;
+    }
+
+    /// N1: the copy is delivered as an agent message (the envelope treatment) and the message's
+    /// status follows the copy, not the failed turn.
+    #[tokio::test]
+    async fn a_context_limit_resend_is_delivered_as_the_agent_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent("a", "thread:p").await;
+        let failed = harness.message_row(&message_id).await;
+        let compaction = harness
+            .fails_at_the_context_limit("p", &message_id, "turn-p")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(
+            harness.message_row(&message_id).await.status.as_str(),
+            "failed",
+            "a recovered turn does not fail the message"
+        );
+
+        harness.settle("p", &compaction, "completed").await;
+
+        let row = harness.message_row(&message_id).await;
+        let (copy_command, copy_message) = (
+            row.delivery_command_id.clone().expect("copy"),
+            row.delivery_message_id.clone().expect("copy"),
+        );
+        assert_ne!(
+            Some(copy_command.as_str()),
+            failed.delivery_command_id.as_deref()
+        );
+        assert!(harness.is_agent_delivery(copy_command, copy_message).await);
+        assert_eq!(
+            row.recipient_turn_id, None,
+            "the failed turn is not its turn"
+        );
+        assert!(harness.claim(&message_id).await.is_some());
+        harness.provider_turn("p", "turn-copy", "Port", true).await;
+        harness.until_status(&message_id, "completed").await;
+        harness.shutdown().await;
+    }
+
+    /// N1: a recovery that ends without a copy fails the message with its turn.
+    #[tokio::test]
+    async fn a_failed_recovery_fails_the_agent_message() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent("a", "thread:p").await;
+        let compaction = harness
+            .fails_at_the_context_limit("p", &message_id, "turn-p")
+            .await;
+
+        harness.settle("p", &compaction, "failed").await;
+
+        let row = harness.until_status(&message_id, "failed").await;
+        assert_eq!(row.reason, Some(AgentMessageReason::RecipientTurnFailed));
+        harness.shutdown().await;
+    }
+
+    impl Harness {
+        /// B's turn ended with `kind` still open, as after a restart, and A's message waits in
+        /// B's queue; returns its id.
+        async fn queued_behind_an_open(&self, kind: &str) -> String {
+            self.messaging_threads().await;
+            self.provider_turn("b", "turn-b", "working", true).await;
+            self.provider_asks("b", kind, "r1").await;
+            let message_id = self.sent_text("a", "thread:b", "approve it").await;
+            self.until_status(&message_id, "queued").await;
+            message_id
+        }
+
+        async fn promote(&self, message_id: &str) -> Result<(), String> {
+            let row = self.message_row(message_id).await;
+            self.engine
+                .dispatch(command(json!({
+                    "type": "thread.turn.promote", "commandId": "person-send-now",
+                    "threadId": "b", "messageId": row.delivery_message_id.expect("entry"),
+                    "createdAt": CREATED_AT,
+                })))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+
+        async fn force_pending(&self, message_id: &str) {
+            let command_id = self
+                .message_row(message_id)
+                .await
+                .delivery_command_id
+                .expect("entry");
+            self.repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_turn_outbox SET state = 'pending' WHERE command_id = ?1",
+                        [&command_id],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("pending");
+        }
+    }
+
+    const WAITS_FOR_AN_ANSWER: &str =
+        "An agent message waits for the open approval or question to be answered.";
+
+    /// N2: Send now does not take an agent message past an open approval or question.
+    #[tokio::test]
+    async fn send_now_does_not_take_an_agent_message_past_an_open_ask() {
+        for kind in ["approval", "user-input"] {
+            let harness = Harness::new().await;
+            let message_id = harness.queued_behind_an_open(kind).await;
+
+            let refused = harness.promote(&message_id).await.expect_err(kind);
+
+            assert!(refused.contains(WAITS_FOR_AN_ANSWER), "{kind}: {refused}");
+            assert!(!refused.contains("approve it"), "{refused}");
+            let command_id = harness
+                .message_row(&message_id)
+                .await
+                .delivery_command_id
+                .expect("entry");
+            assert_eq!(harness.entry_state(&command_id).await, "queued", "{kind}");
+            harness.shutdown().await;
+        }
+    }
+
+    /// N2: whatever made the entry pending, the claim does not hand an agent message to a
+    /// recipient with an open approval or question; it does once the ask is answered.
+    #[tokio::test]
+    async fn the_claim_waits_for_an_open_ask() {
+        for (kind, resolved) in [
+            (
+                "approval",
+                json!({ "requestId": "r1", "decision": "accept" }),
+            ),
+            (
+                "user-input",
+                json!({ "requestId": "r1", "answers": { "color": "Red" } }),
+            ),
+        ] {
+            let harness = Harness::new().await;
+            let message_id = harness.queued_behind_an_open(kind).await;
+            harness.stop_delivery().await;
+            harness.force_pending(&message_id).await;
+
+            assert!(harness.claim(&message_id).await.is_none(), "{kind}");
+            let row = harness.message_row(&message_id).await;
+            assert_ne!(row.status.as_str(), "held", "{kind}: waits, not held");
+
+            harness.provider_resolves("b", kind, resolved).await;
+            assert!(harness.claim(&message_id).await.is_some(), "{kind}");
+            harness.shutdown().await;
+        }
+    }
+
+    /// N2: a person's own message keeps Send now past an open ask.
+    #[tokio::test]
+    async fn a_persons_send_now_is_unchanged_by_an_open_ask() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_asks("b", "approval", "r1").await;
+        let person = harness.person_queues("b").await;
+        harness.session_ends("b", "ready").await;
+        assert_eq!(harness.entry_state(&person).await, "queued");
+        let message_id = harness
+            .repositories
+            .get_provider_turn_delivery(person.clone())
+            .await
+            .expect("readable")
+            .expect("entry")
+            .message_id;
+
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn.promote", "commandId": "person-send-now",
+                "threadId": "b", "messageId": message_id, "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("a person's Send now");
+        harness.until_entry(&person, "delivered").await;
+        harness.shutdown().await;
+    }
+
+    /// N3: an early item that settles before the running event still ties the message to its
+    /// own turn.
+    #[tokio::test]
+    async fn an_early_item_that_settles_keeps_the_message_on_its_turn() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("a", "turn-a", "done", true).await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent_untracked("b", "thread:a").await;
+        harness
+            .delivery_moves(&message_id, &[("pending", "sending")])
+            .await;
+
+        harness.early_delta("a", "turn-t").await;
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.message.assistant.complete", "commandId": "early-complete",
+                "threadId": "a", "messageId": "reply-turn-t", "turnId": "turn-t",
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("early settled item");
+        harness.provider_turn("a", "turn-t", "Port", false).await;
+        harness
+            .delivery_moves(&message_id, &[("sending", "delivered")])
+            .await;
+
+        let row = harness.reconciled_status(&message_id).await;
+        assert_eq!(row.recipient_turn_id.as_deref(), Some("turn-t"));
+        assert_eq!(row.status.as_str(), "consumed");
+        harness.shutdown().await;
+    }
+
+    /// N3: a running event that names a turn older than the message never takes its marker.
+    #[tokio::test]
+    async fn an_older_turn_never_takes_the_marker() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.provider_turn("a", "turn-old", "done", true).await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent_untracked("b", "thread:a").await;
+        harness
+            .delivery_moves(
+                &message_id,
+                &[("pending", "sending"), ("sending", "delivered")],
+            )
+            .await;
+
+        harness.provider_turn("a", "turn-old", "again", false).await;
+
+        let row = harness.reconciled_status(&message_id).await;
+        assert_ne!(row.recipient_turn_id.as_deref(), Some("turn-old"));
+        assert_eq!(row.status.as_str(), "delivered");
+        harness.shutdown().await;
+    }
+
+    /// N4: a person cannot retry a failed agent delivery, even before the tracker withdrew it.
+    #[tokio::test]
+    async fn a_failed_agent_delivery_cannot_be_retried_before_the_tracker_sees_it() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let message_id = harness.sent_untracked("a", "thread:p").await;
+        harness
+            .delivery_moves(
+                &message_id,
+                &[("pending", "sending"), ("sending", "failed")],
+            )
+            .await;
+        let row = harness.message_row(&message_id).await;
+        assert_eq!(row.status.as_str(), "accepted", "no tracker has seen it");
+
+        let refused = harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn-delivery.resolve", "commandId": "person-retry",
+                "threadId": "p", "messageId": row.delivery_message_id.clone().expect("entry"),
+                "action": "retry", "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect_err("an agent message is not retried")
+            .to_string();
+
+        assert!(
+            refused.contains(
+                "A failed agent message is not sent again. Its sender can send it again."
+            ),
+            "{refused}"
+        );
+        assert!(!refused.contains("hello"), "{refused}");
+        let command_id = row.delivery_command_id.expect("entry");
+        assert_eq!(harness.entry_state(&command_id).await, "failed");
+        assert!(harness.claim(&message_id).await.is_none());
+        harness.shutdown().await;
+    }
+
+    /// N4: a person's own failed delivery is still retried.
+    #[tokio::test]
+    async fn a_persons_failed_delivery_is_still_retried() {
+        let harness = Harness::new().await;
+        harness.messaging_threads().await;
+        harness.stop_delivery().await;
+        let person = harness.person_queues("p").await;
+        let entry = harness
+            .repositories
+            .get_provider_turn_delivery(person.clone())
+            .await
+            .expect("readable")
+            .expect("entry");
+        harness
+            .engine
+            .transition_turn_delivery(TurnDeliveryTransition {
+                turn_id: None,
+                command_id: person.clone(),
+                expected_states: vec![TurnDeliveryState::Pending],
+                expected_attempt: entry.attempts,
+                next_state: TurnDeliveryState::Failed,
+                detail: None,
+                updated_at: CREATED_AT.to_owned(),
+            })
+            .await
+            .expect("failed");
+
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn-delivery.resolve", "commandId": "person-retry",
+                "threadId": "p", "messageId": entry.message_id, "action": "retry",
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("a person's retry");
+        assert_eq!(harness.entry_state(&person).await, "pending");
+        harness.shutdown().await;
+    }
+
+    /// N5: a retry with the same clientRequestId replays the stored receipt after its
+    /// recipient was archived or deleted, for a send and for a reply.
+    #[tokio::test]
+    async fn a_replay_does_not_need_a_live_recipient() {
+        for gone in ["thread.archive", "thread.delete"] {
+            let harness = Harness::new().await;
+            harness.messaging_threads().await;
+            let arguments =
+                json!({ "to": "thread:p", "text": "Which port?", "clientRequestId": "k" });
+            let first = harness.agent_send("a", arguments.clone()).await;
+            assert_ne!(first["isError"], true, "{first}");
+            let m1 = harness.sent("b", "thread:a").await;
+            let reply = json!({ "inReplyTo": m1, "text": "Port 5173", "clientRequestId": "r" });
+            let first_reply = harness
+                .agent_tool("a", "agent_message_reply", reply.clone())
+                .await;
+            assert_ne!(first_reply["isError"], true, "{first_reply}");
+            for thread_id in ["p", "b"] {
+                harness
+                    .engine
+                    .dispatch(command(json!({
+                        "type": gone, "commandId": format!("{gone}-{thread_id}"),
+                        "threadId": thread_id,
+                    })))
+                    .await
+                    .expect("gone");
+            }
+
+            let retry = harness.agent_send("a", arguments).await;
+            let reply_retry = harness.agent_tool("a", "agent_message_reply", reply).await;
+
+            assert_ne!(retry["isError"], true, "{gone}: {retry}");
+            assert_eq!(
+                structured(&first)["messageId"],
+                structured(&retry)["messageId"],
+                "{gone}"
+            );
+            assert_ne!(reply_retry["isError"], true, "{gone}: {reply_retry}");
+            assert_eq!(
+                structured(&first_reply)["messageId"],
+                structured(&reply_retry)["messageId"],
+                "{gone}"
+            );
+            harness.shutdown().await;
+        }
     }
 }
