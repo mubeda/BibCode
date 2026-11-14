@@ -400,4 +400,68 @@ mod tests {
         assert!(!is_person_message(&agent_envelope(2, "hi")));
         assert!(!is_person_message(&message(3, "assistant", "hi")));
     }
+
+    /// A message whose timestamp has the given fractional-second text.
+    fn stamped(id: usize, role: &str, created_at: &str) -> ProjectionThreadMessage {
+        let mut row = message(id, role, &format!("message {id}"));
+        row.created_at = created_at.to_owned();
+        row.updated_at = created_at.to_owned();
+        row
+    }
+
+    #[tokio::test]
+    async fn handoff_text_keeps_the_original_task_when_fractional_precision_differs() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("database");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let repositories = crate::persistence::Repositories::new(database);
+        // As text, ".123Z" sorts before ".12Z", although .12 is the earlier instant.
+        let mut rows = vec![
+            stamped(1, "user", "2026-01-01T10:00:00.12Z"),
+            stamped(2, "user", "2026-01-01T10:00:00.123Z"),
+        ];
+        rows.extend((3..43_usize).map(|id| {
+            let role = if id.is_multiple_of(2) { "assistant" } else { "user" };
+            stamped(id, role, &format!("2026-01-01T10:00:{:02}.5Z", id))
+        }));
+        for row in rows {
+            repositories.upsert_message(row).await.expect("message");
+        }
+        let stored = repositories
+            .list_messages_by_thread("t1".to_owned())
+            .await
+            .expect("messages");
+        let handoff = handoff_text(&stored, "");
+        assert_eq!(handoff.first_message.as_deref(), Some("[user] message 1"));
+        assert_eq!(handoff.tail.len(), THREAD_CONTEXT_MAX_MESSAGES);
+        // The second person message is older than the tail and is the only one left out.
+        assert_eq!(handoff.left_out, 1);
+        assert!(!handoff.tail.iter().any(|line| line == "[user] message 1"));
+    }
+
+    #[test]
+    fn handoff_text_orders_the_tail_by_instant_when_precision_differs() {
+        // Stored order is text order; the tail must still end with the latest instant.
+        let thread = vec![
+            stamped(1, "user", "2026-01-01T10:00:00.123Z"),
+            stamped(2, "assistant", "2026-01-01T10:00:00.5Z"),
+            stamped(3, "user", "2026-01-01T10:00:00.12Z"),
+        ];
+        let handoff = handoff_text(&thread, "");
+        assert_eq!(
+            handoff.render(),
+            "[user] message 3\n[user] message 1\n[assistant] message 2"
+        );
+        assert_eq!(
+            thread_context_lines(&thread, "").0.last().map(String::as_str),
+            Some("[assistant] message 2")
+        );
+    }
 }
