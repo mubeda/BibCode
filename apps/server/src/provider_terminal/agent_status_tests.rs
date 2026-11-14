@@ -219,7 +219,9 @@ fn ready_for_prompt_follows_each_provider_event() {
         ("PermissionRequest", None, false),
         ("Elicitation", None, false),
         ("PreToolUse", None, false),
-        ("Stop", None, true),
+        // A project's own Stop hook can block the stop, and Claude then continues without a
+        // new prompt; only the idle notification proves the prompt waits.
+        ("Stop", None, false),
         ("StopFailure", None, false),
         ("SessionEnd", None, false),
         ("Notification", Some("idle_prompt"), true),
