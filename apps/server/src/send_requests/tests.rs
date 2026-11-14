@@ -1805,22 +1805,24 @@ impl FileServer {
             service,
         };
         if first {
-            server.dispatch(json!({
-                "type": "project.create", "commandId": "project-create", "projectId": "p1",
-                "title": "Project", "workspaceRoot": workspace,
-                "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
-                "createdAt": AT,
-            }))
-            .await;
-            for thread_id in ["a", "b"] {
-                server.dispatch(json!({
-                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
-                    "threadId": thread_id, "projectId": "p1", "title": thread_id,
-                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
-                    "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
-                    "worktreePath": null, "createdAt": AT,
+            server
+                .dispatch(json!({
+                    "type": "project.create", "commandId": "project-create", "projectId": "p1",
+                    "title": "Project", "workspaceRoot": workspace,
+                    "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "createdAt": AT,
                 }))
                 .await;
+            for thread_id in ["a", "b"] {
+                server
+                    .dispatch(json!({
+                        "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                        "threadId": thread_id, "projectId": "p1", "title": thread_id,
+                        "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                        "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
+                        "worktreePath": null, "createdAt": AT,
+                    }))
+                    .await;
             }
         }
         server
@@ -2677,7 +2679,11 @@ async fn manage_subscribe_hears_a_new_request_that_stays_queued() {
     send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
 
     let events = stream_events(&mut receiver).await;
-    assert_eq!(events.len(), 1, "one upsert for the new request: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "one upsert for the new request: {events:?}"
+    );
     assert_eq!(events[0]["type"], "upsert");
     assert_eq!(events[0]["request"]["requestId"], "r1");
     assert_eq!(events[0]["request"]["state"], "queued");
