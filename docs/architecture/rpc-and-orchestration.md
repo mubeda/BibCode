@@ -4965,6 +4965,13 @@ terminal's **generation** (the process, `boot:process`), with no queue entry.
   end, the setting's hold and release and marking mail delivered do), obeying the mode ceiling (a terminal receives as
   `full-access`), the rate and backlog limits and the setting (`held` with `messaging_off` while it
   is off). A person's request goes through `accept_person` and skips all of that.
+- **Sender generation.** A row a terminal sends stores `sender_terminal_generation` (migration
+  76; `NULL` for a chat agent or a person). `status_as` and `cancel_as` match the sender's address
+  and generation, so a restarted terminal at the same address reads and cancels none of its
+  predecessor's rows. A reply to a terminal sender goes to that generation only: when another
+  generation runs, the reply is refused as `recipient_gone`, and a generation that ends while the
+  reply is stored ends the row in `accept`. The hop ledger and the rate and backlog limits stay
+  per address.
 - **Pointer.** One task (`TerminalPointer::start`) rescans on every terminal metadata change, new
   message and change of the setting. For each terminal with `queued` mail for its live generation
   it asks the terminal manager for a **write permit** at the PTY write boundary

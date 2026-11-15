@@ -250,6 +250,8 @@ struct Sender {
     title: String,
     provider: String,
     mode: String,
+    /// The generation of a terminal sender; `None` for a chat agent.
+    generation: Option<String>,
 }
 
 /// Where a send or reply goes.
@@ -467,7 +469,13 @@ impl AgentMessaging {
         {
             Some(receipt) => receipt,
             None => match self
-                .deliver_to(caller, &recipient, outgoing, attribution)
+                .deliver_to(
+                    caller,
+                    &recipient,
+                    original.sender_terminal_generation.as_deref(),
+                    outgoing,
+                    attribution,
+                )
                 .await
             {
                 Err(AgentMessagingError::UnknownRecipient) => {
@@ -532,6 +540,7 @@ impl AgentMessaging {
             accepted_at: now.clone(),
             sender_runtime_mode: None,
             recipient_terminal_generation: None,
+            sender_terminal_generation: caller.terminal_generation(),
             send_request_id: original.send_request_id.clone(),
             client_request_id: request.client_request_id.clone(),
             delivery_command_id: None,
@@ -676,7 +685,7 @@ impl AgentMessaging {
         {
             return Ok(receipt);
         }
-        self.deliver_to(caller, &recipient, outgoing, attribution)
+        self.deliver_to(caller, &recipient, None, outgoing, attribution)
             .await
     }
 
@@ -686,6 +695,7 @@ impl AgentMessaging {
         &self,
         caller: &AgentCaller,
         recipient: &Recipient,
+        terminal_generation: Option<&str>,
         outgoing: Outgoing<'_>,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
@@ -701,8 +711,15 @@ impl AgentMessaging {
                 self.deliver(&route, &sender, outgoing).await
             }
             Recipient::Terminal { owner, terminal } => {
-                self.deliver_to_terminal(caller, owner, terminal, outgoing, attribution)
-                    .await
+                self.deliver_to_terminal(
+                    caller,
+                    owner,
+                    terminal,
+                    terminal_generation,
+                    outgoing,
+                    attribution,
+                )
+                .await
             }
         }
     }
@@ -715,6 +732,7 @@ impl AgentMessaging {
                 title: route.sender.title.clone(),
                 provider: route.sender_provider.clone(),
                 mode: route.sender.runtime_mode.clone(),
+                generation: None,
             },
             AgentCaller::Terminal(identity) => {
                 let address = identity.address();
@@ -724,6 +742,7 @@ impl AgentMessaging {
                     title: description.title,
                     provider: description.provider,
                     mode: route.sender.runtime_mode.clone(),
+                    generation: Some(identity.generation_key()),
                 }
             }
         }
@@ -897,6 +916,7 @@ impl AgentMessaging {
                     accepted_at: now.clone(),
                     sender_runtime_mode: Some(sender_mode.clone()),
                     recipient_terminal_generation: None,
+                    sender_terminal_generation: sender.generation.clone(),
                     send_request_id: None,
                     client_request_id: outgoing.client_request_id.map(str::to_owned),
                     delivery_command_id: Some(command_id.clone()),
@@ -1206,6 +1226,14 @@ impl AgentCaller {
         }
     }
 
+    /// The generation of a terminal caller, as a message row stores it; `None` for a chat agent.
+    pub(crate) fn terminal_generation(&self) -> Option<String> {
+        match self {
+            Self::Thread(_) => None,
+            Self::Terminal(identity) => Some(identity.generation_key()),
+        }
+    }
+
     /// The thread whose project and runtime mode the caller has: a terminal's host thread.
     pub(crate) fn owner_thread_id(&self) -> &str {
         match self {
@@ -1313,6 +1341,7 @@ impl AgentMessaging {
         caller: &AgentCaller,
         owner_thread_id: &str,
         terminal_id: &str,
+        expected_generation: Option<&str>,
         outgoing: Outgoing<'_>,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
@@ -1346,6 +1375,12 @@ impl AgentMessaging {
             terminal_id: terminal_id.to_owned(),
             generation,
         };
+        // A reply goes to the generation that sent the message replied to. Another generation
+        // at the same address is not that sender, so the reply is refused as for an ended
+        // terminal. A generation that ends after this check ends the stored row in `accept`.
+        if expected_generation.is_some_and(|expected| expected != recipient.generation_key()) {
+            return Err(AgentMessagingError::UnknownRecipient);
+        }
         let recipient_address = recipient.address();
         let new = NewAgentMessage {
             message_id: outgoing.message_id.to_owned(),
@@ -1361,6 +1396,7 @@ impl AgentMessaging {
             accepted_at: crate::mcp::control::now_iso(),
             sender_runtime_mode: Some(sender.mode),
             recipient_terminal_generation: None,
+            sender_terminal_generation: sender.generation.clone(),
             send_request_id: None,
             client_request_id: outgoing.client_request_id.map(str::to_owned),
             delivery_command_id: None,
@@ -1392,8 +1428,12 @@ impl AgentMessaging {
 
 /// `message` is an agent message `caller` sent. A person's request carries its source agent's
 /// address as its sender, but that agent never sent it, so it may neither see nor cancel it.
+/// `message` was sent by `caller`: by its thread, or by the terminal generation that sent it, so
+/// a restarted terminal at the same address reads and cancels none of its predecessor's mail.
 fn is_sent_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
-    message.sender_kind == SenderKind::Agent && message.sender_address == caller.address()
+    message.sender_kind == SenderKind::Agent
+        && message.sender_address == caller.address()
+        && message.sender_terminal_generation == caller.terminal_generation()
 }
 
 /// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it

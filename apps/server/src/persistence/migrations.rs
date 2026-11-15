@@ -3094,7 +3094,8 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
           delivery_command_id TEXT,
           delivery_message_id TEXT,
           updated_at TEXT NOT NULL,
-          recipient_turn_id TEXT
+          recipient_turn_id TEXT,
+          sender_terminal_generation TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_recipient_status
           ON agent_messages (recipient_address, status, accepted_at, message_id);
@@ -3871,6 +3872,7 @@ mod tests {
                 "delivery_message_id",
                 "updated_at",
                 "recipient_turn_id",
+                "sender_terminal_generation",
             ]
         );
         assert_eq!(

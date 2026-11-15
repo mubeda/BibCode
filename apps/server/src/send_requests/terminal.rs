@@ -115,6 +115,7 @@ pub(crate) async fn deliver_person_request(
         accepted_at: crate::mcp::control::now_iso(),
         sender_runtime_mode: None,
         recipient_terminal_generation: Some(target.generation_key()),
+        sender_terminal_generation: None,
         send_request_id: Some(row.request_id.clone()),
         client_request_id: None,
         delivery_command_id: None,

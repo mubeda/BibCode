@@ -135,6 +135,8 @@ pub struct NewAgentMessage {
     pub accepted_at: String,
     pub sender_runtime_mode: Option<String>,
     pub recipient_terminal_generation: Option<String>,
+    /// The generation of the terminal that sent it; `None` for a chat agent or a person.
+    pub sender_terminal_generation: Option<String>,
     pub send_request_id: Option<String>,
     pub client_request_id: Option<String>,
     pub delivery_command_id: Option<String>,
@@ -156,6 +158,8 @@ pub struct AgentMessageRow {
     pub accepted_at: String,
     pub sender_runtime_mode: Option<String>,
     pub recipient_terminal_generation: Option<String>,
+    /// The generation of the terminal that sent it; `None` for a chat agent or a person.
+    pub sender_terminal_generation: Option<String>,
     pub send_request_id: Option<String>,
     pub client_request_id: Option<String>,
     pub delivery_command_id: Option<String>,
@@ -199,7 +203,7 @@ pub struct RelinkAgentMessage {
     pub reason: Option<AgentMessageReason>,
 }
 
-const COLUMNS: &str = "message_id, conversation_id, sender_address, sender_kind, recipient_address, in_reply_to, hop, text, status, reason, accepted_at, sender_runtime_mode, recipient_terminal_generation, send_request_id, client_request_id, delivery_command_id, delivery_message_id, updated_at, recipient_turn_id";
+const COLUMNS: &str = "message_id, conversation_id, sender_address, sender_kind, recipient_address, in_reply_to, hop, text, status, reason, accepted_at, sender_runtime_mode, recipient_terminal_generation, send_request_id, client_request_id, delivery_command_id, delivery_message_id, updated_at, recipient_turn_id, sender_terminal_generation";
 
 fn decode(row: &Row<'_>) -> rusqlite::Result<AgentMessageRow> {
     let sender_kind: String = row.get(3)?;
@@ -222,6 +226,7 @@ fn decode(row: &Row<'_>) -> rusqlite::Result<AgentMessageRow> {
         accepted_at: row.get(10)?,
         sender_runtime_mode: row.get(11)?,
         recipient_terminal_generation: row.get(12)?,
+        sender_terminal_generation: row.get(19)?,
         send_request_id: row.get(13)?,
         client_request_id: row.get(14)?,
         delivery_command_id: row.get(15)?,
@@ -241,7 +246,7 @@ fn invalid_text(column: usize, value: &str) -> rusqlite::Error {
 
 pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, new: &NewAgentMessage) -> Result<()> {
     tx.execute(
-        &format!("INSERT INTO agent_messages ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?11, NULL)"),
+        &format!("INSERT INTO agent_messages ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?11, NULL, ?18)"),
         params![
             new.message_id,
             new.conversation_id,
@@ -260,6 +265,7 @@ pub(crate) fn insert_message(tx: &rusqlite::Transaction<'_>, new: &NewAgentMessa
             new.client_request_id,
             new.delivery_command_id,
             new.delivery_message_id,
+            new.sender_terminal_generation,
         ],
     )?;
     Ok(())
@@ -945,6 +951,7 @@ mod tests {
             accepted_at: "2026-11-14T00:00:00Z".to_owned(),
             sender_runtime_mode: Some("full-access".to_owned()),
             recipient_terminal_generation: Some("3".to_owned()),
+            sender_terminal_generation: None,
             send_request_id: Some("r1".to_owned()),
             client_request_id: Some("client-1".to_owned()),
             delivery_command_id: Some("c1".to_owned()),
@@ -979,6 +986,7 @@ mod tests {
                 accepted_at: "2026-11-14T00:00:00Z".to_owned(),
                 sender_runtime_mode: Some("full-access".to_owned()),
                 recipient_terminal_generation: Some("3".to_owned()),
+                sender_terminal_generation: None,
                 send_request_id: Some("r1".to_owned()),
                 client_request_id: Some("client-1".to_owned()),
                 delivery_command_id: Some("c1".to_owned()),
@@ -1195,6 +1203,7 @@ mod tests {
             status: AgentMessageStatus::Queued,
             reason: None,
             recipient_terminal_generation: Some("boot-1:1".to_owned()),
+            sender_terminal_generation: None,
             client_request_id: None,
             delivery_command_id: None,
             delivery_message_id: None,

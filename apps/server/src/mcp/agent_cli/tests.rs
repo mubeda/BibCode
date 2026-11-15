@@ -472,6 +472,7 @@ impl Route {
                     accepted_at: crate::mcp::control::now_iso(),
                     sender_runtime_mode: Some("full-access".to_owned()),
                     recipient_terminal_generation: None,
+                    sender_terminal_generation: None,
                     send_request_id: None,
                     client_request_id: None,
                     delivery_command_id: None,

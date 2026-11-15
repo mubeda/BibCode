@@ -4913,9 +4913,12 @@ notification, which Claude sends once the prompt has waited for input a while, a
 never send while the person is active in that terminal. The pointer line can arrive late or not at all then; this is an
 accepted limit. `bibcode agent inbox` always works.
 
-A message row keeps no sender generation, so a restarted terminal can read the status of, and
-cancel, the messages its predecessor sent, and a reply to a terminal lands in the process that
-runs now.
+A message a terminal sends keeps the generation that sent it. A restarted terminal at the same
+address can neither read the status of nor cancel its predecessor's messages: it gets
+`AgentMessagingUnknownMessageError`, as for a message it never sent. A reply to a message whose
+terminal sender has since restarted or exited is refused with `AgentMessagingRecipientGoneError`
+and never reaches the new process. The hop ledger and the rate and backlog limits still count
+per address.
 
 ### Errors of the provider tools
 

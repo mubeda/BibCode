@@ -888,6 +888,7 @@ mod tests {
             accepted_at: "2026-11-14T00:00:00Z".to_owned(),
             sender_runtime_mode: None,
             recipient_terminal_generation: None,
+            sender_terminal_generation: None,
             send_request_id: None,
             client_request_id: None,
             delivery_command_id: Some("agent-message:m1".to_owned()),
