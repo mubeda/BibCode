@@ -111,6 +111,26 @@ vi.mock("~/components/ui/popover", () => ({
   ),
 }));
 
+vi.mock("./sendToAgent/TerminalSendComposer", () => ({
+  TerminalSendComposer: ({
+    terminalId,
+    inCenterPanel,
+    viewportFocusTarget,
+  }: {
+    terminalId: string;
+    inCenterPanel?: boolean;
+    viewportFocusTarget?: unknown;
+  }) => (
+    <button
+      type="button"
+      aria-label="Send to agent"
+      data-send-terminal={terminalId}
+      data-in-center-panel={String(inCenterPanel)}
+      data-has-focus-target={String(typeof viewportFocusTarget === "function")}
+    />
+  ),
+}));
+
 import ThreadTerminalPanel, {
   TerminalViewport,
   resolveTerminalSelectionActionPosition,
@@ -878,5 +898,80 @@ describe("ThreadTerminalPanel sidebar labels", () => {
     expect(markup).toContain("Terminal 1");
     expect(markup).toContain("Terminal 2");
     expect(markup).toContain("bg-accent");
+  });
+});
+
+describe("ThreadTerminalPanel Send to agent", () => {
+  const SEND = 'aria-label="Send to agent"';
+
+  it("an_ai_terminal_shows_send_to_agent_in_both_toolbars_and_a_plain_terminal_shows_none", () => {
+    const ai = new Set(["term-1"]);
+    const floating = renderToStaticMarkup(
+      <ThreadTerminalPanel {...panelProps({ aiTerminalIds: ai })} />,
+    );
+    expect(floating).toContain('data-terminal-toolbar="floating"');
+    expect(floating).toContain(SEND);
+
+    const sidebar = renderToStaticMarkup(
+      <ThreadTerminalPanel
+        {...panelProps({
+          terminalIds: ["term-1", "term-2"],
+          activeTerminalId: "term-1",
+          aiTerminalIds: ai,
+        })}
+      />,
+    );
+    expect(sidebar).toContain('data-terminal-toolbar="sidebar"');
+    expect(sidebar).toContain('data-send-terminal="term-1"');
+
+    const plain = renderToStaticMarkup(<ThreadTerminalPanel {...panelProps()} />);
+    expect(plain).not.toContain(SEND);
+    expect(
+      renderToStaticMarkup(
+        <ThreadTerminalPanel
+          {...panelProps({ terminalIds: ["term-1", "term-2"], aiTerminalIds: new Set(["term-2"]) })}
+        />,
+      ),
+    ).not.toContain(SEND);
+  });
+
+  it("the control reads the active terminal of a split sidebar", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadTerminalPanel
+        {...panelProps({
+          terminalIds: ["term-1", "term-2"],
+          activeTerminalId: "term-2",
+          aiTerminalIds: new Set(["term-1", "term-2"]),
+        })}
+      />,
+    );
+    expect(markup).toContain('data-send-terminal="term-2"');
+    expect(markup).not.toContain('data-send-terminal="term-1"');
+  });
+
+  it("tells the control when its terminal lives in the center panel and where focus returns", () => {
+    const render = (owner: PanelProps["owner"]) =>
+      renderToStaticMarkup(
+        <ThreadTerminalPanel {...panelProps({ owner, aiTerminalIds: new Set(["term-1"]) })} />,
+      );
+    expect(render("center-panel")).toContain('data-in-center-panel="true"');
+    expect(render("right-panel")).toContain('data-in-center-panel="false"');
+    expect(render("right-panel")).toContain('data-has-focus-target="true"');
+  });
+
+  it("shows the control even when the host omits the split and new actions", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadTerminalPanel
+        {...panelProps({
+          owner: "center-panel",
+          onSplitTerminal: undefined,
+          onSplitTerminalVertical: undefined,
+          onNewTerminal: undefined,
+          aiTerminalIds: new Set(["term-1"]),
+        })}
+      />,
+    );
+    expect(markup).toContain(SEND);
+    expect(markup).not.toContain("data-terminal-toolbar-separator");
   });
 });

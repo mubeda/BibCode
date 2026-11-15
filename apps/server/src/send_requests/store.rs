@@ -190,6 +190,49 @@ fn placeholders(states: &[SendState]) -> String {
     vec!["?"; states.len()].join(", ")
 }
 
+/// [`SendRequestStore::transition`] inside the caller's transaction, so a request and another
+/// row can change together.
+pub(crate) fn transition_in(
+    transaction: &rusqlite::Transaction<'_>,
+    request_id: &str,
+    from: &[SendState],
+    change: StateChange,
+) -> Result<Option<SendRequestRow>> {
+    if from.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "UPDATE send_requests SET state = ?2, reason = ?3, \
+         answering_turn_id = COALESCE(?4, answering_turn_id), \
+         answer_message_id = COALESCE(?5, answer_message_id), \
+         answer_text = COALESCE(?6, answer_text), \
+         answer_truncated = CASE WHEN ?6 IS NULL THEN answer_truncated ELSE ?7 END, \
+         dismissed_at = CASE WHEN ?8 THEN COALESCE(dismissed_at, ?9) ELSE dismissed_at END, \
+         updated_at = ?9 \
+         WHERE request_id = ?1 AND state IN ({})",
+        (0..from.len())
+            .map(|index| format!("?{}", index + 10))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        request_id.to_owned().into(),
+        change.to.as_str().to_owned().into(),
+        change.reason.into(),
+        change.answering_turn_id.into(),
+        change.answer_message_id.into(),
+        change.answer_text.into(),
+        i64::from(change.answer_truncated).into(),
+        i64::from(change.dismiss).into(),
+        change.at.into(),
+    ];
+    values.extend(from.iter().map(|state| state.as_str().to_owned().into()));
+    if transaction.execute(&sql, params_from_iter(values))? != 1 {
+        return Ok(None);
+    }
+    read(transaction, request_id)
+}
+
 #[derive(Clone)]
 pub(crate) struct SendRequestStore {
     database: Database,
@@ -332,46 +375,12 @@ impl SendRequestStore {
         from: &[SendState],
         change: StateChange,
     ) -> Result<Option<SendRequestRow>> {
-        if from.is_empty() {
-            return Ok(None);
-        }
         let request_id = request_id.to_owned();
         let from = from.to_vec();
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;
-                let sql = format!(
-                    "UPDATE send_requests SET state = ?2, reason = ?3, \
-                     answering_turn_id = COALESCE(?4, answering_turn_id), \
-                     answer_message_id = COALESCE(?5, answer_message_id), \
-                     answer_text = COALESCE(?6, answer_text), \
-                     answer_truncated = CASE WHEN ?6 IS NULL THEN answer_truncated ELSE ?7 END, \
-                     dismissed_at = CASE WHEN ?8 THEN COALESCE(dismissed_at, ?9) ELSE dismissed_at END, \
-                     updated_at = ?9 \
-                     WHERE request_id = ?1 AND state IN ({})",
-                    (0..from.len())
-                        .map(|index| format!("?{}", index + 10))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                let mut values: Vec<rusqlite::types::Value> = vec![
-                    request_id.clone().into(),
-                    change.to.as_str().to_owned().into(),
-                    change.reason.into(),
-                    change.answering_turn_id.into(),
-                    change.answer_message_id.into(),
-                    change.answer_text.into(),
-                    i64::from(change.answer_truncated).into(),
-                    i64::from(change.dismiss).into(),
-                    change.at.into(),
-                ];
-                values.extend(from.iter().map(|state| state.as_str().to_owned().into()));
-                let changed = transaction.execute(&sql, params_from_iter(values))?;
-                let row = if changed == 1 {
-                    read(&transaction, &request_id)?
-                } else {
-                    None
-                };
+                let row = transition_in(&transaction, &request_id, &from, change)?;
                 transaction.commit()?;
                 Ok(row)
             })

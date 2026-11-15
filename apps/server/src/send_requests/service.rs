@@ -11,6 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange};
 use crate::{
+    agent_messaging::{
+        pointer::{TERMINAL_RECIPIENT_MODE, TerminalPointer},
+        terminal_credential::{TerminalIdentity, parse_terminal_address},
+    },
     orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
     persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
     production::{
@@ -71,6 +75,116 @@ pub(crate) struct SendRequestsGetHandoffTextResult {
     pub(crate) left_out: usize,
     /// The first message, when it is included, and the tail.
     pub(crate) included_messages: usize,
+}
+
+/// The wire input of `sendRequests.getTerminalOutput`: the thread the person clicked in, and the
+/// terminal to read with its owner thread.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SendRequestsGetTerminalOutputInput {
+    pub(crate) source_thread_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) source: TerminalTextSource,
+    // Both parts read the same tail until phase 10 adds the conversation readers.
+    #[allow(dead_code)]
+    pub(crate) part: TerminalTextPart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalTextSource {
+    Output,
+    Conversation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalTextPart {
+    LastAnswer,
+    Handoff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendRequestsGetTerminalOutputResult {
+    pub(crate) thread_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+    pub(crate) used_source: TerminalTextSource,
+    pub(crate) fell_back: bool,
+    pub(crate) start_missing: bool,
+}
+
+/// The most terminal output one read returns, in Unicode scalar values.
+pub(crate) const TERMINAL_OUTPUT_MAX_CHARS: usize = 16_000;
+
+/// The last output of a terminal, without escape sequences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalTail {
+    pub(crate) text: String,
+    /// Older output exists that the text leaves out.
+    pub(crate) truncated: bool,
+}
+
+/// Read access to a terminal's retained output. It has no way to write to the terminal.
+pub(crate) trait TerminalOutputSource: Send + Sync {
+    fn tail<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+        max_chars: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<TerminalTail, crate::terminal::TerminalError>>;
+}
+
+impl TerminalOutputSource for crate::terminal::TerminalManager {
+    fn tail<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+        max_chars: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<TerminalTail, crate::terminal::TerminalError>>
+    {
+        Box::pin(async move {
+            let read = self
+                .read_history(
+                    owner_thread_id,
+                    terminal_id,
+                    None,
+                    raw_window_chars(max_chars),
+                )
+                .await?;
+            Ok(plain_tail(
+                &read.window.text,
+                read.window.start > 0,
+                max_chars,
+            ))
+        })
+    }
+}
+
+/// How many raw characters to read so `plain_tail` can return `max_chars` of plain text.
+pub(crate) fn raw_window_chars(max_chars: usize) -> usize {
+    // shortcut: an escape sequence longer than the extra window still leaks its payload when
+    // its start is cut off, until the history reader can start a window at a sequence boundary.
+    max_chars.saturating_mul(4)
+}
+
+/// The last `max_chars` of plain text in `raw`, the end of a terminal's retained output. Escape
+/// sequences are removed before the limit applies, so a long sequence cannot be cut in half. Tab
+/// and newline stay, every other C0 and C1 control character and DEL goes.
+pub(crate) fn plain_tail(raw: &str, older_exists: bool, max_chars: usize) -> TerminalTail {
+    let (stripped, _open) = crate::ansi::strip_escapes(raw);
+    let text: String = stripped
+        .chars()
+        .filter(|c| matches!(c, '\t' | '\n') || !c.is_control())
+        .collect();
+    let count = text.chars().count();
+    TerminalTail {
+        text: text.chars().skip(count.saturating_sub(max_chars)).collect(),
+        truncated: older_exists || count > max_chars,
+    }
 }
 
 /// Sends one stream event; false when the stream was cancelled or closed.
@@ -239,6 +353,11 @@ pub(crate) struct SendRequestsService {
     repositories: Repositories,
     dispatcher: ServerCommandDispatcher,
     changes: broadcast::Sender<RequestChange>,
+    terminal_output: Option<std::sync::Arc<dyn TerminalOutputSource>>,
+    /// The terminal mailbox a request to an AI Terminal goes to. This clone carries no request
+    /// sink (the pointer's sink holds this service), so it never reads an inbox; it stores,
+    /// cancels and takes the per-terminal exclusion.
+    terminal_mail: Option<TerminalPointer>,
     /// Held across a dispatch, and by a cancel that finds no delivery yet, so a cancelled
     /// request is never queued afterwards.
     // shortcut: one gate for every request; a per-request lock if person sends ever contend.
@@ -259,9 +378,142 @@ impl SendRequestsService {
             repositories,
             dispatcher,
             changes: broadcast::channel(256).0,
+            terminal_output: None,
+            terminal_mail: None,
             dispatch_gate: std::sync::Arc::default(),
             publish_order: std::sync::Arc::default(),
         }
+    }
+
+    pub(crate) fn with_terminal_output(
+        mut self,
+        source: std::sync::Arc<dyn TerminalOutputSource>,
+    ) -> Self {
+        self.terminal_output = Some(source);
+        self
+    }
+
+    pub(crate) fn with_terminal_mail(mut self, pointer: TerminalPointer) -> Self {
+        self.terminal_mail = Some(pointer);
+        self
+    }
+
+    pub(super) fn terminal_mail(&self) -> Option<&TerminalPointer> {
+        self.terminal_mail.as_ref()
+    }
+
+    /// Ends an open request whose terminal generation no longer runs.
+    pub(super) async fn end_unreachable(&self, row: &SendRequestRow) {
+        let change = StateChange {
+            to: SendState::NotAnswered,
+            reason: Some("recipient_gone".to_owned()),
+            answering_turn_id: None,
+            answer_message_id: None,
+            answer_text: None,
+            answer_truncated: false,
+            dismiss: false,
+            at: crate::mcp::control::now_iso(),
+        };
+        if let Err(error) = self.apply(&row.request_id, &OPEN, change).await {
+            tracing::warn!(request_id = %row.request_id, %error, "an unreachable request was kept open");
+        }
+    }
+
+    /// Ends every open request `concerned` names as not answered with `recipient_gone`, and
+    /// returns how many it ended. An answered request keeps its answer: it is not open.
+    pub(super) async fn end_open_where(
+        &self,
+        concerned: impl Fn(&SendRequestRow) -> bool,
+    ) -> crate::persistence::Result<usize> {
+        let mut ended = 0;
+        for row in self
+            .store
+            .list_open()
+            .await?
+            .iter()
+            .filter(|row| concerned(row))
+        {
+            let change = StateChange {
+                to: SendState::NotAnswered,
+                reason: Some("recipient_gone".to_owned()),
+                answering_turn_id: None,
+                answer_message_id: None,
+                answer_text: None,
+                answer_truncated: false,
+                dismiss: false,
+                at: crate::mcp::control::now_iso(),
+            };
+            if self.apply(&row.request_id, &OPEN, change).await?.is_some() {
+                ended += 1;
+            }
+        }
+        Ok(ended)
+    }
+
+    /// The person's requests whose mail the terminal generation `generation_key` at `address`
+    /// held.
+    pub(super) async fn requests_of_generation(
+        &self,
+        address: &str,
+        generation_key: &str,
+    ) -> crate::persistence::Result<Vec<String>> {
+        let (address, generation_key) = (address.to_owned(), generation_key.to_owned());
+        self.repositories
+            .database()
+            .call(move |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT send_request_id FROM agent_messages \
+                     WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2 \
+                       AND send_request_id IS NOT NULL AND sender_kind = 'person'",
+                )?;
+                Ok(statement
+                    .query_map(params![address, generation_key], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?)
+            })
+            .await
+    }
+
+    /// The completed replies to open requests to terminals: answers stored before a stop that
+    /// their request did not hear of.
+    pub(super) async fn unheard_terminal_answers(
+        &self,
+    ) -> crate::persistence::Result<Vec<crate::agent_messaging::store::AgentMessageRow>> {
+        self.repositories
+            .database()
+            .call(|connection| {
+                let ids = connection
+                    .prepare_cached(
+                        "SELECT reply.message_id FROM agent_messages AS reply \
+                         JOIN send_requests AS request ON request.request_id = reply.send_request_id \
+                         WHERE reply.status = 'completed' AND reply.in_reply_to IS NOT NULL \
+                           AND reply.sender_kind = 'agent' \
+                           AND substr(request.target_address, 1, 9) = 'terminal:' \
+                           AND request.state IN ('queued', 'waiting', 'delivered', 'read')",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut replies = Vec::with_capacity(ids.len());
+                for id in ids {
+                    replies.extend(crate::agent_messaging::store::get_message(connection, &id)?);
+                }
+                Ok(replies)
+            })
+            .await
+    }
+
+    /// A message, hand-off or take-over is dismissed once its target read it.
+    pub(super) async fn dismissed_once_read(&self, request_id: &str) -> bool {
+        self.store
+            .get(request_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                matches!(
+                    row.action,
+                    SendAction::Message | SendAction::HandOff | SendAction::TakeOver
+                )
+            })
     }
 
     pub(crate) fn subscribe_changes(&self) -> broadcast::Receiver<RequestChange> {
@@ -472,8 +724,7 @@ impl SendRequestsService {
         let target = parse_address(&row.target_address)
             .ok_or_else(|| invalid("The request's target is not an agent address."))?;
         match target.terminal {
-            // shortcut: no terminal request exists before task 9.2 adds its branch here.
-            true => {}
+            true => self.cancel_terminal(&row).await?,
             false => self.cancel_chat(context, &row).await?,
         }
         let request = self.stored(request_id).await?;
@@ -525,6 +776,59 @@ impl SendRequestsService {
         {
             self.mark_cancelled(row).await?;
         }
+        Ok(())
+    }
+
+    /// Withdraws a queued request to an AI Terminal: under the terminal's exclusion, one
+    /// transaction cancels its mailbox row, only while that row is `queued`, and the request.
+    /// Once the pointer announced it or the inbox returned it, the cancel is refused.
+    async fn cancel_terminal(&self, row: &SendRequestRow) -> Result<(), Value> {
+        let not_cancellable = || {
+            refusal(
+                "not_cancellable",
+                "The terminal's agent was already told about this request, so it cannot be cancelled.",
+            )
+        };
+        match row.state {
+            SendState::Cancelled => return Ok(()),
+            SendState::Queued => {}
+            _ => return Err(not_cancellable()),
+        }
+        let pointer = self.terminal_mail.as_ref().ok_or_else(not_cancellable)?;
+        let _exclusive = pointer.exclusive(&row.target_address).await;
+        let _order = self.publish_order.lock().await;
+        let request_id = row.request_id.clone();
+        let change = StateChange {
+            to: SendState::Cancelled,
+            reason: None,
+            answering_turn_id: None,
+            answer_message_id: None,
+            answer_text: None,
+            answer_truncated: false,
+            dismiss: false,
+            at: crate::mcp::control::now_iso(),
+        };
+        let cancelled = self
+            .repositories
+            .database()
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                if !crate::agent_messaging::store::cancel_unfetched_for_request(&tx, &request_id)? {
+                    return Ok(None);
+                }
+                let row =
+                    super::store::transition_in(&tx, &request_id, &[SendState::Queued], change)?;
+                if row.is_some() {
+                    tx.commit()?;
+                }
+                Ok(row)
+            })
+            .await
+            .map_err(storage)?
+            .ok_or_else(not_cancellable)?;
+        let _ = self
+            .changes
+            .send(RequestChange::Upsert(Box::new(cancelled)));
         Ok(())
     }
 
@@ -648,6 +952,53 @@ impl SendRequestsService {
         })
     }
 
+    /// The last output of an AI Terminal, for a terminal source's preview. It only reads, logs ids
+    /// and sizes, and never the text. The CLI conversation has no reader yet, so that source falls
+    /// back to the output.
+    pub(crate) async fn get_terminal_output(
+        &self,
+        context: &RpcSessionContext,
+        input: SendRequestsGetTerminalOutputInput,
+    ) -> Result<SendRequestsGetTerminalOutputResult, Value> {
+        require_person(context)?;
+        let source = self.live_thread(&input.source_thread_id).await?;
+        let owner = self.live_thread(&input.thread_id).await?;
+        if owner.project_id != source.project_id {
+            return Err(refusal(
+                "other_project",
+                "This terminal belongs to another project.",
+            ));
+        }
+        let reader = self
+            .terminal_output
+            .as_ref()
+            .ok_or_else(|| refusal("not_found", "This terminal's output is not available."))?;
+        let owner_id = owner
+            .host_thread_id
+            .clone()
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| input.thread_id.clone());
+        let tail = reader
+            .tail(&owner_id, &input.terminal_id, TERMINAL_OUTPUT_MAX_CHARS)
+            .await
+            .map_err(|_| refusal("not_found", "This terminal is no longer available."))?;
+        tracing::debug!(
+            terminal_id = %input.terminal_id,
+            chars = tail.text.chars().count(),
+            truncated = tail.truncated,
+            "a terminal's output was read for a send request"
+        );
+        Ok(SendRequestsGetTerminalOutputResult {
+            thread_id: input.thread_id,
+            terminal_id: input.terminal_id,
+            text: tail.text,
+            truncated: tail.truncated,
+            used_source: TerminalTextSource::Output,
+            fell_back: input.source == TerminalTextSource::Conversation,
+            start_missing: false,
+        })
+    }
+
     /// Every undismissed request of the scope (requests sent from `thread_id`, or all), in a
     /// snapshot and pages, then each change. A lag sends a new snapshot and pages.
     pub(crate) fn subscribe(
@@ -762,8 +1113,15 @@ impl SendRequestsService {
         input: SendRequestsSendInput,
     ) -> Result<SendRequest, Value> {
         require_person(context)?;
-        if input.request_id.trim().is_empty() {
-            return Err(invalid("The request needs an id."));
+        // A plain id: an AI Terminal's agent reads it back in BiBCode's own line.
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':');
+        if input.request_id.is_empty()
+            || input.request_id.len() > 128
+            || !input.request_id.chars().all(plain)
+        {
+            return Err(invalid(
+                "The request needs an id of 1 to 128 letters, digits, '-', '_', '.' or ':'.",
+            ));
         }
         let args_digest = canonical_command_digest(&input)
             .map_err(|_| invalid("BiBCode could not read this request."))?;
@@ -828,14 +1186,6 @@ impl SendRequestsService {
                 "The note and attachments are longer than 48,000 characters. Shorten them.",
             ));
         }
-        // shortcut: a terminal agent cannot be notified yet; task 9.2 lifts this.
-        if target.terminal {
-            return Err(refusal(
-                "target_not_notifiable",
-                "BiBCode cannot send a request to a terminal agent yet.",
-            ));
-        }
-
         let source_thread = self.live_thread(&source.thread_id).await?;
         let target_thread = self.live_thread(&target.thread_id).await?;
         let taken_over_thread = match &taken_over {
@@ -853,8 +1203,21 @@ impl SendRequestsService {
                 "Requests go only to agents of the same project.",
             ));
         }
+        let terminal_target = match target.terminal {
+            true => {
+                let pointer = self
+                    .terminal_mail
+                    .as_ref()
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                Some(super::terminal::notifiable_target(pointer, &input.target).await?)
+            }
+            false => None,
+        };
 
-        let command_id = format!("person-send:{}", input.request_id);
+        // A terminal request has no turn command: its mail is the delivery.
+        let command_id = terminal_target
+            .is_none()
+            .then(|| format!("person-send:{}", input.request_id));
         let now = crate::mcp::control::now_iso();
         let order = self.publish_order.lock().await;
         let (row, created) = self
@@ -871,15 +1234,21 @@ impl SendRequestsService {
                 args_digest: args_digest.clone(),
                 note_chars: i64::try_from(note_chars).unwrap_or(i64::MAX),
                 attachment_chars: i64::try_from(attachment_chars).unwrap_or(i64::MAX),
-                target_message_id: Some(command_id.clone()),
-                command_id: Some(command_id.clone()),
-                runtime_mode: target_thread.runtime_mode.clone(),
+                target_message_id: command_id.clone(),
+                command_id: command_id.clone(),
+                // A terminal agent receives as `full-access` (R6).
+                runtime_mode: match terminal_target {
+                    Some(_) => TERMINAL_RECIPIENT_MODE.to_owned(),
+                    None => target_thread.runtime_mode.clone(),
+                },
                 interaction_mode: target_thread.interaction_mode.clone(),
                 answering_turn_id: None,
                 answer_message_id: None,
                 answer_text: None,
                 answer_truncated: false,
-                terminal_generation: None,
+                terminal_generation: terminal_target
+                    .as_ref()
+                    .and_then(|identity| i64::try_from(identity.generation.process).ok()),
                 state: SendState::Queued,
                 reason: None,
                 created_at: now.clone(),
@@ -899,7 +1268,10 @@ impl SendRequestsService {
             // A simultaneous call with the same id stored it first.
             return self.replay(context, row, &args_digest, &input).await;
         }
-        self.dispatch(context, &row, &input).await?;
+        match terminal_target {
+            Some(identity) => self.deliver_terminal(&row, &input, Some(identity)).await?,
+            None => self.dispatch(context, &row, &input).await?,
+        }
         Ok(SendRequest::from(&row))
     }
 
@@ -919,6 +1291,14 @@ impl SendRequestsService {
                 "request_conflict",
                 "A request with this id was already sent with other content.",
             ));
+        }
+        if parse_address(&row.target_address).is_some_and(|target| target.terminal) {
+            // Storing the mail again changes nothing once it is stored.
+            if row.state == SendState::Queued {
+                self.deliver_terminal(&row, input, None).await?;
+            }
+            let current = self.store.get(&row.request_id).await.map_err(storage)?;
+            return Ok(SendRequest::from(current.as_ref().unwrap_or(&row)));
         }
         let receipt = self
             .repositories
@@ -992,6 +1372,85 @@ impl SendRequestsService {
             "invalid",
             "BiBCode could not queue this request on the agent. Try again.",
         ))
+    }
+
+    /// Stores a request to an AI Terminal in its mailbox. `identity` is the generation `send`
+    /// resolved; a replay reads it again, and a generation other than the stored one ends the
+    /// request unanswered.
+    async fn deliver_terminal(
+        &self,
+        row: &SendRequestRow,
+        input: &SendRequestsSendInput,
+        identity: Option<TerminalIdentity>,
+    ) -> Result<(), Value> {
+        let identity = match identity {
+            Some(identity) => identity,
+            None => {
+                let pointer = self
+                    .terminal_mail
+                    .as_ref()
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                let (thread_id, terminal_id) = parse_terminal_address(&row.target_address)
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                let generation = pointer
+                    .terminals()
+                    .live_generation(&thread_id, &terminal_id)
+                    .await
+                    .filter(|generation| {
+                        i64::try_from(generation.process).ok() == row.terminal_generation
+                    });
+                let Some(generation) = generation else {
+                    self.end_unreachable(row).await;
+                    return Err(super::terminal::not_notifiable());
+                };
+                TerminalIdentity {
+                    environment_id: String::new(),
+                    thread_id,
+                    terminal_id,
+                    generation,
+                }
+            }
+        };
+        let attachments = input
+            .attachments
+            .iter()
+            .map(|attachment| (attachment.label.clone(), attachment.text.clone()))
+            .collect::<Vec<_>>();
+        let text = compose_message_text(&input.lead_in, &input.note, &attachments);
+        // A take-over is labelled with the agent whose work it takes over, as a chat one is.
+        let title = self
+            .address_title(
+                row.taken_over_address
+                    .as_deref()
+                    .unwrap_or(&row.source_address),
+            )
+            .await;
+        super::terminal::deliver_person_request(self, row, &title, &text, &identity).await
+    }
+
+    /// The title an agent address shows: its thread's title, or its terminal's label.
+    async fn address_title(&self, address: &str) -> String {
+        if let Some((thread_id, terminal_id)) = parse_terminal_address(address) {
+            if let Some(pointer) = &self.terminal_mail
+                && let Some(summary) = pointer
+                    .terminals()
+                    .thread_sessions(&thread_id)
+                    .await
+                    .into_iter()
+                    .find(|summary| summary.terminal_id == terminal_id)
+            {
+                return summary.label;
+            }
+            return "a terminal".to_owned();
+        }
+        let thread_id = address
+            .strip_prefix("thread:")
+            .unwrap_or(address)
+            .to_owned();
+        match self.repositories.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread.title,
+            _ => "an agent".to_owned(),
+        }
     }
 
     /// Ends a request whose command the engine rejected, and returns that rejection.
@@ -1291,7 +1750,7 @@ fn decide(view: TargetView) -> Next {
 }
 
 /// `text` cut at [`ANSWER_TEXT_MAX_CHARS`] Unicode scalar values, and whether it was cut.
-fn cut_answer(mut text: String) -> (String, bool) {
+pub(super) fn cut_answer(mut text: String) -> (String, bool) {
     match text.char_indices().nth(ANSWER_TEXT_MAX_CHARS) {
         Some((index, _)) => {
             text.truncate(index);

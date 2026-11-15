@@ -438,6 +438,10 @@
       "mode": "unary"
     },
     {
+      "name": "sendRequests.getTerminalOutput",
+      "mode": "unary"
+    },
+    {
       "name": "sendRequests.send",
       "mode": "unary"
     },
@@ -1137,6 +1141,8 @@
     "typed-failures/sendRequests__getAnswer-01.json",
     "typed-failures/sendRequests__getHandoffText-00.json",
     "typed-failures/sendRequests__getHandoffText-01.json",
+    "typed-failures/sendRequests__getTerminalOutput-00.json",
+    "typed-failures/sendRequests__getTerminalOutput-01.json",
     "typed-failures/sendRequests__send-00.json",
     "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",
@@ -1595,6 +1601,8 @@
     "typed-failures/sendRequests__getAnswer-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/sendRequests__getHandoffText-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
     "typed-failures/sendRequests__getHandoffText-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/sendRequests__getTerminalOutput-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
+    "typed-failures/sendRequests__getTerminalOutput-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/sendRequests__send-00.json": "ac47ae8b78fdd763a663a256f655069fc68b59f576449d2100db1a1542d90868",
     "typed-failures/sendRequests__send-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "stream-shapes/sendRequests__subscribe-00.json": "0b06002207fdde2999799e2c07021a94ee1d93fbb7e6988989c8641ec594ac1e",
@@ -2233,6 +2241,8 @@
     "typed-failures/sendRequests__getAnswer-01.json",
     "typed-failures/sendRequests__getHandoffText-00.json",
     "typed-failures/sendRequests__getHandoffText-01.json",
+    "typed-failures/sendRequests__getTerminalOutput-00.json",
+    "typed-failures/sendRequests__getTerminalOutput-01.json",
     "typed-failures/sendRequests__send-00.json",
     "typed-failures/sendRequests__send-01.json",
     "typed-failures/server__claimDiagnosticLogsRelay-00.json",

@@ -15,6 +15,7 @@ import type { OutOfTokensHint } from "./outOfTokens.logic";
 import {
   agentAddress,
   buildSendTargets,
+  canNotifyTerminalRow,
   canSend,
   checkoutOf,
   countCharacters,
@@ -24,6 +25,8 @@ import {
   parseAgentAddress,
   resolveActionAvailability,
   SEND_TO_AGENT_ACTIONS,
+  sendToAgentControlLabel,
+  TERMINAL_NOT_NOTIFIABLE_REASON,
   type SendToAgentSource,
 } from "./sendToAgent.logic";
 
@@ -515,5 +518,58 @@ describe("request limits and failure copy", () => {
         next: "retry",
       },
     );
+  });
+});
+
+describe("canNotifyTerminalRow", () => {
+  it("is true for running Claude, Codex and OpenCode AI Terminals", () => {
+    for (const driver of ["claudeAgent", "codex", "opencode"]) {
+      expect(canNotifyTerminalRow(aiTerminal("host", "t1", driver)), driver).toBe(true);
+    }
+  });
+
+  it("is false for a Cursor terminal, an unavailable status, an exited terminal and no terminal", () => {
+    const codex = aiTerminal("host", "t1", "codex");
+    expect(canNotifyTerminalRow(aiTerminal("host", "t1", "cursor"))).toBe(false);
+    expect(
+      canNotifyTerminalRow({ ...codex, agentStatus: { state: "unavailable", failed: false } }),
+    ).toBe(false);
+    expect(canNotifyTerminalRow({ ...codex, status: "exited" })).toBe(false);
+    expect(canNotifyTerminalRow(undefined)).toBe(false);
+  });
+
+  it("take_over_from_is_disabled_in_a_terminal_that_cannot_be_notified", () => {
+    const terminal = (terminalNotifiable: boolean) =>
+      source({ terminalId: "t1", terminalHasText: true, terminalNotifiable });
+    const availability = (from: SendToAgentSource, action: SendRequestAction) =>
+      resolveActionAvailability({ source: from, action, serverSupported: true }).disabledReason;
+    expect(availability(terminal(false), "take-over")).toBe(TERMINAL_NOT_NOTIFIABLE_REASON);
+    expect(availability(terminal(true), "take-over")).toBeNull();
+    expect(availability(terminal(false), "review")).toBeNull();
+  });
+
+  it("a_cursor_terminal_is_disabled_as_a_target_of_four_actions_and_usable_for_take_over_from", () => {
+    const terminals = [aiTerminal("host", "t1", "cursor")];
+    const rows = rowsOf([shell("source", "claudeAgent"), shell("host", "codex")], terminals);
+    const canNotify = (row: AgentRow) =>
+      canNotifyTerminalRow(terminals.find((summary) => summary.terminalId === row.terminalId));
+    for (const action of ["review", "second-opinion", "hand-off", "message"] as const) {
+      const terminal = targets(action, rows, { canNotifyTerminal: canNotify }).find(
+        (entry) => entry.target.kind === "agent" && entry.target.row.terminalId === "t1",
+      );
+      expect(terminal?.disabledReason, action).toBe(TERMINAL_NOT_NOTIFIABLE_REASON);
+    }
+    const takeOver = targets("take-over", rows, { canNotifyTerminal: canNotify }).find(
+      (entry) => entry.target.kind === "agent" && entry.target.row.terminalId === "t1",
+    );
+    expect(takeOver?.disabledReason).toBeNull();
+  });
+});
+
+describe("sendToAgentControlLabel", () => {
+  it("the_control_badge_names_the_waiting_answers_in_its_accessible_name", () => {
+    expect(sendToAgentControlLabel(0)).toBe("Send to agent");
+    expect(sendToAgentControlLabel(1)).toBe("Send to agent, 1 answer waiting");
+    expect(sendToAgentControlLabel(2)).toBe("Send to agent, 2 answers waiting");
   });
 });

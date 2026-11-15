@@ -204,7 +204,8 @@ fn outgoing(
     target: &str,
 ) -> Result<(String, String, Option<String>), AgentMessagingError> {
     let request = (|| {
-        if !messaging.is_enabled() {
+        // A reply decides after it reads the message: a person's request is answered while off.
+        if tool != "agent_message_reply" && !messaging.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
         let object = strict_object(tool, arguments, &[target, "text", "clientRequestId"])?;
