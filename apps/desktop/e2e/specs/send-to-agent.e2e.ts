@@ -28,6 +28,9 @@ const sendControlSelector = `${visibleSurfaceSelector} button[aria-label^="Send 
 const SLOW_TURN_RELEASE_FILE = ".bibcode-e2e-slow-turn-release";
 
 // The second opinion's own note carries the Codex fixture's slow marker, so Codex stays on it.
+// The primary thread is titled like its project until its first message names it.
+let mainTitle: string = desktopUiFixture.projectName;
+const firstMainPrompt = "refactor the parser [[slow]]";
 const claudeNote = "check the parser";
 const secondOpinionNote = "weigh in on the answer [[slow]]";
 const queuedNote = "please look at the lexer too";
@@ -157,7 +160,7 @@ async function chooseSendTarget(action: string, target: string): Promise<void> {
 }
 
 function previewDialog() {
-  return browser.$('[role="dialog"]');
+  return browser.$('//*[@role="dialog"][.//button[normalize-space()="Send"]]');
 }
 
 /** Types the note in the open preview and presses Send. */
@@ -249,11 +252,12 @@ describe("packaged send to agent", () => {
     const delivered = await waitForProviderPrompt(baseline, "claudeAgent", [claudeNote]);
     expect(delivered.kind).toBe("start");
     await browser.waitUntil(
-      async () => (await browser.$(visibleSurfaceSelector).getText()).includes("sent from main"),
+      async () =>
+        (await browser.$(visibleSurfaceSelector).getText()).includes(`sent from ${mainTitle}`),
       { timeoutMsg: "The new panel did not label the message with where it was sent from." },
     );
     const label = await browser.$(`${visibleSurfaceSelector} [data-message-provenance]`).getText();
-    expect(label).toBe("Message, sent from main");
+    expect(label).toBe(`Message, sent from ${mainTitle}`);
     await expect(browser.$(visibleSurfaceSelector)).toHaveText(
       expect.stringContaining(desktopUiFixture.streamedResponse),
     );
@@ -268,16 +272,17 @@ describe("packaged send to agent", () => {
   it("a queued request can be cancelled and its target never receives it", async () => {
     await chatTab("chat:host").click();
     await waitForComposerDisplayed();
-    slowTurnIds.push(await startSlowMainTurn("refactor the parser [[slow]]"));
+    slowTurnIds.push(await startSlowMainTurn(firstMainPrompt));
+    mainTitle = firstMainPrompt;
     await chatTab(claudeTabId).click();
     await waitForComposerDisplayed();
 
     const baseline = providerInputs().length;
-    await chooseSendTarget("Message", "main");
+    await chooseSendTarget("Message", mainTitle);
     await sendFromPreview(queuedNote);
     const queued = requestRow("queued");
     await queued.waitForDisplayed({ timeoutMsg: "The request row never showed Queued." });
-    await expect(queued).toHaveText(expect.stringContaining("Queued for main"));
+    await expect(queued).toHaveText(expect.stringContaining(`Queued for ${mainTitle}`));
     await queued.$("button=Cancel").click();
     const cancelled = requestRow("cancelled");
     await cancelled.waitForDisplayed({ timeoutMsg: "Cancel did not mark the request cancelled." });
@@ -294,14 +299,16 @@ describe("packaged send to agent", () => {
   });
 
   it("a second opinion that is read but unanswered offers no Dismiss", async () => {
+    await chatTab(claudeTabId).click();
+    await waitForComposerDisplayed();
     const baseline = providerInputs().length;
-    await chooseSendTarget("Second opinion", "main");
+    await chooseSendTarget("Second opinion", mainTitle);
     await sendFromPreview(secondOpinionNote);
     const entry = await waitForProviderPrompt(baseline, "codex", [secondOpinionNote]);
     slowTurnIds.push(entry.turnId!);
     const row = requestRow("read");
     await row.waitForDisplayed({ timeoutMsg: "The second opinion never showed as read." });
-    await expect(row).toHaveText(expect.stringContaining("main read it"));
+    await expect(row).toHaveText(expect.stringContaining(`${mainTitle} read it`));
     await expect(row.$("button=Open")).toBeDisplayed();
     await expect(row.$("button=Dismiss")).not.toExist();
     await expect(row.$("button=Cancel")).not.toExist();
@@ -309,9 +316,12 @@ describe("packaged send to agent", () => {
 
   it("the answer notice survives a reload", async () => {
     await releaseSlowTurn(slowTurnIds.at(-1)!);
+    // The answer comes back to the panel that asked, wherever the person is looking.
+    await chatTab(claudeTabId).click();
+    await waitForComposerDisplayed();
     const notice = browser.$(`${visibleSurfaceSelector} [data-answer-notice]`);
     await notice.waitForDisplayed({ timeoutMsg: "The answer notice did not appear." });
-    await expect(notice).toHaveText(expect.stringContaining("main answered"));
+    await expect(notice).toHaveText(expect.stringContaining(`${mainTitle} answered`));
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "send-to-agent-notice.png"),
     );
@@ -325,8 +335,11 @@ describe("packaged send to agent", () => {
   });
 
   it("Bring back drafts the quoted answer and sends nothing", async () => {
+    await chatTab(claudeTabId).click();
+    await waitForComposerDisplayed();
     const before = providerInputs().length;
     const notice = browser.$(`${visibleSurfaceSelector} [data-answer-notice]`);
+    await notice.waitForDisplayed({ timeoutMsg: "The notice is gone before Bring back." });
     await notice.$("button*=Bring back").click();
     await expect(composerEditor()).toHaveText(
       expect.stringContaining(desktopUiFixture.streamedResponse),
@@ -345,7 +358,7 @@ describe("packaged send to agent", () => {
     slowTurnIds.push(await startSlowMainTurn("document the grammar [[slow]]"));
     await openFixtureCodexTerminal();
 
-    await chooseSendTarget("Message", "main");
+    await chooseSendTarget("Message", mainTitle);
     await sendFromPreview(terminalNote);
     const requests = browser.$(`${visibleSurfaceSelector} button[aria-label^="Send requests"]`);
     await requests.waitForDisplayed({ timeoutMsg: "The terminal never showed Send requests." });
@@ -364,10 +377,9 @@ describe("packaged send to agent", () => {
     const cancelled = browser.$('[data-send-request-state="cancelled"]');
     await cancelled.waitForDisplayed({ timeoutMsg: "The terminal request was not cancelled." });
 
-    // Dismiss with the keyboard, so the focus that must come back is a keyboard user's.
-    const dismiss = await cancelled.$("button=Dismiss");
-    await browser.execute((element: HTMLElement) => element.focus(), dismiss);
-    await browser.keys("Enter");
+    // The embedded driver's Enter key does not activate a focused button, so Dismiss is clicked.
+    // The button holding focus leaves the page with the last row, which is the case under test.
+    await cancelled.$("button=Dismiss").click();
     await requests.waitForExist({
       reverse: true,
       timeoutMsg: "The button stayed after the last row.",
