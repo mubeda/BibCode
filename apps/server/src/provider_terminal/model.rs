@@ -1877,7 +1877,7 @@ impl TerminalAgentActivityControl {
         true
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn latest_observation(&self) -> Option<TerminalAgentActivityObservation> {
         *self.observed.borrow()
     }
