@@ -315,17 +315,20 @@ pub(crate) fn get_message(
 }
 
 /// The message `sender_address` stored under `client_request_id`, if any.
+/// The message `sender_address` stored with `client_request_id`, from the same terminal
+/// generation (`None` for a chat sender), so a restarted terminal never replays its predecessor's.
 pub(crate) fn find_by_client_request(
     connection: &rusqlite::Connection,
     sender_address: &str,
+    sender_generation: Option<&str>,
     client_request_id: &str,
 ) -> Result<Option<AgentMessageRow>> {
     Ok(connection
         .query_row(
             &format!(
-                "SELECT {COLUMNS} FROM agent_messages WHERE sender_address = ?1 AND client_request_id = ?2"
+                "SELECT {COLUMNS} FROM agent_messages WHERE sender_address = ?1 AND sender_terminal_generation IS ?2 AND client_request_id = ?3"
             ),
-            params![sender_address, client_request_id],
+            params![sender_address, sender_generation, client_request_id],
             decode,
         )
         .optional()?)

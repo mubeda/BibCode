@@ -464,7 +464,12 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         let receipt = match self
-            .replay(&caller.address(), &original.sender_address, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &original.sender_address,
+                &outgoing,
+            )
             .await?
         {
             Some(receipt) => receipt,
@@ -520,7 +525,12 @@ impl AgentMessaging {
         };
         let _exclusive = pointer.exclusive(&original.recipient_address).await;
         if let Some(receipt) = self
-            .replay(&caller.address(), &original.sender_address, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &original.sender_address,
+                &outgoing,
+            )
             .await?
         {
             return Ok(receipt);
@@ -680,7 +690,12 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         if let Some(receipt) = self
-            .replay(&caller.address(), &request.to, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &request.to,
+                &outgoing,
+            )
             .await?
         {
             return Ok(receipt);
@@ -850,7 +865,20 @@ impl AgentMessaging {
             "" => "Agent".to_owned(),
             title => title.to_owned(),
         };
-        let recipient_provider = self.sender_description(&recipient_address).await.provider;
+        // A session names its driver. A recipient that never started resolves its instance's
+        // driver as a turn start does, so a custom Codex instance is a Codex recipient too.
+        let recipient_provider = match route
+            .session
+            .as_ref()
+            .and_then(|session| session.provider_name.clone())
+        {
+            Some(provider) => provider,
+            None => starter
+                .provider_kind(&route.recipient.model_selection)
+                .await
+                .unwrap_or_default()
+                .to_owned(),
+        };
         let envelope = build_envelope(&EnvelopeInput {
             sender_title: &label,
             provider: &sender.provider,
@@ -987,7 +1015,12 @@ impl AgentMessaging {
             // Another call with the same id won the unique index, or took the last slot of a
             // limit first: answer from its row.
             return match self
-                .replay(&sender_address, &recipient_address, &outgoing)
+                .replay(
+                    &sender_address,
+                    sender.generation.as_deref(),
+                    &recipient_address,
+                    &outgoing,
+                )
                 .await?
             {
                 Some(receipt) => Ok(receipt),
@@ -1025,19 +1058,29 @@ impl AgentMessaging {
     async fn replay(
         &self,
         sender_address: &str,
+        sender_generation: Option<&str>,
         recipient_address: &str,
         outgoing: &Outgoing<'_>,
     ) -> Result<Option<MessageReceipt>, AgentMessagingError> {
         let Some(client_request_id) = outgoing.client_request_id else {
             return Ok(None);
         };
-        let (sender, client_request_id) = (sender_address.to_owned(), client_request_id.to_owned());
+        let (sender, generation, client_request_id) = (
+            sender_address.to_owned(),
+            sender_generation.map(str::to_owned),
+            client_request_id.to_owned(),
+        );
         let stored = self
             .engine
             .repositories()
             .database()
             .call(move |connection| {
-                store::find_by_client_request(connection, &sender, &client_request_id)
+                store::find_by_client_request(
+                    connection,
+                    &sender,
+                    generation.as_deref(),
+                    &client_request_id,
+                )
             })
             .await
             .map_err(|error| {
@@ -1405,7 +1448,12 @@ impl AgentMessaging {
         if let Err(error) = pointer.accept(self, new, &recipient).await {
             // Another call with the same id won the unique index first: answer from its row.
             return match self
-                .replay(&sender.address, &recipient_address, &outgoing)
+                .replay(
+                    &sender.address,
+                    sender.generation.as_deref(),
+                    &recipient_address,
+                    &outgoing,
+                )
                 .await?
             {
                 Some(receipt) => Ok(receipt),

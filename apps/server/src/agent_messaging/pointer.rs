@@ -309,6 +309,20 @@ impl TerminalPointer {
         &self.terminals
     }
 
+    /// The driver the AI Terminal's agent runs on (`codex`, `claudeAgent`, ...); empty for a
+    /// plain shell or a terminal that is gone.
+    pub(crate) async fn terminal_driver(&self, thread_id: &str, terminal_id: &str) -> String {
+        self.terminals
+            .thread_sessions(thread_id)
+            .await
+            .into_iter()
+            .find(|summary| summary.terminal_id == terminal_id)
+            .and_then(|summary| summary.command)
+            .and_then(|command| command.activity)
+            .map(|activity| activity.driver_kind)
+            .unwrap_or_default()
+    }
+
     /// Stores `new` in `recipient`'s mailbox: one row bound to its generation, with no turn
     /// queue entry. An agent's message obeys the mode ceiling (the terminal receives as
     /// `full-access`) and the rate and backlog limits, and is held while messaging is off; a
@@ -2664,6 +2678,38 @@ pub(crate) mod tests {
             restarted.cancel_as(&relaunched, &receipt.message_id).await,
             Err(AgentMessagingError::UnknownMessage)
         ));
+        fixture.shutdown().await;
+    }
+
+    /// A retry with the same request id answers from the stored message only within the
+    /// generation that sent it: a restarted terminal's same request is a new message, so its
+    /// receipt never names the predecessor's message.
+    #[tokio::test]
+    async fn a_restarted_terminals_retry_is_a_new_message_not_its_predecessors_receipt() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let request = || SendRequest {
+            to: "terminal:t/term-2".to_owned(),
+            text: BODY.to_owned(),
+            client_request_id: Some("retry-1".to_owned()),
+        };
+        let old = AgentCaller::Terminal(fixture.identity("term-1"));
+        let first = fixture.messaging.send_as(&old, request()).await.unwrap();
+        let replayed = fixture.messaging.send_as(&old, request()).await.unwrap();
+        assert_eq!(
+            replayed.message_id, first.message_id,
+            "same generation replays"
+        );
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let new = AgentCaller::Terminal(fixture.identity("term-1"));
+        let fresh = fixture.messaging.send_as(&new, request()).await.unwrap();
+        assert_ne!(fresh.message_id, first.message_id, "{fresh:?}");
+        assert_ne!(fresh.conversation_id, first.conversation_id, "{fresh:?}");
+        let again = fixture.messaging.send_as(&new, request()).await.unwrap();
+        assert_eq!(
+            again.message_id, fresh.message_id,
+            "the new generation replays its own"
+        );
         fixture.shutdown().await;
     }
 

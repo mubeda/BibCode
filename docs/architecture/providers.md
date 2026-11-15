@@ -1186,9 +1186,14 @@ expand a file). Measured when the envelope was added:
 | Cursor   | Not probed (the probe needs a trusted folder)                                                                                                                                                              |
 
 `build_envelope` (`agent_messaging/envelope.rs`) applies the Codex rule for a chat recipient and a
-terminal inbox alike, from the recipient's provider. The stored message, the activity log, the
-status and the sender's view keep the text as written, and a person's request is never changed,
-because a person may name a skill on purpose.
+terminal inbox alike, to the text and to the sender's title. The recipient's provider is the
+driver of its instance, resolved from the provider settings as a turn start resolves it, so a
+custom instance counts before its first session; a terminal's is its launch driver. When a `$`
+was changed, one fixed BiBCode line in the header (before `---`, where the indented text cannot
+reach) says a zero-width space follows each dollar sign and asks the recipient to remove it
+before it runs or quotes code. The stored message, the activity log, the status and the sender's
+view keep the text as written. A person's request keeps its text, because a person may name a
+skill on purpose; only the source title in its header is changed, with the same line.
 
 The rule covers expansion by the provider's client, not a recipient model that decides to call a
 tool because of the text; the mode ceiling governs that.

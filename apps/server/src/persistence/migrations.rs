@@ -3108,7 +3108,7 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agent_messages_delivery_command
           ON agent_messages (delivery_command_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_client_request
-          ON agent_messages (sender_address, client_request_id)
+          ON agent_messages (sender_address, COALESCE(sender_terminal_generation, ''), client_request_id)
           WHERE client_request_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_agent_messages_terminal_pending
           ON agent_messages (status, recipient_address, recipient_terminal_generation)

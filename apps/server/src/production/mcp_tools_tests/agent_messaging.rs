@@ -481,6 +481,48 @@ async fn a_codex_recipient_is_delivered_no_bare_skill_mention() {
     harness.shutdown().await;
 }
 
+/// A recipient that never started, on a custom instance whose driver is Codex, is a Codex
+/// recipient too: its instance's driver decides, not the instance id.
+#[tokio::test]
+async fn a_fresh_recipient_on_a_custom_codex_instance_is_delivered_no_bare_skill_mention() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    tokio::fs::write(
+        harness.state_dir.join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "codex-custom": { "driver": "codex", "enabled": true, "config": {} },
+            },
+        }))
+        .unwrap(),
+    )
+    .await
+    .expect("settings");
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.create", "commandId": "create-c", "threadId": "c", "projectId": "p1",
+            "title": "Custom Codex thread",
+            "modelSelection": { "instanceId": "codex-custom", "model": "model" },
+            "runtimeMode": "full-access", "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("thread created");
+    let result = harness
+        .agent_send("a", send_arguments("thread:c", "Use $deploy-skill for it."))
+        .await;
+    assert_ne!(result["isError"], true, "{result}");
+    let stored = harness.agent_messages().await;
+    let (delivered, _) = harness
+        .projected_message(stored[0].delivery_message_id.clone())
+        .await;
+    assert!(
+        delivered.contains("\n  Use $\u{200B}deploy-skill for it.\n"),
+        "{delivered:?}"
+    );
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn no_spoofing() {
     let harness = Harness::new().await;

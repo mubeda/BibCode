@@ -4873,9 +4873,19 @@ which stops Claude Code from expanding an `@path` inside it; OpenCode keeps it a
 text part. Codex 0.169.0 expands a skill named with `$` inside any text input and has no input
 flag that turns that off, so the text a Codex recipient (a chat agent or an AI Terminal) is
 delivered has a zero-width space after each `$` that a letter, a digit, `_` or `-` follows. A
-`$` before a space, other punctuation or the end of the text stays as it is. The stored message
-and its status keep the text as written, and a person's request is not changed. Cursor was not
-probed: that is a known gap of literal delivery.
+`$` before a space, other punctuation or the end of the text stays as it is. The same applies to
+the sender's title in the `from` line. A recipient is a Codex recipient when its provider
+instance runs the Codex driver, a custom instance or one that never started included. When at
+least one `$` was changed, the envelope's header carries one more line, before `---`:
+
+```text
+BiBCode: a zero-width space follows each dollar sign in this message, so Codex cannot load a skill from it. Remove it before you run or quote code from this message.
+```
+
+The text is indented after `---`, so it can neither forge nor hide that line. The stored message
+and its status keep the text as written. A person's request keeps its text, and only a source
+title it names is changed, with the same line. Cursor was not probed: that is a known gap of
+literal delivery.
 
 ### The person-request envelope
 

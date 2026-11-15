@@ -335,6 +335,18 @@ pub(crate) struct ServerTurnStarter {
 }
 
 impl ServerTurnStarter {
+    /// The provider kind a turn start of `model_selection` resolves to, as delivery resolves
+    /// it; `None` when the selection names no instance or its driver is unknown.
+    pub(crate) async fn provider_kind(&self, model_selection: &Value) -> Option<&'static str> {
+        let instance_id = model_selection
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .filter(|instance_id| !instance_id.trim().is_empty())?;
+        instance_provider_kind(&self.registration.settings_root, instance_id)
+            .await
+            .ok()
+    }
+
     pub(crate) async fn queue_turn_start(
         &self,
         command: OrchestrationCommand,
@@ -1190,16 +1202,7 @@ async fn turn_identity(
         .filter(|instance_id| !instance_id.trim().is_empty())
         .ok_or_else(|| format!("turn for thread {thread_id} has no provider instanceId"))?
         .to_owned();
-    let settings = ProviderSettingsStore::new(settings_root)
-        .get()
-        .await
-        .map_err(|error| error.to_string())?;
-    let driver = settings
-        .provider_instances
-        .get(&instance_id)
-        .map(|instance| instance.driver.as_str())
-        .unwrap_or(instance_id.as_str());
-    let provider_kind = canonical_provider_kind(driver).map_err(|error| error.to_string())?;
+    let provider_kind = instance_provider_kind(settings_root, &instance_id).await?;
     Ok((
         thread_id.clone(),
         message.message_id.clone(),
@@ -1207,6 +1210,23 @@ async fn turn_identity(
         provider_kind.to_owned(),
         created_at.clone(),
     ))
+}
+
+/// The provider kind of `instance_id`: its configured driver, or the id itself for a built-in
+/// instance named after its driver.
+async fn instance_provider_kind(
+    settings_root: &std::path::Path,
+    instance_id: &str,
+) -> Result<&'static str, String> {
+    let settings = ProviderSettingsStore::new(settings_root)
+        .get()
+        .await
+        .map_err(|error| error.to_string())?;
+    let driver = settings
+        .provider_instances
+        .get(instance_id)
+        .map_or(instance_id, |instance| instance.driver.as_str());
+    canonical_provider_kind(driver).map_err(|error| error.to_string())
 }
 
 /// The attachments a turn start may send again by id alone: those an accepted command already
