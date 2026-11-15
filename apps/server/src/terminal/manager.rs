@@ -5069,8 +5069,8 @@ impl TerminalManager {
     }
 }
 
-/// The provider driver whose terminals get a repaint signal after a lossy attach (#348).
-#[cfg(unix)]
+/// The Claude provider driver: its terminals get a repaint signal after a lossy attach (#348),
+/// and its observer records the conversation a send reads.
 const CLAUDE_DRIVER_KIND: &str = "claudeAgent";
 
 /// Sends the one repaint signal of a lossy attach; logs no terminal content.
