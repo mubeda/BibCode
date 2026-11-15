@@ -6,7 +6,7 @@
 import type { ThreadId } from "@bibcode/contracts";
 
 import type { AgentRow } from "../sidebar/agentsSection.logic";
-import { ATTACHMENT_MAX_CHARS, cutAtCharacters, formatLeftOut } from "./attachments.logic";
+import { ATTACHMENT_MAX_CHARS, formatLeftOut, keepLastCharacters } from "./attachments.logic";
 import type { PreviewAttachment, PreviewContent, SendToAgentSource } from "./sendToAgent.logic";
 import {
   TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
@@ -97,10 +97,12 @@ export function buildTakeOverContent(input: {
     loadingMessage: TERMINAL_OUTPUT_LOADING_MESSAGE,
     loadAttachments: async () => {
       const output = await loadTerminalOutput(picked);
-      const cut = cutAtCharacters(output.text, ATTACHMENT_MAX_CHARS);
+      const cut = keepLastCharacters(output.text, ATTACHMENT_MAX_CHARS);
+      // The fell-back note already says the output is the recent part.
+      const startCut = cut.leftOut > 0 && output.usedSource === "conversation";
       const notes = [
         output.fellBack ? TERMINAL_FELL_BACK_NOTE : null,
-        output.startMissing ? TERMINAL_START_MISSING_NOTE : null,
+        output.startMissing || startCut ? TERMINAL_START_MISSING_NOTE : null,
       ].filter((note) => note !== null);
       return [
         {

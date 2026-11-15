@@ -493,17 +493,18 @@ impl CursorSessionRuntime {
     ) -> Result<String, CursorRuntimeError> {
         let (session_id, turn_id, connection, prompt) =
             self.prepare_prompt(input, attachments).await?;
-        let completion = self.track_prompt_response(turn_id.clone(), async move {
-            connection
-                .request(
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": prompt,
-                    }),
-                )
-                .await
-        });
+        let completion =
+            self.track_prompt_response(connection.clone(), turn_id.clone(), async move {
+                connection
+                    .request(
+                        "session/prompt",
+                        json!({
+                            "sessionId": session_id,
+                            "prompt": prompt,
+                        }),
+                    )
+                    .await
+            });
         drop(completion);
         Ok(turn_id)
     }
@@ -525,11 +526,12 @@ impl CursorSessionRuntime {
             )
             .await?;
         let completion = match request.written().await {
-            Ok(()) => self.track_prompt_response(turn_id.clone(), request.response()),
+            Ok(()) => self.track_prompt_response(connection, turn_id.clone(), request.response()),
             Err(failure) if failure.is_definitely_not_sent() => {
                 return Err(failure.into_error().into());
             }
             Err(failure) => self.track_prompt_response(
+                connection,
                 turn_id.clone(),
                 std::future::ready(Err(failure.into_error())),
             ),
@@ -581,6 +583,7 @@ impl CursorSessionRuntime {
 
     fn track_prompt_response<F>(
         &self,
+        connection: AcpJsonRpcConnection,
         background_turn_id: String,
         response: F,
     ) -> oneshot::Receiver<Result<(), CursorRuntimeError>>
@@ -591,6 +594,10 @@ impl CursorSessionRuntime {
         let (completion_tx, completion) = oneshot::channel();
         tokio::spawn(async move {
             let result = response.await;
+            // The response resolves on the reader task, while the chunks the agent wrote before
+            // it may still wait in the incoming queue. Handle them first, so they keep this turn
+            // and come before its `turn.completed`.
+            let _ = connection.barrier().await;
             if runtime.inner.active_turn_id.lock().await.as_deref()
                 == Some(background_turn_id.as_str())
             {
@@ -860,6 +867,9 @@ impl CursorSessionRuntime {
             IncomingEvent::Closed { reason } => {
                 self.emit("session.exited", None, None, json!({ "reason": reason }))
                     .await;
+            }
+            IncomingEvent::Barrier(reached) => {
+                let _ = reached.send(());
             }
         }
     }
@@ -1371,6 +1381,69 @@ mod tests {
                 .await
                 .expect("connection loss should resolve receipt")
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn chunks_read_before_the_prompt_response_belong_to_the_turn_and_precede_its_completion()
+    {
+        let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
+        let receipt = runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+            .expect("session prompt should write");
+        let request: Value = serde_json::from_str(
+            &requests
+                .next_line()
+                .await
+                .expect("request read")
+                .expect("session prompt request"),
+        )
+        .expect("valid JSON-RPC request");
+        // Holding the event counter parks the incoming handler on the first chunk, so the
+        // prompt response is routed while the second chunk still waits in the queue.
+        let held = runtime.inner.event_counter.lock().await;
+        let chunk = |text: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"cursor-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"{text}\"}}}}}}}}\n"
+            )
+        };
+        responses
+            .write_all(
+                format!(
+                    "{}{}{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n",
+                    chunk("first"),
+                    chunk("second"),
+                    request["id"]
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("provider output write");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let events = timeout(Duration::from_secs(2), runtime.collect_events(4))
+            .await
+            .expect("four events");
+        let seen: Vec<(&str, Option<&str>, Option<&str>)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.turn_id.as_deref(),
+                    event.payload["delta"].as_str(),
+                )
+            })
+            .collect();
+        let turn = Some(receipt.turn_id.as_str());
+        assert_eq!(
+            seen,
+            [
+                ("turn.started", turn, None),
+                ("content.delta", turn, Some("first")),
+                ("content.delta", turn, Some("second")),
+                ("turn.completed", turn, None),
+            ]
         );
     }
 
