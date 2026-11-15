@@ -18,6 +18,10 @@
 - AI Terminal agent calls (`bibcode agent`) appear in the Profiler's request timings as `agent.<operation>`.
 - When the server restarts, a turn that was still running is failed and replies left streaming are settled, so a thread no longer shows a turn that never ends.
 
+### Providers
+
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.325.
+
 ## [v0.16.0] - 2026-11-14
 
 BiBCode v0.16.0 adds custom themes, a Host dashboard for each environment, a Review changes button in Source Control and editable rendered Markdown, stops background status reads from taking Git's index lock, keeps terminal sizes correct across panels, displays and windows, and lists this computer's private addresses in Share this host. This release includes PRs #349, #359, #365 and #369 since v0.15.3.
