@@ -770,6 +770,59 @@ async fn a_terminal_send_reaches_the_activity_log_as_the_terminal_without_text()
     route.shutdown().await;
 }
 
+/// With the Profiler on, an authenticated route call records one timing under its operation
+/// (`agent.send`), with no message text; a refused credential records none.
+#[tokio::test]
+async fn a_route_call_with_the_profiler_on_records_one_timing_without_its_text() {
+    use crate::diagnostics::profiler::latency::{PinnedProfiling, global_latency};
+    let _profiling = PinnedProfiling::new(true);
+    let route = route().await;
+    let token = route.token("t", "term-e").await;
+    let agent_timings = || {
+        global_latency()
+            .histograms_for_test()
+            .into_iter()
+            .filter(|payload| {
+                payload["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("agent."))
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = agent_timings();
+    assert_eq!(
+        route
+            .call_raw(
+                HeaderMap::new(),
+                json!({ "operation": "send", "arguments": send("thread:b") })
+            )
+            .await
+            .unwrap_err(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(agent_timings(), before, "a refused credential is not timed");
+    let answer = route.call(&token, "send", send("thread:b")).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    let timings = agent_timings();
+    let sends: Vec<&Value> = timings
+        .iter()
+        .filter(|payload| payload["method"] == "agent.send")
+        .collect();
+    let earlier = before
+        .iter()
+        .find(|payload| payload["method"] == "agent.send")
+        .map_or(0, |payload| payload["samples"].as_u64().unwrap());
+    assert_eq!(sends.len(), 1, "{timings:?}");
+    assert_eq!(
+        sends[0]["samples"].as_u64(),
+        Some(earlier + 1),
+        "{timings:?}"
+    );
+    assert_eq!(sends[0]["outcome"], "success");
+    assert!(!format!("{timings:?}").contains(BODY), "{timings:?}");
+    route.shutdown().await;
+}
+
 #[tokio::test]
 async fn list_through_the_route_returns_the_projects_other_agents_and_terminals() {
     let route = route().await;

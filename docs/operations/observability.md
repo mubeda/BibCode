@@ -75,7 +75,10 @@ removed. A raw `PATH` is never logged. The
 [Claude guide](../providers/claude.md#activity-observation) explains each
 outcome.
 
-Send requests and agent messaging write no Profiler event or finding. Their failures are
+Send requests and agent messaging write no Profiler event or finding of their own. Their calls
+are timed like any request: `sendRequests.*` as RPC methods, the agent tools as `mcp.agent_*`,
+and an AI Terminal's authenticated `POST /api/agent/call` as `agent.<operation>` (no timing for
+a refused credential, and never a body, message text or credential). Their failures are
 `warn` lines at the boundary that failed, such as `a send request could not use the store`,
 `terminal mail could not be read`, `a terminal did not take the pointer in time` (a pointer
 write outran its 2 seconds), `agent messaging could not read a thread`, `could not issue an AI
