@@ -4929,8 +4929,8 @@ A message a terminal sends keeps the generation that sent it. A restarted termin
 address can neither read the status of nor cancel its predecessor's messages: it gets
 `AgentMessagingUnknownMessageError`, as for a message it never sent. A reply to a message whose
 terminal sender has since restarted or exited is refused with `AgentMessagingRecipientGoneError`
-and never reaches the new process. The hop ledger and the rate and backlog limits still count
-per address.
+and never reaches the new process. The rate and backlog limits still count per address; the hop
+ledger is kept per generation, so a restarted terminal starts a fresh one.
 
 ### Accepted limits
 

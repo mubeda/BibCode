@@ -4986,8 +4986,8 @@ terminal's **generation** (the process, `boot:process`), with no queue entry.
   and generation, so a restarted terminal at the same address reads and cancels none of its
   predecessor's rows. A reply to a terminal sender goes to that generation only: when another
   generation runs, the reply is refused as `recipient_gone`, and a generation that ends while the
-  reply is stored ends the row in `accept`. The hop ledger and the rate and backlog limits stay
-  per address.
+  reply is stored ends the row in `accept`. The rate and backlog limits stay per address; the hop
+  ledger is keyed by address and generation and is dropped when the generation ends.
 - **Pointer.** One task (`TerminalPointer::start`) rescans on every terminal metadata change, new
   message and change of the setting. For each terminal with `queued` mail for its live generation
   it asks the terminal manager for a **write permit** at the PTY write boundary
