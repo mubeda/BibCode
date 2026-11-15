@@ -21,6 +21,7 @@
 ### Providers
 
 - Claude AI Terminals keep status hooks on Claude Code up to 2.1.325.
+- A Claude AI Terminal in a BiBCode started from inside a Claude Code session saves its transcript again, so Send to agent attaches its conversation instead of the recent output, because terminals no longer inherit `CLAUDE_CODE_CHILD_SESSION`.
 
 ## [v0.16.0] - 2026-11-14
 
