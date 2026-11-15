@@ -2213,11 +2213,14 @@ CLI stay manual.
    Repeat the Dismiss with the keyboard only.
 9. **Agent messaging off and on.** With **Settings → Agents → Agent
    messaging** off (its default), steps 1 to 8 work, and an agent's
-   `agent_message_send` is refused with the "messaging off" error. Turn it on:
+   `agent_message_send` is refused with `AgentMessagingDisabledError`. Turn it on:
    the agent's next call works without restarting it. Turn it off while a message
-   waits in a recipient's queue: `agent_message_status` reads `held` with the reason
-   `messaging_off`, and the recipient's provider receives nothing. Turn it on
-   again: the message goes back to `queued` and is delivered.
+   waits in a recipient's queue: `agent_message_status` and `bibcode agent status`
+   are refused with the same error, so the held state is not readable, and the
+   recipient's provider receives nothing. Turn it on again: the status reads
+   `queued` and the message is delivered once the recipient's turn ends. The
+   scripted `manual/agent-terminal-wiring.e2e.ts` runs this with a shell as the
+   AI Terminal and the fixture chat as the recipient.
 10. **`bibcode agent` in an AI Terminal.** In a Claude, a Codex and an OpenCode AI
     Terminal, check `echo $BIBCODE_AGENT_ENDPOINT` is set, `echo ${BIBCODE_AGENT_AUTH:+set}`
     prints `set` (never print the value into a report), and `bibcode agent list`
@@ -2228,9 +2231,20 @@ CLI stay manual.
     messages. Run `bibcode agent inbox` to read them." appears once and is
     submitted, `bibcode agent inbox` prints the message inside its envelope and a
     person's request as from the user, and `bibcode agent status <id>` reads
-    `consumed`. No message text is typed into the terminal, only the pointer. On
-    Windows the AI Terminal's `bibcode` is the `bibcode.exe` alias in the folder
-    BiBCode puts first on `PATH`.
+    `consumed`, then `completed` once the agent ran `bibcode agent reply`. No
+    message text is typed into the terminal, only the pointer. On Windows the AI
+    Terminal's `bibcode` is the `bibcode.exe` alias in the folder BiBCode puts
+    first on `PATH`. A terminal is notified only when it is ready: a fresh agent
+    is not ready before its first end-of-turn signal, so give each CLI one tiny
+    prompt first, and answer the CLI's own start-up questions (a trust or model
+    notice) yourself, since a terminal sitting at a question never takes the
+    pointer. A Claude Code build above the hooked range
+    ([Claude Terminal](../providers/claude.md)) runs unhooked: its target entry reads
+    "This terminal cannot be notified of new requests" and its conversation is not
+    read, so use a build inside the range for this step. The real-CLI variant is
+    `manual/send-to-agent-real-providers.e2e.ts` (see its header for the
+    `BIBCODE_E2E_*` variables); it runs the machine's own CLIs and spends a little of
+    each signed-in account.
 11. **The Profiler.** With the Profiler on, none of the steps above leaves a
     finding that names the run's providers or panels, and no note, message,
     answer or terminal text appears in the Profiler data, the logs, the activity

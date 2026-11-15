@@ -1318,7 +1318,11 @@ function writeProviderSettings(
   shimDirectory: string,
   fixtureUserHomePath: string,
   isWindows: boolean,
-  profilerEnabled: boolean,
+  options: {
+    readonly profiler: boolean;
+    readonly agentMessaging: boolean;
+    readonly realProviders: boolean;
+  },
 ): void {
   const executablePath = (name: string): string =>
     NodePath.join(shimDirectory, isWindows ? `${name}.cmd` : name);
@@ -1328,27 +1332,33 @@ function writeProviderSettings(
     NodePath.join(userDataDirectory, "settings.json"),
     `${JSON.stringify(
       {
-        ...(profilerEnabled ? { enableProfiler: true } : {}),
-        providers: {
-          codex: { enabled: true, binaryPath: executablePath("codex") },
-          claudeAgent: { enabled: true, binaryPath: executablePath("claude") },
-          cursor: { enabled: true, binaryPath: executablePath("cursor-agent") },
-          grok: { enabled: true, binaryPath: executablePath("grok") },
-          opencode: { enabled: true, binaryPath: executablePath("opencode") },
-        },
-        providerInstances: {
-          cursor: {
-            driver: "cursor",
-            enabled: true,
-            environment: [
-              {
-                name: isWindows ? "USERPROFILE" : "HOME",
-                value: fixtureUserHomePath,
-                sensitive: false,
+        ...(options.profiler ? { enableProfiler: true } : {}),
+        ...(options.agentMessaging ? { agentMessaging: { enabled: true } } : {}),
+        // Real providers keep the machine's own binaries and sign-ins.
+        ...(options.realProviders
+          ? { enableTerminalAgentActivity: true, terminal: { webglEnabled: false } }
+          : {
+              providers: {
+                codex: { enabled: true, binaryPath: executablePath("codex") },
+                claudeAgent: { enabled: true, binaryPath: executablePath("claude") },
+                cursor: { enabled: true, binaryPath: executablePath("cursor-agent") },
+                grok: { enabled: true, binaryPath: executablePath("grok") },
+                opencode: { enabled: true, binaryPath: executablePath("opencode") },
               },
-            ],
-          },
-        },
+              providerInstances: {
+                cursor: {
+                  driver: "cursor",
+                  enabled: true,
+                  environment: [
+                    {
+                      name: isWindows ? "USERPROFILE" : "HOME",
+                      value: fixtureUserHomePath,
+                      sensitive: false,
+                    },
+                  ],
+                },
+              },
+            }),
       },
       null,
       2,
@@ -1488,14 +1498,15 @@ export function prepareDesktopUiTestContext(
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
   createProviderShims(shimDirectory, isWindows);
+  // BIBCODE_E2E_REAL_PROVIDERS=1 runs the machine's own provider CLIs, sign-ins and HOME, for
+  // the manual real-provider specs; the shared suite never sets it.
+  const realProviders = environment.BIBCODE_E2E_REAL_PROVIDERS === "1";
   // BIBCODE_E2E_PROFILER=1 records the run with the Profiler, so its findings can be read after.
-  writeProviderSettings(
-    stateRoot,
-    shimDirectory,
-    fixtureUserHomePath,
-    isWindows,
-    environment.BIBCODE_E2E_PROFILER === "1",
-  );
+  writeProviderSettings(stateRoot, shimDirectory, fixtureUserHomePath, isWindows, {
+    profiler: environment.BIBCODE_E2E_PROFILER === "1",
+    agentMessaging: environment.BIBCODE_E2E_AGENT_MESSAGING === "1",
+    realProviders,
+  });
 
   environment.BIBCODE_E2E_RUN_ROOT = runRoot;
   environment.BIBCODE_E2E_ARTIFACT_DIR = artifactDirectory;
@@ -1505,7 +1516,9 @@ export function prepareDesktopUiTestContext(
   environment.BIBCODE_E2E_NATIVE_ACTION_LOG = nativeActionLogPath;
   environment.BIBCODE_E2E_PROVIDER_INPUT_LOG = providerInputLogPath;
   environment.BIBCODE_HOME = stateRoot;
-  if (isWindows) {
+  if (realProviders) {
+    // Keep HOME and PATH: the provider CLIs find their own sign-ins there.
+  } else if (isWindows) {
     environment.APPDATA = fixtureAppDataPath;
     environment.LOCALAPPDATA = fixtureLocalAppDataPath;
     environment.PSModuleAnalysisCachePath = powerShellModuleAnalysisCachePath;
@@ -1514,7 +1527,9 @@ export function prepareDesktopUiTestContext(
   } else {
     environment.HOME = fixtureUserHomePath;
   }
-  environment.PATH = `${shimDirectory}${NodePath.delimiter}${environment.PATH ?? ""}`;
+  if (!realProviders) {
+    environment.PATH = `${shimDirectory}${NodePath.delimiter}${environment.PATH ?? ""}`;
+  }
   environment.RUST_LOG ??= "bibcode=debug";
   environment.BIBCODE_LOG = `${environment.BIBCODE_LOG ?? environment.RUST_LOG},bibcode::desktop_e2e=info`;
 
