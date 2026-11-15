@@ -695,6 +695,26 @@ async fn a_terminal_recipients_reply_completes_the_original() {
         (reply.0.as_str(), reply.1.as_str()),
         ("terminal:t/term-c", "thread:a")
     );
+    // A retry with one request id replays its receipt; a new id is a second reply.
+    let retry =
+        json!({ "inReplyTo": original.message_id, "text": "later", "clientRequestId": "r-1" });
+    let first = route.call(&token, "reply", retry.clone()).await;
+    let again = route.call(&token, "reply", retry).await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(
+        first["result"]["messageId"], again["result"]["messageId"],
+        "{again}"
+    );
+    let second = route
+        .call(
+            &token,
+            "reply",
+            json!({ "inReplyTo": original.message_id, "text": "more", "clientRequestId": "r-2" }),
+        )
+        .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_ne!(second["result"]["messageId"], first["result"]["messageId"]);
+    // A restarted terminal cannot reply to its predecessor's mail.
     route.terminals.set_generation("t", "term-c", Some(2));
     let answer = route
         .call(
@@ -704,6 +724,48 @@ async fn a_terminal_recipients_reply_completes_the_original() {
         )
         .await;
     assert_eq!(kind(&answer), "AgentMessagingUnknownMessageError");
+    route.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_terminal_send_reaches_the_activity_log_as_the_terminal_without_text() {
+    let route = route().await;
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let sink = outcomes.clone();
+    let messaging = route
+        .harness
+        .messaging(true)
+        .with_terminals(route.pointer.clone())
+        .with_outcomes(Arc::new(move |outcome| sink.lock().unwrap().push(outcome)));
+    let token = route.token("t", "term-e").await;
+    let answer = agent_call_http(
+        &route.credentials,
+        Some(&messaging),
+        serde_json::to_vec(&json!({ "operation": "send", "arguments": send("thread:b") })).unwrap(),
+        RouteContext {
+            headers: bearer(&token),
+            uri: "/api/agent/call".parse().unwrap(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            origin: crate::RequestOrigin::default(),
+        },
+    )
+    .await
+    .expect("accepted")
+    .body;
+    let outcomes = outcomes.lock().unwrap().clone();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let outcome = &outcomes[0];
+    assert_eq!(outcome.sender_address, "terminal:t/term-e");
+    assert_eq!(outcome.recipient_address, "thread:b");
+    assert_eq!(outcome.tool, "agent_message_send");
+    assert_eq!(outcome.outcome, "accepted");
+    assert_eq!(
+        outcome.message_id.as_deref(),
+        answer["result"]["messageId"].as_str()
+    );
+    assert_eq!(outcome.sender_title.as_deref(), Some("Claude term-e"));
+    assert_eq!(outcome.recipient_title.as_deref(), Some("Thread B"));
+    assert!(!format!("{outcome:?}").contains(BODY), "{outcome:?}");
     route.shutdown().await;
 }
 
@@ -923,7 +985,7 @@ async fn every_other_credential_kind_is_refused_on_the_agent_route() {
         ),
         (
             "a person's session cookie",
-            Some(("cookie", format!("bibcode_session={person}"))),
+            Some(("cookie", format!("{}={person}", auth.cookie_name()))),
         ),
         (
             "an outside agent's token",
