@@ -1318,6 +1318,7 @@ function writeProviderSettings(
   shimDirectory: string,
   fixtureUserHomePath: string,
   isWindows: boolean,
+  profilerEnabled: boolean,
 ): void {
   const executablePath = (name: string): string =>
     NodePath.join(shimDirectory, isWindows ? `${name}.cmd` : name);
@@ -1327,6 +1328,7 @@ function writeProviderSettings(
     NodePath.join(userDataDirectory, "settings.json"),
     `${JSON.stringify(
       {
+        ...(profilerEnabled ? { enableProfiler: true } : {}),
         providers: {
           codex: { enabled: true, binaryPath: executablePath("codex") },
           claudeAgent: { enabled: true, binaryPath: executablePath("claude") },
@@ -1486,7 +1488,14 @@ export function prepareDesktopUiTestContext(
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
   createProviderShims(shimDirectory, isWindows);
-  writeProviderSettings(stateRoot, shimDirectory, fixtureUserHomePath, isWindows);
+  // BIBCODE_E2E_PROFILER=1 records the run with the Profiler, so its findings can be read after.
+  writeProviderSettings(
+    stateRoot,
+    shimDirectory,
+    fixtureUserHomePath,
+    isWindows,
+    environment.BIBCODE_E2E_PROFILER === "1",
+  );
 
   environment.BIBCODE_E2E_RUN_ROOT = runRoot;
   environment.BIBCODE_E2E_ARTIFACT_DIR = artifactDirectory;

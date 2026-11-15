@@ -147,6 +147,21 @@ describe.each([
     expect(environment.BIBCODE_E2E_SHIM_DIRECTORY).toBe(context.shimDirectory);
   });
 
+  it("seeds the Profiler only when BIBCODE_E2E_PROFILER is 1", () => {
+    const read = (environment: NodeJS.ProcessEnv): { readonly enableProfiler?: boolean } => {
+      const context = prepareDesktopUiTestContext(environment);
+      contexts.push(context);
+      return JSON.parse(
+        NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+      ) as { readonly enableProfiler?: boolean };
+    };
+
+    expect(read({ BIBCODE_E2E_PLATFORM: platform }).enableProfiler).toBeUndefined();
+    expect(read({ BIBCODE_E2E_PLATFORM: platform, BIBCODE_E2E_PROFILER: "1" }).enableProfiler).toBe(
+      true,
+    );
+  });
+
   it("isolates provider user inventory inside the disposable run root", () => {
     const environment: NodeJS.ProcessEnv = {
       BIBCODE_E2E_PLATFORM: platform,
