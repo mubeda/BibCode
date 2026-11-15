@@ -4938,7 +4938,7 @@ These are decisions, not bugs:
 
 - A Claude Code terminal reads ready for the pointer line only after Claude's `idle_prompt`
   notification (see above).
-- A Claude Code build outside the hooked versions (2.1.220 to 2.1.323), or any terminal that
+- A Claude Code build outside the hooked versions (2.1.220 to 2.1.325), or any terminal that
   reads **Status unavailable**, has no observer, so `canReceive` is false and the pointer line is
   never typed. Its agent can still read mail with `bibcode agent inbox`.
 - A fresh agent is not ready before its first end-of-turn signal. A CLI that waits on its own
