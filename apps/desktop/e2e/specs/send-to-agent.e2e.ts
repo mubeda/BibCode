@@ -28,13 +28,16 @@ const sendControlSelector = `${visibleSurfaceSelector} button[aria-label^="Send 
 const SLOW_TURN_RELEASE_FILE = ".bibcode-e2e-slow-turn-release";
 
 // The second opinion's own note carries the Codex fixture's slow marker, so Codex stays on it.
-// The primary thread is titled like its project until its first message names it.
-let mainTitle: string = desktopUiFixture.projectName;
-const firstMainPrompt = "refactor the parser [[slow]]";
+// The spec builds its own agents so it does not depend on what earlier specs sent to the primary
+// chat. A panel made through Send to agent is titled "Panel: <provider>".
+const codexPanelTitle = "Panel: Codex";
 const claudeNote = "check the parser";
+const codexSlowNote = "own slow turn [[slow]]";
 const secondOpinionNote = "weigh in on the answer [[slow]]";
 const queuedNote = "please look at the lexer too";
+const sentinelNote = "sentinel after the cancelled request";
 const terminalNote = "terminal asks about the grammar";
+const bringBackQuote = `Second opinion from ${codexPanelTitle}:\n\n> ${desktopUiFixture.streamedResponse}`;
 
 const providerInputs = (): ProviderInputLogEntry[] =>
   readProviderInputLog(preparedProviderInputLogPath);
@@ -154,7 +157,14 @@ async function chooseSendTarget(action: string, target: string): Promise<void> {
   const actionItem = browser.$(`//*[@role="menuitem"][normalize-space()="${action}"]`);
   await actionItem.waitForDisplayed({ timeoutMsg: `The ${action} action was not offered.` });
   await actionItem.click();
-  const targetItem = browser.$(`//*[@role="menuitem"][.//span[normalize-space()="${target}"]]`);
+  // A new panel's entry holds only the provider's name. An existing agent's entry also holds its
+  // provider label, so its title would match a new-panel name if the match were on a span.
+  const newPanel = target === "Claude" || target === "Codex";
+  const targetItem = browser.$(
+    newPanel
+      ? `//*[@role="menuitem"][normalize-space(.)="${target}"]`
+      : `//*[@role="menuitem"][.//span[normalize-space()="${target}"]]`,
+  );
   await targetItem.waitForDisplayed({ timeoutMsg: `${target} was not offered for ${action}.` });
   await targetItem.click();
 }
@@ -174,13 +184,12 @@ async function sendFromPreview(note: string): Promise<void> {
   await dialog.waitForExist({ reverse: true, timeoutMsg: "The preview stayed open after Send." });
 }
 
-function requestRows() {
-  return browser.$$(`${visibleSurfaceSelector} [data-send-request-state]`);
-}
-
 function requestRow(state: string) {
   return browser.$(`${visibleSurfaceSelector} [data-send-request-state="${state}"]`);
 }
+
+/** Slow turns started and not yet released. */
+const slowTurnIds: string[] = [];
 
 async function releaseSlowTurn(turnId: string): Promise<void> {
   completeDesktopUiSlowTurn(preparedProjectPath, turnId);
@@ -188,24 +197,20 @@ async function releaseSlowTurn(turnId: string): Promise<void> {
   await browser.waitUntil(() => !NodeFS.existsSync(release), {
     timeoutMsg: `The fixture provider did not release slow turn ${turnId}.`,
   });
+  slowTurnIds.splice(slowTurnIds.indexOf(turnId), 1);
 }
 
-/** Starts a slow Codex turn in the open `main` thread and returns its turn id. */
-async function startSlowMainTurn(prompt: string): Promise<string> {
-  const baseline = providerInputs().length;
-  await submitWithEnter(prompt);
-  let turnId: string | undefined;
-  await browser.waitUntil(
-    () => {
-      turnId = providerInputs()
-        .slice(baseline)
-        .find((entry) => entry.provider === "codex" && entry.prompt === prompt)?.turnId;
-      return turnId !== undefined;
-    },
-    { timeoutMsg: `The slow Codex turn "${prompt}" did not start.` },
-  );
-  return turnId!;
+/** The id of the center panel tab that is selected now. */
+async function selectedTabId(): Promise<string> {
+  const id = await browser
+    .$('//*[@data-center-panel-tab-id][.//*[@role="tab"][@aria-selected="true"]]')
+    .getAttribute("data-center-panel-tab-id");
+  expect(id).toBeTruthy();
+  return id!;
 }
+
+/** Text without whitespace, so how a composer renders line breaks does not decide a comparison. */
+const collapse = (text: string) => text.replaceAll(/\s+/g, "");
 
 /** Waits for a provider input of this provider whose prompt contains every part. */
 async function waitForProviderPrompt(
@@ -234,12 +239,26 @@ async function waitForProviderPrompt(
 describe("packaged send to agent", () => {
   // Agent messaging stays off (its default): a person's own Send to agent works either way.
   let claudeTabId = "";
-  const slowTurnIds: string[] = [];
+  let codexTabId = "";
+  let terminalTabId = "";
 
-  after(() => {
+  after(async () => {
     // Each write replaces the one release file, so only a turn still running needs it.
+    // A stale release file would show up as a change in the specs that read the project's diff.
     const last = slowTurnIds.at(-1);
     if (last !== undefined) completeDesktopUiSlowTurn(preparedProjectPath, last);
+    NodeFS.rmSync(NodePath.join(preparedProjectPath, SLOW_TURN_RELEASE_FILE), { force: true });
+    // The specs after this one share the session: close the panels this spec opened.
+    for (const id of [terminalTabId, codexTabId, claudeTabId]) {
+      if (id === "") continue;
+      await browser.execute((tabId: string) => {
+        document
+          .querySelector<HTMLElement>(
+            `[data-center-panel-tab-id="${tabId}"] button[aria-label^="Close"]`,
+          )
+          ?.click();
+      }, id);
+    }
   });
 
   it("a message reaches a new Claude panel and shows who sent it", async () => {
@@ -248,67 +267,83 @@ describe("packaged send to agent", () => {
     await setDesktopUiWindowSize(1_200, 900);
     const baseline = providerInputs().length;
     await chooseSendTarget("Message", "Claude");
+    // The preview names the sender; the primary chat's title depends on earlier specs.
+    await previewDialog().waitForDisplayed({ timeoutMsg: "The send preview did not open." });
+    let sender: string | undefined;
+    await browser.waitUntil(
+      async () => {
+        sender = /From ([\s\S]+?) to Claude/.exec(await previewDialog().getText())?.[1];
+        return sender !== undefined;
+      },
+      { timeoutMsg: "The preview did not name the sender." },
+    );
     await sendFromPreview(claudeNote);
     const delivered = await waitForProviderPrompt(baseline, "claudeAgent", [claudeNote]);
     expect(delivered.kind).toBe("start");
     await browser.waitUntil(
       async () =>
-        (await browser.$(visibleSurfaceSelector).getText()).includes(`sent from ${mainTitle}`),
+        (await browser.$(visibleSurfaceSelector).getText()).includes(`sent from ${sender}`),
       { timeoutMsg: "The new panel did not label the message with where it was sent from." },
     );
     const label = await browser.$(`${visibleSurfaceSelector} [data-message-provenance]`).getText();
-    expect(label).toBe(`Message, sent from ${mainTitle}`);
+    expect(label).toBe(`Message, sent from ${sender}`);
     await expect(browser.$(visibleSurfaceSelector)).toHaveText(
       expect.stringContaining(desktopUiFixture.streamedResponse),
     );
-    claudeTabId =
-      (await browser
-        .$('//*[@data-center-panel-tab-id][.//*[@role="tab"][@aria-selected="true"]]')
-        .getAttribute("data-center-panel-tab-id")) ?? "";
-    expect(claudeTabId).not.toBe("");
+    claudeTabId = await selectedTabId();
     expect(claudeTabId).not.toBe("chat:host");
   });
 
   it("a queued request can be cancelled and its target never receives it", async () => {
-    await chatTab("chat:host").click();
-    await waitForComposerDisplayed();
-    slowTurnIds.push(await startSlowMainTurn(firstMainPrompt));
-    mainTitle = firstMainPrompt;
+    // A Codex panel of the spec's own, kept busy with a slow turn.
     await chatTab(claudeTabId).click();
     await waitForComposerDisplayed();
+    let baseline = providerInputs().length;
+    await chooseSendTarget("Message", "Codex");
+    await sendFromPreview(codexSlowNote);
+    const slow = await waitForProviderPrompt(baseline, "codex", [codexSlowNote]);
+    slowTurnIds.push(slow.turnId!);
+    codexTabId = await selectedTabId();
+    expect(codexTabId).not.toBe(claudeTabId);
 
-    const baseline = providerInputs().length;
-    await chooseSendTarget("Message", mainTitle);
+    await chatTab(claudeTabId).click();
+    await waitForComposerDisplayed();
+    baseline = providerInputs().length;
+    await chooseSendTarget("Message", codexPanelTitle);
     await sendFromPreview(queuedNote);
     const queued = requestRow("queued");
     await queued.waitForDisplayed({ timeoutMsg: "The request row never showed Queued." });
-    await expect(queued).toHaveText(expect.stringContaining(`Queued for ${mainTitle}`));
+    await expect(queued).toHaveText(expect.stringContaining(`Queued for ${codexPanelTitle}`));
     await queued.$("button=Cancel").click();
     const cancelled = requestRow("cancelled");
     await cancelled.waitForDisplayed({ timeoutMsg: "Cancel did not mark the request cancelled." });
     await expect(cancelled.$("button=Dismiss")).toBeDisplayed();
     await expect(cancelled.$("button=Cancel")).not.toExist();
 
+    // A second message queues behind the same turn. Once the provider has it, the server has
+    // finished the slow turn and drained its queue, so a cancelled note that was going to arrive
+    // would already have.
+    await chooseSendTarget("Message", codexPanelTitle);
+    await sendFromPreview(sentinelNote);
     await releaseSlowTurn(slowTurnIds.at(-1)!);
-    // Nothing else reached Codex: its own slow turn started before this baseline.
-    await browser.pause(1_000);
-    const afterBaseline = providerInputs().slice(baseline);
-    expect(afterBaseline.filter((entry) => entry.prompt.includes(queuedNote))).toEqual([]);
+    await waitForProviderPrompt(baseline, "codex", [sentinelNote]);
+    const received = providerInputs().slice(baseline);
+    expect(received.filter((entry) => entry.prompt.includes(queuedNote))).toEqual([]);
     await cancelled.$("button=Dismiss").click();
-    await expect(requestRows()).toBeElementsArrayOfSize(0);
+    await cancelled.waitForExist({ reverse: true, timeoutMsg: "Dismiss left the row." });
   });
 
   it("a second opinion that is read but unanswered offers no Dismiss", async () => {
     await chatTab(claudeTabId).click();
     await waitForComposerDisplayed();
     const baseline = providerInputs().length;
-    await chooseSendTarget("Second opinion", mainTitle);
+    await chooseSendTarget("Second opinion", codexPanelTitle);
     await sendFromPreview(secondOpinionNote);
     const entry = await waitForProviderPrompt(baseline, "codex", [secondOpinionNote]);
     slowTurnIds.push(entry.turnId!);
     const row = requestRow("read");
     await row.waitForDisplayed({ timeoutMsg: "The second opinion never showed as read." });
-    await expect(row).toHaveText(expect.stringContaining(`${mainTitle} read it`));
+    await expect(row).toHaveText(expect.stringContaining(`${codexPanelTitle} read it`));
     await expect(row.$("button=Open")).toBeDisplayed();
     await expect(row.$("button=Dismiss")).not.toExist();
     await expect(row.$("button=Cancel")).not.toExist();
@@ -321,7 +356,7 @@ describe("packaged send to agent", () => {
     await waitForComposerDisplayed();
     const notice = browser.$(`${visibleSurfaceSelector} [data-answer-notice]`);
     await notice.waitForDisplayed({ timeoutMsg: "The answer notice did not appear." });
-    await expect(notice).toHaveText(expect.stringContaining(`${mainTitle} answered`));
+    await expect(notice).toHaveText(expect.stringContaining(`${codexPanelTitle} answered`));
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "send-to-agent-notice.png"),
     );
@@ -341,9 +376,10 @@ describe("packaged send to agent", () => {
     const notice = browser.$(`${visibleSurfaceSelector} [data-answer-notice]`);
     await notice.waitForDisplayed({ timeoutMsg: "The notice is gone before Bring back." });
     await notice.$("button*=Bring back").click();
-    await expect(composerEditor()).toHaveText(
-      expect.stringContaining(desktopUiFixture.streamedResponse),
-    );
+    await browser.waitUntil(async () => (await composerEditor().getText()).trim() !== "", {
+      timeoutMsg: "Bring back left the composer empty.",
+    });
+    expect(collapse(await composerEditor().getText())).toBe(collapse(bringBackQuote));
     await expect(notice).not.toExist();
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "send-to-agent-bring-back.png"),
@@ -353,28 +389,34 @@ describe("packaged send to agent", () => {
   });
 
   it("the terminal's requests sit in a popover and focus returns to Send to agent", async () => {
-    await chatTab("chat:host").click();
+    // Keep the Codex panel busy, then open the terminal beside it.
+    await chatTab(codexTabId).click();
     await waitForComposerDisplayed();
-    slowTurnIds.push(await startSlowMainTurn("document the grammar [[slow]]"));
+    const baseline = providerInputs().length;
+    const busyPrompt = "document the grammar [[slow]]";
+    await submitWithEnter(busyPrompt);
+    const busy = await waitForProviderPrompt(baseline, "codex", [busyPrompt]);
+    slowTurnIds.push(busy.turnId!);
     await openFixtureCodexTerminal();
+    terminalTabId = await selectedTabId();
 
-    await chooseSendTarget("Message", mainTitle);
+    await chooseSendTarget("Message", codexPanelTitle);
     await sendFromPreview(terminalNote);
     const requests = browser.$(`${visibleSurfaceSelector} button[aria-label^="Send requests"]`);
     await requests.waitForDisplayed({ timeoutMsg: "The terminal never showed Send requests." });
     await expect(requests).toHaveAttribute("aria-label", "Send requests, 1 request");
     await requests.click();
-    const popoverRow = browser.$(
-      '[role="dialog"] [data-send-request-state="queued"], [data-send-request-state="queued"]',
+    // Only rows inside the opened popover count.
+    const popover = browser.$('//*[@role="dialog"][.//*[@data-send-request-state="queued"]]');
+    await popover.waitForDisplayed({ timeoutMsg: "The popover did not list the queued request." });
+    await expect(popover.$(`[data-send-request-state="queued"]`)).toHaveText(
+      expect.stringContaining(`Queued for ${codexPanelTitle}`),
     );
-    await popoverRow.waitForDisplayed({
-      timeoutMsg: "The popover did not list the queued request.",
-    });
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "send-to-agent-terminal-requests.png"),
     );
-    await popoverRow.$("button=Cancel").click();
-    const cancelled = browser.$('[data-send-request-state="cancelled"]');
+    await popover.$("button=Cancel").click();
+    const cancelled = browser.$('//*[@role="dialog"]//*[@data-send-request-state="cancelled"]');
     await cancelled.waitForDisplayed({ timeoutMsg: "The terminal request was not cancelled." });
 
     // The embedded driver's Enter key does not activate a focused button, so Dismiss is clicked.
