@@ -145,7 +145,7 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
   const [seenSignal, setSeenSignal] = useState(openSignal);
   if (openSignal !== seenSignal) {
     setSeenSignal(openSignal);
-    setMenuOpen(true);
+    if (openSignal > seenSignal) setMenuOpen(true);
   }
 
   const choose = useCallback(

@@ -271,6 +271,29 @@ describe("SendToAgentButton", () => {
     expect(onChoose.mock.calls[0]![0].source.threadId).toBe("beta");
   });
 
+  it("openSignal_opens_the_menu_once_and_not_again_on_a_re_render_or_after_it_is_closed", async () => {
+    const menu = () => document.body.querySelector('[role="menu"]');
+    render(baseProps({ openSignal: 0 }));
+    await flush();
+    expect(menu()).toBeNull();
+    render(baseProps({ openSignal: 1 }));
+    await flush();
+    expect(menu()).not.toBeNull();
+    // An unrelated re-render keeps it open and does not toggle it.
+    render(baseProps({ openSignal: 1, hintFor: () => null }));
+    await flush();
+    expect(menu()).not.toBeNull();
+    await act(async () => triggers()[0]!.click());
+    await flush();
+    expect(menu()).toBeNull();
+    render(baseProps({ openSignal: 1, hintFor: () => null }));
+    await flush();
+    expect(menu()).toBeNull();
+    render(baseProps({ openSignal: 2 }));
+    await flush();
+    expect(menu()).not.toBeNull();
+  });
+
   it("the control is disabled with the update reason when the environment lacks sendRequests", () => {
     render(baseProps({ serverSupported: false }));
     const trigger = triggers()[0]!;

@@ -47,6 +47,7 @@ vi.mock("./SendToAgentButton", () => ({
       | ((render: (live: { source: Record<string, unknown> }) => ReactNode) => ReactNode);
     return (
       <span data-send-to-agent>
+        <button type="button" aria-label="Send to agent" />
         {h.menuOpen
           ? renderLive?.((live) => {
               h.live = live;
@@ -92,13 +93,13 @@ let root: Root;
 let container: HTMLDivElement;
 let selection = "";
 
-function render() {
+function render(terminalId = "term-1") {
   act(() =>
     root.render(
       <TerminalSendToAgentContext.Provider value={services}>
         <TerminalSendComposer
           threadRef={threadRef}
-          terminalId="term-1"
+          terminalId={terminalId}
           terminalLabel="Claude"
           readSelection={() => selection}
         />
@@ -360,6 +361,37 @@ describe("TerminalSendComposer", () => {
       render();
       await open();
       expect(notices()).toHaveLength(1);
+    });
+
+    it("dismissing_the_last_row_moves_focus_to_the_send_to_agent_control_and_closes_the_popover", async () => {
+      h.requests = [terminalRequest()];
+      render();
+      await open();
+      const dismiss = pressed("Dismiss")!;
+      dismiss.focus();
+      expect(document.activeElement).toBe(dismiss);
+      h.requests = [];
+      render();
+      await act(async () => {});
+      expect(trigger()).toBeNull();
+      expect(document.activeElement?.getAttribute("aria-label")).toBe("Send to agent");
+      // A later request must not find the popover still open.
+      h.requests = [terminalRequest({ requestId: "r2" })];
+      render();
+      expect(notices()).toHaveLength(0);
+    });
+
+    it("the_open_signal_belongs_to_the_terminal_it_was_raised_for", async () => {
+      h.requests = [terminalRequest()];
+      render();
+      await open();
+      await act(async () => pressed("Bring back")!.click());
+      await act(async () => {});
+      expect(h.buttonProps.at(-1)!["openSignal"]).toBe(1);
+      render("term-2");
+      expect(h.buttonProps.at(-1)!["openSignal"]).toBe(0);
+      render("term-1");
+      expect(h.buttonProps.at(-1)!["openSignal"]).toBe(0);
     });
 
     it("a plain request shows its row with Cancel, Open and no notice, and Cancel cancels it", async () => {

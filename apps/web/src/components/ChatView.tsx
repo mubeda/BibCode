@@ -353,7 +353,11 @@ import {
   makeTerminalOutputLoader,
   shouldActivateSendPanel,
 } from "./sendToAgent/terminalSource.logic";
-import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
+import {
+  describeRowActionFailure,
+  selectRowsForThread,
+  SendRequestRows,
+} from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
 import {
@@ -5383,7 +5387,7 @@ function ChatViewContent(props: ChatViewProps) {
           stackedThreadToast({
             type: "error",
             title: "Couldn't cancel the request",
-            description: "BiBCode could not reach the server. Try again.",
+            description: describeRowActionFailure(outcome),
           }),
         );
       }
@@ -5398,7 +5402,7 @@ function ChatViewContent(props: ChatViewProps) {
           stackedThreadToast({
             type: "error",
             title: "Couldn't dismiss the request",
-            description: "BiBCode could not reach the server. Try again.",
+            description: describeRowActionFailure(outcome),
           }),
         );
       }

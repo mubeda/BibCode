@@ -7,7 +7,7 @@
  */
 import type { ScopedThreadRef, SendRequest } from "@bibcode/contracts";
 import { InboxIcon } from "lucide-react";
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
@@ -30,6 +30,8 @@ export const TerminalSendRequests = memo(function TerminalSendRequests(props: {
   readonly onCancel: (requestId: string) => Promise<void>;
   readonly onDismiss: (requestId: string) => Promise<void>;
   readonly onBringBack: (text: string) => void;
+  /** Called when the last request goes and the trigger with it, so focus is not lost. */
+  readonly restoreFocus: () => void;
 }) {
   const { threadRef, requests, onBringBack } = props;
   const [open, setOpen] = useState(false);
@@ -44,6 +46,20 @@ export const TerminalSendRequests = memo(function TerminalSendRequests(props: {
     },
     [onBringBack],
   );
+  // A trigger that goes away takes the open popover with it; a later request starts closed.
+  if (shown.length === 0 && open) setOpen(false);
+  const hadRows = useRef(false);
+  const { restoreFocus } = props;
+  useEffect(() => {
+    if (shown.length > 0) {
+      hadRows.current = true;
+      return;
+    }
+    if (!hadRows.current) return;
+    hadRows.current = false;
+    const active = document.activeElement;
+    if (active === null || active === document.body) restoreFocus();
+  }, [restoreFocus, shown.length]);
   if (shown.length === 0) return null;
   return (
     <Popover open={open} onOpenChange={setOpen}>

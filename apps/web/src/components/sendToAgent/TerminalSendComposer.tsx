@@ -306,7 +306,10 @@ function TerminalSendComposerBody(props: {
   );
   // Bring back opens the control's menu with the quoted answer as the Message note: the person
   // copies it or picks an agent to send it on to. Nothing reaches the terminal.
-  const [openSignal, setOpenSignal] = useState(0);
+  const [signal, setSignal] = useState({ terminalId, count: 0 });
+  // The signal belongs to the terminal it was raised for; another terminal starts from zero.
+  if (signal.terminalId !== terminalId) setSignal({ terminalId, count: 0 });
+  const openSignal = signal.terminalId === terminalId ? signal.count : 0;
   const bringBack = useCallback(
     (text: string) => {
       if (source === null) return;
@@ -314,13 +317,20 @@ function TerminalSendComposerBody(props: {
       const store = useSendToAgentStore.getState();
       const typed = store.notes[key] ?? "";
       store.setNote(key, typed === "" ? text : `${typed}\n\n${text}`);
-      setOpenSignal((count) => count + 1);
+      setSignal((current) => ({
+        terminalId,
+        count: (current.terminalId === terminalId ? current.count : 0) + 1,
+      }));
     },
-    [source],
+    [source, terminalId],
   );
+  const controlRef = useRef<HTMLSpanElement | null>(null);
+  const focusControl = useCallback(() => {
+    controlRef.current?.querySelector<HTMLElement>('button[aria-label^="Send to agent"]')?.focus();
+  }, []);
   if (source === null) return null;
   return (
-    <>
+    <span ref={controlRef} className="contents">
       <SendToAgentButton
         source={source}
         serverSupported={services.serverSupported}
@@ -338,6 +348,8 @@ function TerminalSendComposerBody(props: {
         openSignal={openSignal}
       />
       <TerminalSendRequests
+        key={terminalId}
+        restoreFocus={focusControl}
         threadRef={threadRef}
         requests={terminalRequests}
         onOpen={services.openSendTarget}
@@ -345,7 +357,7 @@ function TerminalSendComposerBody(props: {
         onDismiss={services.dismissSendRequest}
         onBringBack={bringBack}
       />
-    </>
+    </span>
   );
 }
 

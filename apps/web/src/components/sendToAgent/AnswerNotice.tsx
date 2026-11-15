@@ -60,6 +60,8 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
   const bringBack = async () => {
     setPhase("reading");
     const result = await getAnswer(requestId);
+    // A notice that went away (popover closed, terminal switched) must not act on a late answer.
+    if (!mounted.current) return;
     const text =
       result._tag === "Success"
         ? composeAnswerBringBack({

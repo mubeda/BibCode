@@ -254,6 +254,23 @@ describe("AnswerNotice", () => {
       expect(onDismiss).toHaveBeenCalledWith("request-1");
     });
 
+    it("a_bring_back_that_finishes_after_the_notice_is_gone_does_nothing", async () => {
+      let finish: (value: unknown) => void = () => undefined;
+      h.getAnswer = vi.fn(() => new Promise((resolve) => (finish = resolve))) as never;
+      const onBringBack = vi.fn();
+      const { onDismiss } = render({ request: terminalRequest(), onBringBack });
+      await act(async () => button("Bring back")!.click());
+      act(() => root.render(null));
+      await act(async () =>
+        finish({
+          _tag: "Success",
+          value: { requestId: "request-1", text: "late", truncated: false },
+        }),
+      );
+      expect(onBringBack).not.toHaveBeenCalled();
+      expect(onDismiss).not.toHaveBeenCalled();
+    });
+
     it("a_not_answered_terminal_request_offers_open_and_no_bring_back", () => {
       render({
         request: terminalRequest({ state: "not_answered", reason: "recipient_gone" }),
