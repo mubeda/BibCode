@@ -4870,9 +4870,12 @@ cannot start a provider command, a skill or a file reference. BiBCode decides th
 an agent message from the message row it stored, never from the text, so a person who pastes an
 envelope still sends a person's message. It marks the envelope to Claude as client-composed,
 which stops Claude Code from expanding an `@path` inside it; OpenCode keeps it as one literal
-text part. Codex 0.169.0 still expands a skill named with `$` inside any text input and has no
-input flag that turns that off, and Cursor was not probed: these are known gaps of literal
-delivery.
+text part. Codex 0.169.0 expands a skill named with `$` inside any text input and has no input
+flag that turns that off, so the text a Codex recipient (a chat agent or an AI Terminal) is
+delivered has a zero-width space after each `$` that a letter, a digit, `_` or `-` follows. A
+`$` before a space, other punctuation or the end of the text stays as it is. The stored message
+and its status keep the text as written, and a person's request is not changed. Cursor was not
+probed: that is a known gap of literal delivery.
 
 ### The person-request envelope
 

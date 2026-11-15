@@ -831,9 +831,11 @@ impl AgentMessaging {
             "" => "Agent".to_owned(),
             title => title.to_owned(),
         };
+        let recipient_provider = self.sender_description(&recipient_address).await.provider;
         let envelope = build_envelope(&EnvelopeInput {
             sender_title: &label,
             provider: &sender.provider,
+            recipient_provider: &recipient_provider,
             sender_address: &sender_address,
             message_id: outgoing.message_id,
             conversation_id: outgoing.conversation_id,

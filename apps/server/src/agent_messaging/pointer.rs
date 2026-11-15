@@ -844,6 +844,10 @@ impl TerminalPointer {
                 };
             }
         }
+        let recipient_provider = messaging
+            .sender_description(&identity.address())
+            .await
+            .provider;
         let mut entries = Vec::with_capacity(consumed.len());
         for message in &consumed {
             // A person's request is stored as it reads, in its own envelope with BiBCode's
@@ -865,6 +869,7 @@ impl TerminalPointer {
                 rendered: build_envelope(&EnvelopeInput {
                     sender_title: label,
                     provider: &sender.provider,
+                    recipient_provider: &recipient_provider,
                     sender_address: &message.sender_address,
                     message_id: &message.message_id,
                     conversation_id: &message.conversation_id,
@@ -975,6 +980,18 @@ pub(crate) mod tests {
                 live_park: StdMutex::new(None),
                 guard_park: StdMutex::new(None),
             })
+        }
+
+        /// Makes the terminal's agent run on `driver`.
+        pub(crate) fn set_driver(&self, thread_id: &str, terminal_id: &str, driver: &'static str) {
+            if let Some(terminal) = self
+                .terminals
+                .lock()
+                .unwrap()
+                .get_mut(&key(thread_id, terminal_id))
+            {
+                terminal.driver = driver;
+            }
         }
 
         /// A running Claude AI Terminal (a plain shell when `ai` is false), not ready.
@@ -1829,6 +1846,7 @@ pub(crate) mod tests {
             super::super::envelope::build_envelope(&super::super::envelope::EnvelopeInput {
                 sender_title: "Sender thread",
                 provider: "codex",
+                recipient_provider: "claudeAgent",
                 sender_address: "thread:a",
                 message_id: &receipt.message_id,
                 conversation_id: &receipt.conversation_id,
@@ -1841,6 +1859,40 @@ pub(crate) mod tests {
             AgentMessageStatus::Consumed
         );
         assert!(fixture.inbox("term-1").await.is_empty());
+        fixture.shutdown().await;
+    }
+
+    /// A Codex AI Terminal reads no bare `$name` skill mention in its inbox; the stored message
+    /// keeps the text.
+    #[tokio::test]
+    async fn a_codex_terminals_inbox_carries_no_bare_skill_mention() {
+        let fixture = fixture().await;
+        fixture.terminals.set_driver("t", "term-1", "codex");
+        let receipt = fixture
+            .messaging
+            .send(
+                "a",
+                SendRequest {
+                    to: "terminal:t/term-1".to_owned(),
+                    text: "Use $deploy-skill for it.".to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let entries = fixture.inbox("term-1").await;
+        assert_eq!(ids(&entries), [receipt.message_id.as_str()]);
+        assert!(
+            entries[0]
+                .rendered
+                .contains("\n  Use $\u{200B}deploy-skill for it.\n"),
+            "{:?}",
+            entries[0].rendered
+        );
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.text,
+            "Use $deploy-skill for it."
+        );
         fixture.shutdown().await;
     }
 

@@ -16,6 +16,8 @@ const TITLE_MAX_CHARS: usize = 200;
 pub(crate) struct EnvelopeInput<'a> {
     pub(crate) sender_title: &'a str,
     pub(crate) provider: &'a str,
+    /// The recipient's provider: Codex expands a `$name` skill mention anywhere in its input.
+    pub(crate) recipient_provider: &'a str,
     pub(crate) sender_address: &'a str,
     pub(crate) message_id: &'a str,
     pub(crate) conversation_id: &'a str,
@@ -45,7 +47,12 @@ pub(crate) fn build_envelope(input: &EnvelopeInput<'_>) -> String {
     }
     envelope.push_str(NOT_THE_USER);
     envelope.push_str("\n---\n  ");
-    envelope.push_str(&quote_body(input.text));
+    let body = quote_body(input.text);
+    if input.recipient_provider == "codex" {
+        envelope.push_str(&neutralize_skill_mentions(&body));
+    } else {
+        envelope.push_str(&body);
+    }
     envelope.push('\n');
     envelope.push_str(CLOSE);
     envelope
@@ -118,6 +125,25 @@ fn escape_controls(text: &str, keep_lines: bool) -> String {
     escaped
 }
 
+/// Codex expands a `$name` skill mention anywhere in a turn's text and has no input flag that
+/// stops it, so a zero-width space follows each `$` that a name character follows. A `$` before
+/// a space, other punctuation or the end of the text cannot start a mention and stays as it is.
+fn neutralize_skill_mentions(text: &str) -> String {
+    let mut neutralized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        neutralized.push(character);
+        if character == '$'
+            && characters
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'))
+        {
+            neutralized.push('\u{200B}');
+        }
+    }
+    neutralized
+}
+
 /// Both tag names in any letter case with `_` turned into `-`, so no marker can be forged.
 fn neutralize_tag(text: &str) -> String {
     [TAG, PERSON_TAG]
@@ -148,12 +174,43 @@ mod tests {
         EnvelopeInput {
             sender_title: "API refactor",
             provider: "codex",
+            recipient_provider: "",
             sender_address: "thread:a",
             message_id: "message-1",
             conversation_id: "conversation-1",
             in_reply_to: None,
             text,
         }
+    }
+
+    const SKILL_TEXT: &str = "Run $deploy-skill, then $_x and $9lives; pay $ 5 or $";
+
+    #[test]
+    fn a_codex_recipient_gets_no_bare_skill_mention() {
+        let envelope = build_envelope(&EnvelopeInput {
+            recipient_provider: "codex",
+            ..input(SKILL_TEXT)
+        });
+        assert!(
+            envelope.contains(
+                "Run $\u{200B}deploy-skill, then $\u{200B}_x and $\u{200B}9lives; pay $ 5 or $\n"
+            ),
+            "{envelope:?}"
+        );
+        assert!(!envelope.contains("$deploy-skill"), "{envelope:?}");
+    }
+
+    #[test]
+    fn other_recipients_and_a_persons_request_keep_a_skill_mention() {
+        for provider in ["", "claudeAgent", "opencode", "cursor"] {
+            let envelope = build_envelope(&EnvelopeInput {
+                recipient_provider: provider,
+                ..input(SKILL_TEXT)
+            });
+            assert!(envelope.contains(SKILL_TEXT), "{provider}: {envelope:?}");
+        }
+        let request = build_person_request("Review", "Parser work", "message-1", SKILL_TEXT);
+        assert!(request.contains(SKILL_TEXT), "{request:?}");
     }
 
     #[test]

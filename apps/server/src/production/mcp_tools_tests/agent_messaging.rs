@@ -436,6 +436,51 @@ async fn accepted() {
     harness.shutdown().await;
 }
 
+/// Codex expands a `$name` skill mention anywhere in its input, so the text a Codex recipient
+/// is delivered carries none; the stored message keeps what the agent wrote, and a recipient on
+/// another provider is delivered it unchanged.
+#[tokio::test]
+async fn a_codex_recipient_is_delivered_no_bare_skill_mention() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let text = "Use $deploy-skill for it.";
+    for (from, to) in [("a", "thread:b"), ("b", "thread:a")] {
+        let result = harness.agent_send(from, send_arguments(to, text)).await;
+        assert_ne!(result["isError"], true, "{result}");
+    }
+    let stored = harness.agent_messages().await;
+    let texts: Vec<String> = harness
+        .repositories
+        .database()
+        .call(|connection| {
+            let mut statement =
+                connection.prepare("SELECT text FROM agent_messages ORDER BY rowid")?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!(texts, [text, text], "the stored messages keep the text");
+    let (to_codex, _) = harness
+        .projected_message(stored[0].delivery_message_id.clone())
+        .await;
+    assert!(
+        to_codex.contains("\n  Use $\u{200B}deploy-skill for it.\n"),
+        "{to_codex:?}"
+    );
+    assert!(!to_codex.contains("$deploy-skill"), "{to_codex:?}");
+    let (to_claude, _) = harness
+        .projected_message(stored[1].delivery_message_id.clone())
+        .await;
+    assert!(
+        to_claude.contains("\n  Use $deploy-skill for it.\n"),
+        "{to_claude:?}"
+    );
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn no_spoofing() {
     let harness = Harness::new().await;

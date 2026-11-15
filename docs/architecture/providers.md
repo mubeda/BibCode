@@ -1178,12 +1178,17 @@ next turn, as it does for a `/` command.
 **Literal delivery per provider** (spec R8: the text must not run a command, load a skill or
 expand a file). Measured when the envelope was added:
 
-| Provider | Result                                                                                                                 |
-| -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Claude   | `@path` inside the envelope was expanded until the line carried `client_composed`; with it the text stays literal      |
-| Codex    | 0.169.0 still expands a skill named with `$` inside any text input and has no input flag to turn that off: a known gap |
-| OpenCode | The envelope is kept as one literal text part                                                                          |
-| Cursor   | Not probed (the probe needs a trusted folder)                                                                          |
+| Provider | Result                                                                                                                                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude   | `@path` inside the envelope was expanded until the line carried `client_composed`; with it the text stays literal                                                                                          |
+| Codex    | 0.169.0 expands a skill named with `$` inside any text input and has no input flag to turn that off, so the envelope for a Codex recipient puts a zero-width space after each `$` a name character follows |
+| OpenCode | The envelope is kept as one literal text part                                                                                                                                                              |
+| Cursor   | Not probed (the probe needs a trusted folder)                                                                                                                                                              |
+
+`build_envelope` (`agent_messaging/envelope.rs`) applies the Codex rule for a chat recipient and a
+terminal inbox alike, from the recipient's provider. The stored message, the activity log, the
+status and the sender's view keep the text as written, and a person's request is never changed,
+because a person may name a skill on purpose.
 
 The rule covers expansion by the provider's client, not a recipient model that decides to call a
 tool because of the text; the mode ceiling governs that.

@@ -4700,6 +4700,7 @@ mod workspace_loss_tests {
         let text = envelope::build_envelope(&envelope::EnvelopeInput {
             sender_title: "Sender",
             provider: "codex",
+            recipient_provider: "",
             sender_address: "thread:sender",
             message_id: "a1",
             conversation_id: "c1",
@@ -33990,6 +33991,7 @@ done
                 &crate::agent_messaging::envelope::EnvelopeInput {
                     sender_title: "Sender",
                     provider: "codex",
+                    recipient_provider: "",
                     sender_address: "thread:sender",
                     message_id: "message-1",
                     conversation_id: "conversation-1",
