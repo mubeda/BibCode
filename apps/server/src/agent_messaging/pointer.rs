@@ -206,6 +206,8 @@ pub struct TerminalPointer {
     exclusions: Arc<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     /// The addresses with a pointer attempt running, and whether a pass skipped one meanwhile.
     in_flight: Arc<StdMutex<HashMap<String, bool>>>,
+    /// The `{address}#{generation key}` ends a sweep started and that have not finished.
+    ending: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl TerminalPointer {
@@ -219,6 +221,7 @@ impl TerminalPointer {
             generation_end: None,
             exclusions: Arc::default(),
             in_flight: Arc::default(),
+            ending: Arc::default(),
         }
     }
 
@@ -339,7 +342,7 @@ impl TerminalPointer {
                     biased;
                     () = shutdown.cancelled() => return,
                     () = async {
-                        pointer.sweep_ended(&messaging).await;
+                        pointer.sweep_ended(&messaging, &shutdown).await;
                         pointer.paste_waiting(&messaging, &shutdown).await;
                     } => {}
                 }
@@ -357,21 +360,44 @@ impl TerminalPointer {
         })
     }
 
-    /// Holds or releases the terminals' agent mail for the setting's current value.
+    /// Holds or releases each terminal's agent mail for the setting's current value, under that
+    /// terminal's exclusion, so a pointer write that read the mail as eligible finishes before
+    /// its mail changes. Each terminal follows in its own task, which reads the setting once it
+    /// holds the exclusion, so one terminal's stuck write delays no other terminal and a later
+    /// value always wins.
     async fn follow_setting(&self, messaging: &AgentMessaging) {
-        let enabled = messaging.is_enabled();
-        if let Err(error) = self
+        let addresses = match self
             .database
-            .call(move |connection| {
-                super::delivery::follow_setting_for_terminals(
-                    connection,
-                    enabled,
-                    &crate::mcp::control::now_iso(),
-                )
-            })
+            .call(|connection| super::delivery::list_terminals_following_setting(connection))
             .await
         {
-            tracing::warn!(error = %error, "terminal agent messages did not follow the setting");
+            Ok(addresses) => addresses,
+            Err(error) => {
+                tracing::warn!(error = %error, "terminal agent messages did not follow the setting");
+                return;
+            }
+        };
+        for address in addresses {
+            let (pointer, messaging) = (self.clone(), messaging.clone());
+            tokio::spawn(async move {
+                let _exclusive = pointer.exclusive(&address).await;
+                let enabled = messaging.is_enabled();
+                if let Err(error) = pointer
+                    .database
+                    .call(move |connection| {
+                        super::delivery::follow_setting_for_terminal(
+                            connection,
+                            &address,
+                            enabled,
+                            &crate::mcp::control::now_iso(),
+                        )
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %error, "terminal agent messages did not follow the setting");
+                }
+                pointer.wake.notify_one();
+            });
         }
     }
 
@@ -524,8 +550,9 @@ impl TerminalPointer {
     }
 
     /// Ends each terminal generation with open mail that no process holds now, those of an
-    /// earlier boot included.
-    async fn sweep_ended(&self, messaging: &AgentMessaging) {
+    /// earlier boot included. Each end runs in its own task, because it waits for its terminal's
+    /// exclusion, which a stuck pointer write holds for up to [`POINTER_WRITE_LIMIT`].
+    async fn sweep_ended(&self, messaging: &AgentMessaging, shutdown: &CancellationToken) {
         let generations = match self
             .database
             .call(|connection| store::list_open_terminal_generations(connection))
@@ -553,10 +580,32 @@ impl TerminalPointer {
                 .terminals
                 .live_generation(&thread_id, &terminal_id)
                 .await;
-            if live.as_ref().map(generation_key).as_deref() != Some(key.as_str()) {
-                self.end_generation(messaging, &thread_id, &terminal_id, &key)
-                    .await;
+            if live.as_ref().map(generation_key).as_deref() == Some(key.as_str()) {
+                continue;
             }
+            let ending = format!("{address}#{key}");
+            if !self
+                .ending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(ending.clone())
+            {
+                continue;
+            }
+            let (pointer, messaging, shutdown) =
+                (self.clone(), messaging.clone(), shutdown.clone());
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {}
+                    () = pointer.end_generation(&messaging, &thread_id, &terminal_id, &key) => {}
+                }
+                pointer
+                    .ending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&ending);
+            });
         }
     }
 

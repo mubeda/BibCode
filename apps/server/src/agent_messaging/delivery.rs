@@ -413,9 +413,6 @@ async fn reconcile(
                     &now,
                 )?;
             }
-            if let Some(enabled) = messaging {
-                follow_setting_for_terminals(connection, enabled, &now)?;
-            }
             hold_above_ceiling(connection, recipient, &now)?;
             let open = match recipient {
                 Some(address) => list_open_for_thread(connection, address)?,
@@ -433,12 +430,30 @@ async fn reconcile(
     Ok(changes.len())
 }
 
-/// Holds every terminal's `queued` and unfetched `delivered` agent message with `messaging_off`
-/// while messaging is off, and puts each back to `queued` when it is on (the pointer then
-/// announces it). A status change only: a terminal row has no queue entry. A person's request
-/// is never held.
-pub(crate) fn follow_setting_for_terminals(
+/// The terminals whose agent mail the setting holds or releases: those with a `queued`, an
+/// unfetched `delivered` or a `messaging_off` held agent message.
+pub(crate) fn list_terminals_following_setting(
     connection: &rusqlite::Connection,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT DISTINCT recipient_address FROM agent_messages
+          WHERE sender_kind = 'agent' AND substr(recipient_address, 1, 9) = 'terminal:'
+            AND (status IN ('queued', 'delivered') OR (status = 'held' AND reason = 'messaging_off'))",
+    )?;
+    let addresses = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(addresses)
+}
+
+/// Holds the terminal `recipient_address`'s `queued` and unfetched `delivered` agent messages
+/// with `messaging_off` while messaging is off, and puts each back to `queued` when it is on
+/// (the pointer then announces it). A status change only: a terminal row has no queue entry. A
+/// person's request is never held. The pointer runs it under that terminal's exclusion; the
+/// chat tracker never touches terminal rows.
+pub(crate) fn follow_setting_for_terminal(
+    connection: &rusqlite::Connection,
+    recipient_address: &str,
     enabled: bool,
     updated_at: &str,
 ) -> Result<usize> {
@@ -450,10 +465,8 @@ pub(crate) fn follow_setting_for_terminals(
           WHERE status IN ('queued', 'delivered')"
     };
     Ok(connection.execute(
-        &format!(
-            "{statement} AND sender_kind = 'agent' AND substr(recipient_address, 1, 9) = 'terminal:'"
-        ),
-        params![updated_at],
+        &format!("{statement} AND sender_kind = 'agent' AND recipient_address = ?2"),
+        params![updated_at, recipient_address],
     )?)
 }
 
