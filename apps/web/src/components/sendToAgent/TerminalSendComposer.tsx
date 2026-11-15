@@ -63,6 +63,9 @@ export interface TerminalSendToAgentServices {
 export const TerminalSendToAgentContext = createContext<TerminalSendToAgentServices | null>(null);
 
 const NO_ROWS: ReadonlyArray<AgentRow> = [];
+
+export const TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE =
+  "BiBCode could not read this terminal's output. Try again.";
 const NO_MESSAGES: SendToAgentSource["messages"] = [];
 
 // Until a terminal can be notified (task 9.2), no terminal is offered as a target.
@@ -200,6 +203,7 @@ function TerminalSendComposerBody(props: {
       return {
         leadIn,
         attachments: [],
+        loadFailedMessage: TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
         loadAttachments: async () => {
           const read = outputRef.current ?? loadOutput();
           // A failed read is not reused: Retry reads again.

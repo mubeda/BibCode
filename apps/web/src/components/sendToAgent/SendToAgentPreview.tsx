@@ -48,6 +48,8 @@ export interface SendToAgentPreviewProps {
   initialAttachments: ReadonlyArray<PreviewAttachment>;
   /** Read once when the preview opens, and again on Retry; Send waits for it. */
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
+  /** Shown when `loadAttachments` fails; defaults to `LOAD_FAILED_MESSAGE`. */
+  loadFailedMessage?: string;
   extraContent?: ReactNode;
   warning?: string | null;
   onClose: () => void;
@@ -219,7 +221,11 @@ function PreviewBody(props: SendToAgentPreviewProps) {
             {loading === "loading" ? "Reading the messages to attach" : ""}
           </p>
           <div role="alert" className="text-destructive-foreground">
-            {loading === "failed" ? LOAD_FAILED_MESSAGE : described ? described.message : null}
+            {loading === "failed"
+              ? (props.loadFailedMessage ?? LOAD_FAILED_MESSAGE)
+              : described
+                ? described.message
+                : null}
           </div>
         </div>
         {/* Stays mounted while a retry loads, so focus stays on it. */}

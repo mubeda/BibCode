@@ -46,6 +46,7 @@ import { useSendToAgentStore } from "~/sendToAgentStore";
 import { buildAgentRows } from "../sidebar/agentsSection.logic";
 import { LOAD_FAILED_MESSAGE } from "./SendToAgentPreview";
 import {
+  TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
   TerminalSendComposer,
   TerminalSendToAgentContext,
   type TerminalSendToAgentServices,
@@ -253,9 +254,9 @@ describe("TerminalSendComposer with the real menu and preview", () => {
     await flush();
     await act(async () => find('[role="menuitem"]', "beta")!.click());
     await flush();
-    expect(document.body.querySelector('[role="alert"]')!.textContent).toContain(
-      LOAD_FAILED_MESSAGE,
-    );
+    const alert = document.body.querySelector('[role="alert"]')!.textContent;
+    expect(alert).toContain(TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE);
+    expect(alert).not.toContain(LOAD_FAILED_MESSAGE);
     expect(find("button", "Send")!.hasAttribute("disabled")).toBe(true);
     await act(async () => find("button", "Retry")!.click());
     await flush();

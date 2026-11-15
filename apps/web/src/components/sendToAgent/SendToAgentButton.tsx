@@ -265,6 +265,9 @@ function PreviewHost(props: {
       {...(content.loadAttachments === undefined
         ? {}
         : { loadAttachments: content.loadAttachments })}
+      {...(content.loadFailedMessage === undefined
+        ? {}
+        : { loadFailedMessage: content.loadFailedMessage })}
       {...(content.extraContent === undefined ? {} : { extraContent: content.extraContent })}
       warning={warning}
       finalFocus={props.finalFocus}

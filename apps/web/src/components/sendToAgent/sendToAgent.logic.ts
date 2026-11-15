@@ -254,6 +254,8 @@ export interface PreviewContent {
   submit?: (draft: PreviewDraft, isCurrent?: () => boolean) => Promise<SendOutcome>;
   /** Attachments read when the preview opens, after `attachments`; Send waits for them. */
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
+  /** The error shown when `loadAttachments` fails; the preview's own wording otherwise. */
+  loadFailedMessage?: string;
 }
 
 export function sourceAddressOf(
