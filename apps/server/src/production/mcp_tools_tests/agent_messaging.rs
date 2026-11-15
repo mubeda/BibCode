@@ -114,6 +114,39 @@ async fn lists_the_other_agents_of_the_project() {
 }
 
 #[tokio::test]
+async fn agents_list_names_the_projects_ai_terminals() {
+    let harness = Harness::new().await;
+    harness.messaging_threads().await;
+    let terminals = crate::agent_messaging::pointer::tests::Scripted::new();
+    terminals.add("a", "term-1", 1, true);
+    terminals.add("x", "term-9", 1, true);
+    let messaging = harness.messaging(true).with_terminals(
+        crate::agent_messaging::pointer::TerminalPointer::new(
+            harness.engine.repositories().database().clone(),
+            terminals,
+        ),
+    );
+
+    let result = run(scope("b"), "agents_list", json!({}), Some(&messaging)).await;
+
+    assert_ne!(result["isError"], true, "{result}");
+    let listed: Vec<&Value> = structured(&result)["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .filter(|agent| agent["kind"] == "terminal")
+        .collect();
+    assert_eq!(
+        json!(listed),
+        json!([{
+            "address": "terminal:a/term-1", "title": "Claude term-1", "provider": "claudeAgent",
+            "kind": "terminal", "status": "working", "canReceive": true,
+        }])
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn other_projects_stay_invisible() {
     let harness = Harness::new().await;
     harness.messaging_threads().await;

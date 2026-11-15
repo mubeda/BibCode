@@ -42,7 +42,7 @@ fn call<'a>(
     Box::pin(async { Err(typed_tool_failure("McpUnknownToolError", "Unknown tool.")) })
 }
 
-const AGENTS_LIST: &str = "List the other agents of your project that you can message: each with its address (thread:<id>), title, provider, kind (chat or terminal), activity status (working, waiting, ready, error, stopped) and canReceive. Your own thread is not listed. Takes no arguments.";
+const AGENTS_LIST: &str = "List the other agents of your project that you can message, chat agents and AI Terminals: each with its address (thread:<id> or terminal:<threadId>/<terminalId>), title, provider, kind (chat or terminal), activity status (working, waiting, blocked, ready, done, error, stopped, unavailable) and canReceive. Your own address is not listed. Takes no arguments.";
 
 const AGENT_MESSAGE_SEND: &str = "Send a message to another agent of your project (an address from agents_list). It is delivered in an envelope that names you as the sender, after the recipient's running turn ends. Returns at once with messageId, conversationId, status accepted and hop; check progress with agent_message_status. Text of 1 to 16000 characters; clientRequestId is optional.";
 
@@ -72,7 +72,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             AGENT_MESSAGE_SEND,
             object_schema(
                 json!({
-                    "to": { "type": "string", "description": "thread:<id>" },
+                    "to": { "type": "string", "description": "thread:<id> or terminal:<threadId>/<terminalId>" },
                     "text": { "type": "string", "minLength": 1, "maxLength": 16000 },
                     "clientRequestId": { "type": "string", "minLength": 1 },
                 }),

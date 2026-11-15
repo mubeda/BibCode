@@ -921,27 +921,93 @@ impl AgentMessaging {
         &self,
         caller_thread_id: &str,
     ) -> Result<Vec<AgentSummary>, AgentMessagingError> {
+        self.agents_for(&AgentCaller::Thread(caller_thread_id.to_owned()))
+            .await
+    }
+
+    /// The chat agents and AI Terminals of `caller`'s project, except `caller` itself: a
+    /// terminal lists its host thread, and a thread its own terminals. A caller whose owner
+    /// thread is gone reaches nobody. Only threads of that one project are read.
+    pub(crate) async fn agents_for(
+        &self,
+        caller: &AgentCaller,
+    ) -> Result<Vec<AgentSummary>, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
-        let caller = caller_thread_id.to_owned();
-        let agents = self
+        let owner = caller.owner_thread_id().to_owned();
+        let excluded = match caller {
+            AgentCaller::Thread(thread_id) => Some(thread_id.clone()),
+            AgentCaller::Terminal(_) => None,
+        };
+        let listed = self
             .engine
             .repositories()
             .database()
             .call(move |connection| {
-                let Some((project_id, caller_mode)) = directory::project_of(connection, &caller)?
+                let Some((project_id, caller_mode)) = directory::project_of(connection, &owner)?
                 else {
                     return Ok(None);
                 };
-                directory::list_agents(connection, &project_id, &caller, &caller_mode).map(Some)
+                let chats = directory::list_agents(
+                    connection,
+                    &project_id,
+                    excluded.as_deref(),
+                    &caller_mode,
+                )?;
+                let owners = directory::terminal_owner_threads(connection, &project_id)?;
+                Ok(Some((chats, owners, caller_mode)))
             })
             .await
             .map_err(|error| {
                 tracing::warn!(error = %error, "agents_list could not read the directory");
                 AgentMessagingError::Storage
             })?;
-        agents.ok_or(AgentMessagingError::UnknownRecipient)
+        let (mut agents, owners, caller_mode) =
+            listed.ok_or(AgentMessagingError::UnknownRecipient)?;
+        if let Some(pointer) = &self.terminals {
+            let own_address = caller.address();
+            for owner in owners {
+                let mut sessions = pointer.terminals().thread_sessions(&owner).await;
+                sessions.sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
+                agents.extend(
+                    sessions
+                        .iter()
+                        .filter_map(|summary| directory::terminal_agent(summary, &caller_mode))
+                        .filter(|agent| agent.address != own_address),
+                );
+            }
+        }
+        Ok(agents)
+    }
+}
+
+/// Who calls a messaging operation: a chat agent by its thread, or an AI Terminal by the live
+/// generation its credential names. Never taken from an argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentCaller {
+    Thread(String),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "task 8.2's command calls as a terminal")
+    )]
+    Terminal(terminal_credential::TerminalIdentity),
+}
+
+impl AgentCaller {
+    pub(crate) fn address(&self) -> String {
+        match self {
+            Self::Thread(thread_id) => format!("thread:{thread_id}"),
+            Self::Terminal(identity) => identity.address(),
+        }
+    }
+
+    /// The thread whose project and runtime mode the caller has: a terminal's host thread.
+    pub(crate) fn owner_thread_id(&self) -> &str {
+        match self {
+            Self::Thread(thread_id) => thread_id,
+            Self::Terminal(identity) => &identity.thread_id,
+        }
     }
 }
 
