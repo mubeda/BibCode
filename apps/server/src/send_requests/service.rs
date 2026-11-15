@@ -473,6 +473,34 @@ impl SendRequestsService {
             .await
     }
 
+    /// The completed replies to open requests to terminals: answers stored before a stop that
+    /// their request did not hear of.
+    pub(super) async fn unheard_terminal_answers(
+        &self,
+    ) -> crate::persistence::Result<Vec<crate::agent_messaging::store::AgentMessageRow>> {
+        self.repositories
+            .database()
+            .call(|connection| {
+                let ids = connection
+                    .prepare_cached(
+                        "SELECT reply.message_id FROM agent_messages AS reply \
+                         JOIN send_requests AS request ON request.request_id = reply.send_request_id \
+                         WHERE reply.status = 'completed' AND reply.in_reply_to IS NOT NULL \
+                           AND reply.sender_kind = 'agent' \
+                           AND substr(request.target_address, 1, 9) = 'terminal:' \
+                           AND request.state IN ('queued', 'waiting', 'delivered', 'read')",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut replies = Vec::with_capacity(ids.len());
+                for id in ids {
+                    replies.extend(crate::agent_messaging::store::get_message(connection, &id)?);
+                }
+                Ok(replies)
+            })
+            .await
+    }
+
     /// A message, hand-off or take-over is dismissed once its target read it.
     pub(super) async fn dismissed_once_read(&self, request_id: &str) -> bool {
         self.store
@@ -1085,8 +1113,15 @@ impl SendRequestsService {
         input: SendRequestsSendInput,
     ) -> Result<SendRequest, Value> {
         require_person(context)?;
-        if input.request_id.trim().is_empty() {
-            return Err(invalid("The request needs an id."));
+        // A plain id: an AI Terminal's agent reads it back in BiBCode's own line.
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':');
+        if input.request_id.is_empty()
+            || input.request_id.len() > 128
+            || !input.request_id.chars().all(plain)
+        {
+            return Err(invalid(
+                "The request needs an id of 1 to 128 letters, digits, '-', '_', '.' or ':'.",
+            ));
         }
         let args_digest = canonical_command_digest(&input)
             .map_err(|_| invalid("BiBCode could not read this request."))?;

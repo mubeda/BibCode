@@ -517,12 +517,6 @@ impl AgentMessaging {
         {
             return Ok(receipt);
         }
-        // A request has one answer; only a replay of it gets past here once it is answered.
-        if original.status == AgentMessageStatus::Completed {
-            return Err(AgentMessagingError::InvalidArgument(
-                "This request was already answered.".to_owned(),
-            ));
-        }
         let now = crate::mcp::control::now_iso();
         let reply = NewAgentMessage {
             message_id: message_id.clone(),
@@ -550,7 +544,11 @@ impl AgentMessaging {
             .database()
             .call(move |connection| {
                 let tx = connection.transaction()?;
-                store::set_status(&tx, &original_id, AgentMessageStatus::Completed, None, &now)?;
+                // Only the reply that completes the request's mail is stored: one answer.
+                if !store::set_status(&tx, &original_id, AgentMessageStatus::Completed, None, &now)?
+                {
+                    return Ok(None);
+                }
                 store::insert_message(&tx, &reply)?;
                 let stored = store::get_message(&tx, &reply.message_id)?;
                 tx.commit()?;
@@ -561,9 +559,12 @@ impl AgentMessaging {
                 tracing::warn!(error = %error, "a terminal's answer to a person was not stored");
                 AgentMessagingError::Storage
             })?;
-        if let Some(stored) = stored {
-            pointer.tell_requests(std::slice::from_ref(&stored)).await;
-        }
+        let Some(stored) = stored else {
+            return Err(AgentMessagingError::InvalidArgument(
+                "This request was already answered.".to_owned(),
+            ));
+        };
+        pointer.tell_requests(std::slice::from_ref(&stored)).await;
         Ok(MessageReceipt {
             message_id,
             conversation_id: original.conversation_id.clone(),

@@ -53,6 +53,14 @@ pub(crate) async fn notifiable_target(
     address: &str,
 ) -> Result<TerminalIdentity, Value> {
     let (thread_id, terminal_id) = parse_terminal_address(address).ok_or_else(not_notifiable)?;
+    let live = || {
+        pointer
+            .terminals()
+            .live_generation(&thread_id, &terminal_id)
+    };
+    // The summary is checked between two reads of the generation, so a terminal replaced
+    // meanwhile, by a plain shell for one, is refused rather than bound to the new process.
+    let generation = live().await.ok_or_else(not_notifiable)?;
     let notifiable = pointer
         .terminals()
         .thread_sessions(&thread_id)
@@ -61,14 +69,9 @@ pub(crate) async fn notifiable_target(
         .find(|summary| summary.terminal_id == terminal_id)
         .and_then(|summary| directory::terminal_agent(summary, TERMINAL_RECIPIENT_MODE))
         .is_some_and(|agent| agent.can_receive);
-    if !notifiable {
+    if !notifiable || live().await.as_ref() != Some(&generation) {
         return Err(not_notifiable());
     }
-    let generation = pointer
-        .terminals()
-        .live_generation(&thread_id, &terminal_id)
-        .await
-        .ok_or_else(not_notifiable)?;
     Ok(TerminalIdentity {
         // Routing reads only the address and the generation.
         environment_id: String::new(),
@@ -197,9 +200,13 @@ pub(crate) fn generation_end_sink(service: SendRequestsService) -> GenerationEnd
 }
 
 /// At server start, ends every open request to a terminal: no terminal survives a restart.
+/// An answer stored before the stop is given to its request first, as the sink would have.
 pub(crate) async fn fail_open_terminal_requests(
     service: &SendRequestsService,
 ) -> crate::persistence::Result<usize> {
+    for reply in service.unheard_terminal_answers().await? {
+        follow_mail(service, reply).await;
+    }
     service
         .end_open_where(|row| parse_terminal_address(&row.target_address).is_some())
         .await

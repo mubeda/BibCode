@@ -266,11 +266,19 @@ impl TerminalPointer {
     ) -> Result<bool, AgentMessagingError> {
         let address = recipient.address();
         let _exclusive = self.exclusive(&address).await;
+        let notifiable = self
+            .terminals
+            .thread_sessions(&recipient.thread_id)
+            .await
+            .iter()
+            .find(|summary| summary.terminal_id == recipient.terminal_id)
+            .and_then(|summary| super::directory::terminal_agent(summary, TERMINAL_RECIPIENT_MODE))
+            .is_some_and(|agent| agent.can_receive);
         let live = self
             .terminals
             .live_generation(&recipient.thread_id, &recipient.terminal_id)
             .await;
-        if live.as_ref() != Some(&recipient.generation) {
+        if !notifiable || live.as_ref() != Some(&recipient.generation) {
             return Err(AgentMessagingError::UnknownRecipient);
         }
         new.sender_kind = SenderKind::Person;
@@ -838,11 +846,16 @@ impl TerminalPointer {
         }
         let mut entries = Vec::with_capacity(consumed.len());
         for message in &consumed {
-            // A person's request is stored as it reads, never in the agent envelope (R8).
+            // A person's request is stored as it reads, never in the agent envelope (R8), then
+            // a line of BiBCode's own naming the id to answer with. The id is a plain id: the
+            // request id is checked when the request is sent.
             if message.sender_kind == SenderKind::Person {
                 entries.push(InboxEntry {
                     message_id: message.message_id.clone(),
-                    rendered: message.text.clone(),
+                    rendered: format!(
+                        "{}\n\nBiBCode: answer this request with `bibcode agent reply {} <answer>`.",
+                        message.text, message.message_id
+                    ),
                 });
                 continue;
             }
