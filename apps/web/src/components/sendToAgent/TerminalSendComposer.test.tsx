@@ -157,24 +157,28 @@ describe("TerminalSendComposer", () => {
     expect(h.getTerminalOutput).not.toHaveBeenCalled();
   });
 
-  it("with_no_selection_the_output_is_loaded_once_when_the_menu_opens_and_labelled_with_the_source_used", async () => {
+  it("opening_the_menu_reads_only_the_output_and_choosing_hand_off_reads_the_conversation", async () => {
     h.menuOpen = true;
     render();
     await act(async () => {});
+    const input = { sourceThreadId: "owner", threadId: "owner", terminalId: "term-1" };
     expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
     expect(h.getTerminalOutput).toHaveBeenCalledWith({
-      sourceThreadId: "owner",
-      threadId: "owner",
-      terminalId: "term-1",
-      source: "conversation",
+      ...input,
+      source: "output",
       part: "handoff",
     });
     expect(h.live?.source["terminalHasText"]).toBe(true);
     const content = previewContentFor()(choiceFor("hand-off"));
     expect(content?.attachments).toEqual([]);
-    const attachments = (await content?.loadAttachments?.()) ?? [];
-    expect(attachments[0]).toMatchObject({ label: "Recent output of Claude" });
     expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
+    const attachments = (await content?.loadAttachments?.()) ?? [];
+    expect(h.getTerminalOutput).toHaveBeenLastCalledWith({
+      ...input,
+      source: "conversation",
+      part: "handoff",
+    });
+    expect(attachments[0]).toMatchObject({ label: "Recent output of Claude" });
   });
 
   it("hand_off_attaches_the_conversation_and_second_opinion_its_last_answer", async () => {
@@ -276,7 +280,8 @@ describe("TerminalSendComposer", () => {
         text: "$ make test\nok",
       });
     }
-    expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
+    // The menu's output read, then one conversation read per choice.
+    expect(h.getTerminalOutput).toHaveBeenCalledTimes(3);
   });
 
   it("an_empty_terminal_disables_second_opinion_and_hand_off_with_the_reason", async () => {

@@ -18,7 +18,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
   type RefObject,
@@ -202,25 +201,17 @@ function TerminalSendComposerBody(props: {
       worktreePath,
     ],
   );
-  // The read of the latest menu open (the conversation's handoff text, else the output); a
-  // preview chosen from it waits on the same read.
-  const outputRef = useRef<ReturnType<LoadOutput> | null>(null);
-  const readTerminal = useCallback(
-    (part: SendRequestsGetTerminalOutputInput["part"]): Promise<TerminalRead> =>
-      getTerminalOutput({
-        sourceThreadId: threadId,
-        threadId,
-        terminalId,
-        source: "conversation",
-        part,
-      }),
+  const read = useCallback(
+    (
+      source: SendRequestsGetTerminalOutputInput["source"],
+      part: SendRequestsGetTerminalOutputInput["part"],
+    ): Promise<TerminalRead> =>
+      getTerminalOutput({ sourceThreadId: threadId, threadId, terminalId, source, part }),
     [getTerminalOutput, terminalId, threadId],
   );
-  const loadOutput = useCallback<LoadOutput>(() => {
-    const read = readTerminal("handoff");
-    outputRef.current = read;
-    return read;
-  }, [readTerminal]);
+  // Opening the menu only asks whether the terminal has text; the conversation is read only for
+  // the Second opinion or Hand off the person chose.
+  const loadOutput = useCallback<LoadOutput>(() => read("output", "handoff"), [read]);
 
   const { previewContentFor: baseContentFor } = services;
   const previewContentFor = useCallback(
@@ -240,23 +231,16 @@ function TerminalSendComposerBody(props: {
         leadIn,
         attachments: [],
         loadAttachments: async () => {
-          const read = outputRef.current ?? loadOutput();
-          // A failed read is not reused: Retry reads again.
-          const shared = await read.catch((error: unknown) => {
-            if (outputRef.current === read) outputRef.current = null;
-            throw error;
-          });
-          // A Second opinion attaches the conversation's last answer; output has no such part.
-          const output =
-            choice.action === "second-opinion" && shared.usedSource === "conversation"
-              ? await readTerminal("last-answer")
-              : shared;
+          const output = await read(
+            "conversation",
+            choice.action === "second-opinion" ? "last-answer" : "handoff",
+          );
           const attachment = readAttachment(output, terminalLabel);
           return attachment === null ? [] : [attachment];
         },
       };
     },
-    [baseContentFor, loadOutput, readSelection, readTerminal, terminalId, terminalLabel, threadId],
+    [baseContentFor, read, readSelection, terminalId, terminalLabel, threadId],
   );
 
   const renderLive = useCallback(

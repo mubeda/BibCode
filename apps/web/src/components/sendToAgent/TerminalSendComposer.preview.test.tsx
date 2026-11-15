@@ -243,7 +243,18 @@ describe("TerminalSendComposer with the real menu and preview", () => {
 
   it("a_failed_output_read_shows_the_preview_error_and_Retry_and_sends_nothing", async () => {
     selection = "";
-    h.getTerminalOutput.mockRejectedValueOnce(new Error("unreadable"));
+    // The menu's output read succeeds; the conversation read for the choice fails once.
+    h.getTerminalOutput
+      .mockResolvedValueOnce({
+        threadId: "owner",
+        terminalId: "term-1",
+        text: "$ make test\nok",
+        truncated: false,
+        usedSource: "output",
+        fellBack: false,
+        startMissing: false,
+      })
+      .mockRejectedValueOnce(new Error("unreadable"));
     render();
     await openMenu();
     const secondOpinion = find('[role="menuitem"]', "Second opinion")!;
@@ -260,7 +271,7 @@ describe("TerminalSendComposer with the real menu and preview", () => {
     await act(async () => find("button", "Retry")!.click());
     await flush();
     expect(document.body.querySelector('[data-attachment="terminal-output"]')).not.toBeNull();
-    expect(h.getTerminalOutput).toHaveBeenCalledTimes(2);
+    expect(h.getTerminalOutput).toHaveBeenCalledTimes(3);
     expect(h.send).not.toHaveBeenCalled();
   });
 
