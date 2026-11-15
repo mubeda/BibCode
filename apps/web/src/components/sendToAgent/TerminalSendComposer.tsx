@@ -201,6 +201,7 @@ function TerminalSendComposerBody(props: {
   readonly threadRef: ScopedThreadRef;
   readonly terminalId: string;
   readonly terminalLabel: string;
+  readonly readBufferText: (() => TerminalOutputText | null) | undefined;
   readonly readSelection: () => string;
   readonly viewportFocusTarget: (() => HTMLElement | null) | undefined;
   readonly inCenterPanel: boolean;
@@ -211,6 +212,7 @@ function TerminalSendComposerBody(props: {
     terminalId,
     terminalLabel,
     readSelection,
+    readBufferText,
     viewportFocusTarget,
     inCenterPanel,
   } = props;
@@ -269,7 +271,14 @@ function TerminalSendComposerBody(props: {
   );
   // Opening the menu only asks whether the terminal has text; the conversation is read only for
   // the Second opinion or Hand off the person chose.
-  const loadOutput = useCallback<LoadOutput>(() => read("output", "handoff"), [read]);
+  // A mounted terminal is read as rendered: the server's raw tail is garbled for an app that
+  // repaints, so it is only the fallback for a terminal that is not mounted.
+  const loadOutput = useCallback<LoadOutput>(() => {
+    const rendered = readBufferText?.() ?? null;
+    return rendered === null
+      ? read("output", "handoff")
+      : Promise.resolve({ ...rendered, fellBack: false, startMissing: false });
+  }, [read, readBufferText]);
 
   const { previewContentFor: baseContentFor } = services;
   const previewContentFor = useCallback(
@@ -291,16 +300,20 @@ function TerminalSendComposerBody(props: {
         loadFailedMessage: TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
         loadingMessage: TERMINAL_OUTPUT_LOADING_MESSAGE,
         loadAttachments: async () => {
-          const output = await read(
+          const served = await read(
             "conversation",
             choice.action === "second-opinion" ? "last-answer" : "handoff",
           );
+          // The output that stood in for the conversation is the garbled raw tail: take the
+          // rendered screen instead and keep the fell-back and start-missing notes.
+          const rendered = served.usedSource === "output" ? (readBufferText?.() ?? null) : null;
+          const output = rendered === null ? served : { ...served, ...rendered };
           const attachment = readAttachment(output, terminalLabel);
           return attachment === null ? [] : [attachment];
         },
       };
     },
-    [baseContentFor, read, readSelection, terminalId, terminalLabel, threadId],
+    [baseContentFor, read, readBufferText, readSelection, terminalId, terminalLabel, threadId],
   );
 
   const renderLive = useCallback(
@@ -396,6 +409,8 @@ export const TerminalSendComposer = memo(function TerminalSendComposer(props: {
   readonly terminalLabel: string;
   /** The terminal's current selection, normalized; empty when nothing is selected. */
   readonly readSelection: () => string;
+  /** The terminal's rendered text, or null when it is not mounted; the server reads it then. */
+  readonly readBufferText?: () => TerminalOutputText | null;
   /** The terminal's focusable viewport; the preview returns focus to it. */
   readonly viewportFocusTarget?: () => HTMLElement | null;
   /** The terminal lives in the center panel, where activating another panel unmounts it. */
@@ -409,6 +424,7 @@ export const TerminalSendComposer = memo(function TerminalSendComposer(props: {
       terminalId={props.terminalId}
       terminalLabel={props.terminalLabel}
       readSelection={props.readSelection}
+      readBufferText={props.readBufferText}
       viewportFocusTarget={props.viewportFocusTarget}
       inCenterPanel={props.inCenterPanel ?? false}
     />

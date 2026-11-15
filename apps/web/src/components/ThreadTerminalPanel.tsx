@@ -152,6 +152,7 @@ import {
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
 import { TerminalSendComposer } from "./sendToAgent/TerminalSendComposer";
+import { terminalBufferText, type TerminalOutputText } from "./sendToAgent/terminalSource.logic";
 
 const terminalInputRegistry = createTerminalInputSchedulerRegistry();
 const terminalInputBindings = new Map<string, TerminalInputBinding>();
@@ -928,6 +929,11 @@ interface TerminalViewportProps {
   workspaceUnavailable?: string | null;
   /** Reports how to read this terminal's current selection, and null when it goes away. */
   onSelectionReaderChange?: (terminalId: string, read: (() => string) | null) => void;
+  /** Reports how to read this terminal's rendered text, and null when it goes away. */
+  onBufferReaderChange?: (
+    terminalId: string,
+    read: (() => TerminalOutputText | null) | null,
+  ) => void;
   /** Reports the element that holds this terminal's focus, and null when it goes away. */
   onFocusTargetChange?: (terminalId: string, target: (() => HTMLElement | null) | null) => void;
 }
@@ -969,6 +975,7 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
   onSelectionReaderChange,
+  onBufferReaderChange,
   onFocusTargetChange,
 }: TerminalViewportProps) {
   const { resolvedTheme: appTheme, resolvedThemeId } = useTheme();
@@ -1047,6 +1054,17 @@ export function TerminalViewport({
     );
     return () => onSelectionReaderChange(terminalId, null);
   }, [onSelectionReaderChange, terminalId]);
+  // Send to agent reads what the terminal shows, not the raw byte stream a repainting app garbles.
+  useEffect(() => {
+    if (!onBufferReaderChange) return;
+    onBufferReaderChange(terminalId, () => {
+      const terminal = terminalRef.current;
+      return terminal === null || terminal === undefined
+        ? null
+        : terminalBufferText(terminal.buffer.active);
+    });
+    return () => onBufferReaderChange(terminalId, null);
+  }, [onBufferReaderChange, terminalId]);
   // Send to agent returns focus here when its preview closes. Focusing xterm's own textarea
   // writes nothing to the terminal.
   useEffect(() => {
@@ -3458,6 +3476,18 @@ export default function ThreadTerminalPanel({
     if (read === null) selectionReadersRef.current.delete(terminalId);
     else selectionReadersRef.current.set(terminalId, read);
   }, []);
+  const bufferReadersRef = useRef(new Map<string, () => TerminalOutputText | null>());
+  const onBufferReaderChange = useCallback(
+    (terminalId: string, read: (() => TerminalOutputText | null) | null) => {
+      if (read === null) bufferReadersRef.current.delete(terminalId);
+      else bufferReadersRef.current.set(terminalId, read);
+    },
+    [],
+  );
+  const readActiveBuffer = useCallback(
+    () => bufferReadersRef.current.get(resolvedActiveTerminalId)?.() ?? null,
+    [resolvedActiveTerminalId],
+  );
   const focusTargetsRef = useRef(new Map<string, () => HTMLElement | null>());
   const onFocusTargetChange = useCallback(
     (terminalId: string, target: (() => HTMLElement | null) | null) => {
@@ -3480,6 +3510,7 @@ export default function ThreadTerminalPanel({
       terminalId={resolvedActiveTerminalId}
       terminalLabel={terminalLabelById.get(resolvedActiveTerminalId) ?? "Terminal"}
       readSelection={readActiveSelection}
+      readBufferText={readActiveBuffer}
       viewportFocusTarget={activeViewportFocusTarget}
       inCenterPanel={owner === "center-panel"}
     />
@@ -3655,6 +3686,7 @@ export default function ThreadTerminalPanel({
                           keybindings={keybindings}
                           workspaceUnavailable={workspaceUnavailable}
                           onSelectionReaderChange={onSelectionReaderChange}
+                          onBufferReaderChange={onBufferReaderChange}
                           onFocusTargetChange={onFocusTargetChange}
                         />
                       </div>
@@ -3689,6 +3721,7 @@ export default function ThreadTerminalPanel({
                   keybindings={keybindings}
                   workspaceUnavailable={workspaceUnavailable}
                   onSelectionReaderChange={onSelectionReaderChange}
+                  onBufferReaderChange={onBufferReaderChange}
                   onFocusTargetChange={onFocusTargetChange}
                 />
               </div>

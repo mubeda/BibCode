@@ -116,10 +116,12 @@ vi.mock("./sendToAgent/TerminalSendComposer", () => ({
     terminalId,
     inCenterPanel,
     viewportFocusTarget,
+    readBufferText,
   }: {
     terminalId: string;
     inCenterPanel?: boolean;
     viewportFocusTarget?: unknown;
+    readBufferText?: unknown;
   }) => (
     <button
       type="button"
@@ -127,6 +129,7 @@ vi.mock("./sendToAgent/TerminalSendComposer", () => ({
       data-send-terminal={terminalId}
       data-in-center-panel={String(inCenterPanel)}
       data-has-focus-target={String(typeof viewportFocusTarget === "function")}
+      data-has-buffer-reader={String(typeof readBufferText === "function")}
     />
   ),
 }));
@@ -957,6 +960,7 @@ describe("ThreadTerminalPanel Send to agent", () => {
     expect(render("center-panel")).toContain('data-in-center-panel="true"');
     expect(render("right-panel")).toContain('data-in-center-panel="false"');
     expect(render("right-panel")).toContain('data-has-focus-target="true"');
+    expect(render("right-panel")).toContain('data-has-buffer-reader="true"');
   });
 
   it("shows the control even when the host omits the split and new actions", () => {

@@ -92,6 +92,9 @@ const services: TerminalSendToAgentServices = {
 let root: Root;
 let container: HTMLDivElement;
 let selection = "";
+let readBuffer:
+  | (() => { text: string; truncated: boolean; usedSource: "output" } | null)
+  | undefined;
 
 function render(terminalId = "term-1") {
   act(() =>
@@ -102,6 +105,7 @@ function render(terminalId = "term-1") {
           terminalId={terminalId}
           terminalLabel="Claude"
           readSelection={() => selection}
+          {...(readBuffer === undefined ? {} : { readBufferText: readBuffer })}
         />
       </TerminalSendToAgentContext.Provider>,
     ),
@@ -147,6 +151,7 @@ beforeEach(() => {
   });
   baseContentFor.mockClear();
   selection = "";
+  readBuffer = undefined;
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -305,6 +310,86 @@ describe("TerminalSendComposer", () => {
     }
     // The menu's output read, then one conversation read per choice.
     expect(h.getTerminalOutput).toHaveBeenCalledTimes(3);
+  });
+
+  it("a_mounted_terminal_attaches_its_rendered_buffer_not_the_servers_raw_tail", async () => {
+    const read = vi.fn(() => ({
+      text: "> identify the terminal",
+      truncated: true,
+      usedSource: "output" as const,
+    }));
+    readBuffer = read;
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    // Opening the menu reads the rendered text only.
+    expect(h.getTerminalOutput).not.toHaveBeenCalled();
+    expect(h.live?.source["terminalHasText"]).toBe(true);
+    h.getTerminalOutput.mockResolvedValue({
+      threadId: "owner",
+      terminalId: "term-1",
+      text: "identifyth erminal ....",
+      truncated: false,
+      usedSource: "output",
+      fellBack: true,
+      startMissing: false,
+    });
+    const content = previewContentFor()(choiceFor("second-opinion"));
+    const attachments = (await content?.loadAttachments?.()) ?? [];
+    expect(h.getTerminalOutput).toHaveBeenCalledWith(
+      expect.objectContaining({ source: "conversation" }),
+    );
+    expect(attachments[0]).toMatchObject({
+      label: "Recent output of Claude, because the conversation could not be read",
+      text: "> identify the terminal",
+      note: "Only the most recent output is included.",
+    });
+    expect(h.terminalWrites).toBe(0);
+  });
+
+  it("a_readable_conversation_is_attached_as_the_server_read_it", async () => {
+    readBuffer = () => ({ text: "screen", truncated: false, usedSource: "output" });
+    h.getTerminalOutput.mockResolvedValue({
+      threadId: "owner",
+      terminalId: "term-1",
+      text: "[user] hi\n[assistant] hello",
+      truncated: false,
+      usedSource: "conversation",
+      fellBack: false,
+      startMissing: false,
+    });
+    render();
+    const content = previewContentFor()(choiceFor("hand-off"));
+    const attachments = (await content?.loadAttachments?.()) ?? [];
+    expect(attachments[0]).toMatchObject({
+      label: "Conversation of Claude",
+      text: "[user] hi\n[assistant] hello",
+    });
+  });
+
+  it("the_buffer_is_not_read_while_the_menu_is_closed", () => {
+    const read = vi.fn(() => null);
+    readBuffer = read;
+    render();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("an_unmounted_terminal_falls_back_to_the_server_read", async () => {
+    readBuffer = () => null;
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it("a_selection_still_wins_over_the_buffer", () => {
+    const read = vi.fn(() => ({ text: "buffer", truncated: false, usedSource: "output" as const }));
+    readBuffer = read;
+    selection = "picked";
+    render();
+    const content = previewContentFor()(choiceFor("second-opinion"));
+    expect(content?.attachments[0]).toMatchObject({ label: "Selection from Claude" });
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("an_empty_terminal_disables_second_opinion_and_hand_off_with_the_reason", async () => {
