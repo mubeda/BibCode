@@ -4329,9 +4329,10 @@ const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id, person_send_json FROM projection_thread_messages";
-// `julianday` reads `...00Z` and `...00.5Z` as times, not text, and `rowid` is the written order
-// of messages in the same millisecond: an upsert keeps it, and a rebuild replays in sequence.
-const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, julianday(created_at) ASC, rowid ASC";
+// `julianday` reads `...00Z` and `...00.5Z` as times, not text, but only to the millisecond; the
+// store's one nine-digit text then orders a millisecond's rows (#366), and `rowid` is the written
+// order of equal times: an upsert keeps it, and a rebuild replays in sequence.
+const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, julianday(created_at) ASC, created_at ASC, rowid ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
 /// ascending order. Spelled this way, the order is that of

@@ -5012,38 +5012,51 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        // A server message 500 microseconds later, in the same millisecond.
-        let server_at = crate::persistence::format_timestamp(
-            time::OffsetDateTime::from_unix_timestamp_nanos(1_767_225_600_120_500_000).unwrap(),
-        );
-        engine
-            .repositories()
-            .database()
-            .call(move |connection| {
-                for (message_id, role, at) in [
-                    ("m-server", "assistant", server_at),
-                    ("m-client", "user", client_at),
-                ] {
-                    connection.execute(
-                        "INSERT INTO projection_thread_messages (message_id, thread_id, role, \
-                         text, is_streaming, created_at, updated_at) \
-                         VALUES (?1, 'thread-a', ?2, '', 0, ?3, ?3)",
-                        rusqlite::params![message_id, role, at],
-                    )?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let order: Vec<String> = engine
-            .repositories()
-            .list_messages_by_thread("thread-a".to_owned())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|message| message.message_id)
-            .collect();
-        assert_eq!(order, ["m-client", "m-server"]);
+        // Server messages 500 and 400 microseconds later, in the same millisecond: julianday
+        // alone rounds to the millisecond, so only the stored text keeps them apart.
+        for (thread_id, offset_ns) in [("thread-a", 500_000_i128), ("thread-b", 400_000)] {
+            let server_at = crate::persistence::format_timestamp(
+                time::OffsetDateTime::from_unix_timestamp_nanos(
+                    1_767_225_600_120_000_000 + offset_ns,
+                )
+                .unwrap(),
+            );
+            let client_at = client_at.clone();
+            let ids = [format!("{thread_id}-server"), format!("{thread_id}-client")];
+            let inserted = ids.clone();
+            engine
+                .repositories()
+                .database()
+                .call(move |connection| {
+                    for (message_id, role, at) in [
+                        (&inserted[0], "assistant", server_at),
+                        (&inserted[1], "user", client_at),
+                    ] {
+                        connection.execute(
+                            "INSERT INTO projection_thread_messages (message_id, thread_id, \
+                             role, text, is_streaming, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, '', 0, ?4, ?4)",
+                            rusqlite::params![message_id, thread_id, role, at],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let order: Vec<String> = engine
+                .repositories()
+                .list_messages_by_thread(thread_id.to_owned())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|message| message.message_id)
+                .collect();
+            assert_eq!(
+                order,
+                [ids[1].clone(), ids[0].clone()],
+                "{offset_ns} ns later"
+            );
+        }
     }
 
     /// #366 review: a user's answer is free-form data, even under a question id named like a
