@@ -722,6 +722,29 @@ case, build once with `codeReview: false` in the review handler's panel request
 in `apps/web/src/components/ChatView.tsx` and run the spec alone: it must fail at
 the Implement check. Restore the line before the full suite.
 
+The default suite also includes `send-to-agent.e2e.ts` (isolate it with
+`BIBCODE_E2E_SPEC=./specs/send-to-agent.e2e.ts`). It runs with **Agent
+messaging** off, against the fixture providers and the Codex Terminal fixture,
+and checks six things. A **Message** from the Codex `main` chat to a new Claude
+panel reaches that panel's provider and is labelled "Message, sent from main". A
+request to a target with a running `[[slow]]` turn shows "Queued for main", and
+**Cancel** turns it into "Cancelled" with **Dismiss** while the target's
+provider never receives it. A **Second opinion** to a target that is working on
+it shows "main read it" with **Open** and no **Dismiss** or **Cancel**. Once the
+target answers, the answer notice is in the sender, survives a reload of the
+window, and **Bring back** drafts the quoted answer into the composer without a
+new provider input. In the Codex Terminal, **Send to agent** sends a **Message**
+whose request row is listed by the **Send requests** popover, and after
+**Cancel** and a keyboard **Dismiss** of the last row, keyboard focus is on
+**Send to agent**. It saves `send-to-agent-notice.png`,
+`send-to-agent-bring-back.png` and `send-to-agent-terminal-requests.png`. Set
+`BIBCODE_E2E_PROFILER=1` to run it with the Profiler on: the run's
+`settings.json` is seeded with `enableProfiler`, and the Profiler's folder is
+`state/userdata/profiler` in the run root while the app runs, and in the
+artifact directory after the run. The spec does not cover steps that need a real
+provider CLI; those are in
+[Send to agent and agent messaging](#send-to-agent-and-agent-messaging).
+
 The native composer fixture must advertise each user-invocable Claude skill in
 both the `initialize.commands` catalog and `reload_skills.skills`. The server
 filters out reload-only model skills, so adding a fixture skill only to the
@@ -2072,6 +2095,116 @@ from `apps/web`.
 
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.
+
+## Send to agent and agent messaging
+
+Run this on every native desktop after a change to `send_requests`,
+`agent_messaging`, the `bibcode agent` command, the terminal pointer, the Send to
+agent control, the request rows or the answer notice. Use a disposable project
+with at least two chats and a Claude and a Codex AI Terminal. A person's Send to
+agent and agents messaging each other are separate features. The first works
+with **Agent messaging** off, the second works only with it on.
+
+The focused gates are:
+
+```sh
+cargo test -p bibcode-server --lib -j 2 -- send_requests agent_messaging mcp::agent_cli
+cargo test -p bibcode-server --test rpc_wire
+vp test run --project unit src/components/sendToAgent src/components/settings/AgentIntegrationsSection.test.tsx
+```
+
+Run the last command from `apps/web`. Check that each filter ran tests; a filter
+that matches nothing prints `running 0 tests` and proves nothing. The packaged
+scripted case is `send-to-agent.e2e.ts`, described with the other default specs
+under [Focused tests](#focused-tests). It drives chats and one AI Terminal
+against the fixture providers, so the steps below that need a real provider
+CLI stay manual.
+
+1. **The control.** Every chat panel shows **Send to agent** in its composer
+   footer, and a Claude or Codex AI Terminal shows it on its toolbar. A plain
+   terminal shows none. With a server that predates the feature the control is
+   disabled and its tooltip says to update the server.
+2. **The five actions.** Open the menu in a chat: **Review**, **Second opinion**,
+   **Hand off**, **Take over from** and **Message**. Each submenu lists the other
+   agents of the same project and environment, most recently updated first, and a
+   new-panel entry per provider. A disabled action or agent shows its reason in
+   the menu: "No answer to review yet", "This agent works in another checkout and
+   cannot see these changes", "This terminal cannot be notified of new requests",
+   "Nothing to take over yet", "Nothing to attach yet". Check each reason appears
+   only when its condition holds, and that the agent keeps its entry while it is
+   busy or out of usage.
+3. **The preview.** Choosing an agent opens a preview that names the sender and
+   the target, shows the lead-in, the note field and every attachment with its
+   character count and what was left out. **Message** is disabled with "Write a
+   message first" until the note has text. Trim and remove an attachment,
+   exceed 48,000 characters (the count turns red and Send is disabled), then
+   **Cancel**: the note stays for the next preview of the same panel and action.
+   A send that fails keeps the note and the attachments. Closing the preview
+   returns focus to the control (to the terminal's viewport for a terminal
+   source).
+4. **Send and provenance.** Send a **Message** from one chat to another chat and
+   to a new panel. The target's transcript shows the text as the person's own
+   message with the label "Message, sent from <title>" and no agent chip. For an
+   AI Terminal source the label reads "sent from a terminal in <title>".
+5. **The request row.** The sending chat shows one row above its composer per
+   request: "Queued for <agent>" with **Open** and **Cancel**, "Waiting: this
+   agent's queue is paused", "Delivered to <agent>", "<agent> read it", and
+   "<agent> answered". To see **Queued**, start a slow turn in the target first.
+   **Cancel** a queued request: the row reads "Cancelled" with **Dismiss**, and
+   the target's provider receives nothing. A **Message**, **Hand off** or **Take
+   over from** row goes away once the agent read it. A **Review** or **Second
+   opinion** row stays until its answer, and while the target works on it
+   ("<agent> read it") it offers **Open** and no **Dismiss**. Stop the target
+   mid-turn: the row reads "<agent> did not answer" with the reason, and offers
+   **Dismiss**.
+6. **The answer notice.** When a **Review** or **Second opinion** is answered,
+   the sending chat shows the answer notice with **Bring back**, **Open** and
+   **Dismiss**, and the chat counts as unread until the notice is seen. **Bring
+   back** quotes the answer into the composer as a draft and sends nothing: the
+   provider input of the sender is unchanged. Reload the window before using it:
+   the notice is still there. An answer longer than the cap is cut and says so.
+7. **Take over and Hand off.** **Hand off** from a chat with a long history
+   attaches the first message and the last messages that fit the cap and says
+   what was left out. **Take over from** sends the other agent's handoff text to
+   this panel's own agent, and the preview says nothing is sent to the source.
+8. **The terminal.** In an AI Terminal, the preview reads the selection first,
+   else the CLI's conversation when the server can read it, else the recent
+   output, and says which. Nothing is typed into the terminal by any step of
+   this item. A terminal that has sent a request shows a **Send requests**
+   button beside the control, with the count of requests (or of answers waiting)
+   in its name. Open it: the rows and the answer notice show as in a chat, and
+   opening it counts as seeing the answer. **Bring back** here closes the popover
+   and opens **Message** with the quoted answer as its note. **Cancel** a queued
+   request, then **Dismiss** the last row: the button goes away with its last
+   row, and keyboard focus is on **Send to agent**, not on the page body.
+   Repeat the Dismiss with the keyboard only.
+9. **Agent messaging off and on.** With **Settings → Agents → Agent
+   messaging** off (its default), steps 1 to 8 work, and an agent's
+   `agent_message_send` is refused with the "messaging off" error. Turn it on:
+   the agent's next call works without restarting it. Turn it off while a message
+   waits in a recipient's queue: `agent_message_status` reads `held` with the reason
+   `messaging_off`, and the recipient's provider receives nothing. Turn it on
+   again: the message goes back to `queued` and is delivered.
+10. **`bibcode agent` in an AI Terminal.** In a Claude, a Codex and an OpenCode AI
+    Terminal, check `echo $BIBCODE_AGENT_ENDPOINT` is set, `echo ${BIBCODE_AGENT_AUTH:+set}`
+    prints `set` (never print the value into a report), and `bibcode agent list`
+    exits 0 and lists the project's other agents. In a plain terminal of the same
+    project, `bibcode agent list` exits with the "no agent identity" error. Send a
+    message to the AI Terminal from a chat's agent or from another terminal: after
+    the terminal's agent finishes its turn, the pointer line "BiBCode: you have new
+    messages. Run `bibcode agent inbox` to read them." appears once and is
+    submitted, `bibcode agent inbox` prints the message inside its envelope and a
+    person's request as from the user, and `bibcode agent status <id>` reads
+    `consumed`. No message text is typed into the terminal, only the pointer. On
+    Windows the AI Terminal's `bibcode` is the `bibcode.exe` alias in the folder
+    BiBCode puts first on `PATH`.
+11. **The Profiler.** With the Profiler on, none of the steps above leaves a
+    finding that names the run's providers or panels, and no note, message,
+    answer or terminal text appears in the Profiler data, the logs, the activity
+    log or a diagnostic bundle. Search each for a marker string put in a note.
+
+Record the provider CLI versions and the per-CLI result of step 10 (whether the
+pointer line was submitted) in the execution report.
 
 ## Remote-server update scenario
 
@@ -3749,6 +3882,20 @@ sizes. Cover relevant:
   instructions…**, **Mod+Alt+Shift+R** outside a terminal, and the button's
   tooltip and disabled reasons in light and dark. Read the Profiler's findings
   afterwards;
+- Send to agent: the control in a chat panel's composer footer, in a Claude and
+  a Codex AI Terminal's toolbar, and its absence in a plain terminal. In light
+  and dark, the menu with every disabled reason ("No answer to review yet", "This
+  agent works in another checkout and cannot see these changes", "This terminal
+  cannot be notified of new requests", "Nothing to take over yet", "Nothing to
+  attach yet"), the preview (over a terminal it types nothing into the terminal
+  and names where the attached text came from), "Write a message first" on an
+  empty **Message**, and the over-limit count. Then a request row and the answer
+  notice in a chat, and the **Send requests** popover with the same row and
+  notice on a terminal's control, with its **Bring back** opening **Message**.
+  The packaged `send-to-agent` spec covers the chat and Codex Terminal flows
+  with fixture providers; by hand, repeat the terminal flows with a real Claude
+  and a real Codex CLI, and follow
+  [Send to agent and agent messaging](#send-to-agent-and-agent-messaging);
 - Host dashboard: the packaged `host-dashboard` spec opens the status bar's
   Resource Manager, chooses **Host dashboard**, and checks shapes only: the
   sheet is titled with the local environment's name, the CPU figure is a
