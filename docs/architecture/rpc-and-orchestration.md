@@ -4876,7 +4876,7 @@ together with the outbox entry, so a crash leaves both or neither, and the rate 
 are checked in that same transaction. The sender's mode and hop are stored on the row. A recipient with
 a paused queue gets the entry held (`recipient_queue_held`), one with an open ask or a running
 session gets it queued, any other gets a start. The command's id is `agent-message:<messageId>`,
-so a retry with the same `clientRequestId` returns the first receipt (the unique index on the
+so a retry with the same `clientRequestId` returns a receipt for the stored message with its current status (the unique index on the
 sender and `clientRequestId` also answers a concurrent one), and a different recipient or text
 is `AgentMessagingConflictError`.
 
@@ -4926,11 +4926,14 @@ returned it. Anything else is `AgentMessagingNotCancellableError`; a second canc
 re-derives every open chat message; the pointer's first sweep ends the generations of an earlier
 boot; the follower's first sweep re-reads every open request.
 
-**Activity log.** Each send and reply call, refused calls included, and each status change of a
-message write one row of the agent activity log (the `mcp_activity` table, tools
+**Activity log.** Each send and reply call, refused calls included, writes one row of the agent activity log (the `mcp_activity` table, tools
 `agent_message_send`, `agent_message_reply` and `agent_message_delivery`): sender address, the two
 titles, the recipient address, the message and conversation ids, the status and the reason, never
-text. One task writes them in arrival order from a bounded queue of 1,024 rows; a full queue drops
+text. The delivery rows (`agent_message_delivery`) are written for `delivered`, `consumed` and
+`failed` (chat tracker and terminal pointer, `recipient_gone` included) and for `completed` of a
+chat message. A terminal message's completion (`reply`, `answer_person`) and every cancellation,
+a send's `held` or `queued` status and a hold by the claim gate update storage without telling the
+outcome sink, so they have no row. One task writes them in arrival order from a bounded queue of 1,024 rows; a full queue drops
 the row and counts it in one warning. The send row and the delivery rows come from separate parts of
 the server, so in a rare scheduling a `delivered` row precedes the `accepted` row of its message;
 each row carries its own state and time. The writer stops in the `agent-message-activity` step,
@@ -4958,7 +4961,8 @@ terminal's **generation** (the process, `boot:process`), with no queue entry.
   credential grants nothing else.
 - **Store.** `AgentMessaging::send` to a terminal checks the recipient is a running AI Terminal of the
   project (one with an agent status, a Cursor terminal included), then `TerminalPointer::accept` stores one `queued` row bound to its
-  generation under the terminal's exclusion, obeying the mode ceiling (a terminal receives as
+  generation (it takes no per-terminal exclusion; `accept_person`, the inbox, cancel, generation
+  end, the setting's hold and release and marking mail delivered do), obeying the mode ceiling (a terminal receives as
   `full-access`), the rate and backlog limits and the setting (`held` with `messaging_off` while it
   is off). A person's request goes through `accept_person` and skips all of that.
 - **Pointer.** One task (`TerminalPointer::start`) rescans on every terminal metadata change, new
