@@ -2044,7 +2044,7 @@ const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
 
 /// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
 /// prompt, message and tool content included.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub(super) struct ClaudeStatusHook {
     #[serde(default)]
     hook_event_name: Option<String>,
@@ -2060,6 +2060,21 @@ pub(super) struct ClaudeStatusHook {
     /// The session's transcript as the CLI reports it: untrusted, only ever recorded (R112).
     #[serde(default)]
     transcript_path: Option<String>,
+}
+
+/// The transcript path names a folder on the person's machine, so it is never printed.
+impl fmt::Debug for ClaudeStatusHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeStatusHook")
+            .field("hook_event_name", &self.hook_event_name)
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id.is_some())
+            .field("tool_name", &self.tool_name)
+            .field("notification_type", &self.notification_type)
+            .field("transcript_path", &self.transcript_path.is_some())
+            .finish()
+    }
 }
 
 /// What one Claude hook says about the main agent.
@@ -4565,7 +4580,8 @@ mod tests {
     #[test]
     fn status_hooks_keep_no_prompt_or_tool_content() {
         // Mutation caught: the status path decoding a hook whole, so a prompt or tool output
-        // is read and held while AI Terminal activity is off (#187).
+        // is read and held while AI Terminal activity is off (#187). The transcript path is
+        // held for R112, but never printed.
         let hook: ClaudeStatusHook = serde_json::from_value(json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "s",
@@ -4576,7 +4592,11 @@ mod tests {
         }))
         .expect("status hook");
         let kept = format!("{hook:?}");
-        for private in ["private prompt", "private tool", "transcript"] {
+        for private in [
+            "private prompt",
+            "private tool",
+            "/private/transcript.jsonl",
+        ] {
             assert!(!kept.contains(private), "{kept}");
         }
     }
