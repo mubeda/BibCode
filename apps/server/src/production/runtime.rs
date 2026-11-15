@@ -127,8 +127,12 @@ pub struct ProductionRuntime {
     agent_message_writer: crate::mcp::activity::AgentMessageWriter,
     /// AI Terminal credentials for agent messaging.
     terminal_credentials: Arc<crate::agent_messaging::terminal_credential::TerminalCredentials>,
+    /// The terminal manager, which the credentials verify a generation against once bound.
+    terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations>,
     /// Stops the task that revokes the credentials of ended terminal processes.
     terminal_credential_revoker: CancellationToken,
+    /// Stops the task that tells AI Terminals about their agent mail.
+    terminal_pointer: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -191,6 +195,18 @@ impl ProductionRuntime {
         &self,
     ) -> Arc<crate::agent_messaging::terminal_credential::TerminalCredentials> {
         self.terminal_credentials.clone()
+    }
+
+    /// Binds the AI Terminal credentials to `endpoint`, the agent call route, and to this
+    /// runtime's terminal manager: AI Terminals launched from now on get a credential.
+    pub fn bind_terminal_credentials(&self, endpoint: String) {
+        self.terminal_credentials
+            .bind(endpoint, self.terminal_live.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_manager_for_test(&self) -> TerminalManager {
+        self.terminal_services.terminal_manager_for_test()
     }
 
     /// The outside-agent MCP tools, for the `/mcp` endpoint.
@@ -680,6 +696,12 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations> =
+            Arc::new(terminal_manager.clone());
+        let terminal_pointer = crate::agent_messaging::pointer::TerminalPointer::new(
+            repositories.database().clone(),
+            Arc::new(terminal_manager.clone()),
+        );
         let shell_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
@@ -866,21 +888,27 @@ impl ProductionRuntime {
         let (agent_message_outcomes, agent_message_writer) =
             crate::mcp::activity::agent_message_writer(mcp_activity);
         mcp_control.attach_terminals(mcp_terminals);
-        mcp_control.attach_agent_messaging(
-            crate::agent_messaging::AgentMessaging::new(
-                orchestration.clone(),
-                control.agent_messaging_enabled_signal(),
-            )
-            .with_starter(crate::production::orchestration_rpc::server_turn_starter(
-                orchestration.clone(),
-                provider_runtime.clone(),
-                config.state_dir(),
-                turn_delivery.clone(),
-                Some(workspace_availability.clone()),
-                attachment_uploads.clone(),
-            ))
-            .with_outcomes(agent_message_outcomes.clone()),
+        let agent_messaging = crate::agent_messaging::AgentMessaging::new(
+            orchestration.clone(),
+            control.agent_messaging_enabled_signal(),
+        )
+        .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            config.state_dir(),
+            turn_delivery.clone(),
+            Some(workspace_availability.clone()),
+            attachment_uploads.clone(),
+        ));
+        let terminal_pointer_task = CancellationToken::new();
+        // Terminal deliveries reach the activity log through the same sink as chat ones.
+        let agent_messaging = start_terminal_messaging(
+            agent_messaging,
+            &terminal_pointer,
+            Some(agent_message_outcomes.clone()),
+            terminal_pointer_task.clone(),
         );
+        mcp_control.attach_agent_messaging(agent_messaging.clone());
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
@@ -908,7 +936,9 @@ impl ProductionRuntime {
             agent_message_tracker_task: std::sync::Mutex::new(Some(agent_message_tracker_task)),
             agent_message_writer,
             terminal_credentials,
+            terminal_live,
             terminal_credential_revoker,
+            terminal_pointer: terminal_pointer_task,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1121,6 +1151,10 @@ impl ProductionRuntime {
             tracing::warn!(%error, "the agent message tracker ended abnormally");
         }
         steps.mark("agent-message-tracker");
+        // Before the activity writer closes, so its last terminal outcomes still reach the
+        // log, and before the profiler's teardown: a stopped pointer rescans on the next start.
+        self.terminal_pointer.cancel();
+        steps.mark("terminal-pointer");
         // After the tracker and the MCP calls, while the database is open and before the
         // profiler's teardown: every queued agent message row is written, then the writer ends.
         self.agent_message_writer.close().await;
@@ -1486,6 +1520,23 @@ struct GitReviewBackend;
 const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Gives `messaging` its terminal pointer and `outcomes`, then starts the pointer task with that
+/// same service, which it returns for every other caller. A sink added to the returned service
+/// afterwards would miss the pointer's copy, so the sink goes in here.
+pub(crate) fn start_terminal_messaging(
+    messaging: crate::agent_messaging::AgentMessaging,
+    pointer: &crate::agent_messaging::pointer::TerminalPointer,
+    outcomes: Option<crate::agent_messaging::OutcomeSink>,
+    shutdown: CancellationToken,
+) -> crate::agent_messaging::AgentMessaging {
+    let mut messaging = messaging.with_terminals(pointer.clone());
+    if let Some(outcomes) = outcomes {
+        messaging = messaging.with_outcomes(outcomes);
+    }
+    pointer.start(messaging.clone(), shutdown);
+    messaging
+}
+
 /// Each review preview source is bounded like a Git Manager commit diff.
 pub(super) const MAX_REVIEW_SOURCE_DIFF_BYTES: usize =
     crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
@@ -3860,7 +3911,7 @@ mod tests {
         for _ in 0..20 {
             messaging.refused(
                 "agent_message_send",
-                "missing",
+                &crate::agent_messaging::AgentCaller::Thread("missing".to_owned()),
                 crate::agent_messaging::AgentMessagingError::Disabled,
             );
         }

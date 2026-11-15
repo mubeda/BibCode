@@ -30,7 +30,12 @@ struct Job {
     data: String,
     cancel: CancellationToken,
     done: oneshot::Sender<Result<(), TerminalError>>,
+    guard: Option<WriteGuard>,
 }
+
+/// A last check made on the writer's thread right before the bytes reach the process; false
+/// drops the write, which then answers as cancelled.
+pub type WriteGuard = Box<dyn FnOnce() -> bool + Send>;
 
 /// One process's input queue and, while it has work, the thread that drains it.
 #[derive(Default)]
@@ -104,6 +109,29 @@ impl TerminalWriter {
         data: &str,
         cancel_on_drop: bool,
     ) -> Result<PendingWrite, TerminalError> {
+        self.push(process, data, cancel_on_drop, None)
+            .map(|pending| pending.expect("an unguarded write always queues"))
+    }
+
+    /// Queues `data` only when no input is queued or being written before it, and writes it only
+    /// if `guard` still allows it on the writer's thread right before the write. `None` when
+    /// earlier input is still pending; dropping the returned write drops it unless it started.
+    pub(crate) fn enqueue_alone(
+        &self,
+        process: &Arc<dyn PtyProcess>,
+        data: &str,
+        guard: WriteGuard,
+    ) -> Result<Option<PendingWrite>, TerminalError> {
+        self.push(process, data, true, Some(guard))
+    }
+
+    fn push(
+        &self,
+        process: &Arc<dyn PtyProcess>,
+        data: &str,
+        cancel_on_drop: bool,
+        guard: Option<WriteGuard>,
+    ) -> Result<Option<PendingWrite>, TerminalError> {
         let length = data.len();
         let mut queue = self
             .queue
@@ -111,6 +139,9 @@ impl TerminalWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.stopped.load(Ordering::Acquire) {
             return Err(TerminalError::PublicationCancelled);
+        }
+        if guard.is_some() && self.queued.load(Ordering::Acquire) != 0 {
+            return Ok(None);
         }
         if self.queued.load(Ordering::Acquire) + length > MOST_QUEUED_INPUT_BYTES {
             return Err(TerminalInputError::queue_full().into());
@@ -124,6 +155,7 @@ impl TerminalWriter {
             data: data.to_owned(),
             cancel: cancel.clone(),
             done,
+            guard,
         };
         self.queued.fetch_add(length, Ordering::AcqRel);
         if let Err(mpsc::SendError(job)) = queue.as_ref().expect("a writer thread").send(job) {
@@ -132,11 +164,11 @@ impl TerminalWriter {
             let _ = sender.send(job);
             *queue = Some(sender);
         }
-        Ok(PendingWrite {
+        Ok(Some(PendingWrite {
             done: receiver,
             cancel,
             cancel_on_drop,
-        })
+        }))
     }
 
     fn start(&self, process: Arc<dyn PtyProcess>) -> Result<mpsc::Sender<Job>, TerminalError> {
@@ -206,12 +238,20 @@ fn drain(
                 }
             }
         };
-        let result = if job.cancel.is_cancelled() || stopped.load(Ordering::Acquire) {
+        let Job {
+            data,
+            cancel,
+            done,
+            guard,
+        } = job;
+        let refused = || cancel.is_cancelled() || stopped.load(Ordering::Acquire);
+        // The guard may wait for a lock: a write given up meanwhile is not made after it.
+        let result = if refused() || !guard.is_none_or(|guard| guard()) || refused() {
             Err(TerminalError::PublicationCancelled)
         } else {
-            process.write(&job.data).map_err(TerminalError::Io)
+            process.write(&data).map_err(TerminalError::Io)
         };
-        queued.fetch_sub(job.data.len(), Ordering::AcqRel);
-        let _ = job.done.send(result);
+        queued.fetch_sub(data.len(), Ordering::AcqRel);
+        let _ = done.send(result);
     }
 }

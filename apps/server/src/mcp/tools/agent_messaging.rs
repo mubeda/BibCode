@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    agent_messaging::{AgentMessaging, AgentMessagingError},
+    agent_messaging::{AgentCaller, AgentMessaging, AgentMessagingError},
     agent_messaging::{MessageReceipt, ReplyRequest, SendRequest, StatusReport},
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     mcp::{
@@ -42,7 +42,7 @@ fn call<'a>(
     Box::pin(async { Err(typed_tool_failure("McpUnknownToolError", "Unknown tool.")) })
 }
 
-const AGENTS_LIST: &str = "List the other agents of your project that you can message: each with its address (thread:<id>), title, provider, kind (chat or terminal), activity status (working, waiting, ready, error, stopped) and canReceive. Your own thread is not listed. Takes no arguments.";
+const AGENTS_LIST: &str = "List the other agents of your project that you can message, chat agents and AI Terminals: each with its address (thread:<id> or terminal:<threadId>/<terminalId>), title, provider, kind (chat or terminal), activity status (working, waiting, blocked, ready, done, error, stopped, unavailable) and canReceive. Your own address is not listed. Takes no arguments.";
 
 const AGENT_MESSAGE_SEND: &str = "Send a message to another agent of your project (an address from agents_list). It is delivered in an envelope that names you as the sender, after the recipient's running turn ends. Returns at once with messageId, conversationId, status accepted and hop; check progress with agent_message_status. Text of 1 to 16000 characters; clientRequestId is optional.";
 
@@ -72,7 +72,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             AGENT_MESSAGE_SEND,
             object_schema(
                 json!({
-                    "to": { "type": "string", "description": "thread:<id>" },
+                    "to": { "type": "string", "description": "thread:<id> or terminal:<threadId>/<terminalId>" },
                     "text": { "type": "string", "minLength": 1, "maxLength": 16000 },
                     "clientRequestId": { "type": "string", "minLength": 1 },
                 }),
@@ -138,70 +138,6 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     ]
 }
 
-async fn reply(
-    scope: &PreviewScope,
-    arguments: &Value,
-    messaging: &AgentMessaging,
-) -> Result<MessageReceipt, AgentMessagingError> {
-    let request = (|| {
-        if !messaging.is_enabled() {
-            return Err(AgentMessagingError::Disabled);
-        }
-        let object = strict_object(
-            "agent_message_reply",
-            arguments,
-            &["inReplyTo", "text", "clientRequestId"],
-        )?;
-        Ok(ReplyRequest {
-            in_reply_to: string_field(object, "inReplyTo", true)?.unwrap_or_default(),
-            text: string_field(object, "text", true)?.unwrap_or_default(),
-            client_request_id: string_field(object, "clientRequestId", false)?,
-        })
-    })();
-    match request {
-        Ok(request) => messaging.reply(&scope.thread_id, request).await,
-        Err(error) => Err(messaging.refused("agent_message_reply", &scope.thread_id, error)),
-    }
-}
-
-async fn status(
-    scope: &PreviewScope,
-    arguments: &Value,
-    messaging: &AgentMessaging,
-) -> Result<StatusReport, AgentMessagingError> {
-    let object = strict_object("agent_message_status", arguments, &["messageId"])?;
-    let message_id = string_field(object, "messageId", true)?.unwrap_or_default();
-    messaging.status(&scope.thread_id, &message_id).await
-}
-
-async fn cancel(
-    scope: &PreviewScope,
-    arguments: &Value,
-    messaging: &AgentMessaging,
-) -> Result<crate::agent_messaging::store::AgentMessageStatus, AgentMessagingError> {
-    let object = strict_object("agent_message_cancel", arguments, &["messageId"])?;
-    let message_id = string_field(object, "messageId", true)?.unwrap_or_default();
-    messaging.cancel(&scope.thread_id, &message_id).await
-}
-
-fn status_result(report: &StatusReport) -> Value {
-    let mut result = json!({
-        "status": report.status.as_str(),
-        "updatedAt": report.updated_at,
-    });
-    if let Some(reason) = report.reason {
-        result["reason"] = json!(reason.as_str());
-    }
-    if let Some(reply) = &report.reply_message_id {
-        result["replyMessageId"] = json!(reply);
-    }
-    tool_result(result, &[])
-}
-
-fn failure(error: &AgentMessagingError) -> Value {
-    typed_tool_failure(error.tag(), &error.message())
-}
-
 /// An object with no field outside `allowed`: a sender or any other unknown field is refused.
 /// The refusal names no value.
 fn strict_object<'a>(
@@ -236,41 +172,122 @@ fn string_field(
     }
 }
 
-fn receipt_result(receipt: &MessageReceipt) -> Value {
-    tool_result(
-        json!({
-            "messageId": receipt.message_id,
-            "conversationId": receipt.conversation_id,
-            "status": receipt.status.as_str(),
-            "hop": receipt.hop,
-        }),
-        &[],
-    )
+fn receipt_value(receipt: &MessageReceipt) -> Value {
+    json!({
+        "messageId": receipt.message_id,
+        "conversationId": receipt.conversation_id,
+        "status": receipt.status.as_str(),
+        "hop": receipt.hop,
+    })
 }
 
-async fn send(
-    scope: &PreviewScope,
-    arguments: &Value,
+fn status_value(report: &StatusReport) -> Value {
+    let mut result = json!({
+        "status": report.status.as_str(),
+        "updatedAt": report.updated_at,
+    });
+    if let Some(reason) = report.reason {
+        result["reason"] = json!(reason.as_str());
+    }
+    if let Some(reply) = &report.reply_message_id {
+        result["replyMessageId"] = json!(reply);
+    }
+    result
+}
+
+/// A send or reply request from `arguments`, or the refusal, reported for `caller`.
+fn outgoing(
     messaging: &AgentMessaging,
-) -> Result<MessageReceipt, AgentMessagingError> {
+    caller: &AgentCaller,
+    tool: &'static str,
+    arguments: &Value,
+    target: &str,
+) -> Result<(String, String, Option<String>), AgentMessagingError> {
     let request = (|| {
         if !messaging.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
-        let object = strict_object(
-            "agent_message_send",
-            arguments,
-            &["to", "text", "clientRequestId"],
-        )?;
-        Ok(SendRequest {
-            to: string_field(object, "to", true)?.unwrap_or_default(),
-            text: string_field(object, "text", true)?.unwrap_or_default(),
-            client_request_id: string_field(object, "clientRequestId", false)?,
-        })
+        let object = strict_object(tool, arguments, &[target, "text", "clientRequestId"])?;
+        Ok((
+            string_field(object, target, true)?.unwrap_or_default(),
+            string_field(object, "text", true)?.unwrap_or_default(),
+            string_field(object, "clientRequestId", false)?,
+        ))
     })();
-    match request {
-        Ok(request) => messaging.send(&scope.thread_id, request).await,
-        Err(error) => Err(messaging.refused("agent_message_send", &scope.thread_id, error)),
+    request.map_err(|error| messaging.refused(tool, caller, error))
+}
+
+/// Runs messaging operation `tool` as `caller` and returns its result, unwrapped: the provider
+/// tools and `bibcode agent` share it, so both obey every rule the same way.
+pub(crate) async fn call_as(
+    messaging: &AgentMessaging,
+    caller: &AgentCaller,
+    tool: &str,
+    arguments: &Value,
+) -> Result<Value, AgentMessagingError> {
+    let message_id = |tool: &str| {
+        let object = strict_object(tool, arguments, &["messageId"])?;
+        Ok::<_, AgentMessagingError>(string_field(object, "messageId", true)?.unwrap_or_default())
+    };
+    match tool {
+        "agents_list" => {
+            if !messaging.is_enabled() {
+                return Err(AgentMessagingError::Disabled);
+            }
+            if arguments
+                .as_object()
+                .is_none_or(|object| !object.is_empty())
+            {
+                return Err(AgentMessagingError::InvalidArgument(
+                    "agents_list takes no arguments.".to_owned(),
+                ));
+            }
+            let agents = messaging.agents_for(caller).await?;
+            Ok(json!({ "agents": agents }))
+        }
+        "agent_message_send" => {
+            let (to, text, client_request_id) =
+                outgoing(messaging, caller, "agent_message_send", arguments, "to")?;
+            let request = SendRequest {
+                to,
+                text,
+                client_request_id,
+            };
+            Ok(receipt_value(&messaging.send_as(caller, request).await?))
+        }
+        "agent_message_reply" => {
+            let (in_reply_to, text, client_request_id) = outgoing(
+                messaging,
+                caller,
+                "agent_message_reply",
+                arguments,
+                "inReplyTo",
+            )?;
+            let request = ReplyRequest {
+                in_reply_to,
+                text,
+                client_request_id,
+            };
+            Ok(receipt_value(&messaging.reply_as(caller, request).await?))
+        }
+        "agent_message_status" => {
+            if !messaging.is_enabled() {
+                return Err(AgentMessagingError::Disabled);
+            }
+            let message_id = message_id("agent_message_status")?;
+            Ok(status_value(
+                &messaging.status_as(caller, &message_id).await?,
+            ))
+        }
+        // Cancel works while messaging is off, so a sender can still take a message back.
+        "agent_message_cancel" => {
+            let message_id = message_id("agent_message_cancel")?;
+            let status = messaging.cancel_as(caller, &message_id).await?;
+            Ok(json!({ "status": status.as_str() }))
+        }
+        _ => Err(AgentMessagingError::InvalidArgument(
+            "Unknown operation.".to_owned(),
+        )),
     }
 }
 
@@ -284,46 +301,17 @@ pub(crate) async fn run(
     let Some(messaging) = messaging else {
         return failure(&AgentMessagingError::Disabled);
     };
-    match name {
-        "agents_list" => {
-            if !messaging.is_enabled() {
-                return failure(&AgentMessagingError::Disabled);
-            }
-            if arguments
-                .as_object()
-                .is_none_or(|object| !object.is_empty())
-            {
-                return failure(&AgentMessagingError::InvalidArgument(
-                    "agents_list takes no arguments.".to_owned(),
-                ));
-            }
-            match messaging.agents(&scope.thread_id).await {
-                Ok(agents) => tool_result(json!({ "agents": agents }), &[("/agents", Cut::Back)]),
-                Err(error) => failure(&error),
-            }
-        }
-        "agent_message_send" => match send(&scope, &arguments, messaging).await {
-            Ok(receipt) => receipt_result(&receipt),
-            Err(error) => failure(&error),
-        },
-        "agent_message_reply" => match reply(&scope, &arguments, messaging).await {
-            Ok(receipt) => receipt_result(&receipt),
-            Err(error) => failure(&error),
-        },
-        "agent_message_status" => {
-            if !messaging.is_enabled() {
-                return failure(&AgentMessagingError::Disabled);
-            }
-            match status(&scope, &arguments, messaging).await {
-                Ok(report) => status_result(&report),
-                Err(error) => failure(&error),
-            }
-        }
-        // Cancel works while messaging is off, so a sender can still take a message back.
-        "agent_message_cancel" => match cancel(&scope, &arguments, messaging).await {
-            Ok(status) => tool_result(json!({ "status": status.as_str() }), &[]),
-            Err(error) => failure(&error),
-        },
-        _ => typed_tool_failure("McpUnknownToolError", "Unknown tool."),
+    if !TOOLS.iter().any(|spec| spec.name == name) {
+        return typed_tool_failure("McpUnknownToolError", "Unknown tool.");
     }
+    let caller = AgentCaller::Thread(scope.thread_id);
+    match call_as(messaging, &caller, name, &arguments).await {
+        Ok(result) if name == "agents_list" => tool_result(result, &[("/agents", Cut::Back)]),
+        Ok(result) => tool_result(result, &[]),
+        Err(error) => failure(&error),
+    }
+}
+
+fn failure(error: &AgentMessagingError) -> Value {
+    typed_tool_failure(error.tag(), &error.message())
 }

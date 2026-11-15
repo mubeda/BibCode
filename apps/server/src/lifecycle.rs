@@ -108,6 +108,8 @@ pub struct ServerHandle {
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
     #[cfg(test)]
     auth: AuthService,
+    #[cfg(test)]
+    connect: Option<Arc<ConnectMcpService>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +262,15 @@ impl ServerRuntime {
         {
             tracing::warn!(%error, "could not write the open-url shim");
         }
+        // The `bibcode` an AI Terminal's agent runs; only those terminals have it on `PATH`.
+        if let Err(error) = open_url_shim_target().and_then(|exe| {
+            crate::mcp::agent_cli::write_agent_shim(
+                &state_paths.state_dir.join("runtime/agent"),
+                &exe,
+            )
+        }) {
+            tracing::warn!(%error, "could not write the agent shim");
+        }
         let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
@@ -317,6 +328,8 @@ impl ServerRuntime {
         };
         let mut relay_token = None;
         let mut mcp_proof_key = None;
+        #[cfg(test)]
+        let mut connect_for_test = None;
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -442,7 +455,32 @@ impl ServerRuntime {
                 // `bibcode diagnostics download` on this host, relayed by the desktop app
                 // (#201): the runtime's relay behind a route with a fresh per-boot token.
                 let relay = runtime.diagnostic_logs_relay();
+                #[cfg(test)]
+                {
+                    connect_for_test = Some(connect.clone());
+                }
                 let mut routes = core_http_routes(auth.clone(), runtime.clone(), connect);
+                // AI Terminals launched from now on get a credential for this listener's agent
+                // route, which only such a credential opens.
+                runtime.bind_terminal_credentials(format!(
+                    "{}/api/agent/call",
+                    local_http_base(local_addr)
+                ));
+                let agent_credentials = runtime.terminal_credentials();
+                let agent_control = runtime.mcp_control();
+                routes.agent_call = Arc::new(move |body, context| {
+                    let credentials = agent_credentials.clone();
+                    let control = agent_control.clone();
+                    Box::pin(async move {
+                        crate::mcp::agent_cli::agent_call_http(
+                            &credentials,
+                            control.agent_messaging(),
+                            body,
+                            context,
+                        )
+                        .await
+                    }) as crate::production::http_routes::BoxFuture<_>
+                });
                 match crate::production::diagnostic_logs_relay::new_relay_token() {
                     Ok(token) => {
                         routes.diagnostic_logs_relay = Some(
@@ -608,6 +646,8 @@ impl ServerRuntime {
             task: Some(task),
             #[cfg(test)]
             auth: auth_for_test,
+            #[cfg(test)]
+            connect: connect_for_test,
         })
     }
 }
@@ -890,6 +930,18 @@ impl ServerHandle {
         self._production_runtime
             .as_ref()
             .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
+    }
+
+    /// The production runtime, so a test can reach its terminals and their credentials.
+    #[cfg(test)]
+    pub(crate) fn production_runtime_for_test(&self) -> Option<Arc<ProductionRuntime>> {
+        self._production_runtime.clone()
+    }
+
+    /// The provider MCP and open-URL credential service, so a test can issue one.
+    #[cfg(test)]
+    pub(crate) fn connect_for_test(&self) -> Option<Arc<ConnectMcpService>> {
+        self.connect.clone()
     }
 
     /// The server's authentication, so a test can hold an exchange.

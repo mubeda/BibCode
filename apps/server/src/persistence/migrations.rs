@@ -3109,6 +3109,9 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_client_request
           ON agent_messages (sender_address, client_request_id)
           WHERE client_request_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_terminal_pending
+          ON agent_messages (status, recipient_address, recipient_terminal_generation)
+          WHERE recipient_terminal_generation IS NOT NULL AND (status IN ('accepted', 'queued', 'held', 'delivered') OR (status = 'consumed' AND reason IS NULL));
         "#,
     )?;
     Ok(())
@@ -3922,6 +3925,7 @@ mod tests {
                 "idx_agent_messages_recipient_status",
                 "idx_agent_messages_reply",
                 "idx_agent_messages_sender",
+                "idx_agent_messages_terminal_pending",
             ]
         );
         // Running it again changes nothing.
