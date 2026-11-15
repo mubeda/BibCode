@@ -81,6 +81,8 @@ export interface SendToAgentButtonProps {
   createPanel?: (selection: DefaultAgentSelection) => Promise<ThreadId | null>;
   /** Brings a panel `createPanel` made inactive forward once its request was sent. */
   revealPanel?: (panel: ThreadId) => void;
+  /** Where focus goes when the preview closes; the trigger by default. */
+  finalFocus?: RefObject<HTMLElement | null>;
   newId?: () => string;
 }
 
@@ -168,7 +170,7 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
           choice={picked.choice}
           hint={picked.hint}
           previewContentFor={previewContentFor}
-          triggerRef={triggerRef}
+          finalFocus={props.finalFocus ?? triggerRef}
           newPanelProviders={props.newPanelProvidersFor(picked.choice.action)}
           send={props.send ?? noSend}
           createPanel={props.createPanel ?? noPanel}
@@ -186,7 +188,7 @@ function PreviewHost(props: {
   choice: SendChoice;
   hint: OutOfTokensHint | null;
   previewContentFor: NonNullable<SendToAgentButtonProps["previewContentFor"]>;
-  triggerRef: RefObject<HTMLElement | null>;
+  finalFocus: RefObject<HTMLElement | null>;
   newPanelProviders: ReadonlyArray<NewPanelProvider>;
   send: NonNullable<SendToAgentButtonProps["send"]>;
   createPanel: NonNullable<SendToAgentButtonProps["createPanel"]>;
@@ -265,7 +267,7 @@ function PreviewHost(props: {
         : { loadAttachments: content.loadAttachments })}
       {...(content.extraContent === undefined ? {} : { extraContent: content.extraContent })}
       warning={warning}
-      finalFocus={props.triggerRef}
+      finalFocus={props.finalFocus}
       onClose={props.onClose}
       onSend={onSend}
       onPickAnother={props.onPickAnother}
