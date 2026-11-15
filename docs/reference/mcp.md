@@ -1567,7 +1567,7 @@ Waits until a thread's turn settles, needs a person, fails, or the timeout passe
 - `status`: string. With `messageId` and a finished turn: `completed`, `interrupted` or `error` (the turn's own outcome, whatever newer turns are doing). Otherwise the thread status (`awaiting_approval`, `awaiting_input`, `delivery_failed`, `running`, `error`, `interrupted`, `idle`), or `queued` when the message has not been admitted yet and the wait is not otherwise done.
 - `turnId`: string or null. The selected turn (null while the message is queued or no turn exists).
 - `turnState`: string or null, the turn's state (`running`, `completed`, `interrupted`, `error`).
-- `settled`: boolean. With `messageId`: the selected turn is `completed`, `interrupted` or `error`. Without: the session is idle, nothing is queued or starting, and the latest turn is not running.
+- `settled`: boolean. With `messageId`: the selected turn is `completed`, `interrupted` or `error`. Without: the session is idle, nothing is queued or starting, and the latest turn is not running. A `completed` turn settles only once its reply stops streaming: until then `settled` is false and `reply.streaming` is true.
 - `timedOut`: boolean. True only when the timeout passed while the wait was not done. `status`, `turnState` and `reply` then show the state at that moment.
 - `effectiveTimeoutMs`: integer, the timeout actually used.
 - `queuedAhead`: integer or null. Set only while the message is queued: how many queued messages are ahead of it (0 means next).
@@ -3458,7 +3458,7 @@ Types data into a terminal as keystrokes: end a command with `\n` to run it. It 
 
 #### `terminal_read`
 
-Reads a terminal's output. Without `cursor` it returns the last `tailChars` characters (4000 unless set). With `cursor` (the `nextCursor` of an earlier read, or `cursor` from `terminal_write`) it returns up to 16,000 characters written after that point. Also returns the terminal's `status` and `exitCode`, so a finished terminal can still be read.
+Reads a terminal's output. Without `cursor` it returns the last `tailChars` characters (4000 unless set), which does not start partway through an escape sequence that opened in the 4 KiB before it; with `raw`, a tail can exceed `tailChars` by one unfinished sequence still arriving, returned whole. With `cursor` (the `nextCursor` of an earlier read, or `cursor` from `terminal_write`) it returns up to 16,000 characters written after that point. Also returns the terminal's `status` and `exitCode`, so a finished terminal can still be read.
 
 - **Set / scope:** Terminals · `terminal:operate`
 - **Access:** Full access only (family refuses below, although the tool is a read)
@@ -3479,7 +3479,7 @@ Reads a terminal's output. Without `cursor` it returns the last `tailChars` char
 - `text` (string): the output of this page, escape sequences removed unless `raw`.
 - `nextCursor` (string, opaque `<epoch>:<offset>`): pass it as `cursor` to continue exactly after this page. When a page ends inside an unfinished escape sequence, `nextCursor` stops before the sequence so the next read returns it whole, and an unfinished sequence that fills the whole page is skipped once it has ended; `text` can then be empty while `more` is true.
 - `dropped` (boolean): the output at your `cursor` is no longer retained (the terminal keeps about 1 MiB, or it was restarted, cleared or reopened, or the cursor is past the end), and this page starts at the oldest output kept. Always false for a read without `cursor`.
-- `more` (boolean): output exists beyond `nextCursor`; read again with `cursor: nextCursor`.
+- `more` (boolean): output exists beyond `nextCursor`; read again with `cursor: nextCursor`. It is false, with a `nextCursor` before the end, while all that is left is an escape sequence still arriving: read again from `nextCursor` later. In an exited terminal such a sequence never ends, so `nextCursor` is the end.
 - `status` (string): `"starting"`, `"running"`, `"exited"` or `"error"`.
 - `exitCode` (integer or null).
 - A page whose escaped text is too long for a result (over 80,000 characters) is retried with half the page size, down to 500 characters, so a read normally fits. If even 500 characters do not fit, `structuredContent` is `{ truncated: true, error: "The result is too long to return; ask for fewer or newer records." }`.
