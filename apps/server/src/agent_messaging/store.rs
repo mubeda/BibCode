@@ -1170,7 +1170,7 @@ mod tests {
         );
         assert_eq!(trigger_hop(&connection, "a").unwrap(), Some(8));
 
-        turn_started(&connection, "t3", "person", None);
+        turn_started(&connection, "turn-3", "person", None);
         assert_eq!(trigger_hop(&connection, "a").unwrap(), None);
     }
 

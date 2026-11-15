@@ -6290,7 +6290,7 @@ async fn codex_terminal_stays_not_ready_while_a_turn_is_unread_after_a_reconcili
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_terminal_never_reads_ready_from_a_replayed_turn_a_newer_turn_supersedes() {
     // Z2: the replay of what a reconciliation buffered made the terminal ready on T2's
-    // completion while T3's start was still buffered, then published activity with it ready.
+    // completion while the third turn's start was still buffered, then published activity with it ready.
     own_process!(isolated);
     let terminal = "terminal-reconcile-replay";
     let probed = open_probed_ready_codex_terminal(terminal).await;
