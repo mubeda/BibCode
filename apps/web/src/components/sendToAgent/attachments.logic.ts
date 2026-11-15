@@ -24,10 +24,7 @@ export function cutAtCharacters(text: string, limit: number): { text: string; le
 }
 
 /** Keeps the last `limit` Unicode scalar values, for text whose newest part matters most. */
-export function keepLastCharacters(
-  text: string,
-  limit: number,
-): { text: string; leftOut: number } {
+export function keepLastCharacters(text: string, limit: number): { text: string; leftOut: number } {
   const characters = Array.from(text);
   if (characters.length <= limit) return { text, leftOut: 0 };
   return { text: characters.slice(-limit).join(""), leftOut: characters.length - limit };
