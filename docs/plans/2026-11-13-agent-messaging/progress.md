@@ -43,16 +43,16 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 | 7.2 | Activity log and profiler redaction | 7 | Closed | lane 7B | Two Codex reviews, 11 findings handled (lanes 7C, 7D); integrated |
 | 7.3 | Settings control | 7 | Closed | lane 7A | Codex review, 2 fixes accepted; integrated |
 | 8.1 | Terminal generation credential | 8 | Closed | lane 8A | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
-| 8.2 | The bibcode agent command | 8 | Open | | |
+| 8.2 | The bibcode agent command | 8 | Closed | lane 8C | |
 | 8.3 | Ready for a prompt | 8 | Closed | lane 8A | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
-| 8.4 | Pointer delivery | 8 | In progress | lane 8B | |
-| 8.5 | Terminals in the directory | 8 | Open | | |
-| 8.6 | Terminal inbox | 8 | In progress | lane 8B | |
+| 8.4 | Pointer delivery | 8 | Closed | lane 8C | |
+| 8.5 | Terminals in the directory | 8 | Closed | lane 8C | |
+| 8.6 | Terminal inbox | 8 | Closed | lane 8C | |
 | 9.1 | An AI Terminal as the source | 9 | In progress | lane 9A | |
-| 9.2 | A terminal agent as the target | 9 | Open | | |
-| 9.3 | Takeover into a terminal and terminal-side notices | 9 | Open | | |
-| 10.1 | Claude conversation reader | 10 | Open | | |
-| 10.2 | Codex conversation reader | 10 | Open | | |
+| 9.2 | A terminal agent as the target | 9 | In progress | lane 9B | |
+| 9.3 | Takeover into a terminal and terminal-side notices | 9 | In progress | lane 9B | |
+| 10.1 | Claude conversation reader | 10 | In progress | lane 10A | |
+| 10.2 | Codex conversation reader | 10 | In progress | lane 10A | |
 | 11.1 | Living documentation | 11 | Open | | |
 | 11.2 | Runbooks and scripted end-to-end | 11 | Open | | |
 | 11.3 | Real-provider run and final gates | 11 | Open | | |
@@ -153,3 +153,11 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-14 20:20 8.1, 8.3 Closed. Evidence: Codex review of lane 8U (gpt-6-astra, high): no actionable findings; cargo test -p bibcode-server --lib -j 2: 5717 passed; --test provider_terminal_supervisor 152 passed; activity_load, production_server_terminal_rpc, terminal_rpc, turn_delivery_recovery, profiler_exits pass; fmt and clippy -D warnings clean (lane report). Commits: 5999f02d4..a61e728e5 across lanes 8A, 8R, 8S, 8T, 8U, merged into the Branch line's branch. Accepted limits are in the rulings of 16:25, 18:15 and 20:16.
 - 2026-11-14 20:30 Integration check on the Branch line's branch at 754ef75ca (phases 1 to 7, tasks 8.1, 8.3): the coordinator resolved one merge conflict in production/runtime.rs by keeping both sides (activity writer fields and stop step; terminal credential fields and stop step); cargo fmt --all --check exit 0; cargo check -p bibcode-server --all-targets exit 0; cargo test -p bibcode-server --lib -j 2: see the result line in the next entry.
 - 2026-11-14 20:30 Result: test result: ok. 5805 passed; 0 failed; 16 ignored (measured by the coordinator).
+- 2026-11-14 20:35 Lane 8V reported the 8 findings fixed on branch worktree-agent-ab9ed2e6044e29c55 (8f7cd9a72..af961112d), 9 red tests committed before the fixes; lib suite 5825 passed, pointer and write_when_ready tests 41 passed in 15 of 15 runs (lane report). It listed seven remaining ways the server could type at a wrong moment, all latency or state the server cannot see. Codex review running.
+- 2026-11-14 20:38 8.5, 8.2 In progress. Owner: lane 8C (opus, medium), based on lane 8V's branch; it first merges the Branch line's branch into it (one conflict in production/runtime.rs) and wires the activity sink into the pointer's service.
+- 2026-11-14 22:45 Lane 8C reported 8.5, 8.2 and the 4 findings partial on branch worktree-agent-a4dec9fbb1ad1025b (5fdf9a72a..64d0b9f98): merge resolved keeping the activity writer, the credential revoker and the pointer, with the activity sink passed to start_terminal_messaging; R1, R2 and R4 fixed red then green, R3 fixed except the store reread in the guard (rejected: every change to a terminal's rows takes its exclusion); lib suite 5882 passed, orchestration 24, production_server_terminal_rpc 21, provider_terminal_supervisor 152, terminal_rpc 2 passed, fmt, check and clippy -D warnings exit 0 (lane report). Not done: the Codex environment probe (the host's permission check denied the command; not rerun by the coordinator), so whether BIBCODE_AGENT_AUTH reaches a command Codex runs stays open for 11.3. Open from the lane: message rows store no sender generation (a restarted terminal can read the status of and cancel its predecessor's messages; a reply to a terminal lands in the live generation). Codex review running.
+- 2026-11-14 22:50 10.1, 10.2 In progress. Owner: lane 10A (opus, medium), based on lane 8C's branch merged with the 9.1 branch; its files are disjoint from 9.2 and 9.3 except named additions to send_requests/service.rs and terminal/manager.rs.
+- 2026-11-14 23:00 Codex review of lane 8C (gpt-6-astra, high): 1 finding, rejected. It says a clap parse error of `bibcode agent send` echoes a message that starts with dashes to stderr. Rejected because that stderr belongs to the terminal whose agent typed the same text on its own command line; nothing reaches a server log, an error body or a profiler record. No finding in the route's credential boundary, the terminal caller's limits, the directory, R1 to R4 or the merge resolution. Lane 8C's branch merged into the Branch line's branch (no conflict; the merged tree equals the lane's head).
+- 2026-11-14 23:02 9.2, 9.3 In progress. Owner: lane 9B (opus, medium), based on the Branch line's branch; it first merges the 9.1 branch and wires the terminal output source in production/runtime.rs, which closes 9.1.
+- 2026-11-14 23:15 8.2, 8.4, 8.5, 8.6 Closed. Evidence on the Branch line's branch after the merge: cargo fmt --all --check exit 0; cargo test -p bibcode-server --lib -j 2: test result: ok. 5882 passed; 0 failed; 16 ignored (measured by the coordinator); integration targets orchestration 24, production_server_terminal_rpc 21, provider_terminal_supervisor 152, terminal_rpc 2 passed and clippy -D warnings exit 0 (lane report, same tree). Commits: lane branch worktree-agent-a4dec9fbb1ad1025b, b182a5630..64d0b9f98. Open for 11.3: the Codex environment probe, the Windows shim, a real AI Terminal run.
+- 2026-11-14 20:40 Codex review of lane 8V (gpt-6-astra, high): 4 findings, all accepted (a later Working report moves the turn start forward and clears a real draft; the setting is checked before the session lock is held; setting reconciliation bypasses the mailbox exclusion; ending a blocked terminal stalls the dispatcher). Sent to lane 8C as an added part, since it is based on that branch and owns those files.
