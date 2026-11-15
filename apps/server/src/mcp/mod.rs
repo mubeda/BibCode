@@ -1,4 +1,5 @@
 pub(crate) mod activity;
+pub mod agent_cli;
 pub mod authorize_cli;
 pub mod call_cli;
 pub mod control;

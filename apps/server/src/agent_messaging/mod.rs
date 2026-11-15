@@ -87,6 +87,8 @@ pub(crate) enum AgentMessagingError {
     BacklogLimit,
     /// The store did not answer; the details go to the log, never to the agent.
     Storage,
+    /// `bibcode agent` ran without an AI Terminal's credential.
+    NoIdentity,
 }
 
 impl AgentMessagingError {
@@ -104,6 +106,7 @@ impl AgentMessagingError {
             Self::RateLimit => "AgentMessagingRateLimitError",
             Self::BacklogLimit => "AgentMessagingBacklogLimitError",
             Self::Storage => "McpStorageError",
+            Self::NoIdentity => "AgentMessagingNoIdentityError",
         }
     }
 
@@ -140,6 +143,10 @@ impl AgentMessagingError {
                 policy::BACKLOG_LIMIT
             ),
             Self::Storage => "BiBCode could not read its store; try again.".to_owned(),
+            Self::NoIdentity => {
+                "This command has no agent identity. Run it in an AI Terminal that BiBCode started."
+                    .to_owned()
+            }
         }
     }
 }
@@ -236,6 +243,33 @@ struct Attribution {
     titles: Option<(String, String)>,
 }
 
+/// Who a message comes from: the caller, with the title, provider and mode it sends with. A
+/// terminal sends with its label and launch driver kind, and with its host thread's mode (R6).
+struct Sender {
+    address: String,
+    title: String,
+    provider: String,
+    mode: String,
+}
+
+/// Where a send or reply goes.
+enum Recipient {
+    Thread(String),
+    Terminal { owner: String, terminal: String },
+}
+
+impl Recipient {
+    fn parse(address: &str) -> Option<Self> {
+        if let Some((owner, terminal)) = terminal_credential::parse_terminal_address(address) {
+            return Some(Self::Terminal { owner, terminal });
+        }
+        address
+            .strip_prefix("thread:")
+            .filter(|id| !id.is_empty())
+            .map(|id| Self::Thread(id.to_owned()))
+    }
+}
+
 /// The sender and recipient threads of a send that passed every check.
 struct Route {
     sender: ProjectionThread,
@@ -276,19 +310,28 @@ impl AgentMessaging {
         self
     }
 
+    #[cfg(test)]
     /// Sends `request` from the agent of `sender_thread_id` to another agent of its project.
     pub(crate) async fn send(
         &self,
         sender_thread_id: &str,
         request: SendRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
+        self.send_as(&AgentCaller::Thread(sender_thread_id.to_owned()), request)
+            .await
+    }
+
+    /// Sends `request` from `caller` to another agent of its project.
+    pub(crate) async fn send_as(
+        &self,
+        caller: &AgentCaller,
+        request: SendRequest,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
         let mut attribution = Attribution::default();
-        let result = self
-            .send_inner(sender_thread_id, &request, &mut attribution)
-            .await;
+        let result = self.send_inner(caller, &request, &mut attribution).await;
         self.report(
             "agent_message_send",
-            sender_thread_id,
+            caller,
             &request.to,
             attribution,
             result.as_ref(),
@@ -296,21 +339,15 @@ impl AgentMessaging {
         result
     }
 
-    /// Reports a send or reply the tool refused before calling [`Self::send`] or
-    /// [`Self::reply`], with no argument of it, and returns the refusal.
+    /// Reports a send or reply the tool refused before calling [`Self::send_as`] or
+    /// [`Self::reply_as`], with no argument of it, and returns the refusal.
     pub(crate) fn refused(
         &self,
         tool: &'static str,
-        caller_thread_id: &str,
+        caller: &AgentCaller,
         error: AgentMessagingError,
     ) -> AgentMessagingError {
-        self.report(
-            tool,
-            caller_thread_id,
-            "",
-            Attribution::default(),
-            Err(&error),
-        );
+        self.report(tool, caller, "", Attribution::default(), Err(&error));
         error
     }
 
@@ -318,7 +355,7 @@ impl AgentMessaging {
     fn report(
         &self,
         tool: &'static str,
-        sender_thread_id: &str,
+        caller: &AgentCaller,
         recipient_address: &str,
         attribution: Attribution,
         result: Result<&MessageReceipt, &AgentMessagingError>,
@@ -338,7 +375,7 @@ impl AgentMessaging {
             Err(error) => (error.tag().to_owned(), None),
         };
         outcomes(MessageOutcome {
-            sender_address: format!("thread:{sender_thread_id}"),
+            sender_address: caller.address(),
             recipient_address: recipient_address.to_owned(),
             tool,
             outcome,
@@ -351,6 +388,7 @@ impl AgentMessaging {
         });
     }
 
+    #[cfg(test)]
     /// Replies to `request.in_reply_to`, a message the agent of `sender_thread_id` received:
     /// the reply goes to that message's sender, in the same conversation. It returns at once.
     pub(crate) async fn reply(
@@ -358,19 +396,25 @@ impl AgentMessaging {
         sender_thread_id: &str,
         request: ReplyRequest,
     ) -> Result<MessageReceipt, AgentMessagingError> {
+        self.reply_as(&AgentCaller::Thread(sender_thread_id.to_owned()), request)
+            .await
+    }
+
+    /// Replies to `request.in_reply_to`, a message `caller` received. A terminal replies only to
+    /// mail its own generation fetched, and its reply completes that mail (R11).
+    pub(crate) async fn reply_as(
+        &self,
+        caller: &AgentCaller,
+        request: ReplyRequest,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
         let mut recipient_address = String::new();
         let mut attribution = Attribution::default();
         let result = self
-            .reply_inner(
-                sender_thread_id,
-                &request,
-                &mut recipient_address,
-                &mut attribution,
-            )
+            .reply_inner(caller, &request, &mut recipient_address, &mut attribution)
             .await;
         self.report(
             "agent_message_reply",
-            sender_thread_id,
+            caller,
             &recipient_address,
             attribution,
             result.as_ref(),
@@ -382,7 +426,7 @@ impl AgentMessaging {
     /// is known to be the caller's.
     async fn reply_inner(
         &self,
-        sender_thread_id: &str,
+        caller: &AgentCaller,
         request: &ReplyRequest,
         recipient_address: &mut String,
         attribution: &mut Attribution,
@@ -393,13 +437,11 @@ impl AgentMessaging {
         let original = self
             .message(&request.in_reply_to)
             .await?
-            .filter(|message| message.recipient_address == format!("thread:{sender_thread_id}"))
+            .filter(|message| received_by(message, caller))
             .ok_or(AgentMessagingError::UnknownMessage)?;
         recipient_address.clone_from(&original.sender_address);
-        let recipient_thread_id = original
-            .sender_address
-            .strip_prefix("thread:")
-            .ok_or(AgentMessagingError::RecipientGone)?;
+        let recipient =
+            Recipient::parse(&original.sender_address).ok_or(AgentMessagingError::RecipientGone)?;
         check_text(&request.text)?;
         let message_id = Uuid::new_v4().to_string();
         let outgoing = Outgoing {
@@ -411,35 +453,54 @@ impl AgentMessaging {
             client_request_id: request.client_request_id.as_deref(),
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
-        if let Some(receipt) = self
-            .replay(
-                &format!("thread:{sender_thread_id}"),
-                &original.sender_address,
-                &outgoing,
-            )
+        let receipt = match self
+            .replay(&caller.address(), &original.sender_address, &outgoing)
             .await?
         {
-            return Ok(receipt);
+            Some(receipt) => receipt,
+            None => match self
+                .deliver_to(caller, &recipient, outgoing, attribution)
+                .await
+            {
+                Err(AgentMessagingError::UnknownRecipient) => {
+                    return Err(AgentMessagingError::RecipientGone);
+                }
+                receipt => receipt?,
+            },
+        };
+        if matches!(caller, AgentCaller::Terminal(_)) {
+            self.complete(&original.message_id).await?;
         }
-        let route = match self.route(sender_thread_id, recipient_thread_id).await {
-            Err(AgentMessagingError::UnknownRecipient) => {
-                return Err(AgentMessagingError::RecipientGone);
-            }
-            route => route?,
-        };
-        attribution.titles = Some((route.sender.title.clone(), route.recipient.title.clone()));
-        let outgoing = Outgoing {
-            hop: self.next_hop(sender_thread_id).await?,
-            ..outgoing
-        };
-        self.deliver(&route, outgoing).await
+        Ok(receipt)
     }
 
-    /// The stored status of a message the agent of `caller_thread_id` sent. Any other message,
-    /// one it received included, reads exactly as a message that does not exist.
-    pub(crate) async fn status(
+    /// Moves mail a terminal fetched to `completed` once the terminal replied to it.
+    async fn complete(&self, message_id: &str) -> Result<(), AgentMessagingError> {
+        let id = message_id.to_owned();
+        self.engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                store::set_status(
+                    connection,
+                    &id,
+                    AgentMessageStatus::Completed,
+                    None,
+                    &crate::mcp::control::now_iso(),
+                )
+            })
+            .await
+            .map(drop)
+            .map_err(|error| {
+                tracing::warn!(error = %error, "a replied terminal message was not completed");
+                AgentMessagingError::Storage
+            })
+    }
+
+    /// The stored status of a message `caller` sent.
+    pub(crate) async fn status_as(
         &self,
-        caller_thread_id: &str,
+        caller: &AgentCaller,
         message_id: &str,
     ) -> Result<StatusReport, AgentMessagingError> {
         if !self.is_enabled() {
@@ -448,7 +509,7 @@ impl AgentMessaging {
         let message = self
             .message(message_id)
             .await?
-            .filter(|message| message.sender_address == format!("thread:{caller_thread_id}"))
+            .filter(|message| message.sender_address == caller.address())
             .ok_or(AgentMessagingError::UnknownMessage)?;
         let in_reply_to = message.message_id.clone();
         let reply_message_id = self
@@ -488,30 +549,15 @@ impl AgentMessaging {
     /// The receipt of an accepted send.
     async fn send_inner(
         &self,
-        sender_thread_id: &str,
+        caller: &AgentCaller,
         request: &SendRequest,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
         if !self.is_enabled() {
             return Err(AgentMessagingError::Disabled);
         }
-        if let Some((owner_thread_id, terminal_id)) =
-            terminal_credential::parse_terminal_address(&request.to)
-        {
-            return self
-                .send_to_terminal(
-                    sender_thread_id,
-                    request,
-                    &owner_thread_id,
-                    &terminal_id,
-                    attribution,
-                )
-                .await;
-        }
-        let recipient_thread_id = request
-            .to
-            .strip_prefix("thread:")
-            .filter(|id| !id.is_empty() && *id != sender_thread_id)
+        let recipient = Recipient::parse(&request.to)
+            .filter(|_| request.to != caller.address())
             .ok_or(AgentMessagingError::UnknownRecipient)?;
         check_text(&request.text)?;
         let message_id = Uuid::new_v4().to_string();
@@ -526,22 +572,77 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         if let Some(receipt) = self
-            .replay(
-                &format!("thread:{sender_thread_id}"),
-                &request.to,
-                &outgoing,
-            )
+            .replay(&caller.address(), &request.to, &outgoing)
             .await?
         {
             return Ok(receipt);
         }
-        let route = self.route(sender_thread_id, recipient_thread_id).await?;
-        attribution.titles = Some((route.sender.title.clone(), route.recipient.title.clone()));
-        let outgoing = Outgoing {
-            hop: self.next_hop(sender_thread_id).await?,
-            ..outgoing
-        };
-        self.deliver(&route, outgoing).await
+        self.deliver_to(caller, &recipient, outgoing, attribution)
+            .await
+    }
+
+    /// Stores `outgoing` from `caller` for `recipient`, under every check: a chat recipient gets
+    /// a queue entry, an AI Terminal a mailbox row.
+    async fn deliver_to(
+        &self,
+        caller: &AgentCaller,
+        recipient: &Recipient,
+        outgoing: Outgoing<'_>,
+        attribution: &mut Attribution,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
+        match recipient {
+            Recipient::Thread(thread_id) => {
+                let route = self.route(caller.owner_thread_id(), thread_id).await?;
+                let sender = self.sender(caller, &route).await;
+                attribution.titles = Some((sender.title.clone(), route.recipient.title.clone()));
+                let outgoing = Outgoing {
+                    hop: self.next_hop_as(caller).await?,
+                    ..outgoing
+                };
+                self.deliver(&route, &sender, outgoing).await
+            }
+            Recipient::Terminal { owner, terminal } => {
+                self.deliver_to_terminal(caller, owner, terminal, outgoing, attribution)
+                    .await
+            }
+        }
+    }
+
+    /// Who `caller` sends as, given its owner thread in `route`.
+    async fn sender(&self, caller: &AgentCaller, route: &Route) -> Sender {
+        match caller {
+            AgentCaller::Thread(_) => Sender {
+                address: caller.address(),
+                title: route.sender.title.clone(),
+                provider: route.sender_provider.clone(),
+                mode: route.sender.runtime_mode.clone(),
+            },
+            AgentCaller::Terminal(identity) => {
+                let address = identity.address();
+                let description = self.sender_description(&address).await;
+                Sender {
+                    address,
+                    title: description.title,
+                    provider: description.provider,
+                    mode: route.sender.runtime_mode.clone(),
+                }
+            }
+        }
+    }
+
+    /// The hop of a message `caller` sends now (R14): a chat agent's from the message that started
+    /// its turn, a terminal's from the highest hop its generation fetched since a person typed.
+    async fn next_hop_as(&self, caller: &AgentCaller) -> Result<u32, AgentMessagingError> {
+        match caller {
+            AgentCaller::Thread(thread_id) => self.next_hop(thread_id).await,
+            AgentCaller::Terminal(identity) => {
+                let trigger = match &self.terminals {
+                    Some(pointer) => pointer.terminal_trigger_hop(identity).await,
+                    None => None,
+                };
+                policy::next_hop(trigger)
+            }
+        }
     }
 
     /// Both threads, when the recipient is a live thread of the sender's project. Every other
@@ -610,15 +711,16 @@ impl AgentMessaging {
     async fn deliver(
         &self,
         route: &Route,
+        sender: &Sender,
         outgoing: Outgoing<'_>,
     ) -> Result<MessageReceipt, AgentMessagingError> {
         let Some(starter) = &self.starter else {
             tracing::warn!("agent messaging has no turn starter");
             return Err(AgentMessagingError::Storage);
         };
-        let sender_address = format!("thread:{}", route.sender.thread_id);
+        let sender_address = sender.address.clone();
         let recipient_address = format!("thread:{}", route.recipient.thread_id);
-        let sender_mode = &route.sender.runtime_mode;
+        let sender_mode = &sender.mode;
         let recipient_mode = &route.recipient.runtime_mode;
         if !policy::ceiling_allows(sender_mode, recipient_mode) {
             return Err(AgentMessagingError::ModeCeiling {
@@ -626,13 +728,13 @@ impl AgentMessaging {
                 recipient: recipient_mode.clone(),
             });
         }
-        let label = match route.sender.title.trim() {
+        let label = match sender.title.trim() {
             "" => "Agent".to_owned(),
             title => title.to_owned(),
         };
         let envelope = build_envelope(&EnvelopeInput {
             sender_title: &label,
-            provider: &route.sender_provider,
+            provider: &sender.provider,
             sender_address: &sender_address,
             message_id: outgoing.message_id,
             conversation_id: outgoing.conversation_id,
@@ -838,6 +940,7 @@ impl AgentMessaging {
         }))
     }
 
+    #[cfg(test)]
     /// Cancels a message the agent of `caller_thread_id` sent, while it is accepted, queued or
     /// held and its entry was not handed to the recipient's provider (R20). Any other caller's
     /// message reads as one that does not exist. Not refused while messaging is off.
@@ -846,10 +949,23 @@ impl AgentMessaging {
         caller_thread_id: &str,
         message_id: &str,
     ) -> Result<AgentMessageStatus, AgentMessagingError> {
+        self.cancel_as(
+            &AgentCaller::Thread(caller_thread_id.to_owned()),
+            message_id,
+        )
+        .await
+    }
+
+    /// [`Self::cancel`] for a message `caller` sent.
+    pub(crate) async fn cancel_as(
+        &self,
+        caller: &AgentCaller,
+        message_id: &str,
+    ) -> Result<AgentMessageStatus, AgentMessagingError> {
         let message = self
             .message(message_id)
             .await?
-            .filter(|message| message.sender_address == format!("thread:{caller_thread_id}"))
+            .filter(|message| message.sender_address == caller.address())
             .ok_or(AgentMessagingError::UnknownMessage)?;
         if message.status == AgentMessageStatus::Cancelled {
             return Ok(AgentMessageStatus::Cancelled);
@@ -916,15 +1032,6 @@ impl AgentMessaging {
         *self.enabled.borrow()
     }
 
-    /// The other agents of the caller's project. A caller whose thread is gone reaches nobody.
-    pub(crate) async fn agents(
-        &self,
-        caller_thread_id: &str,
-    ) -> Result<Vec<AgentSummary>, AgentMessagingError> {
-        self.agents_for(&AgentCaller::Thread(caller_thread_id.to_owned()))
-            .await
-    }
-
     /// The chat agents and AI Terminals of `caller`'s project, except `caller` itself: a
     /// terminal lists its host thread, and a thread its own terminals. A caller whose owner
     /// thread is gone reaches nobody. Only threads of that one project are read.
@@ -987,10 +1094,6 @@ impl AgentMessaging {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentCaller {
     Thread(String),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "task 8.2's command calls as a terminal")
-    )]
     Terminal(terminal_credential::TerminalIdentity),
 }
 
@@ -1024,6 +1127,24 @@ impl AgentMessaging {
     pub(crate) fn with_terminals(mut self, terminals: pointer::TerminalPointer) -> Self {
         self.terminals = Some(terminals);
         self
+    }
+
+    /// The mail of the terminal generation `caller` names, consumed as it is returned. A chat
+    /// agent reads its messages in its own thread and has no inbox.
+    pub(crate) async fn inbox_as(
+        &self,
+        caller: &AgentCaller,
+    ) -> Result<Vec<pointer::InboxEntry>, AgentMessagingError> {
+        let AgentCaller::Terminal(identity) = caller else {
+            return Err(AgentMessagingError::InvalidArgument(
+                "Only an AI Terminal has an inbox; a chat agent reads its messages in its thread."
+                    .to_owned(),
+            ));
+        };
+        match &self.terminals {
+            Some(pointer) => pointer.inbox(self, identity).await,
+            None => Ok(Vec::new()),
+        }
     }
 
     pub(crate) async fn sender_description(&self, address: &str) -> SenderDescription {
@@ -1083,38 +1204,24 @@ impl AgentMessaging {
             .find(|summary| summary.terminal_id == terminal_id)
     }
 
-    /// Stores a message for the AI Terminal `terminal_id` of `owner_thread_id`, which must be a
+    /// Stores `outgoing` for the AI Terminal `terminal_id` of `owner_thread_id`, which must be a
     /// live thread of the sender's project; a plain shell, a terminal that is not running and
     /// any other terminal read as an unknown address.
-    async fn send_to_terminal(
+    async fn deliver_to_terminal(
         &self,
-        sender_thread_id: &str,
-        request: &SendRequest,
+        caller: &AgentCaller,
         owner_thread_id: &str,
         terminal_id: &str,
+        outgoing: Outgoing<'_>,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
-        check_text(&request.text)?;
-        let message_id = Uuid::new_v4().to_string();
-        let conversation_id = Uuid::new_v4().to_string();
-        let outgoing = Outgoing {
-            message_id: &message_id,
-            conversation_id: &conversation_id,
-            in_reply_to: None,
-            hop: 1,
-            text: &request.text,
-            client_request_id: request.client_request_id.as_deref(),
-        };
-        let sender_address = format!("thread:{sender_thread_id}");
-        // A stored receipt answers a retry even after its recipient is gone (R12).
-        if let Some(receipt) = self.replay(&sender_address, &request.to, &outgoing).await? {
-            return Ok(receipt);
-        }
         let pointer = self
             .terminals
             .as_ref()
             .ok_or(AgentMessagingError::UnknownRecipient)?;
-        let route = self.route(sender_thread_id, owner_thread_id).await?;
+        let route = self
+            .route(caller.owner_thread_id(), owner_thread_id)
+            .await?;
         let summary = self
             .terminal_summary(owner_thread_id, terminal_id)
             .await
@@ -1123,13 +1230,14 @@ impl AgentMessaging {
                     && summary.status == crate::terminal::TerminalStatus::Running
             })
             .ok_or(AgentMessagingError::UnknownRecipient)?;
-        attribution.titles = Some((route.sender.title.clone(), summary.label));
+        let sender = self.sender(caller, &route).await;
+        attribution.titles = Some((sender.title.clone(), summary.label));
         let generation = pointer
             .terminals()
             .live_generation(owner_thread_id, terminal_id)
             .await
             .ok_or(AgentMessagingError::UnknownRecipient)?;
-        let hop = self.next_hop(sender_thread_id).await?;
+        let hop = self.next_hop_as(caller).await?;
         let recipient = terminal_credential::TerminalIdentity {
             // Routing reads only the address and the generation.
             environment_id: String::new(),
@@ -1137,28 +1245,32 @@ impl AgentMessaging {
             terminal_id: terminal_id.to_owned(),
             generation,
         };
+        let recipient_address = recipient.address();
         let new = NewAgentMessage {
-            message_id: message_id.clone(),
-            conversation_id: conversation_id.clone(),
-            sender_address: sender_address.clone(),
+            message_id: outgoing.message_id.to_owned(),
+            conversation_id: outgoing.conversation_id.to_owned(),
+            sender_address: sender.address.clone(),
             sender_kind: SenderKind::Agent,
-            recipient_address: recipient.address(),
-            in_reply_to: None,
+            recipient_address: recipient_address.clone(),
+            in_reply_to: outgoing.in_reply_to.map(str::to_owned),
             hop,
-            text: request.text.clone(),
+            text: outgoing.text.to_owned(),
             status: AgentMessageStatus::Queued,
             reason: None,
             accepted_at: crate::mcp::control::now_iso(),
-            sender_runtime_mode: Some(route.sender.runtime_mode.clone()),
+            sender_runtime_mode: Some(sender.mode),
             recipient_terminal_generation: None,
             send_request_id: None,
-            client_request_id: request.client_request_id.clone(),
+            client_request_id: outgoing.client_request_id.map(str::to_owned),
             delivery_command_id: None,
             delivery_message_id: None,
         };
         if let Err(error) = pointer.accept(self, new, &recipient).await {
             // Another call with the same id won the unique index first: answer from its row.
-            return match self.replay(&sender_address, &request.to, &outgoing).await? {
+            return match self
+                .replay(&sender.address, &recipient_address, &outgoing)
+                .await?
+            {
                 Some(receipt) => Ok(receipt),
                 None => Err(error),
             };
@@ -1169,10 +1281,25 @@ impl AgentMessaging {
             AgentMessageStatus::Held
         };
         Ok(MessageReceipt {
-            message_id,
-            conversation_id,
+            message_id: outgoing.message_id.to_owned(),
+            conversation_id: outgoing.conversation_id.to_owned(),
             status,
             hop,
         })
+    }
+}
+
+/// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it.
+fn received_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
+    if message.recipient_address != caller.address() {
+        return false;
+    }
+    match caller {
+        AgentCaller::Thread(_) => true,
+        AgentCaller::Terminal(identity) => {
+            message.status == AgentMessageStatus::Consumed
+                && message.recipient_terminal_generation.as_deref()
+                    == Some(identity.generation_key().as_str())
+        }
     }
 }

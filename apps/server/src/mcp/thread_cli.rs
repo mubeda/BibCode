@@ -159,7 +159,7 @@ pub enum ThreadCommand {
 /// The most characters of a `clientRequestId`, as the server takes it.
 const MOST_REQUEST_ID_BYTES: usize = 256;
 
-fn request_id(text: &str) -> Result<String, String> {
+pub(crate) fn request_id(text: &str) -> Result<String, String> {
     if text.is_empty() || text.len() > MOST_REQUEST_ID_BYTES {
         return Err(format!(
             "an id of 1 to {MOST_REQUEST_ID_BYTES} characters, not {}",

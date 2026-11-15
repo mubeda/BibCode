@@ -55,10 +55,6 @@ pub trait PointerTerminals: Send + Sync {
         thread_id: &'a str,
         terminal_id: &'a str,
     ) -> BoxFuture<'a, Option<TerminalGeneration>>;
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the hop ledger reads it for task 8.2's command")
-    )]
     fn person_input_count<'a>(
         &'a self,
         thread_id: &'a str,
@@ -150,7 +146,6 @@ fn storage(
 
 /// One message a terminal agent fetched: its id and the envelope it reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command prints it"))]
 pub struct InboxEntry {
     pub message_id: String,
     pub rendered: String,
@@ -162,13 +157,11 @@ pub type GenerationEndSink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 /// The hops one terminal generation fetched since a person last typed into it.
 #[derive(Default)]
-#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command reads it"))]
 struct HopLedger {
     inputs_seen: Option<u64>,
     highest: Option<u32>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 8.2's command reads it"))]
 impl HopLedger {
     /// Starts the chain again when the person input count changed since it was last seen.
     fn follow(&mut self, inputs: Option<u64>) {
@@ -180,10 +173,6 @@ impl HopLedger {
 }
 
 /// `{address}#{generation key}`: one terminal process, for the hop ledger and the ended set.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 8.2's command reads the ledger")
-)]
 fn ledger_key(identity: &TerminalIdentity) -> String {
     format!("{}#{}", identity.address(), identity.generation_key())
 }
@@ -732,10 +721,6 @@ impl TerminalPointer {
 }
 
 /// The terminal agent's side: its inbox and its hop chain.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 8.2's `bibcode agent` command calls these")
-)]
 impl TerminalPointer {
     /// The mail of `identity`'s own generation, oldest first, rendered as envelopes; each
     /// returned row is `consumed` in the fetch. `queued` and `delivered` rows only, and an
@@ -822,6 +807,13 @@ impl TerminalPointer {
         ledger.highest
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only a person's input resets the chain, through the count"
+        )
+    )]
     pub(crate) fn reset_hop(&self, identity: &TerminalIdentity) {
         self.hops
             .lock()
@@ -1020,7 +1012,7 @@ pub(crate) mod tests {
             });
         }
 
-        fn close(&self, thread_id: &str, terminal_id: &str) {
+        pub(crate) fn close(&self, thread_id: &str, terminal_id: &str) {
             self.terminals
                 .lock()
                 .unwrap()
@@ -1032,7 +1024,7 @@ pub(crate) mod tests {
             });
         }
 
-        fn person_types(&self, thread_id: &str, terminal_id: &str) {
+        pub(crate) fn person_types(&self, thread_id: &str, terminal_id: &str) {
             self.change(thread_id, terminal_id, |terminal| {
                 terminal.person_inputs += 1;
             });

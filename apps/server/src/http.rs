@@ -148,6 +148,7 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/diagnostics/relay"),
     route(RouteMethod::Get, "/api/assets/*"),
     route(RouteMethod::Post, "/api/preview/open-url"),
+    route(RouteMethod::Post, "/api/agent/call"),
     route(RouteMethod::Get, "/api/transfers/*"),
     route(RouteMethod::Get, DEVICE_MEDIA_PATH),
     route(RouteMethod::Get, DEVICE_MEDIA_E2EE_PATH),

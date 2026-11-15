@@ -88,6 +88,8 @@ pub type OpenUrlHandler = Arc<
         + Send
         + Sync,
 >;
+/// `POST /api/agent/call`: the AI Terminal agent route, bearer-only.
+pub type AgentCallHandler = OpenUrlHandler;
 pub type TransferDownloadHandler = Arc<
     dyn Fn(String, RouteContext) -> BoxFuture<Result<TransferDownloadHttpOutcome, HttpRouteError>>
         + Send
@@ -119,6 +121,8 @@ pub struct HttpRoutesState {
     pub transfer_upload: TransferUploadHandler,
     /// Answers `503` until the production runtime replaces it.
     pub open_url: OpenUrlHandler,
+    /// Answers `503` until the production runtime replaces it.
+    pub agent_call: AgentCallHandler,
     /// The media socket's devices and sessions; `None` (answering `503`) without the
     /// production runtime.
     pub(crate) device_media: Option<crate::device::media_socket::MediaSocketState>,
@@ -153,19 +157,25 @@ impl HttpRoutesState {
             device_media: None,
             diagnostic_logs_relay: None,
             mcp_proof_key: None,
-            open_url: Arc::new(|_body, _context| {
-                Box::pin(async {
-                    Err(HttpRouteError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        json!({
-                            "_tag": "NativeRuntimeUnavailableError",
-                            "message": "The native production runtime is unavailable."
-                        }),
-                    ))
-                })
-            }),
+            open_url: unavailable_runtime_handler(),
+            agent_call: unavailable_runtime_handler(),
         }
     }
+}
+
+/// A route of the production runtime that answers `503` until the runtime replaces it.
+fn unavailable_runtime_handler() -> OpenUrlHandler {
+    Arc::new(|_body, _context| {
+        Box::pin(async {
+            Err(HttpRouteError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "_tag": "NativeRuntimeUnavailableError",
+                    "message": "The native production runtime is unavailable."
+                }),
+            ))
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,6 +377,7 @@ where
             get(transfer_download).post(transfer_upload),
         )
         .route("/api/preview/open-url", post(preview_open_url))
+        .route("/api/agent/call", post(agent_call))
         .route(DEVICE_MEDIA_PATH, get(device_media))
         .route(DEVICE_MEDIA_E2EE_PATH, get(device_media_e2ee))
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
@@ -830,6 +841,28 @@ async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request
         cancellation,
     };
     match (state.open_url)(body, context).await {
+        Ok(response) => json_response(response.status, response.headers, response.body),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Bearer-only, like open-url: deliberately skips `state.authorize`, which would also accept a
+/// person's session cookie. Only an AI Terminal generation's credential opens it.
+async fn agent_call(State(state): State<HttpRoutesState>, request: Request) -> Response {
+    let cancellation = CancellationToken::new();
+    let _guard = CancellationGuard(cancellation.clone());
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, crate::mcp::agent_cli::MAX_AGENT_CALL_BODY_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => return payload_too_large(),
+    };
+    let context = RouteContext {
+        origin: request_origin(&parts),
+        headers: parts.headers,
+        uri: parts.uri,
+        cancellation,
+    };
+    match (state.agent_call)(body, context).await {
         Ok(response) => json_response(response.status, response.headers, response.body),
         Err(error) => error.into_response(),
     }

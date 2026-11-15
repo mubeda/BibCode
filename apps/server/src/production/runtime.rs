@@ -127,6 +127,8 @@ pub struct ProductionRuntime {
     agent_message_writer: crate::mcp::activity::AgentMessageWriter,
     /// AI Terminal credentials for agent messaging.
     terminal_credentials: Arc<crate::agent_messaging::terminal_credential::TerminalCredentials>,
+    /// The terminal manager, which the credentials verify a generation against once bound.
+    terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations>,
     /// Stops the task that revokes the credentials of ended terminal processes.
     terminal_credential_revoker: CancellationToken,
     /// Stops the task that tells AI Terminals about their agent mail.
@@ -193,6 +195,18 @@ impl ProductionRuntime {
         &self,
     ) -> Arc<crate::agent_messaging::terminal_credential::TerminalCredentials> {
         self.terminal_credentials.clone()
+    }
+
+    /// Binds the AI Terminal credentials to `endpoint`, the agent call route, and to this
+    /// runtime's terminal manager: AI Terminals launched from now on get a credential.
+    pub fn bind_terminal_credentials(&self, endpoint: String) {
+        self.terminal_credentials
+            .bind(endpoint, self.terminal_live.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_manager_for_test(&self) -> TerminalManager {
+        self.terminal_services.terminal_manager_for_test()
     }
 
     /// The outside-agent MCP tools, for the `/mcp` endpoint.
@@ -682,6 +696,8 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations> =
+            Arc::new(terminal_manager.clone());
         let terminal_pointer = crate::agent_messaging::pointer::TerminalPointer::new(
             repositories.database().clone(),
             Arc::new(terminal_manager.clone()),
@@ -920,6 +936,7 @@ impl ProductionRuntime {
             agent_message_tracker_task: std::sync::Mutex::new(Some(agent_message_tracker_task)),
             agent_message_writer,
             terminal_credentials,
+            terminal_live,
             terminal_credential_revoker,
             terminal_pointer: terminal_pointer_task,
             registry,
@@ -3894,7 +3911,7 @@ mod tests {
         for _ in 0..20 {
             messaging.refused(
                 "agent_message_send",
-                "missing",
+                &crate::agent_messaging::AgentCaller::Thread("missing".to_owned()),
                 crate::agent_messaging::AgentMessagingError::Disabled,
             );
         }
