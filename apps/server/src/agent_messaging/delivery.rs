@@ -23,7 +23,7 @@ use super::{
 use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
-        TurnDeliveryMode, TurnDeliveryState, canonical_command_digest,
+        TurnDeliveryFailureReason, TurnDeliveryMode, TurnDeliveryState, canonical_command_digest,
         engine::TurnDeliveryResolutionAction,
     },
     persistence::{OrchestrationEvent, Result},
@@ -173,15 +173,29 @@ pub(crate) fn derive_chat_status(
             });
         }
     }
-    let outbox: Option<(String, bool)> = connection
+    let outbox: Option<(String, bool, Option<String>)> = connection
         .query_row(
-            "SELECT state, held FROM provider_turn_outbox WHERE command_id = ?1",
+            "SELECT state, held, failure_reason FROM provider_turn_outbox WHERE command_id = ?1",
             [command_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    // Restart recovery found the message at an idle provider but no turn of it: BiBCode
+    // stopped before it recorded the turn, so its result is lost.
+    if let Some((state, _, Some(reason))) = &outbox
+        && state == "delivered"
+        && reason == TurnDeliveryFailureReason::FoundWithoutTurn.as_str()
+    {
+        return Ok(Derived::of(
+            AgentMessageStatus::Failed,
+            Some(AgentMessageReason::RecipientTurnFailed),
+        ));
+    }
     Ok(
-        match outbox.as_ref().map(|(state, held)| (state.as_str(), *held)) {
+        match outbox
+            .as_ref()
+            .map(|(state, held, _)| (state.as_str(), *held))
+        {
             // A paused queue (an errored or interrupted session, or a restart) holds the entry until
             // a person releases it.
             Some(("queued", true)) => Derived::of(
@@ -881,6 +895,43 @@ mod tests {
             updated_at: "2026-11-14T00:00:00Z".to_owned(),
             recipient_turn_id: None,
         }
+    }
+
+    /// Restart recovery found the message at an idle provider but no turn of it, so the result
+    /// is lost and the message fails; a delivery recovery found normally stays delivered.
+    #[test]
+    fn a_delivery_recovered_without_its_turn_fails_and_a_normal_one_stays_delivered() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        crate::persistence::run_migrations(&mut connection, None).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('b', 'p', 'B', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z', NULL, NULL);
+                 INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('agent-message:m1', 'thread', 'b', '2026-11-14T00:00:00Z', 0, 'accepted', NULL, NULL);
+                 INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, created_at, updated_at) VALUES ('agent-message:m1', 'b', 'd1', 'opencode', 'opencode', 'k', '{}', 'delivered', '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z');",
+            )
+            .unwrap();
+        let derived =
+            derive_chat_status(&connection, &row(AgentMessageStatus::Delivered, None)).unwrap();
+        assert_eq!(
+            (derived.status, derived.reason),
+            (AgentMessageStatus::Delivered, None),
+            "a normal delivery"
+        );
+        connection
+            .execute(
+                "UPDATE provider_turn_outbox SET failure_reason = 'foundWithoutTurn'",
+                [],
+            )
+            .unwrap();
+        let derived =
+            derive_chat_status(&connection, &row(AgentMessageStatus::Delivered, None)).unwrap();
+        assert_eq!(
+            (derived.status, derived.reason),
+            (
+                AgentMessageStatus::Failed,
+                Some(AgentMessageReason::RecipientTurnFailed)
+            )
+        );
     }
 
     #[test]

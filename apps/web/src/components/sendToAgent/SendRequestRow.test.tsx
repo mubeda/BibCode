@@ -169,6 +169,13 @@ describe("SendRequestRows", () => {
     ).toBe("Codex did not answer: its turn was interrupted");
   });
 
+  it('an answer BiBCode stopped before recording reads "BiBCode stopped before it could record the answer"', () => {
+    expect(
+      describeRequestRow(request({ state: "not_answered", reason: "answer_not_recorded" }), "Codex")
+        .text,
+    ).toBe("Codex did not answer: BiBCode stopped before it could record the answer");
+  });
+
   it("a chat target shows read when its turn started and never shows delivered", () => {
     render([request({ action: "review", state: "read" })]);
     expect(container.textContent).toContain("Codex panel read it");
