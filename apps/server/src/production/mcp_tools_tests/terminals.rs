@@ -1029,6 +1029,11 @@ async fn a_read_loop_ends_while_an_escape_is_still_arriving() {
         .await;
     assert_eq!(again["more"], false, "{again}");
     assert_eq!(again["nextCursor"], last["nextCursor"]);
+    // "old" is 3 bytes, so the escape starts at offset 3.
+    assert!(
+        last["nextCursor"].as_str().unwrap().ends_with(":3"),
+        "{last}"
+    );
     fixture.shutdown().await;
 }
 
@@ -1060,6 +1065,11 @@ async fn a_read_loop_ends_at_an_exited_terminals_unfinished_escape() {
     let last = read_to_the_end(&fixture, &agent, &terminal_id, 5).await;
     assert_eq!(last["text"], "", "{last}");
     assert_eq!(last["status"], "exited");
+    // The cursor moves past the 14 bytes of output, unfinished escape included.
+    assert!(
+        last["nextCursor"].as_str().unwrap().ends_with(":14"),
+        "{last}"
+    );
     fixture.shutdown().await;
 }
 
