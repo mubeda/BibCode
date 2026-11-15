@@ -75,6 +75,21 @@ removed. A raw `PATH` is never logged. The
 [Claude guide](../providers/claude.md#activity-observation) explains each
 outcome.
 
+Send requests and agent messaging write no Profiler event or finding. Their failures are
+`warn` lines at the boundary that failed, such as `a send request could not use the store`,
+`terminal mail could not be read`, `a terminal did not take the pointer in time` (a pointer
+write outran its 2 seconds), `agent messaging could not read a thread`, `could not issue an AI
+Terminal credential: no randomness` and `agent message activity rows were dropped: the writer
+fell behind` (with the count). `POST /api/agent/call` writes one `debug` line per call,
+`an AI Terminal agent call answered`, with the owner thread id, the terminal id and the outcome
+tag. Fields are ids, addresses, thread titles, states and error text of the store, never a note,
+an attachment, a message, an answer, a credential or terminal text. Each delivery step of an
+agent message is also a row of the agent activity log (`agent_message_send`,
+`agent_message_reply` and `agent_message_delivery`), written by one task from a queue of 1,024
+rows that the runtime closes in its stop. The stop timings of `send-requests-follower`,
+`agent-message-tracker`, `terminal-pointer`, `agent-message-activity` and
+`terminal-credential-revoker` appear in the `server.stop` event when one is slow.
+
 When the server stops a Git process because of a timeout, a cancellation or
 shutdown, Linux and macOS first send it `SIGTERM` and kill it only if it is
 still running 2 seconds later. Windows kills it at once. If a killed Git command

@@ -43,6 +43,12 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
   of closing them in `pre_exec`. This preserves Rust's spawn-reporting socket
   until exec succeeds or fails, so a missing executable or interpreter produces
   a spawn error rather than false success followed by a child abort.
+- `CommandBuilder` implements `Debug` by hand and prints only the keys of its environment
+  (`env_keys`), and the two Windows registry `log::trace!` lines that read the system and user
+  environment name the variable without its value. Upstream derives `Debug`, which prints every
+  value, and environment values can carry credentials: BiBCode puts the `bibcode agent`
+  credential of an AI Terminal there. Keep the manual `Debug` and the shorter trace lines
+  when this copy is synced.
 
 ## Updating
 
@@ -61,6 +67,7 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
 
 Remove this fork and the workspace `[patch.crates-io]` entry once an upstream
 portable-pty release provides equivalent at-creation Job-list support, correct
-child-killer result propagation, a preserved Unix spawn handshake, and access
-to every raw effective environment entry. Retire individual deviations as their equivalents become available;
+child-killer result propagation, a preserved Unix spawn handshake, access
+to every raw effective environment entry, and a `Debug` and trace output that omit environment
+values. Retire individual deviations as their equivalents become available;
 the Job-list API alone is not sufficient to remove the remaining fixes.
