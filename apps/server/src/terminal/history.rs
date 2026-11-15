@@ -4,6 +4,9 @@ const DEQUE_SHRINK_OCCUPANCY_DENOMINATOR: usize = 4;
 
 /// How far before a tail's start `TerminalHistory::tail` looks for the escape that opens a
 /// sequence the cut lands in.
+// shortcut: a sequence whose ESC is further back than this (a 70,000-character OSC 52 clipboard
+// payload, say) still leaks its tail into an attachment; scan back to a sequence boundary instead
+// when long OSC payloads show up in attachments.
 const ESCAPE_LOOKBACK_BYTES: usize = 4096;
 
 /// ConPTY alt-screen TUIs redraw with cursor movement instead of newlines, so
@@ -319,8 +322,6 @@ impl TerminalHistory {
     /// sequence that has not ended yet is `Err` with how many bytes before `tail` it starts.
     fn cut_sequence_len(&self, tail: &str) -> Result<usize, usize> {
         let cut = self.total_bytes - tail.len();
-        // shortcut: a sequence started more than this before the cut still leaks its rest;
-        // widen the lookback if long OSC payloads (clipboard, images) show up in tails.
         let before = self.retained_range(cut.saturating_sub(ESCAPE_LOOKBACK_BYTES), cut);
         let Some(escape) = before.rfind('\x1b') else {
             return Ok(0);
