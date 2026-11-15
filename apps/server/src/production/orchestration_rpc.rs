@@ -1168,7 +1168,7 @@ async fn dispatch_reserved_turn_command(
 
 async fn turn_identity(
     engine: &OrchestrationEngine,
-    settings_root: &PathBuf,
+    settings_root: &std::path::Path,
     command: &OrchestrationCommand,
 ) -> Result<(String, String, String, String, String), String> {
     let OrchestrationCommand::ThreadTurnStart {
