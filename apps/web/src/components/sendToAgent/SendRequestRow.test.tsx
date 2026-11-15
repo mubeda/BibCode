@@ -11,6 +11,21 @@ vi.mock("~/state/entities", () => ({
     ref === null ? null : (shells.get(ref.threadId) ?? null),
 }));
 
+const terminals = vi.hoisted(() => ({
+  list: null as null | Array<{ threadId: string; terminalId: string }>,
+}));
+vi.mock("~/state/query", () => ({
+  useEnvironmentQuery: (atom: unknown) => ({ data: atom === null ? null : terminals.list }),
+}));
+vi.mock("~/state/terminal", () => ({
+  terminalEnvironment: { metadata: () => ({}) },
+}));
+const toasts = vi.hoisted(() => ({ add: vi.fn() }));
+vi.mock("../ui/toast", () => ({
+  toastManager: toasts,
+  stackedThreadToast: (toast: unknown) => toast,
+}));
+
 import {
   describeRequestRow,
   describeRowActionFailure,
@@ -81,9 +96,44 @@ afterEach(() => {
   act(() => root.unmount());
   container.remove();
   shells.clear();
+  terminals.list = null;
+  toasts.add.mockClear();
 });
 
 describe("SendRequestRows", () => {
+  it("Open on a request to an AI Terminal passes the terminal id", () => {
+    terminals.list = [{ threadId: "target", terminalId: "term-1" }];
+    const props = render([request({ target: "terminal:target/term-1" })]);
+    act(() => button("Open")?.click());
+    expect(props.onOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "target" }),
+      "term-1",
+    );
+    expect(toasts.add).not.toHaveBeenCalled();
+  });
+
+  it("Open on a request to a closed AI Terminal opens its thread and says the terminal closed", () => {
+    terminals.list = [{ threadId: "target", terminalId: "term-2" }];
+    const props = render([request({ target: "terminal:target/term-1" })]);
+    act(() => button("Open")?.click());
+    expect(props.onOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "target" }),
+      null,
+    );
+    expect(toasts.add).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "That terminal has closed" }),
+    );
+  });
+
+  it("Open on a chat target passes no terminal id", () => {
+    const props = render([request()]);
+    act(() => button("Open")?.click());
+    expect(props.onOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "target" }),
+      null,
+    );
+  });
+
   it("queued shows Open and Cancel", () => {
     render([request()]);
     expect(container.textContent).toContain("Queued for Codex panel");

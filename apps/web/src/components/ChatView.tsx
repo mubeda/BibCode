@@ -207,6 +207,7 @@ import {
   selectThreadCenterPanelState,
   type ThreadCenterPanelState,
   type OpenTerminalPanelOptions,
+  revealTerminalSurface,
   useCenterPanelStore,
 } from "../centerPanelStore";
 import {
@@ -361,6 +362,7 @@ import {
   SendRequestRows,
 } from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
+import type { OpenSendTarget } from "./sendToAgent/useSendTargetOpener";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
 import {
   buildHandOffContent,
@@ -5440,9 +5442,15 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [dismissSendRequest],
   );
-  // A request's target opens where it lives: a panel of its host, else its own thread.
-  const handleOpenSendTarget = useCallback(
-    (target: ScopedThreadRef) => {
+  // A request's target opens where it lives: an AI Terminal's tab, a panel of its host, else its
+  // own thread.
+  const handleOpenSendTarget = useCallback<OpenSendTarget>(
+    (target, terminalId) => {
+      if (terminalId !== null) {
+        revealTerminalSurface(target, terminalId);
+        void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(target) });
+        return;
+      }
       const shell = readThreadShell(target);
       const hostThreadId = shell?.hostThreadId ?? null;
       const hostRef =

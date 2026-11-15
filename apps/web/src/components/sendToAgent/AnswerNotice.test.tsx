@@ -26,6 +26,12 @@ vi.mock("~/composerDraftStore", () => ({
     }),
   },
 }));
+vi.mock("~/state/query", () => ({
+  useEnvironmentQuery: (atom: unknown) => ({
+    data: atom === null ? null : [{ threadId: "target", terminalId: "term-1" }],
+  }),
+}));
+vi.mock("~/state/terminal", () => ({ terminalEnvironment: { metadata: () => ({}) } }));
 vi.mock("~/centerPanelStore", () => ({ useCenterPanelStore: { getState: () => ({}) } }));
 vi.mock("~/state/entities", () => ({
   useThreadShell: () => (h.targetTitle === undefined ? undefined : { title: h.targetTitle }),
@@ -124,6 +130,13 @@ afterEach(() => {
 });
 
 describe("AnswerNotice", () => {
+  it("Open on an answer from an AI Terminal passes the terminal id", () => {
+    const onOpen = vi.fn();
+    render({ request: request({ target: "terminal:target/term-1" }), onOpen });
+    act(() => button("Open")?.click());
+    expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ threadId: "target" }), "term-1");
+  });
+
   it("an answered Review names the target and offers Bring back, Open and Dismiss", () => {
     render();
     expect(container.textContent).toContain("Parser agent answered");

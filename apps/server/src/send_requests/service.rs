@@ -1326,13 +1326,13 @@ impl SendRequestsService {
             })
             .transpose()?;
         match (action, &taken_over) {
-            (SendAction::TakeOver, Some(taken_over)) => {
+            (SendAction::TakeOver, Some(_)) => {
                 if input.target != input.source {
                     return Err(invalid(
                         "A take-over is queued on the agent that takes over.",
                     ));
                 }
-                if taken_over.thread_id == source.thread_id {
+                if input.taken_over.as_deref() == Some(input.source.as_str()) {
                     return Err(invalid("An agent cannot take over its own work."));
                 }
             }
