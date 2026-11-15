@@ -53,8 +53,8 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 | 9.3 | Takeover into a terminal and terminal-side notices | 9 | Closed | lane 9B, 9W | WebDriver run in 11.2 |
 | 10.1 | Claude conversation reader | 10 | Closed | lane 10A | |
 | 10.2 | Codex conversation reader | 10 | Closed | lane 10A | |
-| 11.1 | Living documentation | 11 | In progress | | |
-| 11.2 | Runbooks and scripted end-to-end | 11 | Open | | |
+| 11.1 | Living documentation | 11 | Closed | lane 11D | |
+| 11.2 | Runbooks and scripted end-to-end | 11 | In progress | lane 11E | |
 | 11.3 | Real-provider run and final gates | 11 | Open | | |
 
 ## Log
@@ -173,4 +173,7 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-15 01:41 Third Codex pass on lane 10A: 1 finding, rejected (a recovered Working status counts as a turn start, so a draft typed in that window reads as submitted): covered by the limit accepted for 8.4, a turn that starts without the person submitting marks earlier keystrokes as submitted.
 - 2026-11-15 02:01 10.1, 10.2 Closed. Lane branch worktree-agent-a319de016ce19d7e6 (af9824a96..bfdcf7bba) merged into the Branch line's branch; one conflict in TerminalSendComposer.tsx, both sides kept, and a dropped useRef import restored. Evidence measured by the coordinator on the merged branch: cargo fmt --all --check exit 0; cargo test -p bibcode-server --lib -j 2: test result: ok. 5964 passed; 0 failed; 16 ignored; orchestration 24, production_server_terminal_rpc 21, provider_terminal_supervisor 153 (2 ignored), terminal_rpc 2 passed; clippy -D warnings finished; web unit tests (sendToAgent, ThreadTerminalPanel, ChatView): 19 files, 817 passed; vp check --no-fmt clean; vp run typecheck no error lines; vp test run scripts: 938 passed, 1 failed, the identity guard, only on the untracked reports/ and research_notes/ folders.
 - 2026-11-15 02:01 11.1 In progress. Lane 11D (sonnet, medium) wrote the living documentation (935c827e8, a57203fdb), merged; Codex fact check running. Lane 11F (opus, medium) is fixing the five logged follow-ups.
+- 2026-11-15 02:05 Codex fact check of the 11.1 documentation against the merged code (gpt-6-astra, high): 10 statements the code contradicts, all accepted and corrected in f27034f37 (docs only). Ruling on the activity log: completion and cancellation of a terminal message and the held and queued states write no activity row; R21 names accepted, refused, delivered and failed, which are all written, so this is not a gap and the documents now list exactly what is recorded.
+- 2026-11-15 02:08 11.1 Closed. Lane branch worktree-agent-a2d0e2800ca3629ad (935c827e8, a57203fdb, f27034f37) merged. Evidence on the Branch line's branch: vp run check:markdown-links: Markdown links OK; vp check --no-fmt: no warnings in 2484 files; no machine path in added lines (measured by the coordinator); vp test run scripts: 939 passed (lane report). Kept as unchecked in the documents, for 11.3: Codex expanding a skill mention, a Codex environment policy dropping the terminal credential, the Windows shim.
+- 2026-11-15 02:08 11.2 In progress. Owner: lane 11E (sonnet, medium): runbooks under docs/testing and a WebdriverIO spec with the scripted provider, run with the Profiler on.
 - 2026-11-14 20:40 Codex review of lane 8V (gpt-6-astra, high): 4 findings, all accepted (a later Working report moves the turn start forward and clears a real draft; the setting is checked before the session lock is held; setting reconciliation bypasses the mailbox exclusion; ending a blocked terminal stalls the dispatcher). Sent to lane 8C as an added part, since it is based on that branch and owns those files.
