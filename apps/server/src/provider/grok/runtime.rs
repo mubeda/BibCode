@@ -245,6 +245,10 @@ impl GrokSessionRuntime {
                     }),
                 )
                 .await;
+            // The response resolves on the reader task, while the chunks the agent wrote before
+            // it may still wait in the incoming queue. Handle them first, so they keep this turn
+            // and come before its `turn.completed`.
+            let _ = connection.barrier().await;
             if runtime.inner.active_turn_id.lock().await.as_deref()
                 == Some(background_turn_id.as_str())
             {
@@ -769,6 +773,94 @@ fn find_option_id(options: &[Value], kind: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::cursor::AcpConnectionConfig;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn chunks_read_before_the_prompt_response_belong_to_the_turn_and_precede_its_completion()
+    {
+        let (stdout, mut responses) = duplex(4096);
+        let (stdin_peer, stdin) = duplex(4096);
+        let (stderr, _stderr_peer) = duplex(4096);
+        let (connection, incoming) =
+            AcpJsonRpcConnection::spawn(stdout, stdin, stderr, AcpConnectionConfig::default());
+        let runtime = GrokSessionRuntime::new(
+            GrokSessionOptions {
+                thread_id: "grok-thread".to_owned(),
+                cwd: "/workspace".to_owned(),
+                mcp_servers: Vec::new(),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+            },
+            connection,
+            incoming,
+        );
+        runtime
+            .inner
+            .provider_session_id
+            .try_lock()
+            .expect("fresh provider session lock")
+            .replace("grok-session".to_owned());
+        let mut requests = BufReader::new(stdin_peer).lines();
+        let turn_id = runtime
+            .send_turn(Some("hello"), Vec::new())
+            .await
+            .expect("session prompt should start");
+        let request: Value = serde_json::from_str(
+            &requests
+                .next_line()
+                .await
+                .expect("request read")
+                .expect("session prompt request"),
+        )
+        .expect("valid JSON-RPC request");
+        // Holding the event counter parks the incoming handler on the first chunk, so the
+        // prompt response is routed while the second chunk still waits in the queue.
+        let held = runtime.inner.event_counter.lock().await;
+        let chunk = |text: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"grok-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"{text}\"}}}}}}}}\n"
+            )
+        };
+        responses
+            .write_all(
+                format!(
+                    "{}{}{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n",
+                    chunk("first"),
+                    chunk("second"),
+                    request["id"]
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("provider output write");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let events = timeout(Duration::from_secs(2), runtime.collect_events(4))
+            .await
+            .expect("four events");
+        let seen: Vec<(&str, Option<&str>, Option<&str>)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.turn_id.as_deref(),
+                    event.payload["delta"].as_str(),
+                )
+            })
+            .collect();
+        let turn = Some(turn_id.as_str());
+        assert_eq!(
+            seen,
+            [
+                ("turn.started", turn, None),
+                ("content.delta", turn, Some("first")),
+                ("content.delta", turn, Some("second")),
+                ("turn.completed", turn, None),
+            ]
+        );
+    }
 
     #[test]
     fn option_lookup_requires_matching_kind_and_string_identifier() {
