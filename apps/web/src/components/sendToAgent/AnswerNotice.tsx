@@ -17,6 +17,7 @@ import { useCenterSurfaceVisible } from "../centerSurfaceVisibility";
 import { Button } from "../ui/button";
 import { PermissionButton } from "../ui/permission-button";
 import { describeRequestRow } from "./SendRequestRow";
+import { useSendTargetOpener, type OpenSendTarget } from "./useSendTargetOpener";
 
 export const ANSWER_READ_FAILED = "BiBCode could not read the answer. Try again.";
 const BRING_BACK_DESCRIPTION = "Put the answer in this composer as a draft";
@@ -27,7 +28,7 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
   request: SendRequest;
   /** The panel the request was sent from: where the answer is drafted. */
   hostRef: ScopedThreadRef;
-  onOpen: (target: ScopedThreadRef) => void;
+  onOpen: OpenSendTarget;
   onDismiss: (requestId: string) => Promise<void>;
   /** A terminal source has no composer to draft into: it receives the quoted answer instead. */
   onBringBack?: (text: string) => void;
@@ -40,6 +41,7 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
   );
   const title = useThreadShell(targetRef)?.title.trim() || null;
   const view = describeRequestRow(request, title);
+  const open = useSendTargetOpener(hostRef.environmentId, request, targetRef, onOpen);
   const getAnswer = useGetAnswer(hostRef.environmentId);
   const markOpened = useSendRequestOpenedStore((state) => state.markOpened);
   const [phase, setPhase] = useState<"idle" | "reading" | "failed" | "dismissing">("idle");
@@ -117,7 +119,7 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
           </PermissionButton>
         ) : null}
         {view.canOpen ? (
-          <Button size="xs" variant="ghost" onClick={() => onOpen(targetRef)}>
+          <Button size="xs" variant="ghost" onClick={open}>
             Open
           </Button>
         ) : null}

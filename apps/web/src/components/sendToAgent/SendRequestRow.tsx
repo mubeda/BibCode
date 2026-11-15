@@ -6,18 +6,13 @@
  * announced without moving focus.
  */
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import type {
-  EnvironmentId,
-  ScopedThreadRef,
-  SendRequest,
-  SendRequestReason,
-  ThreadId,
-} from "@bibcode/contracts";
+import type { EnvironmentId, SendRequest, SendRequestReason, ThreadId } from "@bibcode/contracts";
 import { memo, useMemo, useState, type ReactNode } from "react";
 
 import { useThreadShell } from "~/state/entities";
 import type { SendOutcome } from "~/state/sendRequests";
 import { Button } from "../ui/button";
+import { useSendTargetOpener, type OpenSendTarget } from "./useSendTargetOpener";
 
 export interface RequestRowView {
   readonly text: string;
@@ -117,7 +112,7 @@ export function describeRowActionFailure(
 export interface SendRequestRowsProps {
   environmentId: EnvironmentId;
   requests: ReadonlyArray<SendRequest>;
-  onOpen: (target: ScopedThreadRef) => void;
+  onOpen: OpenSendTarget;
   onCancel: (requestId: string) => Promise<void>;
   onDismiss: (requestId: string) => Promise<void>;
   renderAnswer?: (request: SendRequest) => ReactNode;
@@ -153,7 +148,7 @@ export const SendRequestRows = memo(function SendRequestRows(props: SendRequestR
 const SendRequestRow = memo(function SendRequestRow(props: {
   environmentId: EnvironmentId;
   request: SendRequest;
-  onOpen: (target: ScopedThreadRef) => void;
+  onOpen: OpenSendTarget;
   onCancel: (requestId: string) => Promise<void>;
   onDismiss: (requestId: string) => Promise<void>;
 }) {
@@ -164,6 +159,7 @@ const SendRequestRow = memo(function SendRequestRow(props: {
   );
   const title = useThreadShell(targetRef)?.title.trim() || null;
   const view = describeRequestRow(request, title);
+  const open = useSendTargetOpener(environmentId, request, targetRef, props.onOpen);
   const [busy, setBusy] = useState<"cancel" | "dismiss" | null>(null);
   if (!view.showRow) return null;
   const run = async (kind: "cancel" | "dismiss", action: (id: string) => Promise<void>) => {
@@ -181,7 +177,7 @@ const SendRequestRow = memo(function SendRequestRow(props: {
     >
       <span className="min-w-0 flex-1 truncate">{view.text}</span>
       {view.canOpen ? (
-        <Button size="xs" variant="ghost" onClick={() => props.onOpen(targetRef)}>
+        <Button size="xs" variant="ghost" onClick={open}>
           Open
         </Button>
       ) : null}

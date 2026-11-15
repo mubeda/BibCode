@@ -16,6 +16,7 @@ import {
   createCenterPanelLayoutState,
   dropCenterPanelSurface,
   findCenterPanelGroup,
+  findCenterPanelGroupForSurface,
   insertCenterPanelSurface,
   mergeCenterPanelGroup,
   removeCenterPanelSurfaceIds,
@@ -1014,4 +1015,18 @@ export function selectActiveCenterSurface(
   ref: ScopedThreadRef | null | undefined,
 ): CenterSurface | null {
   return selectFocusedCenterSurface(selectThreadCenterPanelState(byThreadKey, ref));
+}
+
+/** Shows an AI Terminal in its host thread's center panel, focusing it when it is already open. */
+export function revealTerminalSurface(ref: ScopedThreadRef, terminalId: string): void {
+  const store = useCenterPanelStore.getState();
+  const surfaceId = `terminal:${terminalId}`;
+  const state = store.byThreadKey[scopedThreadKey(ref)];
+  const group = state === undefined ? undefined : findCenterPanelGroupForSurface(state, surfaceId);
+  if (group === undefined) {
+    store.openTerminalPanel(ref, terminalId);
+    return;
+  }
+  store.activateSurface(ref, group.id, surfaceId);
+  store.focusGroup(ref, group.id);
 }

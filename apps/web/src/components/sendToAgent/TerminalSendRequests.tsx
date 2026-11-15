@@ -13,6 +13,7 @@ import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { AnswerNotice } from "./AnswerNotice";
 import { describeRequestRow, SendRequestRows } from "./SendRequestRow";
+import type { OpenSendTarget } from "./useSendTargetOpener";
 
 export function terminalRequestsLabel(requests: ReadonlyArray<SendRequest>): string {
   const answers = requests.filter((request) => request.state === "answered").length;
@@ -26,7 +27,7 @@ export const TerminalSendRequests = memo(function TerminalSendRequests(props: {
   readonly threadRef: ScopedThreadRef;
   /** This terminal's requests. */
   readonly requests: ReadonlyArray<SendRequest>;
-  readonly onOpen: (target: ScopedThreadRef) => void;
+  readonly onOpen: OpenSendTarget;
   readonly onCancel: (requestId: string) => Promise<void>;
   readonly onDismiss: (requestId: string) => Promise<void>;
   readonly onBringBack: (text: string) => void;

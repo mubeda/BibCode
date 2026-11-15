@@ -38,6 +38,7 @@ import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { selectRowsForTerminal } from "./SendRequestRow";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
 import { TerminalSendRequests } from "./TerminalSendRequests";
+import type { OpenSendTarget } from "./useSendTargetOpener";
 import {
   canNotifyTerminalRow,
   sendChoiceKey,
@@ -70,7 +71,7 @@ export interface TerminalSendToAgentServices {
   /** The content of Review, Message and Take over from; the terminal supplies the other two. */
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
   /** Open the target of a request, as the chat's request rows do. */
-  readonly openSendTarget: (target: ScopedThreadRef) => void;
+  readonly openSendTarget: OpenSendTarget;
   readonly cancelSendRequest: (requestId: string) => Promise<void>;
   readonly dismissSendRequest: (requestId: string) => Promise<void>;
 }

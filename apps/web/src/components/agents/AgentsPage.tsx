@@ -1,4 +1,3 @@
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { ScopedThreadRef } from "@bibcode/contracts";
 import { useRouter } from "@tanstack/react-router";
 import {
@@ -10,8 +9,7 @@ import {
 } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
-import { findCenterPanelGroupForSurface } from "../../centerPanelLayout";
-import { useCenterPanelStore } from "../../centerPanelStore";
+import { revealTerminalSurface } from "../../centerPanelStore";
 import { cn } from "../../lib/utils";
 import { ChatRouteInset } from "../../routes/-ChatRouteInset";
 import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorkspaceMetaStore";
@@ -48,20 +46,6 @@ const GROUP_BY_LABELS: Record<AgentsGroupByMode, string> = {
 
 function isAgentsGroupByMode(value: string | null): value is AgentsGroupByMode {
   return value === "status" || value === "project" || value === "environment";
-}
-
-/** Shows an AI Terminal row's terminal in its host thread's center panel. */
-function revealTerminalSurface(ref: ScopedThreadRef, terminalId: string): void {
-  const store = useCenterPanelStore.getState();
-  const surfaceId = `terminal:${terminalId}`;
-  const state = store.byThreadKey[scopedThreadKey(ref)];
-  const group = state === undefined ? undefined : findCenterPanelGroupForSurface(state, surfaceId);
-  if (group === undefined) {
-    store.openTerminalPanel(ref, terminalId);
-    return;
-  }
-  store.activateSurface(ref, group.id, surfaceId);
-  store.focusGroup(ref, group.id);
 }
 
 export function AgentsPage() {
