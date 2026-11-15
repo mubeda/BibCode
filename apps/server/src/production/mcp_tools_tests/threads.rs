@@ -112,6 +112,68 @@ async fn a_wait_on_an_older_message_returns_its_own_turn_and_reply() {
 }
 
 #[tokio::test]
+async fn a_wait_does_not_settle_while_the_completed_turns_reply_still_streams() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, message_id) = start(&harness, &agent, basic_start()).await;
+    harness
+        .provider_turn(&thread_id, "turn-1", "The first half", false)
+        .await;
+    // The turn completes while its reply still streams.
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.session.set", "commandId": "session-turn-1-ready", "threadId": thread_id,
+            "session": {
+                "threadId": thread_id, "status": "ready", "providerName": "codex",
+                "providerInstanceId": "codex", "runtimeMode": "full-access",
+                "activeTurnId": null, "lastError": null, "updatedAt": CREATED_AT,
+            },
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("session ready");
+    for arguments in [
+        json!({ "threadId": thread_id, "messageId": message_id, "timeoutMs": 300 }),
+        json!({ "threadId": thread_id, "timeoutMs": 300 }),
+    ] {
+        let waited = harness.call(&agent, "wait_for_thread", arguments).await;
+        let waited = structured(&waited);
+        assert_eq!(waited["settled"], false, "{waited}");
+        assert_eq!(waited["timedOut"], true, "{waited}");
+    }
+    for value in [
+        json!({
+            "type": "thread.message.assistant.delta", "commandId": "delta-turn-1-rest",
+            "threadId": thread_id, "messageId": "reply-turn-1", "delta": " and the rest.",
+            "turnId": "turn-1", "createdAt": CREATED_AT,
+        }),
+        json!({
+            "type": "thread.message.assistant.complete", "commandId": "complete-turn-1",
+            "threadId": thread_id, "messageId": "reply-turn-1",
+            "turnId": "turn-1", "createdAt": CREATED_AT,
+        }),
+    ] {
+        harness
+            .engine
+            .dispatch(command(value))
+            .await
+            .expect("reply event");
+    }
+    let waited = harness
+        .call(
+            &agent,
+            "wait_for_thread",
+            json!({ "threadId": thread_id, "messageId": message_id, "timeoutMs": 1_000 }),
+        )
+        .await;
+    let waited = structured(&waited);
+    assert_eq!(waited["settled"], true, "{waited}");
+    assert_eq!(waited["reply"]["text"], "The first half and the rest.");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_timed_out_or_cancelled_wait_leaves_work_running_and_releases_its_receiver() {
     let harness = Harness::new().await;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
