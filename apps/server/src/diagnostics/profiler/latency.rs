@@ -513,6 +513,12 @@ impl LatencyBook {
 }
 
 impl LatencyBook {
+    /// The `rpc.histogram` payloads of the current slot: every timing recorded in it.
+    #[cfg(test)]
+    pub(crate) fn histograms_for_test(&self) -> Vec<Value> {
+        self.histograms(now_secs() / SLOT_SECS)
+    }
+
     #[cfg(test)]
     pub(crate) fn outbound_bytes_for_test(&self, key: u64) -> Vec<Value> {
         self.outbound_bytes(key)
@@ -892,7 +898,7 @@ pub(crate) fn in_flight(method: &str) -> bool {
 }
 
 /// The gate every request hook checks first.
-fn profiling() -> bool {
+pub(crate) fn profiling() -> bool {
     #[cfg(test)]
     if let Some(pinned) = PINNED.with(std::cell::Cell::get) {
         return pinned;

@@ -309,6 +309,20 @@ impl TerminalPointer {
         &self.terminals
     }
 
+    /// The driver the AI Terminal's agent runs on (`codex`, `claudeAgent`, ...); empty for a
+    /// plain shell or a terminal that is gone.
+    pub(crate) async fn terminal_driver(&self, thread_id: &str, terminal_id: &str) -> String {
+        self.terminals
+            .thread_sessions(thread_id)
+            .await
+            .into_iter()
+            .find(|summary| summary.terminal_id == terminal_id)
+            .and_then(|summary| summary.command)
+            .and_then(|command| command.activity)
+            .map(|activity| activity.driver_kind)
+            .unwrap_or_default()
+    }
+
     /// Stores `new` in `recipient`'s mailbox: one row bound to its generation, with no turn
     /// queue entry. An agent's message obeys the mode ceiling (the terminal receives as
     /// `full-access`) and the rate and backlog limits, and is held while messaging is off; a
@@ -844,6 +858,10 @@ impl TerminalPointer {
                 };
             }
         }
+        let recipient_provider = messaging
+            .sender_description(&identity.address())
+            .await
+            .provider;
         let mut entries = Vec::with_capacity(consumed.len());
         for message in &consumed {
             // A person's request is stored as it reads, in its own envelope with BiBCode's
@@ -865,6 +883,7 @@ impl TerminalPointer {
                 rendered: build_envelope(&EnvelopeInput {
                     sender_title: label,
                     provider: &sender.provider,
+                    recipient_provider: &recipient_provider,
                     sender_address: &message.sender_address,
                     message_id: &message.message_id,
                     conversation_id: &message.conversation_id,
@@ -915,7 +934,9 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        agent_messaging::{MessageReceipt, SendRequest, delivery::AgentMessageTracker},
+        agent_messaging::{
+            AgentCaller, MessageReceipt, ReplyRequest, SendRequest, delivery::AgentMessageTracker,
+        },
         orchestration::OrchestrationCommand,
         production::mcp_tools_tests::Harness,
         terminal::{
@@ -975,6 +996,18 @@ pub(crate) mod tests {
                 live_park: StdMutex::new(None),
                 guard_park: StdMutex::new(None),
             })
+        }
+
+        /// Makes the terminal's agent run on `driver`.
+        pub(crate) fn set_driver(&self, thread_id: &str, terminal_id: &str, driver: &'static str) {
+            if let Some(terminal) = self
+                .terminals
+                .lock()
+                .unwrap()
+                .get_mut(&key(thread_id, terminal_id))
+            {
+                terminal.driver = driver;
+            }
         }
 
         /// A running Claude AI Terminal (a plain shell when `ai` is false), not ready.
@@ -1449,6 +1482,7 @@ pub(crate) mod tests {
                         sender_runtime_mode: (sender_kind == SenderKind::Agent)
                             .then(|| "full-access".to_owned()),
                         recipient_terminal_generation: None,
+                        sender_terminal_generation: None,
                         send_request_id: None,
                         client_request_id: None,
                         delivery_command_id: None,
@@ -1785,6 +1819,7 @@ pub(crate) mod tests {
             accepted_at: crate::mcp::control::now_iso(),
             sender_runtime_mode: Some(mode.to_owned()),
             recipient_terminal_generation: Some(generation_key.to_owned()),
+            sender_terminal_generation: None,
             send_request_id: None,
             client_request_id: None,
             delivery_command_id: None,
@@ -1829,6 +1864,7 @@ pub(crate) mod tests {
             super::super::envelope::build_envelope(&super::super::envelope::EnvelopeInput {
                 sender_title: "Sender thread",
                 provider: "codex",
+                recipient_provider: "claudeAgent",
                 sender_address: "thread:a",
                 message_id: &receipt.message_id,
                 conversation_id: &receipt.conversation_id,
@@ -1841,6 +1877,40 @@ pub(crate) mod tests {
             AgentMessageStatus::Consumed
         );
         assert!(fixture.inbox("term-1").await.is_empty());
+        fixture.shutdown().await;
+    }
+
+    /// A Codex AI Terminal reads no bare `$name` skill mention in its inbox; the stored message
+    /// keeps the text.
+    #[tokio::test]
+    async fn a_codex_terminals_inbox_carries_no_bare_skill_mention() {
+        let fixture = fixture().await;
+        fixture.terminals.set_driver("t", "term-1", "codex");
+        let receipt = fixture
+            .messaging
+            .send(
+                "a",
+                SendRequest {
+                    to: "terminal:t/term-1".to_owned(),
+                    text: "Use $deploy-skill for it.".to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let entries = fixture.inbox("term-1").await;
+        assert_eq!(ids(&entries), [receipt.message_id.as_str()]);
+        assert!(
+            entries[0]
+                .rendered
+                .contains("\n  Use $\u{200B}deploy-skill for it.\n"),
+            "{:?}",
+            entries[0].rendered
+        );
+        assert_eq!(
+            fixture.row(&receipt.message_id).await.text,
+            "Use $deploy-skill for it."
+        );
         fixture.shutdown().await;
     }
 
@@ -2496,6 +2566,193 @@ pub(crate) mod tests {
             .await;
         assert_eq!(fixture.terminals.writes("t", "term-1").len(), 1);
         tracker.cancel();
+        fixture.shutdown().await;
+    }
+
+    /// A message a terminal sent belongs to the generation that sent it: a restarted terminal
+    /// at the same address can neither read its status nor cancel it.
+    #[tokio::test]
+    async fn a_restarted_terminal_cannot_read_or_cancel_its_predecessors_message() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let old = AgentCaller::Terminal(fixture.identity("term-1"));
+        let receipt = fixture
+            .messaging
+            .send_as(
+                &old,
+                SendRequest {
+                    to: "terminal:t/term-2".to_owned(),
+                    text: BODY.to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .row(&receipt.message_id)
+                .await
+                .sender_terminal_generation
+                .as_deref(),
+            Some("boot-1:1"),
+            "the row keeps the generation that sent it"
+        );
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let new = AgentCaller::Terminal(fixture.identity("term-1"));
+        assert!(matches!(
+            fixture.messaging.status_as(&new, &receipt.message_id).await,
+            Err(AgentMessagingError::UnknownMessage)
+        ));
+        assert!(matches!(
+            fixture.messaging.cancel_as(&new, &receipt.message_id).await,
+            Err(AgentMessagingError::UnknownMessage)
+        ));
+        assert!(
+            fixture
+                .messaging
+                .status_as(&old, &receipt.message_id)
+                .await
+                .is_ok(),
+            "the sending generation still reads it"
+        );
+        fixture.shutdown().await;
+    }
+
+    /// After a server restart (a new pointer and messaging over the same store, and a terminal
+    /// relaunched under a new boot id at the same address), the stored row keeps the generation
+    /// that sent it and the new terminal cannot read it.
+    #[tokio::test]
+    async fn a_terminal_after_a_server_restart_cannot_read_messages_sent_before_it() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let old = AgentCaller::Terminal(fixture.identity("term-1"));
+        let receipt = fixture
+            .messaging
+            .send_as(
+                &old,
+                SendRequest {
+                    to: "terminal:t/term-2".to_owned(),
+                    text: BODY.to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        fixture.stop.cancel();
+        let terminals = Scripted::new();
+        terminals.add("t", "term-1", 1, true);
+        terminals.change("t", "term-1", |terminal| {
+            terminal.generation = Some(TerminalGeneration {
+                boot: "boot-2".to_owned(),
+                process: 1,
+            });
+        });
+        let pointer = TerminalPointer::new(
+            fixture.harness.engine.repositories().database().clone(),
+            terminals.clone(),
+        );
+        let restarted = AgentMessaging::new(fixture.harness.engine.clone(), watch::channel(true).1)
+            .with_terminals(pointer);
+        let relaunched = AgentCaller::Terminal(TerminalIdentity {
+            environment_id: "local".to_owned(),
+            thread_id: "t".to_owned(),
+            terminal_id: "term-1".to_owned(),
+            generation: TerminalGeneration {
+                boot: "boot-2".to_owned(),
+                process: 1,
+            },
+        });
+        assert_eq!(
+            fixture
+                .row(&receipt.message_id)
+                .await
+                .sender_terminal_generation
+                .as_deref(),
+            Some("boot-1:1")
+        );
+        assert!(matches!(
+            restarted.status_as(&relaunched, &receipt.message_id).await,
+            Err(AgentMessagingError::UnknownMessage)
+        ));
+        assert!(matches!(
+            restarted.cancel_as(&relaunched, &receipt.message_id).await,
+            Err(AgentMessagingError::UnknownMessage)
+        ));
+        fixture.shutdown().await;
+    }
+
+    /// A retry with the same request id answers from the stored message only within the
+    /// generation that sent it: a restarted terminal's same request is a new message, so its
+    /// receipt never names the predecessor's message.
+    #[tokio::test]
+    async fn a_restarted_terminals_retry_is_a_new_message_not_its_predecessors_receipt() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let request = || SendRequest {
+            to: "terminal:t/term-2".to_owned(),
+            text: BODY.to_owned(),
+            client_request_id: Some("retry-1".to_owned()),
+        };
+        let old = AgentCaller::Terminal(fixture.identity("term-1"));
+        let first = fixture.messaging.send_as(&old, request()).await.unwrap();
+        let replayed = fixture.messaging.send_as(&old, request()).await.unwrap();
+        assert_eq!(
+            replayed.message_id, first.message_id,
+            "same generation replays"
+        );
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let new = AgentCaller::Terminal(fixture.identity("term-1"));
+        let fresh = fixture.messaging.send_as(&new, request()).await.unwrap();
+        assert_ne!(fresh.message_id, first.message_id, "{fresh:?}");
+        assert_ne!(fresh.conversation_id, first.conversation_id, "{fresh:?}");
+        let again = fixture.messaging.send_as(&new, request()).await.unwrap();
+        assert_eq!(
+            again.message_id, fresh.message_id,
+            "the new generation replays its own"
+        );
+        fixture.shutdown().await;
+    }
+
+    /// A reply to a terminal's message after that terminal restarted ends like mail for an
+    /// ended generation, and never reaches the new generation's mailbox.
+    #[tokio::test]
+    async fn a_reply_to_an_ended_terminal_generation_never_reaches_the_new_one() {
+        let fixture = fixture().await;
+        fixture.terminals.add("t", "term-2", 1, true);
+        let old = AgentCaller::Terminal(fixture.identity("term-1"));
+        let receipt = fixture
+            .messaging
+            .send_as(
+                &old,
+                SendRequest {
+                    to: "terminal:t/term-2".to_owned(),
+                    text: BODY.to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&fixture.inbox("term-2").await),
+            [receipt.message_id.as_str()]
+        );
+        fixture.terminals.set_generation("t", "term-1", Some(2));
+        let reply = fixture
+            .messaging
+            .reply_as(
+                &AgentCaller::Terminal(fixture.identity("term-2")),
+                ReplyRequest {
+                    in_reply_to: receipt.message_id.clone(),
+                    text: "Done.".to_owned(),
+                    client_request_id: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(reply, Err(AgentMessagingError::RecipientGone)),
+            "{reply:?}"
+        );
+        assert!(fixture.inbox("term-1").await.is_empty());
         fixture.shutdown().await;
     }
 

@@ -250,6 +250,8 @@ struct Sender {
     title: String,
     provider: String,
     mode: String,
+    /// The generation of a terminal sender; `None` for a chat agent.
+    generation: Option<String>,
 }
 
 /// Where a send or reply goes.
@@ -462,12 +464,23 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         let receipt = match self
-            .replay(&caller.address(), &original.sender_address, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &original.sender_address,
+                &outgoing,
+            )
             .await?
         {
             Some(receipt) => receipt,
             None => match self
-                .deliver_to(caller, &recipient, outgoing, attribution)
+                .deliver_to(
+                    caller,
+                    &recipient,
+                    original.sender_terminal_generation.as_deref(),
+                    outgoing,
+                    attribution,
+                )
                 .await
             {
                 Err(AgentMessagingError::UnknownRecipient) => {
@@ -512,7 +525,12 @@ impl AgentMessaging {
         };
         let _exclusive = pointer.exclusive(&original.recipient_address).await;
         if let Some(receipt) = self
-            .replay(&caller.address(), &original.sender_address, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &original.sender_address,
+                &outgoing,
+            )
             .await?
         {
             return Ok(receipt);
@@ -532,6 +550,7 @@ impl AgentMessaging {
             accepted_at: now.clone(),
             sender_runtime_mode: None,
             recipient_terminal_generation: None,
+            sender_terminal_generation: caller.terminal_generation(),
             send_request_id: original.send_request_id.clone(),
             client_request_id: request.client_request_id.clone(),
             delivery_command_id: None,
@@ -671,12 +690,17 @@ impl AgentMessaging {
         };
         // A stored receipt answers a retry even after its recipient is gone (R12).
         if let Some(receipt) = self
-            .replay(&caller.address(), &request.to, &outgoing)
+            .replay(
+                &caller.address(),
+                caller.terminal_generation().as_deref(),
+                &request.to,
+                &outgoing,
+            )
             .await?
         {
             return Ok(receipt);
         }
-        self.deliver_to(caller, &recipient, outgoing, attribution)
+        self.deliver_to(caller, &recipient, None, outgoing, attribution)
             .await
     }
 
@@ -686,6 +710,7 @@ impl AgentMessaging {
         &self,
         caller: &AgentCaller,
         recipient: &Recipient,
+        terminal_generation: Option<&str>,
         outgoing: Outgoing<'_>,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
@@ -701,8 +726,15 @@ impl AgentMessaging {
                 self.deliver(&route, &sender, outgoing).await
             }
             Recipient::Terminal { owner, terminal } => {
-                self.deliver_to_terminal(caller, owner, terminal, outgoing, attribution)
-                    .await
+                self.deliver_to_terminal(
+                    caller,
+                    owner,
+                    terminal,
+                    terminal_generation,
+                    outgoing,
+                    attribution,
+                )
+                .await
             }
         }
     }
@@ -715,6 +747,7 @@ impl AgentMessaging {
                 title: route.sender.title.clone(),
                 provider: route.sender_provider.clone(),
                 mode: route.sender.runtime_mode.clone(),
+                generation: None,
             },
             AgentCaller::Terminal(identity) => {
                 let address = identity.address();
@@ -724,6 +757,7 @@ impl AgentMessaging {
                     title: description.title,
                     provider: description.provider,
                     mode: route.sender.runtime_mode.clone(),
+                    generation: Some(identity.generation_key()),
                 }
             }
         }
@@ -831,9 +865,24 @@ impl AgentMessaging {
             "" => "Agent".to_owned(),
             title => title.to_owned(),
         };
+        // A session names its driver. A recipient that never started resolves its instance's
+        // driver as a turn start does, so a custom Codex instance is a Codex recipient too.
+        let recipient_provider = match route
+            .session
+            .as_ref()
+            .and_then(|session| session.provider_name.clone())
+        {
+            Some(provider) => provider,
+            None => starter
+                .provider_kind(&route.recipient.model_selection)
+                .await
+                .unwrap_or_default()
+                .to_owned(),
+        };
         let envelope = build_envelope(&EnvelopeInput {
             sender_title: &label,
             provider: &sender.provider,
+            recipient_provider: &recipient_provider,
             sender_address: &sender_address,
             message_id: outgoing.message_id,
             conversation_id: outgoing.conversation_id,
@@ -895,6 +944,7 @@ impl AgentMessaging {
                     accepted_at: now.clone(),
                     sender_runtime_mode: Some(sender_mode.clone()),
                     recipient_terminal_generation: None,
+                    sender_terminal_generation: sender.generation.clone(),
                     send_request_id: None,
                     client_request_id: outgoing.client_request_id.map(str::to_owned),
                     delivery_command_id: Some(command_id.clone()),
@@ -965,7 +1015,12 @@ impl AgentMessaging {
             // Another call with the same id won the unique index, or took the last slot of a
             // limit first: answer from its row.
             return match self
-                .replay(&sender_address, &recipient_address, &outgoing)
+                .replay(
+                    &sender_address,
+                    sender.generation.as_deref(),
+                    &recipient_address,
+                    &outgoing,
+                )
                 .await?
             {
                 Some(receipt) => Ok(receipt),
@@ -1003,19 +1058,29 @@ impl AgentMessaging {
     async fn replay(
         &self,
         sender_address: &str,
+        sender_generation: Option<&str>,
         recipient_address: &str,
         outgoing: &Outgoing<'_>,
     ) -> Result<Option<MessageReceipt>, AgentMessagingError> {
         let Some(client_request_id) = outgoing.client_request_id else {
             return Ok(None);
         };
-        let (sender, client_request_id) = (sender_address.to_owned(), client_request_id.to_owned());
+        let (sender, generation, client_request_id) = (
+            sender_address.to_owned(),
+            sender_generation.map(str::to_owned),
+            client_request_id.to_owned(),
+        );
         let stored = self
             .engine
             .repositories()
             .database()
             .call(move |connection| {
-                store::find_by_client_request(connection, &sender, &client_request_id)
+                store::find_by_client_request(
+                    connection,
+                    &sender,
+                    generation.as_deref(),
+                    &client_request_id,
+                )
             })
             .await
             .map_err(|error| {
@@ -1204,6 +1269,14 @@ impl AgentCaller {
         }
     }
 
+    /// The generation of a terminal caller, as a message row stores it; `None` for a chat agent.
+    pub(crate) fn terminal_generation(&self) -> Option<String> {
+        match self {
+            Self::Thread(_) => None,
+            Self::Terminal(identity) => Some(identity.generation_key()),
+        }
+    }
+
     /// The thread whose project and runtime mode the caller has: a terminal's host thread.
     pub(crate) fn owner_thread_id(&self) -> &str {
         match self {
@@ -1311,6 +1384,7 @@ impl AgentMessaging {
         caller: &AgentCaller,
         owner_thread_id: &str,
         terminal_id: &str,
+        expected_generation: Option<&str>,
         outgoing: Outgoing<'_>,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
@@ -1344,6 +1418,12 @@ impl AgentMessaging {
             terminal_id: terminal_id.to_owned(),
             generation,
         };
+        // A reply goes to the generation that sent the message replied to. Another generation
+        // at the same address is not that sender, so the reply is refused as for an ended
+        // terminal. A generation that ends after this check ends the stored row in `accept`.
+        if expected_generation.is_some_and(|expected| expected != recipient.generation_key()) {
+            return Err(AgentMessagingError::UnknownRecipient);
+        }
         let recipient_address = recipient.address();
         let new = NewAgentMessage {
             message_id: outgoing.message_id.to_owned(),
@@ -1359,6 +1439,7 @@ impl AgentMessaging {
             accepted_at: crate::mcp::control::now_iso(),
             sender_runtime_mode: Some(sender.mode),
             recipient_terminal_generation: None,
+            sender_terminal_generation: sender.generation.clone(),
             send_request_id: None,
             client_request_id: outgoing.client_request_id.map(str::to_owned),
             delivery_command_id: None,
@@ -1367,7 +1448,12 @@ impl AgentMessaging {
         if let Err(error) = pointer.accept(self, new, &recipient).await {
             // Another call with the same id won the unique index first: answer from its row.
             return match self
-                .replay(&sender.address, &recipient_address, &outgoing)
+                .replay(
+                    &sender.address,
+                    sender.generation.as_deref(),
+                    &recipient_address,
+                    &outgoing,
+                )
                 .await?
             {
                 Some(receipt) => Ok(receipt),
@@ -1390,8 +1476,12 @@ impl AgentMessaging {
 
 /// `message` is an agent message `caller` sent. A person's request carries its source agent's
 /// address as its sender, but that agent never sent it, so it may neither see nor cancel it.
+/// `message` was sent by `caller`: by its thread, or by the terminal generation that sent it, so
+/// a restarted terminal at the same address reads and cancels none of its predecessor's mail.
 fn is_sent_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
-    message.sender_kind == SenderKind::Agent && message.sender_address == caller.address()
+    message.sender_kind == SenderKind::Agent
+        && message.sender_address == caller.address()
+        && message.sender_terminal_generation == caller.terminal_generation()
 }
 
 /// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it

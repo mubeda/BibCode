@@ -1636,6 +1636,62 @@ async fn state_a_delivery_that_fails_is_not_answered() {
     harness.shutdown().await;
 }
 
+/// Restart recovery found the request at an idle provider but no turn of it, so BiBCode stopped
+/// before it recorded the answer: the request ends instead of reading queued forever.
+#[tokio::test]
+async fn state_a_delivery_recovered_without_its_turn_is_not_answered() {
+    use crate::orchestration::delivery::{
+        TurnDeliveryFailureReason, TurnDeliveryState, TurnDeliveryTransition,
+    };
+    let (harness, service, stop) = followed().await;
+    session(&harness, "b", "running").await;
+    send_with(&service, input("r1", "review", "thread:a", "thread:b")).await;
+    let command_id: String = harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE provider_turn_outbox SET state = 'sending', held = 0 WHERE message_id = 'person-send:r1'",
+                [],
+            )?;
+            Ok(connection.query_row(
+                "SELECT command_id FROM provider_turn_outbox WHERE message_id = 'person-send:r1'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    session(&harness, "b", "ready").await;
+    assert!(
+        harness
+            .engine
+            .transition_turn_delivery_with_reason(
+                TurnDeliveryTransition {
+                    turn_id: None,
+                    command_id,
+                    expected_states: vec![TurnDeliveryState::Sending],
+                    expected_attempt: 0,
+                    next_state: TurnDeliveryState::Delivered,
+                    detail: None,
+                    updated_at: "2026-11-15T00:00:00.000000000Z".to_owned(),
+                },
+                Some(TurnDeliveryFailureReason::FoundWithoutTurn),
+            )
+            .await
+            .unwrap(),
+        "the recovery transition applies"
+    );
+
+    service.sweep().await;
+
+    let row = stored_request(&harness, "r1").await;
+    assert_eq!(row.state, SendState::NotAnswered);
+    assert_eq!(row.reason.as_deref(), Some("answer_not_recorded"));
+    stop.cancel();
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn state_an_answer_is_stored_cut_at_48000_characters_with_a_flag() {
     let (harness, service, stop) = followed().await;

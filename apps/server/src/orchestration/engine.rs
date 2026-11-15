@@ -7134,9 +7134,15 @@ async fn persist_turn_delivery_transition(
                 mode = row.mode.as_str().to_owned();
                 transaction.execute("UPDATE provider_turn_outbox SET last_error = ?, failure_reason = NULL WHERE command_id = ?", params![transition.detail, transition.command_id])?;
             } else {
+                // A delivery recovery found without its turn keeps that on the entry, so readers
+                // that wait for its turn (a send request, an agent message) can end instead. The
+                // event's delivery reason, which clients read, does not carry it.
+                let stored_reason = reason.or((found_without_turn
+                    && transition.next_state == TurnDeliveryState::Delivered)
+                    .then(|| TurnDeliveryFailureReason::FoundWithoutTurn.as_str()));
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = ?, last_error = ?, failure_reason = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
-                    params![next_state, transition.detail, reason, transition.updated_at, transition.command_id, state, transition.expected_attempt],
+                    params![next_state, transition.detail, stored_reason, transition.updated_at, transition.command_id, state, transition.expected_attempt],
                 )?;
                 if updated == 0 { return Ok(DeliveryTransitionCommit::Stale); }
                 if unchanged_retry {

@@ -3408,6 +3408,7 @@ mod agent_message {
             accepted_at: TIME.to_owned(),
             sender_runtime_mode: Some("full-access".to_owned()),
             recipient_terminal_generation: None,
+            sender_terminal_generation: None,
             send_request_id: None,
             client_request_id: None,
             delivery_command_id: Some(delivery_command_id.to_owned()),

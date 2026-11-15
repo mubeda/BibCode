@@ -15,7 +15,10 @@ use crate::{
         pointer::{TERMINAL_RECIPIENT_MODE, TerminalPointer},
         terminal_credential::{TerminalIdentity, parse_terminal_address},
     },
-    orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
+    orchestration::{
+        OrchestrationCommand, OrchestrationEngine, TurnDeliveryFailureReason,
+        canonical_command_digest,
+    },
     persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
     production::{
         orchestration_rpc::{ServerActor, ServerCommandDispatcher},
@@ -1709,6 +1712,8 @@ struct TargetView {
     withdrawn: bool,
     /// The engine rejected the request's command.
     rejected: bool,
+    /// Restart recovery found the message at an idle provider but no turn of it.
+    found_without_turn: bool,
 }
 
 #[derive(Debug)]
@@ -1737,7 +1742,7 @@ async fn read_target(
                 .unwrap_or(true);
             let outbox = connection
                 .query_row(
-                    "SELECT state, held, created_at, command_id FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
+                    "SELECT state, held, created_at, command_id, failure_reason FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
                     params![thread_id, message_id],
                     |row| {
                         Ok((
@@ -1745,12 +1750,13 @@ async fn read_target(
                             row.get::<_, bool>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
                 .optional()?;
             let behind_failed = match &outbox {
-                Some((_, _, created_at, delivery_command_id)) => connection.query_row(
+                Some((_, _, created_at, delivery_command_id, _)) => connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state IN ('failed', 'uncertain') AND (created_at, command_id) < (?2, ?3))",
                     params![thread_id, created_at, delivery_command_id],
                     |row| row.get(0),
@@ -1782,9 +1788,15 @@ async fn read_target(
                     },
                 )
                 .optional()?;
+            let found_without_turn = outbox.as_ref().is_some_and(|(state, _, _, _, reason)| {
+                state == "delivered"
+                    && reason.as_deref()
+                        == Some(TurnDeliveryFailureReason::FoundWithoutTurn.as_str())
+            });
             let mut view = TargetView {
                 deleted,
-                outbox: outbox.map(|(state, held, _, _)| (state, held)),
+                outbox: outbox.map(|(state, held, _, _, _)| (state, held)),
+                found_without_turn,
                 session_status,
                 behind_failed,
                 ..TargetView::default()
@@ -1923,6 +1935,8 @@ fn decide(view: TargetView) -> Next {
             next(SendState::Waiting, Some("queue_paused"))
         }
         None if view.rejected => next(SendState::NotAnswered, Some("delivery_failed")),
+        // BiBCode stopped before it recorded the turn, so the answer cannot be read.
+        _ if view.found_without_turn => next(SendState::NotAnswered, Some("answer_not_recorded")),
         _ => next(SendState::Queued, None),
     }
 }

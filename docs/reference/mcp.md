@@ -4870,9 +4870,22 @@ cannot start a provider command, a skill or a file reference. BiBCode decides th
 an agent message from the message row it stored, never from the text, so a person who pastes an
 envelope still sends a person's message. It marks the envelope to Claude as client-composed,
 which stops Claude Code from expanding an `@path` inside it; OpenCode keeps it as one literal
-text part. Codex 0.169.0 still expands a skill named with `$` inside any text input and has no
-input flag that turns that off, and Cursor was not probed: these are known gaps of literal
-delivery.
+text part. Codex 0.169.0 expands a skill named with `$` inside any text input and has no input
+flag that turns that off, so the text a Codex recipient (a chat agent or an AI Terminal) is
+delivered has a zero-width space after each `$` that a letter, a digit, `_` or `-` follows. A
+`$` before a space, other punctuation or the end of the text stays as it is. The same applies to
+the sender's title in the `from` line. A recipient is a Codex recipient when its provider
+instance runs the Codex driver, a custom instance or one that never started included. When at
+least one `$` was changed, the envelope's header carries one more line, before `---`:
+
+```text
+BiBCode: a zero-width space follows each dollar sign in this message, so Codex cannot load a skill from it. Remove it before you run or quote code from this message.
+```
+
+The text is indented after `---`, so it can neither forge nor hide that line. The stored message
+and its status keep the text as written. A person's request keeps its text, and only a source
+title it names is changed, with the same line. Cursor was not probed: that is a known gap of
+literal delivery.
 
 ### The person-request envelope
 
@@ -4910,9 +4923,12 @@ notification, which Claude sends once the prompt has waited for input a while, a
 never send while the person is active in that terminal. The pointer line can arrive late or not at all then; this is an
 accepted limit. `bibcode agent inbox` always works.
 
-A message row keeps no sender generation, so a restarted terminal can read the status of, and
-cancel, the messages its predecessor sent, and a reply to a terminal lands in the process that
-runs now.
+A message a terminal sends keeps the generation that sent it. A restarted terminal at the same
+address can neither read the status of nor cancel its predecessor's messages: it gets
+`AgentMessagingUnknownMessageError`, as for a message it never sent. A reply to a message whose
+terminal sender has since restarted or exited is refused with `AgentMessagingRecipientGoneError`
+and never reaches the new process. The hop ledger and the rate and backlog limits still count
+per address.
 
 ### Errors of the provider tools
 

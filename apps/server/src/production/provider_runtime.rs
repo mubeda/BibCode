@@ -4700,6 +4700,7 @@ mod workspace_loss_tests {
         let text = envelope::build_envelope(&envelope::EnvelopeInput {
             sender_title: "Sender",
             provider: "codex",
+            recipient_provider: "",
             sender_address: "thread:sender",
             message_id: "a1",
             conversation_id: "c1",
@@ -4727,6 +4728,7 @@ mod workspace_loss_tests {
                         accepted_at: BEFORE_LOSS.to_owned(),
                         sender_runtime_mode: None,
                         recipient_terminal_generation: None,
+                        sender_terminal_generation: None,
                         send_request_id: None,
                         client_request_id: None,
                         delivery_command_id: Some("agent-turn".to_owned()),
@@ -33990,6 +33992,7 @@ done
                 &crate::agent_messaging::envelope::EnvelopeInput {
                     sender_title: "Sender",
                     provider: "codex",
+                    recipient_provider: "",
                     sender_address: "thread:sender",
                     message_id: "message-1",
                     conversation_id: "conversation-1",
@@ -34431,6 +34434,7 @@ done
                         accepted_at: "2026-11-14T00:00:00Z".to_owned(),
                         sender_runtime_mode: None,
                         recipient_terminal_generation: None,
+                        sender_terminal_generation: None,
                         send_request_id: None,
                         client_request_id: None,
                         delivery_command_id: Some("agent-message:a1".to_owned()),

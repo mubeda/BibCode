@@ -53,6 +53,7 @@ export const SendRequestReason = Schema.Literals([
   "target_deleted",
   "no_answer",
   "recipient_gone",
+  "answer_not_recorded",
 ]);
 export type SendRequestReason = typeof SendRequestReason.Type;
 

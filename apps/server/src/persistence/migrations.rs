@@ -3094,7 +3094,8 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
           delivery_command_id TEXT,
           delivery_message_id TEXT,
           updated_at TEXT NOT NULL,
-          recipient_turn_id TEXT
+          recipient_turn_id TEXT,
+          sender_terminal_generation TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_recipient_status
           ON agent_messages (recipient_address, status, accepted_at, message_id);
@@ -3107,7 +3108,7 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agent_messages_delivery_command
           ON agent_messages (delivery_command_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_client_request
-          ON agent_messages (sender_address, client_request_id)
+          ON agent_messages (sender_address, COALESCE(sender_terminal_generation, ''), client_request_id)
           WHERE client_request_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_agent_messages_terminal_pending
           ON agent_messages (status, recipient_address, recipient_terminal_generation)
@@ -3871,6 +3872,7 @@ mod tests {
                 "delivery_message_id",
                 "updated_at",
                 "recipient_turn_id",
+                "sender_terminal_generation",
             ]
         );
         assert_eq!(

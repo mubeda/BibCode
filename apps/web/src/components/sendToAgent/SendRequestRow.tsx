@@ -35,6 +35,7 @@ const REASON_COPY: Record<SendRequestReason, string> = {
   target_deleted: "the agent was deleted",
   no_answer: "it finished without an answer",
   recipient_gone: "the terminal closed",
+  answer_not_recorded: "BiBCode stopped before it could record the answer",
 };
 
 const KEEPS_ROW_AFTER_READ = new Set<SendRequest["action"]>(["review", "second-opinion"]);

@@ -2493,6 +2493,13 @@ bounded memory, and works while the server is stopped.
   supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
+- **Agent route calls.** Each `POST /api/agent/call` from an AI Terminal with a
+  valid credential is timed as `agent.<operation>` (`agent.send`, `agent.inbox` and
+  the rest, `agent.invalid` for a body with no known operation) through the same
+  request timer as an MCP tool call. A refused credential is not timed, as an
+  unauthenticated `/mcp` request is not. The name is built only while the Profiler
+  runs and carries no argument, message text, body or credential. No operation is
+  long-running: each returns at once.
 - **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
   and the hang check). A tool is long-running when its `ToolSpec` says so
   (`mcp.wait_for_thread`, every `mcp.preview_*` and `mcp.device_*` call, network

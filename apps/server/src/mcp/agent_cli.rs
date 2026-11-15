@@ -424,12 +424,34 @@ pub(crate) async fn agent_call_http(
             refusal(&AgentMessagingError::NoIdentity),
         ));
     };
-    let answer = match messaging {
-        None => Err(AgentMessagingError::Disabled),
-        Some(messaging) => {
-            call_as(messaging, &AgentCaller::Terminal(identity.clone()), &body).await
+    let request = parse_call(&body);
+    // Timed like an MCP tool call, as `agent.<operation>`, only for an authenticated caller. The
+    // name is built only while the Profiler runs (the request hooks' gate) and holds no argument.
+    let timing = crate::diagnostics::profiler::latency::profiling().then(|| {
+        let operation = request
+            .as_ref()
+            .map_or("invalid", |(operation, _)| *operation);
+        format!("agent.{operation}")
+    });
+    let timer = timing
+        .as_deref()
+        .and_then(|name| crate::diagnostics::profiler::latency::RequestTimer::unary(name, &[]));
+    let answer = match (messaging, request) {
+        (None, _) => Err(AgentMessagingError::Disabled),
+        (_, Err(error)) => Err(error),
+        (Some(messaging), Ok((operation, arguments))) => {
+            call_as(
+                messaging,
+                &AgentCaller::Terminal(identity.clone()),
+                operation,
+                &arguments,
+            )
+            .await
         }
     };
+    if let (Some(timer), Some(name)) = (timer, timing.as_deref()) {
+        timer.finish(name, if answer.is_ok() { "success" } else { "failure" });
+    }
     let (outcome, answer) = match answer {
         Ok(result) => ("ok", json!({ "ok": true, "result": result })),
         Err(error) => (error.tag(), refusal(&error)),
@@ -443,13 +465,9 @@ pub(crate) async fn agent_call_http(
     Ok(JsonRouteResponse::ok(answer))
 }
 
-/// One operation of the route's body for `caller`. The body names an operation and its
-/// arguments only; any other field, a sender included, is refused.
-async fn call_as(
-    messaging: &AgentMessaging,
-    caller: &AgentCaller,
-    body: &[u8],
-) -> Result<Value, AgentMessagingError> {
+/// The route's operation and its arguments. The body names an operation and its arguments
+/// only; any other field, a sender included, or an unknown operation is refused.
+fn parse_call(body: &[u8]) -> Result<(&'static str, Value), AgentMessagingError> {
     let invalid = || {
         AgentMessagingError::InvalidArgument(
             "The body takes only operation and arguments.".to_owned(),
@@ -472,20 +490,33 @@ async fn call_as(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let operation = ["list", "send", "reply", "status", "cancel", "inbox"]
+        .into_iter()
+        .find(|known| *known == operation)
+        .ok_or_else(|| {
+            AgentMessagingError::InvalidArgument(
+                "operation is one of list, send, reply, status, cancel, inbox.".to_owned(),
+            )
+        })?;
+    Ok((operation, arguments))
+}
+
+/// One parsed operation of the route for `caller`.
+async fn call_as(
+    messaging: &AgentMessaging,
+    caller: &AgentCaller,
+    operation: &str,
+    arguments: &Value,
+) -> Result<Value, AgentMessagingError> {
     let tool = match operation {
         "list" => "agents_list",
         "send" => "agent_message_send",
         "reply" => "agent_message_reply",
         "status" => "agent_message_status",
         "cancel" => "agent_message_cancel",
-        "inbox" => return inbox(messaging, caller, &arguments).await,
-        _ => {
-            return Err(AgentMessagingError::InvalidArgument(
-                "operation is one of list, send, reply, status, cancel, inbox.".to_owned(),
-            ));
-        }
+        _ => return inbox(messaging, caller, arguments).await,
     };
-    super::tools::agent_messaging::call_as(messaging, caller, tool, &arguments).await
+    super::tools::agent_messaging::call_as(messaging, caller, tool, arguments).await
 }
 
 async fn inbox(

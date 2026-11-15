@@ -38,12 +38,14 @@ pub(crate) fn render_request(
     source_title: &str,
     message_id: &str,
     text: &str,
+    recipient_provider: &str,
 ) -> String {
     crate::agent_messaging::envelope::build_person_request(
         action_label(action),
         source_title,
         message_id,
         text,
+        recipient_provider,
     )
 }
 
@@ -101,8 +103,17 @@ pub(crate) async fn deliver_person_request(
 ) -> Result<(), Value> {
     let pointer = service.terminal_mail().ok_or_else(not_notifiable)?;
     let message_id = format!("person-send:{}", row.request_id);
+    let recipient_provider = pointer
+        .terminal_driver(&target.thread_id, &target.terminal_id)
+        .await;
     let new = NewAgentMessage {
-        text: render_request(row.action, source_title, &message_id, text),
+        text: render_request(
+            row.action,
+            source_title,
+            &message_id,
+            text,
+            &recipient_provider,
+        ),
         message_id,
         conversation_id: row.request_id.clone(),
         sender_address: row.source_address.clone(),
@@ -115,6 +126,7 @@ pub(crate) async fn deliver_person_request(
         accepted_at: crate::mcp::control::now_iso(),
         sender_runtime_mode: None,
         recipient_terminal_generation: Some(target.generation_key()),
+        sender_terminal_generation: None,
         send_request_id: Some(row.request_id.clone()),
         client_request_id: None,
         delivery_command_id: None,
