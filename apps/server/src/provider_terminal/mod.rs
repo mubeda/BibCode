@@ -2,10 +2,15 @@
 mod agent_status_tests;
 mod claude;
 mod codex;
+mod conversation;
 mod model;
 mod opencode;
 mod supervisor;
 
+#[cfg(test)]
+pub(crate) use conversation::MAX_TRANSCRIPT_BYTES;
+pub(crate) use conversation::{ConversationRefusal, ConversationText, read_claude_conversation};
+pub(crate) use model::ObservedConversation;
 #[allow(unused_imports)]
 pub(crate) use model::{
     TerminalAgentActivityAdmission, TerminalAgentActivityControl, TerminalAgentActivityObservation,

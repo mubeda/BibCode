@@ -82,8 +82,7 @@ pub(crate) struct SendRequestsGetTerminalOutputInput {
     pub(crate) thread_id: String,
     pub(crate) terminal_id: String,
     pub(crate) source: TerminalTextSource,
-    // Both parts read the same tail until phase 10 adds the conversation readers.
-    #[allow(dead_code)]
+    /// The part of a conversation to read; the output has one part only.
     pub(crate) part: TerminalTextPart,
 }
 
@@ -132,9 +131,55 @@ pub(crate) trait TerminalOutputSource: Send + Sync {
         terminal_id: &'a str,
         max_chars: usize,
     ) -> futures_util::future::BoxFuture<'a, Result<TerminalTail, crate::terminal::TerminalError>>;
+
+    /// The conversation a Claude AI Terminal's current observer recorded, if any.
+    fn observed_conversation<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<crate::provider_terminal::ObservedConversation>>;
+
+    /// The main session that observer bound last.
+    fn observed_session<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<String>>;
+
+    /// The environment the terminal's command was launched with, for the provider's folders.
+    fn launch_environment<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>>;
 }
 
 impl TerminalOutputSource for crate::terminal::TerminalManager {
+    fn observed_conversation<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<crate::provider_terminal::ObservedConversation>>
+    {
+        Box::pin(self.observed_conversation(owner_thread_id, terminal_id))
+    }
+
+    fn observed_session<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<String>> {
+        Box::pin(self.observed_session(owner_thread_id, terminal_id))
+    }
+
+    fn launch_environment<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+        Box::pin(self.launch_environment(owner_thread_id, terminal_id))
+    }
+
     fn tail<'a>(
         &'a self,
         owner_thread_id: &'a str,
@@ -181,6 +226,66 @@ pub(crate) fn plain_tail(raw: &str, older_exists: bool, max_chars: usize) -> Ter
         text: text.chars().skip(count.saturating_sub(max_chars)).collect(),
         truncated: older_exists || count > max_chars,
     }
+}
+
+/// The conversation of a Claude AI Terminal, read off the async runtime. Every refusal is the
+/// caller's cue to fall back to the output.
+async fn conversation_text(
+    reader: &dyn TerminalOutputSource,
+    owner_thread_id: &str,
+    terminal_id: &str,
+) -> Result<crate::provider_terminal::ConversationText, crate::provider_terminal::ConversationRefusal>
+{
+    use crate::provider_terminal::ConversationRefusal;
+    let observed = reader
+        .observed_conversation(owner_thread_id, terminal_id)
+        .await
+        .ok_or(ConversationRefusal::NoObservedSession)?;
+    let expected = reader
+        .observed_session(owner_thread_id, terminal_id)
+        .await
+        .ok_or(ConversationRefusal::NoObservedSession)?;
+    let config_dir = crate::provider::environment::claude_config_directory(
+        &reader
+            .launch_environment(owner_thread_id, terminal_id)
+            .await,
+    )
+    .ok_or(ConversationRefusal::Unreadable)?;
+    tokio::task::spawn_blocking(move || {
+        crate::provider_terminal::read_claude_conversation(&observed, &expected, &config_dir)
+    })
+    .await
+    .unwrap_or(Err(ConversationRefusal::Unreadable))
+}
+
+/// The part of a conversation the input asks for; `None` when it has none (no answer yet).
+fn conversation_result(
+    input: &SendRequestsGetTerminalOutputInput,
+    conversation: crate::provider_terminal::ConversationText,
+) -> Option<SendRequestsGetTerminalOutputResult> {
+    let (text, truncated) = match input.part {
+        TerminalTextPart::Handoff => (
+            conversation.handoff.render(),
+            conversation.handoff.truncated,
+        ),
+        TerminalTextPart::LastAnswer => {
+            let answer = conversation.last_answer?;
+            let count = answer.chars().count();
+            (
+                answer.chars().take(TERMINAL_OUTPUT_MAX_CHARS).collect(),
+                count > TERMINAL_OUTPUT_MAX_CHARS,
+            )
+        }
+    };
+    (!text.trim().is_empty()).then(|| SendRequestsGetTerminalOutputResult {
+        thread_id: input.thread_id.clone(),
+        terminal_id: input.terminal_id.clone(),
+        text,
+        truncated,
+        used_source: TerminalTextSource::Conversation,
+        fell_back: false,
+        start_missing: false,
+    })
 }
 
 /// Sends one stream event; false when the stream was cancelled or closed.
@@ -771,9 +876,9 @@ impl SendRequestsService {
         })
     }
 
-    /// The last output of an AI Terminal, for a terminal source's preview. It only reads, logs ids
-    /// and sizes, and never the text. The CLI conversation has no reader yet, so that source falls
-    /// back to the output.
+    /// The last output of an AI Terminal, or its CLI's own conversation when that source is asked
+    /// for and can be read (R112), for a terminal source's preview. It only reads, logs ids and
+    /// sizes, and never the text, a path or why a conversation could not be read.
     pub(crate) async fn get_terminal_output(
         &self,
         context: &RpcSessionContext,
@@ -797,6 +902,24 @@ impl SendRequestsService {
             .clone()
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| input.thread_id.clone());
+        if input.source == TerminalTextSource::Conversation {
+            if let Ok(conversation) =
+                conversation_text(reader.as_ref(), &owner_id, &input.terminal_id).await
+                && let Some(result) = conversation_result(&input, conversation)
+            {
+                tracing::debug!(
+                    terminal_id = %input.terminal_id,
+                    chars = result.text.chars().count(),
+                    truncated = result.truncated,
+                    "a terminal's conversation was read for a send request"
+                );
+                return Ok(result);
+            }
+            tracing::debug!(
+                terminal_id = %input.terminal_id,
+                "a terminal's conversation could not be read, so its output is used"
+            );
+        }
         let tail = reader
             .tail(&owner_id, &input.terminal_id, TERMINAL_OUTPUT_MAX_CHARS)
             .await

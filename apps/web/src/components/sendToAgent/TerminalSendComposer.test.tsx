@@ -166,7 +166,7 @@ describe("TerminalSendComposer", () => {
       sourceThreadId: "owner",
       threadId: "owner",
       terminalId: "term-1",
-      source: "output",
+      source: "conversation",
       part: "handoff",
     });
     expect(h.live?.source["terminalHasText"]).toBe(true);
@@ -174,6 +174,83 @@ describe("TerminalSendComposer", () => {
     expect(content?.attachments).toEqual([]);
     const attachments = (await content?.loadAttachments?.()) ?? [];
     expect(attachments[0]).toMatchObject({ label: "Recent output of Claude" });
+    expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it("hand_off_attaches_the_conversation_and_second_opinion_its_last_answer", async () => {
+    h.getTerminalOutput.mockImplementation(async (input: { part: string }) => ({
+      threadId: "owner",
+      terminalId: "term-1",
+      text:
+        input.part === "handoff" ? "[user] Test question\n[assistant] Test answer" : "Test answer",
+      truncated: false,
+      usedSource: "conversation",
+      fellBack: false,
+      startMissing: false,
+    }));
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    const handOff = (await previewContentFor()(choiceFor("hand-off"))?.loadAttachments?.()) ?? [];
+    expect(handOff[0]).toMatchObject({
+      label: "Conversation of Claude",
+      text: "[user] Test question\n[assistant] Test answer",
+    });
+    const secondOpinion =
+      (await previewContentFor()(choiceFor("second-opinion"))?.loadAttachments?.()) ?? [];
+    expect(secondOpinion[0]).toMatchObject({
+      label: "Conversation of Claude",
+      text: "Test answer",
+    });
+    expect(h.getTerminalOutput).toHaveBeenLastCalledWith({
+      sourceThreadId: "owner",
+      threadId: "owner",
+      terminalId: "term-1",
+      source: "conversation",
+      part: "last-answer",
+    });
+  });
+
+  it("a_long_conversation_handoff_is_attached_whole_with_its_newest_messages", async () => {
+    const text = `[user] ${"q".repeat(4_000)}\n${"[assistant] a\n".repeat(1_800)}[assistant] newest`;
+    h.getTerminalOutput.mockResolvedValue({
+      threadId: "owner",
+      terminalId: "term-1",
+      text,
+      truncated: true,
+      usedSource: "conversation",
+      fellBack: false,
+      startMissing: false,
+    });
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    const attachments =
+      (await previewContentFor()(choiceFor("hand-off"))?.loadAttachments?.()) ?? [];
+    expect(attachments[0]).toMatchObject({ label: "Conversation of Claude", text, leftOut: null });
+    expect(attachments[0]).not.toHaveProperty("note");
+  });
+
+  it("the_preview_says_recent_output_was_used_when_the_conversation_could_not_be_read", async () => {
+    h.getTerminalOutput.mockResolvedValue({
+      threadId: "owner",
+      terminalId: "term-1",
+      text: "$ make test\nok",
+      truncated: false,
+      usedSource: "output",
+      fellBack: true,
+      startMissing: false,
+    });
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    for (const action of ["hand-off", "second-opinion"] as const) {
+      const attachments = (await previewContentFor()(choiceFor(action))?.loadAttachments?.()) ?? [];
+      expect(attachments[0]).toMatchObject({
+        label: "Recent output of Claude, because the conversation could not be read",
+        text: "$ make test\nok",
+      });
+    }
     expect(h.getTerminalOutput).toHaveBeenCalledTimes(1);
   });
 
