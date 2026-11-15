@@ -41,9 +41,20 @@ export interface TerminalOutputText {
 export interface TerminalBufferLike {
   readonly type: "normal" | "alternate";
   readonly length: number;
-  getLine(
-    index: number,
-  ): { readonly isWrapped: boolean; translateToString(trimRight?: boolean): string } | undefined;
+  getLine(index: number): TerminalBufferRowLike | undefined;
+}
+
+export interface TerminalBufferRowLike {
+  readonly isWrapped: boolean;
+  readonly length?: number;
+  translateToString(trimRight?: boolean): string;
+  getCell?(x: number): { getChars(): string; getWidth(): number } | undefined;
+}
+
+/** When a wide character did not fit, xterm leaves an empty cell at the row's end; it is not text. */
+function endsInWidePadding(row: TerminalBufferRowLike, next: TerminalBufferRowLike): boolean {
+  const last = row.getCell?.((row.length ?? 0) - 1);
+  return last !== undefined && last.getChars() === "" && next.getCell?.(0)?.getWidth() === 2;
 }
 
 /**
@@ -55,23 +66,34 @@ export interface TerminalBufferLike {
  */
 export function terminalBufferText(
   buffer: TerminalBufferLike,
-  limit: number = ATTACHMENT_MAX_CHARS,
+  options: {
+    limit?: number;
+    /** Rows the buffer holds before xterm drops the oldest: scrollback plus screen rows. */
+    capacity?: number;
+  } = {},
 ): TerminalOutputText {
+  const { limit = ATTACHMENT_MAX_CHARS, capacity } = options;
   const lines: string[] = [];
   for (let index = 0; index < buffer.length; index += 1) {
     const row = buffer.getLine(index);
     if (row === undefined) continue;
     // A row that continues on the next one keeps its trailing spaces: they are part of the text.
-    const continues = buffer.getLine(index + 1)?.isWrapped === true;
-    const text = row.translateToString(!continues);
+    const next = buffer.getLine(index + 1);
+    const continues = next?.isWrapped === true;
+    let text = row.translateToString(!continues);
+    if (continues && endsInWidePadding(row, next)) text = text.slice(0, -1);
     if (row.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
     else lines.push(text);
   }
   while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
   const kept = keepLastCharacters(lines.join("\n"), limit);
+  // A cut can land inside a grapheme; a combining mark with no base would lead the text.
+  const text = kept.leftOut > 0 ? kept.text.replace(/^\p{M}+/u, "") : kept.text;
+  // A full normal buffer has already dropped its oldest rows.
+  const evicted = buffer.type === "normal" && capacity !== undefined && buffer.length >= capacity;
   return {
-    text: kept.text,
-    truncated: kept.leftOut > 0 || buffer.type === "alternate",
+    text,
+    truncated: kept.leftOut > 0 || evicted || buffer.type === "alternate",
     usedSource: "output",
   };
 }

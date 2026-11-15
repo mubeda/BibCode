@@ -1061,7 +1061,9 @@ export function TerminalViewport({
       const terminal = terminalRef.current;
       return terminal === null || terminal === undefined
         ? null
-        : terminalBufferText(terminal.buffer.active);
+        : terminalBufferText(terminal.buffer.active, {
+            capacity: (terminal.options.scrollback ?? 0) + terminal.rows,
+          });
     });
     return () => onBufferReaderChange(terminalId, null);
   }, [onBufferReaderChange, terminalId]);

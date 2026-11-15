@@ -253,7 +253,7 @@ describe("terminalBufferText", () => {
 
   it("the_end_is_kept_at_the_limit_and_truncated_is_set", () => {
     const rows = Array.from({ length: 5 }, (_, index) => `${index}`.repeat(10));
-    const { text, truncated } = terminalBufferText(fakeBuffer("normal", rows), 25);
+    const { text, truncated } = terminalBufferText(fakeBuffer("normal", rows), { limit: 25 });
     expect(Array.from(text)).toHaveLength(25);
     expect(text.endsWith("4444444444")).toBe(true);
     expect(truncated).toBe(true);
@@ -266,6 +266,13 @@ describe("terminalBufferText", () => {
       truncated: true,
       usedSource: "output",
     });
+  });
+
+  it("a_cut_never_starts_with_a_detached_combining_mark", () => {
+    const rows = ["e\u0301" + "x".repeat(15_999)];
+    const { text } = terminalBufferText(fakeBuffer("normal", rows));
+    expect(text.startsWith("x")).toBe(true);
+    expect(text).toHaveLength(15_999);
   });
 
   it("an_empty_screen_gives_empty_text", () => {
