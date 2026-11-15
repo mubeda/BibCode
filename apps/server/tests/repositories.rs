@@ -510,6 +510,7 @@ fn public_repository_api_inventory_is_explicit() {
         "load_capped_shell_snapshot_rows",
         "load_thread_shell_rows",
         "provider_turn_was_claimed",
+        "thread_blocks_new_turn",
         "thread_has_activity_kind",
         "thread_has_messages_or_turns",
     ]

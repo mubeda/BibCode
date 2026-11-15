@@ -596,9 +596,10 @@ sends your question there; the thread's composer is cleared once it did. A bare
 `:` menu lists `:btw` and `:side` with the other composer actions (`:model`,
 `:plan`, `:default`); `/btw` still goes to the provider as its own command.
 
-Its first answer is based on the thread's delivered messages, up to the last 40
-and 24,000 characters, sent with that first question; the work log shows
-**Started with the thread's last N messages**. Later questions use the side
+Its first answer is based on the thread's delivered messages, sent with that first
+question: your first message (cut at 4,000 characters) when it is older than the
+rest, then up to the last 40 within 24,000 characters; the work log shows
+**Started with the thread's last N messages**, counting your first message too. Later questions use the side
 chat's own history. It sees message text only, not tool output or attachments,
 and reads files from the same checkout, which the thread may still be changing.
 A side chat starts in **Supervised** mode, so it asks before it edits files or
@@ -727,6 +728,117 @@ diagram over 25,000 characters or 500 edges says it is too large to draw; and
 if the diagram renderer cannot be loaded, **Retry** tries again. Diagrams do
 not open links or load images. A diagram that draws above the line you are
 reading in the chat does not move that line.
+
+### Send to agent
+
+**Send to agent** sends a request from one agent to another agent of the same project, in your
+name: a review, a second opinion, the work of one thread handed to another, or a plain message.
+You choose what is sent and see it before it goes. Nothing reaches either agent until you press
+**Send**. The control is in the composer footer of every chat panel, left of **History**, and in
+the toolbar of every AI Terminal. A plain terminal has none. On a server too old to support it,
+the control is disabled and says "Update the BiBCode server on this environment to use Send to
+agent." Your own requests work whether or not [agent messaging](./mcp.md#agents-messaging-each-other)
+is on.
+
+Its menu has five actions, each listing the other agents of the project, most recently active
+first, then (except for Take over from) a new chat panel for each provider that is ready. Take
+over from lists the agents with a context or usage warning first and offers no new panel. An agent that is working shows
+**Busy**; it is still a valid choice, and the request waits for its turn. An agent that ran out
+of context or usage shows "Context window full" or "Out of usage until <time>" under its name,
+and the preview warns that it may not answer.
+
+| Action             | What it asks                                 | What it attaches                                                                                                                                                                                                                                   |
+| ------------------ | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Review**         | Review the code changes of this checkout     | Nothing: the reviewing agent reads the checkout. You pick **Branch vs origin/<base> and uncommitted changes** or **Uncommitted changes**. The prompt is the one of **Review changes**.                                                             |
+| **Second opinion** | Assess this agent's last answer              | **The user's last message** and **The agent's last finished answer**, each cut at 16,000 characters with the count left out                                                                                                                        |
+| **Hand off**       | Continue this thread's work in another agent | The attachment **Handoff from <title>** holds the thread's last 40 messages within 24,000 characters and, when the person's first message is older than those, that message in front (cut at 4,000 characters) with a marker for what was left out |
+| **Take over from** | Continue in this thread after another agent  | The same handoff text, read from the agent you pick. It is queued on this agent. Nothing is sent to the picked one                                                                                                                                 |
+| **Message**        | Whatever you write                           | Nothing. The note is the message                                                                                                                                                                                                                   |
+
+A request reaches the other agent as your own message. In a chat it reads "Review, sent from
+<title>", "Second opinion, sent from <title>" and so on, with no agent chip, because you sent
+it; in an AI Terminal it reaches the agent as a request from the user of the project (see
+**AI Terminals** below). A Review asks the agent not to edit files; when the agent can change files, the preview
+says "This agent can change files. The request asks it not to, but BiBCode cannot stop it."
+
+**The preview.** Choosing an agent opens a dialog titled with the action, "From <this agent> to
+<agent>". It shows the fixed lead-in BiBCode writes, a **Note (optional)** box (**Message** for a
+Message), and each attachment as an editable box with **Remove**. The counter reads "N of 48,000
+characters", counting the note and the attachments. Edit or remove anything: what you see is
+exactly what is sent. The agents' text that attaches, such as a thread's messages, is read when the
+preview opens, and **Send** waits for it; if it cannot be read the dialog says so and offers
+**Retry**. A request over 48,000 characters says "This request is over the 48,000 character
+limit. Remove or shorten an attachment." and cannot be sent. A Message with an empty note says
+"Write a message first". If the send fails, the dialog stays open with your note, and **Send**
+again sends the same request once: a request id makes a repeat harmless, even after a lost
+connection. A send to a new panel creates the panel once, and a failed send does not leave a
+second one.
+
+**Disabled reasons.** An action or an agent that cannot be used stays in the menu and says why:
+
+- "No answer to review yet": Second opinion needs a finished answer in this panel.
+- "This agent works in another checkout and cannot see these changes": a Review of this
+  checkout cannot be sent to an agent that works in a different folder.
+- "This terminal cannot be notified of new requests": BiBCode cannot tell that terminal's agent
+  about a request (it is not a running Claude, Codex or OpenCode AI Terminal that BiBCode
+  observes).
+- "Nothing to take over yet": the agent you picked has no messages.
+- "Nothing to attach yet": the AI Terminal has no text yet to attach.
+
+**What happens next.** Each request has a row above the composer (on a terminal, in a popover on
+its control) with its state:
+
+| Row                                   | Meaning                                                                                           | Buttons       |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------- |
+| Queued for <agent>                    | Waiting for the agent's running turn to end                                                       | Open, Cancel  |
+| Waiting: this agent's queue is paused | Its session errored, was interrupted or stopped; its queue holds the request until you release it | Open, Cancel  |
+| Delivered to <agent>                  | An AI Terminal was told about it (a chat agent skips this state)                                  | Open          |
+| <agent> read it                       | Its turn started                                                                                  | Open          |
+| <agent> answered                      | It finished a turn with an answer                                                                 | Open, Dismiss |
+| <agent> did not answer: <reason>      | See below                                                                                         | Open, Dismiss |
+| Cancelled                             | You cancelled it before the agent took it                                                         | Dismiss       |
+
+**Cancel** withdraws a request the agent has not taken. It is refused once a chat agent started
+its turn on the request, and once a terminal's agent was told about it. The reasons for "did not answer" are "its
+queue is paused", "BiBCode could not deliver it", "its turn failed", "its turn was interrupted",
+"the agent was deleted", "it finished without an answer" and, for an AI Terminal, "the terminal
+closed". A Message, a Hand off and a Take over from need nothing more once the agent read them,
+so their row goes then. A Review and a Second opinion keep their row until you dismiss it.
+
+**The answer.** When the agent answers a Review or a Second opinion, the row becomes a notice,
+"<agent> answered", and the control's name says how many answers wait ("Send to agent, 2
+answers waiting"). **Bring back** puts the answer into this panel's composer as a draft, quoted,
+and shows the panel; anything already typed stays, with the answer after it. It sends nothing:
+read, edit and send it yourself. **Open** shows the agent that answered. The answer is kept with
+the request, up to 48,000 characters, so Bring back works after a reload and after the other
+agent's thread changes. A notice from an AI Terminal opens the **Message** action with the answer
+quoted in the note, because a Message needs an agent first; nothing is typed into the terminal.
+
+**AI Terminals.** An AI Terminal is a source and a target.
+
+- _As a source_, **Second opinion** and **Hand off** attach text from the terminal. If you have
+  text selected in the terminal, the selection is attached ("Selection from <terminal>").
+  Otherwise BiBCode reads the CLI's own conversation when it can ("Conversation of <terminal>"),
+  and otherwise attaches the recent output ("Recent output of <terminal>, because the
+  conversation could not be read"). The preview says which, so you can remove what you do not
+  want. A Claude terminal's conversation is the session its hooks reported, read only from the
+  Claude project folder of the terminal's own working directory, and a transcript elsewhere,
+  such as under another config folder, falls back to the recent output. A Codex terminal's
+  conversation is its newest 20 turns, and a Hand off says "The start of the conversation is
+  not included." when the conversation is longer (a Second opinion reads only the last answer
+  and never says it). A terminal's text is read, never written:
+  the preview types nothing into the terminal.
+- _As a target_, a terminal agent never gets your text typed for you. BiBCode stores the request
+  and tells the agent with one fixed line, "BiBCode: you have new messages. Run `bibcode agent
+  inbox` to read them.", once its agent waits for a prompt and nothing was typed meanwhile. The
+  agent reads the request there as coming from the user, and answers with
+  `bibcode agent reply`. Only a Claude, Codex or OpenCode AI Terminal that BiBCode observes can
+  be told. A Claude Code terminal is ready for the line only after Claude's own idle notice,
+  which comes once the prompt has waited a while, so the line can come late or not at all while
+  you type in it;
+  the request stays queued, and **Cancel** works until the line was typed. If the terminal ends
+  first, the request ends as not answered with "the terminal closed", and a reply stored before
+  the stop is kept.
 
 ### Reading the timeline
 
@@ -953,10 +1065,11 @@ When BiBCode cannot resume a thread's provider conversation (the provider no
 longer has it, for example after its history was cleared), it starts a new one
 and the thread shows **Couldn't resume the previous <provider> conversation.
 Started a new one with a summary of this thread.** Your next message reaches the
-provider together with the thread's earlier messages (up to the last 40, about
-24,000 characters, oldest left out first), so the agent can pick up where it left
-off; the thread still shows only what you typed. A provider command starting with
-`/` is sent as written, and the summary goes with the next ordinary message. A
+provider together with the thread's earlier messages (your first message, then up
+to the last 40, about 24,000 characters, oldest left out first), so the agent can
+pick up where it left off; the thread still shows only what you typed. A provider command starting with
+`/` is sent as written, and so is an agent's message, and the summary goes with the next
+ordinary message. A
 retried message that had to start a new conversation shows **Sent in a new
 conversation with a summary of earlier messages.**
 

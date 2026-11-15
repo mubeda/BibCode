@@ -116,6 +116,40 @@ impl HandoffText {
     }
 }
 
+/// The handoff text of messages kept elsewhere than a thread (a CLI's own conversation), given
+/// oldest first as role and text pairs. Equal content gives the same text as [`handoff_text`].
+pub(crate) fn handoff_text_from_texts(messages: &[(&str, &str)]) -> HandoffText {
+    let rows = messages
+        .iter()
+        .enumerate()
+        .map(|(index, (role, text))| ProjectionThreadMessage {
+            // `handoff_text` leaves out the message whose id it is given, here the empty one.
+            message_id: format!("message-{index}"),
+            thread_id: String::new(),
+            turn_id: None,
+            role: (*role).to_owned(),
+            text: (*text).to_owned(),
+            attachments: None,
+            is_streaming: false,
+            delivery_state: None,
+            delivery_provider: None,
+            delivery_provider_instance_id: None,
+            delivery_detail: None,
+            delivery_reason: None,
+            delivery_mode: None,
+            delivery_held: None,
+            resend_of_message_id: None,
+            actor: None,
+            source_thread_id: None,
+            person_send: None,
+            // Equal unparseable instants keep the given order.
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .collect::<Vec<_>>();
+    handoff_text(&rows, "")
+}
+
 /// The messages oldest first by their parsed `created_at`; equal instants keep repository order.
 /// The repository sorts the timestamp text, and RFC 3339 text of different fractional precision
 /// does not sort chronologically (".123Z" sorts before ".12Z"). An unparseable timestamp sorts

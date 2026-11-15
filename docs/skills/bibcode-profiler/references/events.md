@@ -465,7 +465,9 @@ before it. A stop with no slow step records nothing.
   stop, in order;
 - `durationMs`: the stage so far;
 - `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
-  name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
+  name such as `http-drain`, `webhooks`, `send-requests-follower`,
+  `agent-message-tracker`, `terminal-pointer`, `agent-message-activity`,
+  `terminal-credential-revoker`, `turn-delivery`, `provider-runtime`,
   `operational-logs` or `orchestration`.
 
 The profiler's own teardown is the last quiesce step, and the server's join

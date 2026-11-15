@@ -22,6 +22,10 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::conversation::{
+    CODEX_CONVERSATION_DEADLINE, CodexConversation, CodexConversationHandle,
+    CodexConversationRequest, ConversationRefusal,
+};
 use super::model::{
     PromptEvidence, PromptReadiness, TerminalAgentReport, TerminalAgentState,
     TerminalObserverGenerationLease,
@@ -42,8 +46,6 @@ use crate::process::supervised::spawn_retrying_busy_executable;
 use crate::process::supervised::{
     run_supervised_with_spawn_observer, run_supervised_with_spawn_observer_until,
 };
-#[cfg(unix)]
-#[cfg(all(test, unix))]
 use crate::provider::codex::model::CODEX_REMOTE_MESSAGE_MAX_BYTES;
 #[cfg(unix)]
 use crate::provider::codex::protocol::CODEX_TRANSPORT_MESSAGE_MAX_BYTES;
@@ -63,11 +65,11 @@ use crate::{
         build_initialize_params,
         model::{
             CODEX_RECONCILIATION_BACKGROUND_LIMIT, CODEX_RECONCILIATION_THREAD_LIMIT,
-            CODEX_REMOTE_JSON_TOO_LARGE, ReconciliationThread, ReconciliationThreadStatus,
-            ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
-            ThreadReadResponse, TurnsPager, decode_background_terminals_list_response,
-            decode_thread_list_response, decode_thread_read_response,
-            is_recoverable_thread_resume_error,
+            CODEX_RECONCILIATION_TURN_LIMIT, CODEX_REMOTE_JSON_TOO_LARGE, ReconciliationThread,
+            ReconciliationThreadStatus, ThreadBackgroundTerminalsListParams, ThreadListParams,
+            ThreadReadParams, ThreadReadResponse, TurnsPager,
+            decode_background_terminals_list_response, decode_thread_list_response,
+            decode_thread_read_response, decode_turns_page, is_recoverable_thread_resume_error,
         },
     },
 };
@@ -1407,6 +1409,9 @@ async fn run_codex_observer_inner(
         }
         break resumed;
     };
+    // A person's Second opinion or Hand off reads the root's conversation through this loop.
+    let (conversation, mut conversation_requests) = CodexConversationHandle::channel();
+    generation.publish_codex_conversation(conversation);
     // The left panel learns the root agent's state as soon as the observer attaches (#187).
     let mut readiness = PromptReadiness::default();
     let mut stale = publish_codex_resumed_status(
@@ -1808,11 +1813,16 @@ async fn run_codex_observer_inner(
                     reconciliation_sequence = reconciliation_sequence.saturating_add(1);
                     let buffered = client.drain_request_buffered_notifications();
                     if client.take_lost_notifications() {
-                        // A dropped turn or ask leaves the root's state unknown, and nothing
-                        // still queued can be ordered against it: activity still reads it all,
-                        // but only an event read after it can make the terminal ready.
-                        readiness.reset(generation);
-                        stale.extend(reconciled.drain(..).chain(buffered));
+                        recover_after_lost_codex_notifications(
+                            generation,
+                            &mut readiness,
+                            &mut *client,
+                            &root,
+                            &mut stale,
+                            &mut reconciled,
+                            buffered,
+                        )
+                        .await;
                     } else {
                         // Read in order before the next wait, as if the connection held them.
                         reconciled.extend(buffered);
@@ -1862,6 +1872,23 @@ async fn run_codex_observer_inner(
                 if desired.enabled && live_state != Some(desired) {
                     pending_barrier = Some(desired);
                 }
+            }
+            // Before the envelope, so a wait never makes the terminal ready in the same pass that
+            // a request withdraws readiness; only once what the last one buffered was read, so
+            // retries cannot starve the root's events.
+            Some(request) = conversation_requests.recv(),
+                if stale.is_empty() && reconciled.is_empty() =>
+            {
+                serve_codex_conversation_request(
+                    generation,
+                    &mut readiness,
+                    &mut *client,
+                    &root,
+                    &mut stale,
+                    &mut reconciled,
+                    request,
+                )
+                .await;
             }
             (envelope, evidence) = next_codex_envelope(
                 generation,
@@ -2075,7 +2102,7 @@ async fn cross_codex_enable_barrier(
 
 /// Reports the root agent's state one notification carries; the next wait makes the terminal
 /// ready if it was the latest and fresh.
-fn report_codex_root(
+pub(super) fn report_codex_root(
     generation: &TerminalObserverGenerationLease,
     readiness: &mut PromptReadiness,
     envelope: &Value,
@@ -2640,6 +2667,168 @@ async fn bounded_codex_reconciliation_request(
     .await
     .map_err(|_| ())?
     .map_err(|_| ())
+}
+
+/// The root thread's newest turns for a person's Second opinion or Hand off (R112): one
+/// `thread/turns/list` page of the observer's own root, never a thread a caller names.
+pub(super) async fn answer_codex_conversation(
+    client: &mut dyn CodexRemoteClient,
+    root: &str,
+) -> Result<CodexConversation, ConversationRefusal> {
+    let params = serde_json::json!({
+        "threadId": root,
+        "limit": CODEX_RECONCILIATION_TURN_LIMIT,
+        "sortDirection": "desc",
+        "itemsView": "full",
+    });
+    let page = match tokio::time::timeout(
+        CODEX_CONVERSATION_DEADLINE,
+        client.request("thread/turns/list", params),
+    )
+    .await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) if error == CODEX_REMOTE_JSON_TOO_LARGE => {
+            return Err(ConversationRefusal::TooLarge);
+        }
+        Ok(Err(_)) | Err(_) => return Err(ConversationRefusal::Unreadable),
+    };
+    let (messages, complete) = decode_codex_conversation_page(page)?;
+    Ok(CodexConversation {
+        thread_id: root.to_owned(),
+        messages,
+        complete,
+    })
+}
+
+/// The person's and the agent's text of a `thread/turns/list` page (newest turn first), oldest
+/// first, and whether it holds the oldest turn. Its own decoder: activity decoding keeps no user
+/// text. Text past the transport's byte bound is refused.
+pub(super) fn decode_codex_conversation_page(
+    page: Value,
+) -> Result<(Vec<(String, String)>, bool), ConversationRefusal> {
+    let (turns, next_cursor) =
+        decode_turns_page(page).map_err(|_| ConversationRefusal::Unreadable)?;
+    let mut messages = Vec::new();
+    let mut bytes = 0_usize;
+    for item in turns
+        .iter()
+        .rev()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flatten()
+    {
+        let (role, text) = match item.get("type").and_then(Value::as_str) {
+            Some("userMessage") => (
+                "user",
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Some("agentMessage") => (
+                "assistant",
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            ),
+            _ => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        bytes = bytes.saturating_add(text.len());
+        if bytes > CODEX_REMOTE_MESSAGE_MAX_BYTES {
+            return Err(ConversationRefusal::TooLarge);
+        }
+        messages.push((role.to_owned(), text));
+    }
+    Ok((messages, next_cursor.is_none()))
+}
+
+/// Serves one conversation request inside the observer loop. Like a reconciliation it withdraws
+/// readiness before it waits on Codex, then queues what the request buffered, so readiness comes
+/// back only from the next wait on the live stream, and never when the pointer already took it.
+pub(super) async fn serve_codex_conversation_request(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
+    client: &mut dyn CodexRemoteClient,
+    root: &str,
+    stale: &mut VecDeque<Value>,
+    reconciled: &mut VecDeque<Value>,
+    request: CodexConversationRequest,
+) {
+    if request.caller_gone() {
+        return;
+    }
+    readiness.suspend(generation);
+    let answer = tokio::select! {
+        biased;
+        _ = generation.cancelled() => Err(ConversationRefusal::Unreadable),
+        answer = answer_codex_conversation(client, root) => answer,
+    };
+    let buffered = client.drain_request_buffered_notifications();
+    if client.take_lost_notifications() {
+        recover_after_lost_codex_notifications(
+            generation, readiness, client, root, stale, reconciled, buffered,
+        )
+        .await;
+    } else {
+        reconciled.extend(buffered);
+    }
+    // The connection's own backlog rule: past it the oldest are dropped, which leaves the
+    // root's state unknown.
+    let kept = stale.len() + reconciled.len();
+    if kept > CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
+        readiness.reset(generation);
+        stale.extend(reconciled.drain(..));
+        stale.drain(..kept - CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT);
+    }
+    request.answer(answer);
+}
+
+/// After a request lost notifications. A dropped turn or ask leaves the root's state unknown,
+/// and nothing still queued can be ordered against it: activity still reads it all, but only an
+/// event read after it can make the terminal ready. The loss may also have taken the root's turn
+/// end, which would leave its reported state stale, so the root's status is read again, as a
+/// resume does, and queued after what is left as a status notification: the loop reports it, in
+/// order, without making the terminal ready.
+async fn recover_after_lost_codex_notifications(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
+    client: &mut dyn CodexRemoteClient,
+    root: &str,
+    stale: &mut VecDeque<Value>,
+    reconciled: &mut VecDeque<Value>,
+    buffered: Vec<Value>,
+) {
+    readiness.reset(generation);
+    stale.extend(reconciled.drain(..).chain(buffered));
+    let params = serde_json::to_value(ThreadReadParams {
+        thread_id: root,
+        include_turns: false,
+    })
+    .expect("Codex terminal thread/read params serialize");
+    if let Ok(read) = bounded_codex_reconciliation_request(client, "thread/read", params).await
+        && read.pointer("/thread/id").and_then(Value::as_str) == Some(root)
+        && let Some(status) = read.pointer("/thread/status")
+    {
+        stale.push_back(json!({
+            "method": "thread/status/changed",
+            "params": {"threadId": root, "status": status},
+        }));
+    }
+    // Readiness is reset already, and what the read buffered follows its snapshot, as at a
+    // resume.
+    client.take_lost_notifications();
+    stale.extend(client.drain_request_buffered_notifications());
 }
 
 /// Reads a descendant as the structured runtime does: metadata without turns, then

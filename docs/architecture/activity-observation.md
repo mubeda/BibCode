@@ -428,6 +428,102 @@ Unix-socket helper. The status carries only the derived state, never prompt,
 message or terminal content. The change is in reach: every observable AI
 Terminal now runs an observer, not only terminals launched with the gate on.
 
+The summary's `agentStatus.readyForPrompt` adds one more fact: whether the agent waits for a
+prompt, with fresh proof. The rules are under [Prompt readiness](#prompt-readiness).
+
+### Prompt readiness
+
+`TerminalSummary.agentStatus.readyForPrompt` says whether the terminal's agent waits for the
+person's next prompt and BiBCode has fresh proof of it. It exists so the server can announce agent
+mail to an AI Terminal with one typed line (see
+[Agent messaging](./providers.md#agent-messaging)). The summary shows it as the `ready` status
+of `agents_list`; the write permit that gates that line reads the observer's own readiness,
+never the mirrored summary. It
+is true only while the state is `done` and not failed, and a fresh agent is not ready before its
+first end-of-turn signal. A state report alone never makes a terminal ready: the report carries
+a `PromptEvidence`, and only `Fresh` evidence can.
+
+| Provider | What makes it ready                                                                                                                                  | What never does                                                                                                                |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Claude   | The newest status hook is a `Notification` of type `idle_prompt` for the bound session. Claude sends it once the prompt has waited for input a while | `Stop` (a `Stop` hook of the project or the user can block the stop and Claude then goes on, with no new hook), any older hook |
+| Codex    | The root thread's `thread/status/changed` to idle, or its turn completed without failing, read on the live stream                                    | The `thread/resume` response (a snapshot), a buffered event, a failed turn                                                     |
+| OpenCode | The root session went idle, or an interrupted OpenCode 2 turn ended; read on the live stream                                                         | A session status snapshot at attach, a failed turn, a child session ending                                                     |
+
+A Claude terminal therefore reads ready only after `idle_prompt`. Claude Code sends it only once the prompt has waited for input a
+while after a response, which may never happen while the person is active in that terminal, so a
+pointer line to an idle Claude terminal arrives late or not at all. This is a decision, not a bug:
+waiting for the idle signal was chosen on purpose, and `bibcode agent inbox` always works.
+
+**One publishing point for Codex and OpenCode (`PromptReadiness`).** The observer's loop owns one
+`PromptReadiness`. `observe` reports a root event and keeps only whether the latest one says the
+CLI waits for a prompt and was read fresh. Readiness is published only by `wait`, which polls the
+read of the live stream and, when that read is pending (nothing is buffered or readable) and the
+task still has budget, marks the terminal ready once from that latest event. Any other awaited
+work, such as a reconciliation or an activity publication, calls `suspend` first, which withdraws
+readiness. A transition (an attach, a replaced or lost stream, a snapshot, dropped events) calls
+`reset`, which withdraws it and forgets what was read. An event buffered across a snapshot or a
+transition is `Stale` evidence, which reports state and never restores readiness. A consumer that clears readiness (the
+pointer typing its line) has taken it: the clear holds until a new root event arrives, so one ready
+period serves one write. A Claude observer has no stream to wait on, so it marks ready from its
+newest hook, and a hook older than one already applied changes nothing.
+
+**The write permit.** `TerminalManager::write_when_ready` is the only way the server types for an
+agent. It decides a write permit again on the writer's thread, at the moment the bytes reach the
+process, under the session lock: the generation still runs, the agent reads ready now, nothing
+was typed into the terminal since the agent last started a turn (so a half-written prompt is
+never submitted), the caller's guard still holds (the pointer's guard asks whether the mail is
+still wanted), and no earlier input is queued. A granted write ends the ready period. The result
+is `Written`, `NotReady` (including a refusal at the write), `Busy` (earlier input pending; nothing
+was queued behind it) or `GenerationChanged`. The terminal's person-input count, which only
+a person's typing advances (the server's own writes and the MCP `terminal_write` tool never do),
+also resets the hop chain of agent messages.
+
+### Conversation reads for a send
+
+Send to agent can attach an AI Terminal's text, and for Second opinion and Hand off it prefers the
+CLI's own conversation to the recent output (see
+[Workspace UI](../user/workspace-ui.md#send-to-agent)).
+`sendRequests.getTerminalOutput` with `source: "conversation"` asks a reader below; when it is
+not readable the server answers with the output and `fellBack`. The readers produce text for an
+attachment only. They never feed correlation, status or any other decision of the observers, and
+nothing logs a path, a session id, why a read was refused or any text; only ids, sizes and whether
+the output stood in.
+
+- **Claude.** The status hooks of the main agent report `transcript_path` and `session_id`
+  (a subagent's hook names its own transcript and is ignored). The observer records a path
+  only if it is absolute, ends in `.jsonl`, holds no control character and is at most 4,096
+  bytes, and forgets it when `/clear` starts a session with no usable path. The path is untrusted:
+  it comes from the CLI's own hook, whose credential the agent in that terminal can read. It is
+  read only when the session it names is the session the hooks bound last, the file is
+  `<session>.jsonl`, neither the file nor its folder is a link, the folder is a direct child
+  of `<config dir>/projects` that Claude derives from the working directory the server launched the
+  terminal in (as given, or resolved), the file is opened through a held folder handle that refuses
+  a link, and it is a regular file of at most 64 MiB. The config folder is `CLAUDE_CONFIG_DIR` of the
+  terminal's launch environment, else the server's own, else `.claude` in the home folder, so a
+  transcript that lies under any other config folder falls back to the recent output. The shared transcript parser reads it, keeping
+  the first message and the newest ones. The handoff text follows the limits of a thread's handoff text (the person's first
+  message cut at 4,000 characters, the newest messages within 24,000), and the last answer is cut at
+  16,000 characters.
+- **Codex.** The Codex observer owns a connection to its terminal's app server, so the read goes
+  through it. When the observer has resumed its root thread it publishes a
+  `CodexConversationHandle`. A read sends one request into the observer's loop, which answers
+  with one `thread/turns/list` page of its own root thread only (the handle names no thread):
+  the newest 20 turns, with their items, decoded to the user's text parts and the agent's
+  messages, within 512 KiB. One request is in flight per terminal until the loop finished with it
+  (another caller is refused at once), and a caller waits at most 5 seconds. Serving a request first
+  suspends readiness, then queues the notifications the request buffered the way a
+  reconciliation does, and recovers the root's state with `thread/read` if notifications were
+  lost meanwhile, so the terminal reads ready again only at the next wait on the live stream. A
+  page that does not reach the oldest turn leaves the first message out and, for a Hand off
+  only, sets `startMissing` (a last answer never does);
+  only the newest 20 turns are ever read.
+- **OpenCode** has no conversation reader. Its Second opinion and Hand off use the recent output.
+- **Accepted limits.** The server launches no Claude session id of its own, so a forged hook can
+  name another Claude session of the same working directory, whose file belongs to the same user.
+  The held project folder can still be renamed out of `projects` before the open, two working
+  directories can share one project folder name, and a linked launch folder can be retargeted after
+  launch. Each needs the same user, who can read those files anyway.
+
 ### Codex structured recovery
 
 Codex structured recovery merges validated, bounded live and root/child-history
@@ -542,7 +638,9 @@ exact nested PostToolUse may reparent its named child directly after proving the
 same exact active source parent. Present explicit lineage must still agree.
 Ambiguity is observable but unsupported and performs zero provider I/O;
 semantic text, timing, order, proximity, transcript reads, polling, and timers
-are never correlation inputs.
+are never correlation inputs. The [conversation readers](#conversation-reads-for-a-send)
+of a send read the observed session's own transcript, or Codex's turn list, only to build an
+attachment a person previews, and nothing they read reaches this correlator.
 A fallback target is provisional until matching exact PostToolUse evidence promotes it.
 It remains part of its parent's complete candidate set after installation. If later
 same-generation evidence makes that set non-unique, the correlator synchronously

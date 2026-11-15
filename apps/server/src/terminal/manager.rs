@@ -4886,6 +4886,109 @@ impl TerminalManager {
         .then(|| session.generation.id.clone())
     }
 
+    /// The observation lease of the current process of an AI Terminal of `driver_kind`.
+    async fn observation_of(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        driver_kind: &str,
+    ) -> Option<crate::provider_terminal::TerminalObserverGenerationLease> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let session = session.lock().await;
+        session
+            .command
+            .as_ref()
+            .and_then(|command| command.activity.as_ref())
+            .filter(|activity| activity.driver_kind == driver_kind)?;
+        Some(session.generation.observation.observation())
+    }
+
+    /// The conversation a Claude AI Terminal's observer recorded for its current process (R112).
+    pub(crate) async fn observed_conversation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::provider_terminal::ObservedConversation> {
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
+            .await?
+            .observed_conversation()
+    }
+
+    /// The main session a Claude AI Terminal's observer bound last.
+    pub(crate) async fn observed_session(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<String> {
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
+            .await?
+            .observed_session()
+    }
+
+    /// The way into a Codex AI Terminal's observer loop, for its current process (R112).
+    pub(crate) async fn codex_conversation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::provider_terminal::CodexConversationHandle> {
+        self.observation_of(thread_id, terminal_id, "codex")
+            .await?
+            .codex_conversation()
+    }
+
+    /// The folder the terminal's process was launched in.
+    pub(crate) async fn working_directory(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let cwd = std::path::PathBuf::from(&session.lock().await.cwd);
+        Some(cwd)
+    }
+
+    /// The environment the terminal's command carries (the provider's settings), never the
+    /// spawn environment, which also holds the terminal's credential.
+    pub(crate) async fn launch_environment(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let Some(session) = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let session = session.lock().await;
+        session
+            .command
+            .as_ref()
+            .and_then(|command| command.env.as_ref())
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn subscribe_events(&self) -> TerminalEventReceiver {
         TerminalEventReceiver::new(self.inner.events.subscribe(), false)
     }

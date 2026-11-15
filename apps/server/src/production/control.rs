@@ -2938,6 +2938,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
     // Outside the literal above, which is at `json!`'s recursion limit.
     capabilities["terminalUserInputClaim"] = json!(true);
     capabilities["agentMessaging"] = json!(true);
+    capabilities["sendRequests"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
         json!(crate::production::pipelines_rpc::pipelines_reads_registered());
@@ -7664,6 +7665,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["agentMessaging"], true);
+        assert_eq!(descriptor["capabilities"]["sendRequests"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
         assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
