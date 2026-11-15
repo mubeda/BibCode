@@ -13,7 +13,7 @@
 
 use std::{ffi::OsStr, path::Path, sync::Arc, time::Duration};
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::ObservedConversation;
 use crate::{
@@ -192,19 +192,49 @@ pub(crate) struct CodexConversation {
 }
 
 /// Where the observer loop sends its answer to one request.
-pub(crate) type CodexConversationReply =
-    oneshot::Sender<Result<CodexConversation, ConversationRefusal>>;
+type CodexConversationReply = oneshot::Sender<Result<CodexConversation, ConversationRefusal>>;
+
+/// One request into a Codex observer loop. It holds the terminal's admission until the loop has
+/// finished with it, so a caller that gave up cannot queue another meanwhile.
+#[derive(Debug)]
+pub(crate) struct CodexConversationRequest {
+    reply: CodexConversationReply,
+    admission: Option<OwnedSemaphorePermit>,
+}
+
+impl CodexConversationRequest {
+    /// A request outside any handle, for a test that serves it directly.
+    #[cfg(test)]
+    pub(crate) fn detached(reply: CodexConversationReply) -> Self {
+        Self {
+            reply,
+            admission: None,
+        }
+    }
+
+    /// The caller stopped waiting, so nothing should be asked of Codex for it.
+    pub(crate) fn caller_gone(&self) -> bool {
+        self.reply.is_closed()
+    }
+
+    /// Frees the admission, then answers, so the caller can ask again as soon as it hears back.
+    pub(crate) fn answer(self, answer: Result<CodexConversation, ConversationRefusal>) {
+        let Self { reply, admission } = self;
+        drop(admission);
+        let _ = reply.send(answer);
+    }
+}
 
 /// The way into one Codex observer's loop. It names no thread: the loop answers for its own root.
 #[derive(Clone, Debug)]
 pub(crate) struct CodexConversationHandle {
-    requests: mpsc::Sender<CodexConversationReply>,
+    requests: mpsc::Sender<CodexConversationRequest>,
     in_flight: Arc<Semaphore>,
 }
 
 impl CodexConversationHandle {
     /// A handle and the receiver its observer loop serves.
-    pub(crate) fn channel() -> (Self, mpsc::Receiver<CodexConversationReply>) {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<CodexConversationRequest>) {
         let (requests, receiver) = mpsc::channel(1);
         let handle = Self {
             requests,
@@ -213,15 +243,19 @@ impl CodexConversationHandle {
         (handle, receiver)
     }
 
-    /// Asks the loop for the root thread's conversation. One request is in flight at a time, and
-    /// one that waits past [`CODEX_CONVERSATION_DEADLINE`] is refused.
+    /// Asks the loop for the root thread's conversation. One request is in flight per terminal
+    /// until the loop finished it, even when its caller gave up; another caller meanwhile is
+    /// refused at once. A caller waits at most [`CODEX_CONVERSATION_DEADLINE`].
     pub(crate) async fn request(&self) -> Result<CodexConversation, ConversationRefusal> {
-        let Ok(_in_flight) = self.in_flight.try_acquire() else {
+        let Ok(admission) = self.in_flight.clone().try_acquire_owned() else {
             return Err(ConversationRefusal::Unreadable);
         };
         let (reply, answer) = oneshot::channel();
         self.requests
-            .try_send(reply)
+            .try_send(CodexConversationRequest {
+                reply,
+                admission: Some(admission),
+            })
             .map_err(|_| ConversationRefusal::Unreadable)?;
         tokio::time::timeout(CODEX_CONVERSATION_DEADLINE, answer)
             .await
@@ -638,6 +672,7 @@ mod tests {
                 CodexRemoteClient, answer_codex_conversation, decode_codex_conversation_page,
                 serve_codex_conversation_request,
             },
+            conversation::CodexConversationRequest,
             model::{PromptEvidence, PromptReadiness, TerminalAgentReport},
         };
 
@@ -732,14 +767,14 @@ mod tests {
 
         /// The observer loop's side, for one request: it serves what `client` answers.
         fn serve_one(
-            mut requests: tokio::sync::mpsc::Receiver<CodexConversationReply>,
+            mut requests: tokio::sync::mpsc::Receiver<CodexConversationRequest>,
             mut client: ScriptedClient,
         ) -> tokio::task::JoinHandle<ScriptedClient> {
             tokio::spawn(async move {
                 let generation = TerminalObserverGeneration::new("thread".into(), "term".into());
                 let (mut readiness, mut stale, mut reconciled) =
                     (PromptReadiness::default(), VecDeque::new(), VecDeque::new());
-                let reply = requests.recv().await.expect("one request");
+                let request = requests.recv().await.expect("one request");
                 serve_codex_conversation_request(
                     &generation.observation(),
                     &mut readiness,
@@ -747,7 +782,7 @@ mod tests {
                     ROOT,
                     &mut stale,
                     &mut reconciled,
-                    reply,
+                    request,
                 )
                 .await;
                 client
@@ -853,7 +888,7 @@ mod tests {
                 ROOT,
                 &mut stale,
                 &mut reconciled,
-                reply,
+                CodexConversationRequest::detached(reply),
             )
             .await;
 
@@ -893,6 +928,83 @@ mod tests {
                 "the second never reached the loop"
             );
             first.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_a_caller_that_gave_up_keeps_the_admission_until_the_observer_finished() {
+            let (handle, mut requests) = CodexConversationHandle::channel();
+            let first = tokio::spawn({
+                let handle = handle.clone();
+                async move { handle.request().await }
+            });
+            // The observer loop took the first request and is still serving it.
+            let _serving = requests.recv().await.expect("first request");
+            assert_eq!(
+                first.await.expect("first caller"),
+                Err(ConversationRefusal::Unreadable),
+                "the caller gave up after its deadline"
+            );
+
+            let retry = tokio::time::timeout(Duration::from_millis(1), handle.request()).await;
+
+            assert_eq!(
+                retry,
+                Ok(Err(ConversationRefusal::Unreadable)),
+                "a retry while the observer still serves the first falls back at once"
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "the retry never reached the loop"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_a_dequeued_request_whose_caller_is_gone_sends_nothing() {
+            let (handle, requests) = CodexConversationHandle::channel();
+            assert_eq!(handle.request().await, Err(ConversationRefusal::Unreadable));
+
+            let client = serve_one(requests, ScriptedClient::answering(Reply::Never))
+                .await
+                .expect("observer");
+
+            assert!(
+                client.requests.lock().unwrap().is_empty(),
+                "the provider was asked for a caller that gave up"
+            );
+        }
+
+        #[tokio::test]
+        async fn codex_a_request_that_buffers_past_the_backlog_limit_stays_bounded() {
+            let generation = TerminalObserverGeneration::new("thread".into(), "term".into());
+            let lease = generation.observation();
+            let mut readiness = PromptReadiness::default();
+            idle_and_ready(&lease, &mut readiness).await;
+            let mut client = ScriptedClient::answering(Reply::Page(recorded_page()));
+            client.buffered = (0..300)
+                .map(|index| json!({ "method": "item/completed", "index": index }))
+                .collect();
+            let (mut stale, mut reconciled) = (VecDeque::new(), VecDeque::new());
+
+            serve(
+                &lease,
+                &mut readiness,
+                &mut client,
+                &mut stale,
+                &mut reconciled,
+            )
+            .await
+            .expect("readable");
+            next_wait(&lease, &mut readiness).await;
+
+            assert!(
+                stale.len() + reconciled.len() <= 256,
+                "{} events kept",
+                stale.len() + reconciled.len()
+            );
+            assert!(
+                !reads_ready(&lease),
+                "dropped events leave the root's state unknown"
+            );
         }
 
         /// Text of the conversation never reaches a log. In a process of its own, so no sibling
@@ -991,7 +1103,13 @@ mod tests {
         ) -> Result<CodexConversation, ConversationRefusal> {
             let (reply, answer) = tokio::sync::oneshot::channel();
             serve_codex_conversation_request(
-                generation, readiness, client, ROOT, stale, reconciled, reply,
+                generation,
+                readiness,
+                client,
+                ROOT,
+                stale,
+                reconciled,
+                CodexConversationRequest::detached(reply),
             )
             .await;
             answer.await.expect("answered")

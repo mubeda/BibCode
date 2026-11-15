@@ -1165,6 +1165,16 @@ impl TerminalObserverGenerationLease {
         }
     }
 
+    /// Asks this generation's Codex observer for its root conversation, as a send's preview
+    /// does; whether it answered. For integration tests, which cannot name the handle.
+    #[doc(hidden)]
+    pub async fn request_codex_conversation_for_integration_test(&self) -> bool {
+        match self.codex_conversation() {
+            Some(handle) => handle.request().await.is_ok(),
+            None => false,
+        }
+    }
+
     /// The way into this generation's Codex observer loop, once it resumed its root thread.
     pub(crate) fn codex_conversation(&self) -> Option<super::CodexConversationHandle> {
         self.inner

@@ -4898,6 +4898,9 @@ struct CodexFixtureRemoteState {
     resume_events: Mutex<VecDeque<Vec<Value>>>,
     request_responses: Mutex<BTreeMap<String, VecDeque<Result<Value, String>>>>,
     request_events: Mutex<BTreeMap<String, VecDeque<Vec<Value>>>>,
+    /// Events a request buffers before its delay, so a request that never answers still
+    /// buffered them, by method.
+    request_events_before_delay: Mutex<BTreeMap<String, VecDeque<Vec<Value>>>>,
     request_delays: Mutex<BTreeMap<String, VecDeque<std::time::Duration>>>,
     late_request_delays: Mutex<BTreeMap<String, VecDeque<std::time::Duration>>>,
     connect_delay: Mutex<std::time::Duration>,
@@ -4992,6 +4995,16 @@ impl CodexFixtureRemoteClient {
                 tokio::time::sleep(delay).await;
                 completed.fetch_add(1, Ordering::AcqRel);
             });
+        }
+        if let Some(events) = self
+            .state
+            .request_events_before_delay
+            .lock()
+            .expect("request events before delay lock")
+            .get_mut(&method)
+            .and_then(VecDeque::pop_front)
+        {
+            self.request_buffered_events.extend(events);
         }
         let delay = self
             .state
@@ -6276,6 +6289,80 @@ async fn codex_terminal_stays_not_ready_while_a_turn_is_unread_after_a_reconcili
         handed_out_ready,
         Some(false),
         "the terminal read ready while a turn/started that arrived during the reconciliation was unread"
+    );
+    probed
+        .manager
+        .close("thread-codex", Some(terminal))
+        .await
+        .expect("close Codex terminal");
+    probed.manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_terminal_reads_events_while_conversation_reads_keep_timing_out() {
+    // A person retrying a Send to agent preview against a Codex that stops answering its
+    // conversation read must not starve the observer of the root's events. No read answers;
+    // a turn arrives during the first one, and the caller asks again as soon as it is refused
+    // or gives up.
+    own_process!(isolated);
+    let terminal = "terminal-conversation-retries";
+    let probed = open_probed_ready_codex_terminal(terminal).await;
+    probed
+        .remote_state
+        .request_delays
+        .lock()
+        .expect("Codex request delays")
+        .entry("thread/turns/list".to_owned())
+        .or_default()
+        .extend(std::iter::repeat_n(std::time::Duration::from_secs(60), 64));
+    probed
+        .remote_state
+        .request_events_before_delay
+        .lock()
+        .expect("Codex request events before delay")
+        .entry("thread/turns/list".to_owned())
+        .or_default()
+        .push_back(vec![codex_turn(
+            "turn/started",
+            &probed.root_id,
+            "turn-2",
+            None,
+        )]);
+    let lease = probed
+        .readiness
+        .lease
+        .lock()
+        .expect("readiness probe lease")
+        .clone()
+        .expect("Codex observer lease");
+    let retrying = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let retries = tokio::spawn({
+        let retrying = retrying.clone();
+        async move {
+            while retrying.load(Ordering::Acquire) {
+                lease
+                    .request_codex_conversation_for_integration_test()
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while terminal_readiness(&probed.manager, terminal).await
+            != Some((TerminalAgentStatusState::Working, false))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    retrying.store(false, Ordering::Release);
+    retries.abort();
+    assert!(
+        seen.is_ok(),
+        "the observer never read the turn while conversation reads kept timing out"
     );
     probed
         .manager

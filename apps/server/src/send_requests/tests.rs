@@ -3749,8 +3749,8 @@ fn codex_observer(
 ) -> crate::provider_terminal::CodexConversationHandle {
     let (handle, mut requests) = crate::provider_terminal::CodexConversationHandle::channel();
     tokio::spawn(async move {
-        if let Some(reply) = requests.recv().await {
-            let _ = reply.send(answer);
+        if let Some(request) = requests.recv().await {
+            request.answer(answer);
         }
     });
     handle

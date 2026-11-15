@@ -24,7 +24,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::conversation::{
     CODEX_CONVERSATION_DEADLINE, CodexConversation, CodexConversationHandle,
-    CodexConversationReply, ConversationRefusal,
+    CodexConversationRequest, ConversationRefusal,
 };
 use super::model::{
     PromptEvidence, PromptReadiness, TerminalAgentReport, TerminalAgentState,
@@ -1869,8 +1869,11 @@ async fn run_codex_observer_inner(
                 }
             }
             // Before the envelope, so a wait never makes the terminal ready in the same pass that
-            // a request withdraws readiness.
-            Some(reply) = conversation_requests.recv() => {
+            // a request withdraws readiness; only once what the last one buffered was read, so
+            // retries cannot starve the root's events.
+            Some(request) = conversation_requests.recv(),
+                if stale.is_empty() && reconciled.is_empty() =>
+            {
                 serve_codex_conversation_request(
                     generation,
                     &mut readiness,
@@ -1878,7 +1881,7 @@ async fn run_codex_observer_inner(
                     &root,
                     &mut stale,
                     &mut reconciled,
-                    reply,
+                    request,
                 )
                 .await;
             }
@@ -2755,9 +2758,9 @@ pub(super) async fn serve_codex_conversation_request(
     root: &str,
     stale: &mut VecDeque<Value>,
     reconciled: &mut VecDeque<Value>,
-    reply: CodexConversationReply,
+    request: CodexConversationRequest,
 ) {
-    if reply.is_closed() {
+    if request.caller_gone() {
         return;
     }
     readiness.suspend(generation);
@@ -2773,7 +2776,15 @@ pub(super) async fn serve_codex_conversation_request(
     } else {
         reconciled.extend(buffered);
     }
-    let _ = reply.send(answer);
+    // The connection's own backlog rule: past it the oldest are dropped, which leaves the
+    // root's state unknown.
+    let kept = stale.len() + reconciled.len();
+    if kept > CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
+        readiness.reset(generation);
+        stale.extend(reconciled.drain(..));
+        stale.drain(..kept - CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT);
+    }
+    request.answer(answer);
 }
 
 /// Reads a descendant as the structured runtime does: metadata without turns, then
