@@ -13,7 +13,7 @@
 - A request whose delivery BiBCode could not record before it stopped now ends as **did not answer: BiBCode stopped before it could record the answer** instead of staying queued, and nothing is sent again.
 - The recent output a Send to agent attaches from a full-screen terminal app is readable when the terminal is on screen, because it is read from what the terminal shows. A terminal that is not on screen, and Take over from started in a chat, still read the raw output.
 - Take over from keeps the newest part of a long terminal conversation instead of its oldest.
-- A Cursor answer chunk that arrives after its turn completed is no longer lost, and `wait_for_thread` no longer returns a reply that is still streaming.
+- A Cursor or Grok answer chunk that arrives after its turn completed is no longer lost, and `wait_for_thread` no longer returns a reply that is still streaming.
 - A terminal attachment or `terminal_read` tail no longer starts with half an escape sequence.
 - AI Terminal agent calls (`bibcode agent`) appear in the Profiler's request timings as `agent.<operation>`.
 - When the server restarts, a turn that was still running is failed and replies left streaming are settled, so a thread no longer shows a turn that never ends.
