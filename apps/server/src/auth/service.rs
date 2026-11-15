@@ -8103,8 +8103,10 @@ mod tests {
         })
         .await
         .expect("the watcher reconciled the marker");
-        // One reconcile sends its pairing changes before its session changes, all under one
-        // lock, so the rest of the marker's batch is already queued.
+        // One reconcile sends its pairing changes before its session changes, all under the
+        // state lock. A receiver sees each send at once, so the marker can arrive while the
+        // rest of its batch is still unsent; taking the lock waits for the whole batch.
+        drop(service.state.lock().await);
         while let Ok(event) = events.try_recv() {
             fold(&event.change);
         }
