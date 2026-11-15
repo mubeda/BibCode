@@ -341,10 +341,12 @@ struct Session {
     user_input_clock: u64,
     /// When input other than the terminal's own replies last reached it: a person, an older
     /// client or the MCP `terminal_write` tool.
-    last_line_input: Option<std::time::Instant>,
-    /// When the agent last started a turn from idle: input before it was submitted, input after
-    /// it may still sit on the input line as a draft.
+    last_line_input: Option<LineInput>,
+    /// When the status mirror saw the agent start its last turn from idle (the first report of
+    /// that turn it read, which coalescing can make later than the real start), and the latest
+    /// idle report it read before that: input before the idle report was submitted by that turn.
     turn_started_at: Option<std::time::Instant>,
+    turn_idle_since: Option<std::time::Instant>,
     /// Set while the size is un-owned because its owner left several viewers and none was used
     /// since: the hand-over waits for use, so an attach does not take the size, and only this
     /// viewer answers the terminal's queries meanwhile (#348).
@@ -369,6 +371,14 @@ struct Session {
     /// An AI Terminal's agent state for the left panel (#187): `None` for a plain shell,
     /// unavailable when no observer reports it, else its observer's last report.
     agent_status: Option<SessionAgentStatus>,
+}
+
+/// Input that may sit on the terminal's input line: when it arrived, and whether the agent's
+/// observer showed a turn in progress then.
+#[derive(Clone, Copy, Debug)]
+struct LineInput {
+    at: std::time::Instant,
+    during_turn: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1951,10 +1961,19 @@ impl Session {
     }
 
     /// No input reached the terminal since its agent last started a turn from idle, so nothing
-    /// typed can be waiting on its input line. A tie counts as typed after the start.
+    /// typed can be waiting on its input line. Input typed while idle is submitted by the next
+    /// turn the mirror saw start; input typed during a turn only by a turn that started after an
+    /// idle report newer than the input, because the mirror may have missed the turn's first
+    /// report. A tie counts as typed after the start.
     fn input_line_clean(&self) -> bool {
-        self.last_line_input
-            .is_none_or(|typed| self.turn_started_at.is_some_and(|started| typed < started))
+        self.last_line_input.is_none_or(|input| {
+            let submitted_after = if input.during_turn {
+                self.turn_idle_since
+            } else {
+                self.turn_started_at
+            };
+            self.turn_started_at.is_some() && submitted_after.is_some_and(|after| input.at < after)
+        })
     }
 
     /// Input counts as use of a window unless it is the terminal's own reply: use ends the
@@ -1965,7 +1984,16 @@ impl Session {
         }
         self.departed_owner = None;
         self.owner_unused_since_handoff = false;
-        self.last_line_input = Some(std::time::Instant::now());
+        let at = std::time::Instant::now();
+        let during_turn = self.agent_status.is_some()
+            && self
+                .generation
+                .observation
+                .observation()
+                .subscribe_agent_status()
+                .borrow()
+                .is_some_and(|observation| observation.state != TerminalAgentState::Done);
+        self.last_line_input = Some(LineInput { at, during_turn });
         if let TerminalInputOrigin::User(claim) = origin {
             self.user_input_clock += 1;
             // Departed claims are pruned at each release; past the bound, the window typed in
@@ -2920,6 +2948,7 @@ impl TerminalManager {
             user_input_clock: 0,
             last_line_input: None,
             turn_started_at: None,
+            turn_idle_since: None,
             handover_replier: None,
             refused_size: None,
             first_attachment_grant_used: false,
@@ -3429,6 +3458,8 @@ impl TerminalManager {
             // A fresh agent is idle; a Working report seen while idle starts a turn. A Working
             // report the channel coalesced away leaves the input line dirty, never clean.
             let mut idle = true;
+            // The observed time of the latest idle report read in the current idle stretch.
+            let mut idle_since: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
@@ -3441,7 +3472,9 @@ impl TerminalManager {
                     continue;
                 };
                 let turn_start = idle && observation.state == TerminalAgentState::Working;
+                let turn_idle_since = idle_since;
                 idle = observation.state == TerminalAgentState::Done;
+                idle_since = idle.then_some(observation.observed_at);
                 if !turn_start
                     && published.is_some_and(|previous| {
                         previous.state == observation.state
@@ -3469,6 +3502,7 @@ impl TerminalManager {
                     }
                     if turn_start {
                         session.turn_started_at = Some(observation.observed_at);
+                        session.turn_idle_since = turn_idle_since;
                     }
                     session.agent_status = Some(SessionAgentStatus::Observed(observation));
                     session.summary()
@@ -4679,6 +4713,7 @@ impl TerminalManager {
     /// agent reads ready for a prompt, nothing was typed since the agent last started a turn,
     /// `still_wanted` holds, and no earlier input is pending. A granted write ends the ready
     /// period, so one write goes per period. Dropping the future drops a write not yet started.
+    /// `still_wanted` runs with the session lock held, so it must not wait on anything.
     pub async fn write_when_ready(
         &self,
         thread_id: &str,
@@ -4707,14 +4742,12 @@ impl TerminalManager {
             let guard: WriteGuard = Box::new(move || {
                 #[cfg(test)]
                 generation.pause_before_write_guard();
-                // The mailbox first, then the terminal under its lock, with nothing slow between
-                // that read and the write. The lock is not held across the write: input that
-                // arrives after this check is queued behind the pointer.
-                if !still_wanted() {
-                    return false;
-                }
+                // The caller's wish and the terminal, both read under the session lock, so neither
+                // changes between its read and the write; nothing slow runs between them. The lock
+                // is not held across the write: input that arrives after this check is queued
+                // behind the pointer.
                 let locked = session.blocking_lock();
-                if refusal(&locked, &generation, &guard_process).is_some() {
+                if !still_wanted() || refusal(&locked, &generation, &guard_process).is_some() {
                     return false;
                 }
                 end_ready_period(&generation);
@@ -12147,7 +12180,12 @@ mod tests {
         lease.publish_agent_status(TerminalAgentState::Working, false);
         tokio::time::sleep(Duration::from_millis(2)).await;
         manager
-            .write_from("thread-a", "term-1", "draft", TerminalInputOrigin::User("w"))
+            .write_from(
+                "thread-a",
+                "term-1",
+                "draft",
+                TerminalInputOrigin::User("w"),
+            )
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(2)).await;
