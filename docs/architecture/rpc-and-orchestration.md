@@ -3583,7 +3583,14 @@ streaming assistant messages, clears the active turn, and projects the existing
 restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
-projections without live runtimes retain their existing state.
+projections without live runtimes retain their existing state. After those loops,
+every started turn still running is failed the same way with the session-stopped error
+("Provider session ended when BiBCode stopped. Review delivery status before continuing."),
+which covers a turn cut off before its send was accepted while its session read ready; the
+runtime row is left alone, so a suspended session still resumes. Assistant replies left streaming
+are settled last, so an abandoned turn fails before its reply settles instead of completing.
+Queued messages that never started are untouched
+(`reconcile_abandoned_provider_sessions`).
 
 A deleted thread (including every thread of a deleted project) can never accept
 a session projection, so its work is terminal rather than retryable. Each
@@ -4748,7 +4755,9 @@ Message), made with Send to agent. An **agent message** is one agent's message t
 and, for an AI Terminal, the mailbox, and differ in who may start them and which rules apply.
 The code is `apps/server/src/send_requests/` and `apps/server/src/agent_messaging/`. The tables
 are `send_requests` (migration 75, which also adds `projection_thread_messages.person_send_json`)
-and `agent_messages` (migration 76).
+and `agent_messages` (migration 76). Migration 76 changed while unreleased: a developer database
+that ran an earlier build of it lacks `sender_terminal_generation` and the unique index over the
+sender, generation and `clientRequestId`, and no later start adds them (the migration only creates the table when it is missing).
 
 ### The person-send path
 
@@ -4804,15 +4813,21 @@ attachments. Every change is a compare and set on the stored state, so a late ev
 request back or overwrites a final state, and every change is published to subscribers in the
 order it was stored.
 
-| State          | For a chat target                                                                      | For an AI Terminal target                                    |
-| -------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `queued`       | Its queue entry waits behind the turn that runs                                        | Stored in the terminal's mailbox, not yet announced          |
-| `waiting`      | `queue_paused`: the entry is held, or the session errored, was interrupted or stopped  | Not used                                                     |
-| `delivered`    | Not used                                                                               | The pointer line was typed                                   |
-| `read`         | The target's turn for it started                                                       | `bibcode agent inbox` returned it                            |
-| `answered`     | The turn completed with an assistant message (or a proposed plan, which is the answer) | The terminal replied with `bibcode agent reply`              |
-| `not_answered` | `target_deleted`, `delivery_failed`, `turn_failed`, `turn_interrupted` or `no_answer`  | `recipient_gone`                                             |
-| `cancelled`    | `sendRequests.cancel` won the race against the claim                                   | `sendRequests.cancel` before the pointer or an inbox read it |
+| State          | For a chat target                                                                                            | For an AI Terminal target                                    |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| `queued`       | Its queue entry waits behind the turn that runs                                                              | Stored in the terminal's mailbox, not yet announced          |
+| `waiting`      | `queue_paused`: the entry is held, or the session errored, was interrupted or stopped                        | Not used                                                     |
+| `delivered`    | Not used                                                                                                     | The pointer line was typed                                   |
+| `read`         | The target's turn for it started                                                                             | `bibcode agent inbox` returned it                            |
+| `answered`     | The turn completed with an assistant message (or a proposed plan, which is the answer)                       | The terminal replied with `bibcode agent reply`              |
+| `not_answered` | `target_deleted`, `delivery_failed`, `turn_failed`, `turn_interrupted`, `no_answer` or `answer_not_recorded` | `recipient_gone`                                             |
+| `cancelled`    | `sendRequests.cancel` won the race against the claim                                                         | `sendRequests.cancel` before the pointer or an inbox read it |
+
+`answer_not_recorded` ends a chat request whose target message delivery recovery found delivered
+at an idle provider with no turn of it (`TurnDeliveryFailureReason::FoundWithoutTurn`): BiBCode
+stopped before it recorded the turn, so the answer cannot be read. Nothing is sent again, because
+the provider already holds the message. The web row reads "BiBCode stopped before it could record
+the answer". The agent-message counterpart is `failed` with `recipient_turn_failed`.
 
 The **follower** (`SendRequestsService::start_follower`) moves a chat request. It sweeps every open
 request once at start, then re-reads the requests of a target thread on each event of it (a
@@ -4885,7 +4900,8 @@ is `AgentMessagingConflictError`.
 status is never left. For a chat message the tracker derives the status from the recipient: a deleted
 recipient is `failed` with `recipient_gone`; a turn that started from the message's own queue
 entry is `consumed`, and `completed` once the turn completed and its reply stopped streaming
-(`failed` with `recipient_turn_failed` for an errored or interrupted turn); with no such turn the
+(`failed` with `recipient_turn_failed` for an errored or interrupted turn, and also when delivery
+recovery after a restart found the message delivered at an idle provider with no turn of it); with no such turn the
 outbox entry decides (`pending` or `sending` is `accepted`, `queued` is `queued` or, when held,
 `held` with `recipient_queue_held`, `delivered` is `delivered`, `uncertain` is `held` with
 `delivery_uncertain`, `failed` or `dismissed` is `failed` with `delivery_failed`). The tracker

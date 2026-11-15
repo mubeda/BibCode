@@ -8,6 +8,15 @@
 - An AI Terminal can be the source and the target of a request. As a source it attaches your selection, else the CLI's own conversation when BiBCode can read it (Claude's transcript, Codex's newest 20 turns), else the recent output, and the preview says which. As a target it is told with one fixed line once its agent waits for a prompt, and reads the request with `bibcode agent inbox`. A Claude Code terminal counts as waiting only after Claude's own idle notice, which comes once the prompt has waited a while.
 - **Agent messaging**, off by default in Settings → Agents → Agent integrations, lets the agents of one project message each other with `agents_list`, `agent_message_send`, `agent_message_reply`, `agent_message_status` and `agent_message_cancel`, and an AI Terminal's agent with `bibcode agent`. A message names its sender in an envelope and shows in the recipient's transcript with a **From agent** chip. An agent can message only an agent that runs with no more access than its own, an exchange stops after 8 hops until you write, a sender may send 30 messages a minute, and a recipient may hold 20 unread ones. Sends, replies and the delivered, read and failed steps are rows of Agent activity with ids, thread titles and states, never message text.
 - A side chat's seed and the context handoff after a lost provider session now start with your first message (cut at 4,000 characters) in front of the last 40.
+- A message to a Codex agent, in a chat or an AI Terminal, no longer loads a skill: a `$name` in its text gets a zero-width space after the `$`, and the envelope says so in one header line.
+- A restarted AI Terminal can no longer read the status of, or cancel, the messages its predecessor sent, and a reply to a message from a terminal that has since restarted is refused instead of reaching the new process.
+- A request whose delivery BiBCode could not record before it stopped now ends as **did not answer: BiBCode stopped before it could record the answer** instead of staying queued, and nothing is sent again.
+- The recent output a Send to agent attaches from a full-screen terminal app is readable when the terminal is on screen, because it is read from what the terminal shows. A terminal that is not on screen, and Take over from started in a chat, still read the raw output.
+- Take over from keeps the newest part of a long terminal conversation instead of its oldest.
+- A Cursor answer chunk that arrives after its turn completed is no longer lost, and `wait_for_thread` no longer returns a reply that is still streaming.
+- A terminal attachment or `terminal_read` tail no longer starts with half an escape sequence.
+- AI Terminal agent calls (`bibcode agent`) appear in the Profiler's request timings as `agent.<operation>`.
+- When the server restarts, a turn that was still running is failed and replies left streaming are settled, so a thread no longer shows a turn that never ends.
 
 ## [v0.16.0] - 2026-11-14
 
