@@ -2815,6 +2815,25 @@ pub async fn reconcile_abandoned_provider_sessions(
             tracing::warn!(%error, "failed to read streaming reasoning for startup reconciliation");
         }
     }
+    // The same holds for assistant messages. A stop after a turn ended but before its reply
+    // settled leaves no active turn, so the session loop below would not settle that reply.
+    match repositories.list_streaming_assistant_messages().await {
+        Ok(rows) => {
+            if let Err(error) = settle_streaming_assistant_message_rows(
+                engine,
+                rows,
+                &format!("provider-restart-reconcile-messages:{}", Uuid::new_v4()),
+                &now(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "assistant messages remained streaming after startup reconciliation");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read streaming assistant messages for startup reconciliation");
+        }
+    }
     let runtimes = repositories
         .list_provider_session_runtimes()
         .await

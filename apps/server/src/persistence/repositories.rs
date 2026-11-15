@@ -1616,6 +1616,21 @@ impl Repositories {
             })
             .await
     }
+    /// Every assistant message still streaming, in any thread.
+    pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!(
+                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 ORDER BY thread_id ASC, rowid ASC"
+                    ),
+                    [],
+                    decode_message,
+                )
+            })
+            .await
+    }
     pub async fn delete_messages_by_thread(&self, thread_id: String) -> Result<()> {
         self.delete(
             "DELETE FROM projection_thread_messages WHERE thread_id = ?",
