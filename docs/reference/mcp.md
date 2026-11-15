@@ -4788,7 +4788,9 @@ The statuses, in the order a message goes through them:
 
 The reasons are `messaging_off`, `recipient_mode_above_sender`, `recipient_queue_held` and
 `delivery_uncertain` for `held`, and `recipient_gone`, `recipient_turn_failed` and
-`delivery_failed` for `failed`. `recipient_gone` also ends the mail of a terminal whose process
+`delivery_failed` for `failed`. `recipient_turn_failed` also covers a restart that found the
+message delivered at an idle provider with no turn of it: BiBCode stopped before it recorded the
+turn, nothing is sent again, and the reply cannot be read. `recipient_gone` also ends the mail of a terminal whose process
 ended before it read it.
 
 Errors: `AgentMessagingDisabledError`, `AgentMessagingInvalidArgumentError`,
@@ -4929,6 +4931,32 @@ address can neither read the status of nor cancel its predecessor's messages: it
 terminal sender has since restarted or exited is refused with `AgentMessagingRecipientGoneError`
 and never reaches the new process. The hop ledger and the rate and backlog limits still count
 per address.
+
+### Accepted limits
+
+These are decisions, not bugs:
+
+- A Claude Code terminal reads ready for the pointer line only after Claude's `idle_prompt`
+  notification (see above).
+- A Claude Code build outside the hooked versions (2.1.220 to 2.1.323), or any terminal that
+  reads **Status unavailable**, has no observer, so `canReceive` is false and the pointer line is
+  never typed. Its agent can still read mail with `bibcode agent inbox`.
+- A fresh agent is not ready before its first end-of-turn signal. A CLI that waits on its own
+  start-up question (a folder trust or sign-in prompt) has sent none, so the pointer line is not
+  typed until it answers.
+- A Codex terminal's conversation is its newest 20 turns only.
+- A Claude terminal whose transcript is under a config folder other than the one BiBCode derives
+  (`CLAUDE_CONFIG_DIR` of the launch environment, else the server's, else `.claude`) falls back to
+  the recent output.
+- The server launches no Claude session id of its own, so a forged hook can name another Claude
+  session of the same working directory, and its transcript can be read for a Send to agent. Those
+  files belong to the same user.
+- A terminal tail (`terminal_read` without a cursor, and the output a Send to agent attaches)
+  looks back 4,096 bytes for the escape that opens a sequence it cuts into. A sequence that started
+  further back, such as a long clipboard payload, can still leave its remainder at the start.
+- A developer database that ran an earlier build of the unreleased migration 76 lacks
+  `sender_terminal_generation` and the unique index over sender, generation and `clientRequestId`.
+- The Windows `bibcode.exe` shim was not tested.
 
 ### Errors of the provider tools
 

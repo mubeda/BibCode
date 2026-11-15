@@ -518,6 +518,14 @@ the output stood in.
   only, sets `startMissing` (a last answer never does);
   only the newest 20 turns are ever read.
 - **OpenCode** has no conversation reader. Its Second opinion and Hand off use the recent output.
+- **Recent output.** When the terminal is on screen, the client reads the text from the
+  terminal's rendered buffer (`terminalBufferText` in `terminalSource.logic.ts`): scrollback and
+  screen for the normal buffer, only the screen for the alternate buffer of a full-screen app
+  (always marked as cut), wrapped rows joined, trailing blank rows dropped, and the end kept at
+  16,000 characters. It is marked as cut when the buffer has already dropped its oldest rows. A
+  terminal that is not on screen, and a Take over from started in a chat, use the server's raw
+  read (`plain_tail`), which strips escape sequences from the retained bytes and so garbles an app
+  that repaints with cursor movement. This is a known limit.
 - **Accepted limits.** The server launches no Claude session id of its own, so a forged hook can
   name another Claude session of the same working directory, whose file belongs to the same user.
   The held project folder can still be renamed out of `projects` before the open, two working

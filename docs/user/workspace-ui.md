@@ -801,7 +801,9 @@ its control) with its state:
 **Cancel** withdraws a request the agent has not taken. It is refused once a chat agent started
 its turn on the request, and once a terminal's agent was told about it. The reasons for "did not answer" are "its
 queue is paused", "BiBCode could not deliver it", "its turn failed", "its turn was interrupted",
-"the agent was deleted", "it finished without an answer" and, for an AI Terminal, "the terminal
+"the agent was deleted", "it finished without an answer", "BiBCode stopped before it could record the answer" (BiBCode
+restarted after handing the request to the agent and could not find its turn, so nothing is
+sent again) and, for an AI Terminal, "the terminal
 closed". A Message, a Hand off and a Take over from need nothing more once the agent read them,
 so their row goes then. A Review and a Second opinion keep their row until you dismiss it.
 
@@ -821,7 +823,12 @@ quoted in the note, because a Message needs an agent first; nothing is typed int
   Otherwise BiBCode reads the CLI's own conversation when it can ("Conversation of <terminal>"),
   and otherwise attaches the recent output ("Recent output of <terminal>, because the
   conversation could not be read"). The preview says which, so you can remove what you do not
-  want. A Claude terminal's conversation is the session its hooks reported, read only from the
+  want. The recent output of a terminal that is on screen is read from its rendered buffer: the
+  scrollback plus the screen, or only the screen for a full-screen app, marked as cut when the
+  scrollback limit already dropped lines. A terminal that is not on screen, and a Take over from
+  started in a chat, use the server's raw read of the output instead, which is garbled for a
+  full-screen app that repaints. A
+  Claude terminal's conversation is the session its hooks reported, read only from the
   Claude project folder of the terminal's own working directory, and a transcript elsewhere,
   such as under another config folder, falls back to the recent output. A Codex terminal's
   conversation is its newest 20 turns, and a Hand off says "The start of the conversation is
