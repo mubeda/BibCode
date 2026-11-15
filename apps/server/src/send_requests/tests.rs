@@ -856,6 +856,33 @@ async fn send_take_over_refuses_a_missing_or_self_taken_over_thread() {
 }
 
 #[tokio::test]
+async fn send_take_over_refuses_only_the_exact_same_agent_address() {
+    let harness = harness().await;
+    let own_work = |result: Result<_, serde_json::Value>| {
+        result
+            .err()
+            .is_some_and(|error| error.to_string().contains("cannot take over its own work"))
+    };
+    // A chat agent and an AI Terminal of one thread are different agents.
+    let mut shared_thread = input("r1", "take-over", "thread:b", "thread:b");
+    shared_thread.taken_over = Some("terminal:b/term-1".to_owned());
+    assert!(!own_work(
+        harness.send_requests().send(&person(), shared_thread).await
+    ));
+    let mut terminals = input("r2", "take-over", "terminal:b/term-2", "terminal:b/term-2");
+    terminals.taken_over = Some("terminal:b/term-1".to_owned());
+    assert!(!own_work(
+        harness.send_requests().send(&person(), terminals).await
+    ));
+    let mut itself = input("r3", "take-over", "terminal:b/term-1", "terminal:b/term-1");
+    itself.taken_over = Some("terminal:b/term-1".to_owned());
+    assert!(own_work(
+        harness.send_requests().send(&person(), itself).await
+    ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn send_refuses_an_outside_agent_session() {
     let harness = harness().await;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
