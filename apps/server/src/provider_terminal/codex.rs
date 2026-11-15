@@ -1813,11 +1813,16 @@ async fn run_codex_observer_inner(
                     reconciliation_sequence = reconciliation_sequence.saturating_add(1);
                     let buffered = client.drain_request_buffered_notifications();
                     if client.take_lost_notifications() {
-                        // A dropped turn or ask leaves the root's state unknown, and nothing
-                        // still queued can be ordered against it: activity still reads it all,
-                        // but only an event read after it can make the terminal ready.
-                        readiness.reset(generation);
-                        stale.extend(reconciled.drain(..).chain(buffered));
+                        recover_after_lost_codex_notifications(
+                            generation,
+                            &mut readiness,
+                            &mut *client,
+                            &root,
+                            &mut stale,
+                            &mut reconciled,
+                            buffered,
+                        )
+                        .await;
                     } else {
                         // Read in order before the next wait, as if the connection held them.
                         reconciled.extend(buffered);
@@ -2097,7 +2102,7 @@ async fn cross_codex_enable_barrier(
 
 /// Reports the root agent's state one notification carries; the next wait makes the terminal
 /// ready if it was the latest and fresh.
-fn report_codex_root(
+pub(super) fn report_codex_root(
     generation: &TerminalObserverGenerationLease,
     readiness: &mut PromptReadiness,
     envelope: &Value,
@@ -2771,8 +2776,10 @@ pub(super) async fn serve_codex_conversation_request(
     };
     let buffered = client.drain_request_buffered_notifications();
     if client.take_lost_notifications() {
-        readiness.reset(generation);
-        stale.extend(reconciled.drain(..).chain(buffered));
+        recover_after_lost_codex_notifications(
+            generation, readiness, client, root, stale, reconciled, buffered,
+        )
+        .await;
     } else {
         reconciled.extend(buffered);
     }
@@ -2785,6 +2792,43 @@ pub(super) async fn serve_codex_conversation_request(
         stale.drain(..kept - CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT);
     }
     request.answer(answer);
+}
+
+/// After a request lost notifications. A dropped turn or ask leaves the root's state unknown,
+/// and nothing still queued can be ordered against it: activity still reads it all, but only an
+/// event read after it can make the terminal ready. The loss may also have taken the root's turn
+/// end, which would leave its reported state stale, so the root's status is read again, as a
+/// resume does, and queued after what is left as a status notification: the loop reports it, in
+/// order, without making the terminal ready.
+async fn recover_after_lost_codex_notifications(
+    generation: &TerminalObserverGenerationLease,
+    readiness: &mut PromptReadiness,
+    client: &mut dyn CodexRemoteClient,
+    root: &str,
+    stale: &mut VecDeque<Value>,
+    reconciled: &mut VecDeque<Value>,
+    buffered: Vec<Value>,
+) {
+    readiness.reset(generation);
+    stale.extend(reconciled.drain(..).chain(buffered));
+    let params = serde_json::to_value(ThreadReadParams {
+        thread_id: root,
+        include_turns: false,
+    })
+    .expect("Codex terminal thread/read params serialize");
+    if let Ok(read) = bounded_codex_reconciliation_request(client, "thread/read", params).await
+        && read.pointer("/thread/id").and_then(Value::as_str) == Some(root)
+        && let Some(status) = read.pointer("/thread/status")
+    {
+        stale.push_back(json!({
+            "method": "thread/status/changed",
+            "params": {"threadId": root, "status": status},
+        }));
+    }
+    // Readiness is reset already, and what the read buffered follows its snapshot, as at a
+    // resume.
+    client.take_lost_notifications();
+    stale.extend(client.drain_request_buffered_notifications());
 }
 
 /// Reads a descendant as the structured runtime does: metadata without turns, then

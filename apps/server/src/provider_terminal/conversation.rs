@@ -131,8 +131,10 @@ fn read_claude_conversation_with(
     before_open();
     // Opened through the held folder and refusing a link, so a swap after the checks above
     // follows nothing; what was opened is checked on the open file itself.
-    // Accepted limit: the held folder can still be renamed out of `projects` before this open,
-    // but whoever can do that can as easily put the same file inside it, as the same user.
+    // Accepted limits: the held folder can still be renamed out of `projects` before this open;
+    // two working directories can share a project folder name (`/work/a-b` and `/work/a/b`, or
+    // long paths that share their first 200 encoded characters); and a linked launch folder can
+    // be retargeted after launch. Each needs the same user, who can read those files anyway.
     let file = dir.open_file(name, Open::Read).map_err(opened)?;
     let metadata = file.metadata().map_err(|_| Refusal::Unreadable)?;
     if !metadata.is_file() {
@@ -670,7 +672,7 @@ mod tests {
             TerminalAgentState, TerminalObserverGeneration, TerminalObserverGenerationLease,
             codex::{
                 CodexRemoteClient, answer_codex_conversation, decode_codex_conversation_page,
-                serve_codex_conversation_request,
+                report_codex_root, serve_codex_conversation_request,
             },
             conversation::CodexConversationRequest,
             model::{PromptEvidence, PromptReadiness, TerminalAgentReport},
@@ -970,6 +972,73 @@ mod tests {
             assert!(
                 client.requests.lock().unwrap().is_empty(),
                 "the provider was asked for a caller that gave up"
+            );
+        }
+
+        #[tokio::test]
+        async fn codex_a_lossy_request_recovers_the_roots_state_and_keeps_readiness_reset() {
+            let generation = TerminalObserverGeneration::new("thread".into(), "term".into());
+            let lease = generation.observation();
+            let mut readiness = PromptReadiness::default();
+            readiness.observe(
+                &lease,
+                TerminalAgentReport::Set(TerminalAgentState::Working, false),
+                false,
+                PromptEvidence::Fresh,
+            );
+            // The root's turn end and idle were evicted while the request waited.
+            let mut client = ScriptedClient::answering(Reply::Page(recorded_page()));
+            client.replies.push_back(Reply::Page(json!({
+                "thread": {"id": ROOT, "status": {"type": "idle"}, "turns": []},
+            })));
+            client.lost = true;
+            client.buffered = vec![json!({
+                "method": "item/completed",
+                "params": {"threadId": "descendant-1"},
+            })];
+            let requests = client.requests.clone();
+            let (mut stale, mut reconciled) = (VecDeque::new(), VecDeque::new());
+
+            serve(
+                &lease,
+                &mut readiness,
+                &mut client,
+                &mut stale,
+                &mut reconciled,
+            )
+            .await
+            .expect("readable");
+            // The loop reads what is queued, in order, before its next wait.
+            while let Some(envelope) = stale.pop_front().or_else(|| reconciled.pop_front()) {
+                report_codex_root(
+                    &lease,
+                    &mut readiness,
+                    &envelope,
+                    ROOT,
+                    PromptEvidence::Stale,
+                );
+            }
+
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(method, params)| method == "thread/read" && params["threadId"] == ROOT),
+                "the root's status was read again"
+            );
+            assert_eq!(
+                lease
+                    .subscribe_agent_status()
+                    .borrow()
+                    .map(|status| status.state),
+                Some(TerminalAgentState::Done),
+                "the root's recovered state is reported"
+            );
+            next_wait(&lease, &mut readiness).await;
+            assert!(
+                !reads_ready(&lease),
+                "only a root event read afterwards makes it ready"
             );
         }
 
