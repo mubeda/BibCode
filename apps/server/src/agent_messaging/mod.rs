@@ -1289,7 +1289,8 @@ impl AgentMessaging {
     }
 }
 
-/// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it.
+/// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it
+/// (`completed` once it replied, so a retry with the same `clientRequestId` replays its receipt).
 fn received_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
     if message.recipient_address != caller.address() {
         return false;
@@ -1297,9 +1298,11 @@ fn received_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
     match caller {
         AgentCaller::Thread(_) => true,
         AgentCaller::Terminal(identity) => {
-            message.status == AgentMessageStatus::Consumed
-                && message.recipient_terminal_generation.as_deref()
-                    == Some(identity.generation_key().as_str())
+            matches!(
+                message.status,
+                AgentMessageStatus::Consumed | AgentMessageStatus::Completed
+            ) && message.recipient_terminal_generation.as_deref()
+                == Some(identity.generation_key().as_str())
         }
     }
 }
