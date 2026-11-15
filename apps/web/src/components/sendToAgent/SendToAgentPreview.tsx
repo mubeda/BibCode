@@ -50,6 +50,8 @@ export interface SendToAgentPreviewProps {
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
   /** Shown when `loadAttachments` fails; defaults to `LOAD_FAILED_MESSAGE`. */
   loadFailedMessage?: string;
+  /** Shown while `loadAttachments` runs; defaults to `LOADING_MESSAGE`. */
+  loadingMessage?: string;
   extraContent?: ReactNode;
   warning?: string | null;
   onClose: () => void;
@@ -61,6 +63,7 @@ export interface SendToAgentPreviewProps {
 
 const formatCount = (count: number) => count.toLocaleString("en-US");
 
+export const LOADING_MESSAGE = "Reading the messages to attach";
 export const LOAD_FAILED_MESSAGE = "BiBCode could not read the messages to attach. Try again.";
 
 export function SendToAgentPreview(props: SendToAgentPreviewProps) {
@@ -218,7 +221,7 @@ function PreviewBody(props: SendToAgentPreviewProps) {
         {/* Both regions stay mounted, so a screen reader announces each change of their text. */}
         <div className="flex flex-col gap-1 text-sm">
           <p role="status" className="text-muted-foreground">
-            {loading === "loading" ? "Reading the messages to attach" : ""}
+            {loading === "loading" ? (props.loadingMessage ?? LOADING_MESSAGE) : ""}
           </p>
           <div role="alert" className="text-destructive-foreground">
             {loading === "failed"

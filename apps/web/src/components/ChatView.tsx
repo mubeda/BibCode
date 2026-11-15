@@ -5366,27 +5366,6 @@ function ChatViewContent(props: ChatViewProps) {
       sendRequestsSupported,
     ],
   );
-  // What every AI Terminal control under this chat needs; null outside a stored thread.
-  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
-    () =>
-      isServerThread
-        ? {
-            serverSupported: sendRequestsSupported,
-            newPanelProvidersFor: sendNewPanelProvidersFor,
-            createPanel: createSendPanel,
-            revealPanel: revealSendPanel,
-            previewContentFor: sendPreviewContentFor,
-          }
-        : null,
-    [
-      createSendPanel,
-      isServerThread,
-      revealSendPanel,
-      sendNewPanelProvidersFor,
-      sendPreviewContentFor,
-      sendRequestsSupported,
-    ],
-  );
   const sendRequests = useSendRequests(
     isServerThread && sendRequestsSupported ? environmentId : null,
   );
@@ -5444,6 +5423,33 @@ function ChatViewContent(props: ChatViewProps) {
       void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(hostRef) });
     },
     [centerPanelActions, navigate],
+  );
+  // What every AI Terminal control under this chat needs; null outside a stored thread.
+  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
+    () =>
+      isServerThread
+        ? {
+            serverSupported: sendRequestsSupported,
+            newPanelProvidersFor: sendNewPanelProvidersFor,
+            createPanel: createSendPanel,
+            revealPanel: revealSendPanel,
+            previewContentFor: sendPreviewContentFor,
+            openSendTarget: handleOpenSendTarget,
+            cancelSendRequest: handleCancelSendRequest,
+            dismissSendRequest: handleDismissSendRequest,
+          }
+        : null,
+    [
+      createSendPanel,
+      handleCancelSendRequest,
+      handleDismissSendRequest,
+      handleOpenSendTarget,
+      isServerThread,
+      revealSendPanel,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
+      sendRequestsSupported,
+    ],
   );
   // A Review or Second opinion that is answered, or not, gets the notice with Bring back; the
   // other actions keep the plain row.

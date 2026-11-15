@@ -84,6 +84,7 @@ function render(
     request?: SendRequest;
     onOpen?: () => void;
     onDismiss?: (id: string) => Promise<void>;
+    onBringBack?: (text: string) => void;
   } = {},
 ) {
   const onDismiss = props.onDismiss ?? vi.fn(() => Promise.resolve());
@@ -94,6 +95,7 @@ function render(
         hostRef={HOST}
         onOpen={props.onOpen ?? vi.fn()}
         onDismiss={onDismiss}
+        {...(props.onBringBack === undefined ? {} : { onBringBack: props.onBringBack })}
       />,
     ),
   );
@@ -216,6 +218,51 @@ describe("AnswerNotice", () => {
     const region = container.querySelector('[role="status"]')!;
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.querySelector("[data-answer-notice]")).not.toBeNull();
+  });
+
+  describe("a terminal source", () => {
+    const terminalRequest = (overrides: Partial<SendRequest> = {}) =>
+      request({ source: "terminal:source/term-1", ...overrides });
+
+    it("a_terminal_answer_is_quoted_from_the_getAnswer_text", async () => {
+      const onBringBack = vi.fn();
+      h.getAnswer = vi.fn(() =>
+        Promise.resolve({
+          _tag: "Success",
+          value: { requestId: "request-1", text: "Two bugs.", truncated: true },
+        }),
+      ) as never;
+      render({ request: terminalRequest(), onBringBack });
+      await act(async () => button("Bring back")!.click());
+      await flush();
+      expect(h.getAnswer).toHaveBeenCalledWith("request-1");
+      expect(onBringBack).toHaveBeenCalledWith(
+        "Review from Parser agent:\n\n> Two bugs.\n\n(The answer was cut at 48,000 characters.)",
+      );
+    });
+
+    it("bring_back_opens_the_terminal_composer_with_the_quoted_answer_and_types_nothing", async () => {
+      const onBringBack = vi.fn();
+      const { onDismiss } = render({ request: terminalRequest(), onBringBack });
+      await act(async () => button("Bring back")!.click());
+      await flush();
+      expect(onBringBack).toHaveBeenCalledTimes(1);
+      expect(onBringBack.mock.calls[0]![0]).toContain("> Two bugs.");
+      // The owner thread's composer is untouched and no command ran: nothing reaches the terminal.
+      expect(h.drafts.size).toBe(0);
+      expect(h.commands).toEqual([]);
+      expect(onDismiss).toHaveBeenCalledWith("request-1");
+    });
+
+    it("a_not_answered_terminal_request_offers_open_and_no_bring_back", () => {
+      render({
+        request: terminalRequest({ state: "not_answered", reason: "recipient_gone" }),
+        onBringBack: vi.fn(),
+      });
+      expect(container.textContent).toContain("did not answer: the terminal closed");
+      expect(button("Open")).toBeDefined();
+      expect(button("Bring back")).toBeUndefined();
+    });
   });
 
   it("showing the notice marks its request opened", () => {

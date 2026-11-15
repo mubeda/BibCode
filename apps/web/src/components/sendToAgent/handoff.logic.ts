@@ -8,6 +8,10 @@ import type { ThreadId } from "@bibcode/contracts";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { ATTACHMENT_MAX_CHARS, cutAtCharacters, formatLeftOut } from "./attachments.logic";
 import type { PreviewAttachment, PreviewContent, SendToAgentSource } from "./sendToAgent.logic";
+import {
+  TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
+  TERMINAL_OUTPUT_LOADING_MESSAGE,
+} from "./terminalSource.logic";
 
 // Defined beside `submitSendChoice`, its only caller, so the two modules do not import each other.
 export { resolveRequestRoles } from "./sendToAgent.logic";
@@ -89,6 +93,8 @@ export function buildTakeOverContent(input: {
   return {
     leadIn: TAKE_OVER_LEAD_IN,
     attachments: [],
+    loadFailedMessage: TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
+    loadingMessage: TERMINAL_OUTPUT_LOADING_MESSAGE,
     loadAttachments: async () => {
       const output = await loadTerminalOutput(picked);
       const cut = cutAtCharacters(output.text, ATTACHMENT_MAX_CHARS);

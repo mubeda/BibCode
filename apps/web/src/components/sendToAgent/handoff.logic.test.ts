@@ -12,6 +12,10 @@ import {
   type HandoffLoader,
   type TerminalOutputLoader,
 } from "./handoff.logic";
+import {
+  TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
+  TERMINAL_OUTPUT_LOADING_MESSAGE,
+} from "./terminalSource.logic";
 import { agentAddress, type SendChoice, type SendToAgentSource } from "./sendToAgent.logic";
 
 const ENVIRONMENT = EnvironmentId.make("environment-a");
@@ -143,6 +147,28 @@ describe("handoff.logic", () => {
     expect(content.attachments).toEqual([]);
     expect(content.loadAttachments).toBeUndefined();
     expect(loadHandoff).not.toHaveBeenCalled();
+  });
+
+  it("a picked terminal names the terminal's output, not messages, while reading and when the read fails", () => {
+    const content = buildTakeOverContent({
+      source,
+      picked: row("other", "Terminal agent", "term-1"),
+      loadHandoff: loader(),
+      loadTerminalOutput: terminalOutput(),
+    });
+    expect(content.loadFailedMessage).toBe(TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE);
+    expect(content.loadingMessage).toBe(TERMINAL_OUTPUT_LOADING_MESSAGE);
+  });
+
+  it("a picked chat keeps the messages wording", () => {
+    const content = buildTakeOverContent({
+      source,
+      picked: row("other", "Chat agent"),
+      loadHandoff: loader(),
+      loadTerminalOutput: null,
+    });
+    expect(content.loadFailedMessage).toBeUndefined();
+    expect(content.loadingMessage).toBeUndefined();
   });
 
   it('a picked terminal whose conversation is readable attaches it under the label "Terminal conversation" with no fallback note and shows "The start of the conversation is not included." only when startMissing is true', async () => {

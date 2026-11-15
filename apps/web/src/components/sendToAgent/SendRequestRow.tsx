@@ -48,6 +48,16 @@ export function selectRowsForThread(
   );
 }
 
+/** Requests an AI Terminal sent: they wait on its control, not above a composer. */
+export function selectRowsForTerminal(
+  requests: ReadonlyArray<SendRequest>,
+  threadId: ThreadId,
+  terminalId: string,
+): ReadonlyArray<SendRequest> {
+  const address = `terminal:${threadId}/${terminalId}`;
+  return requests.filter((request) => request.source === address);
+}
+
 export function describeRequestRow(
   request: SendRequest,
   targetTitle: string | null,

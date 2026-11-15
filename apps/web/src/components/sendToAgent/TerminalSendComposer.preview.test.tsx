@@ -104,6 +104,9 @@ const services: TerminalSendToAgentServices = {
   createPanel,
   revealPanel: () => undefined,
   previewContentFor: () => ({ leadIn: "", attachments: [] }),
+  openSendTarget: () => undefined,
+  cancelSendRequest: () => Promise.resolve(),
+  dismissSendRequest: () => Promise.resolve(),
 };
 const threadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("owner") };
 

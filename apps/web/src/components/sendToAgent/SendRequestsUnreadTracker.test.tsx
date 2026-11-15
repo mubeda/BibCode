@@ -148,6 +148,32 @@ describe("SendRequestsUnreadTracker", () => {
     expect(unread()).toEqual([key("source")]);
   });
 
+  it("the_owning_thread_not_the_terminal_is_marked_unread", () => {
+    h.requests.set("environment-a", [
+      request("r1", { source: "terminal:owner/term-1", sourceThreadId: ThreadId.make("owner") }),
+    ]);
+    act(() => root.render(<SendRequestsUnreadTracker />));
+    expect(unread()).toEqual([key("owner")]);
+    expect(unread().some((entry) => entry.includes("term-1"))).toBe(false);
+  });
+
+  it("an_answer_arriving_while_the_terminal_is_closed_marks_the_owner_thread_unread", () => {
+    // Only the tracker is mounted: no terminal panel and no notice exist.
+    const terminalRequest = (state: SendRequest["state"]) =>
+      request("r1", {
+        source: "terminal:owner/term-1",
+        sourceThreadId: ThreadId.make("owner"),
+        state,
+      });
+    h.requests.set("environment-a", [terminalRequest("read")]);
+    act(() => root.render(<SendRequestsUnreadTracker />));
+    expect(unread()).toEqual([]);
+    h.requests.set("environment-a", [terminalRequest("answered")]);
+    // The mocked request list is not reactive; a store change re-renders the tracker.
+    act(() => useSendRequestOpenedStore.setState({ openedIds: [] }));
+    expect(unread()).toEqual([key("owner")]);
+  });
+
   it("opening the notice clears the mark the tracker set", () => {
     h.requests.set("environment-a", [request("r1")]);
     act(() => root.render(<SendRequestsUnreadTracker />));
