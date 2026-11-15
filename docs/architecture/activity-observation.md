@@ -514,7 +514,8 @@ the output stood in.
   suspends readiness, then queues the notifications the request buffered the way a
   reconciliation does, and recovers the root's state with `thread/read` if notifications were
   lost meanwhile, so the terminal reads ready again only at the next wait on the live stream. A
-  page that does not reach the oldest turn leaves the first message out and sets `startMissing`;
+  page that does not reach the oldest turn leaves the first message out and, for a Hand off
+  only, sets `startMissing` (a last answer never does);
   only the newest 20 turns are ever read.
 - **OpenCode** has no conversation reader. Its Second opinion and Hand off use the recent output.
 - **Accepted limits.** The server launches no Claude session id of its own, so a forged hook can

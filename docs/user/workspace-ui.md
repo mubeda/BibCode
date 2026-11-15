@@ -741,18 +741,19 @@ agent." Your own requests work whether or not [agent messaging](./mcp.md#agents-
 is on.
 
 Its menu has five actions, each listing the other agents of the project, most recently active
-first, then a new chat panel for each provider that is ready. An agent that is working shows
+first, then (except for Take over from) a new chat panel for each provider that is ready. Take
+over from lists the agents with a context or usage warning first and offers no new panel. An agent that is working shows
 **Busy**; it is still a valid choice, and the request waits for its turn. An agent that ran out
 of context or usage shows "Context window full" or "Out of usage until <time>" under its name,
 and the preview warns that it may not answer.
 
-| Action             | What it asks                                 | What it attaches                                                                                                                                                                       |
-| ------------------ | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Review**         | Review the code changes of this checkout     | Nothing: the reviewing agent reads the checkout. You pick **Branch vs origin/<base> and uncommitted changes** or **Uncommitted changes**. The prompt is the one of **Review changes**. |
-| **Second opinion** | Assess this agent's last answer              | **The user's last message** and **The agent's last finished answer**, each cut at 16,000 characters with the count left out                                                            |
-| **Hand off**       | Continue this thread's work in another agent | The attachment **Handoff from <title>** holds the thread's first message cut at 4,000 characters, a marker for what was left out, and its last 40 messages within 24,000 characters    |
-| **Take over from** | Continue in this thread after another agent  | The same handoff text, read from the agent you pick. It is queued on this agent. Nothing is sent to the picked one                                                                     |
-| **Message**        | Whatever you write                           | Nothing. The note is the message                                                                                                                                                       |
+| Action             | What it asks                                 | What it attaches                                                                                                                                                                                                                                   |
+| ------------------ | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Review**         | Review the code changes of this checkout     | Nothing: the reviewing agent reads the checkout. You pick **Branch vs origin/<base> and uncommitted changes** or **Uncommitted changes**. The prompt is the one of **Review changes**.                                                             |
+| **Second opinion** | Assess this agent's last answer              | **The user's last message** and **The agent's last finished answer**, each cut at 16,000 characters with the count left out                                                                                                                        |
+| **Hand off**       | Continue this thread's work in another agent | The attachment **Handoff from <title>** holds the thread's last 40 messages within 24,000 characters and, when the person's first message is older than those, that message in front (cut at 4,000 characters) with a marker for what was left out |
+| **Take over from** | Continue in this thread after another agent  | The same handoff text, read from the agent you pick. It is queued on this agent. Nothing is sent to the picked one                                                                                                                                 |
+| **Message**        | Whatever you write                           | Nothing. The note is the message                                                                                                                                                                                                                   |
 
 A request reaches the other agent as your own message. In a chat it reads "Review, sent from
 <title>", "Second opinion, sent from <title>" and so on, with no agent chip, because you sent
@@ -823,8 +824,9 @@ quoted in the note, because a Message needs an agent first; nothing is typed int
   want. A Claude terminal's conversation is the session its hooks reported, read only from the
   Claude project folder of the terminal's own working directory, and a transcript elsewhere,
   such as under another config folder, falls back to the recent output. A Codex terminal's
-  conversation is its newest 20 turns, and the preview says "The start of the conversation is
-  not included." when the conversation is longer. A terminal's text is read, never written:
+  conversation is its newest 20 turns, and a Hand off says "The start of the conversation is
+  not included." when the conversation is longer (a Second opinion reads only the last answer
+  and never says it). A terminal's text is read, never written:
   the preview types nothing into the terminal.
 - _As a target_, a terminal agent never gets your text typed for you. BiBCode stores the request
   and tells the agent with one fixed line, "BiBCode: you have new messages. Run `bibcode agent

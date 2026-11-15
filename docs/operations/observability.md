@@ -80,11 +80,11 @@ Send requests and agent messaging write no Profiler event or finding. Their fail
 `terminal mail could not be read`, `a terminal did not take the pointer in time` (a pointer
 write outran its 2 seconds), `agent messaging could not read a thread`, `could not issue an AI
 Terminal credential: no randomness` and `agent message activity rows were dropped: the writer
-fell behind` (with the count). `POST /api/agent/call` writes one `debug` line per call,
-`an AI Terminal agent call answered`, with the owner thread id, the terminal id and the outcome
+fell behind` (with the count). `POST /api/agent/call` writes one `debug` line per authenticated call (a call with no valid
+credential is refused first and logs none), `an AI Terminal agent call answered`, with the owner thread id, the terminal id and the outcome
 tag. Fields are ids, addresses, thread titles, states and error text of the store, never a note,
-an attachment, a message, an answer, a credential or terminal text. Each delivery step of an
-agent message is also a row of the agent activity log (`agent_message_send`,
+an attachment, a message, an answer, a credential or terminal text. The delivered, consumed and failed steps of an
+agent message (and the completion of a chat one) are also rows of the agent activity log (`agent_message_send`,
 `agent_message_reply` and `agent_message_delivery`), written by one task from a queue of 1,024
 rows that the runtime closes in its stop. The stop timings of `send-requests-follower`,
 `agent-message-tracker`, `terminal-pointer`, `agent-message-activity` and

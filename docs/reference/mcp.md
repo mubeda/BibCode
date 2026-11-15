@@ -4728,8 +4728,10 @@ Result: `{ "messageId", "conversationId", "status", "hop" }`. `status` is `accep
 for a chat agent and `queued` or `held` for a terminal. `hop` is 1 for a message that starts a
 conversation.
 
-A repeat with the same `clientRequestId`, recipient and text returns the first receipt, also
-after the recipient is gone, and a concurrent repeat is answered from the stored message. The
+A repeat with the same `clientRequestId`, recipient and text returns a receipt for the stored
+message with its current status (so `completed`, `cancelled` or `failed` too, not only the first
+status), also after the recipient is gone, and a concurrent repeat is answered from the stored
+message. The
 same id with another recipient or text is `AgentMessagingConflictError`.
 
 Errors: `AgentMessagingDisabledError`, `AgentMessagingInvalidArgumentError` (an empty or too long
@@ -4743,7 +4745,10 @@ other-project or own address, or a terminal that is not an AI Terminal or does n
 Replies to a message the caller received.
 
 Arguments: `inReplyTo` (the `message-id` of the envelope, required), `text` (1 to 16,000
-characters, required) and `clientRequestId` (optional).
+characters, required for a reply to an agent) and `clientRequestId` (optional). A reply to a
+person's request to a terminal is the exception: the server checks only that the text is not
+empty, the tool schema still advertises 16,000, and the request keeps the first 48,000
+characters as its answer (`truncated` beyond that).
 
 The reply goes to the sender of that message, in the same conversation, and returns at once
 with `{ "messageId", "conversationId", "status", "hop" }`; the hop follows the rules below. A
@@ -4800,12 +4805,15 @@ Arguments: `messageId` (required).
 
 Result: `{ "status": "cancelled" }`, also when the message was already cancelled.
 
-Errors: `AgentMessagingNotCancellableError` (already delivered, consumed or final),
+Errors: `AgentMessagingNotCancellableError` (a chat message already delivered to its provider,
+or any message that is consumed or final; a terminal message that was delivered, with its pointer
+typed, can still be cancelled until `bibcode agent inbox` returns it),
 `AgentMessagingInvalidArgumentError`, `AgentMessagingUnknownMessageError`, `McpStorageError`.
 
 ### Limits and rules
 
-- **Text.** 1 to 16,000 characters, counted as Unicode scalar values.
+- **Text.** 1 to 16,000 characters, counted as Unicode scalar values. A reply to a person's
+  request has no 16,000 limit (see `agent_message_reply`); its stored answer is cut at 48,000.
 - **Mode ceiling.** A recipient runs with at most the sender's access, in the order
   `approval-required`, `auto-accept-edits`, `full-access`. It is checked when the message is sent
   (`AgentMessagingModeCeilingError`) and again when the delivery is claimed: a message whose
@@ -4908,27 +4916,30 @@ runs now.
 
 ### Errors of the provider tools
 
-| `_tag` or `kind`                      | Meaning                                                                                           |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `AgentMessagingDisabledError`         | Agent messaging is off. Turn it on in Settings → Agents → Agent integrations.                     |
-| `AgentMessagingUnknownRecipientError` | No agent with that address in this project. Call `agents_list`.                                   |
-| `AgentMessagingInvalidArgumentError`  | An empty or too long text, or a missing or unknown argument. The message names the argument only. |
-| `AgentMessagingUnknownMessageError`   | No message with that id that the caller may use.                                                  |
-| `AgentMessagingRecipientGoneError`    | The agent a reply would go to no longer exists.                                                   |
-| `AgentMessagingModeCeilingError`      | The recipient runs with more access than the caller. The message names both modes.                |
-| `AgentMessagingConflictError`         | The `clientRequestId` was already used for a different message.                                   |
-| `AgentMessagingHopLimitError`         | The conversation reached 8 hops. A person has to write first.                                     |
-| `AgentMessagingNotCancellableError`   | The message was already handed to its recipient.                                                  |
-| `AgentMessagingRateLimitError`        | 30 messages in the last 60 seconds. Wait.                                                         |
-| `AgentMessagingBacklogLimitError`     | The recipient has 20 messages it has not read. Try again later.                                   |
-| `AgentMessagingNoIdentityError`       | `bibcode agent` ran without an AI Terminal's credential.                                          |
-| `McpStorageError`                     | BiBCode could not read its store. Try again.                                                      |
+| `_tag` or `kind`                      | Meaning                                                                                                                                             |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AgentMessagingDisabledError`         | Agent messaging is off. Turn it on in Settings → Agents → Agent integrations.                                                                       |
+| `AgentMessagingUnknownRecipientError` | No agent with that address in this project. Call `agents_list`.                                                                                     |
+| `AgentMessagingInvalidArgumentError`  | An empty or too long text, or a missing or unknown argument. The message names the argument only.                                                   |
+| `AgentMessagingUnknownMessageError`   | No message with that id that the caller may use.                                                                                                    |
+| `AgentMessagingRecipientGoneError`    | The agent a reply would go to no longer exists.                                                                                                     |
+| `AgentMessagingModeCeilingError`      | The recipient runs with more access than the caller. The message names both modes.                                                                  |
+| `AgentMessagingConflictError`         | The `clientRequestId` was already used for a different message.                                                                                     |
+| `AgentMessagingHopLimitError`         | The conversation reached 8 hops. A person has to write first.                                                                                       |
+| `AgentMessagingNotCancellableError`   | The message was already handed to its recipient.                                                                                                    |
+| `AgentMessagingRateLimitError`        | 30 messages in the last 60 seconds. Wait.                                                                                                           |
+| `AgentMessagingBacklogLimitError`     | The recipient has 20 messages it has not read. Try again later.                                                                                     |
+| `AgentCommandTransportError`          | Only from `bibcode agent`: the call never got an answer from the server (no connection, a body over the size limit, or an answer without a result). |
+| `AgentMessagingNoIdentityError`       | `bibcode agent` ran without an AI Terminal's credential.                                                                                            |
+| `McpStorageError`                     | BiBCode could not read its store. Try again.                                                                                                        |
 
 A refusal never quotes the caller's text.
 
 BiBCode writes one row of the [agent activity log](#attribution-and-the-activity-log) for each
-send and reply call, and one for each delivery step of a message (`accepted`, `delivered`,
-`consumed`, `completed`, `held`, `cancelled` or `failed`). A row holds the two addresses, the two
+send and reply call (an accepted one, or a refusal with its error tag) and one for these
+delivery steps: `delivered`, `consumed` and `failed` of a chat or terminal message, and
+`completed` of a chat message. A terminal message's completion, every `held` and `cancelled`
+change and the `accepted` and `queued` states write no row of their own. A row holds the two addresses, the two
 thread titles, the message and conversation ids, the status and the reason, and never message
 text. The log's writer queues at most 1,024 rows and drops a row past that. `changes_since` and
 webhooks skip these rows: an agent never reads another agent's messaging activity through them.

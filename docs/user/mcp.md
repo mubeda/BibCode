@@ -665,8 +665,8 @@ the MCP server above: it needs no pairing, and an outside agent cannot use it.
   that card removes it, and its sender then reads the message as failed. If the recipient's last
   turn ended in an error or was interrupted, the message is held behind it, the card says
   **Waiting for you** and **Send now** releases it. The sender can also cancel a message the
-  recipient has not taken yet. Every send and every delivery step is a row of the same agent
-  activity log, with the two thread titles and the state, never the text.
+  recipient has not taken yet. Every send and reply, and each delivered, read, failed or (for a chat) completed step, is a
+  row of the same agent activity log, with the two thread titles and the state, never the text.
 - **AI Terminals.** BiBCode never types a message into a terminal. When its agent waits for a
   prompt, BiBCode pastes one line, "BiBCode: you have new messages. Run `bibcode agent inbox`
   to read them.", and the agent reads its mail with that command. A Claude Code terminal counts
