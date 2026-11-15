@@ -275,7 +275,7 @@ fn refusal(error: &AgentMessagingError) -> Value {
     json!({ "ok": false, "error": { "kind": error.tag(), "message": error.message() } })
 }
 
-fn print(
+pub(crate) fn print(
     command: &AgentCommand,
     mut answer: Value,
     json: bool,
