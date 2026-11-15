@@ -20,6 +20,8 @@ import { describeRequestRow } from "./SendRequestRow";
 
 export const ANSWER_READ_FAILED = "BiBCode could not read the answer. Try again.";
 const BRING_BACK_DESCRIPTION = "Put the answer in this composer as a draft";
+const TERMINAL_BRING_BACK_DESCRIPTION =
+  "Open Message with the answer quoted; nothing is typed into the terminal";
 
 export const AnswerNotice = memo(function AnswerNotice(props: {
   request: SendRequest;
@@ -27,8 +29,10 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
   hostRef: ScopedThreadRef;
   onOpen: (target: ScopedThreadRef) => void;
   onDismiss: (requestId: string) => Promise<void>;
+  /** A terminal source has no composer to draft into: it receives the quoted answer instead. */
+  onBringBack?: (text: string) => void;
 }) {
-  const { request, hostRef, onOpen, onDismiss } = props;
+  const { request, hostRef, onOpen, onDismiss, onBringBack } = props;
   const { requestId } = request;
   const targetRef = useMemo(
     () => scopeThreadRef(hostRef.environmentId, request.targetThreadId),
@@ -56,6 +60,8 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
   const bringBack = async () => {
     setPhase("reading");
     const result = await getAnswer(requestId);
+    // A notice that went away (popover closed, terminal switched) must not act on a late answer.
+    if (!mounted.current) return;
     const text =
       result._tag === "Success"
         ? composeAnswerBringBack({
@@ -69,7 +75,8 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
       if (mounted.current) setPhase("failed");
       return;
     }
-    appendToComposerDraft(hostRef, text);
+    if (onBringBack === undefined) appendToComposerDraft(hostRef, text);
+    else onBringBack(text);
     await onDismiss(requestId);
     if (mounted.current) setPhase("idle");
   };
@@ -96,7 +103,12 @@ export const AnswerNotice = memo(function AnswerNotice(props: {
             variant="outline"
             permission={{
               allowed: !busy,
-              reason: phase === "reading" ? "Reading the answer" : BRING_BACK_DESCRIPTION,
+              reason:
+                phase === "reading"
+                  ? "Reading the answer"
+                  : onBringBack === undefined
+                    ? BRING_BACK_DESCRIPTION
+                    : TERMINAL_BRING_BACK_DESCRIPTION,
             }}
             onClick={() => void bringBack()}
           >

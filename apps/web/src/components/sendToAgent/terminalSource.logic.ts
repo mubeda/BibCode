@@ -15,6 +15,9 @@ import type { TerminalOutputLoader } from "./handoff.logic";
 import type { PreviewAttachment } from "./sendToAgent.logic";
 
 export const TERMINAL_OUTPUT_TRUNCATED_NOTE = "Only the most recent output is included.";
+export const TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE =
+  "BiBCode could not read this terminal's output. Try again.";
+export const TERMINAL_OUTPUT_LOADING_MESSAGE = "Reading the terminal's output to attach";
 
 /** An AI Terminal reports an agent status and was launched with an activity; a shell has neither. */
 export function isAiTerminal(

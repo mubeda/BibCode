@@ -13,6 +13,7 @@ vi.mock("~/state/entities", () => ({
 
 import {
   describeRequestRow,
+  describeRowActionFailure,
   selectRowsForThread,
   SendRequestRows,
   type SendRequestRowsProps,
@@ -112,6 +113,37 @@ describe("SendRequestRows", () => {
     expect(button("Cancel")!.disabled).toBe(true);
     await act(async () => finish());
     expect(button("Cancel")!.disabled).toBe(false);
+  });
+
+  it("dismiss_is_offered_only_in_a_final_state", () => {
+    const states: SendRequest["state"][] = ["queued", "waiting", "delivered", "read"];
+    for (const state of states) {
+      expect(describeRequestRow(request({ action: "review", state }), "Codex").canDismiss).toBe(
+        false,
+      );
+    }
+    for (const state of ["answered", "not_answered", "cancelled"] as const) {
+      expect(describeRequestRow(request({ action: "review", state }), "Codex").canDismiss).toBe(
+        true,
+      );
+    }
+  });
+
+  it("a_refused_row_action_shows_the_server_reason_not_the_unreachable_text", () => {
+    expect(
+      describeRowActionFailure({
+        kind: "failed",
+        reason: "not_final",
+        message: "Only a request that has ended can be dismissed. Cancel it first.",
+      }),
+    ).toBe("Only a request that has ended can be dismissed. Cancel it first.");
+    expect(
+      describeRowActionFailure({
+        kind: "failed",
+        reason: "unknown_outcome",
+        message: "The connection dropped",
+      }),
+    ).toBe("BiBCode could not reach the server. Try again.");
   });
 
   it('a cancelled request reads "Cancelled" with Dismiss and no Cancel', () => {

@@ -353,7 +353,11 @@ import {
   makeTerminalOutputLoader,
   shouldActivateSendPanel,
 } from "./sendToAgent/terminalSource.logic";
-import { selectRowsForThread, SendRequestRows } from "./sendToAgent/SendRequestRow";
+import {
+  describeRowActionFailure,
+  selectRowsForThread,
+  SendRequestRows,
+} from "./sendToAgent/SendRequestRow";
 import { AnswerNotice } from "./sendToAgent/AnswerNotice";
 import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
 import {
@@ -5366,27 +5370,6 @@ function ChatViewContent(props: ChatViewProps) {
       sendRequestsSupported,
     ],
   );
-  // What every AI Terminal control under this chat needs; null outside a stored thread.
-  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
-    () =>
-      isServerThread
-        ? {
-            serverSupported: sendRequestsSupported,
-            newPanelProvidersFor: sendNewPanelProvidersFor,
-            createPanel: createSendPanel,
-            revealPanel: revealSendPanel,
-            previewContentFor: sendPreviewContentFor,
-          }
-        : null,
-    [
-      createSendPanel,
-      isServerThread,
-      revealSendPanel,
-      sendNewPanelProvidersFor,
-      sendPreviewContentFor,
-      sendRequestsSupported,
-    ],
-  );
   const sendRequests = useSendRequests(
     isServerThread && sendRequestsSupported ? environmentId : null,
   );
@@ -5404,7 +5387,7 @@ function ChatViewContent(props: ChatViewProps) {
           stackedThreadToast({
             type: "error",
             title: "Couldn't cancel the request",
-            description: "BiBCode could not reach the server. Try again.",
+            description: describeRowActionFailure(outcome),
           }),
         );
       }
@@ -5419,7 +5402,7 @@ function ChatViewContent(props: ChatViewProps) {
           stackedThreadToast({
             type: "error",
             title: "Couldn't dismiss the request",
-            description: "BiBCode could not reach the server. Try again.",
+            description: describeRowActionFailure(outcome),
           }),
         );
       }
@@ -5444,6 +5427,33 @@ function ChatViewContent(props: ChatViewProps) {
       void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(hostRef) });
     },
     [centerPanelActions, navigate],
+  );
+  // What every AI Terminal control under this chat needs; null outside a stored thread.
+  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
+    () =>
+      isServerThread
+        ? {
+            serverSupported: sendRequestsSupported,
+            newPanelProvidersFor: sendNewPanelProvidersFor,
+            createPanel: createSendPanel,
+            revealPanel: revealSendPanel,
+            previewContentFor: sendPreviewContentFor,
+            openSendTarget: handleOpenSendTarget,
+            cancelSendRequest: handleCancelSendRequest,
+            dismissSendRequest: handleDismissSendRequest,
+          }
+        : null,
+    [
+      createSendPanel,
+      handleCancelSendRequest,
+      handleDismissSendRequest,
+      handleOpenSendTarget,
+      isServerThread,
+      revealSendPanel,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
+      sendRequestsSupported,
+    ],
   );
   // A Review or Second opinion that is answered, or not, gets the notice with Bring back; the
   // other actions keep the plain row.

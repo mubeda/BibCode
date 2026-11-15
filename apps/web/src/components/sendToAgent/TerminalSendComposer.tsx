@@ -24,6 +24,7 @@ import {
   type RefObject,
 } from "react";
 
+import { useSendToAgentStore } from "~/sendToAgentStore";
 import { useProjects, useThreadShell } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
 import { useGetTerminalOutput, useSendRequest, useSendRequests } from "~/state/sendRequests";
@@ -34,19 +35,26 @@ import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { SECOND_OPINION_LEAD_IN } from "./attachments.logic";
 import { HAND_OFF_LEAD_IN } from "./handoff.logic";
 import { resolveOutOfTokensHint } from "./outOfTokens.logic";
+import { selectRowsForTerminal } from "./SendRequestRow";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
+import { TerminalSendRequests } from "./TerminalSendRequests";
 import {
   canNotifyTerminalRow,
+  sendChoiceKey,
   type NewPanelProvider,
   type PreviewContent,
   type SendChoice,
   type SendToAgentSource,
 } from "./sendToAgent.logic";
 import {
+  TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
+  TERMINAL_OUTPUT_LOADING_MESSAGE,
   terminalAttachment,
   terminalHasText,
   type TerminalOutputText,
 } from "./terminalSource.logic";
+
+export { TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE };
 
 /** What the host chat supplies to every terminal control under it. */
 export interface TerminalSendToAgentServices {
@@ -60,14 +68,16 @@ export interface TerminalSendToAgentServices {
   readonly revealPanel: (panel: ThreadId) => void;
   /** The content of Review, Message and Take over from; the terminal supplies the other two. */
   readonly previewContentFor: (choice: SendChoice) => PreviewContent | null;
+  /** Open the target of a request, as the chat's request rows do. */
+  readonly openSendTarget: (target: ScopedThreadRef) => void;
+  readonly cancelSendRequest: (requestId: string) => Promise<void>;
+  readonly dismissSendRequest: (requestId: string) => Promise<void>;
 }
 
 export const TerminalSendToAgentContext = createContext<TerminalSendToAgentServices | null>(null);
 
 const NO_ROWS: ReadonlyArray<AgentRow> = [];
 
-export const TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE =
-  "BiBCode could not read this terminal's output. Try again.";
 const NO_MESSAGES: SendToAgentSource["messages"] = [];
 
 // The closed control lists no rows; the open menu reads terminal state for the real answer.
@@ -177,11 +187,14 @@ function TerminalSendComposerBody(props: {
   const getTerminalOutput = useGetTerminalOutput(environmentId);
   // A terminal source's answers wait on its control, the only place the person acts from it.
   const requests = useSendRequests(environmentId);
-  const waitingAnswers = useMemo(() => {
-    const address = `terminal:${threadId}/${terminalId}`;
-    return requests.filter((request) => request.source === address && request.state === "answered")
-      .length;
-  }, [requests, terminalId, threadId]);
+  const terminalRequests = useMemo(
+    () => selectRowsForTerminal(requests, threadId, terminalId),
+    [requests, terminalId, threadId],
+  );
+  const waitingAnswers = useMemo(
+    () => terminalRequests.filter((request) => request.state === "answered").length,
+    [terminalRequests],
+  );
   const projectRootByProjectId = useMemo(
     () => new Map(projects.map((project) => [project.id as string, project.workspaceRoot])),
     [projects],
@@ -245,6 +258,7 @@ function TerminalSendComposerBody(props: {
         leadIn,
         attachments: [],
         loadFailedMessage: TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
+        loadingMessage: TERMINAL_OUTPUT_LOADING_MESSAGE,
         loadAttachments: async () => {
           const read = outputRef.current ?? loadOutput();
           // A failed read is not reused: Retry reads again.
@@ -290,23 +304,60 @@ function TerminalSendComposerBody(props: {
           },
     [viewportFocusTarget],
   );
+  // Bring back opens the control's menu with the quoted answer as the Message note: the person
+  // copies it or picks an agent to send it on to. Nothing reaches the terminal.
+  const [signal, setSignal] = useState({ terminalId, count: 0 });
+  // The signal belongs to the terminal it was raised for; another terminal starts from zero.
+  if (signal.terminalId !== terminalId) setSignal({ terminalId, count: 0 });
+  const openSignal = signal.terminalId === terminalId ? signal.count : 0;
+  const bringBack = useCallback(
+    (text: string) => {
+      if (source === null) return;
+      const key = sendChoiceKey({ source, action: "message" });
+      const store = useSendToAgentStore.getState();
+      const typed = store.notes[key] ?? "";
+      store.setNote(key, typed === "" ? text : `${typed}\n\n${text}`);
+      setSignal((current) => ({
+        terminalId,
+        count: (current.terminalId === terminalId ? current.count : 0) + 1,
+      }));
+    },
+    [source, terminalId],
+  );
+  const controlRef = useRef<HTMLSpanElement | null>(null);
+  const focusControl = useCallback(() => {
+    controlRef.current?.querySelector<HTMLElement>('button[aria-label^="Send to agent"]')?.focus();
+  }, []);
   if (source === null) return null;
   return (
-    <SendToAgentButton
-      source={source}
-      serverSupported={services.serverSupported}
-      rows={NO_ROWS}
-      renderLive={renderLive}
-      projectRootByProjectId={projectRootByProjectId}
-      newPanelProvidersFor={services.newPanelProvidersFor}
-      canNotifyTerminal={canNotifyTerminal}
-      previewContentFor={previewContentFor}
-      send={send}
-      createPanel={createPanel}
-      {...(viewportFocus === undefined ? {} : { finalFocus: viewportFocus })}
-      revealPanel={services.revealPanel}
-      waitingAnswers={waitingAnswers}
-    />
+    <span ref={controlRef} className="contents">
+      <SendToAgentButton
+        source={source}
+        serverSupported={services.serverSupported}
+        rows={NO_ROWS}
+        renderLive={renderLive}
+        projectRootByProjectId={projectRootByProjectId}
+        newPanelProvidersFor={services.newPanelProvidersFor}
+        canNotifyTerminal={canNotifyTerminal}
+        previewContentFor={previewContentFor}
+        send={send}
+        createPanel={createPanel}
+        {...(viewportFocus === undefined ? {} : { finalFocus: viewportFocus })}
+        revealPanel={services.revealPanel}
+        waitingAnswers={waitingAnswers}
+        openSignal={openSignal}
+      />
+      <TerminalSendRequests
+        key={terminalId}
+        restoreFocus={focusControl}
+        threadRef={threadRef}
+        requests={terminalRequests}
+        onOpen={services.openSendTarget}
+        onCancel={services.cancelSendRequest}
+        onDismiss={services.dismissSendRequest}
+        onBringBack={bringBack}
+      />
+    </span>
   );
 }
 

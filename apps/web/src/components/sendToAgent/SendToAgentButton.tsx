@@ -88,6 +88,8 @@ export interface SendToAgentButtonProps {
   finalFocus?: RefObject<HTMLElement | null>;
   /** Answers to this source's requests that wait for the person, named on the control. */
   waitingAnswers?: number;
+  /** Opens the menu each time it grows, so a host can bring the person to the control. */
+  openSignal?: number;
   newId?: () => string;
 }
 
@@ -138,6 +140,13 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
   );
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Adjusted during render: a grown signal opens the menu without an extra effect pass.
+  const { openSignal = 0 } = props;
+  const [seenSignal, setSeenSignal] = useState(openSignal);
+  if (openSignal !== seenSignal) {
+    setSeenSignal(openSignal);
+    if (openSignal > seenSignal) setMenuOpen(true);
+  }
 
   const choose = useCallback(
     (next: SendChoice, hint: OutOfTokensHint | null) => {
@@ -295,6 +304,7 @@ function PreviewHost(props: {
       {...(content.loadFailedMessage === undefined
         ? {}
         : { loadFailedMessage: content.loadFailedMessage })}
+      {...(content.loadingMessage === undefined ? {} : { loadingMessage: content.loadingMessage })}
       {...(content.extraContent === undefined ? {} : { extraContent: content.extraContent })}
       warning={warning}
       finalFocus={props.finalFocus}

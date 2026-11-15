@@ -50,6 +50,7 @@ interface Harness {
   onPickAnother?: () => void;
   leadIn?: string;
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
+  loadingMessage?: string;
 }
 
 function Host(props: Harness) {
@@ -68,6 +69,7 @@ function Host(props: Harness) {
         leadIn={props.leadIn ?? ""}
         initialAttachments={props.attachments ?? []}
         {...(props.loadAttachments === undefined ? {} : { loadAttachments: props.loadAttachments })}
+        {...(props.loadingMessage === undefined ? {} : { loadingMessage: props.loadingMessage })}
         onClose={() => {
           props.onClose?.();
           setOpen(false);
@@ -166,6 +168,17 @@ describe("SendToAgentPreview", () => {
     const input = (send.mock.calls[0] as unknown as [SendRequestsSendInput])[0];
     expect(input.note).toBe("start from the new part");
     expect(input.attachments).toEqual([{ label: "Attachment a", text: shortened }]);
+  });
+
+  it("names what it reads while loading when the content says so", () => {
+    render({
+      action: "take-over",
+      loadAttachments: () => new Promise<ReadonlyArray<PreviewAttachment>>(() => undefined),
+      loadingMessage: "Reading the terminal's output to attach",
+    });
+    expect(document.body.querySelector('[role="status"]')?.textContent).toBe(
+      "Reading the terminal's output to attach",
+    );
   });
 
   it("loads attachments before Send is allowed", async () => {

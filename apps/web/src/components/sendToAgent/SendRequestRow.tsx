@@ -16,6 +16,7 @@ import type {
 import { memo, useMemo, useState, type ReactNode } from "react";
 
 import { useThreadShell } from "~/state/entities";
+import type { SendOutcome } from "~/state/sendRequests";
 import { Button } from "../ui/button";
 
 export interface RequestRowView {
@@ -48,6 +49,16 @@ export function selectRowsForThread(
   );
 }
 
+/** Requests an AI Terminal sent: they wait on its control, not above a composer. */
+export function selectRowsForTerminal(
+  requests: ReadonlyArray<SendRequest>,
+  threadId: ThreadId,
+  terminalId: string,
+): ReadonlyArray<SendRequest> {
+  const address = `terminal:${threadId}/${terminalId}`;
+  return requests.filter((request) => request.source === address);
+}
+
 export function describeRequestRow(
   request: SendRequest,
   targetTitle: string | null,
@@ -62,7 +73,7 @@ export function describeRequestRow(
     case "delivered":
       return row(`Delivered to ${agent}`, { canOpen: true });
     case "read":
-      return { ...row(`${agent} read it`, { canOpen: true, canDismiss: true }), showRow: keepsRow };
+      return { ...row(`${agent} read it`, { canOpen: true }), showRow: keepsRow };
     case "answered":
       return {
         ...row(`${agent} answered`, { canOpen: true, canDismiss: true }),
@@ -91,6 +102,15 @@ function row(
     canDismiss: can.canDismiss ?? false,
     showRow: true,
   };
+}
+
+/** What a refused cancel or dismiss says: the server's reason, or the connection text when it never answered. */
+export function describeRowActionFailure(
+  outcome: Extract<SendOutcome, { kind: "failed" }>,
+): string {
+  return outcome.reason === "unknown_outcome"
+    ? "BiBCode could not reach the server. Try again."
+    : outcome.message;
 }
 
 export interface SendRequestRowsProps {

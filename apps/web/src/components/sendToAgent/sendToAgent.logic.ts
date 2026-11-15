@@ -289,6 +289,8 @@ export interface PreviewContent {
   loadAttachments?: () => Promise<ReadonlyArray<PreviewAttachment>>;
   /** The error shown when `loadAttachments` fails; the preview's own wording otherwise. */
   loadFailedMessage?: string;
+  /** What the preview says while `loadAttachments` runs; "messages" wording by default. */
+  loadingMessage?: string;
 }
 
 export function sourceAddressOf(
