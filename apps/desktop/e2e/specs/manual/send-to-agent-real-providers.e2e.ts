@@ -210,13 +210,25 @@ async function step(name: string, id: string, body: () => Promise<void>): Promis
 
 let senderTab = "";
 let terminal = { tabId: "", terminalId: "" };
+let primaryTab = "";
 
 describe(`real ${provider}`, function () {
   this.timeout(1_800_000);
   it("opens the project, the AI Terminal and a Claude sender chat", async function () {
     this.timeout(1_500_000);
     NodeFS.writeFileSync(evidencePath, "");
-    await importProject();
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await importProject();
+        break;
+      } catch (error) {
+        // The first scripts after a launch can time out; the second attempt starts clean.
+        note(`import attempt ${attempt} failed: ${String(error).split("\n")[0]}`);
+        if (attempt >= 3) throw error;
+        await browser.pause(10_000);
+      }
+    }
+    primaryTab = await selectedTabId();
     terminal = await terminalTab();
     // A fresh CLI needs a moment before it waits for a prompt.
     await browser.pause(provider === "claude" ? 25_000 : 12_000);
@@ -350,6 +362,12 @@ describe(`real ${provider}`, function () {
       } else {
         note("no answer notice");
       }
+      // What the terminal's agent read for the person's request: BiBCode's lines come first.
+      await activate(terminal.tabId);
+      note(
+        `terminal screen after the request: ${(await terminalScreen()).replaceAll(/\s+/g, " ").slice(0, 2200)}`,
+      );
+      await shot("2-terminal-inbox");
     });
   });
 
@@ -367,12 +385,28 @@ describe(`real ${provider}`, function () {
         await dialog.waitForDisplayed({ timeout: 30_000 });
         await browser.pause(3_000);
         note(
-          `${action} preview from the terminal: ${(await dialog.getText()).replaceAll(/\s+/g, " ").slice(0, 700)}`,
+          `${action} preview from the terminal: ${(await dialog.getText()).replaceAll(/\s+/g, " ").slice(0, 2000)}`,
         );
         await shot(`3-${action.replaceAll(" ", "-")}`);
         await dialog.$("button=Cancel").click();
         await dialog.waitForExist({ reverse: true });
       }
+    });
+  });
+
+  it("4. an agent message with $HOME reaches a Codex chat", async function () {
+    this.timeout(1_500_000);
+    await step("4 skill mention in a message to a Codex chat", "4", async () => {
+      await activate(senderTab);
+      await submitPrompt(
+        'Use the agents_list tool, find the Codex chat agent (its address starts with "thread:" and its provider is Codex), then call agent_message_send once to it with exactly this text: "Reply with the word ok. This note mentions $HOME as plain text." Do not wait for a reply.',
+      );
+      await waitForTurn(240_000);
+      note(`sender text tail: ${(await chatText()).replaceAll(/\s+/g, " ").slice(-500)}`);
+      await activate(primaryTab);
+      await browser.pause(90_000);
+      await shot("4-codex-chat");
+      note(`codex chat text: ${(await chatText()).replaceAll(/\s+/g, " ").slice(0, 1800)}`);
     });
   });
 });

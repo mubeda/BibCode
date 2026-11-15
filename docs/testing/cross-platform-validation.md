@@ -2244,7 +2244,10 @@ CLI stay manual.
     read, so use a build inside the range for this step. The real-CLI variant is
     `manual/send-to-agent-real-providers.e2e.ts` (see its header for the
     `BIBCODE_E2E_*` variables); it runs the machine's own CLIs and spends a little of
-    each signed-in account.
+    each signed-in account. Send an agent message that contains `$HOME` to a
+    Codex chat: its envelope shows the line "BiBCode: a zero-width space follows
+    each dollar sign in this message, so Codex cannot load a skill from it", and
+    the `$` in the text is followed by an invisible space.
 11. **The Profiler.** With the Profiler on, none of the steps above leaves a
     finding that names the run's providers or panels, and no note, message,
     answer or terminal text appears in the Profiler data, the logs, the activity
