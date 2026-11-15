@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 
 const DEQUE_SHRINK_OCCUPANCY_DENOMINATOR: usize = 4;
 
+/// How far before a tail's start `TerminalHistory::tail` looks for the escape that opens a
+/// sequence the cut lands in.
+const ESCAPE_LOOKBACK_BYTES: usize = 4096;
+
 /// ConPTY alt-screen TUIs redraw with cursor movement instead of newlines, so
 /// a line limit alone leaves retention unbounded in bytes. One mebibyte keeps
 /// ample replay headroom above the 512 KiB client transcript cap.
@@ -289,7 +293,9 @@ impl TerminalHistory {
             remaining -= piece.chars().count().min(remaining);
             pieces.push(piece);
         }
-        let text: String = pieces.into_iter().rev().collect();
+        let mut text: String = pieces.into_iter().rev().collect();
+        let inside = self.cut_sequence_len(&text);
+        text.drain(..inside);
         HistoryWindow {
             epoch: self.epoch,
             start: self.total_bytes_written - text.len() as u64,
@@ -297,6 +303,45 @@ impl TerminalHistory {
             text,
             dropped: false,
         }
+    }
+
+    /// How many leading bytes of `tail`, the end of the retained output, belong to an escape
+    /// sequence that starts before it, so a reader never sees half a sequence as text.
+    fn cut_sequence_len(&self, tail: &str) -> usize {
+        let cut = self.total_bytes - tail.len();
+        // shortcut: a sequence started more than this before the cut still leaks its rest;
+        // widen the lookback if long OSC payloads (clipboard, images) show up in tails.
+        let before = self.retained_range(cut.saturating_sub(ESCAPE_LOOKBACK_BYTES), cut);
+        let Some(escape) = before.rfind('\x1b') else {
+            return 0;
+        };
+        let started = before.len() - escape;
+        let joined = [&before[escape..], tail].concat();
+        crate::ansi::escape_end(joined.as_bytes(), 0)
+            .map_or(tail.len(), |end| end.saturating_sub(started))
+    }
+
+    /// The retained bytes from `from` to `to`, counted from the oldest retained byte, widened
+    /// at the start to a character boundary.
+    fn retained_range(&self, from: usize, to: usize) -> String {
+        let mut text = String::new();
+        let mut offset = 0;
+        for chunk in &self.chunks {
+            let retained = chunk.retained();
+            let (start, end) = (from.max(offset), to.min(offset + retained.len()));
+            if start < end {
+                let mut local = start - offset;
+                while !retained.is_char_boundary(local) {
+                    local += 1;
+                }
+                text.push_str(&retained[local..end - offset]);
+            }
+            offset += retained.len();
+            if offset >= to {
+                break;
+            }
+        }
+        text
     }
 
     pub(crate) fn push(&mut self, data: &str) {
@@ -856,5 +901,20 @@ mod tests {
         assert_eq!(tail.epoch, history.at(0).epoch);
         let all = history.tail(100);
         assert_eq!((all.text.as_str(), all.start), ("abc\ndéf", 0));
+    }
+
+    #[test]
+    fn the_tail_never_starts_inside_an_escape_sequence() {
+        let mut history = TerminalHistory::new(100);
+        history.push("old\x1b[38;2;");
+        history.push("255;0;0mred\x1b]0;a title\x07done");
+        // Each limit cuts inside a sequence: the colour, then the title.
+        for (limit, expected) in [(24, "red\x1b]0;a title\x07done"), (10, "done")] {
+            let tail = history.tail(limit);
+            assert_eq!(tail.text, expected, "a tail of {limit}");
+            assert_eq!(tail.start, tail.end - tail.text.len() as u64);
+        }
+        let plain = crate::send_requests::service::plain_tail(&history.tail(24).text, true, 100);
+        assert_eq!(plain.text, "reddone");
     }
 }
