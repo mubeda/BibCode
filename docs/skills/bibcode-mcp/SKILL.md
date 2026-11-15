@@ -76,12 +76,13 @@ feed. It exits 0 on success, 1 on failure and 2 when the thread waits on a perso
    `delivery_failed`, `awaiting_approval` or `awaiting_input`. A turn can run for many
    minutes; there is no attempt limit. Tell the user it is still running every few calls.
    A transport error says nothing about the thread: retry the wait, never the start.
-   A `completed` turn settles only once its reply stops streaming (`reply.streaming`
-   false), so a settled reply is whole.
+   A `completed` turn settles only once its reply stops streaming, so a wait can time out
+   with status `completed` and `settled: false`: wait again, and report only a settled
+   reply, which is whole.
 3. Report from `reply`, `read_thread`, `get_turn_diff` (follow `nextCursor`) and
    `git_status`, not from what the thread says it did.
 
-When you follow a terminal with `terminal_read`, `more: false` with a `nextCursor` short of
+When you follow a terminal with `terminal_read` (without `raw`), `more: false` with a `nextCursor` short of
 the end means an escape sequence is still arriving: read again from `nextCursor` later. A
 `raw` tail can be longer than `tailChars` by that one unfinished sequence.
 
