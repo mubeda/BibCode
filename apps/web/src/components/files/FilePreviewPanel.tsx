@@ -764,6 +764,7 @@ function RenderedMarkdownSurface({
         text={session.unsavedContents ?? contents}
         cwd={cwd}
         threadRef={threadRef}
+        markdownPath={relativePath}
         className="mx-auto max-w-4xl px-6 py-5"
         onTaskListChange={({ markerOffset, checked }) => {
           const currentContents =

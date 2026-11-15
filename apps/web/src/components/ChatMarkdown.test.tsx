@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { getSharedHighlighter } from "@pierre/diffs";
+import { EnvironmentId, ThreadId, type ScopedThreadRef } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -7,6 +8,7 @@ import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { vi } from "vite-plus/test";
 import { __setClientSettingsForTests } from "../hooks/useSettings";
+import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import { writeThemePreference } from "../hooks/useTheme";
 
 vi.mock("./ui/menu", () => ({
@@ -20,6 +22,45 @@ vi.mock("./ui/menu", () => ({
       {children}
     </button>
   ),
+}));
+
+// The workspace image loader's boundary, as RichMarkdownImage.test.tsx mocks it. Only a
+// workspace-file asset request is intercepted; everything else ChatMarkdown reads stays real.
+const assetState = vi.hoisted(() => ({
+  result: { _tag: "Initial" } as { _tag: "Initial" },
+  requests: [] as unknown[],
+  marker: Symbol("workspace-asset-request"),
+}));
+vi.mock("@effect/atom-react", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@effect/atom-react")>();
+  return {
+    ...original,
+    useAtomValue: ((atom: unknown, ...rest: unknown[]) =>
+      typeof atom === "object" && atom !== null && assetState.marker in atom
+        ? assetState.result
+        : (original.useAtomValue as (...args: unknown[]) => unknown)(
+            atom,
+            ...rest,
+          )) as typeof original.useAtomValue,
+  };
+});
+vi.mock("~/state/assets", async (importOriginal) => {
+  const original = await importOriginal<typeof import("~/state/assets")>();
+  const createUrl = (request: { input: { resource: { _tag: string } } }) => {
+    if (request.input.resource._tag !== "workspace-file") {
+      return original.assetEnvironment.createUrl(request as never);
+    }
+    assetState.requests.push(request);
+    return { [assetState.marker]: true };
+  };
+  return {
+    ...original,
+    assetEnvironment: { ...original.assetEnvironment, createUrl },
+  };
+});
+vi.mock("~/state/environments", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/state/environments")>()),
+  useEnvironmentHttpBaseUrl: () => "https://server.example.test/",
 }));
 
 let ChatMarkdownComponent: typeof import("./ChatMarkdown").default | null = null;
@@ -86,6 +127,8 @@ interface RenderOptions {
   detailsOpen?: ReadonlyMap<number, boolean>;
   onDetailsOpenChange?: (ordinal: number, open: boolean) => void;
   findScope?: string;
+  threadRef?: ScopedThreadRef;
+  markdownPath?: string;
 }
 
 async function renderMarkdown(text: string, options: RenderOptions = {}) {
@@ -1184,6 +1227,63 @@ describe("ChatMarkdown", () => {
       }
       expect(stream.container.innerHTML).toContain("pierre-dark");
       expect(stream.container.innerHTML).not.toContain("pierre-light");
+    });
+  });
+
+  describe("images", () => {
+    const threadRef: ScopedThreadRef = {
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: ThreadId.make("thread-1"),
+    };
+
+    beforeEach(() => {
+      assetState.requests.length = 0;
+    });
+
+    it("relative image reads from the workspace when a markdownPath is given", async () => {
+      const container = await mountMarkdown("![A pixel](img/a.png)", {
+        cwd: "/workspace",
+        threadRef,
+        markdownPath: "docs/readme.md",
+      });
+
+      expect(assetState.requests).toEqual([
+        {
+          environmentId: threadRef.environmentId,
+          input: {
+            resource: {
+              _tag: "workspace-file",
+              threadId: threadRef.threadId,
+              path: joinWorkspacePath("/workspace", "docs/img/a.png"),
+            },
+          },
+        },
+      ]);
+      expect(container.querySelector("[data-rich-markdown-image-text=loading]")).not.toBeNull();
+      expect(container.querySelector("img")).toBeNull();
+    });
+
+    it("relative image outside the workspace is refused with the loader's message", async () => {
+      const container = await mountMarkdown("![Outside](../../outside.png)", {
+        cwd: "/workspace",
+        threadRef,
+        markdownPath: "docs/readme.md",
+      });
+
+      expect(assetState.requests).toEqual([]);
+      expect(
+        container.querySelector("[data-rich-markdown-image-text=failed]")?.getAttribute("title"),
+      ).toBe("Only images inside this project are shown.");
+    });
+
+    it("image without a markdownPath stays a plain image", async () => {
+      const markup = await renderMarkdown("![A pixel](img/a.png)", {
+        cwd: "/workspace",
+        threadRef,
+      });
+
+      expect(assetState.requests).toEqual([]);
+      expect(markup).toContain('<img src="img/a.png" alt="A pixel"/>');
     });
   });
 });

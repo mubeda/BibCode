@@ -3,7 +3,17 @@ import type { HostMetricsView } from "@bibcode/client-runtime/state/server";
 import type { EnvironmentId } from "@bibcode/contracts";
 import type { ClientSettings } from "@bibcode/contracts/settings";
 import { ChevronRightIcon } from "lucide-react";
-import { type JSX, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import * as Equal from "effect/Equal";
+import {
+  createContext,
+  type JSX,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import { useClientSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
@@ -174,11 +184,13 @@ export function HostDashboardSheet({
               <div
                 className={cn("grid gap-6 transition-opacity", presentation.dimmed && "opacity-64")}
               >
-                <HostDashboardValuesView
-                  values={presentation.values}
-                  view={chartView}
-                  timestampFormat={timestampFormat}
-                />
+                <HostDashboardSinceContext value={presentation.values.since}>
+                  <HostDashboardValuesView
+                    values={presentation.values}
+                    view={chartView}
+                    timestampFormat={timestampFormat}
+                  />
+                </HostDashboardSinceContext>
               </div>
             )}
           </div>
@@ -208,15 +220,42 @@ function SectionHeading({ children, aside }: { children: string; aside?: string 
   );
 }
 
-function HostDashboardValuesView({
-  values,
-  view,
-  timestampFormat,
-}: {
+/**
+ * The "Since" heading's text, whose uptime ticks with the sheet's 1 s clock. It reaches the
+ * heading by context, so a tick renders the heading and not the memoized values view (R18).
+ */
+const HostDashboardSinceContext = createContext<string | null>(null);
+
+function HostDashboardSinceHeading() {
+  const since = useContext(HostDashboardSinceContext);
+  return <SectionHeading>{since ?? "Since start"}</SectionHeading>;
+}
+
+interface HostDashboardValuesViewProps {
   readonly values: HostDashboardValues;
   readonly view: HostMetricsView | null;
   readonly timestampFormat: ClientSettings["timestampFormat"];
-}) {
+}
+
+// `presentHostDashboard` builds a fresh `values` on every 1 s tick, so compare it by content:
+// only a changed reading renders the view again. `since` changes with the clock alone and is
+// shown by `HostDashboardSinceHeading`, so it is left out (R18).
+function valuesViewPropsEqual(
+  previous: HostDashboardValuesViewProps,
+  next: HostDashboardValuesViewProps,
+): boolean {
+  return (
+    previous.view === next.view &&
+    previous.timestampFormat === next.timestampFormat &&
+    Equal.equals({ ...previous.values, since: null }, { ...next.values, since: null })
+  );
+}
+
+export const HostDashboardValuesView = memo(function HostDashboardValuesView({
+  values,
+  view,
+  timestampFormat,
+}: HostDashboardValuesViewProps) {
   const recent = view?.recent;
   const uptime = view?.uptime;
   const charts = useMemo(
@@ -328,7 +367,7 @@ function HostDashboardValuesView({
         )}
       </section>
       <section data-testid="host-dashboard-since" className="grid gap-3">
-        <SectionHeading>{values.since ?? "Since start"}</SectionHeading>
+        <HostDashboardSinceHeading />
         {values.statistics.length === 0 ? null : (
           <table className="w-full text-left text-xs tabular-nums">
             <thead className="text-muted-foreground">
@@ -373,4 +412,4 @@ function HostDashboardValuesView({
       </section>
     </>
   );
-}
+}, valuesViewPropsEqual);

@@ -215,6 +215,65 @@ export function desktopUiPlatform(environment: NodeJS.ProcessEnv = process.env):
   return host === "darwin" ? "mac" : host === "win32" ? "win" : "linux";
 }
 
+/** `mochaOpts.timeout` of `wdio.conf.ts`: the allowance of one test and of each of its hooks. */
+export const DESKTOP_UI_TEST_TIMEOUT_MS = 120_000;
+/**
+ * One bound for the probe, the stop, the relaunch, `reloadSession` and the mock restore, leaving
+ * 20 s of the hook's allowance for the rest of `beforeTest`. A single WDIO command may wait
+ * `connectionRetryTimeout` (120 s), so every step is raced against this instead.
+ */
+export const DESKTOP_UI_RECOVERY_DEADLINE_MS = 100_000;
+
+export interface RecoveryDeadline {
+  readonly budgetMs: number;
+  remainingMs(): number;
+}
+
+export function startRecoveryDeadline(
+  budgetMs: number = DESKTOP_UI_RECOVERY_DEADLINE_MS,
+): RecoveryDeadline {
+  const started = Date.now();
+  return { budgetMs, remainingMs: () => Math.max(0, budgetMs - (Date.now() - started)) };
+}
+
+/**
+ * Settles with `operation`, or rejects once the deadline runs out first. A late operation is
+ * abandoned, not cancelled: its own caps (bounded by the deadline) end it.
+ */
+export function withinRecoveryDeadline<T>(
+  deadline: RecoveryDeadline,
+  step: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    // A zero-delay timer loses to the operation's microtasks, so a spent deadline starts nothing.
+    if (deadline.remainingMs() <= 0) {
+      reject(
+        new Error(`The webview recovery ran out of its ${deadline.budgetMs} ms during ${step}.`),
+      );
+      return;
+    }
+    const timer = setTimeout(
+      () =>
+        reject(
+          new Error(`The webview recovery ran out of its ${deadline.budgetMs} ms during ${step}.`),
+        ),
+      deadline.remainingMs(),
+    );
+    // An async wrapper turns a synchronous throw into a rejection, so the timer is still cleared.
+    (async () => operation())().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 let relaunched: NodeChildProcess.ChildProcess | null = null;
 let relaunchCount = 0;
 
@@ -223,7 +282,9 @@ let relaunchCount = 0;
  * and port, and opens a new WebDriver session on it. The WDIO service only restarts the app
  * between spec files, so each closing case of one spec gets its own app session here.
  */
-export async function relaunchDesktopUiApplication(): Promise<void> {
+export async function relaunchDesktopUiApplication(
+  deadline: RecoveryDeadline = startRecoveryDeadline(),
+): Promise<void> {
   const port = webDriverPort();
   if (await isDesktopUiApplicationRunning(port)) {
     throw new Error("The packaged app is still running; it cannot be relaunched.");
@@ -234,15 +295,23 @@ export async function relaunchDesktopUiApplication(): Promise<void> {
   });
   // The single-instance plugin hands a new launch to a copy that is still exiting, which then
   // ends both, so wait until no process runs this packaged binary.
-  const started = Date.now();
-  while (runningBinaryPids(appBinaryPath).length > 0) {
-    if (Date.now() - started > 30_000) {
-      throw new Error("The previous packaged app was still exiting after 30 s.");
+  const exitCapMs = Math.min(30_000, deadline.remainingMs());
+  await withinRecoveryDeadline(deadline, "exit wait", async () => {
+    const started = Date.now();
+    while (runningBinaryPids(appBinaryPath).length > 0) {
+      if (Date.now() - started > exitCapMs) {
+        throw new Error(`The previous packaged app was still exiting after ${exitCapMs} ms.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
+  });
   const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
   if (!artifactDirectory) throw new Error("BIBCODE_E2E_ARTIFACT_DIR is required.");
+  if (deadline.remainingMs() <= 0) {
+    throw new Error(
+      `The webview recovery ran out of its ${deadline.budgetMs} ms before the relaunch started.`,
+    );
+  }
   relaunchCount += 1;
   // A file, not a pipe: an unread pipe would stall the app's debug logging.
   const log = NodeFS.openSync(
@@ -258,33 +327,111 @@ export async function relaunchDesktopUiApplication(): Promise<void> {
   } finally {
     NodeFS.closeSync(log);
   }
-  const launched = Date.now();
-  while (!(await isDesktopUiApplicationRunning(port))) {
-    if (relaunched.exitCode !== null) {
-      throw new Error(`The relaunched packaged app exited with ${relaunched.exitCode}.`);
+  const child = relaunched;
+  const serveCapMs = Math.min(90_000, deadline.remainingMs());
+  await withinRecoveryDeadline(deadline, "serve wait", async () => {
+    const launched = Date.now();
+    while (!(await isDesktopUiApplicationRunning(port))) {
+      if (child.exitCode !== null) {
+        throw new Error(`The relaunched packaged app exited with ${child.exitCode}.`);
+      }
+      if (Date.now() - launched > serveCapMs) {
+        throw new Error("The relaunched packaged app never served WebDriver.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (Date.now() - launched > 90_000) {
-      throw new Error("The relaunched packaged app never served WebDriver.");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  try {
-    await browser.reloadSession();
-  } catch (error) {
-    // The service copies the old session's mocks onto the new one after it opens; the new app
-    // never had them, and each spec installs the mocks it needs again.
-    if (!(error instanceof Error) || !error.message.startsWith("Mock updates failed")) throw error;
-  }
-  // Drop the old app's mocks, or every later mock call retries them against the new app.
-  await browser.tauri.restoreAllMocks();
-  await browser.waitUntil(
-    () =>
-      browser.execute(() => {
-        const host = window as Window & { readonly wdioTauri?: { readonly execute?: unknown } };
-        return typeof host.wdioTauri?.execute === "function";
-      }),
-    { timeoutMsg: "The relaunched app's Tauri WebDriver plugin did not initialize." },
+  });
+  await prepareRelaunchedDesktopUiSession(
+    {
+      reloadSession: async () => {
+        try {
+          await browser.reloadSession();
+        } catch (error) {
+          // The service copies the old session's mocks onto the new one after it opens; the new
+          // app never had them, and each spec installs the mocks it needs again.
+          if (!(error instanceof Error) || !error.message.startsWith("Mock updates failed"))
+            throw error;
+        }
+      },
+      probe: () => browser.execute(() => true),
+      restoreMocks: () => browser.tauri.restoreAllMocks(),
+      waitForPlugin: () =>
+        browser.waitUntil(
+          () =>
+            browser.execute(() => {
+              const host = window as Window & {
+                readonly wdioTauri?: { readonly execute?: unknown };
+              };
+              return typeof host.wdioTauri?.execute === "function";
+            }),
+          {
+            timeout: Math.min(20_000, deadline.remainingMs()),
+            timeoutMsg: "The relaunched app's Tauri WebDriver plugin did not initialize.",
+          },
+        ),
+    },
+    deadline,
   );
+}
+
+export interface RelaunchedSessionSteps {
+  readonly reloadSession: () => Promise<void>;
+  readonly probe: () => Promise<unknown>;
+  readonly restoreMocks: () => Promise<unknown>;
+  readonly waitForPlugin: () => Promise<unknown>;
+}
+
+/** Bounds one step by its own cap, never past the shared deadline. */
+function withinStepBound<T>(
+  deadline: RecoveryDeadline,
+  capMs: number,
+  step: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withinRecoveryDeadline(
+    startRecoveryDeadline(Math.min(capMs, deadline.remainingMs())),
+    step,
+    operation,
+  );
+}
+
+/**
+ * The new session after a relaunch. A fresh WebKitGTK webview can hang the first script it gets,
+ * so a trivial probe must answer (each try 5 s, all tries 30 s) before any other script; the mock
+ * restore then has 10 s. Every bound is also cut to the shared deadline.
+ */
+export async function prepareRelaunchedDesktopUiSession(
+  steps: RelaunchedSessionSteps,
+  deadline: RecoveryDeadline,
+): Promise<void> {
+  await withinRecoveryDeadline(deadline, "reloadSession", steps.reloadSession);
+  const answerCapMs = Math.min(30_000, deadline.remainingMs());
+  await withinRecoveryDeadline(deadline, "webview answer", async () => {
+    const started = Date.now();
+    for (;;) {
+      const leftMs = answerCapMs - (Date.now() - started);
+      let failure: unknown;
+      try {
+        await withinRecoveryDeadline(
+          startRecoveryDeadline(Math.min(5_000, Math.max(0, leftMs))),
+          "webview probe",
+          steps.probe,
+        );
+        return;
+      } catch (error) {
+        failure = error;
+      }
+      if (Date.now() - started + 250 >= answerCapMs) {
+        throw new Error(
+          `The relaunched webview did not answer a trivial script within ${answerCapMs} ms: ${String(failure)}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  });
+  // Drop the old app's mocks, or every later mock call retries them against the new app.
+  await withinStepBound(deadline, 10_000, "mock restore", steps.restoreMocks);
+  await withinRecoveryDeadline(deadline, "plugin wait", steps.waitForPlugin);
 }
 
 /** Ends an app this helper relaunched, if it still runs: only a process this helper started. */
@@ -316,24 +463,53 @@ export interface DeadWebviewRecovery {
   readonly probe: () => Promise<unknown>;
   readonly isRunning: () => Promise<boolean>;
   readonly stopApplication: () => Promise<void>;
-  readonly relaunch: () => Promise<void>;
+  readonly relaunch: (deadline: RecoveryDeadline) => Promise<void>;
 }
 
 /**
- * One trivial script before a spec file. When it fails with a dead-session error, the app is
+ * One trivial script before a test. When it fails with a dead-session error, the app is
  * relaunched once (after ending a process that survived its webview), so a webview crash fails
- * only the spec that hit it. Returns whether it relaunched.
+ * only the test that hit it. Every step shares one deadline. Returns whether it relaunched.
  */
-export async function recoverDeadDesktopUiWebview(deps: DeadWebviewRecovery): Promise<boolean> {
+export async function recoverDeadDesktopUiWebview(
+  deps: DeadWebviewRecovery,
+  deadline: RecoveryDeadline = startRecoveryDeadline(),
+): Promise<boolean> {
   try {
-    await deps.probe();
+    await withinRecoveryDeadline(deadline, "probe", deps.probe);
     return false;
   } catch (error) {
     if (!isDeadDesktopUiWebviewError(error)) throw error;
   }
-  if (await deps.isRunning()) await deps.stopApplication();
-  await deps.relaunch();
+  if (await withinRecoveryDeadline(deadline, "liveness check", deps.isRunning)) {
+    await withinRecoveryDeadline(deadline, "stop", deps.stopApplication);
+  }
+  await withinRecoveryDeadline(deadline, "relaunch", () => deps.relaunch(deadline));
   return true;
+}
+
+/**
+ * Failure evidence from a webview that may have died. When collecting it fails, one trivial
+ * probe (5 s) decides: a webview that fails or misses the probe is dead, and the evidence is
+ * dropped whatever the error said; a webview that answers keeps the error, which is then a
+ * harness fault. Mocha recorded the test's own failure before `afterTest`, so this can only drop
+ * evidence, never an assertion. Throwing here would skip the worker's remaining tests.
+ */
+export async function tolerateDeadDesktopUiWebview<T>(
+  operation: () => Promise<T>,
+  probe: () => Promise<unknown> = () => browser.execute(() => true),
+): Promise<T | undefined> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isDeadDesktopUiWebviewError(error)) return undefined;
+    try {
+      await withinRecoveryDeadline(startRecoveryDeadline(5_000), "evidence probe", probe);
+    } catch {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 async function stopRunningDesktopUiApplication(): Promise<void> {
@@ -342,7 +518,7 @@ async function stopRunningDesktopUiApplication(): Promise<void> {
   await waitForDesktopUiApplicationExit(pid, 10_000).catch(() => process.kill(pid, "SIGKILL"));
 }
 
-/** The per-spec-file probe of the shared app; see {@link recoverDeadDesktopUiWebview}. */
+/** The per-test probe of the shared app; see {@link recoverDeadDesktopUiWebview}. */
 export function ensureLiveDesktopUiWebview(): Promise<boolean> {
   return recoverDeadDesktopUiWebview({
     probe: () => browser.execute(() => true),

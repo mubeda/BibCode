@@ -2,13 +2,16 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   acquireBrowserSurface,
+  acquireBrowserSurfaceOcclusion,
+  isBrowserSurfaceOccluded,
   resolveBrowserSurfacePanelRect,
   useBrowserSurfaceStore,
+  type BrowserSurfaceRect,
 } from "./browserSurfaceStore";
 
 describe("browserSurfaceStore", () => {
   beforeEach(() => {
-    useBrowserSurfaceStore.setState({ byTabId: {} });
+    useBrowserSurfaceStore.setState({ byTabId: {}, occlusionOwners: new Map() });
   });
 
   it("tracks content dimensions for a browser that has never been visible", () => {
@@ -196,6 +199,55 @@ describe("browserSurfaceStore", () => {
     expect(useBrowserSurfaceStore.getState().byTabId[tabId]).toMatchObject({
       visible: false,
       owner: null,
+    });
+  });
+
+  describe("occlusion by rectangle", () => {
+    const surface = { x: 0, y: 0, width: 400, height: 300 };
+    const owners = (...rects: Array<BrowserSurfaceRect | null>) =>
+      new Map(rects.map((rect) => [Symbol("owner"), rect] as const));
+
+    it("is occluded by a lease without a rectangle", () => {
+      expect(isBrowserSurfaceOccluded(surface, owners(null))).toBe(true);
+    });
+
+    it("is occluded by an overlapping rectangle", () => {
+      expect(
+        isBrowserSurfaceOccluded(surface, owners({ x: 390, y: 290, width: 50, height: 50 })),
+      ).toBe(true);
+    });
+
+    it("is not occluded by a disjoint rectangle or one that only touches an edge", () => {
+      expect(isBrowserSurfaceOccluded(surface, owners())).toBe(false);
+      expect(
+        isBrowserSurfaceOccluded(surface, owners({ x: 500, y: 0, width: 100, height: 100 })),
+      ).toBe(false);
+      expect(
+        isBrowserSurfaceOccluded(surface, owners({ x: 400, y: 0, width: 100, height: 100 })),
+      ).toBe(false);
+      expect(
+        isBrowserSurfaceOccluded(surface, owners({ x: 0, y: 300, width: 100, height: 100 })),
+      ).toBe(false);
+    });
+
+    it("replaces a lease's rectangle on update and removes it on release", () => {
+      const first = { x: 500, y: 0, width: 100, height: 100 };
+      const moved = { x: 100, y: 100, width: 50, height: 50 };
+      const lease = acquireBrowserSurfaceOcclusion(first);
+      expect([...useBrowserSurfaceStore.getState().occlusionOwners.values()]).toEqual([first]);
+
+      lease.update(moved);
+      expect([...useBrowserSurfaceStore.getState().occlusionOwners.values()]).toEqual([moved]);
+
+      lease.release();
+      lease.update(first);
+      expect(useBrowserSurfaceStore.getState().occlusionOwners.size).toBe(0);
+    });
+
+    it("treats a lease taken without a rectangle as covering everything", () => {
+      const lease = acquireBrowserSurfaceOcclusion();
+      expect([...useBrowserSurfaceStore.getState().occlusionOwners.values()]).toEqual([null]);
+      lease.release();
     });
   });
 });

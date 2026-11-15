@@ -4,7 +4,8 @@
 //! They reach the worktree catalog's own handlers, so a removal records its profiler outcome
 //! there (`worktree_audit::record_removal_outcome`, once per real removal and never for a
 //! replay) and finishes in the catalog's operation runtime even when the MCP call is
-//! cancelled. Creation and removal carry a `commandId`, so a retry with the same
+//! cancelled. A failed creation's rollback records a `create-rollback` outcome there too.
+//! Creation and removal carry a `commandId`, so a retry with the same
 //! `clientRequestId` replays the stored request by its receipt ([`ToolCall::commands`]).
 
 use std::{sync::OnceLock, time::Instant};

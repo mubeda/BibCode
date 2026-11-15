@@ -1,5 +1,10 @@
 [workspace]
-members = ["apps/desktop/src-tauri", "apps/server", "tools/updater-verifier"]
+members = [
+  "apps/desktop/src-tauri",
+  "apps/server",
+  "tools/objc-exception-probe",
+  "tools/updater-verifier",
+]
 resolver = "3"
 
 [workspace.package]

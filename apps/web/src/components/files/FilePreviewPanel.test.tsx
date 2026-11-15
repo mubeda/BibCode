@@ -372,6 +372,17 @@ vi.mock("~/components/ChatMarkdown", () => ({
   },
 }));
 
+// The editor chunk loads once per test file, so a later test cannot see its loading fallback
+// unless it asks for it: while `loading` is set, the view shows its fallback as it does then.
+const richMarkdownView = vi.hoisted(() => ({ loading: false }));
+vi.mock("./RichMarkdownView", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./RichMarkdownView")>();
+  return {
+    RichMarkdownView: (props: Parameters<typeof original.RichMarkdownView>[0]) =>
+      richMarkdownView.loading ? props.fallback : <original.RichMarkdownView {...props} />,
+  };
+});
+
 vi.mock("./richMarkdown/RichMarkdownSurface", () => ({
   default: (props: Record<string, unknown>) => {
     ui.record("RichMarkdownSurface", props);
@@ -2407,6 +2418,36 @@ describe("rich markdown editing", () => {
       "This file is too large to edit in rendered view. Edit it in source view.",
     );
     expect(markup).not.toContain(readOnlyNotice);
+  });
+
+  // ChatMarkdown is a stub here, so these prove only that the path reaches it; ChatMarkdown.test.tsx
+  // proves its images load from the workspace and refuse a path that leaves it.
+  it("forwards the file path to ChatMarkdown in the read-only rendered view while the rich editor loads", () => {
+    setFileData("![A pixel](img/a.png)\n", { version: "v1" });
+    richMarkdownView.loading = true;
+    try {
+      const markup = renderPanel(baseProps({ relativePath: "docs/README.md" }));
+
+      expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+      expect(markup).not.toContain("data-read-only-markdown-notice");
+      expect(ui.find("ChatMarkdown")).toMatchObject({ markdownPath: "docs/README.md" });
+    } finally {
+      richMarkdownView.loading = false;
+    }
+  });
+
+  it("forwards the file path to ChatMarkdown in the read-only rendered view of a file too large to edit", async () => {
+    await renderRich(`![A pixel](img/a.png)\n\n${"a".repeat(129 * 1024)}\n`, undefined);
+
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    expect(ui.find("ChatMarkdown")).toMatchObject({ markdownPath: "README.md" });
+  });
+
+  it("forwards the file path to ChatMarkdown in the read-only rendered view of content the editor cannot change", async () => {
+    await renderRich("![A pixel](img/a.png)\n", null);
+
+    expect(ui.filter("RichMarkdownSurface")).toHaveLength(0);
+    expect(ui.find("ChatMarkdown")).toMatchObject({ markdownPath: "README.md" });
   });
 
   it("a file the editor refused opens editable again once a source edit repairs it", async () => {

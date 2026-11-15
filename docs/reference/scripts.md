@@ -212,8 +212,19 @@ output directory also receives
 [Symbol assets](../operations/release.md#symbol-assets). `--symbols` needs
 `dump_syms` on `PATH` and cannot be combined with `--skip-build`.
 
+`--workspace-codegen-units <n>` (1 to 256), which CI passes as 16 and Release
+does not pass, hands Cargo
+`--config profile.release.package.<crate>.codegen-units=<n>` for
+`bibcode-server` and `bibcode-desktop` in the build step. The shipped profile
+has one codegen unit, which compiles each of the two crates on one core. A
+package override leaves every dependency's fingerprint as it was, so a cached
+`target` still serves both builds.
+
 `scripts/dump-symbols.ts` runs `dump_syms --inlines --check-cfi --store <store>`
-on one release binary:
+on one release binary. When `dump_syms` logs an `[ERROR]` line, which it does
+without failing, the script dumps the binary alone a second time and fails
+unless that run is clean and the stored file holds the same number of `STACK`
+records; see [Symbol assets](../operations/release.md#symbol-assets).
 
 ```sh
 node scripts/dump-symbols.ts --binary <path> --module-name <shipped-name> --out <store> \

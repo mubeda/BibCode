@@ -40,8 +40,6 @@ describe("Desktop server exposure contract", () => {
         management: "native",
         endpointUrl: null,
         advertisedHost: null,
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
       }),
     ).toEqual({
       mode: "local-only",
@@ -49,8 +47,26 @@ describe("Desktop server exposure contract", () => {
       management: "native",
       endpointUrl: null,
       advertisedHost: null,
-      tailscaleServeEnabled: false,
-      tailscaleServePort: 443,
+    });
+  });
+
+  it("still reads the state an older desktop sends with its Tailscale Serve fields", () => {
+    expect(
+      decodeDesktopServerExposureState({
+        mode: "local-only",
+        configuredMode: "local-only",
+        management: "native",
+        endpointUrl: null,
+        advertisedHost: null,
+        tailscaleServeEnabled: true,
+        tailscaleServePort: 443,
+      }),
+    ).toEqual({
+      mode: "local-only",
+      configuredMode: "local-only",
+      management: "native",
+      endpointUrl: null,
+      advertisedHost: null,
     });
   });
 });

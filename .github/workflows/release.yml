@@ -99,6 +99,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Setup Rust
@@ -314,6 +315,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: |
             args:
               - --filter=bibcode-relay...
@@ -433,6 +435,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Align package manifest versions to release version
@@ -646,6 +649,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Align package manifest versions to release version
@@ -846,6 +850,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: true
 
       - name: Download all desktop artifacts
@@ -1091,6 +1096,7 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
           run-install: |
             args:
               - --filter=@bibcode/scripts...

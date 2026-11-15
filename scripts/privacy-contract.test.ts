@@ -203,6 +203,7 @@ describe("zero-telemetry privacy contract", () => {
       "@vitejs/plugin-react",
       "@wdio/tauri-plugin",
       "@xterm/addon-fit",
+      "@xterm/addon-unicode11",
       "@xterm/addon-webgl",
       "@xterm/xterm",
       "babel-plugin-react-compiler",

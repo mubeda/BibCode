@@ -3,10 +3,57 @@ import type { AdvertisedEndpoint } from "@bibcode/contracts";
 import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
 import {
+  describeWidenFailure,
   generateShareOffer,
   nativeShareAddressUnavailableReason,
   resolveShareAddressOptions,
 } from "./shareOffer.ts";
+
+const RESTORED = "Restored local-only safeguards.";
+
+describe("describeWidenFailure", () => {
+  it("explains missing administrator permission from the desktop's string rejection", () => {
+    expect(
+      describeWidenFailure(
+        `Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. ${RESTORED}`,
+      ),
+    ).toEqual({
+      reason: "elevation-required",
+      message:
+        "Windows needs administrator permission to open the firewall for BiBCode, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows permission prompt, or close BiBCode, start it with Run as administrator, and try again.",
+    });
+  });
+
+  it.each([
+    ["firewall-add-failed", "BiBCode could not add its Windows Firewall rule"],
+    ["firewall-remove-failed", "BiBCode could not replace its old Windows Firewall rule"],
+    ["firewall-read-failed", "BiBCode could not read the Windows Firewall rules"],
+    ["firewall-timed-out", "the Windows Firewall change took too long"],
+    ["firewall-unavailable", "the Windows Firewall step could not run"],
+  ])("names the failed firewall step for %s", (token, step) => {
+    expect(
+      describeWidenFailure(new Error(`open remote-access firewall rule: ${token}. ${RESTORED}`)),
+    ).toEqual({
+      message: `Remote access was not turned on: ${step}. This computer is still local-only. Try again.`,
+    });
+  });
+
+  it("does not claim local-only when recovery could not confirm it", () => {
+    expect(
+      describeWidenFailure(
+        "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-add-failed. Local-only recovery also reported: stop failed.",
+      ).message,
+    ).toContain("BiBCode could not confirm that this computer is back to local-only");
+  });
+
+  it("keeps a string rejection's own reason instead of the generic text", () => {
+    expect(
+      describeWidenFailure("  restart did not produce a network-accessible endpoint "),
+    ).toEqual({ message: "restart did not produce a network-accessible endpoint" });
+    expect(describeWidenFailure("x".repeat(600)).message).toHaveLength(500);
+    expect(describeWidenFailure(undefined)).toEqual({ message: "Could not enable remote access." });
+  });
+});
 
 const wideState = {
   configuredMode: "network-accessible" as const,
@@ -14,8 +61,6 @@ const wideState = {
   mode: "network-accessible" as const,
   endpointUrl: "http://192.168.1.20:3773",
   advertisedHost: "192.168.1.20",
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 
 const loopbackState = {
@@ -33,6 +78,27 @@ const defaultDeps = {
   cleanupExposureAfterFailedMint: null,
   sleep: async () => {},
 };
+
+function localOnlyObservation(
+  idPrefix: string,
+  host: string,
+  reachability: AdvertisedEndpoint["reachability"],
+  isDefault: boolean | undefined,
+): AdvertisedEndpoint {
+  return {
+    id: `${idPrefix}:${host}:3773`,
+    label: reachability === "lan" ? "Local network" : "Private network",
+    provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+    httpBaseUrl: `http://${host}:3773/`,
+    wsBaseUrl: `ws://${host}:3773/`,
+    reachability,
+    compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+    source: "desktop-core",
+    status: "unavailable",
+    unavailableReason: "local-only",
+    ...(isDefault === undefined ? {} : { isDefault }),
+  };
+}
 
 describe("share offer links", () => {
   it("builds the deep link and browser URL from one code", () => {
@@ -75,6 +141,122 @@ describe("generateShareOffer", () => {
       ok: true,
       offer: { endpoint: "http://192.168.1.20:3773", deepLink: "bibcode://pair?code=c0de" },
     });
+  });
+
+  it("keeps the port of an externally served HTTPS address when widening", async () => {
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: "AI-SERVER",
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "tailscale-magicdns:https://machine.tailnet.ts.net/",
+        label: "machine.tailnet.ts.net",
+        httpBaseUrl: "https://machine.tailnet.ts.net/",
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => ({ ...wideState, endpointUrl: "http://192.168.1.20:3774" }),
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(mintOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "https://machine.tailnet.ts.net/" }),
+    );
+  });
+
+  it.each([
+    [
+      "firewall-prompt-open",
+      "A Windows permission prompt for the BiBCode firewall rule is still open, so remote access was not turned on. This computer is still local-only. Answer or close that prompt, then try again.",
+    ],
+    [
+      "firewall-rule-removed-not-added",
+      "BiBCode removed its old Windows Firewall rule, which named an earlier install, but the new rule was not added, so remote access was not turned on. This computer is still local-only. Try again and approve the Windows permission prompt.",
+    ],
+  ])("explains %s", (token, message) => {
+    expect(
+      describeWidenFailure(
+        `Could not apply server exposure network-accessible: open remote-access firewall rule: ${token}. No exposure change was made.`,
+      ).message,
+    ).toBe(message);
+  });
+
+  it("keeps the chosen host but takes the port the widened server listens on", async () => {
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => ({
+      code: "c0de",
+      endpoint: input.endpoint,
+      name: "AI-SERVER",
+      expiresAt: "2026-08-27T01:00:00.000Z",
+    }));
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "desktop-network:10.20.0.5:3773",
+        label: "10.20.0.5 (enables remote access)",
+        httpBaseUrl: "http://10.20.0.5:3773/",
+        servedByNativeListener: true,
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => ({ ...wideState, endpointUrl: "http://192.168.1.20:3774" }),
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(mintOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "http://10.20.0.5:3774/" }),
+    );
+    expect(result).toMatchObject({ ok: true, offer: { endpoint: "http://10.20.0.5:3774/" } });
+  });
+
+  it("says nothing changed when the permission step failed before any restart", () => {
+    expect(
+      describeWidenFailure(
+        "Could not apply server exposure network-accessible: open remote-access firewall rule: firewall-elevation-required. No exposure change was made.",
+      ).message,
+    ).toContain("This computer is still local-only.");
+  });
+
+  it("widens first and keeps a chosen local-only address for the code", async () => {
+    const calls: string[] = [];
+    const applyServerExposure = vi.fn(async () => {
+      calls.push("widen");
+      return wideState;
+    });
+    const mintOffer = vi.fn(async (input: { endpoint: string }) => {
+      calls.push(`mint ${input.endpoint}`);
+      return {
+        code: "c0de",
+        endpoint: input.endpoint,
+        name: "AI-SERVER",
+        expiresAt: "2026-08-27T01:00:00.000Z",
+      };
+    });
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "desktop-network:10.20.0.5:3773",
+        label: "10.20.0.5 (enables remote access)",
+        httpBaseUrl: "http://10.20.0.5:3773/",
+      },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure,
+      mintOffer,
+      ...defaultDeps,
+    });
+    expect(calls).toEqual(["widen", "mint http://10.20.0.5:3773/"]);
+    expect(applyServerExposure).toHaveBeenCalledWith("network-accessible");
+    expect(result).toMatchObject({ ok: true, offer: { endpoint: "http://10.20.0.5:3773/" } });
   });
 
   it("fails visibly without minting when widening fails", async () => {
@@ -774,6 +956,7 @@ describe("resolveShareAddressOptions", () => {
           compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
           source: "desktop-core",
           status: "unavailable",
+          unavailableReason: "local-only",
           isDefault: false,
         },
       ],
@@ -798,6 +981,7 @@ describe("resolveShareAddressOptions", () => {
           compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
           source: "desktop-core",
           status: "unavailable",
+          unavailableReason: "local-only",
           isDefault: false,
         },
       ],
@@ -811,25 +995,87 @@ describe("resolveShareAddressOptions", () => {
   it("offers native automatic LAN for an observed private default route before widening", () => {
     const options = resolveShareAddressOptions({
       intent: "another-device",
+      advertisedEndpoints: [localOnlyObservation("desktop-network", "192.168.0.10", "lan", true)],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([
+      expect.objectContaining({ id: "auto-lan", httpBaseUrl: null }),
+      expect.objectContaining({
+        id: "desktop-network:192.168.0.10:3773",
+        httpBaseUrl: "http://192.168.0.10:3773/",
+      }),
+    ]);
+  });
+
+  it("lists every private address that enabling remote access makes reachable", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
       advertisedEndpoints: [
+        localOnlyObservation("desktop-network", "192.168.0.10", "lan", true),
+        localOnlyObservation("desktop-network", "10.20.0.5", "lan", false),
+        localOnlyObservation("desktop-network", "100.64.0.7", "private-network", false),
+        // The Tailscale CLI reports the same tailnet address the interface scan found.
         {
-          id: "desktop-network:192.168.1.20:3773",
-          label: "Local network",
-          provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
-          httpBaseUrl: "http://192.168.1.20:3773/",
-          wsBaseUrl: "ws://192.168.1.20:3773/",
-          reachability: "lan",
-          compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
-          source: "desktop-core",
-          status: "unavailable",
-          isDefault: true,
+          ...localOnlyObservation("tailscale-ip", "100.64.0.7", "private-network", undefined),
+          label: "Tailscale IP",
+          provider: { id: "tailscale", label: "Tailscale", kind: "private-network", isAddon: true },
+          source: "desktop-addon",
+        },
+        {
+          ...localOnlyObservation("desktop-network", "8.8.8.8", "public", false),
+          label: "Public address",
         },
       ],
       exposureState: loopbackState,
       primaryHttpBaseUrl: "http://127.0.0.1:3773",
     });
 
-    expect(options).toEqual([expect.objectContaining({ id: "auto-lan", httpBaseUrl: null })]);
+    expect(options).toEqual([
+      expect.objectContaining({ id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null }),
+      ...["192.168.0.10", "10.20.0.5", "100.64.0.7"].map((host) => ({
+        id: `desktop-network:${host}:3773`,
+        label: `${host} (enables remote access)`,
+        httpBaseUrl: `http://${host}:3773/`,
+        description: "BiBCode will enable remote access, then use this address.",
+        servedByNativeListener: true,
+      })),
+    ]);
+  });
+
+  it("leaves out an address that is unavailable for a reason other than local-only", () => {
+    const { unavailableReason: _omitted, ...withoutReason } = localOnlyObservation(
+      "desktop-network",
+      "10.20.0.5",
+      "lan",
+      false,
+    );
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [
+        localOnlyObservation("desktop-network", "192.168.0.10", "lan", true),
+        withoutReason,
+      ],
+      exposureState: loopbackState,
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options.map((option) => option.httpBaseUrl)).toEqual([
+      null,
+      "http://192.168.0.10:3773/",
+    ]);
+  });
+
+  it("does not offer local-only addresses while exposure is managed outside BiBCode", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [localOnlyObservation("desktop-network", "192.168.0.10", "lan", true)],
+      exposureState: { ...loopbackState, management: "external" },
+      primaryHttpBaseUrl: "http://127.0.0.1:3773",
+    });
+
+    expect(options).toEqual([]);
   });
 
   it("never offers public interface candidates for a native-managed wide server", () => {

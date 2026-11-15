@@ -27,7 +27,8 @@ export interface BrowserSurfaceContentPresentation {
 
 interface BrowserSurfaceStoreState {
   readonly byTabId: Record<string, BrowserSurfacePresentation>;
-  readonly occlusionOwners: ReadonlySet<symbol>;
+  /** Occlusion leases by owner; a null rectangle covers every surface. */
+  readonly occlusionOwners: ReadonlyMap<symbol, BrowserSurfaceRect | null>;
   readonly claim: (tabId: string, owner: symbol) => void;
   readonly present: (
     tabId: string,
@@ -45,7 +46,24 @@ export interface BrowserSurfaceLease {
 }
 
 export interface BrowserSurfaceOcclusionLease {
+  readonly update: (rect: BrowserSurfaceRect | null) => void;
   readonly release: () => void;
+}
+
+const rectsOverlap = (left: BrowserSurfaceRect, right: BrowserSurfaceRect): boolean =>
+  left.x < right.x + right.width &&
+  right.x < left.x + left.width &&
+  left.y < right.y + right.height &&
+  right.y < left.y + left.height;
+
+export function isBrowserSurfaceOccluded(
+  rect: BrowserSurfaceRect,
+  owners: ReadonlyMap<symbol, BrowserSurfaceRect | null>,
+): boolean {
+  for (const owner of owners.values()) {
+    if (owner === null || rectsOverlap(rect, owner)) return true;
+  }
+  return false;
 }
 
 export function resolveBrowserSurfacePanelRect(
@@ -77,7 +95,7 @@ const rectEquals = (left: BrowserSurfaceRect | null, right: BrowserSurfaceRect):
 
 export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) => ({
   byTabId: {},
-  occlusionOwners: new Set(),
+  occlusionOwners: new Map(),
   claim: (tabId, owner) =>
     set((state) => {
       const current = state.byTabId[tabId];
@@ -157,20 +175,29 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
     }),
 }));
 
-export function acquireBrowserSurfaceOcclusion(): BrowserSurfaceOcclusionLease {
+export function acquireBrowserSurfaceOcclusion(
+  rect: BrowserSurfaceRect | null = null,
+): BrowserSurfaceOcclusionLease {
   const owner = Symbol("browser-surface-occlusion");
   let released = false;
   useBrowserSurfaceStore.setState((state) => ({
-    occlusionOwners: new Set(state.occlusionOwners).add(owner),
+    occlusionOwners: new Map(state.occlusionOwners).set(owner, rect),
   }));
 
   return {
+    update: (next) => {
+      if (released) return;
+      useBrowserSurfaceStore.setState((state) => {
+        if (!state.occlusionOwners.has(owner)) return state;
+        return { occlusionOwners: new Map(state.occlusionOwners).set(owner, next) };
+      });
+    },
     release: () => {
       if (released) return;
       released = true;
       useBrowserSurfaceStore.setState((state) => {
         if (!state.occlusionOwners.has(owner)) return state;
-        const occlusionOwners = new Set(state.occlusionOwners);
+        const occlusionOwners = new Map(state.occlusionOwners);
         occlusionOwners.delete(owner);
         return { occlusionOwners };
       });

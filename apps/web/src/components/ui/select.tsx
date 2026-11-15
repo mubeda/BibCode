@@ -2,12 +2,14 @@
 
 import { mergeProps } from "@base-ui/react/merge-props";
 import { Select as SelectPrimitive } from "@base-ui/react/select";
+import { useRef } from "react";
 import { useRender } from "@base-ui/react/use-render";
 import { cva, type VariantProps } from "class-variance-authority";
 import { ChevronDownIcon, ChevronsUpDownIcon, ChevronUpIcon } from "lucide-react";
 import type * as React from "react";
 
 import { cn } from "~/lib/utils";
+import { PopupOcclusion } from "./usePopupOcclusion";
 
 const Select = SelectPrimitive.Root;
 
@@ -123,6 +125,7 @@ function SelectPopup({
   matchTriggerWidth?: boolean;
   anchor?: SelectPrimitive.Positioner.Props["anchor"];
 }) {
+  const positionerRef = useRef<HTMLDivElement>(null);
   return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Positioner
@@ -132,9 +135,11 @@ function SelectPopup({
         anchor={anchor}
         className="z-50 select-none"
         data-slot="select-positioner"
+        ref={positionerRef}
         side={side}
         sideOffset={sideOffset}
       >
+        <PopupOcclusion positionerRef={positionerRef} />
         <SelectPrimitive.Popup
           className="origin-(--transform-origin) rounded-lg text-foreground outline-none"
           data-slot="select-popup"

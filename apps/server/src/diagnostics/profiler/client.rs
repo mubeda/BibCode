@@ -25,6 +25,7 @@ use super::{
         judge,
     },
     record_finding,
+    redact::redact_message,
     store::EventId,
 };
 use crate::rpc::ACTIVE_RPC_METHODS;
@@ -32,6 +33,12 @@ use crate::rpc::ACTIVE_RPC_METHODS;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 64;
 const MAX_HISTOGRAMS: usize = 64;
+const MAX_RENDER_ERRORS: usize = 8;
+const MAX_COMPONENT_NAMES: usize = 12;
+const MAX_NAME_BYTES: usize = 64;
+const MAX_ROUTE_BYTES: usize = 256;
+/// React's error codes are below 1000 today.
+const MAX_REACT_ERROR_CODE: u32 = 9_999;
 const MAX_METHOD_BYTES: usize = 128;
 const MAX_VERSION_BYTES: usize = 64;
 const MAX_ID_BYTES: usize = 64;
@@ -137,6 +144,21 @@ struct ClientBatch {
     /// the server's. Older clients send none.
     #[serde(default)]
     app_version: Option<String>,
+    /// Render errors the client's error screen caught (R51). Older clients send none.
+    #[serde(default)]
+    render_errors: Vec<RenderError>,
+}
+
+/// Names and codes only. Unknown fields, such as a message a client should never send, are
+/// not deserialized, so they never reach an event.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderError {
+    error_type: String,
+    react_error_code: Option<u32>,
+    component_names: Vec<String>,
+    route_pattern: Option<String>,
+    fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -181,9 +203,12 @@ fn validate(batch: &Value) -> Result<ClientBatch, Value> {
             .and_then(Value::as_array)
             .map_or(0, Vec::len)
     };
-    if length("records") > MAX_RECORDS || length("histograms") > MAX_HISTOGRAMS {
+    if length("records") > MAX_RECORDS
+        || length("histograms") > MAX_HISTOGRAMS
+        || length("renderErrors") > MAX_RENDER_ERRORS
+    {
         return Err(too_large(
-            "The batch has more than 64 records or 64 histograms.",
+            "The batch has more than 64 records, 64 histograms or 8 render errors.",
         ));
     }
     let batch = ClientBatch::deserialize(batch).map_err(|error| invalid(&error.to_string()))?;
@@ -295,8 +320,84 @@ impl ClientBatch {
                 .as_ref()
                 .is_none_or(|version| version.len() <= MAX_VERSION_BYTES),
             "appVersion is over 64 bytes.",
-        )
+        )?;
+        for error in &self.render_errors {
+            ensure(
+                error.component_names.len() <= MAX_COMPONENT_NAMES,
+                "A render error has more than 12 component names.",
+            )?;
+            ensure(
+                error
+                    .react_error_code
+                    .is_none_or(|code| code <= MAX_REACT_ERROR_CODE)
+                    && error.fingerprint.len() <= 16
+                    && !error.fingerprint.is_empty()
+                    && error.fingerprint.bytes().all(|b| b.is_ascii_hexdigit()),
+                "A render error's code or fingerprint is invalid.",
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// The error types a record may name; any other is [`OTHER_ERROR_TYPE`]. The web collector
+/// applies the same set, identifier shape and placeholder (`clientCollector.ts`).
+const ERROR_TYPES: [&str; 9] = [
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
+    "DOMException",
+];
+const OTHER_ERROR_TYPE: &str = "Other";
+const UNNAMED_COMPONENT: &str = "Unnamed";
+/// The first segments of the web app's route ids (`apps/web/src/routeTree.gen.ts`): a route
+/// under any other is not the app's, so it is recorded as unknown. "" is the index route.
+const ROUTE_ROOTS: [&str; 5] = ["", "_chat", "settings", "pair", "agents"];
+
+/// A plain identifier: letters, digits, `_` and `$`, so never a path, a URL or a sentence.
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    value.len() <= MAX_NAME_BYTES
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A route id of the web app, such as `/_chat/$environmentId/$threadId`: it starts at one of
+/// [`ROUTE_ROOTS`], and each further segment is a `$parameter` or a lowercase word without
+/// digits, so a real path's ids are refused.
+fn is_route_pattern(value: &str) -> bool {
+    let word = |segment: &str| {
+        let segment = segment.strip_prefix('_').unwrap_or(segment);
+        segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+            && segment.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    };
+    let parameter = |segment: &str| {
+        segment
+            .strip_prefix('$')
+            .is_some_and(|name| name.is_empty() || is_identifier(name))
+    };
+    if value == "__root__" {
+        return true;
+    }
+    let Some(rest) = value.strip_prefix('/') else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    value.len() <= MAX_ROUTE_BYTES
+        && segments
+            .next()
+            .is_some_and(|root| ROUTE_ROOTS.contains(&root))
+        && segments.all(|segment| segment.is_empty() || word(segment) || parameter(segment))
 }
 
 struct Analysis {
@@ -442,7 +543,76 @@ fn analyze(
         };
         findings.push((finding, batch_event));
     }
+    for error in &batch.render_errors {
+        let (payload, finding) = render_error(batch, error);
+        findings.push((finding, events.len()));
+        events.push(("client.render-error", payload));
+    }
     Analysis { events, findings }
+}
+
+/// One caught render error's event and finding. The server enforces the shapes again: an
+/// error type outside the closed set becomes "Other", a component name that is not a plain
+/// identifier becomes "Unnamed", and a route that is not one of the app's route ids becomes
+/// `null`; what is left still passes the redaction helper, as every profiler record does.
+/// The finding groups by type, code, route and component names: the packaged app's
+/// component names are minified, so the route keeps different crashes apart. The client's
+/// hash is shown, not trusted.
+fn render_error(batch: &ClientBatch, error: &RenderError) -> (Value, FindingInput) {
+    let error_type = redact_message(if ERROR_TYPES.contains(&error.error_type.as_str()) {
+        &error.error_type
+    } else {
+        OTHER_ERROR_TYPE
+    });
+    let names: Vec<String> = error
+        .component_names
+        .iter()
+        .map(|name| {
+            redact_message(if is_identifier(name) {
+                name
+            } else {
+                UNNAMED_COMPONENT
+            })
+        })
+        .collect();
+    let route = error
+        .route_pattern
+        .as_deref()
+        .filter(|route| is_route_pattern(route))
+        .map(redact_message);
+    let payload = json!({
+        "clientId": batch.client_id,
+        "errorType": error_type,
+        "reactErrorCode": error.react_error_code,
+        "componentNames": names,
+        "routePattern": route,
+        "fingerprint": redact_message(&error.fingerprint),
+    });
+    let code = error
+        .react_error_code
+        .map_or_else(String::new, |code| code.to_string());
+    let react = error
+        .react_error_code
+        .map_or_else(String::new, |code| format!(" (React error #{code})"));
+    let fingerprint_fields = [error_type.clone(), code, route.clone().unwrap_or_default()]
+        .into_iter()
+        .chain(names.iter().cloned())
+        .collect();
+    let finding = FindingInput {
+        kind: "client.render-error",
+        severity: Severity::Error,
+        source: SOURCE.to_owned(),
+        fingerprint_fields,
+        title: format!("The error screen caught {error_type}{react}"),
+        summary: format!(
+            "The app showed \"Something went wrong.\" for {error_type}{react} in {component} \
+             on {route}.",
+            component = names.first().map_or("an unnamed component", String::as_str),
+            route = route.as_deref().unwrap_or("an unknown route"),
+        ),
+        evidence: payload.clone(),
+    };
+    (payload, finding)
 }
 
 /// Where one request's time went, as the client saw it until the response was painted.
@@ -877,6 +1047,218 @@ mod tests {
                 0.0
             )]))
             .is_ok()
+        );
+    }
+
+    fn render_error() -> Value {
+        json!({
+            "errorType": "Error",
+            "reactErrorCode": 185,
+            "componentNames": ["GitManagerBranchDropdown", "Popover"],
+            "routePattern": "/_chat/$environmentId/$threadId",
+            "fingerprint": "0a1b2c3d",
+        })
+    }
+
+    /// R51: each caught render error is one event; repeats share one finding, grouped by the
+    /// error's type, code and component names, never by the route or the client's hash.
+    #[test]
+    fn render_errors_become_events_and_one_grouped_finding() {
+        let book = LatencyBook::default();
+        let mut report = batch(Vec::new());
+        report["renderErrors"] = json!([render_error(), render_error()]);
+        let analysis = analyze_with(&book, &report);
+
+        let events = events(&analysis, "client.render-error");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            &json!({
+                "clientId": "c1",
+                "errorType": "Error",
+                "reactErrorCode": 185,
+                "componentNames": ["GitManagerBranchDropdown", "Popover"],
+                "routePattern": "/_chat/$environmentId/$threadId",
+                "fingerprint": "0a1b2c3d",
+            }),
+            "no envId, message, URL or path"
+        );
+        let findings: Vec<&(FindingInput, usize)> = analysis
+            .findings
+            .iter()
+            .filter(|(finding, _)| finding.kind == "client.render-error")
+            .collect();
+        assert_eq!(
+            findings.len(),
+            2,
+            "one per occurrence, merged by fingerprint"
+        );
+        let (finding, event) = findings[0];
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.source, "client");
+        assert_eq!(
+            finding.fingerprint_fields,
+            [
+                "Error",
+                "185",
+                "/_chat/$environmentId/$threadId",
+                "GitManagerBranchDropdown",
+                "Popover"
+            ]
+        );
+        assert_eq!(findings[1].0.fingerprint_fields, finding.fingerprint_fields);
+        assert_eq!(analysis.events[*event].0, "client.render-error");
+
+        let mut other_hash = render_error();
+        other_hash["fingerprint"] = json!("ffffffff");
+        report["renderErrors"] = json!([other_hash]);
+        let analysis = analyze_with(&book, &report);
+        assert_eq!(
+            analysis.findings[0].0.fingerprint_fields, finding.fingerprint_fields,
+            "the client's hash does not split the finding"
+        );
+        // Minified names are shared by unrelated crashes: the route keeps them apart.
+        let mut other_route = render_error();
+        other_route["routePattern"] = json!("/settings/general");
+        report["renderErrors"] = json!([other_route]);
+        let analysis = analyze_with(&book, &report);
+        assert_ne!(
+            analysis.findings[0].0.fingerprint_fields,
+            finding.fingerprint_fields
+        );
+    }
+
+    /// Codex's adversarial shapes: content where a name or a route should be is replaced,
+    /// never recorded, in the event, the evidence and the grouping.
+    #[test]
+    fn content_shaped_render_error_fields_are_replaced() {
+        let book = LatencyBook::default();
+        let cases = [
+            ("errorType", json!("private_document.txt"), "Other"),
+            ("errorType", json!("PrivateDocumentError"), "Other"),
+            ("errorType", json!("Error: secret thread"), "Other"),
+        ];
+        for (field, value, expected) in cases {
+            let mut error = render_error();
+            error[field] = value.clone();
+            let mut report = batch(Vec::new());
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1[field], expected, "{value}");
+            assert_eq!(analysis.findings[0].0.fingerprint_fields[0], expected);
+        }
+        let mut error = render_error();
+        error["componentNames"] = json!([
+            "private prompt words",
+            "/home/test-user/app.tsx",
+            "https://example.test/app.js:1:2",
+            "Context.Provider",
+            "\"quoted\"",
+            "Panel",
+        ]);
+        let mut report = batch(Vec::new());
+        report["renderErrors"] = json!([error]);
+        let analysis = analyze_with(&book, &report);
+        assert_eq!(
+            analysis.events[1].1["componentNames"],
+            json!([
+                "Unnamed", "Unnamed", "Unnamed", "Unnamed", "Unnamed", "Panel"
+            ])
+        );
+        for route in [
+            "/home/test-user/private-project",
+            "/_chat/env-1/thread-42",
+            "/settings?token=x",
+            "private-project",
+        ] {
+            let mut error = render_error();
+            error["routePattern"] = json!(route);
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1["routePattern"], Value::Null, "{route}");
+            assert_eq!(analysis.findings[0].0.fingerprint_fields[2], "", "{route}");
+            let finding = &analysis.findings[0].0;
+            let text = format!(
+                "{:?} {} {} {}",
+                finding.fingerprint_fields, finding.evidence, finding.title, finding.summary
+            );
+            assert!(
+                !text.contains("private") && !text.contains("thread-42"),
+                "{text}"
+            );
+        }
+        for route in [
+            "/",
+            "__root__",
+            "/settings/source-control",
+            "/pair",
+            "/_chat/",
+        ] {
+            let mut error = render_error();
+            error["routePattern"] = json!(route);
+            report["renderErrors"] = json!([error]);
+            let analysis = analyze_with(&book, &report);
+            assert_eq!(analysis.events[1].1["routePattern"], route);
+        }
+    }
+
+    #[test]
+    fn a_render_error_keeps_only_its_known_fields() {
+        let book = LatencyBook::default();
+        let mut leaky = render_error();
+        leaky["message"] = json!("Cannot read secret-thread from ~/project/file.ts");
+        leaky["url"] = json!("https://example.test/app");
+        leaky["threadId"] = json!("thread-1");
+        let mut report = batch(Vec::new());
+        report["renderErrors"] = json!([leaky]);
+        let analysis = analyze_with(&book, &report);
+        let event = events(&analysis, "client.render-error")[0].to_string();
+        for forbidden in ["message", "secret", "url", "https", "thread-1", "file.ts"] {
+            assert!(!event.contains(forbidden), "{forbidden} in {event}");
+        }
+    }
+
+    #[test]
+    fn malformed_render_errors_are_rejected() {
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "13 component names",
+                Box::new(|e| e["componentNames"] = json!(vec!["Panel"; 13])),
+            ),
+            (
+                "a free-text fingerprint",
+                Box::new(|e| e["fingerprint"] = json!("secret thread")),
+            ),
+            (
+                "a code out of range",
+                Box::new(|e| e["reactErrorCode"] = json!(100_000)),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut error = render_error();
+            mutate(&mut error);
+            let mut report = batch(Vec::new());
+            report["renderErrors"] = json!([error]);
+            let rejected = validate(&report)
+                .err()
+                .unwrap_or_else(|| panic!("{name} accepted"));
+            assert_eq!(tag(&rejected), "ProfilerClientBatchInvalid", "{name}");
+        }
+        let mut report = batch(Vec::new());
+        report["renderErrors"] = json!(vec![render_error(); 9]);
+        assert_eq!(
+            tag(&validate(&report).err().expect("rejected")),
+            "ProfilerClientBatchTooLarge"
+        );
+        let mut root = render_error();
+        root["routePattern"] = json!("__root__");
+        root["reactErrorCode"] = Value::Null;
+        report["renderErrors"] = json!([root]);
+        assert!(validate(&report).is_ok(), "the root route and no code");
+        assert!(
+            validate(&batch(Vec::new())).is_ok(),
+            "an older client sends no renderErrors"
         );
     }
 

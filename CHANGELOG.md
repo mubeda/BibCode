@@ -2,9 +2,24 @@
 
 ## Unreleased
 
+### Send to agent and agent messaging
+
+- **Send to agent** in every chat panel's composer footer and every AI Terminal's toolbar sends a request to another agent of the project: **Review**, **Second opinion**, **Hand off**, **Take over from** or **Message**. A preview shows exactly what is sent (a lead-in, your note and editable attachments, up to 48,000 characters), and nothing is sent until you press **Send**. A row above the composer follows the request (queued, waiting, delivered, read, answered, not answered, cancelled), **Cancel** withdraws one the agent has not taken, and an answer shows a notice whose **Bring back** drafts it into your composer without sending anything. An agent that ran out of context or usage is marked in the menu.
+- An AI Terminal can be the source and the target of a request. As a source it attaches your selection, else the CLI's own conversation when BiBCode can read it (Claude's transcript, Codex's newest 20 turns), else the recent output, and the preview says which. As a target it is told with one fixed line once its agent waits for a prompt, and reads the request with `bibcode agent inbox`. A Claude Code terminal counts as waiting only after Claude's own idle notice, which comes once the prompt has waited a while.
+- **Agent messaging**, off by default in Settings → Agents → Agent integrations, lets the agents of one project message each other with `agents_list`, `agent_message_send`, `agent_message_reply`, `agent_message_status` and `agent_message_cancel`, and an AI Terminal's agent with `bibcode agent`. A message names its sender in an envelope and shows in the recipient's transcript with a **From agent** chip. An agent can message only an agent that runs with no more access than its own, an exchange stops after 8 hops until you write, a sender may send 30 messages a minute, and a recipient may hold 20 unread ones. Sends, replies and the delivered, read and failed steps are rows of Agent activity with ids, thread titles and states, never message text.
+- A side chat's seed and the context handoff after a lost provider session now start with your first message (cut at 4,000 characters) in front of the last 40.
+
+## [v0.16.0] - 2026-11-14
+
+BiBCode v0.16.0 adds custom themes, a Host dashboard for each environment, a Review changes button in Source Control and editable rendered Markdown, stops background status reads from taking Git's index lock, keeps terminal sizes correct across panels, displays and windows, and lists this computer's private addresses in Share this host. This release includes PRs #349, #359, #365 and #369 since v0.15.3.
+
 ### Diagnostics
 
 - Each environment has a Host dashboard (the environment card's menu, Settings > Remote Servers, and the status bar's Resource Manager) with its host's CPU, memory and volumes, live and since the server started. It lists the volumes it hides and why, shows per-volume statistics, never reads network volumes, and says when the volume list is not answering. Agents can read the same figures with the `host_metrics` MCP tool. (#292)
+- The Host dashboard on Linux no longer lists another running BiBCode AppImage's mount, or one a killed instance left behind, as a full read-only volume. (#353)
+- A refused pairing offer or pairing credential is now logged as a warning with a fixed reason, so a pairing that fails shows in the server log; the log never holds the offered link or the credential. (#358)
+- An expired pairing link, pairing offer or session is refused from the moment it expires. Before, one whose expiry fell on a whole second could still be accepted for up to a second, because expiry times were compared as text. The same text form could delete a signed-in device's refresh token up to a second early. The server now writes every stored timestamp at one fixed width, and re-writes the timestamps a client sends or a session import carries in that form before storing them. (#362, #366)
+- With the Profiler on, an error that the "Something went wrong" screen catches is recorded as a `client.render-error` event and grouped in one finding. It holds the error's type, React's error number, component names and the route pattern, never the error's message. (#360)
 
 ### Pipelines
 
@@ -18,10 +33,16 @@
 - The profiler warns about a leftover worktree folder only when it shows worktree evidence, one finding per folder, and the warning ends when the folder is gone. BiBCode records the worktrees it creates, so folders that were never worktrees no longer warn every ten minutes. (#344)
 - Create worktree starts fresh every time it opens, after a creation or a close: the last Name, Create From, mode, base override, Advanced, Create more and agent pick no longer come back. Input stays while the dialog is open, and Create more still keeps the project, mode, agent and base override for its batch. (#346)
 - Source Control has a **Review changes** button that starts a code review of your branch and its uncommitted changes in a chat panel beside the thread or in an AI Terminal. A Claude review starts in Claude's plan mode, a Codex review runs in Codex's read-only sandbox, other chat agents ask before edits or are only told not to edit, and Settings → Agents and the button's tooltip say which applies. A review's findings offer no Implement. The review prompt can be set per user in Settings → Agents and per project from the button's menu, which also starts a review once with another agent or with added instructions. Mod+Alt+Shift+R starts a review from the keyboard. On Windows, a terminal review gets the prompt with its line breaks as spaces. (#293)
+- Sign-in guidance after a failed fetch or push now appears only when Git's own `fatal:` line says it could not read a username, so a commit message or hook output that contains those words no longer triggers it. (#354)
+- A pull request that the forge CLI could not look up is no longer asked for again at once on every status change: a failed lookup waits 5 seconds, and a pull request shown for a branch disappears when the lookups keep failing and the last answer is more than 5 minutes old. A status-neutral local change no longer leaves an outdated answer in place, and a lookup that is running when BiBCode quits ends with it. (#355)
+- A worktree recreated at the path of a removed one keeps its own creation record, and a record on a volume that is not mounted is no longer deleted by the profiler's worktree audit. A failed worktree creation that is rolled back is now visible to the profiler. (#356)
 
 ### Chats
 
 - A new worktree's or project's chat lists only its own provider's models in the composer, before the first message too; to use another provider, add a chat panel from the chat header `+`. A new chat that has not been sent still lists every ready provider. A chat whose provider is disabled or removed now says so above the composer and keeps Send unavailable, and **Add as project** in Files opens the new Main on your Default Agent instead of Codex. (#347)
+- Expanding a reasoning row in the chat no longer scrolls the list to its end on Windows. (#351)
+- The app no longer falls to the "Something went wrong" screen (React error 185) when a closed branch picker in Git Manager, or a closed model picker, receives a new list, as happened after a branch switch and a fetch in a repository with thousands of branches. (#360)
+- The model picker opens with an empty search every time, instead of the text from the last time it was open. (#358)
 
 ### Files
 
@@ -31,6 +52,12 @@
 - Mermaid diagrams in an editable rendered Markdown file are drawn again, as one block that is not edited in place; the file's source is kept as written. (#342)
 - The Linux AppImage now carries its own GStreamer plugins for the audio Files previews in WAV, MP3, Ogg, WebM and FLAC files, instead of relying on the system's plugins, which its bundled GStreamer cannot load on newer distributions. M4A is not covered: its AAC decoder is not bundled.
 - A PDF preview in the Files panel is no longer blocked by the page's content security policy in Chromium-based webviews and browsers: the Windows desktop app, and browser mode in Chrome or Edge.
+- A read-only rendered Markdown file (large files, and files the editor cannot change safely) now loads its relative images from the project, as the editable view does. (#358)
+- After you allow an update to install, the Files block survives a reload of the window and covers a Files source opened during the install, and the "Installing an update" dialog has **Check again**, which asks the desktop whether the install is still running. (#357)
+- While an update you allowed is installing, the remote-update notice's **Manage devices** action is switched off and says it is available when the update finishes, instead of opening Settings underneath the dialog. (#357)
+- **Share this host** lists this computer's private addresses (local network, VPN or overlay, and Tailscale) while remote access is still local-only, each marked as enabling remote access; choosing one turns remote access on and makes the code for that address. Before, only "Automatic (LAN)" was offered. (#361)
+- On Windows, when BiBCode has no administrator rights and needs its firewall rule, it now asks through the Windows permission prompt when you generate a code, and if you decline it says what is missing and offers **Retry**, instead of failing with a raw error. Without administrator rights BiBCode cannot remove that rule later: turning sharing off returns the server to local-only and may leave the rule in place. A rule that was disabled or changed to block is replaced instead of reused. (#361)
+- BiBCode no longer manages Tailscale Serve: the Tailscale HTTPS switch is gone, BiBCode only reads Tailscale addresses, and a Serve address you set up yourself is listed when it answers. (#361)
 
 ### Appearance
 
@@ -38,6 +65,7 @@
 - Clicking a theme row applies it and, when the theme's base differs from the mode on screen, switches the mode with an Undo that restores the previous mode and theme. (#290)
 - The left panel draws its repository, environment, primary checkout, worktree and chat rows as five visually distinct levels in every built-in theme, and a theme can style each level. (#290)
 - On the desktop app, exporting a theme or plan opens the native Save dialog, and closing, quitting, restarting or installing an update with unsaved Files edits asks first with Save all, Discard and Cancel. (#290, #342)
+- On the macOS desktop app, a menu, popover, select or combobox opened over a native browser preview is drawn above it, and the preview is hidden only where the popup covers it. (#358)
 
 ### Terminals
 
@@ -49,13 +77,15 @@
 - Opening, collapsing or dragging a panel no longer resizes its terminal's program to 2 or 5 columns on the way: a terminal takes a new size once its panel holds still for a moment, and a small panel that holds still still sizes it. (#348)
 - A terminal that was off-screen or hidden while its program kept printing after its rows shrank comes back showing its last lines and footer, instead of a view stuck rows above them until you changed a panel's size; a terminal you had scrolled up to read stays where you left it. (#348)
 - When two windows, for example on two machines, show the same terminal, the window you last used sizes it and the other one shows the whole terminal scaled down to fit instead of cutting off its bottom rows; a window nobody is clicking or typing in, such as an idle server host window, no longer takes the size back when it regains focus, where its web view reports recent input. A click or **Fit to this window** that takes the size leaves the terminal focused, so the first keys you type reach the program. (#348)
+- A terminal repaints and refits after a font loads late, and one created after the server's settings arrived no longer keeps a stale picture until a panel is resized. (#348)
+- Every terminal counts an emoji as two columns, as programs such as the Claude CLI assume, so their lines no longer drift. (#353)
+- **Fit to this window** now says when the server already holds the size, and a terminal no longer shows a transient size change of a few rows right after you return to it. (#353)
+- A new terminal tries the WebGL renderer again after an earlier terminal fell back to the standard one. (#353)
+- A client uses the typed-last size hand-over only with a server that says it has it, so a client and a server of different versions keep working. (#358)
 
-### Send to agent and agent messaging
+### Providers
 
-- **Send to agent** in every chat panel's composer footer and every AI Terminal's toolbar sends a request to another agent of the project: **Review**, **Second opinion**, **Hand off**, **Take over from** or **Message**. A preview shows exactly what is sent (a lead-in, your note and editable attachments, up to 48,000 characters), and nothing is sent until you press **Send**. A row above the composer follows the request (queued, waiting, delivered, read, answered, not answered, cancelled), **Cancel** withdraws one the agent has not taken, and an answer shows a notice whose **Bring back** drafts it into your composer without sending anything. An agent that ran out of context or usage is marked in the menu.
-- An AI Terminal can be the source and the target of a request. As a source it attaches your selection, else the CLI's own conversation when BiBCode can read it (Claude's transcript, Codex's newest 20 turns), else the recent output, and the preview says which. As a target it is told with one fixed line once its agent waits for a prompt, and reads the request with `bibcode agent inbox`. A Claude Code terminal counts as waiting only after Claude's own idle notice, which comes once the prompt has waited a while.
-- **Agent messaging**, off by default in Settings → Agents → Agent integrations, lets the agents of one project message each other with `agents_list`, `agent_message_send`, `agent_message_reply`, `agent_message_status` and `agent_message_cancel`, and an AI Terminal's agent with `bibcode agent`. A message names its sender in an envelope and shows in the recipient's transcript with a **From agent** chip. An agent can message only an agent that runs with no more access than its own, an exchange stops after 8 hops until you write, a sender may send 30 messages a minute, and a recipient may hold 20 unread ones. Sends, replies and the delivered, read and failed steps are rows of Agent activity with ids, thread titles and states, never message text.
-- A side chat's seed and the context handoff after a lost provider session now start with your first message (cut at 4,000 characters) in front of the last 40.
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.323.
 
 ## [v0.15.3] - 2026-11-08
 

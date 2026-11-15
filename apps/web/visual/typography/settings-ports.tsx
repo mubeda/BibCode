@@ -286,8 +286,6 @@ const exposure: DesktopServerExposureState = {
   mode: "network-accessible",
   endpointUrl: "http://192.0.2.20:3773",
   advertisedHost: "192.0.2.20",
-  tailscaleServeEnabled: false,
-  tailscaleServePort: 443,
 };
 export const ownedDesktopNetworkAccess: DesktopNetworkAccessSnapshot = {
   serverExposureState: exposure,
@@ -309,20 +307,13 @@ export const ownedDesktopNetworkAccess: DesktopNetworkAccessSnapshot = {
 export const ownedShareDesktopPort = {
   getServerExposureState: async () => selectedShareNetwork.serverExposureState,
   getAdvertisedEndpoints: async () => selectedShareNetwork.advertisedEndpoints,
-  setTailscaleServeEnabled: async () => {
-    throw new Error("Fixture forbids changing network exposure.");
-  },
   getClientSettings: async () => DEFAULT_CLIENT_SETTINGS,
   setClientSettings: async () => {
     throw new Error("Fixture forbids host persistence.");
   },
 } satisfies Pick<
   DesktopBridge,
-  | "getServerExposureState"
-  | "getAdvertisedEndpoints"
-  | "setTailscaleServeEnabled"
-  | "getClientSettings"
-  | "setClientSettings"
+  "getServerExposureState" | "getAdvertisedEndpoints" | "getClientSettings" | "setClientSettings"
 >;
 let selectedShareNetwork = ownedDesktopNetworkAccess;
 

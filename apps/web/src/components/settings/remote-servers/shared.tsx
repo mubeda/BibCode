@@ -25,7 +25,6 @@ import type { ServerClientSessionRecord, ServerPairingLinkRecord } from "~/envir
 import { Popover, PopoverPopup, PopoverTrigger } from "../../ui/popover";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 
-export const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 export const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
 export const EMPTY_DISCOVERED_SSH_HOSTS: ReadonlyArray<DesktopDiscoveredSshHost> = [];
 

@@ -42,6 +42,15 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
 }) {
   const [uncontrolledIsMenuOpen, setUncontrolledIsMenuOpen] = useState(false);
   const isMenuOpen = props.open ?? uncontrolledIsMenuOpen;
+  // The popover keeps its content mounted while closed, so key the content by opening: each
+  // opening, by any route (trigger, the composer's shortcut, the `open` prop), starts with an
+  // empty search and the current values.
+  const [wasMenuOpen, setWasMenuOpen] = useState(isMenuOpen);
+  const [openings, setOpenings] = useState(0);
+  if (isMenuOpen !== wasMenuOpen) {
+    setWasMenuOpen(isMenuOpen);
+    if (isMenuOpen) setOpenings((count) => count + 1);
+  }
 
   // Resolve the active instance entry by exact routing key. The composer
   // resolves fallbacks before rendering this component; if the selected
@@ -193,6 +202,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         viewportClassName="!overflow-hidden p-0"
       >
         <ModelPickerContent
+          key={openings}
           activeInstanceId={activeInstanceId}
           model={props.model}
           lockToActiveInstance={props.lockToActiveInstance ?? false}

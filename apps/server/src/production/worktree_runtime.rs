@@ -13,7 +13,6 @@ use std::{
 
 use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use serde_json::json;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinHandle,
@@ -1218,9 +1217,7 @@ fn availability_token(availability: AdoptedWorktreeAvailability) -> &'static str
 }
 
 fn now_iso() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    crate::persistence::now_timestamp()
 }
 
 async fn workspace_thread_ids(

@@ -1376,12 +1376,12 @@ pub(crate) async fn run_subscriber(
 /// time, per test thread: subscribers that finished joining, and ticks in
 /// flight. A tick in flight is the only work a test cannot see from outside.
 #[cfg(all(test, unix))]
-mod test_progress {
+pub(in crate::pull_requests) mod test_progress {
     use std::cell::Cell;
 
     thread_local! {
-        pub(super) static JOINED: Cell<usize> = const { Cell::new(0) };
-        pub(super) static TICKING: Cell<usize> = const { Cell::new(0) };
+        pub(in crate::pull_requests) static JOINED: Cell<usize> = const { Cell::new(0) };
+        pub(in crate::pull_requests) static TICKING: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Counts one tick from its start until its event is broadcast, or until

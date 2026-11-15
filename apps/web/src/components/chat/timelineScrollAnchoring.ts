@@ -22,6 +22,26 @@ export function rowToggleNeedsEndReveal(input: {
   );
 }
 
+/** Where the list was, against its content, when it last reported whether it is at its end. */
+export interface TimelineListPosition {
+  readonly scroll: number;
+  readonly contentLength: number;
+}
+
+/**
+ * Whether the view moved up through its content between two reports, as a scroll the timeline
+ * did not see as the reader's own does (`scrollIntoView`, #351). Content that grows moves the
+ * view down or not at all, and content that shrinks can pull it up by no more than it lost, so
+ * neither counts.
+ */
+export function listMovedAwayFromEnd(
+  previous: TimelineListPosition,
+  next: TimelineListPosition,
+): boolean {
+  const contentShrank = Math.max(0, previous.contentLength - next.contentLength);
+  return previous.scroll - next.scroll - contentShrank > 1;
+}
+
 /** Controls whose press is a click, not the reader taking over the timeline's scroll. */
 const TIMELINE_CONTROL_SELECTOR =
   'button, a[href], input, textarea, select, summary, [role="button"]';

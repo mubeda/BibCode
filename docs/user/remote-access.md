@@ -67,14 +67,17 @@ proxy on those hosts.
 
 ### Tailscale endpoints
 
-When the desktop app can read `tailscale status --json`, it can add the machine's
-Tailnet IPv4 addresses and MagicDNS name to the endpoint list.
+BiBCode reads Tailscale; it does not manage it. When the desktop app can read
+`tailscale status --json`, it adds the machine's Tailnet IPv4 addresses to the
+address list. It never starts, changes or stops Tailscale or Tailscale Serve.
 
-An HTTPS MagicDNS endpoint is shown as available only after its well-known
-BiBCode endpoint responds successfully. Configure Tailscale Serve separately to
-proxy the chosen HTTPS address to the local BiBCode backend, then let the desktop
-app rescan it. The native `bibcode` CLI does not currently provide Tailscale
-Serve setup flags.
+If you set up Tailscale Serve yourself to proxy HTTPS on the default port (443)
+to the local BiBCode backend, the desktop app also lists the machine's MagicDNS
+HTTPS address, but only once BiBCode's well-known endpoint answers there. Use
+**Refresh** after changing Serve. Turning Serve off, or changing its port, is
+done in Tailscale, not in BiBCode. Earlier versions had a **Tailscale HTTPS**
+switch in Settings; it is gone, and upgrading leaves your Serve configuration as
+it was. The native `bibcode` CLI has no Tailscale Serve flags either.
 
 ### Reverse proxies
 

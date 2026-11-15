@@ -2593,17 +2593,26 @@ esac"#,
         let mut first = Box::pin(service.subscribe(input("conversation"), &|_| true, &c));
         let mut second = Box::pin(service.subscribe(input("files"), &|_| true, &c));
         let (mut first_result, mut second_result) = (None, None);
-        for step in 0..5000 {
+        // The paused clock moves to the next poll tick only once both subscribers joined (their
+        // `git` read answered) and no tick is in flight, so no process deadline fires before a
+        // fake CLI answers, however loaded the machine. The guard is real time.
+        let settled = || {
+            super::gitlab::poll::test_progress::JOINED.with(std::cell::Cell::get) >= 2
+                && super::gitlab::poll::test_progress::TICKING.with(std::cell::Cell::get) == 0
+        };
+        let guard = std::time::Instant::now() + Duration::from_secs(60);
+        while first_result.is_none() || second_result.is_none() {
+            assert!(
+                std::time::Instant::now() < guard,
+                "both subscriptions end within 60 s"
+            );
             if first_result.is_none() {
                 first_result = poll_immediate(first.as_mut()).await;
             }
             if second_result.is_none() {
                 second_result = poll_immediate(second.as_mut()).await;
             }
-            if first_result.is_some() && second_result.is_some() {
-                break;
-            }
-            if step % 200 == 199 {
+            if settled() && (first_result.is_none() || second_result.is_none()) {
                 tokio::time::advance(Duration::from_secs(10)).await;
             }
             std::thread::sleep(Duration::from_millis(1));

@@ -35,7 +35,7 @@ use crate::security::{
     unprotect_string as unprotect_catalog_string,
 };
 use crate::server_exposure::{
-    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure, recover_local,
+    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure_after, recover_local,
 };
 #[cfg(not(test))]
 use crate::ssh::default_home_dir;
@@ -65,7 +65,8 @@ const AUTH_TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:t
 const CLIENT_SETTINGS_FILE_NAME: &str = "client-settings.json";
 const CONNECTION_CATALOG_FILE_NAME: &str = "connection-catalog.tauri.json";
 const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
-const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
+/// Tailscale Serve's default HTTPS port. BiBCode only probes it; it never configures Serve.
+const TAILSCALE_SERVE_HTTPS_PORT: u16 = 443;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const WSL_INSTANCE_ID_PREFIX: &str = "wsl:";
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,19 +75,17 @@ const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesktopSettings {
     server_exposure_mode: String,
-    tailscale_serve_enabled: bool,
-    tailscale_serve_port: u16,
     wsl_backend_enabled: bool,
     wsl_distro: Option<String>,
     wsl_only: bool,
 }
 
+/// Keys an earlier version wrote, such as `tailscaleServeEnabled`, are ignored on read and
+/// dropped on the next write.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSettingsDocument {
     server_exposure_mode: Option<String>,
-    tailscale_serve_enabled: Option<bool>,
-    tailscale_serve_port: Option<u64>,
     wsl_backend_enabled: Option<bool>,
     wsl_mode: Option<String>,
     wsl_distro: Option<String>,
@@ -260,8 +259,6 @@ fn desktop_settings_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, Stri
 fn default_desktop_settings() -> DesktopSettings {
     DesktopSettings {
         server_exposure_mode: "local-only".to_string(),
-        tailscale_serve_enabled: false,
-        tailscale_serve_port: DEFAULT_TAILSCALE_SERVE_PORT,
         wsl_backend_enabled: false,
         wsl_distro: None,
         wsl_only: false,
@@ -272,13 +269,6 @@ fn normalize_server_exposure_mode(value: Option<&str>) -> String {
     match value {
         Some("network-accessible") => "network-accessible".to_string(),
         _ => "local-only".to_string(),
-    }
-}
-
-fn normalize_tailscale_serve_port(value: Option<u64>) -> u16 {
-    match value {
-        Some(value) if (1..=u16::MAX as u64).contains(&value) => value as u16,
-        _ => DEFAULT_TAILSCALE_SERVE_PORT,
     }
 }
 
@@ -317,8 +307,6 @@ fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> Des
         server_exposure_mode: normalize_server_exposure_mode(
             document.server_exposure_mode.as_deref(),
         ),
-        tailscale_serve_enabled: document.tailscale_serve_enabled.unwrap_or(false),
-        tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
         wsl_backend_enabled,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
         wsl_only,
@@ -328,8 +316,6 @@ fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> Des
 fn desktop_settings_to_value(settings: &DesktopSettings) -> Value {
     json!({
         "serverExposureMode": &settings.server_exposure_mode,
-        "tailscaleServeEnabled": settings.tailscale_serve_enabled,
-        "tailscaleServePort": settings.tailscale_serve_port,
         "wslBackendEnabled": settings.wsl_backend_enabled,
         "wslDistro": &settings.wsl_distro,
         "wslOnly": settings.wsl_only,
@@ -462,8 +448,6 @@ fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunC
             "management": management,
             "endpointUrl": &config.endpoint_url,
             "advertisedHost": &config.advertised_host,
-            "tailscaleServeEnabled": config.tailscale_serve_enabled,
-            "tailscaleServePort": config.tailscale_serve_port,
         });
     }
 
@@ -473,8 +457,6 @@ fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunC
         "management": if settings.wsl_only { "external" } else { "native" },
         "endpointUrl": null,
         "advertisedHost": null,
-        "tailscaleServeEnabled": settings.tailscale_serve_enabled,
-        "tailscaleServePort": settings.tailscale_serve_port,
     })
 }
 
@@ -664,7 +646,7 @@ fn advertised_endpoints_for_config(
                 address.interface_name
             )
         };
-        endpoints.push(advertised_endpoint(
+        let mut endpoint = advertised_endpoint(
             format!("desktop-network:{socket}"),
             classification.label_kind.as_str(),
             format!("http://{socket}"),
@@ -672,7 +654,13 @@ fn advertised_endpoints_for_config(
             network_status,
             Some(is_default),
             &description,
-        )?);
+        )?;
+        if network_status == "unavailable"
+            && classification.reachability != AdvertisedAddressReachability::Public
+        {
+            endpoint["unavailableReason"] = json!("local-only");
+        }
+        endpoints.push(endpoint);
     }
 
     Ok(endpoints)
@@ -700,41 +688,36 @@ fn tailscale_endpoints_for_status(
         } else {
             "unavailable"
         };
-        endpoints.push(tailscale_advertised_endpoint(
+        let mut endpoint = tailscale_advertised_endpoint(
             format!("tailscale-ip:{http_base_url}"),
             "Tailscale IP",
             http_base_url,
             status,
             "mixed-content-blocked",
             "Reachable from devices on the same Tailnet.",
-        )?);
+        )?;
+        if status == "unavailable" {
+            endpoint["unavailableReason"] = json!("local-only");
+        }
+        endpoints.push(endpoint);
     }
 
-    let Some(magic_dns_name) = &status.magic_dns_name else {
-        return Ok(endpoints);
-    };
-    let http_base_url =
-        build_tailscale_https_base_url(magic_dns_name, config.tailscale_serve_port)?;
-    endpoints.push(tailscale_advertised_endpoint(
-        format!("tailscale-magicdns:{http_base_url}"),
-        "Tailscale HTTPS",
-        http_base_url,
-        if magic_dns_reachable {
-            "available"
-        } else {
-            "unavailable"
-        },
-        if magic_dns_reachable {
-            "compatible"
-        } else {
-            "requires-configuration"
-        },
-        if magic_dns_reachable {
-            "HTTPS endpoint served by Tailscale Serve."
-        } else {
-            "MagicDNS hostname. Configure Tailscale Serve for HTTPS access."
-        },
-    )?);
+    // BiBCode does not manage Tailscale Serve. A MagicDNS name is offered only when the
+    // person's own Serve already answers BiBCode's well-known endpoint over HTTPS.
+    if let Some(magic_dns_name) = &status.magic_dns_name
+        && magic_dns_reachable
+    {
+        let http_base_url =
+            build_tailscale_https_base_url(magic_dns_name, TAILSCALE_SERVE_HTTPS_PORT)?;
+        endpoints.push(tailscale_advertised_endpoint(
+            format!("tailscale-magicdns:{http_base_url}"),
+            "Tailscale HTTPS",
+            http_base_url,
+            "available",
+            "compatible",
+            "HTTPS address served by Tailscale Serve, set up outside BiBCode.",
+        )?);
+    }
 
     Ok(endpoints)
 }
@@ -742,28 +725,40 @@ fn tailscale_endpoints_for_status(
 async fn tailscale_advertised_endpoints_for_config(
     config: &BackendRunConfig,
 ) -> Result<Vec<Value>, String> {
-    if config.server_exposure_mode != "network-accessible" && !config.tailscale_serve_enabled {
-        return Ok(Vec::new());
-    }
+    tailscale_advertised_endpoints_with(config, read_tailscale_status, |base_url| async move {
+        probe_tailscale_https_endpoint(&base_url).await
+    })
+    .await
+}
 
-    let status = match read_tailscale_status().await {
+/// Reads Tailscale only: `tailscale status --json` and one HTTPS probe of the MagicDNS name.
+async fn tailscale_advertised_endpoints_with<F, Fut, P, ProbeFut>(
+    config: &BackendRunConfig,
+    read_status: F,
+    probe: P,
+) -> Result<Vec<Value>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<TailscaleStatus, String>>,
+    P: FnOnce(String) -> ProbeFut,
+    ProbeFut: std::future::Future<Output = bool>,
+{
+    let status = match read_status().await {
         Ok(status) => status,
         Err(error) => {
             tracing::debug!("Tailscale advertised endpoint discovery skipped: {error}");
             return Ok(Vec::new());
         }
     };
-    let magic_dns_reachable = if config.tailscale_serve_enabled {
-        match status.magic_dns_name.as_ref() {
-            Some(magic_dns_name) => {
-                let base_url =
-                    build_tailscale_https_base_url(magic_dns_name, config.tailscale_serve_port)?;
-                probe_tailscale_https_endpoint(&base_url).await
-            }
-            None => false,
+    let magic_dns_reachable = match status.magic_dns_name.as_ref() {
+        Some(magic_dns_name) => {
+            probe(build_tailscale_https_base_url(
+                magic_dns_name,
+                TAILSCALE_SERVE_HTTPS_PORT,
+            )?)
+            .await
         }
-    } else {
-        false
+        None => false,
     };
 
     tailscale_endpoints_for_status(config, &status, magic_dns_reachable)
@@ -1363,7 +1358,8 @@ impl ExposureOperations for DesktopExposureOperations<'_> {
     }
 
     fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(crate::firewall::sync_remote_access_rule(enabled))
+        // Inside the exposure lock nothing waits for a person.
+        Box::pin(crate::firewall::sync_remote_access_rule(enabled, false))
     }
 
     fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
@@ -1419,12 +1415,22 @@ pub async fn desktop_bridge_apply_server_exposure(
     backend: State<'_, BackendSupervisor>,
     coordinator: State<'_, ServerExposureCoordinator>,
     desired: String,
+    allow_elevation_prompt: Option<bool>,
 ) -> Result<Value, String> {
     let operations = DesktopExposureOperations {
         app: &app,
         backend: backend.inner(),
     };
-    let transition = apply_exposure(coordinator.inner(), &operations, &desired).await?;
+    // Only a widen the person started in Share this host may raise the Windows prompt.
+    let prompt_first = async {
+        if allow_elevation_prompt == Some(true) {
+            crate::firewall::sync_remote_access_rule(true, true).await
+        } else {
+            Ok(())
+        }
+    };
+    let transition =
+        apply_exposure_after(coordinator.inner(), &operations, &desired, prompt_first).await?;
     let settings = read_desktop_settings(&app)?;
     Ok(server_exposure_state(
         &settings,
@@ -1432,33 +1438,18 @@ pub async fn desktop_bridge_apply_server_exposure(
     ))
 }
 
+/// Removed: BiBCode no longer manages Tailscale Serve. Kept registered so an older web
+/// bundle gets the `tauri_capability_unsupported` payload the web bridge already treats as
+/// unsupported, instead of an unknown-command error. It changes nothing, neither the desktop
+/// settings nor Tailscale.
 #[tauri::command]
-pub async fn desktop_bridge_set_tailscale_serve_enabled(
-    app: AppHandle<DesktopRuntime>,
-    backend: State<'_, BackendSupervisor>,
-    coordinator: State<'_, ServerExposureCoordinator>,
-    input: Value,
-) -> Result<Value, String> {
-    coordinator
-        .run_exclusive(async {
-            let enabled = input
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let requested_port = input.get("port").and_then(Value::as_u64);
-            let settings = update_desktop_settings(&app, |settings| {
-                settings.tailscale_serve_enabled = enabled;
-                settings.tailscale_serve_port = normalize_tailscale_serve_port(
-                    requested_port.or(Some(settings.tailscale_serve_port as u64)),
-                );
-            })?;
-            let restarted_config = backend
-                .restart_default_if_active_preserving_exposure(app.clone())
-                .await?;
-            let current_config = restarted_config.or_else(|| backend.current_run_config());
-            Ok(server_exposure_state(&settings, current_config.as_ref()))
-        })
-        .await
+pub fn desktop_bridge_set_tailscale_serve_enabled(_input: Value) -> Result<Value, Value> {
+    Err(json!({
+        "code": "tauri_capability_unsupported",
+        "method": "setTailscaleServeEnabled",
+        "capability": "Tailscale Serve management",
+        "message": "setTailscaleServeEnabled was removed: BiBCode no longer manages Tailscale Serve.",
+    }))
 }
 
 #[tauri::command]
@@ -2478,8 +2469,6 @@ mod tests {
             server_exposure_mode: mode.to_owned(),
             endpoint_url: wide.then(|| "http://192.168.1.25:13773".to_owned()),
             advertised_host: wide.then(|| "192.168.1.25".to_owned()),
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 
@@ -3055,8 +3044,6 @@ mod tests {
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         }
     }
 
@@ -3399,13 +3386,84 @@ mod tests {
 
         let mut config = test_run_config();
         config.server_exposure_mode = "local-only".to_string();
-        config.tailscale_serve_enabled = false;
         assert!(
-            tailscale_advertised_endpoints_for_config(&config)
-                .await
-                .expect("disabled Tailscale discovery should succeed")
-                .is_empty()
+            tailscale_advertised_endpoints_with(
+                &config,
+                || async { Err("tailscale is not installed".to_string()) },
+                |_| async { panic!("no probe without Tailscale") }
+            )
+            .await
+            .expect("missing Tailscale discovery should succeed")
+            .is_empty()
         );
+    }
+
+    fn tailscale_status_with_magic_dns() -> TailscaleStatus {
+        TailscaleStatus {
+            magic_dns_name: Some("desktop.tail.example.test".to_string()),
+            tailnet_ipv4_addresses: vec!["100.64.0.7".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoints_read_tailscale_addresses_while_local_only() {
+        let mut config = test_run_config();
+        config.server_exposure_mode = "local-only".to_string();
+
+        let endpoints = tailscale_advertised_endpoints_with(
+            &config,
+            || async { Ok(tailscale_status_with_magic_dns()) },
+            |_| async { false },
+        )
+        .await
+        .expect("local-only Tailscale discovery should succeed");
+
+        // Serve does not answer, so no HTTPS address and no setup row; only the tailnet IP.
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["httpBaseUrl"], "http://100.64.0.7:13773/");
+        assert_eq!(endpoints[0]["status"], "unavailable");
+        assert_eq!(endpoints[0]["unavailableReason"], "local-only");
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoints_list_a_tailscale_serve_address_set_up_outside_bibcode() {
+        let config = test_run_config();
+        let probed = std::sync::Mutex::new(None);
+
+        let endpoints = tailscale_advertised_endpoints_with(
+            &config,
+            || async { Ok(tailscale_status_with_magic_dns()) },
+            |base_url| {
+                *probed.lock().unwrap() = Some(base_url);
+                async { true }
+            },
+        )
+        .await
+        .expect("Tailscale discovery should succeed");
+
+        assert_eq!(
+            probed.lock().unwrap().as_deref(),
+            Some("https://desktop.tail.example.test/")
+        );
+        let https = endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint["id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("tailscale-magicdns:")
+            })
+            .expect("the answering HTTPS address is listed");
+        assert_eq!(https["httpBaseUrl"], "https://desktop.tail.example.test/");
+        assert_eq!(https["status"], "available");
+    }
+
+    #[test]
+    fn the_removed_tailscale_serve_command_answers_unsupported_and_changes_nothing() {
+        let error = desktop_bridge_set_tailscale_serve_enabled(json!({"enabled": false}))
+            .expect_err("Tailscale Serve is no longer managed");
+        assert_eq!(error["code"], "tauri_capability_unsupported");
+        assert_eq!(error["method"], "setTailscaleServeEnabled");
     }
 
     #[test]
@@ -3514,8 +3572,6 @@ mod tests {
     fn normalizes_desktop_settings_with_legacy_wsl_mode() {
         let settings = normalize_desktop_settings_document(DesktopSettingsDocument {
             server_exposure_mode: Some("network-accessible".to_string()),
-            tailscale_serve_enabled: Some(true),
-            tailscale_serve_port: Some(8443),
             wsl_backend_enabled: None,
             wsl_mode: Some("wsl".to_string()),
             wsl_distro: Some("Ubuntu-24.04".to_string()),
@@ -3526,8 +3582,6 @@ mod tests {
             settings,
             DesktopSettings {
                 server_exposure_mode: "network-accessible".to_string(),
-                tailscale_serve_enabled: true,
-                tailscale_serve_port: 8443,
                 wsl_backend_enabled: true,
                 wsl_distro: Some("Ubuntu-24.04".to_string()),
                 wsl_only: true,
@@ -3562,11 +3616,25 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_tailscale_serve_preference_is_ignored_and_dropped_on_write() {
+        let document: DesktopSettingsDocument = serde_json::from_value(json!({
+            "serverExposureMode": "network-accessible",
+            "tailscaleServeEnabled": true,
+            "tailscaleServePort": 8443,
+        }))
+        .expect("settings an earlier version wrote still load");
+        let settings = normalize_desktop_settings_document(document);
+        assert_eq!(settings.server_exposure_mode, "network-accessible");
+        let value = desktop_settings_to_value(&settings);
+
+        assert!(value.get("tailscaleServeEnabled").is_none());
+        assert!(value.get("tailscaleServePort").is_none());
+    }
+
+    #[test]
     fn invalid_desktop_settings_fall_back_to_safe_defaults() {
         let settings = normalize_desktop_settings_document(DesktopSettingsDocument {
             server_exposure_mode: Some("public-internet".to_string()),
-            tailscale_serve_enabled: Some(true),
-            tailscale_serve_port: Some(70_000),
             wsl_backend_enabled: Some(false),
             wsl_mode: Some("wsl".to_string()),
             wsl_distro: Some(" Ubuntu ".to_string()),
@@ -3577,8 +3645,6 @@ mod tests {
             settings,
             DesktopSettings {
                 server_exposure_mode: "local-only".to_string(),
-                tailscale_serve_enabled: true,
-                tailscale_serve_port: DEFAULT_TAILSCALE_SERVE_PORT,
                 wsl_backend_enabled: false,
                 wsl_distro: None,
                 wsl_only: false,
@@ -3594,28 +3660,17 @@ mod tests {
             desktop_settings_to_value(&settings),
             json!({
                 "serverExposureMode": "local-only",
-                "tailscaleServeEnabled": false,
-                "tailscaleServePort": 443,
                 "wslBackendEnabled": false,
                 "wslDistro": null,
                 "wslOnly": false,
             })
         );
-        assert_eq!(normalize_tailscale_serve_port(Some(1)), 1);
-        assert_eq!(
-            normalize_tailscale_serve_port(Some(u16::MAX as u64)),
-            u16::MAX
-        );
-        assert_eq!(normalize_tailscale_serve_port(Some(0)), 443);
-        assert_eq!(normalize_tailscale_serve_port(None), 443);
         assert_eq!(normalize_server_exposure_mode(None), "local-only");
     }
 
     #[test]
     fn server_exposure_state_prefers_runtime_state_when_available() {
         let mut settings = default_desktop_settings();
-        settings.tailscale_serve_enabled = true;
-        settings.tailscale_serve_port = 8443;
 
         assert_eq!(
             server_exposure_state(&settings, None),
@@ -3625,8 +3680,6 @@ mod tests {
                 "management": "native",
                 "endpointUrl": null,
                 "advertisedHost": null,
-                "tailscaleServeEnabled": true,
-                "tailscaleServePort": 8443,
             })
         );
 
@@ -3642,8 +3695,6 @@ mod tests {
                 "management": "native",
                 "endpointUrl": "http://192.168.1.20:13773",
                 "advertisedHost": "192.168.1.20",
-                "tailscaleServeEnabled": false,
-                "tailscaleServePort": 443,
             })
         );
 
@@ -3661,8 +3712,6 @@ mod tests {
                 "management": "external",
                 "endpointUrl": null,
                 "advertisedHost": null,
-                "tailscaleServeEnabled": false,
-                "tailscaleServePort": 443,
             })
         );
     }
@@ -3791,6 +3840,54 @@ mod tests {
         assert_eq!(endpoints[1]["reachability"], "public");
         assert_eq!(endpoints[1]["status"], "unavailable");
         assert_eq!(endpoints[1]["isDefault"], false);
+    }
+
+    #[test]
+    fn advertised_endpoints_say_local_only_is_why_private_addresses_are_unavailable() {
+        let config = test_run_config();
+        let addresses = [
+            NetworkAddress {
+                interface_name: "Ethernet".to_string(),
+                ip: "192.168.0.10".parse().expect("LAN fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
+                interface_name: "Overlay".to_string(),
+                ip: "10.20.0.5".parse().expect("overlay fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Tailnet".to_string(),
+                ip: "100.64.0.7".parse().expect("CGNAT fixture"),
+                is_default_route: false,
+            },
+            NetworkAddress {
+                interface_name: "Internet".to_string(),
+                ip: "8.8.8.8".parse().expect("public fixture"),
+                is_default_route: false,
+            },
+        ];
+
+        let local = advertised_endpoints_for_config(&config, &addresses)
+            .expect("local-only endpoints should build");
+        assert_eq!(local.len(), 5);
+        assert!(local[0].get("unavailableReason").is_none());
+        for endpoint in &local[1..4] {
+            assert_eq!(endpoint["status"], "unavailable");
+            assert_eq!(endpoint["unavailableReason"], "local-only");
+        }
+        // Native sharing never uses a public address, so widening is not why it is unavailable.
+        assert_eq!(local[4]["reachability"], "public");
+        assert!(local[4].get("unavailableReason").is_none());
+
+        let mut wide_config = config;
+        wide_config.server_exposure_mode = "network-accessible".to_string();
+        let wide = advertised_endpoints_for_config(&wide_config, &addresses)
+            .expect("network-accessible endpoints should build");
+        assert!(
+            wide.iter()
+                .all(|endpoint| endpoint.get("unavailableReason").is_none())
+        );
     }
 
     #[test]
@@ -4080,8 +4177,6 @@ mod tests {
             server_exposure_mode: "network-accessible".to_string(),
             endpoint_url: Some("http://192.168.1.20:13773".to_string()),
             advertised_host: Some("192.168.1.20".to_string()),
-            tailscale_serve_enabled: true,
-            tailscale_serve_port: 8443,
         };
         let status = TailscaleStatus {
             magic_dns_name: Some("desktop.tail.ts.net".to_string()),
@@ -4114,14 +4209,11 @@ mod tests {
 
         assert_eq!(
             endpoints[1]["id"],
-            "tailscale-magicdns:https://desktop.tail.ts.net:8443/"
+            "tailscale-magicdns:https://desktop.tail.ts.net/"
         );
         assert_eq!(endpoints[1]["label"], "Tailscale HTTPS");
-        assert_eq!(
-            endpoints[1]["httpBaseUrl"],
-            "https://desktop.tail.ts.net:8443/"
-        );
-        assert_eq!(endpoints[1]["wsBaseUrl"], "wss://desktop.tail.ts.net:8443/");
+        assert_eq!(endpoints[1]["httpBaseUrl"], "https://desktop.tail.ts.net/");
+        assert_eq!(endpoints[1]["wsBaseUrl"], "wss://desktop.tail.ts.net/");
         assert_eq!(endpoints[1]["status"], "available");
         assert_eq!(
             endpoints[1]["compatibility"]["hostedHttpsApp"],
@@ -4142,8 +4234,6 @@ mod tests {
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 8443,
         };
         let status = TailscaleStatus {
             magic_dns_name: None,
@@ -4161,7 +4251,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_unprobed_tailscale_magic_dns_as_requires_configuration() {
+    fn an_unanswered_magic_dns_name_is_not_offered_and_no_setup_is_suggested() {
         let config = BackendRunConfig {
             environment_id: "primary".to_string(),
             label: "Local".to_string(),
@@ -4173,8 +4263,6 @@ mod tests {
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
             advertised_host: None,
-            tailscale_serve_enabled: false,
-            tailscale_serve_port: 443,
         };
         let status = TailscaleStatus {
             magic_dns_name: Some("desktop.tail.ts.net".to_string()),
@@ -4184,13 +4272,7 @@ mod tests {
         let endpoints =
             tailscale_endpoints_for_status(&config, &status, false).expect("endpoint should build");
 
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0]["httpBaseUrl"], "https://desktop.tail.ts.net/");
-        assert_eq!(endpoints[0]["status"], "unavailable");
-        assert_eq!(
-            endpoints[0]["compatibility"]["hostedHttpsApp"],
-            "requires-configuration"
-        );
+        assert!(endpoints.is_empty(), "{endpoints:?}");
     }
 
     #[test]
@@ -4689,13 +4771,13 @@ mod tests {
         // Valid exposure transitions are covered with fake operations in the
         // server_exposure tests. This runtime-agnostic IPC smoke must not
         // mutate the Windows host firewall.
-        assert!(
-            invoke(
-                "desktop_bridge_set_tailscale_serve_enabled",
-                json!({"input":{"enabled":false,"port":443}}),
-            )
-            .is_ok()
-        );
+        // Removed: an older web bundle gets the structured unsupported answer.
+        let removed = invoke(
+            "desktop_bridge_set_tailscale_serve_enabled",
+            json!({"input":{"enabled":false,"port":443}}),
+        )
+        .expect_err("Tailscale Serve is no longer managed");
+        assert_eq!(removed["code"], "tauri_capability_unsupported");
         assert!(
             invoke(
                 "desktop_bridge_set_wsl_backend_enabled",

@@ -9,6 +9,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     terminalOrderedInput: false,
     terminalSizeOwnership: false,
     terminalUserInputClaim: false,
+    terminalSizeHandOver: false,
     terminalImagePaste: false,
     pullRequestCreateOptions: false,
     worktreeCatalog: false,

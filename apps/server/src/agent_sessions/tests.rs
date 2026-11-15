@@ -93,7 +93,11 @@ fn claude_keeps_visible_text_and_skips_sidechain_meta_and_compact_records() {
             ("assistant", "API error"),
         ]
     );
-    assert_eq!(session.messages[0].created_at, "2026-10-02T10:00:00.500Z");
+    // #366: imported instants are stored in the server's one timestamp form.
+    assert_eq!(
+        session.messages[0].created_at,
+        "2026-10-02T10:00:00.500000000Z"
+    );
     assert_eq!(session.messages[2].created_at, FALLBACK);
 }
 

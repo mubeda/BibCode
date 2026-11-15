@@ -62,8 +62,6 @@ export function shareChangedSitesData(
         mode: "local-only",
         endpointUrl: null,
         advertisedHost: null,
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
       },
     },
   };

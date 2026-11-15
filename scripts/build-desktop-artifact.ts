@@ -87,6 +87,11 @@ export interface TauriBuildCliInput {
   readonly allowCrossPlatform?: boolean;
   readonly updater?: boolean;
   readonly symbols?: boolean;
+  /**
+   * Codegen units for `bibcode-server` and `bibcode-desktop` only. CI passes 16 because the
+   * shipped single unit compiles each of them on one core; Release leaves it unset.
+   */
+  readonly workspaceCodegenUnits?: number;
 }
 
 export interface TauriBuildHost {
@@ -146,6 +151,7 @@ interface MutableTauriBuildCliInput {
   allowCrossPlatform?: boolean;
   updater?: boolean;
   symbols?: boolean;
+  workspaceCodegenUnits?: number;
 }
 
 export interface TauriUpdaterArtifactDescriptor {
@@ -520,6 +526,17 @@ export const resolveTauriBuildPlan = Effect.fn("resolveTauriBuildPlan")(function
       // --verbose reports a failed attempt as an opaque "failed to run
       // bundle_dmg.sh". Verbose logging keeps the first failure diagnosable.
       ...(step === "bundle" && platform === "mac" && target === "dmg" ? ["--verbose"] : []),
+      // Tauri hands what follows `--` to Cargo. A package override changes no dependency
+      // fingerprint, so the Rust cache that Release restores stays valid.
+      ...(step === "build" && input.workspaceCodegenUnits !== undefined
+        ? [
+            "--",
+            ...["bibcode-server", "bibcode-desktop"].flatMap((crate) => [
+              "--config",
+              `profile.release.package.${crate}.codegen-units=${input.workspaceCodegenUnits}`,
+            ]),
+          ]
+        : []),
     ],
     cwd: repoRoot,
   });
@@ -772,6 +789,7 @@ export function parseTauriArtifactCliArgs(argv: ReadonlyArray<string>): TauriBui
       "allow-cross-platform": { type: "boolean" },
       updater: { type: "boolean" },
       symbols: { type: "boolean" },
+      "workspace-codegen-units": { type: "string" },
     },
     allowPositionals: false,
   });
@@ -788,6 +806,16 @@ export function parseTauriArtifactCliArgs(argv: ReadonlyArray<string>): TauriBui
   }
   if (typeof values.updater === "boolean") input.updater = values.updater;
   if (typeof values.symbols === "boolean") input.symbols = values.symbols;
+  const units = values["workspace-codegen-units"];
+  if (typeof units === "string") {
+    // rustc accepts 1 to 256 codegen units.
+    if (!/^[0-9]{1,3}$/.test(units) || Number(units) < 1 || Number(units) > 256) {
+      throw new TauriDesktopBuildConfigurationError(
+        "--workspace-codegen-units must be a whole number from 1 to 256.",
+      );
+    }
+    input.workspaceCodegenUnits = Number(units);
+  }
   return input;
 }
 

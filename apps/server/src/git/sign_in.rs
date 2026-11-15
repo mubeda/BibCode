@@ -97,11 +97,21 @@ pub fn has_gcm_refusal(stderr: &str) -> bool {
     })
 }
 
-/// True when Git stopped for a missing username with prompts disabled (#343).
+/// True when Git stopped for a missing username with prompts disabled (#343): a line that
+/// starts with `fatal:` holds both phrases, so a commit message or hook output that quotes
+/// them does not count (R23).
+///
+/// Neither caller joins lines: Git Manager passes the last Git output's raw stderr, and
+/// Source Control the wire `detail`, which is that stderr trimmed and redacted. Git's progress
+/// output separates updates with `\r`, so the fatal line can follow one after `\r`, not `\n`.
 #[must_use]
 pub fn has_missing_username_refusal(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("could not read username") && detail.contains("terminal prompts disabled")
+    detail.split(['\n', '\r']).any(|line| {
+        let line = line.trim_start().to_ascii_lowercase();
+        line.starts_with("fatal:")
+            && line.contains("could not read username")
+            && line.contains("terminal prompts disabled")
+    })
 }
 
 /// Where this server's Git runs, as a failed push names it (#343): `remote` for every server
@@ -585,6 +595,35 @@ mod tests {
         assert!(!has_missing_username_refusal(
             "fatal: Authentication failed for 'https://gitlab.example.test/'"
         ));
+    }
+
+    const HOOK_ECHO: &str = "remote: checking\nhook: could not read username, terminal prompts disabled\nTo https://gitlab.example.test/example-group/sample-project.git";
+    const AFTER_PROGRESS: &str = "Writing objects: 50%\rfatal: could not read Username for 'https://gitlab.example.test': terminal prompts disabled\n";
+
+    #[test]
+    fn the_missing_username_refusal_needs_a_fatal_line() {
+        assert!(!has_missing_username_refusal(
+            "fix: could not read Username and terminal prompts disabled"
+        ));
+        assert!(!has_missing_username_refusal(HOOK_ECHO));
+        assert!(has_missing_username_refusal(AFTER_PROGRESS));
+        assert!(has_missing_username_refusal(
+            "   FATAL: Could not read Username for 'https://gitlab.example.test': Terminal Prompts Disabled\r\n"
+        ));
+        assert!(!has_missing_username_refusal(
+            "fatal: could not read Username for 'https://gitlab.example.test'\nterminal prompts disabled"
+        ));
+        assert!(has_missing_username_refusal(MISSING_USERNAME));
+    }
+
+    #[test]
+    fn push_guidance_ignores_both_phrases_outside_a_fatal_line() {
+        let place = ExecutionPlace {
+            remote: true,
+            server_name: None,
+        };
+        assert_eq!(place.push_guidance(HOOK_ECHO), None);
+        assert!(place.push_guidance(AFTER_PROGRESS).is_some());
     }
 
     #[test]

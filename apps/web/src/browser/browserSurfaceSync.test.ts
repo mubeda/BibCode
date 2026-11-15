@@ -32,7 +32,7 @@ describe("browserSurfaceSync", () => {
   };
 
   beforeEach(() => {
-    useBrowserSurfaceStore.setState({ byTabId: {}, occlusionOwners: new Set() } as never);
+    useBrowserSurfaceStore.setState({ byTabId: {}, occlusionOwners: new Map() });
   });
 
   afterEach(() => {
@@ -151,6 +151,34 @@ describe("browserSurfaceSync", () => {
       ["sync-occluded", rect, true],
       ["sync-occluded", rect, false],
       ["sync-occluded", rect, true],
+    ]);
+    stop();
+  });
+
+  it("hides a surface only while a rectangle lease overlaps it", async () => {
+    const setBounds = vi.fn().mockResolvedValue(undefined);
+    const stop = startSync(setBounds);
+    const surface = acquireBrowserSurface("sync-rect-occlusion");
+    const rect = { x: 0, y: 0, width: 400, height: 300 };
+    surface.present(rect, true);
+
+    const popup = acquireBrowserSurfaceOcclusion({ x: 500, y: 0, width: 100, height: 100 });
+    await flushPromises();
+    expect(setBounds.mock.calls).toEqual([["sync-rect-occlusion", rect, true]]);
+
+    popup.update({ x: 100, y: 100, width: 50, height: 50 });
+    await flushPromises();
+    expect(setBounds.mock.calls).toEqual([
+      ["sync-rect-occlusion", rect, true],
+      ["sync-rect-occlusion", rect, false],
+    ]);
+
+    popup.release();
+    await flushPromises();
+    expect(setBounds.mock.calls).toEqual([
+      ["sync-rect-occlusion", rect, true],
+      ["sync-rect-occlusion", rect, false],
+      ["sync-rect-occlusion", rect, true],
     ]);
     stop();
   });

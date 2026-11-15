@@ -95,6 +95,7 @@ import {
   showInternalBrowserFailedNotice,
 } from "../browser/linkNotices";
 import { openLink } from "../browser/openLink";
+import { RichMarkdownImage } from "./files/richMarkdown/RichMarkdownImage";
 
 class CodeHighlightErrorBoundary extends React.Component<
   { fallback: ReactNode; children: ReactNode },
@@ -136,6 +137,11 @@ interface ChatMarkdownProps {
   onDetailsOpenChange?: ((ordinal: number, open: boolean) => void) | undefined;
   /** Marks the rendered text as one Find in thread scope, named by this value. */
   findScope?: string | undefined;
+  /**
+   * The Markdown file shown, relative to `cwd`. With a thread, its relative images are read from
+   * the workspace the way the rich editor reads them. Chat messages pass none.
+   */
+  markdownPath?: string | undefined;
 }
 
 const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
@@ -1061,6 +1067,8 @@ interface ChatMarkdownRenderState {
   readonly fileLinks: MarkdownFileLinks;
   readonly environmentId: ReturnType<typeof useActiveEnvironmentId>;
   readonly threadRef: ScopedThreadRef | undefined;
+  readonly cwd: string | undefined;
+  readonly markdownPath: string | undefined;
   readonly skills: MarkdownSkills;
   readonly onTaskListChange: ChatMarkdownProps["onTaskListChange"];
   readonly openInPreferredEditor: MarkdownFileLinkProps["onOpen"];
@@ -1350,7 +1358,27 @@ function MarkdownPre({ node, children, ...props }: MarkdownComponentProps<"pre">
   );
 }
 
+function MarkdownImage({ node: _node, src, alt, ...props }: MarkdownComponentProps<"img">) {
+  const { threadRef, cwd, markdownPath } = useChatMarkdownRenderState();
+  if (markdownPath === undefined || !threadRef || !cwd || typeof src !== "string") {
+    return <img src={src} alt={alt} {...props} />;
+  }
+  return (
+    <RichMarkdownImage
+      workspace={{
+        environmentId: threadRef.environmentId,
+        threadId: threadRef.threadId,
+        cwd,
+        markdownPath,
+      }}
+      src={src}
+      alt={alt ?? ""}
+    />
+  );
+}
+
 const CHAT_MARKDOWN_COMPONENTS: Components = {
+  img: MarkdownImage,
   p: MarkdownParagraph,
   li: MarkdownListItem,
   input: MarkdownInput,
@@ -1372,6 +1400,7 @@ function ChatMarkdown({
   detailsOpen,
   onDetailsOpenChange,
   findScope,
+  markdownPath,
 }: ChatMarkdownProps) {
   // Links and files open in the right panel on screen: a chat panel's is its host's.
   const threadRef = use(RightPanelThreadContext) ?? messageThreadRef;
@@ -1447,6 +1476,8 @@ function ChatMarkdown({
       fileLinks,
       environmentId,
       threadRef,
+      cwd,
+      markdownPath,
       skills,
       onTaskListChange,
       openInPreferredEditor,
@@ -1454,8 +1485,10 @@ function ChatMarkdown({
       openMarkdownFileInPreview,
     }),
     [
+      cwd,
       diffThemeName,
       environmentId,
+      markdownPath,
       fileLinks,
       isStreaming,
       onTaskListChange,

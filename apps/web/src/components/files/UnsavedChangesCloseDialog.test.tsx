@@ -16,6 +16,11 @@ vi.mock("../ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ui/toast")>()),
   toastManager: { add: toastAdd },
 }));
+// The real toast viewport reads the route; no router is mounted here.
+vi.mock("@tanstack/react-router", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tanstack/react-router")>()),
+  useParams: ({ select }: { select?: (params: object) => unknown }) => select?.({}),
+}));
 
 import { FileEditingSession } from "./fileEditingSession";
 import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
@@ -447,6 +452,552 @@ describe("UnsavedChangesCloseHost", () => {
       await expect(answer).resolves.toBe("stay");
       expect(dialogText()).toContain("Installing an update");
     });
+  });
+
+  describe("the update install state when the window loads", () => {
+    const MARKER = "bibcode:update-install-allowed";
+    type State = {
+      readonly requestedBy: { readonly label: string; readonly detail: string | null } | null;
+      readonly phase: string;
+    };
+    const notRunning: State = { requestedBy: null, phase: "idle" };
+    const running: State = {
+      requestedBy: { label: "Test User", detail: null },
+      phase: "installing",
+    };
+
+    function stateBridge(getUpdateState?: () => Promise<State>) {
+      const bridge = {
+        replies: [] as [number, string][],
+        send: null as ((request: DesktopCloseRequest) => void) | null,
+        endInstall: null as (() => void) | null,
+        pushState: null as ((state: State) => void) | null,
+        onCloseRequest: (listener: (request: DesktopCloseRequest) => void) => {
+          bridge.send = listener;
+          return () => {};
+        },
+        replyCloseRequest: async (requestId: number, reply: string) => {
+          bridge.replies.push([requestId, reply]);
+        },
+        onUpdateInstallEnded: (listener: () => void) => {
+          bridge.endInstall = listener;
+          return () => {};
+        },
+        onUpdateState: (listener: (state: State) => void) => {
+          bridge.pushState = listener;
+          return () => {
+            bridge.pushState = null;
+          };
+        },
+        getUpdateState: getUpdateState ? vi.fn(getUpdateState) : undefined,
+      };
+      if (!getUpdateState) Reflect.deleteProperty(bridge, "getUpdateState");
+      return bridge;
+    }
+
+    /** Loads the window again: fresh modules, the same sessionStorage, as a reload does. */
+    async function loadWindow(bridge: ReturnType<typeof stateBridge>) {
+      await act(async () => root.unmount());
+      vi.resetModules();
+      const host = await import("./UnsavedChangesCloseDialog");
+      const { FileEditingSessionRegistry: Registry } = await import("./fileEditingSessionRegistry");
+      const { FileEditingSession: EditingSession } = await import("./fileEditingSession");
+      window.desktopBridge = bridge as unknown as DesktopBridge;
+      root = createRoot(container);
+      await act(async () => root.render(<host.UnsavedChangesCloseHost />));
+      return {
+        openFile(relativePath: string, persist: Persist = vi.fn<Persist>(async () => saved())) {
+          const registry = new Registry<Session>();
+          registries.push(registry as unknown as FileEditingSessionRegistry<Session>);
+          return registry.getOrCreate(
+            relativePath,
+            () =>
+              new EditingSession<unknown, { readonly version?: string }, unknown>({
+                cwd: "/repo",
+                relativePath,
+                debounceMs: 500,
+                base: { version: "v1", contents: "old\n" },
+                persist,
+                onPendingChange: vi.fn(),
+                onConfirmed: vi.fn(),
+                onConflictChange: vi.fn(),
+              }),
+          );
+        },
+      };
+    }
+
+    const advance = (ms: number) =>
+      act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      window.sessionStorage.clear();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      window.sessionStorage.clear();
+      delete window.desktopBridge;
+    });
+
+    it("reload during an install: the marker restores the block while the first query rejects", async () => {
+      // The window allows the install through the close protocol, which writes the marker.
+      const before = stateBridge(() => new Promise<State>(() => {}));
+      await loadWindow(before);
+      await act(async () => before.send!({ requestId: 3, reason: "update" }));
+      await advance(0);
+      await vi.waitFor(() => expect(before.replies.at(-1)).toEqual([3, "allow"]), {
+        timeout: 30_000,
+      });
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const after = stateBridge(() => Promise.reject(new Error("state unavailable")));
+      const reloaded = await loadWindow(after);
+      expect(dialogText()).toContain("Installing an update");
+      const persist = vi.fn<Persist>(async () => saved());
+      reloaded.openFile("notes.md", persist).changeFromRichEditor("edit after the reload");
+      await advance(700);
+      expect(persist).not.toHaveBeenCalled();
+      expect(after.getUpdateState).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledOnce();
+      await advance(2_000);
+      expect(after.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("reload during an install: a confirmed not-running answer clears the block and the marker", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      const answers: (() => Promise<State>)[] = [
+        () => Promise.reject(new Error("state unavailable")),
+        async () => notRunning,
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      const loaded = await loadWindow(bridge);
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      session.changeFromRichEditor("held edit");
+      await advance(700);
+      expect(persist).not.toHaveBeenCalled();
+      expect(dialogText()).toContain("Installing an update");
+
+      await advance(2_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+      // Saving resumes: the held edit is written.
+      await advance(700);
+      expect(persist).toHaveBeenCalledWith("notes.md", "held edit", expect.anything());
+      expect(session.unsavedContents).toBeNull();
+    });
+
+    it("reload during an install: an answer that still names the requester keeps the block", async () => {
+      // Between the allow and the backup the phase still reads "available".
+      window.sessionStorage.setItem(MARKER, "1");
+      const bridge = stateBridge(async () => ({ ...running, phase: "available" }));
+      await loadWindow(bridge);
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledOnce();
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("a fresh window with no marker holds nothing until an answer says an install runs", async () => {
+      let answer!: (state: State) => void;
+      const bridge = stateBridge(
+        () =>
+          new Promise<State>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const loaded = await loadWindow(bridge);
+      expect(dialogText()).toBeUndefined();
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      session.changeFromRichEditor("free edit");
+      await act(async () => {
+        await expect(session.flush()).resolves.toBe("saved");
+      });
+      expect(persist).toHaveBeenCalledOnce();
+
+      await act(async () => answer(running));
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("a failed query never releases a known block", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      const answers: (() => Promise<State>)[] = [
+        () => new Promise<State>(() => {}),
+        () => Promise.reject(new Error("state unavailable")),
+        () => new Promise<State>(() => {}),
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      // The first query never answers: after 5 seconds it counts as failed and is asked again.
+      await advance(5_000);
+      expect(dialogText()).toContain("Installing an update");
+      await advance(2_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      await advance(2_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(3);
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+      expect(warn).toHaveBeenCalledOnce();
+    });
+
+    it("a failed query never releases a known block, even when its late answer comes", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      let late!: (state: State) => void;
+      const answers: (() => Promise<State>)[] = [
+        () =>
+          new Promise<State>((resolve) => {
+            late = resolve;
+          }),
+        () => new Promise<State>(() => {}),
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      await advance(5_000);
+      await act(async () => late(notRunning));
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("a pushed update state ends the wait", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      const bridge = stateBridge(() => Promise.reject(new Error("state unavailable")));
+      await loadWindow(bridge);
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledOnce();
+      await act(async () => bridge.pushState!(running));
+      await advance(10_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledOnce();
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    it("a desktop without getUpdateState clears a stale marker and holds nothing", async () => {
+      window.sessionStorage.setItem(MARKER, "1");
+      const loaded = await loadWindow(stateBridge());
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      session.changeFromRichEditor("free edit");
+      await act(async () => {
+        await expect(session.flush()).resolves.toBe("saved");
+      });
+    });
+
+    it("an unusable sessionStorage means no marker and no crash", async () => {
+      vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+        throw new Error("storage disabled");
+      });
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("storage disabled");
+      });
+      const bridge = stateBridge(async () => notRunning);
+      await loadWindow(bridge);
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      // An allowed install still blocks, without a marker to restore it.
+      await act(async () => bridge.send!({ requestId: 4, reason: "update" }));
+      await advance(0);
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([4, "allow"]), {
+        timeout: 30_000,
+      });
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    async function allowInstall(bridge: ReturnType<typeof stateBridge>, requestId: number) {
+      await act(async () => bridge.send!({ requestId, reason: "update" }));
+      await advance(0);
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([requestId, "allow"]), {
+        timeout: 30_000,
+      });
+      expect(dialogText()).toContain("Installing an update");
+    }
+
+    it("a pushed update state with no remote install closes the installing dialog", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      await allowInstall(bridge, 5);
+      session.changeFromRichEditor("held edit");
+      await advance(700);
+      expect(persist).not.toHaveBeenCalled();
+
+      await act(async () => bridge.pushState!(notRunning));
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+      await advance(700);
+      expect(persist).toHaveBeenCalledWith("notes.md", "held edit", expect.anything());
+      expect(toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error", title: "The update did not install" }),
+      );
+    });
+
+    it("a pushed state that still names the requester keeps the installing dialog", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 6);
+      await act(async () => bridge.pushState!({ ...running, phase: "available" }));
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    it("a completed install that clears the requester keeps the dialog until the restart", async () => {
+      const completed: State = { requestedBy: null, phase: "installing" };
+      const answers: State[] = [notRunning, completed];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 11);
+      await act(async () => bridge.pushState!(completed));
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("a pushed state while Check again waits enables the button again", async () => {
+      const answers: (() => Promise<State>)[] = [async () => notRunning];
+      const bridge = stateBridge(() => answers.shift()?.() ?? new Promise<State>(() => {}));
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 12);
+      await click("Check again");
+      expect(button("Checking…").disabled).toBe(true);
+      await act(async () => bridge.pushState!(running));
+      await advance(0);
+      expect(button("Check again").disabled).toBe(false);
+      expect(dialogText()).toContain("Installing an update");
+    });
+
+    it("a pushed running remote install blocks a window that had no block", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      await loadWindow(bridge);
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      await act(async () => bridge.pushState!(running));
+      expect(dialogText()).toContain("Installing an update");
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+    });
+
+    it("an update state pushed after Discard on a quit keeps the Discard holds", async () => {
+      const bridge = stateBridge(async () => notRunning);
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      loaded.openFile("notes.md", persist).changeFromRichEditor("discarded edit");
+      await act(async () => bridge.send!({ requestId: 7, reason: "quit" }));
+      await advance(0);
+      await click("Discard");
+      await vi.waitFor(() => expect(bridge.replies.at(-1)).toEqual([7, "allow"]), {
+        timeout: 30_000,
+      });
+      // A local update check or download pushes states with no remote requester.
+      await act(async () => bridge.pushState!(notRunning));
+      await advance(5_000);
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it("Check again asks the desktop for the state and closes the dialog when no install runs", async () => {
+      const answers: State[] = [notRunning, running, notRunning];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 8);
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(3);
+      expect(dialogText()).toBeUndefined();
+    });
+
+    it("Check again with an install still running keeps the dialog", async () => {
+      const answers: State[] = [notRunning, running];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 9);
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(button("Check again").disabled).toBe(false);
+    });
+
+    const checkStatus = () =>
+      document.querySelector('[data-slot="alert-dialog-popup"] p[role="status"]')?.textContent ??
+      "";
+
+    it("Check again says when the install is still running, and a later answer clears it", async () => {
+      const answers: State[] = [notRunning, running, notRunning];
+      const bridge = stateBridge(async () => answers.shift()!);
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 13);
+      expect(checkStatus()).toBe("");
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("The update is still installing.");
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      // A later window block starts without the old message.
+      await act(async () => bridge.pushState!(running));
+      expect(checkStatus()).toBe("");
+    });
+
+    it("Check again says when the app could not be reached, and a later answer clears it", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const answers: (() => Promise<State>)[] = [
+        async () => notRunning,
+        () => Promise.reject(new Error("state unavailable")),
+        async () => running,
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      await advance(0);
+      await allowInstall(bridge, 14);
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("Could not reach BiBCode to check. Try again.");
+      await click("Check again");
+      await advance(0);
+      expect(checkStatus()).toBe("The update is still installing.");
+    });
+
+    it("a block restored after a reload shows the Check again button", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      window.sessionStorage.setItem(MARKER, "1");
+      const answers: (() => Promise<State>)[] = [
+        () => Promise.reject(new Error("state unavailable")),
+        async () => notRunning,
+      ];
+      const bridge = stateBridge(() => answers.shift()!());
+      await loadWindow(bridge);
+      await advance(0);
+      expect(dialogText()).toContain("Installing an update");
+      await click("Check again");
+      await advance(0);
+      expect(dialogText()).toBeUndefined();
+      expect(window.sessionStorage.getItem(MARKER)).toBeNull();
+    });
+
+    it("a rejecting state query keeps the dialog, the block, the marker and the button, and the retry keeps asking", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const answers: (() => Promise<State>)[] = [async () => notRunning];
+      const bridge = stateBridge(
+        () => answers.shift()?.() ?? Promise.reject(new Error("state unavailable")),
+      );
+      const loaded = await loadWindow(bridge);
+      await advance(0);
+      const persist = vi.fn<Persist>(async () => saved());
+      const session = loaded.openFile("notes.md", persist);
+      await allowInstall(bridge, 10);
+      session.changeFromRichEditor("held edit");
+
+      await click("Check again");
+      await advance(0);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(2);
+      expect(dialogText()).toContain("Installing an update");
+      expect(button("Check again").disabled).toBe(false);
+      expect(window.sessionStorage.getItem(MARKER)).toBe("1");
+      await advance(2_000);
+      expect(bridge.getUpdateState).toHaveBeenCalledTimes(3);
+      expect(dialogText()).toContain("Installing an update");
+      expect(persist).not.toHaveBeenCalled();
+    });
+  });
+
+  // Only the toast layer stays out of the inert region; whether Manage devices may act while the
+  // dialog is up is `RemoteUpdateRequestNotifier.install.test.tsx` (it stays disabled, R39).
+  it("the toast layer stays outside the installing dialog's inert region", async () => {
+    await act(async () => root.unmount());
+    // The real toast module: its viewport and its manager, not the mocked `add`.
+    const toast = await vi.importActual<typeof import("../ui/toast")>("../ui/toast");
+    const { remoteUpdateRequestToast } = await import("../RemoteUpdateRequestNotifier");
+    let answer!: (state: unknown) => void;
+    let pushState!: (state: unknown) => void;
+    window.desktopBridge = {
+      onCloseRequest: () => () => {},
+      replyCloseRequest: async () => {},
+      onUpdateInstallEnded: () => () => {},
+      onUpdateState: (listener: (state: unknown) => void) => {
+        pushState = listener;
+        return () => {};
+      },
+      getUpdateState: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    } as unknown as DesktopBridge;
+    const outside = document.createElement("textarea");
+    container.append(outside);
+    const mount = document.createElement("div");
+    container.append(mount);
+    root = createRoot(mount);
+    try {
+      await act(async () =>
+        root.render(
+          <toast.ToastProvider>
+            <UnsavedChangesCloseHost />
+          </toast.ToastProvider>,
+        ),
+      );
+      const onManageDevices = vi.fn();
+      // Added as `RemoteUpdateRequestNotifier` adds it, before the dialog opens.
+      await act(async () => {
+        toast.toastManager.add(
+          toast.stackedThreadToast({
+            type: "info",
+            ...remoteUpdateRequestToast({ label: "Test User", detail: null }, "1.2.3"),
+            actionVariant: "outline",
+            actionProps: { children: "Manage devices", onClick: onManageDevices },
+          }),
+        );
+      });
+      const action = await vi.waitFor(() => button("Manage devices"), { timeout: 30_000 });
+
+      await act(async () =>
+        answer({ requestedBy: { label: "Test User", detail: null }, phase: "installing" }),
+      );
+      await vi.waitFor(() => expect(dialogText()).toContain("Installing an update"), {
+        timeout: 30_000,
+      });
+      // Control: the modal dialog does take the page beneath it out of reach.
+      await vi.waitFor(
+        () => expect(outside.closest("[inert], [aria-hidden='true']")).not.toBeNull(),
+        { timeout: 30_000 },
+      );
+      expect(action.isConnected).toBe(true);
+      expect(action.closest("[inert], [aria-hidden='true']")).toBeNull();
+      await act(async () => {
+        action.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      expect(onManageDevices).toHaveBeenCalledOnce();
+    } finally {
+      // The block lives in module state: end it for the tests after this one.
+      await act(async () => pushState?.({ requestedBy: null, phase: "idle" }));
+      delete window.desktopBridge;
+    }
   });
 
   it("answers a desktop close request through the bridge", async () => {

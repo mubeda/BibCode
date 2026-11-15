@@ -31,7 +31,10 @@ use bibcode_server::{
 use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::{sync::watch, time::timeout};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::timeout,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 #[path = "support/isolated_git_config.rs"]
@@ -129,7 +132,7 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     fs::remove_dir(&other_orphan).expect("remove one orphan");
     scan_once(&sources, &processes).await;
     let next = runtime.status()["findings"].as_array().unwrap().clone();
-    assert_eq!(next.len(), 2);
+    assert_eq!(next.len(), 2, "{:?}", finding_kinds(&runtime));
     for finding in next {
         let expected = if finding["id"] == remaining_id { 3 } else { 2 };
         assert_eq!(
@@ -220,7 +223,8 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     assert_eq!(
         removal_failures(&runtime),
         2,
-        "a drain timeout is its own finding"
+        "a drain timeout is its own finding: {:?}",
+        removal_failure_summaries(&runtime)
     );
 
     // A client that interrupts the removal once the server-owned operation is waiting for
@@ -230,16 +234,22 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .acquire_admission(&thread_id, [fixture.worktree.as_path()])
         .await
         .expect("admission");
+    // Forget the permit of the undrained removal, so the next one is this removal's.
+    let earlier = fixture.drain_entered.available_permits();
+    if let Ok(permits) = fixture
+        .drain_entered
+        .try_acquire_many(u32::try_from(earlier).expect("permit count"))
+    {
+        permits.forget();
+    }
     remove(&mut fixture, &thread_id, "remove-interrupted", true, "6").await;
-    timeout(RPC_DEADLINE, async {
-        while fixture.availability.guard_thread(&thread_id).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the removal holds its removing guard");
-    // Past the plan, which takes milliseconds, and into the drain, which takes 5 s.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Interrupt inside the drain, whatever the plan before it takes: waiting on time instead
+    // lets a slow plan see the interrupt and fail with its own reason.
+    timeout(RPC_DEADLINE, fixture.drain_entered.acquire())
+        .await
+        .expect("the removal reaches the admission drain")
+        .expect("drain signal")
+        .forget();
     send(
         fixture.socket(),
         json!({ "_tag": "Interrupt", "requestId": "7" }),
@@ -269,7 +279,8 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     assert_eq!(
         removal_failures(&runtime),
         2,
-        "an interrupted removal is not a finding"
+        "an interrupted removal is not a finding: {:?}",
+        removal_failure_summaries(&runtime)
     );
     // An exact retry replays the accepted result: not a new outcome.
     request(
@@ -332,6 +343,72 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         );
     }
 
+    // A creation whose thread dispatch is refused rolls its worktree back.
+    git(
+        &fixture.git_config,
+        &fixture.main,
+        &["branch", "feature/dup-a"],
+    );
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create",
+                "commandId":"dup-a-create",
+                "threadId":"dup-a-thread",
+                "projectId":"project-1",
+                "title":"Existing",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "createdAt":"2026-10-09T00:00:01Z"
+            }))
+            .expect("thread command"),
+        )
+        .await
+        .expect("existing thread");
+    let records_before = fixture.creation_records().await;
+    request(
+        fixture.socket(),
+        "800",
+        "worktree.createManaged",
+        managed_create_payload("dup-a", "dup-a-thread", "feature/dup-a"),
+    )
+    .await;
+    assert_eq!(
+        failure_reason(fixture.socket(), "800").await,
+        "orchestration-failed"
+    );
+    assert_eq!(
+        fixture.creation_records().await,
+        records_before,
+        "the rolled-back creation keeps no record"
+    );
+
+    // A creation whose record cannot be written rolls its worktree back. Last: it drops the
+    // records table, so no scan or record read follows.
+    git(
+        &fixture.git_config,
+        &fixture.main,
+        &["branch", "feature/dup-b"],
+    );
+    fixture
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute_batch("DROP TABLE worktree_creation_records")?;
+            Ok(())
+        })
+        .await
+        .expect("records table removed");
+    request(
+        fixture.socket(),
+        "801",
+        "worktree.createManaged",
+        managed_create_payload("dup-b", "dup-b-thread", "feature/dup-b"),
+    )
+    .await;
+    assert_eq!(failure_reason(fixture.socket(), "801").await, "internal");
+
     let events = shutdown_and_read_events(runtime, state.path()).await;
     let removals: Vec<_> = events
         .iter()
@@ -349,9 +426,27 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .collect();
     assert_eq!(
         removals.len(),
-        4,
-        "the replay is not recorded: {removals:?}"
+        6,
+        "four removals and two creation rollbacks; the replay is not recorded: {removals:?}"
     );
+    // One per rollback arm, so removing either audit call fails this count.
+    assert_eq!(
+        removals
+            .iter()
+            .filter(|&&(mode, ..)| mode == "create-rollback")
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            ("create-rollback", true, None, false, false),
+            ("create-rollback", true, None, false, false),
+        ],
+        "{removals:?}"
+    );
+    let rollback_ids: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "worktree.removal" && event["mode"] == "create-rollback")
+        .map(|event| &event["eventId"])
+        .collect();
     for expected in [
         (
             "delete-git-worktree",
@@ -389,6 +484,10 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
         .map(|finding| &finding["evidence"]["eventIds"][0])
         .collect();
     assert!(!cited.is_empty());
+    assert!(
+        cited.iter().all(|id| !rollback_ids.contains(id)),
+        "a successful rollback raises no finding: {cited:?}"
+    );
     assert!(
         cited
             .iter()
@@ -446,6 +545,26 @@ fn removal_failures(runtime: &ProfilerRuntime) -> usize {
         .count()
 }
 
+/// Each `worktree.removal-failed` finding as `id severity count: summary`. The summary names
+/// the mode and the reason token (or `admission-drain-timeout`), never a path.
+fn removal_failure_summaries(runtime: &ProfilerRuntime) -> Vec<String> {
+    runtime.status()["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|finding| finding["kind"] == "worktree.removal-failed")
+        .map(|finding| {
+            format!(
+                "{} {} x{}: {}",
+                finding["id"].as_str().unwrap_or_default(),
+                finding["severity"].as_str().unwrap_or_default(),
+                finding["count"],
+                finding["summary"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
 fn finding_kinds(runtime: &ProfilerRuntime) -> Vec<String> {
     runtime.status()["findings"]
         .as_array()
@@ -501,6 +620,24 @@ async fn remove(
     .await;
 }
 
+/// A `worktree.createManaged` payload for `ref_name`, with the thread defaults `adopt` uses.
+fn managed_create_payload(command_id: &str, thread_id: &str, ref_name: &str) -> Value {
+    json!({
+        "commandId":command_id,
+        "projectId":"project-1",
+        "threadId":thread_id,
+        "title":"Managed",
+        "refName":ref_name,
+        "newRefName":null,
+        "baseRefName":null,
+        "threadDefaults":{
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access",
+            "interactionMode":"default"
+        }
+    })
+}
+
 async fn adopt(fixture: &mut Fixture) -> String {
     request(
         fixture.socket(),
@@ -552,6 +689,8 @@ struct Fixture {
     repositories: Repositories,
     catalog: WorktreeCatalogService,
     availability: WorkspaceAvailabilityRegistry,
+    /// One permit each time a removal starts waiting for admitted work.
+    drain_entered: Arc<Semaphore>,
     operations: WorktreeCatalogOperationRuntime,
     engine: OrchestrationEngine,
     handle: Option<bibcode_server::ServerHandle>,
@@ -617,7 +756,9 @@ impl Fixture {
             Arc::new(GitRepository::default()),
             availability.clone(),
         );
-        let services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone());
+        let drain_entered = Arc::new(Semaphore::new(0));
+        let services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone())
+            .with_removal_drain_signal_for_integration_test(Arc::clone(&drain_entered));
         let operations = services.operation_runtime();
         let mut registry = RpcRegistry::empty();
         register_worktree_catalog_rpc(&mut registry, services);
@@ -640,6 +781,7 @@ impl Fixture {
             repositories,
             catalog,
             availability,
+            drain_entered,
             operations,
             engine,
             handle: Some(handle),

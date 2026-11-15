@@ -46,7 +46,12 @@ cargo test -p bibcode-server --lib diagnostics::monitor::tests:: -j 2
 cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
 cargo test -p bibcode-server --lib diagnostics::registry::tests::a_surviving_registration_is_no_shutdown_root -j 2 -- --exact
 cargo test -p bibcode-server --lib production::runtime::tests::quiesce_in_ -j 2
+cargo test -p bibcode-server --lib -j 2 -- background_status_ git_stop_ index_lock_cleanup_
 ```
+
+CI runs the last command with those three name filters. Libtest accepts several
+filters after `--`. A filter that matches no test fails the CI step, so a
+renamed test must keep its prefix or the step must change with it.
 
 A registration marked `survives_shutdown` (a diff app opened through
 **Open with**) must never be a shutdown root, and a standalone server's
@@ -664,15 +669,16 @@ vp run test:ui:desktop
 Follow the native runbook to select the worktree-built `BIBCODE_E2E_APP_PATH`
 and, on Linux, for the headless `xvfb-run` invocation and its Wayland-socket
 guard.
-When a worker starts, the harness sends one trivial script to the webview. If
-the driver answers with a dead-session error (the webview crashed in an earlier
-spec; WebKitGTK then answers every script with "Unsupported result type"), it
-ends the app if its process survived (found through `lsof`, which must be
-installed), relaunches it once, and opens a new session. The shared specs run
-in one worker, so a crash in one of them fails the rest of that worker (the
-failure screenshot of the `afterTest` hook fails on the dead webview and Mocha
-skips what follows); only the closing spec's worker starts with the relaunch
-check.
+Before every test, the harness sends one trivial script to the webview. If the
+driver answers with a dead-session error (the webview crashed; WebKitGTK then
+answers every script with "Unsupported result type"), it ends the app if its
+process survived (found through `lsof`, which must be installed), relaunches
+it, and opens a new session. The probe, the stop, the relaunch, the session
+reload and the mock restore share one overall recovery deadline, which is
+shorter than the test timeout, so a recovery that stalls fails the test that
+hit it. A crash fails only that test: the next test's probe recovers the app.
+The failure screenshot and page source of the `afterTest` hook tolerate a dead
+webview, so the hook does not throw and the failing test's own error stands.
 The default suite includes `composer-message-queue.e2e.ts`. To isolate it, set
 `BIBCODE_E2E_SPEC=./specs/composer-message-queue.e2e.ts` for the test invocation
 using the native shell's environment syntax, then clear that selection before
