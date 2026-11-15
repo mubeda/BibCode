@@ -640,6 +640,41 @@ script that only needs to read: `bibcode mcp call list_projects_and_threads`, or
 than `files_download`; `bibcode mcp tools` lists every tool with `oneShot: true` for those
 it takes. It exits 0 on success, 1 on a failure and 2 when the thread waits on a person.
 
+## Agents messaging each other
+
+Separately from outside agents, the agents BiBCode itself runs can message each other.
+An agent in a chat panel lists the other agents of its project, sends one a message and reads the
+reply as a new turn; an agent in an AI Terminal does the same with `bibcode agent`. This is not
+the MCP server above: it needs no pairing, and an outside agent cannot use it.
+
+- **Turn it on** in Settings → Agents → Agent integrations → **Agent messaging**. It is off by
+  default. While it is off, agents cannot send, list or read status, and a message already
+  waiting is held until you turn it on again. Your own [Send to agent](./workspace-ui.md#send-to-agent)
+  works either way.
+- **Same project only.** An agent reaches the agents of its own project and no others.
+- **No more access than the sender.** An agent can message only an agent that runs with at most
+  its own mode (Supervised, Auto-accept edits, Full access). A message to a broader agent is
+  refused, and one that was waiting when the recipient's mode went up is held. An AI Terminal
+  counts as Full access, so only a Full access agent can message one.
+- **At most 8 hops.** After eight agent-to-agent messages in one exchange, agents stop until you
+  write in a thread. Your own message starts the count again.
+- **Limits.** An agent can send 30 messages a minute, and a recipient can hold 20 it has not
+  read. A message is at most 16,000 characters.
+- **What you see.** A message shows in the recipient's transcript as a queued message with a
+  **From agent · <title>** chip, and it waits for the recipient's running turn to end. Cancel on
+  that card removes it, and its sender then reads the message as failed. If the recipient's last
+  turn ended in an error or was interrupted, the message is held behind it and the card says
+  **Waiting for you**: **Send now** releases it. The sender can also cancel a message the
+  recipient has not taken yet. Every send and every delivery step is a row of the same agent
+  activity log, with the two thread titles and the state, never the text.
+- **AI Terminals.** BiBCode never types a message into a terminal. When its agent waits for a
+  prompt, BiBCode pastes one line, "BiBCode: you have new messages. Run `bibcode agent inbox`
+  to read them.", and the agent reads its mail with that command. A Claude Code terminal counts
+  as waiting only after Claude's own idle notice, about a minute after a reply, so its line can
+  come late or not at all while you are typing in it; the command still works. The command
+  needs the credential BiBCode puts in that terminal's environment, so it works in no other
+  shell.
+
 ## What it can and cannot do
 
 - **Access.** A thread an agent starts never runs above **Agents may**, and an agent cannot

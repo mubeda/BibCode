@@ -4739,6 +4739,265 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   mounted, never applies one past its local deadline, and hides a shown one when that
   passes.
 
+## Send requests and agent messaging
+
+Two features move text between agents of one project. A **send request** is a signed-in
+person's request to a specific agent (Review, Second opinion, Hand off, Take over from,
+Message), made with Send to agent. An **agent message** is one agent's message to another
+(`agent_message_send` and `bibcode agent send`). They share the turn queue, the activity log
+and, for an AI Terminal, the mailbox, and differ in who may start them and which rules apply.
+The code is `apps/server/src/send_requests/` and `apps/server/src/agent_messaging/`. The tables
+are `send_requests` (migration 75, which also adds `projection_thread_messages.person_send_json`)
+and `agent_messages` (migration 76).
+
+### The person-send path
+
+`sendRequests.*` has seven methods. All of them start with `require_person`, which refuses a
+session whose principal is an outside agent (`mcp-client`) with `person_only`. A terminal
+credential opens only `POST /api/agent/call`, and a hosted agent reaches only its provider tools,
+which call the messaging service directly, so neither holds a session for these methods. The
+engine refuses a hosted-agent actor that carries a `personSend` as well.
+
+| Method                           | Scope                   | What it does                                                                                                          |
+| -------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `sendRequests.send`              | `orchestration:operate` | Stores the request, then queues it on the target (a chat) or stores it in the mailbox (a terminal)                    |
+| `sendRequests.cancel`            | `orchestration:operate` | Withdraws a request the target has not taken. Returns `{ request, cancelled }`                                        |
+| `sendRequests.dismiss`           | `orchestration:operate` | Hides a final request (`not_final` otherwise)                                                                         |
+| `sendRequests.getTerminalOutput` | `orchestration:operate` | Reads an AI Terminal's text for a preview (see Terminal sources below)                                                |
+| `sendRequests.getAnswer`         | `orchestration:read`    | The stored answer of an answered request                                                                              |
+| `sendRequests.getHandoffText`    | `orchestration:read`    | A thread's handoff text, read from its stored messages                                                                |
+| `sendRequests.subscribe`         | `orchestration:read`    | A stream, optionally of one source `threadId`: a `snapshot`, further `page` events of 100, then `upsert` and `remove` |
+
+None of the methods but `getTerminalOutput` waits on a provider, a network or a hosting service,
+so none of the others is in the profiler's `is_long_running` list, and the stream is log-only.
+The wire fixtures are in `packages/contracts/fixtures/rpc-wire/`.
+
+**Input.** `send` takes `requestId` (1 to 128 characters of letters, digits, `-`, `_`, `.` and `:`,
+because an AI Terminal's agent reads it back in a command), `action`, `source`, `target`, an
+optional `takenOver`, `leadIn` (at most 16,000 characters), `note` and `attachments`
+(`{ label, text }`). The note and the attachment texts together are at most 48,000 characters
+(`too_long`); this is the one place the 16,000-character text rule of agent messages does not
+apply. The server resolves the actor, the modes and the project: unknown fields are refused, and
+no field names a sender. An address is `thread:<id>` or `terminal:<threadId>/<terminalId>`. The
+source, the target and a taken-over agent must be live threads of one project
+(`unknown_thread`, `other_project`). A Take over from is queued on the source itself and names
+the picked agent as `takenOver`; every other action needs a target other than the source. A
+Message needs a non-empty note. The queued text is the lead-in, the note and each attachment
+under `=== label ===`, joined by blank lines.
+
+**Provenance.** A chat request is a `thread.turn.start` with `queued: true` whose message carries
+`personSend: { requestId, action, sourceAddress }`, dispatched with the person actor through the
+server-only dispatcher, with the target thread's own runtime and interaction mode. The engine
+accepts `personSend` only on a person's claim (an agent actor of either kind is refused as an
+invariant), only without a `sourceThreadId`, and only when its source is a live thread of the
+target's project. The source-thread rule of an agent's panel message is unchanged. The message
+stores `person_send_json`, and the transcript labels it "<action>, sent from <title>" with no
+agent chip. A `personSend` message is queued, like a compaction's start, while its thread blocks a
+new turn (an open approval or question, a held queue, an errored session), also when that began
+after the RPC's own check. Cancel through the public delivery resolve command also withdraws a
+pending person's request, the same as `sendRequests.cancel` does.
+
+**States.** A request is `queued`, `waiting`, `delivered`, `read`, `answered`, `not_answered` or
+`cancelled`; the last three are final. The row keeps the sizes of the note and attachments and
+the answer text (cut at 48,000 characters, with `answerTruncated`), never the note or the
+attachments. Every change is a compare and set on the stored state, so a late event never moves a
+request back or overwrites a final state, and every change is published to subscribers in the
+order it was stored.
+
+| State          | For a chat target                                                                      | For an AI Terminal target                                    |
+| -------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `queued`       | Its queue entry waits behind the turn that runs                                        | Stored in the terminal's mailbox, not yet announced          |
+| `waiting`      | `queue_paused`: the entry is held, or the session errored, was interrupted or stopped  | Not used                                                     |
+| `delivered`    | Not used                                                                               | The pointer line was typed                                   |
+| `read`         | The target's turn for it started                                                       | `bibcode agent inbox` returned it                            |
+| `answered`     | The turn completed with an assistant message (or a proposed plan, which is the answer) | The terminal replied with `bibcode agent reply`              |
+| `not_answered` | `target_deleted`, `delivery_failed`, `turn_failed`, `turn_interrupted` or `no_answer`  | `recipient_gone`                                             |
+| `cancelled`    | `sendRequests.cancel` won the race against the claim                                   | `sendRequests.cancel` before the pointer or an inbox read it |
+
+The **follower** (`SendRequestsService::start_follower`) moves a chat request. It sweeps every open
+request once at start, then re-reads the requests of a target thread on each event of it (a
+streamed chunk is skipped, a lagged broadcast sweeps everything), and `decide` derives the state
+from what the target shows: the queue entry, its session, the turn and the assistant message. A
+turn whose reply still streams reads `read`, not `answered`. A message, a hand off and a take over
+are dismissed once the target read them; a review and a second opinion keep their row until the
+person dismisses it. A deleted source thread removes its requests (`remove` events), also at the
+sweep after a restart. The follower stops in the `send-requests-follower` step of the runtime's
+stop and resumes from its first sweep.
+
+**Idempotency, replay and cancel.** The row is stored once per `requestId` with a digest of the
+canonical input. A repeat with the same input replays without validating again, because the
+target may be gone by then: for a chat, the command receipt says what the first attempt reached
+(accepted, nothing is sent again; rejected, the failure is returned; none or reserved, the same
+command is dispatched again and the engine admits it once). A different input with the same id is
+`request_conflict`. Concurrent calls with one id store one row. For a terminal a repeat stores
+the mailbox row again only while the request is `queued`, and a generation other than the
+stored one ends the request as `recipient_gone`. A chat cancel holds the dispatch gate: with no
+delivery yet the request is marked `cancelled` and `send` cannot queue it afterwards; with a
+delivery the engine's worker runs `thread.turn-delivery.resolve` `cancel`, so the cancel and
+the claim are one compare and set each and exactly one wins. A request already read, or whose
+delivery was claimed, is returned unchanged with `cancelled: false`. A terminal cancel runs under
+the terminal's exclusion, in one transaction that cancels the mailbox row (only while `queued`)
+and the request, and is `not_cancellable` once the pointer announced the mail or the inbox
+returned it.
+
+**Refusals** are `{ "_tag": "SendRequestError", "reason", "message" }` with the reason
+`person_only`, `invalid`, `too_long`, `request_conflict`, `unknown_thread`, `other_project`,
+`target_not_notifiable`, `not_found`, `not_final`, `not_cancellable`, `not_answered` or `storage`.
+No refusal quotes the note or an attachment, and no log or profiler record holds one.
+
+**Terminal sources.** `sendRequests.getTerminalOutput { sourceThreadId, threadId, terminalId,
+source, part }` reads an AI Terminal of the source's project for a preview. `source` is `output`
+(the last 16,000 characters of the retained output, escape sequences and other controls
+removed) or `conversation` (the CLI's own conversation, see
+[Activity observation](./activity-observation.md#conversation-reads-for-a-send)); `part` is
+`last-answer` or `handoff`. The result says `usedSource`, `fellBack` (the conversation was asked
+for and the output stands in), `startMissing` and `truncated`. A conversation that is not readable
+for any reason falls back to the output, and the reason is never logged. Reading a terminal's
+text needs `orchestration:operate`, and it only reads. It waits on Codex for up to 5 seconds, so
+it is in the profiler's `is_long_running` list.
+
+### Agent message lifecycle
+
+`AgentMessaging` (`agent_messaging/mod.rs`) is the one place both the provider tools and
+`bibcode agent` go through (`call_as`), so both obey every rule. Its pieces:
+
+- `policy.rs`: the mode ceiling, the hop count, the rate and backlog limits and the **claim gate**.
+- `store.rs`: the `agent_messages` row and its status.
+- `delivery.rs`: the **tracker** that derives a chat message's status from its recipient.
+- `envelope.rs`: the agent envelope and the person-request envelope.
+- `directory.rs`: `agents_list`.
+- `pointer.rs` and `terminal_credential.rs`: the AI Terminal side (below).
+
+**Send.** For a chat recipient, `send` stores the message and queues its turn in one
+transaction: a `thread.turn.start` with `queued: true` and the envelope as its text, dispatched
+with the `hosted-agent` actor (`{ kind: "hosted-agent", address, label }`, the sender's thread
+title), and the `agent_messages` row as a companion of that command. The row is inserted
+together with the outbox entry, so a crash leaves both or neither, and the rate and backlog limits
+are checked in that same transaction. The sender's mode and hop are stored on the row. A recipient with
+a paused queue gets the entry held (`recipient_queue_held`), one with an open ask or a running
+session gets it queued, any other gets a start. The command's id is `agent-message:<messageId>`,
+so a retry with the same `clientRequestId` returns the first receipt (the unique index on the
+sender and `clientRequestId` also answers a concurrent one), and a different recipient or text
+is `AgentMessagingConflictError`.
+
+**Status.** `accepted`, `queued`, `held`, `delivered`, `consumed`, `completed`, `cancelled` and
+`failed`, with the reasons of [Provider tools](../reference/mcp.md#provider-tools). A terminal
+status is never left. For a chat message the tracker derives the status from the recipient: a deleted
+recipient is `failed` with `recipient_gone`; a turn that started from the message's own queue
+entry is `consumed`, and `completed` once the turn completed and its reply stopped streaming
+(`failed` with `recipient_turn_failed` for an errored or interrupted turn); with no such turn the
+outbox entry decides (`pending` or `sending` is `accepted`, `queued` is `queued` or, when held,
+`held` with `recipient_queue_held`, `delivered` is `delivered`, `uncertain` is `held` with
+`delivery_uncertain`, `failed` or `dismissed` is `failed` with `delivery_failed`). The tracker
+re-derives each open message on the events of its recipient's thread and once at start, so a
+restart or a lost broadcast cannot leave a status behind. A status change reports to the outcome
+sink (the activity log), once per change. The tracker stops in the `agent-message-tracker`
+step.
+
+**The claim gate.** `claim_provider_turn` asks `policy::claim_gate` first, inside the claiming
+database call, so no claim slips between the decision and the claim. For an entry of an agent
+message the gate returns `Hold(reason)`, which writes the hold and wakes the tracker, which
+takes the entry out of the queue; `Wait`, which claims nothing and which the delivery
+worker skips so a person's own message behind it can still be claimed; or `Proceed`. It holds with
+`messaging_off` while `agentMessaging.enabled` is false and with `recipient_mode_above_sender` when
+the recipient runs above the sender's stored mode (a terminal recipient counts as `full-access`);
+it waits while the recipient has an open approval or question. A person's request and any entry
+with no agent message proceed. An agent message's turn runs in its recipient's current runtime mode,
+never the mode it was admitted in. Holds are released by the tracker, in acceptance order, when the
+setting is on again or the mode ceiling holds again, as a fresh turn start under
+`agent-message:<messageId>:<n>` that replaces the old entry in one transaction. A message whose
+recipient is gone fails then. A `recipient_queue_held` hold is released only by a person's Send
+now.
+
+**Hops, rate and backlog.** `next_hop` is one more than the hop of the message that started the
+sender's latest turn (`store::trigger_hop`), unless a later turn started from a signed-in
+person's message (one with no actor); an outside agent's or a hosted agent's message keeps the
+chain. A turn with no known message resets nothing, and time never does. Past `HOP_LIMIT` (8) the
+send is refused. `enforce_limits` counts only agent-origin rows: 30 sent by one sender in 60
+seconds, and 20 unconsumed for one recipient. The text is at most 16,000 Unicode scalar values.
+
+**Cancel.** `agent_message_cancel` is allowed while the setting is off. For a chat message it
+cancels the row while it is `accepted`, `queued` or `held`, then withdraws its queue entry (the
+claim gate never claims a cancelled message, and the tracker withdraws an entry left behind).
+For a terminal message it cancels the row under the terminal's exclusion while no inbox has
+returned it. Anything else is `AgentMessagingNotCancellableError`; a second cancel is `cancelled`.
+
+**Restart.** Nothing is kept in memory that a restart cannot rebuild. The tracker's first pass
+re-derives every open chat message; the pointer's first sweep ends the generations of an earlier
+boot; the follower's first sweep re-reads every open request.
+
+**Activity log.** Each send and reply call, refused calls included, and each status change of a
+message write one row of the agent activity log (the `mcp_activity` table, tools
+`agent_message_send`, `agent_message_reply` and `agent_message_delivery`): sender address, the two
+titles, the recipient address, the message and conversation ids, the status and the reason, never
+text. One task writes them in arrival order from a bounded queue of 1,024 rows; a full queue drops
+the row and counts it in one warning. The send row and the delivery rows come from separate parts of
+the server, so in a rare scheduling a `delivered` row precedes the `accepted` row of its message;
+each row carries its own state and time. The writer stops in the `agent-message-activity` step,
+after the tracker, the MCP calls and the pointer, and writes every queued row first. A row that is
+reported after the stop is dropped.
+
+### AI Terminal mailbox, credential and pointer
+
+An AI Terminal has no turn queue, so its mail is a set of `agent_messages` rows bound to the
+terminal's **generation** (the process, `boot:process`), with no queue entry.
+
+- **Credential** (`terminal_credential.rs`). Issued at launch, in the terminal's own environment,
+  only to an AI Terminal: a random 256-bit value stored as a SHA-256 hash, bound to the
+  environment, the owner thread, the terminal id and the generation. Any credential variable
+  that a caller or a prepared environment supplied is removed first, so no caller can pick one.
+  `verify` accepts a token only while the terminal's live generation is still the one it was
+  issued to. The revoker task revokes on `Exited` and `Closed` by generation and on `Restarted` by
+  a sweep, and stops in the `terminal-credential-revoker` step. The variables are
+  `BIBCODE_AGENT_AUTH` and `BIBCODE_AGENT_ENDPOINT`; the `bibcode` shim folder is put first on
+  the terminal's `PATH`. See [Providers](./providers.md#agent-messaging).
+- **Route.** `POST /api/agent/call` (`mcp/agent_cli.rs`) takes only that bearer, at most 256 KiB,
+  and a body of `operation` and `arguments`; a sender field is refused. It calls the same
+  `call_as` as the provider tools, with the terminal as the caller. It is not an RPC method: a
+  terminal's agent holds no session, so none of the RPC authorization applies, and the
+  credential grants nothing else.
+- **Store.** `AgentMessaging::send` to a terminal checks the recipient is a running AI Terminal of the
+  project (one with an agent status, a Cursor terminal included), then `TerminalPointer::accept` stores one `queued` row bound to its
+  generation under the terminal's exclusion, obeying the mode ceiling (a terminal receives as
+  `full-access`), the rate and backlog limits and the setting (`held` with `messaging_off` while it
+  is off). A person's request goes through `accept_person` and skips all of that.
+- **Pointer.** One task (`TerminalPointer::start`) rescans on every terminal metadata change, new
+  message and change of the setting. For each terminal with `queued` mail for its live generation
+  it asks the terminal manager for a **write permit** at the PTY write boundary
+  (`TerminalManager::write_when_ready`, see
+  [Activity observation](./activity-observation.md#prompt-readiness)) and, only if the permit is
+  granted, pastes one fixed line followed by Enter, then marks that mail `delivered`. A held row is
+  never announced, a person's request is announced while the setting is off, and each terminal
+  writes in its own bounded task (2 seconds), so a terminal that stopped reading input holds up
+  no other terminal and no shutdown. The pointer stops in the `terminal-pointer` step, before the
+  activity writer closes.
+- **Inbox.** `bibcode agent inbox` returns the mail of the caller's own generation, oldest
+  first, `consumed` in the same fetch; an agent's message only while the setting is on and its
+  sender's mode reaches `full-access`; a person's request always. Each is rendered as stored
+  (a person's request) or in the agent envelope. The fetch also records the highest hop fetched
+  for the terminal's hop chain, which a person's typing, or fetching a person's request, resets.
+- **Reply.** `agent_message_reply` from a terminal completes the mail it answers. A reply to a
+  person's request is stored `completed` with no queue entry, so it starts no turn; one reply is
+  stored per request, in the transaction that completes the mail, and the request takes it as
+  its answer through the request sink.
+- **Generation end.** The pointer ends each generation with open mail that no process holds now,
+  those of an earlier boot included, each in its own task under the terminal's exclusion. In one
+  transaction it fails the unconsumed mail with `recipient_gone` and records the end on the
+  consumed mail, and it then tells the generation-end sink once per generation, across restarts.
+  The sink ends the open requests of that generation as `not_answered` with `recipient_gone`; an
+  answer already stored wins over it.
+- **Start-up.** Before the pointer starts, `fail_open_terminal_requests` gives every open terminal
+  request the reply already stored for it, then ends the rest as `not_answered` with
+  `recipient_gone`, because no terminal survives a restart.
+
+**Amendments for a person's request to a terminal.** A person's request differs from an agent's
+message in seven ways, each tested: its note and attachments may be 48,000 characters; the inbox
+and reply work for it while agent messaging is off; it reaches a terminal whatever any thread's
+mode is; it is printed as from the user, in its own envelope, not in the agent envelope; the reply
+to it is stored as its answer and queued for nobody; fetching it resets the terminal's hop count,
+as a person typing does; and the inbox returns it with agent messages, oldest first, while only it
+is returned when the setting is off or the ceiling fails.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop
@@ -5495,7 +5754,9 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   `server.refreshProviderUsage`; `worktree.createManaged` and `worktree.remove`
   (which deletes the whole tree, dependencies and build output included); and
   `agentSessions.import` and `agentSessions.openInPanel` (a whole transcript
-  read and a wait on the project mutation lock). `agentSessions.listForThread`
+  read and a wait on the project mutation lock), and
+  `sendRequests.getTerminalOutput` (a Codex AI Terminal's conversation waits on Codex for up to
+  5 seconds). `agentSessions.listForThread`
   stays out: its per-request budget bounds it, so a slow listing is a finding.
   They still emit `rpc.timing`, but never raise `rpc.slow` or count toward
   saturation.
@@ -5662,6 +5923,18 @@ H.264 video does not travel over RPC. The ticket from
   before interrupting; unavailable attachments and failed cancellations remain
   visible to the user.
 - Contracts define the wire; server and client fixtures guard compatibility.
+- A person's request (`personSend`) is admitted only from the person-send path: never from an
+  agent actor, never with a source thread, and never with a source outside the target's project.
+  The request row keeps the sizes of the note and attachments, never their text (the text is the
+  target's own message, or a terminal's mailbox row), and the answer, cut at 48,000 characters.
+- An agent message and its queue entry are written in one transaction, and its status only moves
+  forward: a terminal status (`completed`, `cancelled`, `failed`) is never left. The claim gate
+  decides each delivery at the moment of the claim, so the setting, the mode ceiling and an open
+  approval or question are checked there, not only when the message was sent.
+- An AI Terminal receives agent mail only through its own mailbox. BiBCode types nothing but the
+  fixed pointer line into a terminal, once per ready period, only under a write permit decided at
+  the PTY write, and never any message text. A credential names one process of one terminal and
+  is refused once another process holds that terminal.
 - One connection supervisor owns reconnects. The Effect RPC protocol does not
   retry sockets independently.
 - Authorization is checked at each HTTP route or RPC method, not inferred from
