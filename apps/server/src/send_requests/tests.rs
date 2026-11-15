@@ -3206,6 +3206,7 @@ struct FakeTerminalOutput {
     conversation: Option<crate::provider_terminal::ObservedConversation>,
     session: Option<String>,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    codex: Option<crate::provider_terminal::CodexConversationHandle>,
 }
 
 impl FakeTerminalOutput {
@@ -3216,6 +3217,21 @@ impl FakeTerminalOutput {
             conversation: None,
             session: None,
             environment: Vec::new(),
+            codex: None,
+        })
+    }
+
+    fn codex(
+        text: &str,
+        handle: crate::provider_terminal::CodexConversationHandle,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            text: text.to_owned(),
+            calls: std::sync::Mutex::default(),
+            conversation: None,
+            session: None,
+            environment: Vec::new(),
+            codex: Some(handle),
         })
     }
 
@@ -3231,11 +3247,23 @@ impl FakeTerminalOutput {
             conversation,
             session: session.map(str::to_owned),
             environment: vec![("CLAUDE_CONFIG_DIR".into(), config_dir.into())],
+            codex: None,
         })
     }
 }
 
 impl crate::send_requests::service::TerminalOutputSource for FakeTerminalOutput {
+    fn codex_conversation<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Option<crate::provider_terminal::CodexConversationHandle>,
+    > {
+        Box::pin(async move { self.codex.clone() })
+    }
+
     fn observed_conversation<'a>(
         &'a self,
         _owner_thread_id: &'a str,
@@ -3665,6 +3693,86 @@ async fn get_terminal_output_never_logs_the_refusal_or_the_path() {
         assert!(!log.contains(canary), "{canary} reached the log:\n{log}");
     }
     child.complete();
+}
+
+/// A Codex observer loop that answers one conversation request with `answer`.
+fn codex_observer(
+    answer: Result<
+        crate::provider_terminal::CodexConversation,
+        crate::provider_terminal::ConversationRefusal,
+    >,
+) -> crate::provider_terminal::CodexConversationHandle {
+    let (handle, mut requests) = crate::provider_terminal::CodexConversationHandle::channel();
+    tokio::spawn(async move {
+        if let Some(reply) = requests.recv().await {
+            let _ = reply.send(answer);
+        }
+    });
+    handle
+}
+
+#[tokio::test]
+async fn get_terminal_output_codex_conversation_reads_the_root_thread() {
+    let harness = harness().await;
+    for complete in [true, false] {
+        let handle = codex_observer(Ok(crate::provider_terminal::CodexConversation {
+            thread_id: "thread-1".to_owned(),
+            messages: vec![
+                ("user".to_owned(), "Test question".to_owned()),
+                ("assistant".to_owned(), "Test answer".to_owned()),
+            ],
+            complete,
+        }));
+        let fake = FakeTerminalOutput::codex("recent output", handle);
+        let service = harness.send_requests().with_terminal_output(fake.clone());
+
+        let result = read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+
+        assert_eq!(
+            result["text"],
+            "[user] Test question\n[assistant] Test answer"
+        );
+        assert_eq!(result["usedSource"], "conversation");
+        assert_eq!(result["fellBack"], false);
+        assert_eq!(
+            result["startMissing"], !complete,
+            "the start is missing when the pager did not reach the oldest turn"
+        );
+        assert!(fake.calls.lock().unwrap().is_empty(), "no output was read");
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_codex_unreadable_conversation_falls_back() {
+    let harness = harness().await;
+    let (gone, requests) = crate::provider_terminal::CodexConversationHandle::channel();
+    drop(requests);
+    for handle in [
+        codex_observer(Err(crate::provider_terminal::ConversationRefusal::TooLarge)),
+        codex_observer(Ok(crate::provider_terminal::CodexConversation {
+            thread_id: "thread-1".to_owned(),
+            messages: Vec::new(),
+            complete: true,
+        })),
+        gone,
+    ] {
+        let service = harness
+            .send_requests()
+            .with_terminal_output(FakeTerminalOutput::codex("hello", handle));
+
+        let result = read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+
+        assert_eq!(result["usedSource"], "output");
+        assert_eq!(result["fellBack"], true);
+        assert_eq!(result["startMissing"], false);
+        assert_eq!(result["text"], "hello");
+    }
+    harness.shutdown().await;
 }
 
 #[derive(Clone, Default)]

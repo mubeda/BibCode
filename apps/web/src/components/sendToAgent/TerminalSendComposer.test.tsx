@@ -227,8 +227,33 @@ describe("TerminalSendComposer", () => {
     await act(async () => {});
     const attachments =
       (await previewContentFor()(choiceFor("hand-off"))?.loadAttachments?.()) ?? [];
-    expect(attachments[0]).toMatchObject({ label: "Conversation of Claude", text, leftOut: null });
-    expect(attachments[0]).not.toHaveProperty("note");
+    expect(attachments[0]).toMatchObject({
+      label: "Conversation of Claude",
+      text,
+      leftOut: null,
+      note: null,
+    });
+  });
+
+  it("a_conversation_whose_start_was_not_read_says_so", async () => {
+    h.getTerminalOutput.mockResolvedValue({
+      threadId: "owner",
+      terminalId: "term-1",
+      text: "[user] Test question\n[assistant] Test answer",
+      truncated: true,
+      usedSource: "conversation",
+      fellBack: false,
+      startMissing: true,
+    });
+    h.menuOpen = true;
+    render();
+    await act(async () => {});
+    const attachments =
+      (await previewContentFor()(choiceFor("hand-off"))?.loadAttachments?.()) ?? [];
+    expect(attachments[0]).toMatchObject({
+      label: "Conversation of Claude",
+      note: "The start of the conversation is not included.",
+    });
   });
 
   it("the_preview_says_recent_output_was_used_when_the_conversation_could_not_be_read", async () => {

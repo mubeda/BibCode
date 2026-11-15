@@ -703,6 +703,7 @@ struct TerminalObserverGenerationInner {
     cancellation: CancellationToken,
     agent_status: watch::Sender<Option<TerminalAgentObservation>>,
     conversation: StdMutex<ObservedSession>,
+    codex_conversation: StdMutex<Option<super::CodexConversationHandle>>,
 }
 
 /// The CLI conversation a Claude AI Terminal's status hooks name (spec R112): the session the
@@ -890,6 +891,7 @@ impl TerminalObserverGeneration {
                     cancellation: cancellation.clone(),
                     agent_status: watch::channel(None).0,
                     conversation: StdMutex::default(),
+                    codex_conversation: StdMutex::default(),
                 }),
             },
             workers: TerminalObserverWorkerContext {
@@ -1150,6 +1152,26 @@ impl TerminalObserverGenerationLease {
     /// The main session the status hooks bound last.
     pub(crate) fn observed_session(&self) -> Option<String> {
         self.observed().session_id.clone()
+    }
+
+    /// Hands out the way into a Codex observer's loop, while this generation is current.
+    pub(crate) fn publish_codex_conversation(&self, handle: super::CodexConversationHandle) {
+        if self.is_current() {
+            *self
+                .inner
+                .codex_conversation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+        }
+    }
+
+    /// The way into this generation's Codex observer loop, once it resumed its root thread.
+    pub(crate) fn codex_conversation(&self) -> Option<super::CodexConversationHandle> {
+        self.inner
+            .codex_conversation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it

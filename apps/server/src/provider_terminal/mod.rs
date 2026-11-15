@@ -8,8 +8,11 @@ mod opencode;
 mod supervisor;
 
 #[cfg(test)]
-pub(crate) use conversation::MAX_TRANSCRIPT_BYTES;
-pub(crate) use conversation::{ConversationRefusal, ConversationText, read_claude_conversation};
+pub(crate) use conversation::{CodexConversation, MAX_TRANSCRIPT_BYTES};
+pub(crate) use conversation::{
+    CodexConversationHandle, ConversationRefusal, ConversationText, read_claude_conversation,
+    read_codex_conversation,
+};
 pub(crate) use model::ObservedConversation;
 #[allow(unused_imports)]
 pub(crate) use model::{

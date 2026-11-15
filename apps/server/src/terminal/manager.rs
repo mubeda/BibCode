@@ -4886,11 +4886,12 @@ impl TerminalManager {
         .then(|| session.generation.id.clone())
     }
 
-    /// The observation lease of a Claude AI Terminal's current process.
-    async fn claude_observation(
+    /// The observation lease of the current process of an AI Terminal of `driver_kind`.
+    async fn observation_of(
         &self,
         thread_id: &str,
         terminal_id: &str,
+        driver_kind: &str,
     ) -> Option<crate::provider_terminal::TerminalObserverGenerationLease> {
         let session = self
             .inner
@@ -4904,7 +4905,7 @@ impl TerminalManager {
             .command
             .as_ref()
             .and_then(|command| command.activity.as_ref())
-            .filter(|activity| activity.driver_kind == CLAUDE_DRIVER_KIND)?;
+            .filter(|activity| activity.driver_kind == driver_kind)?;
         Some(session.generation.observation.observation())
     }
 
@@ -4914,7 +4915,7 @@ impl TerminalManager {
         thread_id: &str,
         terminal_id: &str,
     ) -> Option<crate::provider_terminal::ObservedConversation> {
-        self.claude_observation(thread_id, terminal_id)
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
             .await?
             .observed_conversation()
     }
@@ -4925,9 +4926,20 @@ impl TerminalManager {
         thread_id: &str,
         terminal_id: &str,
     ) -> Option<String> {
-        self.claude_observation(thread_id, terminal_id)
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
             .await?
             .observed_session()
+    }
+
+    /// The way into a Codex AI Terminal's observer loop, for its current process (R112).
+    pub(crate) async fn codex_conversation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::provider_terminal::CodexConversationHandle> {
+        self.observation_of(thread_id, terminal_id, "codex")
+            .await?
+            .codex_conversation()
     }
 
     /// The environment the terminal's command carries (the provider's settings), never the

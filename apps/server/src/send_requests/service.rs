@@ -152,6 +152,16 @@ pub(crate) trait TerminalOutputSource: Send + Sync {
         owner_thread_id: &'a str,
         terminal_id: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>>;
+
+    /// The way into a Codex AI Terminal's observer loop, once it resumed its root thread.
+    fn codex_conversation<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Option<crate::provider_terminal::CodexConversationHandle>,
+    >;
 }
 
 impl TerminalOutputSource for crate::terminal::TerminalManager {
@@ -178,6 +188,17 @@ impl TerminalOutputSource for crate::terminal::TerminalManager {
         terminal_id: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>> {
         Box::pin(self.launch_environment(owner_thread_id, terminal_id))
+    }
+
+    fn codex_conversation<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Option<crate::provider_terminal::CodexConversationHandle>,
+    > {
+        Box::pin(self.codex_conversation(owner_thread_id, terminal_id))
     }
 
     fn tail<'a>(
@@ -228,7 +249,8 @@ pub(crate) fn plain_tail(raw: &str, older_exists: bool, max_chars: usize) -> Ter
     }
 }
 
-/// The conversation of a Claude AI Terminal, read off the async runtime. Every refusal is the
+/// The conversation of a Codex AI Terminal through its observer, which waits on Codex for at
+/// most 5 seconds, or of a Claude AI Terminal, read off the async runtime. Every refusal is the
 /// caller's cue to fall back to the output.
 async fn conversation_text(
     reader: &dyn TerminalOutputSource,
@@ -237,6 +259,12 @@ async fn conversation_text(
 ) -> Result<crate::provider_terminal::ConversationText, crate::provider_terminal::ConversationRefusal>
 {
     use crate::provider_terminal::ConversationRefusal;
+    if let Some(observer) = reader
+        .codex_conversation(owner_thread_id, terminal_id)
+        .await
+    {
+        return crate::provider_terminal::read_codex_conversation(&observer).await;
+    }
     let observed = reader
         .observed_conversation(owner_thread_id, terminal_id)
         .await
@@ -263,6 +291,9 @@ fn conversation_result(
     input: &SendRequestsGetTerminalOutputInput,
     conversation: crate::provider_terminal::ConversationText,
 ) -> Option<SendRequestsGetTerminalOutputResult> {
+    // Only the handoff text starts at the conversation's start.
+    let start_missing =
+        matches!(input.part, TerminalTextPart::Handoff) && conversation.start_missing;
     let (text, truncated) = match input.part {
         TerminalTextPart::Handoff => (
             conversation.handoff.render(),
@@ -284,7 +315,7 @@ fn conversation_result(
         truncated,
         used_source: TerminalTextSource::Conversation,
         fell_back: false,
-        start_missing: false,
+        start_missing,
     })
 }
 

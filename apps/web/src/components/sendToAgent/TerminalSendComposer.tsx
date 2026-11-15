@@ -31,7 +31,7 @@ import { serverEnvironment } from "~/state/server";
 import { useAgentRows } from "../agents/useAgentRows";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { SECOND_OPINION_LEAD_IN } from "./attachments.logic";
-import { HAND_OFF_LEAD_IN } from "./handoff.logic";
+import { HAND_OFF_LEAD_IN, TERMINAL_START_MISSING_NOTE } from "./handoff.logic";
 import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
 import type {
@@ -73,6 +73,8 @@ const canNotifyTerminal = () => false;
 interface TerminalRead extends TerminalOutputText {
   /** The conversation was asked for and could not be read, so the output is used. */
   fellBack: boolean;
+  /** The conversation read did not reach its start (a long Codex thread). */
+  startMissing: boolean;
 }
 
 /** Rejects when the output could not be read. */
@@ -92,6 +94,7 @@ function readAttachment(output: TerminalRead, terminalLabel: string): PreviewAtt
           label: `Conversation of ${terminalLabel}`,
           text: output.text,
           leftOut: null,
+          note: output.startMissing ? TERMINAL_START_MISSING_NOTE : null,
         };
   }
   const attachment = terminalAttachment({ selection: null, output, terminalLabel });
