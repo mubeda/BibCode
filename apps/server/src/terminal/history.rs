@@ -294,23 +294,21 @@ impl TerminalHistory {
             pieces.push(piece);
         }
         let mut text: String = pieces.into_iter().rev().collect();
-        let end = match self.cut_sequence_len(&text) {
+        match self.cut_sequence_len(&text) {
             Ok(inside) => {
                 text.drain(..inside);
-                self.total_bytes_written
             }
-            // A sequence still arriving: an empty window at its ESC, so a read continuing from
-            // the window's end gets the sequence whole.
+            // A sequence still arriving: the window starts at its ESC and holds it whole, so a
+            // reader sees one unfinished escape, which it keeps its cursor before.
             Err(started) => {
-                let end = self.total_bytes_written - (text.len() + started) as u64;
-                text.clear();
-                end
+                let cut = self.total_bytes - text.len();
+                text.insert_str(0, &self.retained_range(cut - started, cut));
             }
-        };
+        }
         HistoryWindow {
             epoch: self.epoch,
-            start: end - text.len() as u64,
-            end,
+            start: self.total_bytes_written - text.len() as u64,
+            end: self.total_bytes_written,
             text,
             dropped: false,
         }
