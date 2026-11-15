@@ -16,7 +16,7 @@ and two Codex reviews)
 Amended 2026-11-13, for requests sent by a person only, by the approved
 [Send to agent design](./2026-11-13-send-to-agent-design.md): R2, R5, R6, R8, R10, R14 and
 the inbox row of D12. That document's Constraints section states each change.
-Size: full    Mode: quick    Type: feature
+Size: full Mode: quick Type: feature
 Source: research handoff "Inter-Agent Communication for BibCode", conversation 2026-11-13.
 Verified at `a9938193b` (`main`). Research notes and the full report with every permalink
 are kept outside the repository (see [Evidence](#evidence)).
@@ -83,17 +83,17 @@ Anti-goals, which count as failure even when everything works:
 
 ## Vocabulary
 
-| Term | Meaning |
-| --- | --- |
-| Chat agent | The provider session of a thread, including a chat panel's thread. |
-| Terminal agent | A provider CLI that BiBCode launched in an AI Terminal. |
-| Agent address | `thread:<threadId>` for a chat agent, `terminal:<threadId>/<terminalId>` for a terminal agent. |
-| Agent message | One text sent from one agent address to another through this feature. |
-| Conversation | The first agent message and every reply that descends from it; it has one conversation id. |
-| Hop | The position of a message in a chain of agent-triggered messages, starting at 1. |
-| Envelope | The labelled block around the text that the recipient's model reads. |
+| Term                | Meaning                                                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Chat agent          | The provider session of a thread, including a chat panel's thread.                                                       |
+| Terminal agent      | A provider CLI that BiBCode launched in an AI Terminal.                                                                  |
+| Agent address       | `thread:<threadId>` for a chat agent, `terminal:<threadId>/<terminalId>` for a terminal agent.                           |
+| Agent message       | One text sent from one agent address to another through this feature.                                                    |
+| Conversation        | The first agent message and every reply that descends from it; it has one conversation id.                               |
+| Hop                 | The position of a message in a chain of agent-triggered messages, starting at 1.                                         |
+| Envelope            | The labelled block around the text that the recipient's model reads.                                                     |
 | Terminal generation | One launch of the agent process in one terminal by one server run. A restart, a replacement, an exit or a close ends it. |
-| Ready for a prompt | A terminal agent whose process is alive, whose last turn ended, and which has no pending question or approval. |
+| Ready for a prompt  | A terminal agent whose process is alive, whose last turn ended, and which has no pending question or approval.           |
 
 ## Architecture
 
@@ -183,7 +183,7 @@ stateDiagram-v2
 
 ## Requirements
 
-### R1. Agent directory  [Must]
+### R1. Agent directory [Must]
 
 WHEN an agent asks for the agents it can reach, the messaging service SHALL return every
 chat agent and terminal agent of the caller's project except the caller's own address
@@ -192,70 +192,79 @@ agent address, title, provider, kind (chat or terminal), activity status and whe
 receive now.
 
 #### Scenario: two panels and a terminal
+
 - GIVEN a project with a Claude thread, a Codex panel and a Claude AI Terminal, messaging on
 - WHEN the Claude thread's agent lists agents
 - THEN it gets two entries, the Codex panel and the terminal, each with an address
 
 #### Scenario: other projects stay invisible
+
 - GIVEN a second project in the same environment with one thread
 - WHEN an agent of the first project lists agents
 - THEN the second project's thread is not in the result, and no count hints at it
 
-### R2. Sending  [Must]
+### R2. Sending [Must]
 
 WHEN an agent sends text to an agent address, the messaging service SHALL store one agent
 message together with its queue entry, so that both exist or neither does, and return its
 message id, its conversation id and the status `accepted`.
 
 #### Scenario: crash right after acceptance
+
 - GIVEN A's send returned a message id
 - WHEN the server stops before delivery and starts again
 - THEN the message is still queued for B and is delivered or reported under R18; it never
   stays `accepted` with nothing left to deliver it
 
 #### Scenario: accepted
+
 - GIVEN agents A and B in one project
 - WHEN A sends "Which port does the dev server use?" to B's address
 - THEN A gets a message id and `accepted`, and the message exists with sender A, recipient B
 
 #### Scenario: invalid recipient
+
 - GIVEN agent A
 - WHEN A sends to an address that does not exist, to its own address, or with empty text or
   text over 16,000 characters
 - THEN the call fails with an error naming the reason, and no message is stored
 
-### R3. Sender identity  [Must]
+### R3. Sender identity [Must]
 
 The messaging service SHALL take the sender of every agent message from the caller's
 credential and SHALL refuse a call that supplies a sender or any other unknown field.
 
 #### Scenario: no spoofing
+
 - GIVEN agent A's credential
 - WHEN A sends a message with a field claiming agent C as the sender
 - THEN the call is refused as an invalid argument, and no message is recorded with sender C
 
-### R4. Project scope  [Must]
+### R4. Project scope [Must]
 
 IF the recipient is not in the sender's project and environment, THEN the messaging service
 SHALL refuse the send with the same error as for an address that does not exist.
 
 #### Scenario: cross-project send
+
 - GIVEN agent A in project one and thread X in project two
 - WHEN A sends to `thread:<X>`
 - THEN A gets the unknown-recipient error, nothing is queued for X, and the error does not
   reveal that X exists
 
-### R5. Opt-in  [Must]
+### R5. Opt-in [Must]
 
 WHILE agent messaging is off for the environment, the messaging service SHALL refuse every
 directory, send, reply, status and inbox call with an error that names the setting.
 
 #### Scenario: default is off
+
 - GIVEN a fresh environment
 - WHEN an agent calls the directory
 - THEN it gets the disabled error naming Settings → Agents, and no agent is listed
 
 #### Scenario: turned off mid-conversation
+
 - GIVEN messaging on and a message from A queued for B
 - WHEN a person turns messaging off
 - THEN new calls are refused, the queued message becomes `held` with reason
@@ -263,7 +272,7 @@ directory, send, reply, status and inbox call with an error that names the setti
   delivered normally, and the agent message rejoins the end of the queue when messaging is
   on again; it is not deleted
 
-### R6. Runtime-mode ceiling  [Must]
+### R6. Runtime-mode ceiling [Must]
 
 IF the recipient's runtime mode ranks above the sender's in the order `approval-required`,
 `auto-accept-edits`, `full-access`, at send time or at delivery time, THEN the messaging
@@ -272,27 +281,31 @@ service SHALL refuse the send, or mark the already accepted message `held` with 
 receives as `full-access`.
 
 #### Scenario: a supervised agent cannot drive a full-access agent
+
 - GIVEN A in `approval-required` and B in `full-access`
 - WHEN A sends to B
 - THEN the send is refused and B receives nothing
 
 #### Scenario: equal or lower is allowed
+
 - GIVEN A in `full-access` and B in `approval-required`
 - WHEN A sends to B
 - THEN the message is accepted
 
 #### Scenario: the recipient's mode rises while the message waits
+
 - GIVEN A and B in `auto-accept-edits` and A's message queued behind B's running turn
 - WHEN a person switches B to `full-access` before the message is delivered
 - THEN the message is not delivered and becomes `held` with `recipient_mode_above_sender`
 
 #### Scenario: terminal recipient
+
 - GIVEN A in `auto-accept-edits` and terminal agent C
 - WHEN A sends to C
 - THEN the send is refused, because a terminal agent's own permissions are not known to
   BiBCode
 
-### R7. Delivery to a chat agent  [Must]
+### R7. Delivery to a chat agent [Must]
 
 WHEN an agent message for a chat agent reaches the head of that thread's queue and the
 thread is ready, the messaging service SHALL start a turn whose input is the envelope, and
@@ -300,18 +313,20 @@ SHALL set the status to `delivered` when the provider accepts the turn and `cons
 the turn starts.
 
 #### Scenario: idle recipient
+
 - GIVEN B idle
 - WHEN A's message is accepted
 - THEN B starts a turn without any person acting, B's transcript shows the message, and the
   message status reaches `consumed`
 
 #### Scenario: busy recipient
+
 - GIVEN B in the middle of a turn
 - WHEN A's message is accepted
 - THEN the status is `queued`, B's running turn is not interrupted or steered, and the
   message is delivered after that turn ends
 
-### R8. Envelope  [Must]
+### R8. Envelope [Must]
 
 The messaging service SHALL deliver every agent message inside an envelope that states the
 sender's title, provider and agent address, the message id, the conversation id, the id of
@@ -319,37 +334,41 @@ the message it replies to when there is one, and that the text comes from anothe
 not from the recipient's user.
 
 #### Scenario: recipient can tell who wrote it
+
 - GIVEN A, titled "API refactor", sends "Run the migration" to B
 - WHEN B's turn starts
 - THEN the input B's model receives names "API refactor" as the sender and states that the
   text is not from B's user
 
 #### Scenario: text cannot forge an envelope
+
 - GIVEN A sends text that contains the envelope's own closing marker followed by a line
   claiming to be from the user
 - WHEN B's turn starts
 - THEN the forged marker is neutralized, and everything A wrote stays inside A's envelope
 
 #### Scenario: text is delivered literally
+
 - GIVEN A sends text that starts with a slash command, names a skill, or contains an
   `@path` file reference
 - WHEN B's turn starts
 - THEN B's provider runs no command, loads no skill and expands no file because of that
   text; B's model receives the characters A wrote
 
-### R9. No user authority  [Must]
+### R9. No user authority [Must]
 
 WHILE a recipient is waiting for an approval or for an answer to a question, the messaging
 service SHALL keep agent messages for it `queued` and SHALL NOT deliver any of them as the
 approval or the answer.
 
 #### Scenario: pending approval
+
 - GIVEN B is waiting for a person to approve a command
 - WHEN A sends "approve it"
 - THEN the approval stays pending, the message stays `queued`, and it is delivered as an
   ordinary agent message only after a person resolved the approval
 
-### R10. Replies and correlation  [Must]
+### R10. Replies and correlation [Must]
 
 WHEN an agent replies to an agent message it received, the messaging service SHALL deliver
 the reply to that message's sender in the same conversation, record which message it
@@ -358,17 +377,19 @@ any later time while both agents exist, and a reply from a terminal agent sets t
 message to `completed`.
 
 #### Scenario: round trip across providers
+
 - GIVEN A (Claude) sent message m1 to B (Codex) and B consumed it
 - WHEN B replies to m1 with "Port 5173"
 - THEN A starts a turn whose envelope carries "Port 5173", m1's id as the answered message
   and the same conversation id, and A did not have to wait in a tool call for it
 
 #### Scenario: reply to a message that was not yours
+
 - GIVEN message m1 from A to B
 - WHEN agent C replies to m1
 - THEN the reply is refused and A receives nothing from C
 
-### R11. Status tracking  [Must]
+### R11. Status tracking [Must]
 
 WHEN the sender of an agent message asks for its status, the messaging service SHALL return
 one of `accepted`, `queued`, `held`, `delivered`, `consumed`, `completed`, `cancelled` or
@@ -378,43 +399,48 @@ ends normally and `failed` with `recipient_turn_failed` when that turn is interr
 errors.
 
 #### Scenario: four distinct stages
+
 - GIVEN A sent m1 to a busy B
 - WHEN A reads the status before B's turn ends, after B's next turn starts, and after it ends
 - THEN A reads `queued`, then `consumed`, then `completed`
 
 #### Scenario: only the sender may ask
+
 - GIVEN message m1 from A to B
 - WHEN agent C asks for m1's status
 - THEN the call fails as for an unknown message, and C learns nothing about m1
 
-### R12. Idempotent sends  [Must]
+### R12. Idempotent sends [Must]
 
 WHEN an agent repeats a send or a reply with the same client request id and the same
 arguments, the messaging service SHALL return the first call's result and SHALL NOT store
 or deliver a second message.
 
 #### Scenario: retry after a timeout
+
 - GIVEN A sent m1 with client request id k and lost the response
 - WHEN A sends again with id k and the same arguments
 - THEN A gets m1's id, and B receives the text once
 
 #### Scenario: same id, other arguments
+
 - GIVEN client request id k was used for m1
 - WHEN A sends different text with id k
 - THEN the call fails with a conflict error and nothing is delivered
 
-### R13. Ordering  [Must]
+### R13. Ordering [Must]
 
 The messaging service SHALL deliver the agent messages for one recipient in the order it
 accepted them, interleaved with a person's queued messages for that thread by acceptance
 time.
 
 #### Scenario: two senders, one recipient
+
 - GIVEN B busy, A's message accepted first and C's second
 - WHEN B becomes ready
 - THEN B receives A's message in one turn and C's in the following turn, never the reverse
 
-### R14. Hop limit  [Must]
+### R14. Hop limit [Must]
 
 IF sending a message would make its hop number greater than 8, THEN the messaging service
 SHALL refuse it with an error that names the limit. For a chat sender the hop number is 1
@@ -424,39 +450,44 @@ the highest hop among the agent messages it fetched in its terminal generation s
 person last typed into that terminal, and 1 when it fetched none since then.
 
 #### Scenario: a slow exchange does not reset itself
+
 - GIVEN terminal agents C and D answering each other once an hour with no person typing in
   either terminal, the last message at hop 8
 - WHEN its recipient fetches it and sends again
 - THEN the send is refused with the hop-limit error, however much time passed
 
 #### Scenario: two terminals cannot ping-pong
+
 - GIVEN terminal agents C and D answering each other within seconds, the last message at
   hop 8
 - WHEN its recipient fetches it and sends again
 - THEN the send is refused with the hop-limit error
 
 #### Scenario: ping-pong stops
+
 - GIVEN A and B answering each other with no person involved, the last message at hop 8
 - WHEN its recipient sends another message in the turn that message started
 - THEN the send is refused with the hop-limit error and nothing is delivered
 
 #### Scenario: a person resets the chain
+
 - GIVEN the same conversation stopped at hop 8
 - WHEN a person types a message in A's thread and A then sends to B
 - THEN the message is accepted at hop 1
 
-### R15. Rate and backlog limits  [Should]
+### R15. Rate and backlog limits [Should]
 
 IF an agent has sent 30 agent messages in the last 60 seconds, or the recipient already has
 20 agent messages not yet consumed, THEN the messaging service SHALL refuse the send with an
 error that names the limit that applied.
 
 #### Scenario: flooding one recipient
+
 - GIVEN B is held with 20 unconsumed agent messages
 - WHEN A sends one more
 - THEN the send is refused with the backlog error and B's queue stays at 20
 
-### R16. Terminal agents can send and receive  [Must]
+### R16. Terminal agents can send and receive [Must]
 
 WHEN BiBCode launches an AI Terminal, the terminal runtime SHALL give its process a
 credential bound to that terminal generation, SHALL revoke it when the generation ends, and
@@ -464,29 +495,33 @@ the `bibcode agent` command run inside it SHALL offer the directory, send, reply
 inbox operations under that terminal's agent address.
 
 #### Scenario: a sibling terminal cannot use the credential
+
 - GIVEN AI Terminals C and E on the same thread
 - WHEN a process in E runs the send command
 - THEN the message is sent from E's address; nothing BiBCode gives E (environment, shared
   thread configuration or files) contains C's credential
 
 #### Scenario: a restarted terminal does not inherit mail
+
 - GIVEN m1 queued for terminal agent C
 - WHEN C's terminal is restarted and a new agent process starts under the same terminal id
 - THEN m1 is `failed` with `recipient_gone`, the old credential is refused, and the new
   process's inbox is empty
 
 #### Scenario: terminal to panel
+
 - GIVEN a Codex AI Terminal C and a chat agent B in one project
 - WHEN C's agent runs the send command addressed to B
 - THEN B receives the envelope naming C's terminal as the sender
 
 #### Scenario: a shell without the credential
+
 - GIVEN a plain terminal that BiBCode did not launch as an AI Terminal
 - WHEN a process in it runs the send command
 - THEN the command exits non-zero with a message that it has no agent identity, and nothing
   is sent
 
-### R17. Delivery to a terminal agent  [Must]
+### R17. Delivery to a terminal agent [Must]
 
 WHEN a terminal agent has agent messages it has not fetched and it is observed ready for a
 prompt in its current terminal generation, the messaging service SHALL paste one fixed
@@ -495,6 +530,7 @@ SHALL set a message to `consumed` only when the terminal agent fetches it throug
 operation.
 
 #### Scenario: ready terminal
+
 - GIVEN terminal agent C ready for a prompt and a message m1 from A
 - WHEN m1 is accepted
 - THEN one line telling the agent to run the inbox command appears in C's terminal, m1 is
@@ -502,13 +538,14 @@ operation.
   printed the envelope
 
 #### Scenario: terminal not safe to type into
+
 - GIVEN C is working, is blocked on a permission prompt, is waiting for an answer to a
   question it asked, or its readiness cannot be observed
 - WHEN m1 is accepted
 - THEN nothing is typed into the terminal, m1 is `queued`, C can still fetch m1 with the
   inbox operation, and the body of m1 is never written to the terminal in any state
 
-### R18. Recipient unavailable  [Must]
+### R18. Recipient unavailable [Must]
 
 IF a recipient's queue is held, or a terminal recipient's generation ended (close, exit,
 restart, replacement or server restart) before the message was consumed, THEN the messaging
@@ -517,56 +554,63 @@ service SHALL set the message to `held` (held chat queue) or `failed` with reaso
 sender.
 
 #### Scenario: recipient errored
+
 - GIVEN B's last turn ended in an error, so its queue is held
 - WHEN A sends m1
 - THEN m1 is `held` with the reason, B's session is not restarted by the message, and m1 is
   delivered when a person releases B's queue
 
 #### Scenario: terminal closed
+
 - GIVEN m1 queued for terminal agent C
 - WHEN C's terminal closes
 - THEN m1 becomes `failed` with `recipient_gone`, and no later terminal receives it
 
-### R19. Persistence  [Should]
+### R19. Persistence [Should]
 
 The messaging service SHALL keep every agent message, its status and its correlation data
 across a server restart.
 
 #### Scenario: restart with a queued message
+
 - GIVEN m1 queued for chat agent B, whose turn was running
 - WHEN the server restarts
 - THEN m1 still exists, its status is `held` because B's abandoned session holds its queue,
   and A can read that status after the restart
 
 #### Scenario: restart with an idle recipient
+
 - GIVEN m1 queued for chat agent B, which was ready and not running
 - WHEN the server restarts
 - THEN m1 keeps its place and is delivered as it would have been without the restart
 
-### R20. Cancelling  [Should]
+### R20. Cancelling [Should]
 
 WHEN the sender cancels an agent message that is `queued` or `held`, or `delivered` to a
 terminal agent that has not fetched it, the messaging service SHALL set it to `cancelled`
 and SHALL NOT deliver it.
 
 #### Scenario: too late to cancel
+
 - GIVEN m1 already `consumed`
 - WHEN A cancels m1
 - THEN the call fails saying the message was already delivered, and m1's status is unchanged
 
-### R21. Visible to the person  [Must]
+### R21. Visible to the person [Must]
 
 WHEN an agent message is accepted, refused, delivered or failed, the application SHALL show
 it to the person: the recipient's transcript marks the message with the sending agent, and
 the agent activity log records sender, recipient, outcome and time without the message text.
 
 #### Scenario: transcript attribution
+
 - GIVEN A's message was delivered to B
 - WHEN a person opens B's thread
 - THEN the message shows a chip naming A's thread as the sender, distinct from messages the
   person typed
 
 #### Scenario: no content in diagnostics
+
 - GIVEN the Profiler is on
 - WHEN agents exchange messages
 - THEN profiler events, findings and logs contain ids and outcomes and no message text
@@ -695,14 +739,14 @@ D10. Agent tools are named `agents_list`, `agent_message_send`, `agent_message_r
 
 D12. Message contract. Decided by: agent's call.
 
-| Operation | Arguments | Result |
-| --- | --- | --- |
-| `agents_list` | none | `agents[]`: `address`, `title`, `provider`, `kind`, `status`, `canReceive` |
-| `agent_message_send` | `to`, `text`, `clientRequestId` | `messageId`, `conversationId`, `status`, `hop` |
-| `agent_message_reply` | `inReplyTo`, `text`, `clientRequestId` | same as send |
-| `agent_message_status` | `messageId` | `status`, `reason?`, `updatedAt`, `replyMessageId?` |
-| `agent_message_cancel` | `messageId` | `status` |
-| `bibcode agent inbox` (terminal only) | none | the envelopes of every `queued` or `delivered` message addressed to the caller's terminal generation that still passes R5 and R6, oldest first; fetching marks them `consumed` in the same step. Held, cancelled and failed messages are never returned |
+| Operation                             | Arguments                              | Result                                                                                                                                                                                                                                                  |
+| ------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agents_list`                         | none                                   | `agents[]`: `address`, `title`, `provider`, `kind`, `status`, `canReceive`                                                                                                                                                                              |
+| `agent_message_send`                  | `to`, `text`, `clientRequestId`        | `messageId`, `conversationId`, `status`, `hop`                                                                                                                                                                                                          |
+| `agent_message_reply`                 | `inReplyTo`, `text`, `clientRequestId` | same as send                                                                                                                                                                                                                                            |
+| `agent_message_status`                | `messageId`                            | `status`, `reason?`, `updatedAt`, `replyMessageId?`                                                                                                                                                                                                     |
+| `agent_message_cancel`                | `messageId`                            | `status`                                                                                                                                                                                                                                                |
+| `bibcode agent inbox` (terminal only) | none                                   | the envelopes of every `queued` or `delivered` message addressed to the caller's terminal generation that still passes R5 and R6, oldest first; fetching marks them `consumed` in the same step. Held, cancelled and failed messages are never returned |
 
 A stored agent message holds: message id, conversation id, sender address, recipient
 address, the answered message's id, hop, text, status, reason, the times of acceptance and
@@ -751,14 +795,14 @@ One milestone, in slices that each run end to end. The first slice is the proof 
 
 ## Verification
 
-| Requirement | Checked by |
-| --- | --- |
-| R1 to R6, R11 to R15, R20 | Server integration tests on the provider MCP endpoint with two or three thread credentials and scripted providers. |
-| R7, R9, R10, R13, R18, R19 | Orchestration tests driving the turn queue with a fake provider driver, including restart and held-queue cases. |
-| R8 | Unit tests of the envelope, including the forged-marker case, plus one assertion on the text the fake driver received. |
-| R16, R17 | Terminal manager tests with a scripted PTY program and a controlled activity status; one end-to-end run per observable CLI in the Linux lab. |
-| R21 | Web component tests for the chip and the activity row; a profiler redaction test. |
-| Goal 1 | One end-to-end test: Claude thread to Codex panel and back, real providers, Profiler on. |
+| Requirement                | Checked by                                                                                                                                   |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1 to R6, R11 to R15, R20  | Server integration tests on the provider MCP endpoint with two or three thread credentials and scripted providers.                           |
+| R7, R9, R10, R13, R18, R19 | Orchestration tests driving the turn queue with a fake provider driver, including restart and held-queue cases.                              |
+| R8                         | Unit tests of the envelope, including the forged-marker case, plus one assertion on the text the fake driver received.                       |
+| R16, R17                   | Terminal manager tests with a scripted PTY program and a controlled activity status; one end-to-end run per observable CLI in the Linux lab. |
+| R21                        | Web component tests for the chip and the activity row; a profiler redaction test.                                                            |
+| Goal 1                     | One end-to-end test: Claude thread to Codex panel and back, real providers, Profiler on.                                                     |
 
 Input classes no scenario names, and what happens: a message to a deleted or archived
 thread fails as unknown recipient; a message containing control characters is delivered
@@ -840,7 +884,7 @@ Summary of what it verified in source:
 Status: Approved 2026-11-13 (approved in chat by the maintainer, including the amendments to
 the messaging design listed under Constraints; after an independent read and three Codex
 passes)
-Size: full    Mode: quick    Type: feature
+Size: full Mode: quick Type: feature
 Source: [design brief](./2026-11-13-send-to-agent-brief.md), approved 2026-11-13. Builds on the
 approved [agent messaging design](./2026-11-13-agent-messaging-design.md) ("the messaging
 design"). Verified at `a9938193b` (`main`).
@@ -898,36 +942,38 @@ Anti-goals:
 
 ## Vocabulary
 
-| Term | Meaning |
-| --- | --- |
-| Source | The chat panel or AI Terminal whose Send to agent control was used. |
-| Target | The agent picked in the menu, or the new panel it creates. |
-| Action | Review, Second opinion, Hand off, Take over from, or Message. |
-| Note | What the person typed for this send. |
-| Attachment | The context an action adds below the note. |
-| Handoff text | A thread's first message from the person, then its most recent messages. |
-| Answer notice | The marker in the source that a review or second opinion was answered. |
-| Chat agent, terminal agent, ready for a prompt | As in the messaging design. |
+| Term                                           | Meaning                                                                  |
+| ---------------------------------------------- | ------------------------------------------------------------------------ |
+| Source                                         | The chat panel or AI Terminal whose Send to agent control was used.      |
+| Target                                         | The agent picked in the menu, or the new panel it creates.               |
+| Action                                         | Review, Second opinion, Hand off, Take over from, or Message.            |
+| Note                                           | What the person typed for this send.                                     |
+| Attachment                                     | The context an action adds below the note.                               |
+| Handoff text                                   | A thread's first message from the person, then its most recent messages. |
+| Answer notice                                  | The marker in the source that a review or second opinion was answered.   |
+| Chat agent, terminal agent, ready for a prompt | As in the messaging design.                                              |
 
 ## Requirements
 
-### R101. The control  [Must]
+### R101. The control [Must]
 
 The application SHALL show a Send to agent control in every chat panel's composer footer
 and in every AI Terminal's toolbar, with the same five actions in both.
 
 #### Scenario: chat panel
+
 - GIVEN a project with two chat panels
 - WHEN the person looks at either composer
 - THEN a Send to agent control is beside the other composer actions and opens with the
   keyboard as well as the pointer
 
 #### Scenario: plain terminal
+
 - GIVEN a terminal that is not an AI Terminal
 - WHEN the person looks at its toolbar
 - THEN there is no Send to agent control
 
-### R102. Picking the action and the target  [Must]
+### R102. Picking the action and the target [Must]
 
 WHEN the person opens the control, the application SHALL offer the five actions and, for
 the chosen action, every chat agent of the project that has a provider session and is
@@ -936,22 +982,25 @@ except Take over from, a new panel with a provider the person picks; the source 
 not listed.
 
 #### Scenario: agents and a new panel
+
 - GIVEN a project with a Claude panel, a Codex panel and a Codex AI Terminal
 - WHEN the person opens the control in the Claude panel and chooses Second opinion
 - THEN the list shows the Codex panel, the Codex terminal and the new-panel entry, each
   agent with its title, provider and whether it is busy
 
 #### Scenario: another project
+
 - GIVEN a second project in the same environment
 - WHEN the person opens the control
 - THEN no agent of the second project is listed
 
-### R103. Entries that cannot be used say why  [Must]
+### R103. Entries that cannot be used say why [Must]
 
 IF an action or a target cannot be used, THEN the application SHALL show it disabled with
 the reason in words next to it and in its accessible name.
 
 #### Scenario: the listed reasons
+
 - GIVEN the control is open
 - WHEN the person reaches an entry in one of these states
 - THEN it is disabled and reads: Second opinion with no finished answer in the source
@@ -961,59 +1010,66 @@ the reason in words next to it and in its accessible name.
   with no messages ("Nothing to take over yet")
 
 #### Scenario: taking over from a terminal that cannot be notified
+
 - GIVEN a Cursor AI Terminal, which cannot be told it has mail
 - WHEN the person chooses Take over from in another panel
 - THEN that terminal can be picked, because taking over sends it nothing; it is disabled
   only as a target of the other four actions
 
 #### Scenario: an agent that is out of usage
+
 - GIVEN an agent carrying the hint of R117
 - WHEN the person picks it for Review, Second opinion, Hand off or Message
 - THEN it can be picked, and the preview says it may not answer until the time shown
 
 #### Scenario: nothing is hidden
+
 - GIVEN an agent that cannot be a target for the chosen action
 - WHEN the list is shown
 - THEN the agent is still in the list, disabled, and not removed from it
 
-### R104. The source is where the person clicked  [Must]
+### R104. The source is where the person clicked [Must]
 
 The application SHALL take every attachment from the source and SHALL name the source in
 the preview before anything is sent.
 
 #### Scenario: two panels open side by side
+
 - GIVEN panels A and B are both visible and B has keyboard focus
 - WHEN the person uses the control in A's composer
 - THEN the preview names A as the source and the attachment comes from A's thread
 
-### R105. Preview and trimming  [Must]
+### R105. Preview and trimming [Must]
 
 WHEN an action and a target are chosen, the application SHALL show the note field, the
 target, the source, each attachment with its size, and what was left out, and SHALL let the
 person remove or shorten an attachment before sending.
 
 #### Scenario: trimming
+
 - GIVEN a Hand off preview with handoff text of 18,000 characters
 - WHEN the person removes the oldest part and sends
 - THEN the target receives the shortened text and the note
 
 #### Scenario: backing out
+
 - GIVEN a preview is open and the composer held a draft before
 - WHEN the person closes the preview without sending
 - THEN nothing is sent, the composer's draft is unchanged, and the note typed in the
   preview is still there when the preview is opened again in that panel
 
-### R106. Message  [Must]
+### R106. Message [Must]
 
 WHEN the person sends a Message, the application SHALL deliver the note to the target with
 no attachment.
 
 #### Scenario: empty note
+
 - GIVEN a Message preview with an empty note
 - WHEN the person looks at the send button
 - THEN it is disabled with "Write a message first", and nothing can be sent
 
-### R107. Review  [Must]
+### R107. Review [Must]
 
 WHEN the person sends a Review, the application SHALL deliver the same review request the
 Code review button builds for the source's checkout and the scope picked in the preview
@@ -1021,6 +1077,7 @@ Code review button builds for the source's checkout and the scope picked in the 
 preselected), with the note as extra instructions, and SHALL attach no diff text.
 
 #### Scenario: new panel
+
 - GIVEN the person picks a new panel with Codex as the target
 - WHEN the review is sent
 - THEN a review panel opens through the Code review button's launcher with Codex as the
@@ -1029,6 +1086,7 @@ preselected), with the note as extra instructions, and SHALL attach no diff text
   cannot be kept from editing
 
 #### Scenario: running agent that can edit
+
 - GIVEN the target is a running chat agent in `auto-accept-edits` or `full-access`, or any
   running terminal agent
 - WHEN the preview opens
@@ -1036,68 +1094,77 @@ preselected), with the note as extra instructions, and SHALL attach no diff text
   the person can still send
 
 #### Scenario: same checkout
+
 - GIVEN a source thread and a target thread whose working folders are the same path
 - WHEN the person chooses Review
 - THEN the target can be picked; a terminal as source or target counts with the checkout
   of the thread it belongs to
 
 #### Scenario: other checkout
+
 - GIVEN the target works in a different worktree
 - WHEN the person chooses Review
 - THEN that target is disabled with the reason of R103, and no review is sent to it
 
-### R108. Second opinion  [Must]
+### R108. Second opinion [Must]
 
 WHEN the person sends a Second opinion, the application SHALL attach the source's last
 message from the person and the last finished answer, each cut at 16,000 characters, under
 a fixed lead-in that asks for an assessment without changing files.
 
 #### Scenario: long answer
+
 - GIVEN the source's last finished answer is 40,000 characters
 - WHEN the preview opens
 - THEN it shows the answer cut to 16,000 characters and says how much was left out
 
 #### Scenario: answer still streaming
+
 - GIVEN the source's agent is still writing its answer
 - WHEN the person chooses Second opinion
 - THEN the attachment is the last finished answer, and the action is disabled with the
   reason of R103 when there is none
 
 #### Scenario: terminal source with nothing to attach
+
 - GIVEN an AI Terminal with no selection and no output yet
 - WHEN the person opens the control there
 - THEN Second opinion and Hand off are disabled with "Nothing to attach yet"
 
-### R109. Hand off  [Must]
+### R109. Hand off [Must]
 
 WHEN the person sends a Hand off, the application SHALL attach the source's handoff text,
 which is the person's first message cut at 4,000 characters followed by the most recent 40
 messages within 24,000 characters, and SHALL leave the source's agent as it was.
 
 #### Scenario: the task survives a long thread
+
 - GIVEN a source thread of 300 messages
 - WHEN the preview opens
 - THEN the handoff text starts with the person's first message, marks the gap, and ends
   with the most recent messages
 
 #### Scenario: the source keeps running
+
 - GIVEN the source's agent is in the middle of a turn
 - WHEN the hand off is sent
 - THEN that turn is not interrupted and the source thread is neither stopped nor archived
 
-### R110. Take over from  [Must]
+### R110. Take over from [Must]
 
 WHEN the person sends Take over from with another agent picked, the application SHALL build
 that agent's handoff text from what BiBCode has stored, without sending anything to that
 agent, and SHALL deliver it with the note to the source's own agent.
 
 #### Scenario: the other agent cannot answer
+
 - GIVEN agent A's thread stopped with a full context window and cannot take another turn
 - WHEN the person, in panel B, takes over from A
 - THEN B's agent starts a turn with A's handoff text and the note, and A's thread received
   no message and started no turn
 
 #### Scenario: taking over into a terminal
+
 - GIVEN the source is an AI Terminal
 - WHEN the person takes over from another agent there
 - THEN the handoff reaches the terminal's agent as a request under R115, never typed into
@@ -1105,12 +1172,13 @@ agent, and SHALL deliver it with the note to the source's own agent.
   terminal cannot be notified
 
 #### Scenario: taking over from a terminal agent
+
 - GIVEN the picked agent is a terminal agent whose conversation BiBCode cannot read
 - WHEN the preview opens
 - THEN the attachment is that terminal's recent output of at most 16,000 characters, and
   the preview says it is terminal text
 
-### R111. An AI Terminal as the source  [Must]
+### R111. An AI Terminal as the source [Must]
 
 WHEN the source is an AI Terminal, the application SHALL open the preview as its own
 composer over the terminal, SHALL type nothing into the terminal, and SHALL build Second
@@ -1118,16 +1186,18 @@ opinion and Hand off attachments from the person's current selection in that ter
 from its most recent 16,000 characters of output when nothing is selected.
 
 #### Scenario: selection wins
+
 - GIVEN the person selected 30 lines in the terminal
 - WHEN they choose Second opinion
 - THEN the attachment is those 30 lines, labelled as a selection from that terminal
 
 #### Scenario: the CLI sees nothing
+
 - GIVEN the terminal's CLI is waiting at its prompt
 - WHEN the person writes a note in the preview and sends
 - THEN no character of the note or the attachment was written to that terminal
 
-### R112. Reading a CLI's own conversation  [Should]
+### R112. Reading a CLI's own conversation [Should]
 
 WHERE BiBCode can read the conversation of an AI Terminal's CLI, the application SHALL
 build that terminal's handoff text and last answer from the conversation instead of from
@@ -1136,18 +1206,20 @@ read only when it belongs to the session BiBCode observed for that terminal and 
 inside that provider's own conversation folder.
 
 #### Scenario: a path that points elsewhere
+
 - GIVEN the CLI reported a conversation file that is a link to, or lies in, another folder,
   or that belongs to another session
 - WHEN the person chooses Hand off there
 - THEN the file is not read, the attachment falls back as in R111, and the preview says so
 
 #### Scenario: fallback
+
 - GIVEN a Claude AI Terminal whose conversation cannot be read at this moment
 - WHEN the person chooses Hand off there
 - THEN the attachment falls back to selection or recent output as in R111, and the preview
   says so
 
-### R113. Delivery to a chat agent  [Must]
+### R113. Delivery to a chat agent [Must]
 
 WHEN a send targets a chat agent, the server SHALL add it to that thread's turn queue as a
 new queued message from the person, so that it starts a turn when the agent is idle and
@@ -1155,12 +1227,14 @@ waits behind a running turn, a pending approval or a pending question; it is nev
 the answer to a pending approval or question.
 
 #### Scenario: idle target
+
 - GIVEN the target is idle
 - WHEN the person sends
 - THEN the target starts a turn with the note and the attachment, and the source shows the
   request as read
 
 #### Scenario: no agent rules applied
+
 - GIVEN agent messaging is off, the target is in `full-access` and the source thread is in
   `approval-required`
 - WHEN the person sends
@@ -1168,6 +1242,7 @@ the answer to a pending approval or question.
   and agent envelope do not apply to a person's send
 
 #### Scenario: another project is refused by the server
+
 - GIVEN a request whose source, target, new panel or taken-over thread is in another
   project or environment than the rest
 - WHEN it reaches the server
@@ -1175,6 +1250,7 @@ the answer to a pending approval or question.
   showed
 
 #### Scenario: only a signed-in person can use this path
+
 - GIVEN a hosted agent's credential, a terminal credential, or an outside agent's MCP
   session
 - WHEN it calls the person-send operation, or asks for another thread's handoff text or a
@@ -1182,24 +1258,26 @@ the answer to a pending approval or question.
 - THEN the call is refused; agents keep only the paths and rules of the messaging design
   and of the existing outside-agent tools
 
-### R114. Where a request came from  [Must]
+### R114. Where a request came from [Must]
 
 The application SHALL mark every message that arrived through Send to agent, in the
 target's transcript, as sent by the person from the named source, with the action, and
 SHALL NOT mark it as sent by an agent.
 
 #### Scenario: attribution
+
 - GIVEN the person sent a Review from panel "API refactor" to the Codex panel
 - WHEN anyone opens the Codex panel's transcript
 - THEN the message reads as the person's, with "Review, sent from API refactor", and
   carries no agent chip
 
 #### Scenario: different worktrees, same project
+
 - GIVEN source and target are threads of one project in different worktrees
 - WHEN the person sends a Message
 - THEN it is delivered and attributed the same way
 
-### R115. Delivery to a terminal agent  [Must]
+### R115. Delivery to a terminal agent [Must]
 
 WHEN a send targets a terminal agent, the server SHALL store it as a request from the
 person in the messaging design's store, announce it by that design's pointer line when the
@@ -1210,29 +1288,33 @@ request marked as from the user of this project, with the action and the source,
 with the envelope line that says a message is not from the user.
 
 #### Scenario: agent messaging is off
+
 - GIVEN agent messaging is off and the person sent a Review to a terminal agent
 - WHEN that agent runs its inbox command and then its reply command for that request
 - THEN it receives the request and its reply is stored as the request's answer; its inbox
   returns no agent messages and it still cannot send to other agents
 
 #### Scenario: a reply starts no turn
+
 - GIVEN a terminal agent replies to a person's request
 - WHEN the reply is stored
 - THEN no message is queued for any agent and no turn starts; the reply appears only as the
   answer notice of R116
 
 #### Scenario: not ready
+
 - GIVEN the target terminal agent is in the middle of a turn
 - WHEN the person sends
 - THEN the request shows as queued, nothing is typed into that terminal, and it becomes
   delivered when the pointer line is pasted
 
 #### Scenario: pasted is not read
+
 - GIVEN the pointer line was pasted and the agent has not fetched its inbox
 - WHEN the person looks at the request
 - THEN it shows delivered and not read
 
-### R116. Answer notice and Bring back  [Must]
+### R116. Answer notice and Bring back [Must]
 
 WHEN the turn that a Review or a Second opinion started in a chat target ends, or a
 terminal target replies to it through its command, the application SHALL show an answer
@@ -1243,35 +1325,40 @@ sends nothing. For a terminal source the notice belongs to the thread that owns 
 terminal.
 
 #### Scenario: the right answer
+
 - GIVEN the target answered the request and then answered two later messages
 - WHEN the person uses Bring back on the request's notice
 - THEN the draft quotes the final answer of the turn the request started, not the target's
   latest answer
 
 #### Scenario: the person decides
+
 - GIVEN a second opinion was answered
 - WHEN the notice appears in the source
 - THEN the source's agent has received nothing; after Bring back the quoted answer is in
   the composer as a draft, and it is sent only when the person sends it
 
 #### Scenario: answered while away
+
 - GIVEN the person closed the source panel and reloaded the application before the answer
 - WHEN they open the source thread again
 - THEN the notice is there and the thread was marked unread in the sidebar
 
 #### Scenario: terminal source
+
 - GIVEN the request was sent from an AI Terminal
 - WHEN the answer arrives
 - THEN the notice is on that terminal's Send to agent control and opens its composer with
   the quoted answer, to copy or to send on; nothing is typed into the terminal
 
 #### Scenario: a turn that failed
+
 - GIVEN the target's turn ended in an error or was interrupted
 - WHEN the source is shown
 - THEN the notice says the request was not answered and offers to open the target; it
   offers no Bring back
 
-### R119. Every request has a visible state  [Must]
+### R119. Every request has a visible state [Must]
 
 The application SHALL keep, for every send, one request that links the source, the action,
 the target, the delivered message and its answer, and SHALL show its state in a row above
@@ -1283,12 +1370,14 @@ disappears once its turn started or it was read; a Review or Second opinion row 
 its answer notice is brought back or dismissed.
 
 #### Scenario: the target's queue is paused
+
 - GIVEN the target's last turn errored, so its queue is held
 - WHEN the person sends a Second opinion to it
 - THEN the request shows "Waiting: this agent's queue is paused" with Open and Cancel, and
   it does not stay silently queued
 
 #### Scenario: the target is deleted
+
 - GIVEN a request for a target that has no stored answer yet, whether queued, delivered or
   read
 - WHEN the target thread is deleted, or the terminal agent it was sent to closes, exits,
@@ -1297,28 +1386,31 @@ its answer notice is brought back or dismissed.
   stored before that moment is kept
 
 #### Scenario: cancel
+
 - GIVEN a queued request
 - WHEN the person cancels it in the source
 - THEN the target never receives it and the request shows cancelled
 
-### R117. Out-of-tokens hint  [Should]
+### R117. Out-of-tokens hint [Should]
 
 WHILE a chat agent's last turn failed because its context window was full, or its
 provider's account usage is at its limit, the application SHALL show that state beside the
 agent in the control's list and put Take over from first for it.
 
 #### Scenario: usage limit
+
 - GIVEN the Claude account's usage is at its limit with a reset time
 - WHEN the person opens the control in a Codex panel
 - THEN the Claude agents read "Out of usage until <time>" and Take over from is still
   available for every other agent as well
 
 #### Scenario: no signal
+
 - GIVEN a Cursor agent, for which neither signal exists
 - WHEN the list is shown
 - THEN it carries no hint and can still be taken over from
 
-### R118. Failed sends keep the person's work  [Must]
+### R118. Failed sends keep the person's work [Must]
 
 IF a send fails or its outcome is unknown, THEN the application SHALL keep the preview with
 the note and the attachments, say what failed and what to do next, and SHALL NOT deliver
@@ -1326,11 +1418,13 @@ the request twice when the person sends again; every send carries one request id
 server uses to recognize a repeat.
 
 #### Scenario: connection lost while sending
+
 - GIVEN the connection drops after the person pressed send
 - WHEN it returns and the person presses send again
 - THEN the target receives the request once
 
 #### Scenario: target gone
+
 - GIVEN the target thread was deleted while the preview was open
 - WHEN the person sends
 - THEN the preview stays with its note, says the agent no longer exists, and offers to
@@ -1526,17 +1620,17 @@ Slices, each working end to end. Slices 1 to 4 need nothing from the messaging d
 
 ## Verification
 
-| Requirement | Checked by |
-| --- | --- |
-| R101 to R106 | Web component tests of the control, the list, disabled reasons, focus and keyboard path, preview and draft keeping. |
-| R107, R108 | Web logic tests of the request text; one test that a new-panel review calls the review launcher with the picked provider. |
-| R109, R110 | Server tests of the handoff builder: first message plus tail, limits, gap marker, and that the picked thread gets no command. |
-| R111, R112 | Terminal panel tests for selection and recent output; server tests for the bounded output read; per-CLI tests with recorded, anonymized session data. |
-| R119 | Server tests of the request record through queued, waiting, read, answered, not answered and cancelled; web tests of the state row and Cancel. |
+| Requirement      | Checked by                                                                                                                                                                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R101 to R106     | Web component tests of the control, the list, disabled reasons, focus and keyboard path, preview and draft keeping.                                                                                                                                             |
+| R107, R108       | Web logic tests of the request text; one test that a new-panel review calls the review launcher with the picked provider.                                                                                                                                       |
+| R109, R110       | Server tests of the handoff builder: first message plus tail, limits, gap marker, and that the picked thread gets no command.                                                                                                                                   |
+| R111, R112       | Terminal panel tests for selection and recent output; server tests for the bounded output read; per-CLI tests with recorded, anonymized session data.                                                                                                           |
+| R119             | Server tests of the request record through queued, waiting, read, answered, not answered and cancelled; web tests of the state row and Cancel.                                                                                                                  |
 | R113, R114, R118 | Refusal tests for a hosted agent's credential, a terminal credential and an MCP session on the person-send operation. Orchestration tests: person send with source and action, same project across worktrees accepted, other project refused, idempotent retry. |
-| R115 | The messaging design's terminal tests, with a person as sender. |
-| R116, R117 | Web tests of the notice across reload; server test that the notice is stored with the thread; hint tests with a context-limit failure and a usage snapshot. |
-| Goal 1 | One WebDriver end-to-end run: second opinion from a Claude panel to a Codex panel and Bring back, Profiler on. |
+| R115             | The messaging design's terminal tests, with a person as sender.                                                                                                                                                                                                 |
+| R116, R117       | Web tests of the notice across reload; server test that the notice is stored with the thread; hint tests with a context-limit failure and a usage snapshot.                                                                                                     |
+| Goal 1           | One WebDriver end-to-end run: second opinion from a Claude panel to a Codex panel and Bring back, Profiler on.                                                                                                                                                  |
 
 Input classes no scenario names, and what happens: a note with only whitespace counts as
 empty; a target that becomes busy between preview and send is queued as in R113; an

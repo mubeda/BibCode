@@ -1,63 +1,64 @@
 # Progress: Send to agent and agent messaging
 
 Plan: plan.md
-Spec: spec.md (sha256 d3eed2efe3ec)
+Spec: spec.md (sha256 36d418fb76d4)
 Plan status: Approved 2026-11-13
 Plan review: Codex gpt-6-astra (high), round 2, Needs rework; findings handled, fixes after round 2 not reviewed again
 Executor: mstack-codex-review-workflow
 Branch: claude/bibcode-inter-agent-communication-1bc0ff
 
-| Task | Title | Phase | State | Owner | Note |
-|---|---|---|---|---|---|
-| 1.1 | Send request record and store | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 1.2 | Person-only send operation | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 1.3 | Request states from turn events | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 1.4 | Contracts for send requests | 1 | Closed | lane 1A | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 1.5 | Retry and replay of a person's send | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 1.6 | Cancel, dismiss, subscribe and answer retrieval | 1 | Closed | lane 1B | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated |
-| 2.1 | Control, menu and agent list | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
-| 2.2 | Preview and Message send | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
-| 2.3 | Person-send label in the transcript | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
-| 2.4 | Request state row | 2 | Closed | lane 2 | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a |
-| 3.1 | Review action | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
-| 3.2 | Second opinion attachments | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
-| 3.3 | Answer notice and Bring back | 3 | Closed | lane 3 | Codex review, 5 fixes accepted; integrated |
-| 4.1 | One handoff builder and on-demand handoff text | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
-| 4.2 | Hand off and Take over from actions | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
-| 4.3 | Out-of-tokens hint | 4 | Closed | lane 4 | Codex review, 3 fixes accepted; integrated |
-| 5.1 | Agent message store | 5 | Closed | lane 5A | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.2 | Agent messaging setting | 5 | Closed | lane 5A | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.3 | Agent directory tool | 5 | Closed | lane 5A | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.4 | Sending with identity and scope | 5 | Closed | lane 5B | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.5 | Delivery and status tracking | 5 | Closed | lane 5B | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.6 | Reply, correlation and status tool | 5 | Closed | lane 5B | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated |
-| 5.7 | Envelope and literal delivery | 5 | In progress | lane 5A | |
-| 6.1 | Runtime-mode ceiling and the claim gate | 6 | Closed | lane 6A | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.2 | No user authority | 6 | Closed | lane 6A | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.3 | Idempotent sends | 6 | Closed | lane 6A | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.4 | Ordering and turning messaging off | 6 | Closed | lane 6B | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.5 | Hop limit for chat senders | 6 | Closed | lane 6B | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.6 | Rate and backlog limits | 6 | Closed | lane 6C | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 6.7 | Held, failed, restart and cancel | 6 | Closed | lane 6C | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated |
-| 7.1 | Agent sender chip | 7 | Closed | lane 7A | Codex review, 2 fixes accepted; integrated |
-| 7.2 | Activity log and profiler redaction | 7 | Closed | lane 7B | Two Codex reviews, 11 findings handled (lanes 7C, 7D); integrated |
-| 7.3 | Settings control | 7 | Closed | lane 7A | Codex review, 2 fixes accepted; integrated |
-| 8.1 | Terminal generation credential | 8 | Closed | lane 8A | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
-| 8.2 | The bibcode agent command | 8 | Closed | lane 8C | |
-| 8.3 | Ready for a prompt | 8 | Closed | lane 8A | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
-| 8.4 | Pointer delivery | 8 | Closed | lane 8C | |
-| 8.5 | Terminals in the directory | 8 | Closed | lane 8C | |
-| 8.6 | Terminal inbox | 8 | Closed | lane 8C | |
-| 9.1 | An AI Terminal as the source | 9 | Closed | lane 9A, 9B | |
-| 9.2 | A terminal agent as the target | 9 | Closed | lane 9B | |
-| 9.3 | Takeover into a terminal and terminal-side notices | 9 | Closed | lane 9B, 9W | WebDriver run in 11.2 |
-| 10.1 | Claude conversation reader | 10 | Closed | lane 10A | |
-| 10.2 | Codex conversation reader | 10 | Closed | lane 10A | |
-| 11.1 | Living documentation | 11 | Closed | lane 11D | |
-| 11.2 | Runbooks and scripted end-to-end | 11 | Closed | lane 11E | keyboard-only Dismiss stays a manual step |
-| 11.3 | Real-provider run and final gates | 11 | Open | | |
+| Task | Title                                              | Phase | State       | Owner       | Note                                                                                         |
+| ---- | -------------------------------------------------- | ----- | ----------- | ----------- | -------------------------------------------------------------------------------------------- |
+| 1.1  | Send request record and store                      | 1     | Closed      | lane 1A     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 1.2  | Person-only send operation                         | 1     | Closed      | lane 1A     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 1.3  | Request states from turn events                    | 1     | Closed      | lane 1B     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 1.4  | Contracts for send requests                        | 1     | Closed      | lane 1A     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 1.5  | Retry and replay of a person's send                | 1     | Closed      | lane 1B     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 1.6  | Cancel, dismiss, subscribe and answer retrieval    | 1     | Closed      | lane 1B     | Two Codex reviews, 5 findings fixed (lanes 1B, 1C); integrated                               |
+| 2.1  | Control, menu and agent list                       | 2     | Closed      | lane 2      | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a                      |
+| 2.2  | Preview and Message send                           | 2     | Closed      | lane 2      | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a                      |
+| 2.3  | Person-send label in the transcript                | 2     | Closed      | lane 2      | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a                      |
+| 2.4  | Request state row                                  | 2     | Closed      | lane 2      | Codex review, 3 fixes accepted; branch worktree-agent-a2389b1ddd118699a                      |
+| 3.1  | Review action                                      | 3     | Closed      | lane 3      | Codex review, 5 fixes accepted; integrated                                                   |
+| 3.2  | Second opinion attachments                         | 3     | Closed      | lane 3      | Codex review, 5 fixes accepted; integrated                                                   |
+| 3.3  | Answer notice and Bring back                       | 3     | Closed      | lane 3      | Codex review, 5 fixes accepted; integrated                                                   |
+| 4.1  | One handoff builder and on-demand handoff text     | 4     | Closed      | lane 4      | Codex review, 3 fixes accepted; integrated                                                   |
+| 4.2  | Hand off and Take over from actions                | 4     | Closed      | lane 4      | Codex review, 3 fixes accepted; integrated                                                   |
+| 4.3  | Out-of-tokens hint                                 | 4     | Closed      | lane 4      | Codex review, 3 fixes accepted; integrated                                                   |
+| 5.1  | Agent message store                                | 5     | Closed      | lane 5A     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.2  | Agent messaging setting                            | 5     | Closed      | lane 5A     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.3  | Agent directory tool                               | 5     | Closed      | lane 5A     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.4  | Sending with identity and scope                    | 5     | Closed      | lane 5B     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.5  | Delivery and status tracking                       | 5     | Closed      | lane 5B     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.6  | Reply, correlation and status tool                 | 5     | Closed      | lane 5B     | Two Codex reviews, 5 findings fixed (lanes 5B, 6A); integrated                               |
+| 5.7  | Envelope and literal delivery                      | 5     | In progress | lane 5A     |                                                                                              |
+| 6.1  | Runtime-mode ceiling and the claim gate            | 6     | Closed      | lane 6A     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.2  | No user authority                                  | 6     | Closed      | lane 6A     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.3  | Idempotent sends                                   | 6     | Closed      | lane 6A     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.4  | Ordering and turning messaging off                 | 6     | Closed      | lane 6B     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.5  | Hop limit for chat senders                         | 6     | Closed      | lane 6B     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.6  | Rate and backlog limits                            | 6     | Closed      | lane 6C     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 6.7  | Held, failed, restart and cancel                   | 6     | Closed      | lane 6C     | Five Codex reviews, 18 findings fixed (lanes 6B, 6C, 6D), last review clean; integrated      |
+| 7.1  | Agent sender chip                                  | 7     | Closed      | lane 7A     | Codex review, 2 fixes accepted; integrated                                                   |
+| 7.2  | Activity log and profiler redaction                | 7     | Closed      | lane 7B     | Two Codex reviews, 11 findings handled (lanes 7C, 7D); integrated                            |
+| 7.3  | Settings control                                   | 7     | Closed      | lane 7A     | Codex review, 2 fixes accepted; integrated                                                   |
+| 8.1  | Terminal generation credential                     | 8     | Closed      | lane 8A     | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
+| 8.2  | The bibcode agent command                          | 8     | Closed      | lane 8C     |                                                                                              |
+| 8.3  | Ready for a prompt                                 | 8     | Closed      | lane 8A     | Six Codex reviews, 28 findings handled (lanes 8R, 8S, 8T, 8U), last review clean; integrated |
+| 8.4  | Pointer delivery                                   | 8     | Closed      | lane 8C     |                                                                                              |
+| 8.5  | Terminals in the directory                         | 8     | Closed      | lane 8C     |                                                                                              |
+| 8.6  | Terminal inbox                                     | 8     | Closed      | lane 8C     |                                                                                              |
+| 9.1  | An AI Terminal as the source                       | 9     | Closed      | lane 9A, 9B |                                                                                              |
+| 9.2  | A terminal agent as the target                     | 9     | Closed      | lane 9B     |                                                                                              |
+| 9.3  | Takeover into a terminal and terminal-side notices | 9     | Closed      | lane 9B, 9W | WebDriver run in 11.2                                                                        |
+| 10.1 | Claude conversation reader                         | 10    | Closed      | lane 10A    |                                                                                              |
+| 10.2 | Codex conversation reader                          | 10    | Closed      | lane 10A    |                                                                                              |
+| 11.1 | Living documentation                               | 11    | Closed      | lane 11D    |                                                                                              |
+| 11.2 | Runbooks and scripted end-to-end                   | 11    | Closed      | lane 11E    | keyboard-only Dismiss stays a manual step                                                    |
+| 11.3 | Real-provider run and final gates                  | 11    | Open        |             |                                                                                              |
 
 ## Log
+
 - 2026-11-13 Plan written and reviewed twice by Codex; see reviews/.
 - 2026-11-13 Plan written. `rust-best-practices` installed at user level for Claude Code; it loads in a new session.
 - 2026-11-13 21:55 Executor set to mstack-codex-review-workflow on branch claude/bibcode-inter-agent-communication-1bc0ff. Reviewer: Codex gpt-6-astra, high.
@@ -179,4 +180,7 @@ Branch: claude/bibcode-inter-agent-communication-1bc0ff
 - 2026-11-15 02:31 Lane 11E found that the desktop descriptor (production/control.rs) never set the sendRequests capability, so Send to agent stayed disabled in the desktop app; only the standalone server's descriptor set it. Fixed by the coordinator in 301c5483a with the assertion first (red: left Null, right true; green: 1 passed). The repository API inventory test missed thread_blocks_new_turn since task 1.2; fixed in 79aba2d6e (repositories target: 30 passed). The per-merge checks ran four integration targets, not all; the final gates run the full package.
 - 2026-11-15 03:19 Codex review of the 11.2 spec and runbook (gpt-6-astra, high): 4 findings, all accepted (the chat title assumption fails in the shared suite; the cancel check could pass before delivery was possible; the popover selector matched rows anywhere; Bring back did not check the quote). Fixed in 314fc8986, each new assertion flipped once to show it fails.
 - 2026-11-15 04:30 11.2 Closed. Lane branch worktree-agent-a692aa0f91dfc1645 (45a53df13..314fc8986) merged. Evidence (lane report, packaged macOS arm64 app built from committed code, Profiler on): the spec alone: Spec Files: 1 passed, 1 total, 6 passing; the default suite with the spec: 37 passing, 4 failing; the baseline without it: 31 passing, 4 failing, the same Mermaid and Files binary preview cases (the webview did not reach the 1600x1000 viewport) and the closing spec, so not caused by this work. Profiler data of the full run: no findings, no crash dumps; sendRequests calls all succeeded. Left for 11.3: real-CLI pointer delivery and conversation reads, messaging toggled mid-queue, keyboard-only Dismiss (the embedded driver's Enter does not activate a focused button).
+- 2026-11-15 04:45 Lane 11F (opus, medium) closed the five logged follow-ups after three Codex rounds: a Cursor chunk read before the prompt response now belongs to its turn (a barrier in the ACP reader); a wait settles only when the completed turn's reply stopped streaming; a thread's messages list by parsed time then written order; a terminal tail never starts inside an escape sequence and a read loop ends at one still arriving; Take over keeps the newest part of a terminal conversation. Accepted from the reviews: start-up settles replies left streaming and fails every started turn still running (after the session loops). Rejected, written as a shortcut comment: an escape sequence whose start lies more than 4,096 bytes back can still leak into an attachment. Fourth pass: no actionable findings. Merged as 8a9ce171c. Not fixed in this run: the Grok runtime has the Cursor race; four other readers page by timestamp text.
+- 2026-11-15 05:46 main (27a32e809, 163 commits, release v0.16.0) merged into the Branch line's branch by lane 11M (opus, medium): 0675ff361, 0df36535d, with 99e0d9e75 (the route inventory test missed POST /api/agent/call) and 6b657aeb8 (messages order by parsed time, then stored text, then written order, so main's order within a millisecond from #366 holds; red on a 400 microsecond case, then green). Migrations 75 and 76 keep their numbers; the changelog entry moved from the v0.16.0 section to Unreleased; the five stop steps are listed in main's ordered quiesce list. Evidence (lane report, merged tree): cargo fmt exit 0; cargo test -p bibcode-server -j 2 --no-fail-fast: lib 6026 passed, 16 ignored, every integration target 0 failed; cargo clippy --workspace --all-targets -- -D warnings exit 0; vp run typecheck exit 0; vp run check:contracts exit 0; vp test run scripts: 953 passed; web unit project: 11989 passed; markdown links OK. Not compiled here: Windows-only and Linux-only targets.
+- 2026-11-15 05:50 The plan files were formatted with vp fmt so vp check passes on tracked files (whitespace and table alignment only); the Spec line's hash was updated for that reason alone. vp check still names only the untracked reports/ and research_notes/ folders.
 - 2026-11-14 20:40 Codex review of lane 8V (gpt-6-astra, high): 4 findings, all accepted (a later Working report moves the turn start forward and clears a real draft; the setting is checked before the session lock is held; setting reconciliation bypasses the mailbox exclusion; ending a blocked terminal stalls the dispatcher). Sent to lane 8C as an added part, since it is based on that branch and owns those files.

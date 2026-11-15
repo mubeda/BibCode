@@ -59,7 +59,6 @@ Steps
 6. [ ] Prove the table can fail: make the Codex `turn/completed` rule return true for a failed turn. Expected: the Codex row FAILS. Restore. Make `mirror_agent_status` ignore the flag in its dedupe. Expected: the republish test FAILS. Restore.
 7. [ ] Run `cargo fmt --all --check`, `cargo clippy -p bibcode-server --all-targets -- -D warnings`, `vp check` and `vp run typecheck`. Expected: no errors. Profiler coverage: no new event, finding or log; the existing `agentStatus` values are untouched.
 
-
 ### Task 8.4: Pointer delivery
 
 - Satisfies: R17 (scenarios "ready terminal" for the pointer, "terminal not safe to type into"), R6 (scenario "terminal recipient")
