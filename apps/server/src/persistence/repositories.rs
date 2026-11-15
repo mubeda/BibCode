@@ -1616,6 +1616,21 @@ impl Repositories {
             })
             .await
     }
+    /// The threads with a started turn still running. A message's marker row, admitted but not
+    /// started, has no turn id and does not count.
+    pub async fn list_thread_ids_with_running_turns(&self) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT thread_id FROM projection_turns WHERE turn_id IS NOT NULL AND state = 'running' ORDER BY thread_id",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+    }
     /// Every assistant message still streaming, in any thread.
     pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
         self.database
