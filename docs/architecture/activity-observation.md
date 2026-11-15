@@ -436,19 +436,21 @@ prompt, with fresh proof. The rules are under [Prompt readiness](#prompt-readine
 `TerminalSummary.agentStatus.readyForPrompt` says whether the terminal's agent waits for the
 person's next prompt and BiBCode has fresh proof of it. It exists so the server can announce agent
 mail to an AI Terminal with one typed line (see
-[Agent messaging](./providers.md#agent-messaging)), and only the terminal's pointer reads it. It
+[Agent messaging](./providers.md#agent-messaging)). The summary shows it as the `ready` status
+of `agents_list`; the write permit that gates that line reads the observer's own readiness,
+never the mirrored summary. It
 is true only while the state is `done` and not failed, and a fresh agent is not ready before its
 first end-of-turn signal. A state report alone never makes a terminal ready: the report carries
 a `PromptEvidence`, and only `Fresh` evidence can.
 
-| Provider | What makes it ready                                                                                                                                                                 | What never does                                                                                                                |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Claude   | The newest status hook is a `Notification` of type `idle_prompt` for the bound session. Claude sends it after the prompt has waited for input a while, about a minute after a reply | `Stop` (a `Stop` hook of the project or the user can block the stop and Claude then goes on, with no new hook), any older hook |
-| Codex    | The root thread's `thread/status/changed` to idle, or its turn completed without failing, read on the live stream                                                                   | The `thread/resume` response (a snapshot), a buffered event, a failed turn                                                     |
-| OpenCode | The root session went idle, or an interrupted OpenCode 2 turn ended; read on the live stream                                                                                        | A session status snapshot at attach, a failed turn, a child session ending                                                     |
+| Provider | What makes it ready                                                                                                                                  | What never does                                                                                                                |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Claude   | The newest status hook is a `Notification` of type `idle_prompt` for the bound session. Claude sends it once the prompt has waited for input a while | `Stop` (a `Stop` hook of the project or the user can block the stop and Claude then goes on, with no new hook), any older hook |
+| Codex    | The root thread's `thread/status/changed` to idle, or its turn completed without failing, read on the live stream                                    | The `thread/resume` response (a snapshot), a buffered event, a failed turn                                                     |
+| OpenCode | The root session went idle, or an interrupted OpenCode 2 turn ended; read on the live stream                                                         | A session status snapshot at attach, a failed turn, a child session ending                                                     |
 
-A Claude terminal therefore reads ready only after `idle_prompt`. Claude Code sends it about 60
-seconds after a response and may not send it while the person is active in that terminal, so a
+A Claude terminal therefore reads ready only after `idle_prompt`. Claude Code sends it only once the prompt has waited for input a
+while after a response, which may never happen while the person is active in that terminal, so a
 pointer line to an idle Claude terminal arrives late or not at all. This is a decision, not a bug:
 waiting for the idle signal was chosen on purpose, and `bibcode agent inbox` always works.
 
@@ -476,10 +478,6 @@ was queued behind it) or `GenerationChanged`. The terminal's person-input count,
 a person's typing advances (the server's own writes and the MCP `terminal_write` tool never do),
 also resets the hop chain of agent messages.
 
-Accepted limit: an idle and a busy OpenCode event that arrive together can be split by one task
-hop in the stream reader, so the terminal can read ready for that moment. The write permit is the
-second safeguard.
-
 ### Conversation reads for a send
 
 Send to agent can attach an AI Terminal's text, and for Second opinion and Hand off it prefers the
@@ -501,8 +499,8 @@ the output stood in.
   of `<config dir>/projects` that Claude derives from the working directory the server launched the
   terminal in (as given, or resolved), the file is opened through a held folder handle that refuses
   a link, and it is a regular file of at most 64 MiB. The config folder is `CLAUDE_CONFIG_DIR` of the
-  terminal's launch environment, else `.claude` in the home folder, so a transcript under another
-  config folder falls back to the recent output. The shared transcript parser reads it, keeping
+  terminal's launch environment, else the server's own, else `.claude` in the home folder, so a
+  transcript that lies under any other config folder falls back to the recent output. The shared transcript parser reads it, keeping
   the first message and the newest ones. The handoff text follows the limits of a thread's handoff text (the person's first
   message cut at 4,000 characters, the newest messages within 24,000), and the last answer is cut at
   16,000 characters.

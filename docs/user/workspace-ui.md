@@ -596,9 +596,10 @@ sends your question there; the thread's composer is cleared once it did. A bare
 `:` menu lists `:btw` and `:side` with the other composer actions (`:model`,
 `:plan`, `:default`); `/btw` still goes to the provider as its own command.
 
-Its first answer is based on the thread's delivered messages, up to the last 40
-and 24,000 characters, sent with that first question; the work log shows
-**Started with the thread's last N messages**. Later questions use the side
+Its first answer is based on the thread's delivered messages, sent with that first
+question: your first message (cut at 4,000 characters) when it is older than the
+rest, then up to the last 40 within 24,000 characters; the work log shows
+**Started with the thread's last N messages**, counting your first message too. Later questions use the side
 chat's own history. It sees message text only, not tool output or attachments,
 and reads files from the same checkout, which the thread may still be changing.
 A side chat starts in **Supervised** mode, so it asks before it edits files or
@@ -749,7 +750,7 @@ and the preview warns that it may not answer.
 | ------------------ | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Review**         | Review the code changes of this checkout     | Nothing: the reviewing agent reads the checkout. You pick **Branch vs origin/<base> and uncommitted changes** or **Uncommitted changes**. The prompt is the one of **Review changes**. |
 | **Second opinion** | Assess this agent's last answer              | **The user's last message** and **The agent's last finished answer**, each cut at 16,000 characters with the count left out                                                            |
-| **Hand off**       | Continue this thread's work in another agent | **Handoff from <title>**: the thread's first message cut at 4,000 characters, a marker for what was left out, and its last 40 messages within 24,000 characters                        |
+| **Hand off**       | Continue this thread's work in another agent | The attachment **Handoff from <title>** holds the thread's first message cut at 4,000 characters, a marker for what was left out, and its last 40 messages within 24,000 characters    |
 | **Take over from** | Continue in this thread after another agent  | The same handoff text, read from the agent you pick. It is queued on this agent. Nothing is sent to the picked one                                                                     |
 | **Message**        | Whatever you write                           | Nothing. The note is the message                                                                                                                                                       |
 
@@ -831,7 +832,8 @@ quoted in the note, because a Message needs an agent first; nothing is typed int
   agent reads the request there as coming from the user, and answers with
   `bibcode agent reply`. Only a Claude, Codex or OpenCode AI Terminal that BiBCode observes can
   be told. A Claude Code terminal is ready for the line only after Claude's own idle notice,
-  about a minute after a reply, so the line can come late or not at all while you type in it;
+  which comes once the prompt has waited a while, so the line can come late or not at all while
+  you type in it;
   the request stays queued, and **Cancel** works until the line was typed. If the terminal ends
   first, the request ends as not answered with "the terminal closed", and a reply stored before
   the stop is kept.
@@ -1061,10 +1063,11 @@ When BiBCode cannot resume a thread's provider conversation (the provider no
 longer has it, for example after its history was cleared), it starts a new one
 and the thread shows **Couldn't resume the previous <provider> conversation.
 Started a new one with a summary of this thread.** Your next message reaches the
-provider together with the thread's earlier messages (up to the last 40, about
-24,000 characters, oldest left out first), so the agent can pick up where it left
-off; the thread still shows only what you typed. A provider command starting with
-`/` is sent as written, and the summary goes with the next ordinary message. A
+provider together with the thread's earlier messages (your first message, then up
+to the last 40, about 24,000 characters, oldest left out first), so the agent can
+pick up where it left off; the thread still shows only what you typed. A provider command starting with
+`/` is sent as written, and so is an agent's message, and the summary goes with the next
+ordinary message. A
 retried message that had to start a new conversation shows **Sent in a new
 conversation with a summary of earlier messages.**
 

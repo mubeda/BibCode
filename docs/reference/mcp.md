@@ -4898,8 +4898,8 @@ to a later one. The rules for "waits for a prompt" are in
 mailbox is described in [Agent messaging](../architecture/providers.md#agent-messaging).
 
 A Claude Code terminal counts as waiting for a prompt only after Claude's `idle_prompt`
-notification, which Claude sends about a minute after a reply and may not send while the person
-is active in that terminal. The pointer line can arrive late or not at all then; this is an
+notification, which Claude sends once the prompt has waited for input a while, and which it may
+never send while the person is active in that terminal. The pointer line can arrive late or not at all then; this is an
 accepted limit. `bibcode agent inbox` always works.
 
 A message row keeps no sender generation, so a restarted terminal can read the status of, and
@@ -4930,7 +4930,8 @@ BiBCode writes one row of the [agent activity log](#attribution-and-the-activity
 send and reply call, and one for each delivery step of a message (`accepted`, `delivered`,
 `consumed`, `completed`, `held`, `cancelled` or `failed`). A row holds the two addresses, the two
 thread titles, the message and conversation ids, the status and the reason, and never message
-text. The log's writer queues at most 1,024 rows and drops a row past that.
+text. The log's writer queues at most 1,024 rows and drops a row past that. `changes_since` and
+webhooks skip these rows: an agent never reads another agent's messaging activity through them.
 
 ## Error reference
 

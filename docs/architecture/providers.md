@@ -1115,9 +1115,7 @@ other terminal and no provider launch gets one.
   the environment, the owner thread, the terminal id and the terminal's generation (its process),
   and only its SHA-256 hash is kept. It is revoked when that process exits, is closed or is
   replaced, and a server that stops loses every credential with its memory. Until the endpoint is
-  bound at start-up, launches get none. A credential keeps verifying until its process's exit is finalized: a quiesce
-  that preserves history and the start of a worktree removal do not fence it early, because
-  fencing would refuse input on a process that fails to exit.
+  bound at start-up, launches get none.
 - The variable is not named `*_TOKEN` or `*_KEY`, for the same reason as the open-URL token:
   Codex's default `shell_environment_policy` drops those names from the commands it runs. The
   credential also reaches every other process in that terminal, as the open-URL token does:
@@ -1175,8 +1173,7 @@ an agent sender. Only then does the driver get `deliver_agent_message` (Claude m
 the delivery acknowledgement needs; the other drivers deliver as for a person). A person who
 pastes an envelope still sends a person's message. An agent message never carries the owed
 context handoff or a side chat seed: the envelope goes out whole, and the handoff waits for the
-next turn, as it does for a `/` command. A resend after a context-limit recovery keeps its
-actor and its agent treatment.
+next turn, as it does for a `/` command.
 
 **Literal delivery per provider** (spec R8: the text must not run a command, load a skill or
 expand a file). Measured when the envelope was added:
@@ -1209,9 +1206,7 @@ An agent message's turn then runs in its recipient's current mode, not the mode 
 The ceiling is also checked when the message is sent. A message sent to a paused queue (the
 recipient's last turn errored or was interrupted, or an entry a person has not released waits)
 is held with `recipient_queue_held` and queued behind the held entries, so it never starts an
-errored session and never overtakes a held message. A pending start admitted just before its
-recipient's queue pauses can still be claimed and start the session, because the claim cannot tell
-it from a person's Send now release; this is an accepted limit.
+errored session and never overtakes a held message.
 
 **Hop limit, rate and backlog.** At most 8 agent-to-agent hops follow one person's message, 30
 agent messages per sender in 60 seconds, and 20 unconsumed agent messages per recipient. A
