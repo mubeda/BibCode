@@ -181,6 +181,32 @@ const SESSION_CREDENTIAL_KEYS: [&str; 4] = [
     crate::agent_messaging::terminal_credential::ENDPOINT_ENV,
 ];
 
+/// The entries a launch hook put in front of `PATH`, with their trailing separator: the hook's
+/// `PATH` less the caller's (else this process's), which the hook extended. `None` when the hook
+/// left `PATH` alone.
+fn path_prefix(
+    caller: &std::collections::BTreeMap<String, String>,
+    hooked: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let path = |env: &std::collections::BTreeMap<String, String>| {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.clone())
+    };
+    let hooked = path(hooked)?;
+    let base = path(caller)
+        .or_else(|| std::env::var("PATH").ok())
+        .filter(|base| !base.is_empty());
+    match base {
+        Some(base) if hooked == base => None,
+        Some(base) => hooked
+            .strip_suffix(base.as_str())
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_owned),
+        None => Some(format!("{hooked}{}", if cfg!(windows) { ';' } else { ':' })),
+    }
+}
+
 /// See [`TerminalManagerOptions::session_env`].
 pub type TerminalSessionEnv = Arc<
     dyn for<'a> Fn(
@@ -2491,6 +2517,9 @@ impl TerminalManager {
         // project's version manager `[env]` must not redirect a terminal's credential. `PATH`
         // stays open, since a prepared launch pins its own tools there.
         let mut session_keys = Vec::new();
+        // What the hook put in front of `PATH` (the shim folders), which a prepared `PATH`
+        // overlay keeps in front of its own.
+        let mut hook_path_prefix = None;
         if let Some(session_env) = self.inner.options.session_env.as_ref() {
             let caller_env = input.env.clone();
             let ai_terminal = input
@@ -2518,6 +2547,7 @@ impl TerminalManager {
             // The credential keys stay the hook's even when the caller already held the same
             // value, which the comparison above cannot see.
             session_keys.extend(SESSION_CREDENTIAL_KEYS.map(str::to_owned));
+            hook_path_prefix = path_prefix(&caller_env, &input.env);
         }
         let prepared_may_set = |key: &String| {
             !session_keys
@@ -2682,7 +2712,16 @@ impl TerminalManager {
                     prepared
                         .env_overlay
                         .into_iter()
-                        .filter(|(key, _)| prepared_may_set(key)),
+                        .filter(|(key, _)| prepared_may_set(key))
+                        .map(|(key, value)| match &hook_path_prefix {
+                            Some(prefix)
+                                if key.eq_ignore_ascii_case("PATH")
+                                    && !value.starts_with(prefix) =>
+                            {
+                                (key, format!("{prefix}{value}"))
+                            }
+                            _ => (key, value),
+                        }),
                 );
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
@@ -12450,6 +12489,59 @@ mod tests {
         fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(std::future::ready(()))
         }
+    }
+
+    /// Prepares every AI Terminal with a pinned `PATH`, as a version manager's shim does.
+    struct PinnedPathPreparer;
+
+    impl TerminalLaunchPreparer for PinnedPathPreparer {
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::from([(
+                        "PATH".to_owned(),
+                        "/pinned/tool/bin:/usr/bin".to_owned(),
+                    )]),
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(LeaseSlot::default())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_prepared_path_keeps_the_shim_folders_first() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, _credentials) =
+            credential_manager(backend.clone(), Some(Arc::new(PinnedPathPreparer)));
+        let mut input = ai_terminal_input(root.path(), "term-ai");
+        input
+            .env
+            .insert("PATH".to_owned(), "/caller/bin".to_owned());
+        manager.open(input).await.unwrap();
+        let spawn = backend.spawns().pop().expect("a spawn");
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            spawn.env["PATH"],
+            [
+                "/state/runtime/agent",
+                "/state/runtime/open-url",
+                "/pinned/tool/bin:/usr/bin",
+            ]
+            .join(separator),
+            "the pinned PATH drops the `bibcode` shim"
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test]
