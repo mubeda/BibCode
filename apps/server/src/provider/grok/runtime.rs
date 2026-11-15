@@ -543,6 +543,9 @@ impl GrokSessionRuntime {
                 self.emit("session.exited", None, None, json!({ "reason": reason }))
                     .await;
             }
+            IncomingEvent::Barrier(reached) => {
+                let _ = reached.send(());
+            }
         }
     }
 
