@@ -336,7 +336,7 @@ impl TerminalPointer {
             let mut metadata = pointer.terminals.subscribe_metadata().await;
             let mut enabled = messaging.enabled.clone();
             let (mut setting_open, mut metadata_open) = (true, true);
-            pointer.follow_setting(&messaging).await;
+            pointer.follow_setting(&messaging, &shutdown).await;
             loop {
                 tokio::select! {
                     biased;
@@ -351,7 +351,7 @@ impl TerminalPointer {
                     () = shutdown.cancelled() => return,
                     changed = enabled.changed(), if setting_open => {
                         setting_open = changed.is_ok();
-                        pointer.follow_setting(&messaging).await;
+                        pointer.follow_setting(&messaging, &shutdown).await;
                     }
                     () = pointer.wake.notified() => {}
                     event = metadata.recv(), if metadata_open => metadata_open = event.is_some(),
@@ -365,7 +365,7 @@ impl TerminalPointer {
     /// its mail changes. Each terminal follows in its own task, which reads the setting once it
     /// holds the exclusion, so one terminal's stuck write delays no other terminal and a later
     /// value always wins.
-    async fn follow_setting(&self, messaging: &AgentMessaging) {
+    async fn follow_setting(&self, messaging: &AgentMessaging, shutdown: &CancellationToken) {
         let addresses = match self
             .database
             .call(|connection| super::delivery::list_terminals_following_setting(connection))
@@ -378,9 +378,14 @@ impl TerminalPointer {
             }
         };
         for address in addresses {
-            let (pointer, messaging) = (self.clone(), messaging.clone());
+            let (pointer, messaging, shutdown) =
+                (self.clone(), messaging.clone(), shutdown.clone());
             tokio::spawn(async move {
-                let _exclusive = pointer.exclusive(&address).await;
+                let _exclusive = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    exclusive = pointer.exclusive(&address) => exclusive,
+                };
                 let enabled = messaging.is_enabled();
                 if let Err(error) = pointer
                     .database
@@ -826,7 +831,7 @@ impl TerminalPointer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::HashMap, sync::Mutex as StdMutex, time::Duration};
 
     use serde_json::json;
@@ -843,9 +848,11 @@ mod tests {
         },
     };
 
-    struct FakeTerminal {
+    pub(crate) struct FakeTerminal {
         generation: Option<TerminalGeneration>,
         ai: bool,
+        /// The launch driver kind of an AI Terminal.
+        pub(crate) driver: &'static str,
         state: TerminalAgentStatusState,
         ready: bool,
         person_inputs: u64,
@@ -854,7 +861,7 @@ mod tests {
     }
 
     /// Terminals whose readiness and generation the test sets; every write is recorded.
-    struct Scripted {
+    pub(crate) struct Scripted {
         terminals: StdMutex<HashMap<(String, String), FakeTerminal>>,
         metadata: broadcast::Sender<TerminalMetadataEvent>,
         /// When set, a write to the named terminal that typed parks until released, as a slow PTY
@@ -884,7 +891,7 @@ mod tests {
     }
 
     impl Scripted {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 terminals: StdMutex::new(HashMap::new()),
                 metadata: broadcast::channel(256).0,
@@ -895,12 +902,13 @@ mod tests {
         }
 
         /// A running Claude AI Terminal (a plain shell when `ai` is false), not ready.
-        fn add(&self, thread_id: &str, terminal_id: &str, process: u64, ai: bool) {
+        pub(crate) fn add(&self, thread_id: &str, terminal_id: &str, process: u64, ai: bool) {
             self.terminals.lock().unwrap().insert(
                 key(thread_id, terminal_id),
                 FakeTerminal {
                     generation: Some(generation(process)),
                     ai,
+                    driver: "claudeAgent",
                     state: TerminalAgentStatusState::Working,
                     ready: false,
                     person_inputs: 0,
@@ -934,8 +942,8 @@ mod tests {
                     args: Vec::new(),
                     label: None,
                     activity: Some(ProviderTerminalActivityLaunch {
-                        driver_kind: "claudeAgent".to_owned(),
-                        provider_instance_id: "claudeAgent".to_owned(),
+                        driver_kind: terminal.driver.to_owned(),
+                        provider_instance_id: terminal.driver.to_owned(),
                     }),
                     env: None,
                 }),
@@ -949,7 +957,7 @@ mod tests {
             }
         }
 
-        fn change(
+        pub(crate) fn change(
             &self,
             thread_id: &str,
             terminal_id: &str,
@@ -966,14 +974,19 @@ mod tests {
             });
         }
 
-        fn set_state(&self, thread_id: &str, terminal_id: &str, state: TerminalAgentStatusState) {
+        pub(crate) fn set_state(
+            &self,
+            thread_id: &str,
+            terminal_id: &str,
+            state: TerminalAgentStatusState,
+        ) {
             self.change(thread_id, terminal_id, |terminal| {
                 terminal.state = state;
                 terminal.ready = state == TerminalAgentStatusState::Done;
             });
         }
 
-        fn set_ready(&self, thread_id: &str, terminal_id: &str) {
+        pub(crate) fn set_ready(&self, thread_id: &str, terminal_id: &str) {
             self.set_state(thread_id, terminal_id, TerminalAgentStatusState::Done);
         }
 
@@ -995,7 +1008,12 @@ mod tests {
         }
 
         /// A new process (`Some`) or none (`None`, an exit) now holds the terminal.
-        fn set_generation(&self, thread_id: &str, terminal_id: &str, process: Option<u64>) {
+        pub(crate) fn set_generation(
+            &self,
+            thread_id: &str,
+            terminal_id: &str,
+            process: Option<u64>,
+        ) {
             self.change(thread_id, terminal_id, |terminal| {
                 terminal.generation = process.map(generation);
                 terminal.ready = false;
@@ -2370,6 +2388,14 @@ mod tests {
     #[tokio::test]
     async fn the_setting_holds_no_mail_while_a_pointer_write_holds_its_terminal() {
         let fixture = fixture().await;
+        // The chat tracker follows the setting too; it must leave this terminal's mail alone.
+        let tracker = CancellationToken::new();
+        AgentMessageTracker::start(
+            fixture.harness.engine.clone(),
+            None,
+            fixture.enabled.subscribe(),
+            tracker.clone(),
+        );
         fixture.start();
         let receipt = fixture.send("a", "terminal:t/term-1").await.unwrap();
         fixture.until_attempts("term-1", 1).await;
@@ -2392,6 +2418,7 @@ mod tests {
             .until_status(&receipt.message_id, AgentMessageStatus::Delivered)
             .await;
         assert_eq!(fixture.terminals.writes("t", "term-1").len(), 1);
+        tracker.cancel();
         fixture.shutdown().await;
     }
 
