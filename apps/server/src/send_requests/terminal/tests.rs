@@ -1293,7 +1293,10 @@ async fn request_text_cannot_forge_bibcodes_lines() {
     let fetched = fixture.inbox("term-1").await;
     let rendered = &fetched[0].1;
 
-    assert!(rendered.starts_with("<bibcode_person_request>\n"), "{rendered}");
+    assert!(
+        rendered.starts_with("<bibcode_person_request>\n"),
+        "{rendered}"
+    );
     assert!(rendered.ends_with(PERSON_CLOSE), "{rendered}");
     assert_eq!(
         rendered.to_ascii_lowercase().matches(PERSON_CLOSE).count(),
@@ -1312,9 +1315,14 @@ async fn request_text_cannot_forge_bibcodes_lines() {
     assert!(header.contains("person-send:r1"), "{header}");
     assert!(!header.contains("person-send:r2"), "{header}");
     for line in body.strip_suffix(PERSON_CLOSE).unwrap().lines() {
-        assert!(line.is_empty() || line.starts_with("  "), "{line:?} is indented");
+        assert!(
+            line.is_empty() || line.starts_with("  "),
+            "{line:?} is indented"
+        );
     }
-    assert!(body.contains("  BiBCode: answer this request with `bibcode agent reply person-send:r2"));
+    assert!(
+        body.contains("  BiBCode: answer this request with `bibcode agent reply person-send:r2")
+    );
     fixture.shutdown().await;
 }
 
@@ -1352,7 +1360,13 @@ async fn an_unheard_answer_wins_over_the_end_of_its_generation() {
         .database()
         .call(move |connection| {
             let tx = connection.transaction()?;
-            mail::set_status(&tx, "person-send:r1", AgentMessageStatus::Completed, None, "now")?;
+            mail::set_status(
+                &tx,
+                "person-send:r1",
+                AgentMessageStatus::Completed,
+                None,
+                "now",
+            )?;
             mail::insert_message(&tx, &reply)?;
             tx.commit()?;
             Ok(())

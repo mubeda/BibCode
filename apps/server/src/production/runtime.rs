@@ -904,6 +904,13 @@ impl ProductionRuntime {
             Some(workspace_availability.clone()),
             attachment_uploads.clone(),
         ));
+        // Before the pointer starts, so a stored answer reaches its request before any
+        // generation end of the earlier run can.
+        if let Err(error) =
+            crate::send_requests::terminal::fail_open_terminal_requests(&send_requests).await
+        {
+            tracing::warn!(%error, "open terminal requests were kept open at start");
+        }
         let terminal_pointer_task = CancellationToken::new();
         // Attached before the pointer is shared: its sinks are per clone.
         let terminal_pointer = terminal_pointer
@@ -924,11 +931,6 @@ impl ProductionRuntime {
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
-        if let Err(error) =
-            crate::send_requests::terminal::fail_open_terminal_requests(&send_requests).await
-        {
-            tracing::warn!(%error, "open terminal requests were kept open at start");
-        }
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         let terminal_credential_revoker = CancellationToken::new();
         terminal_credentials.spawn_revoker(

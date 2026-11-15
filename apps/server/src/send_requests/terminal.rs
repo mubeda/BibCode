@@ -30,12 +30,20 @@ pub(crate) fn action_label(action: SendAction) -> &'static str {
     }
 }
 
-/// The text a terminal's inbox prints for a person's request: who it is from, then the request.
+/// The text a terminal's inbox prints for a person's request `message_id`: BiBCode's lines (who
+/// it is from and how to answer it), then the request's text quoted so it cannot forge them.
 /// Never the agent envelope, because it comes from the person (R8).
-pub(crate) fn render_request(action: SendAction, source_title: &str, text: &str) -> String {
-    format!(
-        "From the user of this project: {}, sent from {source_title}.\n\n{text}",
-        action_label(action)
+pub(crate) fn render_request(
+    action: SendAction,
+    source_title: &str,
+    message_id: &str,
+    text: &str,
+) -> String {
+    crate::agent_messaging::envelope::build_person_request(
+        action_label(action),
+        source_title,
+        message_id,
+        text,
     )
 }
 
@@ -92,15 +100,16 @@ pub(crate) async fn deliver_person_request(
     target: &TerminalIdentity,
 ) -> Result<(), Value> {
     let pointer = service.terminal_mail().ok_or_else(not_notifiable)?;
+    let message_id = format!("person-send:{}", row.request_id);
     let new = NewAgentMessage {
-        message_id: format!("person-send:{}", row.request_id),
+        text: render_request(row.action, source_title, &message_id, text),
+        message_id,
         conversation_id: row.request_id.clone(),
         sender_address: row.source_address.clone(),
         sender_kind: SenderKind::Person,
         recipient_address: target.address(),
         in_reply_to: None,
         hop: 1,
-        text: render_request(row.action, source_title, text),
         status: AgentMessageStatus::Queued,
         reason: None,
         accepted_at: crate::mcp::control::now_iso(),
@@ -186,6 +195,14 @@ pub(crate) fn generation_end_sink(service: SendRequestsService) -> GenerationEnd
             // process number the request keeps.
             let ended = match service.requests_of_generation(&address, &key).await {
                 Ok(requests) => {
+                    // An answer stored before the end wins over `recipient_gone`.
+                    if let Err(error) = give_unheard_answers(&service, |request_id| {
+                        requests.iter().any(|request| request == request_id)
+                    })
+                    .await
+                    {
+                        tracing::warn!(%error, "stored terminal answers were not read");
+                    }
                     service
                         .end_open_where(|row| requests.contains(&row.request_id))
                         .await
@@ -199,14 +216,26 @@ pub(crate) fn generation_end_sink(service: SendRequestsService) -> GenerationEnd
     })
 }
 
+/// Gives each open terminal request `concerned` names the reply already stored for it, through
+/// the request sink's own path.
+async fn give_unheard_answers(
+    service: &SendRequestsService,
+    concerned: impl Fn(&str) -> bool,
+) -> crate::persistence::Result<()> {
+    for reply in service.unheard_terminal_answers().await? {
+        if reply.send_request_id.as_deref().is_some_and(&concerned) {
+            follow_mail(service, reply).await;
+        }
+    }
+    Ok(())
+}
+
 /// At server start, ends every open request to a terminal: no terminal survives a restart.
 /// An answer stored before the stop is given to its request first, as the sink would have.
 pub(crate) async fn fail_open_terminal_requests(
     service: &SendRequestsService,
 ) -> crate::persistence::Result<usize> {
-    for reply in service.unheard_terminal_answers().await? {
-        follow_mail(service, reply).await;
-    }
+    give_unheard_answers(service, |_| true).await?;
     service
         .end_open_where(|row| parse_terminal_address(&row.target_address).is_some())
         .await

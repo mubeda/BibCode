@@ -846,16 +846,12 @@ impl TerminalPointer {
         }
         let mut entries = Vec::with_capacity(consumed.len());
         for message in &consumed {
-            // A person's request is stored as it reads, never in the agent envelope (R8), then
-            // a line of BiBCode's own naming the id to answer with. The id is a plain id: the
-            // request id is checked when the request is sent.
+            // A person's request is stored as it reads, in its own envelope with BiBCode's
+            // lines first, never in the agent envelope (R8).
             if message.sender_kind == SenderKind::Person {
                 entries.push(InboxEntry {
                     message_id: message.message_id.clone(),
-                    rendered: format!(
-                        "{}\n\nBiBCode: answer this request with `bibcode agent reply {} <answer>`.",
-                        message.text, message.message_id
-                    ),
+                    rendered: message.text.clone(),
                 });
                 continue;
             }
