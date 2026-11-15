@@ -887,6 +887,21 @@ pub(crate) fn cancel_unfetched_terminal(
     Ok(changed == 1)
 }
 
+/// Cancels the mailbox row of a person's request `send_request_id` in one compare and set, only
+/// while it is `queued`: once the pointer announced it or an inbox fetched it, it stays. True
+/// when it was cancelled.
+pub(crate) fn cancel_unfetched_for_request(
+    tx: &rusqlite::Transaction<'_>,
+    send_request_id: &str,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "UPDATE agent_messages SET status = 'cancelled', reason = NULL, updated_at = ?2
+          WHERE send_request_id = ?1 AND sender_kind = 'person' AND status = 'queued'",
+        params![send_request_id, crate::mcp::control::now_iso()],
+    )?;
+    Ok(changed == 1)
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentMessageStore {
     database: Database,

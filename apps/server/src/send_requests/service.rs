@@ -11,6 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::store::{SendAction, SendRequestRow, SendRequestStore, SendState, StateChange};
 use crate::{
+    agent_messaging::{
+        pointer::{TERMINAL_RECIPIENT_MODE, TerminalPointer},
+        terminal_credential::{TerminalIdentity, parse_terminal_address},
+    },
     orchestration::{OrchestrationCommand, OrchestrationEngine, canonical_command_digest},
     persistence::{Database, OrchestrationEvent, ProjectionThread, Repositories},
     production::{
@@ -350,6 +354,10 @@ pub(crate) struct SendRequestsService {
     dispatcher: ServerCommandDispatcher,
     changes: broadcast::Sender<RequestChange>,
     terminal_output: Option<std::sync::Arc<dyn TerminalOutputSource>>,
+    /// The terminal mailbox a request to an AI Terminal goes to. This clone carries no request
+    /// sink (the pointer's sink holds this service), so it never reads an inbox; it stores,
+    /// cancels and takes the per-terminal exclusion.
+    terminal_mail: Option<TerminalPointer>,
     /// Held across a dispatch, and by a cancel that finds no delivery yet, so a cancelled
     /// request is never queued afterwards.
     // shortcut: one gate for every request; a per-request lock if person sends ever contend.
@@ -371,6 +379,7 @@ impl SendRequestsService {
             dispatcher,
             changes: broadcast::channel(256).0,
             terminal_output: None,
+            terminal_mail: None,
             dispatch_gate: std::sync::Arc::default(),
             publish_order: std::sync::Arc::default(),
         }
@@ -382,6 +391,47 @@ impl SendRequestsService {
     ) -> Self {
         self.terminal_output = Some(source);
         self
+    }
+
+    pub(crate) fn with_terminal_mail(mut self, pointer: TerminalPointer) -> Self {
+        self.terminal_mail = Some(pointer);
+        self
+    }
+
+    pub(super) fn terminal_mail(&self) -> Option<&TerminalPointer> {
+        self.terminal_mail.as_ref()
+    }
+
+    /// Ends an open request whose terminal generation no longer runs.
+    pub(super) async fn end_unreachable(&self, row: &SendRequestRow) {
+        let change = StateChange {
+            to: SendState::NotAnswered,
+            reason: Some("recipient_gone".to_owned()),
+            answering_turn_id: None,
+            answer_message_id: None,
+            answer_text: None,
+            answer_truncated: false,
+            dismiss: false,
+            at: crate::mcp::control::now_iso(),
+        };
+        if let Err(error) = self.apply(&row.request_id, &OPEN, change).await {
+            tracing::warn!(request_id = %row.request_id, %error, "an unreachable request was kept open");
+        }
+    }
+
+    /// A message, hand-off or take-over is dismissed once its target read it.
+    pub(super) async fn dismissed_once_read(&self, request_id: &str) -> bool {
+        self.store
+            .get(request_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                matches!(
+                    row.action,
+                    SendAction::Message | SendAction::HandOff | SendAction::TakeOver
+                )
+            })
     }
 
     pub(crate) fn subscribe_changes(&self) -> broadcast::Receiver<RequestChange> {
@@ -592,8 +642,7 @@ impl SendRequestsService {
         let target = parse_address(&row.target_address)
             .ok_or_else(|| invalid("The request's target is not an agent address."))?;
         match target.terminal {
-            // shortcut: no terminal request exists before task 9.2 adds its branch here.
-            true => {}
+            true => self.cancel_terminal(&row).await?,
             false => self.cancel_chat(context, &row).await?,
         }
         let request = self.stored(request_id).await?;
@@ -645,6 +694,59 @@ impl SendRequestsService {
         {
             self.mark_cancelled(row).await?;
         }
+        Ok(())
+    }
+
+    /// Withdraws a queued request to an AI Terminal: under the terminal's exclusion, one
+    /// transaction cancels its mailbox row, only while that row is `queued`, and the request.
+    /// Once the pointer announced it or the inbox returned it, the cancel is refused.
+    async fn cancel_terminal(&self, row: &SendRequestRow) -> Result<(), Value> {
+        let not_cancellable = || {
+            refusal(
+                "not_cancellable",
+                "The terminal's agent was already told about this request, so it cannot be cancelled.",
+            )
+        };
+        match row.state {
+            SendState::Cancelled => return Ok(()),
+            SendState::Queued => {}
+            _ => return Err(not_cancellable()),
+        }
+        let pointer = self.terminal_mail.as_ref().ok_or_else(not_cancellable)?;
+        let _exclusive = pointer.exclusive(&row.target_address).await;
+        let _order = self.publish_order.lock().await;
+        let request_id = row.request_id.clone();
+        let change = StateChange {
+            to: SendState::Cancelled,
+            reason: None,
+            answering_turn_id: None,
+            answer_message_id: None,
+            answer_text: None,
+            answer_truncated: false,
+            dismiss: false,
+            at: crate::mcp::control::now_iso(),
+        };
+        let cancelled = self
+            .repositories
+            .database()
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                if !crate::agent_messaging::store::cancel_unfetched_for_request(&tx, &request_id)? {
+                    return Ok(None);
+                }
+                let row =
+                    super::store::transition_in(&tx, &request_id, &[SendState::Queued], change)?;
+                if row.is_some() {
+                    tx.commit()?;
+                }
+                Ok(row)
+            })
+            .await
+            .map_err(storage)?
+            .ok_or_else(not_cancellable)?;
+        let _ = self
+            .changes
+            .send(RequestChange::Upsert(Box::new(cancelled)));
         Ok(())
     }
 
@@ -995,14 +1097,6 @@ impl SendRequestsService {
                 "The note and attachments are longer than 48,000 characters. Shorten them.",
             ));
         }
-        // shortcut: a terminal agent cannot be notified yet; task 9.2 lifts this.
-        if target.terminal {
-            return Err(refusal(
-                "target_not_notifiable",
-                "BiBCode cannot send a request to a terminal agent yet.",
-            ));
-        }
-
         let source_thread = self.live_thread(&source.thread_id).await?;
         let target_thread = self.live_thread(&target.thread_id).await?;
         let taken_over_thread = match &taken_over {
@@ -1020,8 +1114,21 @@ impl SendRequestsService {
                 "Requests go only to agents of the same project.",
             ));
         }
+        let terminal_target = match target.terminal {
+            true => {
+                let pointer = self
+                    .terminal_mail
+                    .as_ref()
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                Some(super::terminal::notifiable_target(pointer, &input.target).await?)
+            }
+            false => None,
+        };
 
-        let command_id = format!("person-send:{}", input.request_id);
+        // A terminal request has no turn command: its mail is the delivery.
+        let command_id = terminal_target
+            .is_none()
+            .then(|| format!("person-send:{}", input.request_id));
         let now = crate::mcp::control::now_iso();
         let order = self.publish_order.lock().await;
         let (row, created) = self
@@ -1038,15 +1145,21 @@ impl SendRequestsService {
                 args_digest: args_digest.clone(),
                 note_chars: i64::try_from(note_chars).unwrap_or(i64::MAX),
                 attachment_chars: i64::try_from(attachment_chars).unwrap_or(i64::MAX),
-                target_message_id: Some(command_id.clone()),
-                command_id: Some(command_id.clone()),
-                runtime_mode: target_thread.runtime_mode.clone(),
+                target_message_id: command_id.clone(),
+                command_id: command_id.clone(),
+                // A terminal agent receives as `full-access` (R6).
+                runtime_mode: match terminal_target {
+                    Some(_) => TERMINAL_RECIPIENT_MODE.to_owned(),
+                    None => target_thread.runtime_mode.clone(),
+                },
                 interaction_mode: target_thread.interaction_mode.clone(),
                 answering_turn_id: None,
                 answer_message_id: None,
                 answer_text: None,
                 answer_truncated: false,
-                terminal_generation: None,
+                terminal_generation: terminal_target
+                    .as_ref()
+                    .and_then(|identity| i64::try_from(identity.generation.process).ok()),
                 state: SendState::Queued,
                 reason: None,
                 created_at: now.clone(),
@@ -1066,7 +1179,10 @@ impl SendRequestsService {
             // A simultaneous call with the same id stored it first.
             return self.replay(context, row, &args_digest, &input).await;
         }
-        self.dispatch(context, &row, &input).await?;
+        match terminal_target {
+            Some(identity) => self.deliver_terminal(&row, &input, Some(identity)).await?,
+            None => self.dispatch(context, &row, &input).await?,
+        }
         Ok(SendRequest::from(&row))
     }
 
@@ -1086,6 +1202,14 @@ impl SendRequestsService {
                 "request_conflict",
                 "A request with this id was already sent with other content.",
             ));
+        }
+        if parse_address(&row.target_address).is_some_and(|target| target.terminal) {
+            // Storing the mail again changes nothing once it is stored.
+            if row.state == SendState::Queued {
+                self.deliver_terminal(&row, input, None).await?;
+            }
+            let current = self.store.get(&row.request_id).await.map_err(storage)?;
+            return Ok(SendRequest::from(current.as_ref().unwrap_or(&row)));
         }
         let receipt = self
             .repositories
@@ -1159,6 +1283,85 @@ impl SendRequestsService {
             "invalid",
             "BiBCode could not queue this request on the agent. Try again.",
         ))
+    }
+
+    /// Stores a request to an AI Terminal in its mailbox. `identity` is the generation `send`
+    /// resolved; a replay reads it again, and a generation other than the stored one ends the
+    /// request unanswered.
+    async fn deliver_terminal(
+        &self,
+        row: &SendRequestRow,
+        input: &SendRequestsSendInput,
+        identity: Option<TerminalIdentity>,
+    ) -> Result<(), Value> {
+        let identity = match identity {
+            Some(identity) => identity,
+            None => {
+                let pointer = self
+                    .terminal_mail
+                    .as_ref()
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                let (thread_id, terminal_id) = parse_terminal_address(&row.target_address)
+                    .ok_or_else(super::terminal::not_notifiable)?;
+                let generation = pointer
+                    .terminals()
+                    .live_generation(&thread_id, &terminal_id)
+                    .await
+                    .filter(|generation| {
+                        i64::try_from(generation.process).ok() == row.terminal_generation
+                    });
+                let Some(generation) = generation else {
+                    self.end_unreachable(row).await;
+                    return Err(super::terminal::not_notifiable());
+                };
+                TerminalIdentity {
+                    environment_id: String::new(),
+                    thread_id,
+                    terminal_id,
+                    generation,
+                }
+            }
+        };
+        let attachments = input
+            .attachments
+            .iter()
+            .map(|attachment| (attachment.label.clone(), attachment.text.clone()))
+            .collect::<Vec<_>>();
+        let text = compose_message_text(&input.lead_in, &input.note, &attachments);
+        // A take-over is labelled with the agent whose work it takes over, as a chat one is.
+        let title = self
+            .address_title(
+                row.taken_over_address
+                    .as_deref()
+                    .unwrap_or(&row.source_address),
+            )
+            .await;
+        super::terminal::deliver_person_request(self, row, &title, &text, &identity).await
+    }
+
+    /// The title an agent address shows: its thread's title, or its terminal's label.
+    async fn address_title(&self, address: &str) -> String {
+        if let Some((thread_id, terminal_id)) = parse_terminal_address(address) {
+            if let Some(pointer) = &self.terminal_mail
+                && let Some(summary) = pointer
+                    .terminals()
+                    .thread_sessions(&thread_id)
+                    .await
+                    .into_iter()
+                    .find(|summary| summary.terminal_id == terminal_id)
+            {
+                return summary.label;
+            }
+            return "a terminal".to_owned();
+        }
+        let thread_id = address
+            .strip_prefix("thread:")
+            .unwrap_or(address)
+            .to_owned();
+        match self.repositories.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread.title,
+            _ => "an agent".to_owned(),
+        }
     }
 
     /// Ends a request whose command the engine rejected, and returns that rejection.
@@ -1458,7 +1661,7 @@ fn decide(view: TargetView) -> Next {
 }
 
 /// `text` cut at [`ANSWER_TEXT_MAX_CHARS`] Unicode scalar values, and whether it was cut.
-fn cut_answer(mut text: String) -> (String, bool) {
+pub(super) fn cut_answer(mut text: String) -> (String, bool) {
     match text.char_indices().nth(ANSWER_TEXT_MAX_CHARS) {
         Some((index, _)) => {
             text.truncate(index);

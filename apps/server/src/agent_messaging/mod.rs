@@ -431,14 +431,22 @@ impl AgentMessaging {
         recipient_address: &mut String,
         attribution: &mut Attribution,
     ) -> Result<MessageReceipt, AgentMessagingError> {
-        if !self.is_enabled() {
-            return Err(AgentMessagingError::Disabled);
-        }
         let original = self
             .message(&request.in_reply_to)
             .await?
-            .filter(|message| received_by(message, caller))
-            .ok_or(AgentMessagingError::UnknownMessage)?;
+            .filter(|message| received_by(message, caller));
+        // A person's request is answered whatever the setting is (R5).
+        if let Some(original) = original
+            .as_ref()
+            .filter(|message| message.sender_kind == SenderKind::Person)
+        {
+            recipient_address.clone_from(&original.sender_address);
+            return self.answer_person(caller, original, request).await;
+        }
+        if !self.is_enabled() {
+            return Err(AgentMessagingError::Disabled);
+        }
+        let original = original.ok_or(AgentMessagingError::UnknownMessage)?;
         recipient_address.clone_from(&original.sender_address);
         let recipient =
             Recipient::parse(&original.sender_address).ok_or(AgentMessagingError::RecipientGone)?;
@@ -472,6 +480,90 @@ impl AgentMessaging {
             self.complete(&original.message_id).await?;
         }
         Ok(receipt)
+    }
+
+    /// A terminal's reply to a person's request it fetched: stored `completed` with no queue entry,
+    /// so it starts no turn (R10), in the transaction that completes the request's mail, under the
+    /// terminal's exclusion; then the request takes it as its answer through the request sink.
+    async fn answer_person(
+        &self,
+        caller: &AgentCaller,
+        original: &AgentMessageRow,
+        request: &ReplyRequest,
+    ) -> Result<MessageReceipt, AgentMessagingError> {
+        // The answer is cut to the request's limit when stored, not refused here.
+        if request.text.trim().is_empty() {
+            return Err(AgentMessagingError::InvalidArgument(
+                "text must not be empty.".to_owned(),
+            ));
+        }
+        let pointer = self
+            .terminals
+            .as_ref()
+            .ok_or(AgentMessagingError::UnknownMessage)?;
+        let message_id = Uuid::new_v4().to_string();
+        let outgoing = Outgoing {
+            message_id: &message_id,
+            conversation_id: &original.conversation_id,
+            in_reply_to: Some(&original.message_id),
+            hop: 1,
+            text: &request.text,
+            client_request_id: request.client_request_id.as_deref(),
+        };
+        let _exclusive = pointer.exclusive(&original.recipient_address).await;
+        if let Some(receipt) = self
+            .replay(&caller.address(), &original.sender_address, &outgoing)
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let now = crate::mcp::control::now_iso();
+        let reply = NewAgentMessage {
+            message_id: message_id.clone(),
+            conversation_id: original.conversation_id.clone(),
+            sender_address: caller.address(),
+            sender_kind: SenderKind::Agent,
+            recipient_address: original.sender_address.clone(),
+            in_reply_to: Some(original.message_id.clone()),
+            hop: 1,
+            text: request.text.clone(),
+            status: AgentMessageStatus::Completed,
+            reason: None,
+            accepted_at: now.clone(),
+            sender_runtime_mode: None,
+            recipient_terminal_generation: None,
+            send_request_id: original.send_request_id.clone(),
+            client_request_id: request.client_request_id.clone(),
+            delivery_command_id: None,
+            delivery_message_id: None,
+        };
+        let original_id = original.message_id.clone();
+        let stored = self
+            .engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                store::set_status(&tx, &original_id, AgentMessageStatus::Completed, None, &now)?;
+                store::insert_message(&tx, &reply)?;
+                let stored = store::get_message(&tx, &reply.message_id)?;
+                tx.commit()?;
+                Ok(stored)
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "a terminal's answer to a person was not stored");
+                AgentMessagingError::Storage
+            })?;
+        if let Some(stored) = stored {
+            pointer.tell_requests(std::slice::from_ref(&stored)).await;
+        }
+        Ok(MessageReceipt {
+            message_id,
+            conversation_id: original.conversation_id.clone(),
+            status: AgentMessageStatus::Completed,
+            hop: 1,
+        })
     }
 
     /// Moves mail a terminal fetched to `completed` once the terminal replied to it.
@@ -509,7 +601,7 @@ impl AgentMessaging {
         let message = self
             .message(message_id)
             .await?
-            .filter(|message| message.sender_address == caller.address())
+            .filter(|message| is_sent_by(message, caller))
             .ok_or(AgentMessagingError::UnknownMessage)?;
         let in_reply_to = message.message_id.clone();
         let reply_message_id = self
@@ -965,7 +1057,7 @@ impl AgentMessaging {
         let message = self
             .message(message_id)
             .await?
-            .filter(|message| message.sender_address == caller.address())
+            .filter(|message| is_sent_by(message, caller))
             .ok_or(AgentMessagingError::UnknownMessage)?;
         if message.status == AgentMessageStatus::Cancelled {
             return Ok(AgentMessageStatus::Cancelled);
@@ -1287,6 +1379,12 @@ impl AgentMessaging {
             hop,
         })
     }
+}
+
+/// `message` is an agent message `caller` sent. A person's request carries its source agent's
+/// address as its sender, but that agent never sent it, so it may neither see nor cancel it.
+fn is_sent_by(message: &AgentMessageRow, caller: &AgentCaller) -> bool {
+    message.sender_kind == SenderKind::Agent && message.sender_address == caller.address()
 }
 
 /// `message` was sent to `caller`: to its thread, or to the terminal generation that fetched it

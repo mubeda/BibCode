@@ -877,7 +877,9 @@ impl ProductionRuntime {
                 attachment_uploads.clone(),
             ),
         )
-        .with_terminal_output(Arc::new(send_request_terminals));
+        .with_terminal_output(Arc::new(send_request_terminals))
+        // Before the request sink below: the service's pointer carries none, so no cycle.
+        .with_terminal_mail(terminal_pointer.clone());
         crate::send_requests::rpc::register_send_requests_rpc(&mut registry, send_requests.clone());
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
@@ -903,6 +905,10 @@ impl ProductionRuntime {
             attachment_uploads.clone(),
         ));
         let terminal_pointer_task = CancellationToken::new();
+        // Attached before the pointer is shared: its sinks are per clone.
+        let terminal_pointer = terminal_pointer.with_request_sink(
+            crate::send_requests::terminal::request_state_sink(send_requests.clone()),
+        );
         // Terminal deliveries reach the activity log through the same sink as chat ones.
         let agent_messaging = start_terminal_messaging(
             agent_messaging,

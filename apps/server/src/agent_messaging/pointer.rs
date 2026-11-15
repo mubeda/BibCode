@@ -155,6 +155,12 @@ pub struct InboxEntry {
 /// ended with mail, read or not.
 pub type GenerationEndSink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
+/// Told each mail row of a person's request, or the reply to one, after its change committed:
+/// `delivered`, `consumed`, or a `completed` reply. Awaited in order under the terminal's
+/// exclusion, so the request's state follows its mail in the order the mail changed.
+pub(crate) type RequestStateSink =
+    Arc<dyn Fn(AgentMessageRow) -> BoxFuture<'static, ()> + Send + Sync>;
+
 /// The hops one terminal generation fetched since a person last typed into it.
 #[derive(Default)]
 struct HopLedger {
@@ -188,6 +194,7 @@ pub struct TerminalPointer {
     hops: Arc<StdMutex<HashMap<String, HopLedger>>>,
     ended: Arc<StdMutex<HashSet<String>>>,
     generation_end: Option<GenerationEndSink>,
+    request_sink: Option<RequestStateSink>,
     /// One lock per terminal address: a pointer write, from the eligibility read until its mail
     /// is marked, excludes that terminal's inbox fetch, cancel and generation end.
     /// shortcut: entries are never removed, one per terminal that got mail in this server run;
@@ -208,6 +215,7 @@ impl TerminalPointer {
             hops: Arc::default(),
             ended: Arc::default(),
             generation_end: None,
+            request_sink: None,
             exclusions: Arc::default(),
             in_flight: Arc::default(),
             ending: Arc::default(),
@@ -234,6 +242,63 @@ impl TerminalPointer {
     pub fn with_generation_end_sink(mut self, sink: GenerationEndSink) -> Self {
         self.generation_end = Some(sink);
         self
+    }
+
+    pub(crate) fn with_request_sink(mut self, sink: RequestStateSink) -> Self {
+        self.request_sink = Some(sink);
+        self
+    }
+
+    /// Tells the request-state sink, if any, of each row that belongs to a person's request.
+    pub(crate) async fn tell_requests(&self, rows: &[AgentMessageRow]) {
+        let Some(sink) = &self.request_sink else {
+            return;
+        };
+        for row in rows.iter().filter(|row| row.send_request_id.is_some()) {
+            sink(row.clone()).await;
+        }
+    }
+
+    /// Stores a person's request in `recipient`'s mailbox, `queued` and bound to its generation,
+    /// under the terminal's exclusion. It skips every agent messaging rule. False when the row
+    /// was already stored (a replay, which changes nothing); `UnknownRecipient` when the
+    /// generation no longer runs.
+    pub(crate) async fn accept_person(
+        &self,
+        mut new: NewAgentMessage,
+        recipient: &TerminalIdentity,
+    ) -> Result<bool, AgentMessagingError> {
+        let address = recipient.address();
+        let _exclusive = self.exclusive(&address).await;
+        let live = self
+            .terminals
+            .live_generation(&recipient.thread_id, &recipient.terminal_id)
+            .await;
+        if live.as_ref() != Some(&recipient.generation) {
+            return Err(AgentMessagingError::UnknownRecipient);
+        }
+        new.sender_kind = SenderKind::Person;
+        new.recipient_address = address;
+        new.recipient_terminal_generation = Some(recipient.generation_key());
+        new.status = AgentMessageStatus::Queued;
+        new.reason = None;
+        new.delivery_command_id = None;
+        new.delivery_message_id = None;
+        let created = self
+            .database
+            .call(move |connection| {
+                let tx = connection.transaction()?;
+                if store::get_message(&tx, &new.message_id)?.is_some() {
+                    return Ok(false);
+                }
+                store::insert_message(&tx, &new)?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(storage("a person's request to a terminal was not stored"))?;
+        self.wake.notify_one();
+        Ok(created)
     }
 
     pub(crate) fn terminals(&self) -> &Arc<dyn PointerTerminals> {
@@ -535,7 +600,10 @@ impl TerminalPointer {
             .call(move |connection| store::deliver_queued(connection, &ids, &now))
             .await
         {
-            Ok(delivered) => self.report(messaging, &delivered, "delivered", None).await,
+            Ok(delivered) => {
+                self.tell_requests(&delivered).await;
+                self.report(messaging, &delivered, "delivered", None).await;
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "terminal mail was not marked delivered")
             }
@@ -764,14 +832,24 @@ impl TerminalPointer {
             let mut hops = self.hops.lock().unwrap_or_else(PoisonError::into_inner);
             let ledger = hops.entry(ledger_key(identity)).or_default();
             ledger.follow(inputs);
+            // A person's request starts the chain again (R14), in the order the mail was fetched.
             for message in &consumed {
-                if message.sender_kind == SenderKind::Agent {
-                    ledger.highest = ledger.highest.max(Some(message.hop));
-                }
+                ledger.highest = match message.sender_kind {
+                    SenderKind::Agent => ledger.highest.max(Some(message.hop)),
+                    SenderKind::Person => None,
+                };
             }
         }
         let mut entries = Vec::with_capacity(consumed.len());
         for message in &consumed {
+            // A person's request is stored as it reads, never in the agent envelope (R8).
+            if message.sender_kind == SenderKind::Person {
+                entries.push(InboxEntry {
+                    message_id: message.message_id.clone(),
+                    rendered: message.text.clone(),
+                });
+                continue;
+            }
             let sender = messaging.sender_description(&message.sender_address).await;
             let label = match sender.title.trim() {
                 "" => "Agent",
@@ -790,6 +868,7 @@ impl TerminalPointer {
                 }),
             });
         }
+        self.tell_requests(&consumed).await;
         self.report(messaging, &consumed, "consumed", None).await;
         Ok(entries)
     }
@@ -991,7 +1070,7 @@ pub(crate) mod tests {
             read(&self.terminals.lock().unwrap()[&key(thread_id, terminal_id)])
         }
 
-        fn writes(&self, thread_id: &str, terminal_id: &str) -> Vec<String> {
+        pub(crate) fn writes(&self, thread_id: &str, terminal_id: &str) -> Vec<String> {
             self.read(thread_id, terminal_id, |terminal| terminal.writes.clone())
         }
 
