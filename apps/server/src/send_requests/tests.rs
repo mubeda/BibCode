@@ -3207,6 +3207,7 @@ struct FakeTerminalOutput {
     session: Option<String>,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     codex: Option<crate::provider_terminal::CodexConversationHandle>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl FakeTerminalOutput {
@@ -3218,6 +3219,7 @@ impl FakeTerminalOutput {
             session: None,
             environment: Vec::new(),
             codex: None,
+            cwd: None,
         })
     }
 
@@ -3232,10 +3234,22 @@ impl FakeTerminalOutput {
             session: None,
             environment: Vec::new(),
             codex: Some(handle),
+            cwd: None,
         })
     }
 
+    /// A Claude terminal launched in `/work/sample`, whose project folder is `-work-sample`.
     fn claude(
+        text: &str,
+        conversation: Option<crate::provider_terminal::ObservedConversation>,
+        session: Option<&str>,
+        config_dir: &std::path::Path,
+    ) -> std::sync::Arc<Self> {
+        Self::claude_in("/work/sample", text, conversation, session, config_dir)
+    }
+
+    fn claude_in(
+        cwd: &str,
         text: &str,
         conversation: Option<crate::provider_terminal::ObservedConversation>,
         session: Option<&str>,
@@ -3248,11 +3262,20 @@ impl FakeTerminalOutput {
             session: session.map(str::to_owned),
             environment: vec![("CLAUDE_CONFIG_DIR".into(), config_dir.into())],
             codex: None,
+            cwd: Some(cwd.into()),
         })
     }
 }
 
 impl crate::send_requests::service::TerminalOutputSource for FakeTerminalOutput {
+    fn working_directory<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<std::path::PathBuf>> {
+        Box::pin(async move { self.cwd.clone() })
+    }
+
     fn codex_conversation<'a>(
         &'a self,
         _owner_thread_id: &'a str,
@@ -3568,19 +3591,32 @@ fn unreadable_conversations(
     let project = transcript.parent().unwrap();
     let misnamed = project.join("33333333-3333-4333-8333-333333333333.jsonl");
     std::fs::copy(transcript, &misnamed).expect("misnamed copy");
-    let large_folder = config.join("projects/-large");
+    let large_folder = config.join("projects/-work-large");
     std::fs::create_dir_all(&large_folder).expect("large folder");
     let large = large_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
     std::fs::File::create(&large)
         .and_then(|file| file.set_len(crate::provider_terminal::MAX_TRANSCRIPT_BYTES + 1))
         .expect("sparse file");
-    let empty_folder = config.join("projects/-empty");
+    let empty_folder = config.join("projects/-work-empty");
     std::fs::create_dir_all(&empty_folder).expect("empty folder");
     let empty = empty_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
     std::fs::write(&empty, "").expect("empty");
-    let missing = config.join(format!("projects/-missing/{CLAUDE_SESSION}.jsonl"));
+    let missing = config.join(format!("projects/-work-missing/{CLAUDE_SESSION}.jsonl"));
+    let other_folder = config.join("projects/-work-other");
+    std::fs::create_dir_all(&other_folder).expect("other project folder");
+    let other = other_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::copy(transcript, &other).expect("other project copy");
+    // The working directory whose project folder holds `path`.
     let claude = |path: &std::path::Path, session: Option<&str>| {
-        FakeTerminalOutput::claude(
+        let folder = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let cwd = folder.replacen("-work-", "/work/", 1);
+        FakeTerminalOutput::claude_in(
+            &cwd,
             "hello",
             Some(observed_conversation(path.to_path_buf())),
             session,
@@ -3609,10 +3645,19 @@ fn unreadable_conversations(
         ("over the bound", claude(&large, Some(CLAUDE_SESSION))),
         ("empty", claude(&empty, Some(CLAUDE_SESSION))),
         ("missing", claude(&missing, Some(CLAUDE_SESSION))),
+        (
+            "another working directory's project",
+            FakeTerminalOutput::claude(
+                "hello",
+                Some(observed_conversation(other)),
+                Some(CLAUDE_SESSION),
+                config,
+            ),
+        ),
     ];
     #[cfg(unix)]
     {
-        let linked_folder = config.join("projects/-linked");
+        let linked_folder = config.join("projects/-work-linked");
         std::fs::create_dir_all(&linked_folder).expect("linked folder");
         let link = linked_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
         std::os::unix::fs::symlink(&outside, &link).expect("link");

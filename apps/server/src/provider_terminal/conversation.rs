@@ -2,8 +2,10 @@
 //! or Hand off (spec R112).
 //!
 //! Claude's transcript path comes from the CLI's own hook, so it is untrusted: it is read only
-//! for the session the status hooks bound, only as a direct child of the provider's `projects`
-//! folder, never through a symbolic link, and within [`MAX_TRANSCRIPT_BYTES`].
+//! for the session the status hooks bound, only in the project folder Claude derives from the
+//! terminal's own working directory (a direct child of the provider's `projects` folder), never
+//! through a symbolic link, and within [`MAX_TRANSCRIPT_BYTES`]. The hook can still name another
+//! session of that same working directory: those files belong to the same user and project.
 //!
 //! Codex is asked through its observer's own connection, for the root thread the observer
 //! resumed and nothing else: [`CodexConversationHandle`] carries one request at a time into the
@@ -17,6 +19,7 @@ use super::ObservedConversation;
 use crate::{
     agent_sessions::{AgentSessionProvider, ParsedSession, parse_transcript},
     production::thread_context::{HandoffText, handoff_text_from_texts},
+    provider::environment::ClaudeProjectDirectoryName,
     workspace::beneath::{Dir, Open, Root, is_escape},
 };
 
@@ -40,6 +43,8 @@ pub(crate) enum ConversationRefusal {
     SessionMismatch,
     NotATranscriptFile,
     OutsideProviderFolder,
+    /// The project folder is not the one Claude derives from the terminal's working directory.
+    AnotherProject,
     SymbolicLink,
     TooLarge,
     Unreadable,
@@ -47,14 +52,21 @@ pub(crate) enum ConversationRefusal {
 }
 
 /// Reads the conversation of `observed` when it is `expected_session` (the session the status
-/// hooks bound now) and its transcript lies directly in a project folder of
-/// `<config_dir>/projects`.
+/// hooks bound now) and its transcript lies directly in the project folder of `<config_dir>/projects`
+/// that Claude keeps for `working_directory`, the folder the server launched the terminal in.
 pub(crate) fn read_claude_conversation(
     observed: &ObservedConversation,
     expected_session: &str,
     config_dir: &Path,
+    working_directory: &Path,
 ) -> Result<ConversationText, ConversationRefusal> {
-    read_claude_conversation_with(observed, expected_session, config_dir, &|| {})
+    read_claude_conversation_with(
+        observed,
+        expected_session,
+        config_dir,
+        working_directory,
+        &|| {},
+    )
 }
 
 /// [`read_claude_conversation`], running `before_open` after every check on the path and before
@@ -63,6 +75,7 @@ fn read_claude_conversation_with(
     observed: &ObservedConversation,
     expected_session: &str,
     config_dir: &Path,
+    working_directory: &Path,
     before_open: &dyn Fn(),
 ) -> Result<ConversationText, ConversationRefusal> {
     use ConversationRefusal as Refusal;
@@ -93,6 +106,19 @@ fn read_claude_conversation_with(
     if folder.parent() != Some(projects.as_path()) {
         return Err(Refusal::OutsideProviderFolder);
     }
+    // Claude names the folder after the working directory as given and, for a linked one, as
+    // resolved; a hook cannot point at another project's conversation.
+    let folder_name = folder.file_name().map(OsStr::to_string_lossy);
+    let own_project = std::iter::once(working_directory.to_path_buf())
+        .chain(std::fs::canonicalize(working_directory).ok())
+        .any(|cwd| {
+            folder_name
+                .as_deref()
+                .is_some_and(|name| ClaudeProjectDirectoryName::of(&cwd).matches(name))
+        });
+    if !own_project {
+        return Err(Refusal::AnotherProject);
+    }
     let opened = |error: std::io::Error| {
         if is_escape(&error) {
             Refusal::SymbolicLink
@@ -105,6 +131,8 @@ fn read_claude_conversation_with(
     before_open();
     // Opened through the held folder and refusing a link, so a swap after the checks above
     // follows nothing; what was opened is checked on the open file itself.
+    // Accepted limit: the held folder can still be renamed out of `projects` before this open,
+    // but whoever can do that can as easily put the same file inside it, as the same user.
     let file = dir.open_file(name, Open::Read).map_err(opened)?;
     let metadata = file.metadata().map_err(|_| Refusal::Unreadable)?;
     if !metadata.is_file() {
@@ -245,6 +273,17 @@ mod tests {
     use crate::production::thread_context::handoff_text_from_texts;
 
     const SESSION: &str = "11111111-1111-4111-8111-111111111111";
+    /// The terminal's working directory, whose Claude project folder is `-work-sample`.
+    const WORK_DIR: &str = "/work/sample";
+
+    /// The reader for a terminal launched in [`WORK_DIR`].
+    fn read_claude_conversation(
+        observed: &ObservedConversation,
+        expected_session: &str,
+        config_dir: &Path,
+    ) -> Result<ConversationText, ConversationRefusal> {
+        super::read_claude_conversation(observed, expected_session, config_dir, Path::new(WORK_DIR))
+    }
     const OTHER_SESSION: &str = "22222222-2222-4222-8222-222222222222";
 
     fn record(session: &str, role: &str, text: &str) -> String {
@@ -370,6 +409,19 @@ mod tests {
             "[assistant] Test answer 299"
         );
         assert_eq!(text.handoff, handoff_text_from_texts(&messages));
+    }
+
+    #[test]
+    fn a_transcript_of_another_working_directory_is_not_read() {
+        let config = Config::new();
+        let other = config.path().join("projects/-work-other");
+        std::fs::create_dir_all(&other).expect("other project");
+        let path = other.join(format!("{SESSION}.jsonl"));
+        std::fs::write(&path, transcript(SESSION, &SHORT)).expect("transcript");
+
+        let refused = read_claude_conversation(&observed_at(SESSION, path), SESSION, config.path());
+
+        assert_eq!(refused.err(), Some(ConversationRefusal::AnotherProject));
     }
 
     #[test]
@@ -505,6 +557,7 @@ mod tests {
                 &observed_at(SESSION, path.clone()),
                 SESSION,
                 config.path(),
+                Path::new(WORK_DIR),
                 &swap,
             );
 

@@ -4942,6 +4942,23 @@ impl TerminalManager {
             .codex_conversation()
     }
 
+    /// The folder the terminal's process was launched in.
+    pub(crate) async fn working_directory(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let cwd = std::path::PathBuf::from(&session.lock().await.cwd);
+        Some(cwd)
+    }
+
     /// The environment the terminal's command carries (the provider's settings), never the
     /// spawn environment, which also holds the terminal's credential.
     pub(crate) async fn launch_environment(

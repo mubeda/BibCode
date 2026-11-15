@@ -153,6 +153,13 @@ pub(crate) trait TerminalOutputSource: Send + Sync {
         terminal_id: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>>;
 
+    /// The folder the terminal was launched in.
+    fn working_directory<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<std::path::PathBuf>>;
+
     /// The way into a Codex AI Terminal's observer loop, once it resumed its root thread.
     fn codex_conversation<'a>(
         &'a self,
@@ -188,6 +195,14 @@ impl TerminalOutputSource for crate::terminal::TerminalManager {
         terminal_id: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>> {
         Box::pin(self.launch_environment(owner_thread_id, terminal_id))
+    }
+
+    fn working_directory<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<std::path::PathBuf>> {
+        Box::pin(self.working_directory(owner_thread_id, terminal_id))
     }
 
     fn codex_conversation<'a>(
@@ -279,8 +294,17 @@ async fn conversation_text(
             .await,
     )
     .ok_or(ConversationRefusal::Unreadable)?;
+    let working_directory = reader
+        .working_directory(owner_thread_id, terminal_id)
+        .await
+        .ok_or(ConversationRefusal::AnotherProject)?;
     tokio::task::spawn_blocking(move || {
-        crate::provider_terminal::read_claude_conversation(&observed, &expected, &config_dir)
+        crate::provider_terminal::read_claude_conversation(
+            &observed,
+            &expected,
+            &config_dir,
+            &working_directory,
+        )
     })
     .await
     .unwrap_or(Err(ConversationRefusal::Unreadable))
