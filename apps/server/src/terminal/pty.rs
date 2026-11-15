@@ -882,6 +882,10 @@ const MULTIPLEXER_ENV_KEYS: [&str; 7] = [
     "ZELLIJ_SESSION_NAME",
     "ZELLIJ_PANE_ID",
 ];
+/// Variables a Claude Code session sets for its own child processes. A BiBCode started from
+/// inside one passes them on, and an interactive Claude Code that inherits
+/// `CLAUDE_CODE_CHILD_SESSION` saves no transcript, so its conversation cannot be read.
+const NESTED_AGENT_SESSION_ENV_KEYS: [&str; 1] = ["CLAUDE_CODE_CHILD_SESSION"];
 const FISH_FEATURES_ENV: &str = "fish_features";
 
 /// Applies `launch_env` over the server environment the command inherited.
@@ -903,7 +907,10 @@ fn apply_pty_environment(
         command.env("TERM", DEFAULT_TERMINAL_TYPE);
     }
     // Only inherited values are removed: the launch env below still wins.
-    for name in MULTIPLEXER_ENV_KEYS {
+    for name in MULTIPLEXER_ENV_KEYS
+        .into_iter()
+        .chain(NESTED_AGENT_SESSION_ENV_KEYS)
+    {
         for key in pty_env_entries(platform, command, name)
             .map(|(key, _)| key.to_owned())
             .collect::<Vec<_>>()
@@ -2993,6 +3000,57 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(command.get_env("FORCE_COLOR"), Some(OsStr::new("3")));
+    }
+
+    #[test]
+    fn pty_environment_drops_an_inherited_claude_child_session_marker_only() {
+        let mut command = command_inheriting(&[
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("ANTHROPIC_API_KEY", "test-key"),
+            ("ANTHROPIC_BASE_URL", "https://api.example.test"),
+            ("CLAUDE_CONFIG_DIR", "/tmp/claude-config"),
+            ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+            ("CLAUDECODE", "1"),
+        ]);
+
+        apply_pty_environment(Platform::Unix, &mut command, &BTreeMap::new());
+
+        assert_eq!(
+            command.get_env("CLAUDE_CODE_CHILD_SESSION"),
+            None,
+            "an inherited marker turns the terminal CLI's transcript off"
+        );
+        for (key, value) in [
+            ("ANTHROPIC_API_KEY", "test-key"),
+            ("ANTHROPIC_BASE_URL", "https://api.example.test"),
+            ("CLAUDE_CONFIG_DIR", "/tmp/claude-config"),
+            ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+            ("CLAUDECODE", "1"),
+        ] {
+            assert_eq!(command.get_env(key), Some(OsStr::new(value)), "{key}");
+        }
+
+        let mut command = command_inheriting(&[("CLAUDE_CODE_CHILD_SESSION", "1")]);
+        let launch_env = BTreeMap::from([("CLAUDE_CODE_CHILD_SESSION".to_owned(), "1".to_owned())]);
+        apply_pty_environment(Platform::Unix, &mut command, &launch_env);
+        assert_eq!(
+            command.get_env("CLAUDE_CODE_CHILD_SESSION"),
+            Some(OsStr::new("1")),
+            "a launch environment that sets it on purpose wins"
+        );
+    }
+
+    #[test]
+    fn windows_pty_environment_drops_the_claude_child_session_marker_case_insensitively() {
+        let mut command = command_inheriting(&[("claude_code_child_session", "1")]);
+
+        apply_pty_environment(Platform::Windows, &mut command, &BTreeMap::new());
+
+        assert!(
+            !command
+                .iter_full_env_as_str()
+                .any(|(key, _)| key.eq_ignore_ascii_case("CLAUDE_CODE_CHILD_SESSION"))
+        );
     }
 
     #[test]

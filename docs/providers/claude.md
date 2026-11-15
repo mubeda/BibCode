@@ -742,5 +742,10 @@ unsigned or re-signed build on macOS, behind a shim whose answer is refused or
 that is not mise, when a copy without block sharing outlasts the preparation
 budget, or when the probe or settings merge fails.
 
+A terminal does not inherit `CLAUDE_CODE_CHILD_SESSION` from the process that
+started BiBCode. Claude Code sets it for its own child processes, and an
+interactive Claude Code that inherits it saves no transcript, so BiBCode could
+not read its conversation.
+
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.
