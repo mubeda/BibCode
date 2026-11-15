@@ -2921,6 +2921,76 @@ pub async fn reconcile_abandoned_provider_sessions(
             tracing::warn!(thread_id, %error, "projected provider session remains eligible for startup reconciliation retry");
         }
     }
+    // No session is live, so a started turn still running after the loops above is abandoned
+    // too, such as one cut off before its send was accepted while its session read ready. It
+    // fails the way the loops fail one. The runtime row is left alone, so a suspended session
+    // still resumes.
+    match repositories.list_thread_ids_with_running_turns().await {
+        Ok(thread_ids) => {
+            for thread_id in thread_ids {
+                let result = async {
+                    if discard_runtime_of_deleted_thread(&repositories, &thread_id).await? {
+                        return Ok(());
+                    }
+                    let Some(session) = repositories
+                        .get_thread_session(thread_id.clone())
+                        .await
+                        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+                    else {
+                        return Ok(());
+                    };
+                    let settled_at = session.updated_at.clone();
+                    reconcile_abandoned_provider_session(
+                        engine,
+                        &repositories,
+                        SessionInput {
+                            thread_id: session.thread_id,
+                            status: session.status,
+                            provider_name: session.provider_name,
+                            provider_instance_id: session.provider_instance_id,
+                            runtime_mode: session.runtime_mode,
+                            active_turn_id: session.active_turn_id,
+                            last_error: session.last_error,
+                            last_error_class: session.last_error_class,
+                            updated_at: session.updated_at,
+                        },
+                        None,
+                        RESTART_ERROR,
+                        settled_at,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(thread_id, %error, "a running turn remains eligible for startup reconciliation retry");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read running turns for startup reconciliation");
+        }
+    }
+    // No session is live, so an assistant message still streaming is orphaned too. A stop after
+    // a turn ended but before its reply settled leaves no active turn for the loops above to
+    // settle. This runs after them, so an abandoned turn is failed before its reply settles;
+    // settling first would complete it.
+    match repositories.list_streaming_assistant_messages().await {
+        Ok(rows) => {
+            if let Err(error) = settle_streaming_assistant_message_rows(
+                engine,
+                rows,
+                &format!("provider-restart-reconcile-messages:{}", Uuid::new_v4()),
+                &now(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "assistant messages remained streaming after startup reconciliation");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read streaming assistant messages for startup reconciliation");
+        }
+    }
     // After the sessions: a recovery's settlement restores the original error over the restart's.
     settle_abandoned_compactions(engine).await;
     Ok(())
@@ -31956,6 +32026,59 @@ done
         fixture.emit("turn.started", "announced", "unused").await;
         fixture.stream("announced", "assistant-announced").await;
         fixture.assert_projection("ready", None).await;
+        fixture.close().await;
+    }
+
+    /// A stop after Cursor announced a turn and streamed part of its reply, but before the send
+    /// was accepted, leaves that turn failed at start-up, never completed.
+    #[tokio::test(start_paused = true)]
+    async fn startup_recovery_fails_a_turn_cut_off_before_its_send_was_accepted() {
+        let _clock = keep_idle_clock_paused();
+        let fixture =
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+        fixture.emit("turn.started", "announced", "unused").await;
+        fixture.stream("announced", "assistant-announced").await;
+        fixture.assert_projection("ready", None).await;
+
+        super::reconcile_abandoned_provider_sessions(&fixture.engine)
+            .await
+            .unwrap();
+
+        let turn = fixture
+            .engine
+            .repositories()
+            .get_turn_by_id("t1".to_owned(), "announced".to_owned())
+            .await
+            .unwrap()
+            .expect("the announced turn");
+        assert_eq!(turn.state, "error");
+        fixture.close().await;
+    }
+
+    /// The same cut-off turn after a graceful shutdown, which suspends the runtime and leaves the
+    /// session `ready`, still fails at start-up.
+    #[tokio::test(start_paused = true)]
+    async fn startup_recovery_fails_a_turn_cut_off_before_its_send_was_accepted_after_a_shutdown() {
+        let _clock = keep_idle_clock_paused();
+        let fixture =
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+        fixture.emit("turn.started", "announced", "unused").await;
+        fixture.stream("announced", "assistant-announced").await;
+        fixture.assert_projection("ready", None).await;
+        fixture.supervisor.shutdown().await.unwrap();
+
+        super::reconcile_abandoned_provider_sessions(&fixture.engine)
+            .await
+            .unwrap();
+
+        let turn = fixture
+            .engine
+            .repositories()
+            .get_turn_by_id("t1".to_owned(), "announced".to_owned())
+            .await
+            .unwrap()
+            .expect("the announced turn");
+        assert_eq!(turn.state, "error");
         fixture.close().await;
     }
 

@@ -1616,6 +1616,36 @@ impl Repositories {
             })
             .await
     }
+    /// The threads with a started turn still running. A message's marker row, admitted but not
+    /// started, has no turn id and does not count.
+    pub async fn list_thread_ids_with_running_turns(&self) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT thread_id FROM projection_turns WHERE turn_id IS NOT NULL AND state = 'running' ORDER BY thread_id",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+    }
+    /// Every assistant message still streaming, in any thread.
+    pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!(
+                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 ORDER BY thread_id ASC, rowid ASC"
+                    ),
+                    [],
+                    decode_message,
+                )
+            })
+            .await
+    }
     pub async fn delete_messages_by_thread(&self, thread_id: String) -> Result<()> {
         self.delete(
             "DELETE FROM projection_thread_messages WHERE thread_id = ?",
@@ -4295,7 +4325,9 @@ const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id, person_send_json FROM projection_thread_messages";
-const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
+// `julianday` reads `...00Z` and `...00.5Z` as times, not text, and `rowid` is the written order
+// of messages in the same millisecond: an upsert keeps it, and a rebuild replays in sequence.
+const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, julianday(created_at) ASC, rowid ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
 /// ascending order. Spelled this way, the order is that of
@@ -5780,6 +5812,44 @@ mod activity_order_tests {
             !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
             "{plan:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod message_order_tests {
+    use super::*;
+    use crate::persistence::run_migrations;
+
+    #[tokio::test]
+    async fn thread_messages_list_in_written_order_for_equal_or_differently_precise_times() {
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                // Ids sort against the written order, and `...00Z` sorts after `...00.5Z` as text.
+                for (id, created_at) in [
+                    ("z-first", "2026-11-15T10:00:00Z"),
+                    ("a-second", "2026-11-15T10:00:00Z"),
+                    ("m-third", "2026-11-15T10:00:00.5Z"),
+                ] {
+                    connection.execute(
+                        "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES (?1, 't', 'user', 'x', 0, ?2, ?2)",
+                        [id, created_at],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let messages = Repositories::new(database)
+            .list_messages_by_thread("t".to_owned())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, ["z-first", "a-second", "m-third"]);
     }
 }
 

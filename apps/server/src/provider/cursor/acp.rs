@@ -58,6 +58,8 @@ pub enum IncomingEvent {
     Closed {
         reason: String,
     },
+    /// Queued by `AcpJsonRpcConnection::barrier`; the consumer answers it when it reaches it.
+    Barrier(oneshot::Sender<()>),
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +104,8 @@ struct Inner {
     close_reason: Mutex<Option<String>>,
     next_request_id: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Weak, so the incoming channel still closes when the reader, writer and stderr tasks end.
+    incoming: mpsc::WeakUnboundedSender<IncomingEvent>,
 }
 
 impl Inner {
@@ -206,6 +210,17 @@ impl AcpRequestReceipt {
 }
 
 impl AcpJsonRpcConnection {
+    /// Resolves once the incoming consumer has handled every message routed before this call,
+    /// such as the notifications the agent wrote before a response this caller just received.
+    /// It resolves at once with an error when the incoming channel is closed.
+    pub fn barrier(&self) -> oneshot::Receiver<()> {
+        let (reached, receiver) = oneshot::channel();
+        if let Some(incoming) = self.inner.incoming.upgrade() {
+            let _ = incoming.send(IncomingEvent::Barrier(reached));
+        }
+        receiver
+    }
+
     pub fn spawn<R, W, E>(
         stdout: R,
         stdin: W,
@@ -226,6 +241,7 @@ impl AcpJsonRpcConnection {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),
+            incoming: incoming_tx.downgrade(),
         });
         let connection = Self {
             inner: inner.clone(),
@@ -904,6 +920,7 @@ mod tests {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),
+            incoming: mpsc::unbounded_channel().0.downgrade(),
         });
         (
             AcpJsonRpcConnection {
@@ -1219,6 +1236,7 @@ mod tests {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),
+            incoming: mpsc::unbounded_channel().0.downgrade(),
         });
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
 

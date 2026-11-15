@@ -367,11 +367,22 @@ pub(crate) async fn read_wait_state(
             let turn_state = turn.as_ref().map(|turn| turn.1.clone());
             let turn_settled = matches!(turn_state.as_deref(), Some("completed" | "interrupted" | "error"));
             let session_busy = matches!(session_status.as_deref(), Some("running" | "starting"));
-            let settled = match &message_id {
-                Some(_) => turn_settled,
-                // The whole thread: idle, and nothing waiting to start.
-                None => !session_busy && !pending_work && turn_state.as_deref() != Some("running"),
+            // A turn can be completed while its reply still streams; it settles with the reply.
+            let reply_streaming = match (turn_state.as_deref(), turn.as_ref().and_then(|turn| turn.0.as_ref())) {
+                (Some("completed"), Some(turn_id)) => connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projection_thread_messages
+                      WHERE thread_id = ?1 AND turn_id = ?2 AND role = 'assistant' AND is_streaming = 1)",
+                    params![thread_id, turn_id],
+                    |row| row.get::<_, bool>(0),
+                )?,
+                _ => false,
             };
+            let settled = !reply_streaming
+                && match &message_id {
+                    Some(_) => turn_settled,
+                    // The whole thread: idle, and nothing waiting to start.
+                    None => !session_busy && !pending_work && turn_state.as_deref() != Some("running"),
+                };
             let status = match (&message_id, turn_state.as_deref()) {
                 // The selected turn's own outcome, whatever newer turns are doing.
                 (Some(_), Some("completed")) => "completed",

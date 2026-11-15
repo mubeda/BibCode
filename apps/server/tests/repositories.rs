@@ -427,6 +427,8 @@ fn public_repository_api_inventory_is_explicit() {
         "list_projection_states",
         "list_proposed_plans_by_thread",
         "list_reasoning_by_thread",
+        "list_streaming_assistant_messages",
+        "list_thread_ids_with_running_turns",
         "list_streaming_reasoning",
         "list_streaming_reasoning_by_thread",
         "list_thread_checkouts",

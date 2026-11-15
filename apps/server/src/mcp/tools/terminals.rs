@@ -523,23 +523,29 @@ impl ToolCall<'_> {
                 .await
                 .map_err(|error| lookup_failure(&error, terminal_id))?;
             let window = read.window;
-            let (text, end) = if raw {
-                (window.text, window.end)
+            let (text, end, before_open_escape) = if raw {
+                (window.text, window.end, false)
             } else {
                 let (clean, open) = strip_escapes(&window.text);
                 if open == 0 {
-                    (clean, window.end)
+                    (clean, window.end, false)
                 } else if open < window.text.len() {
                     // An escape cut at the page's end is read whole by the next page.
-                    (clean, window.end - open as u64)
+                    (clean, window.end - open as u64, true)
                 } else {
                     // The page is one unfinished escape: skip it whole once it has ended, and
                     // stay before it while it is still arriving.
-                    (
-                        String::new(),
-                        escape_skip(&services, &owner, terminal_id, &window).await,
-                    )
+                    let end = escape_skip(&services, &owner, terminal_id, &window).await;
+                    (String::new(), end, end == window.start)
                 }
+            };
+            // When all that is left is an escape still arriving, nothing is readable now, so
+            // `more` is false. An exited terminal's unfinished escape never ends: it is the end.
+            let waiting = before_open_escape && window.end == read.total;
+            let end = if waiting && read.status == TerminalStatus::Exited {
+                read.total
+            } else {
+                end
             };
             let result = tool_result(
                 json!({
@@ -548,7 +554,7 @@ impl ToolCall<'_> {
                     "text": text,
                     "nextCursor": HistoryCursor { epoch: window.epoch, offset: end }.to_string(),
                     "dropped": window.dropped,
-                    "more": end < read.total,
+                    "more": end < read.total && !waiting,
                     "status": read.status.as_str(),
                     "exitCode": read.exit_code,
                 }),

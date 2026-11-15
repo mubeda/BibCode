@@ -957,6 +957,122 @@ async fn an_escape_still_arriving_keeps_the_cursor_before_it() {
     fixture.shutdown().await;
 }
 
+/// A tail that would start inside an escape still arriving keeps its cursor at that escape, so
+/// the read after the escape ends strips it whole.
+#[tokio::test]
+async fn a_tail_cut_inside_an_escape_still_arriving_continues_from_the_escape() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("old\u{1b}[38;2;255;");
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "old")
+        .await;
+    let tail = fixture
+        .read(&agent, json!({ "terminalId": terminal_id, "tailChars": 4 }))
+        .await;
+    assert_eq!(tail["text"], "", "{tail}");
+    backend.latest().emit("0;0mRED");
+    let done = fixture
+        .read_until(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": tail["nextCursor"] }),
+            "RED",
+        )
+        .await;
+    assert_eq!(done["text"], "RED", "{done}");
+    fixture.shutdown().await;
+}
+
+/// Reads with each returned cursor until `more` is false, failing after `pages` reads.
+async fn read_to_the_end(
+    fixture: &Fixture,
+    agent: &ClientPrincipal,
+    terminal_id: &str,
+    pages: usize,
+) -> Value {
+    let mut page = fixture
+        .read(agent, json!({ "terminalId": terminal_id, "tailChars": 4 }))
+        .await;
+    for _ in 0..pages {
+        if page["more"] == false {
+            return page;
+        }
+        page = fixture
+            .read(
+                agent,
+                json!({ "terminalId": terminal_id, "cursor": page["nextCursor"] }),
+            )
+            .await;
+    }
+    panic!("the read loop did not end: {page}");
+}
+
+/// Output that ends in an escape still arriving has nothing to read yet, so the read loop ends;
+/// its cursor still stays at the escape.
+#[tokio::test]
+async fn a_read_loop_ends_while_an_escape_is_still_arriving() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("old\u{1b}[38;2;255;");
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "old")
+        .await;
+    let last = read_to_the_end(&fixture, &agent, &terminal_id, 5).await;
+    assert_eq!(last["text"], "", "{last}");
+    let again = fixture
+        .read(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": last["nextCursor"] }),
+        )
+        .await;
+    assert_eq!(again["more"], false, "{again}");
+    assert_eq!(again["nextCursor"], last["nextCursor"]);
+    // "old" is 3 bytes, so the escape starts at offset 3.
+    assert!(
+        last["nextCursor"].as_str().unwrap().ends_with(":3"),
+        "{last}"
+    );
+    fixture.shutdown().await;
+}
+
+/// An exited terminal's unfinished escape is the end of its output.
+#[tokio::test]
+async fn a_read_loop_ends_at_an_exited_terminals_unfinished_escape() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("old\u{1b}[38;2;255;");
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "old")
+        .await;
+    backend.latest().exit.send_replace(Some(PtyExit {
+        exit_code: Some(0),
+        signal: None,
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture
+            .read(&agent, json!({ "terminalId": terminal_id }))
+            .await["status"]
+            != "exited"
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the terminal exits");
+    let last = read_to_the_end(&fixture, &agent, &terminal_id, 5).await;
+    assert_eq!(last["text"], "", "{last}");
+    assert_eq!(last["status"], "exited");
+    // The cursor moves past the 14 bytes of output, unfinished escape included.
+    assert!(
+        last["nextCursor"].as_str().unwrap().ends_with(":14"),
+        "{last}"
+    );
+    fixture.shutdown().await;
+}
+
 #[derive(Clone, Default)]
 struct CapturedLog(Arc<Mutex<Vec<u8>>>);
 

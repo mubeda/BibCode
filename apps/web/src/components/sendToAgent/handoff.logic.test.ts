@@ -197,6 +197,21 @@ describe("handoff.logic", () => {
     expect(startMissing[0]?.note).toBe("The start of the conversation is not included.");
   });
 
+  it('a picked terminal whose conversation is longer than 16,000 characters keeps its newest part and shows "The start of the conversation is not included."', async () => {
+    const text = `OLDEST${"x".repeat(16_000)}NEWEST`;
+    const [attachment] = await buildTakeOverContent({
+      source,
+      picked: row("other", "Terminal agent", "term-1"),
+      loadHandoff: loader(),
+      loadTerminalOutput: terminalOutput({ text }),
+    }).loadAttachments!();
+    expect(attachment?.text).toHaveLength(16_000);
+    expect(attachment?.text.endsWith("NEWEST")).toBe(true);
+    expect(attachment?.text).not.toContain("OLDEST");
+    expect(attachment?.leftOut).toBe("12 characters left out");
+    expect(attachment?.note).toBe("The start of the conversation is not included.");
+  });
+
   it('a picked terminal whose conversation is unreadable attaches its recent output under the label "Recent terminal output" with the note "The conversation could not be read, so this is recent terminal output."', async () => {
     const loadTerminalOutput = terminalOutput({
       text: "x".repeat(16_005),
