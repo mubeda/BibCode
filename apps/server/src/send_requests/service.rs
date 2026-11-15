@@ -450,6 +450,29 @@ impl SendRequestsService {
         Ok(ended)
     }
 
+    /// The person's requests whose mail the terminal generation `generation_key` at `address`
+    /// held.
+    pub(super) async fn requests_of_generation(
+        &self,
+        address: &str,
+        generation_key: &str,
+    ) -> crate::persistence::Result<Vec<String>> {
+        let (address, generation_key) = (address.to_owned(), generation_key.to_owned());
+        self.repositories
+            .database()
+            .call(move |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT send_request_id FROM agent_messages \
+                     WHERE recipient_address = ?1 AND recipient_terminal_generation = ?2 \
+                       AND send_request_id IS NOT NULL AND sender_kind = 'person'",
+                )?;
+                Ok(statement
+                    .query_map(params![address, generation_key], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?)
+            })
+            .await
+    }
+
     /// A message, hand-off or take-over is dismissed once its target read it.
     pub(super) async fn dismissed_once_read(&self, request_id: &str) -> bool {
         self.store

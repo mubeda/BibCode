@@ -177,19 +177,18 @@ pub(crate) fn generation_end_sink(service: SendRequestsService) -> GenerationEnd
     Arc::new(move |thread_id, terminal_id, generation_key| {
         let service = service.clone();
         let address = format!("terminal:{thread_id}/{terminal_id}");
-        // The stored generation is the process; the key is `{boot}:{process}`.
-        let process = generation_key
-            .rsplit_once(':')
-            .and_then(|(_, process)| process.parse::<i64>().ok());
+        let key = generation_key.to_owned();
         Box::pin(async move {
-            let Some(process) = process else {
-                return;
+            // The requests whose mail that generation held: exact across boots, unlike the
+            // process number the request keeps.
+            let ended = match service.requests_of_generation(&address, &key).await {
+                Ok(requests) => {
+                    service
+                        .end_open_where(|row| requests.contains(&row.request_id))
+                        .await
+                }
+                Err(error) => Err(error),
             };
-            let ended = service
-                .end_open_where(|row| {
-                    row.target_address == address && row.terminal_generation == Some(process)
-                })
-                .await;
             if let Err(error) = ended {
                 tracing::warn!(%error, "the requests of an ended terminal were kept open");
             }

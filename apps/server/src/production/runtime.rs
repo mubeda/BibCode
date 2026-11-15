@@ -3236,6 +3236,78 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// No terminal survives a restart, so the runtime ends a stored open terminal request at
+    /// start.
+    #[tokio::test]
+    async fn runtime_start_ends_an_open_terminal_request() {
+        use crate::send_requests::store::{
+            SendAction, SendRequestRow, SendRequestStore, SendState,
+        };
+
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let store = SendRequestStore::new(database.clone());
+        let at = "2026-11-14T00:00:00.000Z".to_owned();
+        store
+            .insert_if_absent(SendRequestRow {
+                request_id: "before-restart".to_owned(),
+                project_id: "p1".to_owned(),
+                source_address: "thread:a".to_owned(),
+                source_thread_id: "a".to_owned(),
+                action: SendAction::Review,
+                target_address: "terminal:b/term-1".to_owned(),
+                target_thread_id: "b".to_owned(),
+                taken_over_address: None,
+                args_digest: "digest".to_owned(),
+                note_chars: 1,
+                attachment_chars: 0,
+                target_message_id: None,
+                command_id: None,
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                answering_turn_id: None,
+                answer_message_id: None,
+                answer_text: None,
+                answer_truncated: false,
+                terminal_generation: Some(1),
+                state: SendState::Delivered,
+                reason: None,
+                created_at: at.clone(),
+                updated_at: at,
+                dismissed_at: None,
+            })
+            .await
+            .expect("request stored");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+        let row = store
+            .get("before-restart")
+            .await
+            .expect("read")
+            .expect("kept");
+        assert_eq!(
+            (row.state, row.reason.as_deref()),
+            (SendState::NotAnswered, Some("recipient_gone"))
+        );
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn host_metrics_start_with_the_runtime_and_stop_in_quiesce() {
         let state = TempDir::new().expect("state");

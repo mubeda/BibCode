@@ -517,6 +517,12 @@ impl AgentMessaging {
         {
             return Ok(receipt);
         }
+        // A request has one answer; only a replay of it gets past here once it is answered.
+        if original.status == AgentMessageStatus::Completed {
+            return Err(AgentMessagingError::InvalidArgument(
+                "This request was already answered.".to_owned(),
+            ));
+        }
         let now = crate::mcp::control::now_iso();
         let reply = NewAgentMessage {
             message_id: message_id.clone(),

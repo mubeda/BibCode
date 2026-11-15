@@ -493,6 +493,20 @@ async fn a_reply_to_a_person_request_is_stored_as_the_answer_and_queues_nothing(
         fixture.mail("person-send:r1").await.status,
         AgentMessageStatus::Completed
     );
+    let again = fixture
+        .reply("term-1", "person-send:r1", "A second answer.")
+        .await;
+    assert_eq!(
+        error_kind(&again),
+        "AgentMessagingInvalidArgumentError",
+        "{again}"
+    );
+    assert_eq!(
+        fixture
+            .count("SELECT COUNT(*) FROM agent_messages WHERE in_reply_to = 'person-send:r1'")
+            .await,
+        1
+    );
     assert_eq!(
         fixture
             .count("SELECT COUNT(*) FROM provider_turn_outbox")
