@@ -6,6 +6,7 @@ import {
   SEND_REQUEST_MAX_CHARS,
   type SendRequestAction,
   type SendRequestsSendInput,
+  type TerminalSummary,
   ThreadId,
 } from "@bibcode/contracts";
 import type { ReactNode } from "react";
@@ -50,6 +51,11 @@ export interface SendToAgentSource {
     Pick<OrchestrationMessage, "id" | "role" | "text" | "streaming" | "actor" | "personSend">
   >;
   terminalHasText: boolean;
+  /**
+   * A terminal source can be notified of a request, so Take over from, which goes to the source
+   * itself, can reach it. Unknown counts as notifiable.
+   */
+  terminalNotifiable?: boolean;
 }
 
 export type SendTarget =
@@ -112,6 +118,30 @@ export function checkoutOf(
   return row.shell.worktreePath ?? projectRootByProjectId.get(row.shell.projectId) ?? "";
 }
 
+/** The control's accessible name, naming the answers that wait for the person. */
+export function sendToAgentControlLabel(waitingAnswers: number): string {
+  if (waitingAnswers <= 0) return "Send to agent";
+  return `Send to agent, ${waitingAnswers} ${waitingAnswers === 1 ? "answer" : "answers"} waiting`;
+}
+
+/** The providers whose readiness BiBCode observes, as the server's `canReceive` names them. */
+const OBSERVED_TERMINAL_DRIVERS: ReadonlySet<string> = new Set([
+  "claudeAgent",
+  "codex",
+  "opencode",
+]);
+
+/** Whether BiBCode can tell this AI Terminal about a request: the server's `canReceive` rule. */
+export function canNotifyTerminalRow(summary: TerminalSummary | undefined): boolean {
+  return (
+    summary !== undefined &&
+    summary.status === "running" &&
+    summary.agentStatus !== undefined &&
+    summary.agentStatus.state !== "unavailable" &&
+    OBSERVED_TERMINAL_DRIVERS.has(summary.command?.activity?.driverKind ?? "")
+  );
+}
+
 export function resolveActionAvailability(input: {
   source: SendToAgentSource;
   action: SendRequestAction;
@@ -119,6 +149,9 @@ export function resolveActionAvailability(input: {
 }): { disabledReason: string | null } {
   const { source, action } = input;
   if (!input.serverSupported) return { disabledReason: SEND_TO_AGENT_SERVER_UPDATE_REASON };
+  if (action === "take-over" && source.terminalId !== null && source.terminalNotifiable === false) {
+    return { disabledReason: TERMINAL_NOT_NOTIFIABLE_REASON };
+  }
   if (action === "second-opinion" || action === "hand-off") {
     if (source.terminalId !== null && !source.terminalHasText) {
       return { disabledReason: NOTHING_TO_ATTACH_REASON };

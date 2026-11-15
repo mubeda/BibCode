@@ -419,6 +419,37 @@ impl SendRequestsService {
         }
     }
 
+    /// Ends every open request `concerned` names as not answered with `recipient_gone`, and
+    /// returns how many it ended. An answered request keeps its answer: it is not open.
+    pub(super) async fn end_open_where(
+        &self,
+        concerned: impl Fn(&SendRequestRow) -> bool,
+    ) -> crate::persistence::Result<usize> {
+        let mut ended = 0;
+        for row in self
+            .store
+            .list_open()
+            .await?
+            .iter()
+            .filter(|row| concerned(row))
+        {
+            let change = StateChange {
+                to: SendState::NotAnswered,
+                reason: Some("recipient_gone".to_owned()),
+                answering_turn_id: None,
+                answer_message_id: None,
+                answer_text: None,
+                answer_truncated: false,
+                dismiss: false,
+                at: crate::mcp::control::now_iso(),
+            };
+            if self.apply(&row.request_id, &OPEN, change).await?.is_some() {
+                ended += 1;
+            }
+        }
+        Ok(ended)
+    }
+
     /// A message, hand-off or take-over is dismissed once its target read it.
     pub(super) async fn dismissed_once_read(&self, request_id: &str) -> bool {
         self.store

@@ -906,9 +906,13 @@ impl ProductionRuntime {
         ));
         let terminal_pointer_task = CancellationToken::new();
         // Attached before the pointer is shared: its sinks are per clone.
-        let terminal_pointer = terminal_pointer.with_request_sink(
-            crate::send_requests::terminal::request_state_sink(send_requests.clone()),
-        );
+        let terminal_pointer = terminal_pointer
+            .with_request_sink(crate::send_requests::terminal::request_state_sink(
+                send_requests.clone(),
+            ))
+            .with_generation_end_sink(crate::send_requests::terminal::generation_end_sink(
+                send_requests.clone(),
+            ));
         // Terminal deliveries reach the activity log through the same sink as chat ones.
         let agent_messaging = start_terminal_messaging(
             agent_messaging,
@@ -920,6 +924,11 @@ impl ProductionRuntime {
 
         // Late, so a failed start leaves no follower running.
         let send_requests_follower = CancellationToken::new();
+        if let Err(error) =
+            crate::send_requests::terminal::fail_open_terminal_requests(&send_requests).await
+        {
+            tracing::warn!(%error, "open terminal requests were kept open at start");
+        }
         send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
         let terminal_credential_revoker = CancellationToken::new();
         terminal_credentials.spawn_revoker(

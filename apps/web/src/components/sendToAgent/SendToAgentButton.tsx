@@ -48,6 +48,7 @@ import {
   type SendChoice,
   type SendTargetEntry,
   type SendToAgentSource,
+  sendToAgentControlLabel,
 } from "./sendToAgent.logic";
 
 /** What the open menu needs and the closed button must not subscribe to. */
@@ -56,6 +57,8 @@ export interface LiveSendInputs {
   rows: ReadonlyArray<AgentRow>;
   /** The out-of-tokens hint of an agent, from data read only while the menu is open. */
   hintFor?: (row: AgentRow) => OutOfTokensHint | null;
+  /** Whether a terminal row can be notified, from terminal state read only while open. */
+  canNotifyTerminal?: (row: AgentRow) => boolean;
 }
 
 export interface SendToAgentButtonProps {
@@ -83,6 +86,8 @@ export interface SendToAgentButtonProps {
   revealPanel?: (panel: ThreadId) => void;
   /** Where focus goes when the preview closes; the trigger by default. */
   finalFocus?: RefObject<HTMLElement | null>;
+  /** Answers to this source's requests that wait for the person, named on the control. */
+  waitingAnswers?: number;
   newId?: () => string;
 }
 
@@ -97,19 +102,30 @@ const noSend = () =>
   Promise.resolve<SendOutcome>({ kind: "failed", reason: "invalid", message: "Cannot send." });
 
 function TriggerButton(
-  props: ComponentProps<typeof Button> & { readonly unavailable?: boolean },
+  props: ComponentProps<typeof Button> & {
+    readonly unavailable?: boolean;
+    readonly waitingAnswers?: number;
+  },
 ): ReactElement {
-  const { unavailable, ...rest } = props;
+  const { unavailable, waitingAnswers = 0, ...rest } = props;
   return (
     <Button
       variant="ghost"
       size="icon-sm"
       type="button"
-      aria-label="Send to agent"
+      aria-label={sendToAgentControlLabel(waitingAnswers)}
+      className={waitingAnswers > 0 ? "relative" : undefined}
       {...(unavailable ? { "aria-disabled": "true" as const } : {})}
       {...rest}
     >
       <ForwardIcon />
+      {waitingAnswers > 0 ? (
+        <span
+          aria-hidden="true"
+          data-waiting-answers={waitingAnswers}
+          className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
+        />
+      ) : null}
     </Button>
   );
 }
@@ -148,7 +164,15 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
     <>
       <Menu open={menuOpen} onOpenChange={setMenuOpen}>
         <Tooltip>
-          <TooltipTrigger render={<MenuTrigger render={<TriggerButton ref={triggerRef} />} />} />
+          <TooltipTrigger
+            render={
+              <MenuTrigger
+                render={
+                  <TriggerButton ref={triggerRef} waitingAnswers={props.waitingAnswers ?? 0} />
+                }
+              />
+            }
+          />
           <TooltipPopup side="top">Send to agent</TooltipPopup>
         </Tooltip>
         <MenuPopup side="top" align="end" className="w-72 max-w-[calc(100vw-2rem)]">
@@ -159,6 +183,9 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
                   source={live.source}
                   rows={live.rows}
                   {...(live.hintFor === undefined ? {} : { hintFor: live.hintFor })}
+                  {...(live.canNotifyTerminal === undefined
+                    ? {}
+                    : { canNotifyTerminal: live.canNotifyTerminal })}
                   onChoose={choose}
                 />
               ))

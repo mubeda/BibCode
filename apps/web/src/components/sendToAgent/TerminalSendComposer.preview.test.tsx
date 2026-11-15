@@ -30,6 +30,7 @@ vi.mock("~/state/server", () => ({ serverEnvironment: { providerUsage: () => nul
 vi.mock("~/state/sendRequests", () => ({
   useSendRequest: () => h.send,
   useGetTerminalOutput: () => h.getTerminalOutput,
+  useSendRequests: () => [],
 }));
 // The composer must never reach the terminal's write command.
 vi.mock("~/state/terminal", () => ({
@@ -41,6 +42,7 @@ vi.mock("~/state/terminal", () => ({
   },
 }));
 vi.mock("../agents/useAgentRows", () => ({ useAgentRows: () => h.rows }));
+vi.mock("../../hooks/useAgentFreshness", () => ({ useAgentTerminalSources: () => [] }));
 
 import { useSendToAgentStore } from "~/sendToAgentStore";
 import { buildAgentRows } from "../sidebar/agentsSection.logic";

@@ -16,6 +16,7 @@ import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { useAgentRows } from "../agents/useAgentRows";
 import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
+import { useCanNotifyTerminal } from "./TerminalSendComposer";
 import type {
   NewPanelProvider,
   PreviewContent,
@@ -26,7 +27,7 @@ import type {
 const NO_ROWS: ReadonlyArray<AgentRow> = [];
 const NO_MESSAGES: SendToAgentSource["messages"] = [];
 
-// Until terminals can be notified (phase 9), no terminal is offered as a target.
+// The closed control lists no rows; the open menu reads terminal state for the real answer.
 const canNotifyTerminal = () => false;
 
 /** Mounted while the menu is open: the only reader of the messages and the agent directory. */
@@ -46,7 +47,8 @@ function LiveSendInputsReader(props: {
     (row: AgentRow) => resolveOutOfTokensHint({ row, usage, now: new Date() }),
     [usage],
   );
-  return props.render({ source, rows, hintFor });
+  const canNotifyTerminal = useCanNotifyTerminal(props.threadRef.environmentId);
+  return props.render({ source, rows, hintFor, canNotifyTerminal });
 }
 
 export const ChatSendToAgentControl = memo(function ChatSendToAgentControl(props: {

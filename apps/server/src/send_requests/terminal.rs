@@ -12,7 +12,7 @@ use super::{
     service::{SendRequestsService, cut_answer, refusal},
     store::{SendAction, SendRequestRow, SendState, StateChange},
 };
-pub(crate) use crate::agent_messaging::pointer::RequestStateSink;
+pub(crate) use crate::agent_messaging::pointer::{GenerationEndSink, RequestStateSink};
 use crate::agent_messaging::{
     AgentMessagingError, directory,
     pointer::{TERMINAL_RECIPIENT_MODE, TerminalPointer},
@@ -169,6 +169,41 @@ async fn follow_mail(service: &SendRequestsService, row: AgentMessageRow) {
     if let Err(error) = service.apply(&request_id, from, change).await {
         tracing::warn!(%request_id, %error, "a terminal request's state was not stored");
     }
+}
+
+/// Ends, as not answered with `recipient_gone`, every open request to the terminal generation
+/// that ended, from `queued`, `delivered` and `read` alike; an answered one keeps its answer.
+pub(crate) fn generation_end_sink(service: SendRequestsService) -> GenerationEndSink {
+    Arc::new(move |thread_id, terminal_id, generation_key| {
+        let service = service.clone();
+        let address = format!("terminal:{thread_id}/{terminal_id}");
+        // The stored generation is the process; the key is `{boot}:{process}`.
+        let process = generation_key
+            .rsplit_once(':')
+            .and_then(|(_, process)| process.parse::<i64>().ok());
+        Box::pin(async move {
+            let Some(process) = process else {
+                return;
+            };
+            let ended = service
+                .end_open_where(|row| {
+                    row.target_address == address && row.terminal_generation == Some(process)
+                })
+                .await;
+            if let Err(error) = ended {
+                tracing::warn!(%error, "the requests of an ended terminal were kept open");
+            }
+        })
+    })
+}
+
+/// At server start, ends every open request to a terminal: no terminal survives a restart.
+pub(crate) async fn fail_open_terminal_requests(
+    service: &SendRequestsService,
+) -> crate::persistence::Result<usize> {
+    service
+        .end_open_where(|row| parse_terminal_address(&row.target_address).is_some())
+        .await
 }
 
 #[cfg(test)]

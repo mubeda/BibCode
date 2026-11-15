@@ -26,19 +26,21 @@ import {
 
 import { useProjects, useThreadShell } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
-import { useGetTerminalOutput, useSendRequest } from "~/state/sendRequests";
+import { useGetTerminalOutput, useSendRequest, useSendRequests } from "~/state/sendRequests";
 import { serverEnvironment } from "~/state/server";
+import { useAgentTerminalSources } from "../../hooks/useAgentFreshness";
 import { useAgentRows } from "../agents/useAgentRows";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { SECOND_OPINION_LEAD_IN } from "./attachments.logic";
 import { HAND_OFF_LEAD_IN } from "./handoff.logic";
 import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
-import type {
-  NewPanelProvider,
-  PreviewContent,
-  SendChoice,
-  SendToAgentSource,
+import {
+  canNotifyTerminalRow,
+  type NewPanelProvider,
+  type PreviewContent,
+  type SendChoice,
+  type SendToAgentSource,
 } from "./sendToAgent.logic";
 import {
   terminalAttachment,
@@ -68,8 +70,31 @@ export const TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE =
   "BiBCode could not read this terminal's output. Try again.";
 const NO_MESSAGES: SendToAgentSource["messages"] = [];
 
-// Until a terminal can be notified (task 9.2), no terminal is offered as a target.
+// The closed control lists no rows; the open menu reads terminal state for the real answer.
 const canNotifyTerminal = () => false;
+
+/**
+ * Whether a terminal row of `environmentId` can be notified of a request, from its live terminal
+ * summary. Call it only in a component mounted while the menu is open.
+ */
+export function useCanNotifyTerminal(
+  environmentId: ScopedThreadRef["environmentId"],
+): (row: Pick<AgentRow, "ref" | "terminalId">) => boolean {
+  const environmentIds = useMemo(() => [environmentId], [environmentId]);
+  const sources = useAgentTerminalSources(environmentIds);
+  return useCallback(
+    (row: Pick<AgentRow, "ref" | "terminalId">) =>
+      canNotifyTerminalRow(
+        sources
+          .find((source) => source.environmentId === row.ref.environmentId)
+          ?.rows.find(
+            (summary) =>
+              summary.threadId === row.ref.threadId && summary.terminalId === row.terminalId,
+          ),
+      ),
+    [sources],
+  );
+}
 
 /** Rejects when the output could not be read. */
 type LoadOutput = () => Promise<TerminalOutputText>;
@@ -114,8 +139,17 @@ function LiveTerminalInputsReader(props: {
   // Loading and failed keep the entries enabled: only a read that found nothing says so. A failed
   // read shows the preview's error and Retry when an entry is chosen.
   const hasText = hasSelection || typeof output !== "object" || terminalHasText(null, output);
-  const source = useMemo(() => ({ ...base, terminalHasText: hasText }), [base, hasText]);
-  return props.render({ source, rows, hintFor });
+  const canNotifyTerminal = useCanNotifyTerminal(props.environmentId);
+  // Take over from goes to this terminal itself, so it needs this terminal to be notifiable.
+  const terminalNotifiable = canNotifyTerminal({
+    ref: { environmentId: base.environmentId, threadId: base.threadId },
+    terminalId: base.terminalId,
+  });
+  const source = useMemo(
+    () => ({ ...base, terminalHasText: hasText, terminalNotifiable }),
+    [base, hasText, terminalNotifiable],
+  );
+  return props.render({ source, rows, hintFor, canNotifyTerminal });
 }
 
 function TerminalSendComposerBody(props: {
@@ -141,6 +175,13 @@ function TerminalSendComposerBody(props: {
   const projects = useProjects();
   const send = useSendRequest(environmentId);
   const getTerminalOutput = useGetTerminalOutput(environmentId);
+  // A terminal source's answers wait on its control, the only place the person acts from it.
+  const requests = useSendRequests(environmentId);
+  const waitingAnswers = useMemo(() => {
+    const address = `terminal:${threadId}/${terminalId}`;
+    return requests.filter((request) => request.source === address && request.state === "answered")
+      .length;
+  }, [requests, terminalId, threadId]);
   const projectRootByProjectId = useMemo(
     () => new Map(projects.map((project) => [project.id as string, project.workspaceRoot])),
     [projects],
@@ -264,6 +305,7 @@ function TerminalSendComposerBody(props: {
       createPanel={createPanel}
       {...(viewportFocus === undefined ? {} : { finalFocus: viewportFocus })}
       revealPanel={services.revealPanel}
+      waitingAnswers={waitingAnswers}
     />
   );
 }

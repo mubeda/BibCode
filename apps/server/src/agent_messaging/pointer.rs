@@ -152,8 +152,8 @@ pub struct InboxEntry {
 }
 
 /// Told `(thread id, terminal id, generation key)` once for every terminal generation that
-/// ended with mail, read or not.
-pub type GenerationEndSink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+/// ended with mail, read or not. Its future is awaited in the task that recorded the end.
+pub type GenerationEndSink = Arc<dyn Fn(&str, &str, &str) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Told each mail row of a person's request, or the reply to one, after its change committed:
 /// `delivered`, `consumed`, or a `completed` reply. Awaited in order under the terminal's
@@ -235,10 +235,6 @@ impl TerminalPointer {
         lock.lock_owned().await
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "task 9.3 supplies the generation-end sink")
-    )]
     pub fn with_generation_end_sink(mut self, sink: GenerationEndSink) -> Self {
         self.generation_end = Some(sink);
         self
@@ -730,7 +726,7 @@ impl TerminalPointer {
                 && (!failed.is_empty() || read > 0)
                 && let Some(sink) = &pointer.generation_end
             {
-                sink(&thread, &terminal, &key);
+                sink(&thread, &terminal, &key).await;
             }
             failed
         });
@@ -1295,6 +1291,7 @@ pub(crate) mod tests {
                     terminal_id.to_owned(),
                     generation_key.to_owned(),
                 ));
+                Box::pin(std::future::ready(()))
             },
         ));
         let (enabled, receiver) = watch::channel(true);
@@ -2540,6 +2537,7 @@ pub(crate) mod tests {
                     terminal_id.to_owned(),
                     generation_key.to_owned(),
                 ));
+                Box::pin(std::future::ready(()))
             },
         ));
         let stop = CancellationToken::new();

@@ -86,7 +86,9 @@ async fn fixture(enabled: bool) -> Fixture {
     let database = harness.engine.repositories().database().clone();
     let pointer = TerminalPointer::new(database.clone(), terminals.clone());
     let service = harness.send_requests().with_terminal_mail(pointer.clone());
-    let pointer = pointer.with_request_sink(request_state_sink(service.clone()));
+    let pointer = pointer
+        .with_request_sink(request_state_sink(service.clone()))
+        .with_generation_end_sink(generation_end_sink(service.clone()));
     let (enabled, receiver) = watch::channel(enabled);
     let messaging =
         AgentMessaging::new(harness.engine.clone(), receiver).with_terminals(pointer.clone());
@@ -873,5 +875,158 @@ async fn a_terminal_requests_source_thread_is_its_owner_thread() {
         .unwrap();
     assert_eq!(sent.source_thread_id, "b");
     assert_eq!(fixture.request("r1").await.source_thread_id, "b");
+    fixture.shutdown().await;
+}
+
+// ---- Task 9.3: the end of a terminal generation ----
+
+#[derive(Clone, Copy, Debug)]
+enum End {
+    Close,
+    Exit,
+    Restart,
+    Replace,
+}
+
+impl Fixture {
+    fn end(&self, terminal_id: &str, end: End) {
+        match end {
+            End::Close => self.terminals.close("b", terminal_id),
+            End::Exit => self.terminals.set_generation("b", terminal_id, None),
+            End::Restart => self.terminals.set_generation("b", terminal_id, Some(2)),
+            End::Replace => {
+                self.terminals.close("b", terminal_id);
+                self.terminals.add("b", terminal_id, 3, true);
+            }
+        }
+    }
+
+    async fn until_reason(&self, request_id: &str, state: SendState, reason: &str) {
+        self.until_state(request_id, state).await;
+        assert_eq!(
+            self.request(request_id).await.reason.as_deref(),
+            Some(reason),
+            "{request_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_to_a_terminal_whose_generation_ends_shows_not_answered() {
+    let fixture = fixture(true).await;
+    fixture.start();
+    let mut run = 0;
+    for end in [End::Close, End::Exit, End::Restart, End::Replace] {
+        for start in [SendState::Queued, SendState::Delivered, SendState::Read] {
+            run += 1;
+            let (terminal_id, request_id) = (format!("g-{run}"), format!("end-{run}"));
+            fixture.terminals.add("b", &terminal_id, 1, true);
+            fixture
+                .send(input(
+                    &request_id,
+                    "review",
+                    "thread:api",
+                    &format!("terminal:b/{terminal_id}"),
+                ))
+                .await
+                .unwrap();
+            if start != SendState::Queued {
+                fixture.terminals.set_ready("b", &terminal_id);
+                fixture.until_state(&request_id, SendState::Delivered).await;
+            }
+            if start == SendState::Read {
+                assert_eq!(fixture.inbox(&terminal_id).await.len(), 1);
+            }
+            assert_eq!(fixture.state(&request_id).await, start, "{end:?}");
+            fixture.end(&terminal_id, end);
+            fixture
+                .until_reason(&request_id, SendState::NotAnswered, "recipient_gone")
+                .await;
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_restart_fails_open_terminal_requests() {
+    let fixture = fixture(true).await;
+    fixture.send(review("r1")).await.unwrap();
+    fixture.send(review("r2")).await.unwrap();
+    fixture.inbox("term-1").await;
+    assert_eq!(
+        fail_open_terminal_requests(&fixture.service).await.unwrap(),
+        2
+    );
+    fixture
+        .until_reason("r1", SendState::NotAnswered, "recipient_gone")
+        .await;
+    fixture
+        .until_reason("r2", SendState::NotAnswered, "recipient_gone")
+        .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn generation_end_is_published_to_a_subscribed_stream() {
+    let fixture = fixture(true).await;
+    fixture.start();
+    let mut stream =
+        fixture
+            .service
+            .subscribe(&person(), Some("api".to_owned()), CancellationToken::new());
+    fixture.send(review("r1")).await.unwrap();
+    fixture.end("term-1", End::Close);
+    let state = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let chunk = stream.recv().await.expect("open").expect("not an error");
+            for event in chunk {
+                if event["type"] == "upsert"
+                    && event["request"]["requestId"] == "r1"
+                    && event["request"]["state"] == "not_answered"
+                {
+                    return event["request"]["reason"].as_str().unwrap().to_owned();
+                }
+            }
+        }
+    })
+    .await
+    .expect("the not answered upsert arrives");
+    assert_eq!(state, "recipient_gone");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_answer_stored_before_the_generation_ended_is_kept() {
+    let fixture = fixture(true).await;
+    fixture.start();
+    fixture.send(review("r1")).await.unwrap();
+    fixture.inbox("term-1").await;
+    fixture
+        .reply("term-1", "person-send:r1", "Kept answer.")
+        .await;
+    // A second, unanswered request makes the generation end reach the sink.
+    fixture.send(review("r2")).await.unwrap();
+    fixture.end("term-1", End::Close);
+    fixture
+        .until_reason("r2", SendState::NotAnswered, "recipient_gone")
+        .await;
+    assert_eq!(fixture.state("r1").await, SendState::Answered);
+    let answer = fixture.service.get_answer(&person(), "r1").await.unwrap();
+    assert_eq!(answer.text, "Kept answer.");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_terminal_answer_is_returned_by_get_answer_cut_at_48000_characters() {
+    let fixture = fixture(true).await;
+    fixture.send(review("r1")).await.unwrap();
+    fixture.inbox("term-1").await;
+    let replied = fixture
+        .reply("term-1", "person-send:r1", &"y".repeat(60_000))
+        .await;
+    assert_eq!(replied["ok"], true, "{}", replied["error"]);
+    let answer = fixture.service.get_answer(&person(), "r1").await.unwrap();
+    assert!(answer.truncated);
+    assert_eq!(answer.text.chars().count(), 48_000);
     fixture.shutdown().await;
 }

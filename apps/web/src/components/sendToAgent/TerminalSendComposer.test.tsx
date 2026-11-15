@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   getTerminalOutput: vi.fn(),
   terminalWrites: 0,
   send: vi.fn(),
+  requests: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("~/state/entities", () => ({
@@ -23,6 +24,7 @@ vi.mock("~/state/server", () => ({ serverEnvironment: { providerUsage: () => nul
 vi.mock("~/state/sendRequests", () => ({
   useSendRequest: () => h.send,
   useGetTerminalOutput: () => h.getTerminalOutput,
+  useSendRequests: () => h.requests,
 }));
 // The composer must never reach the terminal's write command.
 vi.mock("~/state/terminal", () => ({
@@ -34,6 +36,7 @@ vi.mock("~/state/terminal", () => ({
   },
 }));
 vi.mock("../agents/useAgentRows", () => ({ useAgentRows: () => [] }));
+vi.mock("../../hooks/useAgentFreshness", () => ({ useAgentTerminalSources: () => [] }));
 vi.mock("./SendToAgentButton", () => ({
   SendToAgentButton: (props: Record<string, unknown>) => {
     h.buttonProps.push(props);
@@ -112,6 +115,7 @@ beforeEach(() => {
   h.live = null;
   h.menuOpen = false;
   h.terminalWrites = 0;
+  h.requests = [];
   h.getTerminalOutput.mockReset();
   h.getTerminalOutput.mockResolvedValue({
     threadId: "owner",
@@ -223,6 +227,22 @@ describe("TerminalSendComposer", () => {
     const content = previewContentFor()(choiceFor("second-opinion"));
     await content?.loadAttachments?.();
     expect(h.terminalWrites).toBe(0);
+  });
+
+  it("the_control_counts_the_answers_waiting_for_this_terminal_only", () => {
+    const request = (requestId: string, source: string, state: string) => ({
+      requestId,
+      source,
+      state,
+    });
+    h.requests = [
+      request("r1", "terminal:owner/term-1", "answered"),
+      request("r2", "terminal:owner/term-1", "read"),
+      request("r3", "terminal:owner/term-2", "answered"),
+      request("r4", "thread:owner", "answered"),
+    ];
+    render();
+    expect(h.buttonProps.at(-1)!["waitingAnswers"]).toBe(1);
   });
 
   it("renders nothing without the host chat's services", () => {
