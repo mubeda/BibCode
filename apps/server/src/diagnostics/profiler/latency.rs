@@ -184,6 +184,8 @@ pub fn is_long_running(method: &str) -> bool {
             // `agentSessions.listForThread` stays out: its budget bounds it, so a slow one is a
             // finding.
             | "agentSessions.openInPanel"
+            // A Codex AI Terminal's conversation waits on Codex for up to 5 s (R112).
+            | "sendRequests.getTerminalOutput"
             // Waits on discovery and `simctl`: `check_available` lists simulators (up to
             // 15 s), and a rediscovery runs the Xcode probes.
             | "device.open"
@@ -1138,6 +1140,27 @@ mod tests {
         let finding = hang_finding(&hung[0].0, hung[0].1);
         assert_eq!(finding.kind, "rpc.hang");
         assert_eq!(finding.fingerprint_fields, ["test.hung", "server"]);
+    }
+
+    #[test]
+    fn get_terminal_output_is_long_running() {
+        let book = LatencyBook::default();
+
+        book.observe(
+            "sendRequests.getTerminalOutput",
+            "success",
+            4_000.0,
+            0.0,
+            None,
+        );
+        book.observe("sendRequests.getHandoffText", "success", 4_000.0, 0.0, None);
+
+        let slow = lock(&book.slow);
+        assert!(
+            !slow.contains_key(&("sendRequests.getTerminalOutput".to_owned(), "success")),
+            "a read that waits on Codex for up to 5 s is no rpc.slow finding"
+        );
+        assert!(slow.contains_key(&("sendRequests.getHandoffText".to_owned(), "success")));
     }
 
     #[test]

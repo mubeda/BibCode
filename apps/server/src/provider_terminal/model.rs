@@ -702,6 +702,23 @@ struct TerminalObserverGenerationInner {
     cancellation_requested_while_current: AtomicBool,
     cancellation: CancellationToken,
     agent_status: watch::Sender<Option<TerminalAgentObservation>>,
+    conversation: StdMutex<ObservedSession>,
+    codex_conversation: StdMutex<Option<super::CodexConversationHandle>>,
+}
+
+/// The CLI conversation a Claude AI Terminal's status hooks name (spec R112): the session the
+/// observer bound and the transcript path the CLI reported for it. The path is untrusted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedConversation {
+    pub session_id: String,
+    pub transcript_path: PathBuf,
+}
+
+/// The main session the status hooks bound, and its conversation while one was reported.
+#[derive(Debug, Default)]
+struct ObservedSession {
+    session_id: Option<String>,
+    conversation: Option<ObservedConversation>,
 }
 
 /// A terminal agent's main state as its observer last saw it, for the left panel (#187).
@@ -873,6 +890,8 @@ impl TerminalObserverGeneration {
                     cancellation_requested_while_current: AtomicBool::new(false),
                     cancellation: cancellation.clone(),
                     agent_status: watch::channel(None).0,
+                    conversation: StdMutex::default(),
+                    codex_conversation: StdMutex::default(),
                 }),
             },
             workers: TerminalObserverWorkerContext {
@@ -1091,6 +1110,78 @@ impl TerminalObserverGenerationLease {
                 }
                 _ => false,
             })
+    }
+
+    fn observed(&self) -> std::sync::MutexGuard<'_, ObservedSession> {
+        self.inner
+            .conversation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Binds the main session and the transcript its CLI reported, while this generation is
+    /// current.
+    pub(crate) fn publish_conversation(&self, conversation: ObservedConversation) {
+        if self.is_current() {
+            *self.observed() = ObservedSession {
+                session_id: Some(conversation.session_id.clone()),
+                conversation: Some(conversation),
+            };
+        }
+    }
+
+    /// Binds the main session without a usable transcript: a conversation of another session
+    /// is forgotten, the one of this session is kept.
+    pub(crate) fn bind_conversation_session(&self, session_id: &str) {
+        if !self.is_current() {
+            return;
+        }
+        let mut observed = self.observed();
+        if observed.session_id.as_deref() != Some(session_id) {
+            *observed = ObservedSession {
+                session_id: Some(session_id.to_owned()),
+                conversation: None,
+            };
+        }
+    }
+
+    pub(crate) fn observed_conversation(&self) -> Option<ObservedConversation> {
+        self.observed().conversation.clone()
+    }
+
+    /// The main session the status hooks bound last.
+    pub(crate) fn observed_session(&self) -> Option<String> {
+        self.observed().session_id.clone()
+    }
+
+    /// Hands out the way into a Codex observer's loop, while this generation is current.
+    pub(crate) fn publish_codex_conversation(&self, handle: super::CodexConversationHandle) {
+        if self.is_current() {
+            *self
+                .inner
+                .codex_conversation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+        }
+    }
+
+    /// Asks this generation's Codex observer for its root conversation, as a send's preview
+    /// does; whether it answered. For integration tests, which cannot name the handle.
+    #[doc(hidden)]
+    pub async fn request_codex_conversation_for_integration_test(&self) -> bool {
+        match self.codex_conversation() {
+            Some(handle) => handle.request().await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// The way into this generation's Codex observer loop, once it resumed its root thread.
+    pub(crate) fn codex_conversation(&self) -> Option<super::CodexConversationHandle> {
+        self.inner
+            .codex_conversation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it

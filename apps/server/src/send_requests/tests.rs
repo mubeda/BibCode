@@ -3198,10 +3198,16 @@ async fn handoff_refuses_an_unknown_thread() {
     harness.shutdown().await;
 }
 
-/// A terminal that holds `text` and records every `tail` call. It has no write method.
+/// A terminal that holds `text` and records every `tail` call. It has no write method. A Claude
+/// terminal also names its observed conversation and its launch environment.
 struct FakeTerminalOutput {
     text: String,
     calls: std::sync::Mutex<Vec<(String, String, usize)>>,
+    conversation: Option<crate::provider_terminal::ObservedConversation>,
+    session: Option<String>,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    codex: Option<crate::provider_terminal::CodexConversationHandle>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl FakeTerminalOutput {
@@ -3209,11 +3215,103 @@ impl FakeTerminalOutput {
         std::sync::Arc::new(Self {
             text,
             calls: std::sync::Mutex::default(),
+            conversation: None,
+            session: None,
+            environment: Vec::new(),
+            codex: None,
+            cwd: None,
+        })
+    }
+
+    fn codex(
+        text: &str,
+        handle: crate::provider_terminal::CodexConversationHandle,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            text: text.to_owned(),
+            calls: std::sync::Mutex::default(),
+            conversation: None,
+            session: None,
+            environment: Vec::new(),
+            codex: Some(handle),
+            cwd: None,
+        })
+    }
+
+    /// A Claude terminal launched in `/work/sample`, whose project folder is `-work-sample`.
+    fn claude(
+        text: &str,
+        conversation: Option<crate::provider_terminal::ObservedConversation>,
+        session: Option<&str>,
+        config_dir: &std::path::Path,
+    ) -> std::sync::Arc<Self> {
+        Self::claude_in("/work/sample", text, conversation, session, config_dir)
+    }
+
+    fn claude_in(
+        cwd: &str,
+        text: &str,
+        conversation: Option<crate::provider_terminal::ObservedConversation>,
+        session: Option<&str>,
+        config_dir: &std::path::Path,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            text: text.to_owned(),
+            calls: std::sync::Mutex::default(),
+            conversation,
+            session: session.map(str::to_owned),
+            environment: vec![("CLAUDE_CONFIG_DIR".into(), config_dir.into())],
+            codex: None,
+            cwd: Some(cwd.into()),
         })
     }
 }
 
 impl crate::send_requests::service::TerminalOutputSource for FakeTerminalOutput {
+    fn working_directory<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<std::path::PathBuf>> {
+        Box::pin(async move { self.cwd.clone() })
+    }
+
+    fn codex_conversation<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Option<crate::provider_terminal::CodexConversationHandle>,
+    > {
+        Box::pin(async move { self.codex.clone() })
+    }
+
+    fn observed_conversation<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<crate::provider_terminal::ObservedConversation>>
+    {
+        Box::pin(async move { self.conversation.clone() })
+    }
+
+    fn observed_session<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.session.clone() })
+    }
+
+    fn launch_environment<'a>(
+        &'a self,
+        _owner_thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+        Box::pin(async move { self.environment.clone() })
+    }
+
     fn tail<'a>(
         &'a self,
         owner_thread_id: &'a str,
@@ -3386,7 +3484,7 @@ async fn get_terminal_output_only_reads() {
 }
 
 #[tokio::test]
-async fn get_terminal_output_conversation_request_falls_back_to_output_until_a_reader_exists() {
+async fn get_terminal_output_conversation_without_an_observed_session_falls_back_to_output() {
     let harness = harness().await;
     let service = harness
         .send_requests()
@@ -3404,6 +3502,336 @@ async fn get_terminal_output_conversation_request_falls_back_to_output_until_a_r
     assert_eq!(result["fellBack"], true);
     assert_eq!(result["text"], "hello");
     harness.shutdown().await;
+}
+
+const CLAUDE_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+
+/// A Claude config folder whose project folder holds `CLAUDE_SESSION`'s transcript.
+fn claude_config() -> (tempfile::TempDir, std::path::PathBuf) {
+    let config = tempfile::tempdir().expect("config folder");
+    let project = config.path().join("projects/-work-sample");
+    std::fs::create_dir_all(&project).expect("project folder");
+    let transcript = project.join(format!("{CLAUDE_SESSION}.jsonl"));
+    let records = [
+        json!({"type": "user", "sessionId": CLAUDE_SESSION,
+               "message": {"role": "user", "content": "Test question one"}}),
+        json!({"type": "assistant", "sessionId": CLAUDE_SESSION,
+               "message": {"role": "assistant",
+                           "content": [{"type": "text", "text": "Test answer one"}]}}),
+    ];
+    std::fs::write(
+        &transcript,
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>(),
+    )
+    .expect("transcript");
+    (config, transcript)
+}
+
+fn observed_conversation(
+    path: std::path::PathBuf,
+) -> crate::provider_terminal::ObservedConversation {
+    crate::provider_terminal::ObservedConversation {
+        session_id: CLAUDE_SESSION.to_owned(),
+        transcript_path: path,
+    }
+}
+
+fn conversation_input(part: &str) -> Value {
+    json!({
+        "sourceThreadId": "b", "threadId": "a", "terminalId": "term-1",
+        "source": "conversation", "part": part,
+    })
+}
+
+#[tokio::test]
+async fn get_terminal_output_conversation_reads_the_observed_session() {
+    let harness = harness().await;
+    let (config, transcript) = claude_config();
+    let fake = FakeTerminalOutput::claude(
+        "recent output",
+        Some(observed_conversation(transcript)),
+        Some(CLAUDE_SESSION),
+        config.path(),
+    );
+    let service = harness.send_requests().with_terminal_output(fake.clone());
+
+    for (part, expected) in [
+        (
+            "handoff",
+            "[user] Test question one\n[assistant] Test answer one",
+        ),
+        ("last-answer", "Test answer one"),
+    ] {
+        let result = read_terminal_output(service.clone(), person(), conversation_input(part))
+            .await
+            .expect("readable");
+
+        assert_eq!(result["text"], expected, "{part}");
+        assert_eq!(result["usedSource"], "conversation");
+        assert_eq!(result["fellBack"], false);
+        assert_eq!(result["startMissing"], false);
+        assert_eq!(result["truncated"], false);
+    }
+    assert!(fake.calls.lock().unwrap().is_empty(), "no output was read");
+    harness.shutdown().await;
+}
+
+/// Every refusal of the reader, as a fake terminal: each must fall back to the output.
+fn unreadable_conversations(
+    config: &std::path::Path,
+    transcript: &std::path::Path,
+) -> Vec<(&'static str, std::sync::Arc<FakeTerminalOutput>)> {
+    let elsewhere = config.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let outside = elsewhere.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::copy(transcript, &outside).expect("outside copy");
+    let project = transcript.parent().unwrap();
+    let misnamed = project.join("33333333-3333-4333-8333-333333333333.jsonl");
+    std::fs::copy(transcript, &misnamed).expect("misnamed copy");
+    let large_folder = config.join("projects/-work-large");
+    std::fs::create_dir_all(&large_folder).expect("large folder");
+    let large = large_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::File::create(&large)
+        .and_then(|file| file.set_len(crate::provider_terminal::MAX_TRANSCRIPT_BYTES + 1))
+        .expect("sparse file");
+    let empty_folder = config.join("projects/-work-empty");
+    std::fs::create_dir_all(&empty_folder).expect("empty folder");
+    let empty = empty_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::write(&empty, "").expect("empty");
+    let missing = config.join(format!("projects/-work-missing/{CLAUDE_SESSION}.jsonl"));
+    let other_folder = config.join("projects/-work-other");
+    std::fs::create_dir_all(&other_folder).expect("other project folder");
+    let other = other_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::copy(transcript, &other).expect("other project copy");
+    // The working directory whose project folder holds `path`.
+    let claude = |path: &std::path::Path, session: Option<&str>| {
+        let folder = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let cwd = folder.replacen("-work-", "/work/", 1);
+        FakeTerminalOutput::claude_in(
+            &cwd,
+            "hello",
+            Some(observed_conversation(path.to_path_buf())),
+            session,
+            config,
+        )
+    };
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut cases = vec![
+        (
+            "no observed session",
+            FakeTerminalOutput::claude("hello", None, None, config),
+        ),
+        ("no bound session", claude(transcript, None)),
+        (
+            "another bound session",
+            claude(transcript, Some("22222222-2222-4222-8222-222222222222")),
+        ),
+        (
+            "outside the provider folder",
+            claude(&outside, Some(CLAUDE_SESSION)),
+        ),
+        (
+            "named after another session",
+            claude(&misnamed, Some(CLAUDE_SESSION)),
+        ),
+        ("over the bound", claude(&large, Some(CLAUDE_SESSION))),
+        ("empty", claude(&empty, Some(CLAUDE_SESSION))),
+        ("missing", claude(&missing, Some(CLAUDE_SESSION))),
+        (
+            "another working directory's project",
+            FakeTerminalOutput::claude(
+                "hello",
+                Some(observed_conversation(other)),
+                Some(CLAUDE_SESSION),
+                config,
+            ),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        let linked_folder = config.join("projects/-work-linked");
+        std::fs::create_dir_all(&linked_folder).expect("linked folder");
+        let link = linked_folder.join(format!("{CLAUDE_SESSION}.jsonl"));
+        std::os::unix::fs::symlink(&outside, &link).expect("link");
+        cases.push(("a symbolic link", claude(&link, Some(CLAUDE_SESSION))));
+    }
+    cases
+}
+
+#[tokio::test]
+async fn get_terminal_output_unreadable_conversation_falls_back_and_says_why() {
+    let harness = harness().await;
+    let (config, transcript) = claude_config();
+
+    for (case, fake) in unreadable_conversations(config.path(), &transcript) {
+        let service = harness.send_requests().with_terminal_output(fake);
+        let result = read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+
+        assert_eq!(result["usedSource"], "output", "{case}");
+        assert_eq!(result["fellBack"], true, "{case}");
+        assert_eq!(result["startMissing"], false, "{case}");
+        assert_eq!(result["text"], "hello", "{case}");
+    }
+    harness.shutdown().await;
+}
+
+/// The log names no transcript path and no refusal. In a process of its own, so no sibling
+/// test can turn a callsite off for this capture.
+#[tokio::test]
+async fn get_terminal_output_never_logs_the_refusal_or_the_path() {
+    let Some(child) = crate::test_support::in_own_process(
+        "send_requests::tests::get_terminal_output_never_logs_the_refusal_or_the_path",
+    ) else {
+        return;
+    };
+    let log = CapturedTerminalLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+    let harness = harness().await;
+    let (config, transcript) = claude_config();
+
+    for (_, fake) in unreadable_conversations(config.path(), &transcript) {
+        let service = harness.send_requests().with_terminal_output(fake);
+        read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+    }
+    harness.shutdown().await;
+
+    let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("conversation"),
+        "the capture saw the fallback:\n{log}"
+    );
+    let config = config.path().to_string_lossy().into_owned();
+    for canary in [
+        config.as_str(),
+        CLAUDE_SESSION,
+        ".jsonl",
+        "NoObservedSession",
+        "SessionMismatch",
+        "NotATranscriptFile",
+        "OutsideProviderFolder",
+        "SymbolicLink",
+        "TooLarge",
+        "Unreadable",
+        "Empty",
+    ] {
+        assert!(!log.contains(canary), "{canary} reached the log:\n{log}");
+    }
+    child.complete();
+}
+
+/// A Codex observer loop that answers one conversation request with `answer`.
+fn codex_observer(
+    answer: Result<
+        crate::provider_terminal::CodexConversation,
+        crate::provider_terminal::ConversationRefusal,
+    >,
+) -> crate::provider_terminal::CodexConversationHandle {
+    let (handle, mut requests) = crate::provider_terminal::CodexConversationHandle::channel();
+    tokio::spawn(async move {
+        if let Some(request) = requests.recv().await {
+            request.answer(answer);
+        }
+    });
+    handle
+}
+
+#[tokio::test]
+async fn get_terminal_output_codex_conversation_reads_the_root_thread() {
+    let harness = harness().await;
+    for complete in [true, false] {
+        let handle = codex_observer(Ok(crate::provider_terminal::CodexConversation {
+            thread_id: "thread-1".to_owned(),
+            messages: vec![
+                ("user".to_owned(), "Test question".to_owned()),
+                ("assistant".to_owned(), "Test answer".to_owned()),
+            ],
+            complete,
+        }));
+        let fake = FakeTerminalOutput::codex("recent output", handle);
+        let service = harness.send_requests().with_terminal_output(fake.clone());
+
+        let result = read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+
+        assert_eq!(
+            result["text"],
+            "[user] Test question\n[assistant] Test answer"
+        );
+        assert_eq!(result["usedSource"], "conversation");
+        assert_eq!(result["fellBack"], false);
+        assert_eq!(
+            result["startMissing"], !complete,
+            "the start is missing when the pager did not reach the oldest turn"
+        );
+        assert!(fake.calls.lock().unwrap().is_empty(), "no output was read");
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_codex_unreadable_conversation_falls_back() {
+    let harness = harness().await;
+    let (gone, requests) = crate::provider_terminal::CodexConversationHandle::channel();
+    drop(requests);
+    for handle in [
+        codex_observer(Err(crate::provider_terminal::ConversationRefusal::TooLarge)),
+        codex_observer(Ok(crate::provider_terminal::CodexConversation {
+            thread_id: "thread-1".to_owned(),
+            messages: Vec::new(),
+            complete: true,
+        })),
+        gone,
+    ] {
+        let service = harness
+            .send_requests()
+            .with_terminal_output(FakeTerminalOutput::codex("hello", handle));
+
+        let result = read_terminal_output(service, person(), conversation_input("handoff"))
+            .await
+            .expect("readable");
+
+        assert_eq!(result["usedSource"], "output");
+        assert_eq!(result["fellBack"], true);
+        assert_eq!(result["startMissing"], false);
+        assert_eq!(result["text"], "hello");
+    }
+    harness.shutdown().await;
+}
+
+#[derive(Clone, Default)]
+struct CapturedTerminalLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedTerminalLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// What the real reader returns for terminal output `raw`: the history keeps the last

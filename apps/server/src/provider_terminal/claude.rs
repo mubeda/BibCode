@@ -38,7 +38,8 @@ use tokio_util::sync::CancellationToken;
 #[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
 use super::model::{
-    PromptEvidence, TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease,
+    ObservedConversation, PromptEvidence, TerminalAgentReport, TerminalAgentState,
+    TerminalObserverGenerationLease,
 };
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
@@ -2043,7 +2044,7 @@ const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
 
 /// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
 /// prompt, message and tool content included.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub(super) struct ClaudeStatusHook {
     #[serde(default)]
     hook_event_name: Option<String>,
@@ -2056,6 +2057,24 @@ pub(super) struct ClaudeStatusHook {
     tool_name: Option<String>,
     #[serde(default)]
     notification_type: Option<String>,
+    /// The session's transcript as the CLI reports it: untrusted, only ever recorded (R112).
+    #[serde(default)]
+    transcript_path: Option<String>,
+}
+
+/// The transcript path names a folder on the person's machine, so it is never printed.
+impl fmt::Debug for ClaudeStatusHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeStatusHook")
+            .field("hook_event_name", &self.hook_event_name)
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id.is_some())
+            .field("tool_name", &self.tool_name)
+            .field("notification_type", &self.notification_type)
+            .field("transcript_path", &self.transcript_path.is_some())
+            .finish()
+    }
 }
 
 /// What one Claude hook says about the main agent.
@@ -2086,6 +2105,20 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook, 
         _ => order.session = Some(session_id.to_owned()),
     }
     order.applied = arrival;
+    // A subagent's hook names its own transcript; only the main agent's names the conversation.
+    if hook.agent_id.is_none() {
+        match hook
+            .transcript_path
+            .as_deref()
+            .and_then(claude_transcript_path)
+        {
+            Some(transcript_path) => state.status.publish_conversation(ObservedConversation {
+                session_id: session_id.to_owned(),
+                transcript_path,
+            }),
+            None => state.status.bind_conversation_session(session_id),
+        }
+    }
     match report {
         // Claude's hooks are its only stream and carry no snapshot, so the newest is fresh.
         ClaudeAgentReport::Set(agent_state, failed) => state.status.report_agent_evidence(
@@ -2101,6 +2134,17 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook, 
                 })
         }
     }
+}
+
+/// A transcript path a hook may name: absolute, a `.jsonl` file, without control characters,
+/// and short enough to be a path. Where it points is checked only when it is read.
+fn claude_transcript_path(path: &str) -> Option<std::path::PathBuf> {
+    const MAX_TRANSCRIPT_PATH_BYTES: usize = 4096;
+    if path.len() > MAX_TRANSCRIPT_PATH_BYTES || path.chars().any(char::is_control) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path);
+    (path.is_absolute() && path.extension() == Some(std::ffi::OsStr::new("jsonl"))).then_some(path)
 }
 
 /// Whether a Claude hook proves the CLI waits for the user's next prompt: only Claude's
@@ -4536,7 +4580,8 @@ mod tests {
     #[test]
     fn status_hooks_keep_no_prompt_or_tool_content() {
         // Mutation caught: the status path decoding a hook whole, so a prompt or tool output
-        // is read and held while AI Terminal activity is off (#187).
+        // is read and held while AI Terminal activity is off (#187). The transcript path is
+        // held for R112, but never printed.
         let hook: ClaudeStatusHook = serde_json::from_value(json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "s",
@@ -4547,7 +4592,11 @@ mod tests {
         }))
         .expect("status hook");
         let kept = format!("{hook:?}");
-        for private in ["private prompt", "private tool", "transcript"] {
+        for private in [
+            "private prompt",
+            "private tool",
+            "/private/transcript.jsonl",
+        ] {
             assert!(!kept.contains(private), "{kept}");
         }
     }
@@ -4920,5 +4969,133 @@ mod tests {
             Some(false),
             "a hook refused for capacity left the terminal ready"
         );
+    }
+
+    const OBSERVED_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+    const NEXT_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn transcript_of(session: &str) -> String {
+        format!("/home/test-user/.claude/projects/-work-sample/{session}.jsonl")
+    }
+
+    fn session_start(session: &str, transcript_path: &str) -> Body {
+        Body::from(
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "transcript_path": transcript_path,
+            })
+            .to_string(),
+        )
+    }
+
+    fn observed(session: &str) -> crate::provider_terminal::ObservedConversation {
+        crate::provider_terminal::ObservedConversation {
+            session_id: session.to_owned(),
+            transcript_path: transcript_of(session).into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_records_the_observed_conversation() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        let lease = generation.observation();
+        assert_eq!(
+            lease.observed_conversation(),
+            Some(observed(OBSERVED_SESSION))
+        );
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_ignores_a_relative_or_non_jsonl_path() {
+        for path in [
+            format!("projects/-work-sample/{OBSERVED_SESSION}.jsonl"),
+            format!("/home/test-user/.claude/projects/-work-sample/{OBSERVED_SESSION}.json"),
+            "/home/test-user/.claude/projects/-work-sample/".to_owned(),
+            format!("/home/test-user/\u{7}/{OBSERVED_SESSION}.jsonl"),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let state = status_only_hook_state(&generation);
+
+            send_status_hook(&state, session_start(OBSERVED_SESSION, &path)).await;
+
+            assert_eq!(
+                generation.observation().observed_conversation(),
+                None,
+                "{path:?} was recorded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_never_rebinds_for_a_subagent() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        for event in ["SessionStart", "PreToolUse", "Stop"] {
+            send_status_hook(
+                &state,
+                Body::from(
+                    json!({
+                        "hook_event_name": event,
+                        "session_id": NEXT_SESSION,
+                        "agent_id": "agent-1",
+                        "tool_name": "Read",
+                        "transcript_path": transcript_of(NEXT_SESSION),
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        }
+
+        let lease = generation.observation();
+        assert_eq!(
+            lease.observed_conversation(),
+            Some(observed(OBSERVED_SESSION))
+        );
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_a_new_session_after_clear_replaces_it() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        send_status_hook(
+            &state,
+            session_start(NEXT_SESSION, &transcript_of(NEXT_SESSION)),
+        )
+        .await;
+        assert_eq!(
+            generation.observation().observed_conversation(),
+            Some(observed(NEXT_SESSION))
+        );
+
+        // A new session whose path is unusable leaves no stale conversation behind.
+        send_status_hook(&state, session_start(OBSERVED_SESSION, "relative.jsonl")).await;
+        let lease = generation.observation();
+        assert_eq!(lease.observed_conversation(), None);
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
     }
 }

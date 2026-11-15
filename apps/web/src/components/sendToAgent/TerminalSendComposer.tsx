@@ -18,8 +18,8 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
+  useRef,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -33,7 +33,7 @@ import { useAgentTerminalSources } from "../../hooks/useAgentFreshness";
 import { useAgentRows } from "../agents/useAgentRows";
 import type { AgentRow } from "../sidebar/agentsSection.logic";
 import { SECOND_OPINION_LEAD_IN } from "./attachments.logic";
-import { HAND_OFF_LEAD_IN } from "./handoff.logic";
+import { HAND_OFF_LEAD_IN, TERMINAL_START_MISSING_NOTE } from "./handoff.logic";
 import { resolveOutOfTokensHint } from "./outOfTokens.logic";
 import { selectRowsForTerminal } from "./SendRequestRow";
 import { SendToAgentButton, type LiveSendInputs } from "./SendToAgentButton";
@@ -42,6 +42,7 @@ import {
   canNotifyTerminalRow,
   sendChoiceKey,
   type NewPanelProvider,
+  type PreviewAttachment,
   type PreviewContent,
   type SendChoice,
   type SendToAgentSource,
@@ -106,8 +107,41 @@ export function useCanNotifyTerminal(
   );
 }
 
+/** The output, or the CLI's conversation when the server could read it. */
+interface TerminalRead extends TerminalOutputText {
+  /** The conversation was asked for and could not be read, so the output is used. */
+  fellBack: boolean;
+  /** The conversation read did not reach its start (a long Codex thread). */
+  startMissing: boolean;
+}
+
 /** Rejects when the output could not be read. */
-type LoadOutput = () => Promise<TerminalOutputText>;
+type LoadOutput = () => Promise<TerminalRead>;
+
+/**
+ * The attachment of a terminal read, saying when the output stood in for the conversation. The
+ * server already bounds a conversation (the handoff text, or one answer), so it is attached whole:
+ * cutting its start would drop the newest messages.
+ */
+function readAttachment(output: TerminalRead, terminalLabel: string): PreviewAttachment | null {
+  if (output.usedSource === "conversation") {
+    return output.text.trim() === ""
+      ? null
+      : {
+          id: "terminal-output",
+          label: `Conversation of ${terminalLabel}`,
+          text: output.text,
+          leftOut: null,
+          note: output.startMissing ? TERMINAL_START_MISSING_NOTE : null,
+        };
+  }
+  const attachment = terminalAttachment({ selection: null, output, terminalLabel });
+  if (attachment === null || !output.fellBack) return attachment;
+  return {
+    ...attachment,
+    label: `Recent output of ${terminalLabel}, because the conversation could not be read`,
+  };
+}
 
 /** Mounted while the menu is open: the only reader of the agent directory and the output. */
 function LiveTerminalInputsReader(props: {
@@ -225,20 +259,17 @@ function TerminalSendComposerBody(props: {
       worktreePath,
     ],
   );
-  // The output read of the latest menu open; a preview chosen from it waits on the same read.
-  const outputRef = useRef<ReturnType<LoadOutput> | null>(null);
-  const loadOutput = useCallback<LoadOutput>(() => {
-    const input: SendRequestsGetTerminalOutputInput = {
-      sourceThreadId: threadId,
-      threadId,
-      terminalId,
-      source: "output",
-      part: "handoff",
-    };
-    const read = getTerminalOutput(input).then((result): TerminalOutputText => result);
-    outputRef.current = read;
-    return read;
-  }, [getTerminalOutput, terminalId, threadId]);
+  const read = useCallback(
+    (
+      source: SendRequestsGetTerminalOutputInput["source"],
+      part: SendRequestsGetTerminalOutputInput["part"],
+    ): Promise<TerminalRead> =>
+      getTerminalOutput({ sourceThreadId: threadId, threadId, terminalId, source, part }),
+    [getTerminalOutput, terminalId, threadId],
+  );
+  // Opening the menu only asks whether the terminal has text; the conversation is read only for
+  // the Second opinion or Hand off the person chose.
+  const loadOutput = useCallback<LoadOutput>(() => read("output", "handoff"), [read]);
 
   const { previewContentFor: baseContentFor } = services;
   const previewContentFor = useCallback(
@@ -260,18 +291,16 @@ function TerminalSendComposerBody(props: {
         loadFailedMessage: TERMINAL_OUTPUT_LOAD_FAILED_MESSAGE,
         loadingMessage: TERMINAL_OUTPUT_LOADING_MESSAGE,
         loadAttachments: async () => {
-          const read = outputRef.current ?? loadOutput();
-          // A failed read is not reused: Retry reads again.
-          const output = await read.catch((error: unknown) => {
-            if (outputRef.current === read) outputRef.current = null;
-            throw error;
-          });
-          const attachment = terminalAttachment({ selection: null, output, terminalLabel });
+          const output = await read(
+            "conversation",
+            choice.action === "second-opinion" ? "last-answer" : "handoff",
+          );
+          const attachment = readAttachment(output, terminalLabel);
           return attachment === null ? [] : [attachment];
         },
       };
     },
-    [baseContentFor, loadOutput, readSelection, terminalId, terminalLabel, threadId],
+    [baseContentFor, read, readSelection, terminalId, terminalLabel, threadId],
   );
 
   const renderLive = useCallback(
