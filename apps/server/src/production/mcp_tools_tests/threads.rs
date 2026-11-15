@@ -221,6 +221,67 @@ async fn startup_recovery_settles_a_reply_left_streaming_by_a_completed_turn() {
     harness.shutdown().await;
 }
 
+/// Every reader of a thread's messages orders equal times the same way: the list, the MCP pager
+/// and the client's re-sort of older history (`compareByCreatedAt` in
+/// `packages/client-runtime/src/state/threadHistory.ts`) all order by stored time text, then id.
+#[tokio::test]
+async fn the_list_and_the_mcp_pager_agree_on_messages_with_equal_times() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    let thread = thread_id.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            // Written against id order, at one time.
+            for id in ["z-written-first", "a-written-second"] {
+                connection.execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES (?1, ?2, 'assistant', 'x', 0, '2026-12-01T00:00:00.000000000Z', '2026-12-01T00:00:00.000000000Z')",
+                    rusqlite::params![id, thread],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let listed: Vec<String> = harness
+        .repositories
+        .list_messages_by_thread(thread_id.clone())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|message| message.message_id)
+        .collect();
+    let paged = harness
+        .call(&agent, "read_thread", json!({ "threadId": thread_id }))
+        .await;
+    let paged: Vec<String> = structured(&paged)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["messageId"].as_str().unwrap().to_owned())
+        .collect();
+    let latest = harness
+        .call(
+            &agent,
+            "read_thread",
+            json!({ "threadId": thread_id, "limit": 1 }),
+        )
+        .await;
+    assert_eq!(listed, paged);
+    assert_eq!(
+        listed[listed.len() - 2..],
+        ["a-written-second", "z-written-first"],
+        "time text, then id, as the client sorts"
+    );
+    assert_eq!(
+        structured(&latest)["messages"][0]["messageId"],
+        "z-written-first"
+    );
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_timed_out_or_cancelled_wait_leaves_work_running_and_releases_its_receiver() {
     let harness = Harness::new().await;
