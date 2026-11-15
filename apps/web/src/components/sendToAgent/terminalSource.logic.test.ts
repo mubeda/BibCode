@@ -13,6 +13,7 @@ import {
   makeTerminalOutputLoader,
   shouldActivateSendPanel,
   terminalAttachment,
+  terminalBufferText,
   terminalHasText,
 } from "./terminalSource.logic";
 
@@ -208,5 +209,73 @@ describe("shouldActivateSendPanel", () => {
     expect(shouldActivateSendPanel({ hostThreadId: null, sourceUnmountsOnActivate: false })).toBe(
       true,
     );
+  });
+});
+
+type FakeRow = string | { text: string; wrapped: true };
+function fakeBuffer(type: "normal" | "alternate", rows: ReadonlyArray<FakeRow>) {
+  const lines = rows.map((row) => (typeof row === "string" ? { text: row, wrapped: false } : row));
+  return {
+    type,
+    length: lines.length,
+    getLine: (index: number) => {
+      const line = lines[index];
+      return line === undefined
+        ? undefined
+        : {
+            isWrapped: "wrapped" in line && line.wrapped === true,
+            translateToString: (trimRight?: boolean) =>
+              trimRight === true ? line.text.trimEnd() : line.text.padEnd(20, " "),
+          };
+    },
+  };
+}
+
+describe("terminalBufferText", () => {
+  it("a_repainting_tui_gives_clean_lines_from_the_rendered_buffer", () => {
+    // The raw stream of this screen reads "identifyth erminal"; the rendered rows are clean.
+    const buffer = fakeBuffer("normal", ["> identify the terminal", "", "conversation ok", "", ""]);
+    expect(terminalBufferText(buffer)).toEqual({
+      text: "> identify the terminal\n\nconversation ok",
+      truncated: false,
+      usedSource: "output",
+    });
+  });
+
+  it("wrapped_rows_are_joined_into_one_line", () => {
+    const buffer = fakeBuffer("normal", [
+      "a long line that is",
+      { text: "wrapped here", wrapped: true },
+      "next",
+    ]);
+    expect(terminalBufferText(buffer).text).toBe("a long line that is wrapped here\nnext");
+  });
+
+  it("the_end_is_kept_at_the_limit_and_truncated_is_set", () => {
+    const rows = Array.from({ length: 5 }, (_, index) => `${index}`.repeat(10));
+    const { text, truncated } = terminalBufferText(fakeBuffer("normal", rows), { limit: 25 });
+    expect(Array.from(text)).toHaveLength(25);
+    expect(text.endsWith("4444444444")).toBe(true);
+    expect(truncated).toBe(true);
+  });
+
+  it("the_alternate_buffer_yields_the_visible_screen_and_says_older_output_is_missing", () => {
+    const buffer = fakeBuffer("alternate", ["menu", "", "selected: one", ""]);
+    expect(terminalBufferText(buffer)).toEqual({
+      text: "menu\n\nselected: one",
+      truncated: true,
+      usedSource: "output",
+    });
+  });
+
+  it("a_cut_never_starts_with_a_detached_combining_mark", () => {
+    const rows = ["e\u0301" + "x".repeat(15_999)];
+    const { text } = terminalBufferText(fakeBuffer("normal", rows));
+    expect(text.startsWith("x")).toBe(true);
+    expect(text).toHaveLength(15_999);
+  });
+
+  it("an_empty_screen_gives_empty_text", () => {
+    expect(terminalBufferText(fakeBuffer("normal", ["", ""])).text).toBe("");
   });
 });
