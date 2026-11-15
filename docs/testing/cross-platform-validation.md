@@ -725,23 +725,39 @@ the Implement check. Restore the line before the full suite.
 The default suite also includes `send-to-agent.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/send-to-agent.e2e.ts`). It runs with **Agent
 messaging** off, against the fixture providers and the Codex Terminal fixture,
-and checks six things. A **Message** from the Codex `main` chat to a new Claude
-panel reaches that panel's provider and is labelled "Message, sent from main". A
-request to a target with a running `[[slow]]` turn shows "Queued for main", and
-**Cancel** turns it into "Cancelled" with **Dismiss** while the target's
-provider never receives it. A **Second opinion** to a target that is working on
-it shows "main read it" with **Open** and no **Dismiss** or **Cancel**. Once the
-target answers, the answer notice is in the sender, survives a reload of the
-window, and **Bring back** drafts the quoted answer into the composer without a
-new provider input. In the Codex Terminal, **Send to agent** sends a **Message**
-whose request row is listed by the **Send requests** popover, and after
-**Cancel** and a keyboard **Dismiss** of the last row, keyboard focus is on
-**Send to agent**. It saves `send-to-agent-notice.png`,
+in six cases that share one app session and run in order. The primary thread is
+titled after its project until its first message, then after that message, so
+the spec reads titles from the fixture rather than assuming "main".
+
+1. A **Message** from the primary Codex chat to a new Claude panel reaches that
+   panel's provider and the panel labels it "Message, sent from <project>".
+2. With a `[[slow]]` turn running in the Codex chat, a **Message** from the
+   Claude panel shows "Queued for <title>". **Cancel** turns the row into
+   "Cancelled" with **Dismiss** and no **Cancel**, and after the slow turn is
+   released the Codex provider never received the note. **Dismiss** removes the
+   row.
+3. A **Second opinion** from the Claude panel whose note holds `[[slow]]` shows
+   "<title> read it" with **Open**, and no **Dismiss** or **Cancel**.
+4. Once the slow turn is released, the answer notice reads "<title> answered" in
+   the Claude panel and is still there after a reload of the window.
+5. **Bring back** puts the quoted answer in the Claude composer, removes the
+   notice and adds no provider input in the next second.
+6. A Codex Terminal's **Send to agent** sends a **Message** to the busy chat.
+   The **Send requests** button reads "Send requests, 1 request", its popover
+   lists the queued row, **Cancel** shows "Cancelled", and clicking **Dismiss** on
+   the last row removes the button and leaves keyboard focus on **Send to agent**
+   in the same panel.
+
+The embedded driver's Enter key does not activate a focused button, so case 6
+clicks **Dismiss**. Dismiss with the keyboard alone stays a manual check (step 8
+of the section below). The spec saves `send-to-agent-notice.png`,
 `send-to-agent-bring-back.png` and `send-to-agent-terminal-requests.png`. Set
 `BIBCODE_E2E_PROFILER=1` to run it with the Profiler on: the run's
 `settings.json` is seeded with `enableProfiler`, and the Profiler's folder is
 `state/userdata/profiler` in the run root while the app runs, and in the
-artifact directory after the run. The spec does not cover steps that need a real
+artifact directory after the run. A first script after launch can time out with
+"Script execution timed out" before any case runs. Run the spec again before
+treating it as a failure. The spec does not cover steps that need a real
 provider CLI; those are in
 [Send to agent and agent messaging](#send-to-agent-and-agent-messaging).
 
