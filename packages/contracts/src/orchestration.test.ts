@@ -12,6 +12,7 @@ import {
   DispatchResult,
   ModelSelection,
   OrchestrationActor,
+  OrchestrationMessageActor,
   OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -212,6 +213,47 @@ describe("conversation compaction contracts", () => {
     const decoded = decodeOlderMessage({ ...message, resendOf: "message-1" });
     expect(decoded.text).toBe("continue");
     expect(Object.hasOwn(decoded, "resendOf")).toBe(false);
+  });
+
+  it("a message carries personSend", () => {
+    const personSend = {
+      requestId: "request-1",
+      action: "second-opinion",
+      sourceAddress: "thread:thread-a",
+    };
+    expect(decodeOrchestrationMessageSync({ ...message, personSend }).personSend).toEqual(
+      personSend,
+    );
+    expect(
+      Object.hasOwn(decodeOrchestrationMessageSync(message), "personSend"),
+      "a message without it decodes unchanged",
+    ).toBe(false);
+  });
+
+  it("the client turn-start command refuses personSend", () => {
+    const strict = { onExcessProperty: "error" } as const;
+    const start = {
+      type: "thread.turn.start",
+      commandId: "command-1",
+      threadId: "thread-1",
+      message: { messageId: "message-1", role: "user", text: "next task", attachments: [] },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: "2026-11-13T00:00:00Z",
+    };
+    const withPersonSend = {
+      ...start,
+      message: {
+        ...start.message,
+        personSend: { requestId: "request-1", action: "review", sourceAddress: "thread:thread-a" },
+      },
+    };
+    expect(() => decodeClientOrchestrationCommandSync(withPersonSend, strict)).toThrow();
+    expect(decodeClientOrchestrationCommandSync(start, strict)).toEqual(start);
+    const server = decodeOrchestrationCommandSync(withPersonSend, strict);
+    expect(server.type === "thread.turn.start" && server.message.personSend).toEqual(
+      withPersonSend.message.personSend,
+    );
   });
 
   it("dispatches thread.compact as a client command", () => {
@@ -2057,5 +2099,21 @@ describe("OrchestrationActor across versions", () => {
       decodeActor({ kind: "mcp-client", clientId: "s1", label: null, namedClientId: "nc_1" })
         .namedClientId,
     ).toBe("nc_1");
+  });
+});
+
+const decodeMessageActor = Schema.decodeUnknownSync(OrchestrationMessageActor);
+
+describe("OrchestrationMessageActor", () => {
+  it("a message actor may be an outside agent or a hosted agent", () => {
+    expect(decodeMessageActor({ kind: "mcp-client", clientId: "s1", label: "MCP" })).toEqual({
+      kind: "mcp-client",
+      clientId: "s1",
+      label: "MCP",
+    });
+    const hosted = { kind: "hosted-agent", address: "thread:t1", label: "API refactor" };
+    expect(decodeMessageActor(hosted)).toEqual(hosted);
+    expect(() => decodeMessageActor({ kind: "hosted-agent", address: "x", label: null })).toThrow();
+    expect(() => decodeMessageActor({ kind: "person" })).toThrow();
   });
 });

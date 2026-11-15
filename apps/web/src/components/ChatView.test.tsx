@@ -372,6 +372,13 @@ vi.mock("../state/entities", () => ({
     ref ? (h.threadsByKey.get(`${ref.environmentId}:${ref.threadId}`) ?? null) : null,
   useThreadRefs: () => h.threadRefs,
   useThreadProposedPlans: () => [],
+  readThreadShell: () => null,
+}));
+
+// The Send to agent control reads the agent list, which this file does not mock;
+// ChatSendToAgentControl.test.tsx covers the control.
+vi.mock("./sendToAgent/ChatSendToAgentControl", () => ({
+  ChatSendToAgentControl: () => null,
 }));
 
 vi.mock("../state/environments", () => ({

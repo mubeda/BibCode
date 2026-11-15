@@ -530,6 +530,32 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain('data-user-message-footer="true"');
   });
 
+  it("a user message with personSend renders the person-send label", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const entry = buildUserTimelineEntry("Please look at the retry path.");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            ...entry,
+            message: {
+              ...entry.message,
+              personSend: {
+                requestId: "request-1",
+                action: "review" as const,
+                sourceAddress: "thread:source-thread",
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Review, sent from another thread");
+    expect(markup).not.toContain("data-agent-chip");
+  });
+
   it("does not render collapse controls for short user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(

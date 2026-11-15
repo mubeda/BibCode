@@ -470,7 +470,10 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     assert_eq!(operation_wire_name("recording_stop"), "recordingStop");
     assert_eq!(operation_wire_name("click"), "click");
     let tools = tool_descriptors(false);
-    assert_eq!(tools.len(), TOOL_OPERATIONS.len());
+    assert_eq!(
+        tools.len(),
+        TOOL_OPERATIONS.len() + crate::mcp::tools::agent_messaging::tool_descriptors().len()
+    );
     let status = tools
         .iter()
         .find(|tool| tool["name"] == "preview_status")
@@ -486,7 +489,11 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
         "../../../../../packages/contracts/fixtures/mcp-tools/preview-tools.json"
     ))
     .unwrap();
-    for tool in &tools {
+    for tool in tools.iter().filter(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("preview_"))
+    }) {
         let name = tool["name"].as_str().unwrap();
         assert_eq!(tool["inputSchema"], fixture[name]["inputSchema"], "{name}");
         assert_ne!(
@@ -514,10 +521,21 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
 /// silently; raise it only for a tool or argument that earns it.
 #[test]
 fn the_provider_preview_tools_stay_within_their_list_budget() {
-    let size = serde_json::to_string(&tool_descriptors(false))
+    let size = serde_json::to_string(&crate::mcp::tools::previews::preview_tool_descriptors())
         .unwrap()
         .len();
     assert!(size < 14_000, "the preview descriptors take {size} bytes");
+}
+
+#[test]
+fn the_agent_messaging_descriptors_stay_within_their_list_budget() {
+    let size = serde_json::to_string(&crate::mcp::tools::agent_messaging::tool_descriptors())
+        .unwrap()
+        .len();
+    assert!(
+        size < 6_000,
+        "the agent messaging descriptors take {size} bytes"
+    );
 }
 
 #[test]
@@ -1326,7 +1344,7 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     .await;
     assert_eq!(
         listed["result"]["tools"].as_array().unwrap().len(),
-        TOOL_OPERATIONS.len()
+        TOOL_OPERATIONS.len() + crate::mcp::tools::agent_messaging::tool_descriptors().len()
     );
 
     for name in ["unknown", "preview_unknown"] {
@@ -2147,7 +2165,10 @@ fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
         .map(|spec| spec.name)
         .collect();
     assert_eq!(listed, registered);
-    for name in &listed {
+    for name in listed
+        .iter()
+        .filter(|name| name.starts_with("preview_") || name.starts_with("device_"))
+    {
         let spec = tool_spec(PrincipalKind::Provider, name).unwrap();
         // They wait on a page or an emulator, so `mcp.<name>` is long-running.
         assert!(spec.long_running, "{name}");
@@ -2158,6 +2179,537 @@ fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
         assert_eq!(twin.kind, PrincipalKind::Client, "{name}");
         assert!(twin.long_running && !twin.holds_wait_slot, "{name}");
     }
+}
+
+#[test]
+fn agent_messaging_tools_have_no_client_twin() {
+    use crate::mcp::control::{PrincipalKind, tool_spec};
+    assert!(tool_spec(PrincipalKind::Client, "agents_list").is_none());
+    assert!(tool_spec(PrincipalKind::Provider, "agents_list").is_some());
+}
+
+#[tokio::test]
+async fn a_providers_tools_call_reaches_the_directory() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tools.control.attach_agent_messaging(tools.messaging(true));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let response = rpc(
+        &service,
+        headers,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}),
+    )
+    .await;
+
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let addresses: Vec<&str> = response["result"]["structuredContent"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|agent| agent["address"].as_str())
+        .collect();
+    assert!(addresses.contains(&"thread:b"), "{addresses:?}");
+    assert!(!addresses.contains(&"thread:a"), "{addresses:?}");
+    tools.shutdown().await;
+}
+
+/// A provider credential reaches send and status, and the sender is the credential's thread.
+#[tokio::test]
+async fn a_providers_send_and_status_calls_reach_the_messaging_service() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        tools
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                    "threadId": thread_id, "projectId": "p1", "title": title,
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tools.control.attach_agent_messaging(tools.messaging(true));
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let sent = rpc(
+        &service,
+        headers.clone(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":"thread:b","text":"Which port?","clientRequestId":"k1"}}}),
+    )
+    .await;
+    assert_ne!(sent["result"]["isError"], true, "{sent}");
+    let message_id = sent["result"]["structuredContent"]["messageId"]
+        .as_str()
+        .expect("message id")
+        .to_owned();
+    let status = rpc(
+        &service,
+        headers,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agent_message_status","arguments":{"messageId":message_id}}}),
+    )
+    .await;
+
+    assert_ne!(status["result"]["isError"], true, "{status}");
+    assert!(status["result"]["structuredContent"]["status"].is_string());
+    let sender: String = tools
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT sender_address FROM agent_messages WHERE message_id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(sender, "thread:a");
+    tools.shutdown().await;
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A provider driver that keeps the text each delivery hands it, so the test can prove the
+/// envelope crossed the delivery path to the driver.
+#[derive(Clone, Default)]
+struct EnvelopeDriver {
+    delivered: Arc<std::sync::Mutex<Vec<String>>>,
+    stop: CancellationToken,
+}
+
+impl crate::production::provider_runtime::ProviderDriverFactory for EnvelopeDriver {
+    fn create(
+        &self,
+        _request: crate::production::provider_runtime::ProviderLaunchRequest,
+    ) -> crate::production::provider_runtime::BoxRuntimeFuture<
+        '_,
+        Result<
+            Arc<dyn crate::production::provider_runtime::ProviderDriver>,
+            crate::production::provider_runtime::ProviderRuntimeError,
+        >,
+    > {
+        let driver = self.clone();
+        Box::pin(async move {
+            Ok(Arc::new(driver)
+                as Arc<
+                    dyn crate::production::provider_runtime::ProviderDriver,
+                >)
+        })
+    }
+}
+
+type DriverResult<'a, T> = crate::production::provider_runtime::BoxRuntimeFuture<
+    'a,
+    Result<T, crate::production::provider_runtime::ProviderRuntimeError>,
+>;
+
+impl crate::production::provider_runtime::ProviderDriver for EnvelopeDriver {
+    fn start(&self) -> DriverResult<'_, crate::production::provider_runtime::StartedSession> {
+        Box::pin(async {
+            Ok(crate::production::provider_runtime::StartedSession {
+                resume_cursor: Some(json!({ "threadId": "native-session" })),
+                ..crate::production::provider_runtime::StartedSession::default()
+            })
+        })
+    }
+
+    fn send(
+        &self,
+        text: String,
+        _attachments: Vec<Value>,
+        _interaction_mode: String,
+    ) -> DriverResult<'_, Option<String>> {
+        self.delivered.lock().unwrap().push(text);
+        Box::pin(async { Ok(Some("turn-1".to_owned())) })
+    }
+
+    fn interrupt(&self, _turn_id: Option<String>) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn approve(&self, _request_id: String, _decision: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn answer(&self, _request_id: String, _answers: Value) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_mode(&self, _mode: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_model(&self, _model: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_options(&self, _options: Vec<Value>) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rollback(&self, _turn_count: i64, _rewind_key: String) -> DriverResult<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(
+        &self,
+    ) -> crate::production::provider_runtime::BoxRuntimeFuture<
+        '_,
+        Option<crate::production::provider_runtime::ProviderEvent>,
+    > {
+        Box::pin(async {
+            self.stop.cancelled().await;
+            None
+        })
+    }
+
+    fn shutdown(&self) -> DriverResult<'_, ()> {
+        self.stop.cancel();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The status of the one stored agent message, once it is delivered or past it.
+async fn delivered_status(engine: &crate::orchestration::OrchestrationEngine) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status: Option<String> = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    Ok(connection
+                        .query_row("SELECT status FROM agent_messages", [], |row| row.get(0))
+                        .ok())
+                })
+                .await
+                .unwrap();
+            if let Some(status) = status.filter(|status| status != "accepted" && status != "queued")
+            {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the message is delivered")
+}
+
+/// Message text reaches neither the log, the trace, the profiler nor the activity log, whether
+/// the send was accepted and delivered through the real turn delivery to a provider driver, or
+/// refused. In a process of its own: the tracing subscriber and the profiler are global.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_log_and_the_profiler_never_see_agent_message_text() {
+    use crate::{
+        agent_messaging::{AgentMessaging, delivery::AgentMessageTracker, policy},
+        mcp::control::{McpAccess, McpControl, McpServerSettings},
+        orchestration::{OrchestrationEngine, engine::EngineOptions},
+        persistence::{Database, Repositories, run_migrations},
+    };
+    let Some(child) = crate::test_support::in_own_process(
+        "production::connect_mcp::tests::the_log_and_the_profiler_never_see_agent_message_text",
+    ) else {
+        return;
+    };
+    let log = CapturedLog::default();
+    // Global, so the database worker's and every runtime thread's records are captured too.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    )
+    .expect("the only subscriber of this process");
+    let state = tempfile::tempdir().expect("profiler state");
+    let (_enabled, enabled) = tokio::sync::watch::channel(true);
+    let runtime = crate::diagnostics::profiler::runtime::ProfilerRuntime::start(
+        state.path(),
+        enabled,
+        vec![],
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while runtime.status()["enabled"] != true {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the profiler turns on");
+
+    // The server's own services, with a provider driver behind the real turn delivery.
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+        .await
+        .expect("engine");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut commands = vec![json!({
+        "type": "project.create", "commandId": "project-create", "projectId": "p1",
+        "title": "Project", "workspaceRoot": workspace.path(),
+        "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+        "createdAt": "2026-11-14T00:00:00.000Z",
+    })];
+    for (thread_id, title) in [("a", "Caller"), ("b", "Recipient")] {
+        commands.push(json!({
+            "type": "thread.create", "commandId": format!("create-{thread_id}"),
+            "threadId": thread_id, "projectId": "p1", "title": title,
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+        }));
+    }
+    for command in commands {
+        engine
+            .dispatch(serde_json::from_value(command).unwrap())
+            .await
+            .unwrap();
+    }
+    let driver = EnvelopeDriver::default();
+    let provider = Arc::new(
+        crate::production::provider_runtime::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(driver.clone()),
+            crate::activity::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                database.clone(),
+            )),
+            crate::production::provider_runtime::SupervisorOptions::default(),
+        ),
+    );
+    let delivery = Arc::new(
+        crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            provider.clone(),
+            workspace.path().to_path_buf(),
+        ),
+    );
+    let uploads = crate::transfer::staging::UploadRegistry::new(
+        workspace.path().join("uploads"),
+        crate::transfer::staging::UploadLimits::default(),
+        Arc::new(tokio::time::Instant::now),
+    );
+    let secrets = tempfile::tempdir().expect("secrets");
+    let auth = crate::auth::AuthService::new_with_persistence(
+        &crate::ServerConfig::new(".").with_bind("127.0.0.1", 3773),
+        vec![7_u8; 32],
+        crate::auth::SecretStore::new(secrets.path())
+            .await
+            .expect("secret store"),
+        Repositories::new(database.clone()),
+    )
+    .await
+    .expect("auth");
+    let (_settings, settings) = tokio::sync::watch::channel(McpServerSettings {
+        enabled: true,
+        access: McpAccess::FullAccess,
+        ..McpServerSettings::default()
+    });
+    let control = McpControl::new(
+        crate::rpc::RpcRegistry::empty(),
+        auth,
+        engine.clone(),
+        settings,
+    );
+    let (sink, writer) = crate::mcp::activity::agent_message_writer(control.activity().clone());
+    let (_messaging, messaging_on) = tokio::sync::watch::channel(true);
+    engine
+        .repositories()
+        .set_agent_claim_gate(policy::claim_gate(messaging_on.clone()));
+    let tracker = CancellationToken::new();
+    let tracking = AgentMessageTracker::start(
+        engine.clone(),
+        Some(sink.clone()),
+        messaging_on.clone(),
+        tracker.clone(),
+    );
+    control.attach_agent_messaging(
+        AgentMessaging::new(engine.clone(), messaging_on)
+            .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+                engine.clone(),
+                provider.clone(),
+                workspace.path().to_path_buf(),
+                delivery.clone(),
+                None,
+                uploads,
+            ))
+            .with_outcomes(sink),
+    );
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(control.clone());
+    let issued = service
+        .issue_mcp_credential("a", "a", "codex")
+        .await
+        .unwrap();
+    let headers = initialize(&service, &issued).await;
+
+    let mut results = Vec::new();
+    for (id, to, text) in [
+        (2, "thread:b", "SEND-CANARY-31337".to_owned()),
+        (3, "thread:gone", "REFUSED-CANARY-31337".to_owned()),
+        (4, "thread:b", format!("LONG-CANARY{}", "x".repeat(16_000))),
+    ] {
+        let response = rpc(
+            &service,
+            headers.clone(),
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"agent_message_send","arguments":{"to":to,"text":text}}}),
+        )
+        .await;
+        results.push(response["result"].clone());
+    }
+    assert_ne!(results[0]["isError"], true, "{}", results[0]);
+    assert_eq!(results[0]["structuredContent"]["status"], "accepted");
+    let message_id = results[0]["structuredContent"]["messageId"]
+        .as_str()
+        .expect("a message id")
+        .to_owned();
+    for (result, tag) in results[1..].iter().zip([
+        "AgentMessagingUnknownRecipientError",
+        "AgentMessagingInvalidArgumentError",
+    ]) {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["_tag"], tag,
+            "{result}"
+        );
+    }
+    // The driver took the turn, so the message reads delivered, or consumed once the tracker
+    // ties it to the driver's turn.
+    let status = delivered_status(&engine).await;
+    assert!(
+        matches!(status.as_str(), "delivered" | "consumed"),
+        "{status}"
+    );
+    // The positive control: the envelope crossed the delivery path to the driver.
+    let delivered = driver.delivered.lock().unwrap().clone();
+    assert!(
+        delivered.len() == 1 && delivered[0].contains("SEND-CANARY-31337"),
+        "the driver got the envelope"
+    );
+    // Every row is written before the rows are read.
+    tracker.cancel();
+    tracking.await.unwrap();
+    writer.close().await;
+    let rows = control.activity().recent().await.unwrap();
+    delivery.shutdown().await;
+    provider.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+    runtime.shutdown().await;
+
+    // The delivery service and the tracker run beside the calls, so each row is found on its
+    // own, never by its place among the others.
+    let count = |tool: &str, outcome: &str, status: &[Option<&str>], message: Option<&str>| {
+        rows.iter()
+            .filter(|row| {
+                row["tool"] == tool
+                    && row["outcome"] == outcome
+                    && status.contains(&row["target"]["status"].as_str())
+                    && row["target"]["messageId"].as_str() == message
+            })
+            .count()
+    };
+    let message = Some(message_id.as_str());
+    assert_eq!(
+        count(
+            "agent_message_send",
+            "success",
+            &[Some("accepted")],
+            message
+        ),
+        1,
+        "{rows:?}"
+    );
+    for tag in [
+        "AgentMessagingUnknownRecipientError",
+        "AgentMessagingInvalidArgumentError",
+    ] {
+        assert_eq!(
+            count("agent_message_send", tag, &[None], None),
+            1,
+            "{tag}: {rows:?}"
+        );
+    }
+    assert!(
+        count(
+            "agent_message_delivery",
+            "success",
+            &[Some("delivered"), Some("consumed")],
+            message
+        ) > 0,
+        "{rows:?}"
+    );
+    let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("MCP tool call failed") && log.contains("AgentMessagingUnknownRecipientError"),
+        "the capture saw the refusal:\n{log}"
+    );
+    assert!(
+        !log.contains("CANARY"),
+        "message text reached the log:\n{log}"
+    );
+    assert!(
+        !serde_json::to_string(&rows).unwrap().contains("CANARY"),
+        "message text reached the activity log"
+    );
+    let profiler = std::fs::read_dir(crate::diagnostics::profiler::profiler_dir(state.path()))
+        .expect("profiler directory")
+        .filter_map(|entry| std::fs::read(entry.expect("entry").path()).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect::<String>();
+    assert!(!profiler.is_empty(), "the profiler recorded the run");
+    assert!(
+        !profiler.contains("CANARY"),
+        "message text reached the profiler"
+    );
+    child.complete();
 }
 
 #[test]
@@ -2895,7 +3447,10 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
     assert!(
         provider_tools
             .iter()
-            .all(|name| name.starts_with("preview_") || name.starts_with("device_"))
+            .all(|name| name.starts_with("preview_")
+                || name.starts_with("device_")
+                || name == "agents_list"
+                || name.starts_with("agent_message_"))
     );
 
     // Each kind's call to the other's tool is a scope refusal.
@@ -3324,5 +3879,160 @@ async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
         .status,
         StatusCode::METHOD_NOT_ALLOWED
     );
+    tools.shutdown().await;
+}
+
+/// A provider's MCP credential reaches no `sendRequests.*` method: none is listed, and a call
+/// of each spelling fails. Task 8.1 owes the same test for the credential it adds.
+#[tokio::test]
+async fn a_provider_credential_is_refused_every_send_request_method() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+
+    let listed = names(
+        &rpc(
+            &service,
+            initialize(&service, &issued).await,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|name| !name.to_ascii_lowercase().contains("sendrequests")),
+        "{listed:?}"
+    );
+    for (id, name) in [(2, "sendRequests.send"), (3, "sendRequests_send")] {
+        let called = rpc(
+            &service,
+            initialize(&service, &issued).await,
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{
+                "requestId": "r1", "action": "review", "source": "thread:thread",
+                "target": "thread:other", "leadIn": "", "note": "n", "attachments": [],
+            }}}),
+        )
+        .await;
+        assert!(
+            called["result"]["isError"] == true || called["error"].is_object(),
+            "{name}: {called}"
+        );
+    }
+    tools.shutdown().await;
+}
+
+/// The token a terminal gets for `bibcode open-url` is not an MCP bearer.
+#[tokio::test]
+async fn an_open_url_credential_is_not_an_mcp_credential() {
+    let connect = harness(4, 4).await;
+    let issued = connect
+        .service
+        .issue_open_url_credential("thread")
+        .await
+        .unwrap();
+
+    let refused = connect
+        .service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(),
+            context(bearer(&issued.token)),
+        )
+        .await;
+
+    assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED);
+}
+
+/// The credential an AI Terminal gets for `bibcode agent` reaches no `sendRequests.*` method:
+/// it is no MCP bearer and no session of a person, so neither `/mcp` nor RPC accepts it.
+#[tokio::test]
+async fn a_terminal_generation_credential_is_refused_every_send_request_method() {
+    use crate::agent_messaging::terminal_credential::{
+        AUTH_ENV, LiveGenerations, TerminalCredentials,
+    };
+    use crate::terminal::{TerminalGeneration, TerminalSessionLaunch};
+
+    struct AlwaysLive(TerminalGeneration);
+    impl LiveGenerations for AlwaysLive {
+        fn live_generation<'a>(
+            &'a self,
+            _thread_id: &'a str,
+            _terminal_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<TerminalGeneration>> + Send + 'a>,
+        > {
+            Box::pin(async { Some(self.0.clone()) })
+        }
+    }
+
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let generation = TerminalGeneration {
+        boot: "boot-1".to_owned(),
+        process: 1,
+    };
+    let credentials = TerminalCredentials::new("env-1".to_owned(), "/state/runtime/agent".into());
+    credentials.bind(
+        "http://127.0.0.1:3773/api/agent/call".to_owned(),
+        Arc::new(AlwaysLive(generation.clone())),
+    );
+    let mut env = std::collections::BTreeMap::new();
+    credentials
+        .issue(
+            &TerminalSessionLaunch {
+                thread_id: "thread",
+                terminal_id: "term-1",
+                generation: &generation,
+                ai_terminal: true,
+            },
+            &mut env,
+        )
+        .await;
+    let token = env.remove(AUTH_ENV).expect("a terminal credential");
+    assert!(credentials.verify(&token).await.is_some());
+
+    for (id, method) in [
+        "sendRequests.send",
+        "sendRequests.cancel",
+        "sendRequests.dismiss",
+        "sendRequests.subscribe",
+        "sendRequests.getAnswer",
+        "sendRequests.getHandoffText",
+        "sendRequests.getTerminalOutput",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = service
+            .mcp(
+                Method::POST,
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                    "params":{"name":method,"arguments":{}}}))
+                .unwrap(),
+                context(bearer(&token)),
+            )
+            .await;
+        assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED, "{method}");
+    }
+    for transport in [
+        crate::auth::SessionTransport::Plain,
+        crate::auth::SessionTransport::E2ee,
+    ] {
+        assert!(
+            tools
+                .auth
+                .authenticate_token(&token, transport)
+                .await
+                .is_err(),
+            "a terminal credential is a person's RPC principal"
+        );
+    }
+    assert!(tools.auth.authenticate_mcp_client(&token).await.is_err());
     tools.shutdown().await;
 }

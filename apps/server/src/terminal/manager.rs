@@ -28,7 +28,7 @@ use super::{
     TerminalSize, TerminalStatus, TerminalSummary,
     history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
-use super::{TerminalAgentStatus, TerminalAgentStatusState};
+use super::{TerminalAgentStatus, TerminalAgentStatusState, writer::WriteGuard};
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -154,15 +154,63 @@ pub struct TerminalManagerOptions {
     pub subprocess_inspector: Option<Arc<dyn TerminalSubprocessInspector>>,
     pub launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
     /// Server-owned variables merged into every spawn's environment after the caller's, so
-    /// they win. Called with the thread id once per process start, never for an open that
-    /// finds the terminal running.
+    /// they win. Called once per process start, before the session is published, never for
+    /// an open that finds the terminal running.
     pub session_env: Option<TerminalSessionEnv>,
+}
+
+/// The process a [`TerminalSessionEnv`] hook launches.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalSessionLaunch<'a> {
+    pub thread_id: &'a str,
+    pub terminal_id: &'a str,
+    pub generation: &'a TerminalGeneration,
+    /// True when the launch command runs a provider CLI (`command.activity` is set).
+    pub ai_terminal: bool,
+}
+
+/// The variables that carry a launch hook's credentials and where they are sent. No prepared
+/// environment may set them, whatever value the caller supplied. A process of the terminal that
+/// copies the credential into another variable of that terminal gains nothing, since every one
+/// of its processes can already read it; only redirecting the endpoint would, and that is
+/// refused here.
+const SESSION_CREDENTIAL_KEYS: [&str; 4] = [
+    crate::open_url::TOKEN_ENV,
+    crate::open_url::ENDPOINT_ENV,
+    crate::agent_messaging::terminal_credential::AUTH_ENV,
+    crate::agent_messaging::terminal_credential::ENDPOINT_ENV,
+];
+
+/// The entries a launch hook put in front of `PATH`, with their trailing separator: the hook's
+/// `PATH` less the caller's (else this process's), which the hook extended. `None` when the hook
+/// left `PATH` alone.
+fn path_prefix(
+    caller: &std::collections::BTreeMap<String, String>,
+    hooked: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let path = |env: &std::collections::BTreeMap<String, String>| {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.clone())
+    };
+    let hooked = path(hooked)?;
+    let base = path(caller)
+        .or_else(|| std::env::var("PATH").ok())
+        .filter(|base| !base.is_empty());
+    match base {
+        Some(base) if hooked == base => None,
+        Some(base) => hooked
+            .strip_suffix(base.as_str())
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_owned),
+        None => Some(format!("{hooked}{}", if cfg!(windows) { ';' } else { ':' })),
+    }
 }
 
 /// See [`TerminalManagerOptions::session_env`].
 pub type TerminalSessionEnv = Arc<
     dyn for<'a> Fn(
-            &'a str,
+            TerminalSessionLaunch<'a>,
             &'a mut std::collections::BTreeMap<String, String>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
         + Send
@@ -198,7 +246,7 @@ impl TerminalManagerOptions {
     pub fn session_env_hook<F>(hook: F) -> TerminalSessionEnv
     where
         F: for<'a> Fn(
-                &'a str,
+                TerminalSessionLaunch<'a>,
                 &'a mut std::collections::BTreeMap<String, String>,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
             + Send
@@ -258,6 +306,19 @@ pub enum TerminalError {
     WorktreeRemovalInProgress { thread_id: String },
 }
 
+/// What [`TerminalManager::write_when_ready`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteWhenReady {
+    Written,
+    /// The agent is not waiting for a prompt, its input line holds a draft, or the caller's
+    /// guard refused at the moment of the write.
+    NotReady,
+    /// Earlier input is still queued or being written: nothing was queued behind it.
+    Busy,
+    /// Another process holds the terminal now, or none does.
+    GenerationChanged,
+}
+
 struct SizeOwner {
     claim: String,
     attachment: uuid::Uuid,
@@ -304,6 +365,14 @@ struct Session {
     /// goes to the one used last when its owner leaves several viewers (#348).
     user_input_order: HashMap<String, u64>,
     user_input_clock: u64,
+    /// When input other than the terminal's own replies last reached it: a person, an older
+    /// client or the MCP `terminal_write` tool.
+    last_line_input: Option<LineInput>,
+    /// When the status mirror saw the agent start its last turn from idle (the first report of
+    /// that turn it read, which coalescing can make later than the real start), and the latest
+    /// idle report it read before that: input before the idle report was submitted by that turn.
+    turn_started_at: Option<std::time::Instant>,
+    turn_idle_since: Option<std::time::Instant>,
     /// Set while the size is un-owned because its owner left several viewers and none was used
     /// since: the hand-over waits for use, so an attach does not take the size, and only this
     /// viewer answers the terminal's queries meanwhile (#348).
@@ -328,6 +397,14 @@ struct Session {
     /// An AI Terminal's agent state for the left panel (#187): `None` for a plain shell,
     /// unavailable when no observer reports it, else its observer's last report.
     agent_status: Option<SessionAgentStatus>,
+}
+
+/// Input that may sit on the terminal's input line: when it arrived, and whether the agent's
+/// observer showed a turn in progress then.
+#[derive(Clone, Copy, Debug)]
+struct LineInput {
+    at: std::time::Instant,
+    during_turn: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -370,8 +447,56 @@ impl SessionAgentStatus {
                     .format(&Rfc3339)
                     .ok()
             }),
+            ready_for_prompt: observation.is_some_and(|observation| observation.ready_for_prompt),
         }
     }
+}
+
+/// Why the server may not type into `session`'s `process` now; `None` grants the write permit's
+/// terminal items: the live generation reads ready for a prompt now and its input line is clean.
+fn refusal(
+    session: &Session,
+    generation: &Arc<SessionGeneration>,
+    process: &Arc<dyn PtyProcess>,
+) -> Option<WriteWhenReady> {
+    if generation.is_invalidated()
+        || generation.is_closing()
+        || !Arc::ptr_eq(&session.generation, generation)
+        || session.status != TerminalStatus::Running
+        || !session
+            .process
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, process))
+    {
+        return Some(WriteWhenReady::GenerationChanged);
+    }
+    (session.agent_status.is_none()
+        || !reads_ready_for_prompt(generation)
+        || !session.input_line_clean())
+    .then_some(WriteWhenReady::NotReady)
+}
+
+/// The observer's own readiness, not the mirrored summary. With [`end_ready_period`], the only
+/// use of the observer's readiness API in this file.
+fn reads_ready_for_prompt(generation: &SessionGeneration) -> bool {
+    generation
+        .observation
+        .observation()
+        .subscribe_agent_status()
+        .borrow()
+        .is_some_and(|observation| {
+            observation.ready_for_prompt
+                && observation.state == TerminalAgentState::Done
+                && !observation.failed
+        })
+}
+
+/// Ends the ready period a granted write used, so one write goes per period.
+fn end_ready_period(generation: &SessionGeneration) {
+    generation
+        .observation
+        .observation()
+        .clear_ready_for_prompt();
 }
 
 /// How often an unchanged Working report refreshes the published age: often enough that the
@@ -1277,9 +1402,34 @@ struct SessionGeneration {
     activity_completed: CancellationToken,
     #[cfg(test)]
     output_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
+    /// Runs on the writer's thread before a guarded write's guard.
+    #[cfg(test)]
+    write_guard_pause: std::sync::Mutex<Option<Arc<GuardPause>>>,
+    /// Held for writing by a test, it stops the status mirror before it reads the next report,
+    /// so the reports published meanwhile coalesce.
+    #[cfg(test)]
+    mirror_pause: tokio::sync::RwLock<()>,
+}
+
+#[cfg(test)]
+struct GuardPause(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for GuardPause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuardPause")
+    }
 }
 
 impl SessionGeneration {
+    #[cfg(test)]
+    fn pause_before_write_guard(&self) {
+        let pause = self.write_guard_pause.lock().expect("pause lock").clone();
+        if let Some(pause) = pause {
+            (pause.0)();
+        }
+    }
+
     fn new(
         key: &SessionKey,
         observer_runtime: Option<tokio::runtime::Handle>,
@@ -1307,6 +1457,10 @@ impl SessionGeneration {
             activity_completed: CancellationToken::new(),
             #[cfg(test)]
             output_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            write_guard_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            mirror_pause: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -1832,6 +1986,22 @@ impl Session {
         }
     }
 
+    /// No input reached the terminal since its agent last started a turn from idle, so nothing
+    /// typed can be waiting on its input line. Input typed while idle is submitted by the next
+    /// turn the mirror saw start; input typed during a turn only by a turn that started after an
+    /// idle report newer than the input, because the mirror may have missed the turn's first
+    /// report. A tie counts as typed after the start.
+    fn input_line_clean(&self) -> bool {
+        self.last_line_input.is_none_or(|input| {
+            let submitted_after = if input.during_turn {
+                self.turn_idle_since
+            } else {
+                self.turn_started_at
+            };
+            self.turn_started_at.is_some() && submitted_after.is_some_and(|after| input.at < after)
+        })
+    }
+
     /// Input counts as use of a window unless it is the terminal's own reply: use ends the
     /// departed owner's claim to the size, and a user's input orders the windows (#348).
     fn note_input(&mut self, origin: TerminalInputOrigin<'_>) {
@@ -1840,6 +2010,16 @@ impl Session {
         }
         self.departed_owner = None;
         self.owner_unused_since_handoff = false;
+        let at = std::time::Instant::now();
+        let during_turn = self.agent_status.is_some()
+            && self
+                .generation
+                .observation
+                .observation()
+                .subscribe_agent_status()
+                .borrow()
+                .is_some_and(|observation| observation.state != TerminalAgentState::Done);
+        self.last_line_input = Some(LineInput { at, during_turn });
         if let TerminalInputOrigin::User(claim) = origin {
             self.user_input_clock += 1;
             // Departed claims are pruned at each release; past the bound, the window typed in
@@ -2333,9 +2513,47 @@ impl TerminalManager {
             carry_over = session.carry_over();
         }
         let mut input = input;
+        // The keys the server's hook sets, which no prepared environment may replace: a
+        // project's version manager `[env]` must not redirect a terminal's credential. `PATH`
+        // stays open, since a prepared launch pins its own tools there.
+        let mut session_keys = Vec::new();
+        // What the hook put in front of `PATH` (the shim folders), which a prepared `PATH`
+        // overlay keeps in front of its own.
+        let mut hook_path_prefix = None;
         if let Some(session_env) = self.inner.options.session_env.as_ref() {
-            session_env(&input.thread_id, &mut input.env).await;
+            let caller_env = input.env.clone();
+            let ai_terminal = input
+                .command
+                .as_ref()
+                .is_some_and(|command| command.activity.is_some());
+            session_env(
+                TerminalSessionLaunch {
+                    thread_id: &input.thread_id,
+                    terminal_id: &input.terminal_id,
+                    generation: &generation.id,
+                    ai_terminal,
+                },
+                &mut input.env,
+            )
+            .await;
+            session_keys = input
+                .env
+                .iter()
+                .filter(|(key, value)| {
+                    !key.eq_ignore_ascii_case("PATH") && caller_env.get(*key) != Some(*value)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            // The credential keys stay the hook's even when the caller already held the same
+            // value, which the comparison above cannot see.
+            session_keys.extend(SESSION_CREDENTIAL_KEYS.map(str::to_owned));
+            hook_path_prefix = path_prefix(&caller_env, &input.env);
         }
+        let prepared_may_set = |key: &String| {
+            !session_keys
+                .iter()
+                .any(|session_key| environment_keys_equal(Platform::current(), session_key, key))
+        };
 
         // The provider's native form of the command applies to observed and unobserved
         // launches alike, so it replaces the requested one first. Only the spawn uses it: the
@@ -2365,7 +2583,12 @@ impl TerminalManager {
             .await
             {
                 native_args = Some(native.args);
-                input.env.extend(native.env);
+                input.env.extend(
+                    native
+                        .env
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key)),
+                );
             }
         }
 
@@ -2485,7 +2708,21 @@ impl TerminalManager {
                 });
                 diagnostic_values.dedup();
                 let mut env = input.env.clone();
-                env.extend(prepared.env_overlay);
+                env.extend(
+                    prepared
+                        .env_overlay
+                        .into_iter()
+                        .filter(|(key, _)| prepared_may_set(key))
+                        .map(|(key, value)| match &hook_path_prefix {
+                            Some(prefix)
+                                if key.eq_ignore_ascii_case("PATH")
+                                    && !value.starts_with(prefix) =>
+                            {
+                                (key, format!("{prefix}{value}"))
+                            }
+                            _ => (key, value),
+                        }),
+                );
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
                 if let Err(observer) = generation.install_observer(observer) {
@@ -2748,6 +2985,9 @@ impl TerminalManager {
             owner_unused_since_handoff: false,
             user_input_order: HashMap::new(),
             user_input_clock: 0,
+            last_line_input: None,
+            turn_started_at: None,
+            turn_idle_since: None,
             handover_replier: None,
             refused_size: None,
             first_attachment_grant_used: false,
@@ -3254,23 +3494,37 @@ impl TerminalManager {
         let generation = generation.clone();
         tokio::spawn(async move {
             let mut published: Option<TerminalAgentObservation> = None;
+            // A fresh agent is idle; a Working report seen while idle starts a turn. A Working
+            // report the channel coalesced away leaves the input line dirty, never clean.
+            let mut idle = true;
+            // The observed time of the latest idle report read in the current idle stretch.
+            let mut idle_since: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     () = generation.cancellation.cancelled() => return,
                     changed = reports.changed() => if changed.is_err() { return; },
                 }
+                #[cfg(test)]
+                drop(generation.mirror_pause.read().await);
                 let Some(observation) = *reports.borrow_and_update() else {
                     continue;
                 };
-                if published.is_some_and(|previous| {
-                    previous.state == observation.state
-                        && previous.failed == observation.failed
-                        && observation
-                            .observed_at
-                            .saturating_duration_since(previous.observed_at)
-                            < AGENT_STATUS_REFRESH_INTERVAL
-                }) {
+                let turn_start = idle && observation.state == TerminalAgentState::Working;
+                let turn_idle_since = idle_since;
+                idle = observation.state == TerminalAgentState::Done;
+                idle_since = idle.then_some(observation.observed_at);
+                if !turn_start
+                    && published.is_some_and(|previous| {
+                        previous.state == observation.state
+                            && previous.failed == observation.failed
+                            && previous.ready_for_prompt == observation.ready_for_prompt
+                            && observation
+                                .observed_at
+                                .saturating_duration_since(previous.observed_at)
+                                < AGENT_STATUS_REFRESH_INTERVAL
+                    })
+                {
                     continue;
                 }
                 let _publication = generation.publication.lock().await;
@@ -3284,6 +3538,10 @@ impl TerminalManager {
                     }
                     if session.agent_status.is_none() {
                         continue;
+                    }
+                    if turn_start {
+                        session.turn_started_at = Some(observation.observed_at);
+                        session.turn_idle_since = turn_idle_since;
                     }
                     session.agent_status = Some(SessionAgentStatus::Observed(observation));
                     session.summary()
@@ -4140,6 +4398,11 @@ impl TerminalManager {
             .inner
             .generations
             .remove_matching(thread_id, terminal_id);
+        // Every ending generation stops being live before any cleanup waits, so no credential of
+        // a terminal still queued for cleanup verifies meanwhile.
+        for generation in &generations {
+            generation.begin_closing();
+        }
         for generation in &generations {
             generation.stop_output().await;
             generation
@@ -4471,6 +4734,80 @@ impl TerminalManager {
         })
     }
 
+    /// How many times a person typed into the terminal's current process; the server's own
+    /// writes and unmarked ones (the MCP `terminal_write` tool) never count.
+    pub async fn person_input_count(&self, thread_id: &str, terminal_id: &str) -> Option<u64> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        Some(session.lock().await.user_input_clock)
+    }
+
+    /// Types `data` as the terminal's own input under one write permit, decided again on the
+    /// writer's thread at the moment the bytes reach the process: `generation` still runs, its
+    /// agent reads ready for a prompt, nothing was typed since the agent last started a turn,
+    /// `still_wanted` holds, and no earlier input is pending. A granted write ends the ready
+    /// period, so one write goes per period. Dropping the future drops a write not yet started.
+    /// `still_wanted` runs with the session lock held, so it must not wait on anything.
+    pub async fn write_when_ready(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        generation: &TerminalGeneration,
+        data: &str,
+        still_wanted: WriteGuard,
+    ) -> Result<WriteWhenReady, TerminalError> {
+        let session = self.require_session(thread_id, terminal_id).await?;
+        let current = session.lock().await.generation.clone();
+        if current.id != *generation {
+            return Ok(WriteWhenReady::GenerationChanged);
+        }
+        let mut pending = {
+            let _publication = current.publication.lock().await;
+            let locked = session.lock().await;
+            let Some(process) = locked.process.clone() else {
+                return Ok(WriteWhenReady::GenerationChanged);
+            };
+            if let Some(refusal) = refusal(&locked, &current, &process) {
+                return Ok(refusal);
+            }
+            drop(locked);
+            let (session, generation) = (session.clone(), current.clone());
+            let guard_process = process.clone();
+            let guard: WriteGuard = Box::new(move || {
+                #[cfg(test)]
+                generation.pause_before_write_guard();
+                // The caller's wish and the terminal, both read under the session lock, so neither
+                // changes between its read and the write; nothing slow runs between them. The lock
+                // is not held across the write: input that arrives after this check is queued
+                // behind the pointer.
+                let locked = session.blocking_lock();
+                if !still_wanted() || refusal(&locked, &generation, &guard_process).is_some() {
+                    return false;
+                }
+                end_ready_period(&generation);
+                true
+            });
+            let Some(pending) = current.writer.enqueue_alone(&process, data, guard)? else {
+                return Ok(WriteWhenReady::Busy);
+            };
+            current
+                .activity_wake
+                .store(true, std::sync::atomic::Ordering::Release);
+            pending
+        };
+        match pending.wait().await {
+            Ok(()) => Ok(WriteWhenReady::Written),
+            // Refused at the write, or the generation ended first.
+            Err(TerminalError::PublicationCancelled) => Ok(WriteWhenReady::NotReady),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Terminal sessions whose process is starting or running.
     pub async fn live_session_count(&self) -> usize {
         let sessions = self.inner.sessions.read().await;
@@ -4520,6 +4857,138 @@ impl TerminalManager {
         TerminalMetadataAttachment { initial, events }
     }
 
+    /// The generation of the terminal's process while it runs. A process a close, restart or
+    /// shutdown has begun to end is no longer live, though its session runs until cleanup.
+    pub async fn live_generation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<TerminalGeneration> {
+        // A manager that shuts down ends every terminal it holds.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let session = session.lock().await;
+        // Shutdown may have begun while this waited for the session.
+        if self.inner.cancellation.is_cancelled() {
+            return None;
+        }
+        (session.status == TerminalStatus::Running
+            && !session.generation.is_closing()
+            && !session.generation.is_invalidated())
+        .then(|| session.generation.id.clone())
+    }
+
+    /// The observation lease of the current process of an AI Terminal of `driver_kind`.
+    async fn observation_of(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        driver_kind: &str,
+    ) -> Option<crate::provider_terminal::TerminalObserverGenerationLease> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let session = session.lock().await;
+        session
+            .command
+            .as_ref()
+            .and_then(|command| command.activity.as_ref())
+            .filter(|activity| activity.driver_kind == driver_kind)?;
+        Some(session.generation.observation.observation())
+    }
+
+    /// The conversation a Claude AI Terminal's observer recorded for its current process (R112).
+    pub(crate) async fn observed_conversation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::provider_terminal::ObservedConversation> {
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
+            .await?
+            .observed_conversation()
+    }
+
+    /// The main session a Claude AI Terminal's observer bound last.
+    pub(crate) async fn observed_session(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<String> {
+        self.observation_of(thread_id, terminal_id, CLAUDE_DRIVER_KIND)
+            .await?
+            .observed_session()
+    }
+
+    /// The way into a Codex AI Terminal's observer loop, for its current process (R112).
+    pub(crate) async fn codex_conversation(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<crate::provider_terminal::CodexConversationHandle> {
+        self.observation_of(thread_id, terminal_id, "codex")
+            .await?
+            .codex_conversation()
+    }
+
+    /// The folder the terminal's process was launched in.
+    pub(crate) async fn working_directory(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()?;
+        let cwd = std::path::PathBuf::from(&session.lock().await.cwd);
+        Some(cwd)
+    }
+
+    /// The environment the terminal's command carries (the provider's settings), never the
+    /// spawn environment, which also holds the terminal's credential.
+    pub(crate) async fn launch_environment(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let Some(session) = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&(thread_id.to_owned(), terminal_id.to_owned()))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let session = session.lock().await;
+        session
+            .command
+            .as_ref()
+            .and_then(|command| command.env.as_ref())
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn subscribe_events(&self) -> TerminalEventReceiver {
         TerminalEventReceiver::new(self.inner.events.subscribe(), false)
     }
@@ -4531,6 +5000,11 @@ impl TerminalManager {
 
     async fn shutdown_with_report(&self) -> ProcessCleanupReport {
         self.inner.cancellation.cancel();
+        // Attachment cleanup can wait on session locks a credential check also waits on: every
+        // generation stops verifying before that wait.
+        for generation in self.inner.generations.snapshot_live() {
+            generation.begin_closing();
+        }
         {
             let _registrations = self
                 .inner
@@ -4540,7 +5014,11 @@ impl TerminalManager {
             self.inner.attachment_tasks.close();
         }
         self.inner.attachment_tasks.wait().await;
-        for generation in self.inner.generations.remove_all() {
+        let generations = self.inner.generations.remove_all();
+        for generation in &generations {
+            generation.begin_closing();
+        }
+        for generation in generations {
             generation.stop_output().await;
             generation
                 .cancel_and_invalidate(TerminalObserverCancellationReason::Shutdown)
@@ -4591,8 +5069,8 @@ impl TerminalManager {
     }
 }
 
-/// The provider driver whose terminals get a repaint signal after a lossy attach (#348).
-#[cfg(unix)]
+/// The Claude provider driver: its terminals get a repaint signal after a lossy attach (#348),
+/// and its observer records the conversation a send reads.
 const CLAUDE_DRIVER_KIND: &str = "claudeAgent";
 
 /// Sends the one repaint signal of a lossy attach; logs no terminal content.
@@ -11182,6 +11660,1319 @@ mod tests {
         manager.shutdown().await;
     }
 
+    type LeaseSlot = Arc<StdMutex<Option<TerminalObserverGenerationLease>>>;
+
+    #[derive(Debug)]
+    struct LeaseCapture(LeaseSlot);
+
+    impl PreparedTerminalObserver for LeaseCapture {
+        fn on_spawned(
+            &self,
+            _pid: u32,
+            generation: TerminalObserverGenerationLease,
+            _workers: TerminalObserverWorkerContext,
+        ) {
+            *self.0.lock().unwrap() = Some(generation);
+        }
+
+        fn diagnostic_label(&self) -> &str {
+            "lease-capture"
+        }
+    }
+
+    /// Prepares every AI Terminal with an observer that hands its generation lease to the test.
+    struct LeaseCapturingPreparer(LeaseSlot);
+
+    impl TerminalLaunchPreparer for LeaseCapturingPreparer {
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::new(),
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(self.0.clone())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    async fn next_agent_status(
+        events: &mut broadcast::Receiver<TerminalMetadataEvent>,
+        wanted: impl Fn(&TerminalSummary) -> bool,
+    ) -> TerminalAgentStatus {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(TerminalMetadataEvent::Upsert { terminal }) = events.recv().await
+                    && wanted(&terminal)
+                    && let Some(status) = terminal.agent_status
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .expect("a summary with the wanted agent status is published")
+    }
+
+    fn agent_status_is(
+        terminal: &TerminalSummary,
+        wanted: impl Fn(&TerminalAgentStatus) -> bool,
+    ) -> bool {
+        terminal.agent_status.as_ref().is_some_and(wanted)
+    }
+
+    #[tokio::test]
+    async fn agent_status_summary_carries_ready_for_prompt() {
+        for status in [
+            SessionAgentStatus::Unavailable,
+            SessionAgentStatus::Ready,
+            SessionAgentStatus::Exited { failed: false },
+        ] {
+            assert!(!status.summary().ready_for_prompt, "{status:?}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let slot = LeaseSlot::default();
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer: Some(Arc::new(LeaseCapturingPreparer(slot.clone()))),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = slot.lock().unwrap().clone() {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer receives its generation");
+
+        for (state, shown) in [
+            (
+                TerminalAgentState::Working,
+                TerminalAgentStatusState::Working,
+            ),
+            (
+                TerminalAgentState::Blocked,
+                TerminalAgentStatusState::Blocked,
+            ),
+            (
+                TerminalAgentState::Waiting,
+                TerminalAgentStatusState::Waiting,
+            ),
+        ] {
+            lease.publish_agent_status(state, false);
+            // Only a done, unfailed observation can be marked.
+            lease.mark_ready_for_prompt();
+            let status = next_agent_status(&mut events, |terminal| {
+                agent_status_is(terminal, |status| status.state == shown)
+            })
+            .await;
+            assert!(!status.ready_for_prompt, "{state:?}");
+        }
+        lease.publish_agent_status(TerminalAgentState::Done, true);
+        lease.mark_ready_for_prompt();
+        let failed = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.failed)
+        })
+        .await;
+        assert!(!failed.ready_for_prompt, "a failed turn is not ready");
+
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        let done = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Done && !status.failed
+            })
+        })
+        .await;
+        assert!(!done.ready_for_prompt, "a done report alone is not ready");
+        // The same observation with only the flag changed is published again.
+        lease.mark_ready_for_prompt();
+        let ready = next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        assert_eq!(ready.state, TerminalAgentStatusState::Done);
+        assert_eq!(ready.observed_at, done.observed_at);
+
+        backend.latest().exit(0);
+        let exited = next_agent_status(&mut events, |terminal| {
+            terminal.status == TerminalStatus::Exited
+        })
+        .await;
+        assert!(!exited.ready_for_prompt, "an exited agent is not ready");
+        manager.shutdown().await;
+    }
+
+    /// A manager whose AI Terminals hand their observer lease to the test.
+    fn write_when_ready_manager(backend: Arc<HistoryTestBackend>) -> (TerminalManager, LeaseSlot) {
+        let slot = LeaseSlot::default();
+        let manager = TerminalManager::new(
+            backend,
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer: Some(Arc::new(LeaseCapturingPreparer(slot.clone()))),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        (manager, slot)
+    }
+
+    /// The lease of the generation spawned after `previous` (any one when `None`).
+    async fn next_lease(
+        slot: &LeaseSlot,
+        previous: Option<&TerminalObserverGenerationLease>,
+    ) -> TerminalObserverGenerationLease {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = slot.lock().unwrap().clone()
+                    && previous.is_none_or(|previous| previous.id() != lease.id())
+                {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer receives its generation")
+    }
+
+    fn mark_ready(lease: &TerminalObserverGenerationLease) {
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+    }
+
+    /// A caller whose mail stays eligible.
+    fn wanted() -> WriteGuard {
+        Box::new(|| true)
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_writes_once_per_ready_period_of_the_running_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        assert_eq!(backend.latest().writes(), ["pointer"]);
+        assert!(
+            !lease
+                .subscribe_agent_status()
+                .borrow()
+                .unwrap()
+                .ready_for_prompt,
+            "the write ends the ready period"
+        );
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        assert_eq!(backend.latest().writes(), ["pointer"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_a_busy_blocked_waiting_or_unobserved_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        let write =
+            || manager.write_when_ready("thread-a", "term-1", &generation, "pointer", wanted());
+        assert_eq!(
+            write().await.unwrap(),
+            WriteWhenReady::NotReady,
+            "never observed"
+        );
+        for state in [
+            TerminalAgentState::Working,
+            TerminalAgentState::Blocked,
+            TerminalAgentState::Waiting,
+        ] {
+            lease.publish_agent_status(state, false);
+            lease.mark_ready_for_prompt();
+            assert_eq!(
+                write().await.unwrap(),
+                WriteWhenReady::NotReady,
+                "{state:?}"
+            );
+        }
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        assert_eq!(
+            write().await.unwrap(),
+            WriteWhenReady::NotReady,
+            "done without fresh prompt evidence"
+        );
+        // A plain shell never reads ready.
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-a",
+                "shell",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let shell = manager.live_generation("thread-a", "shell").await.unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "shell", &shell, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        for process in backend.processes.lock().unwrap().iter() {
+            assert!(process.writes().is_empty(), "nothing was typed");
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_the_old_generation_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let first = next_lease(&slot, None).await;
+        let old = manager.live_generation("thread-a", "term-1").await.unwrap();
+        manager
+            .restart(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, Some(&first)).await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &old, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::GenerationChanged
+        );
+        assert!(backend.latest().writes().is_empty());
+        let new = manager.live_generation("thread-a", "term-1").await.unwrap();
+        assert_ne!(new, old);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &new, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_is_automatic_and_only_a_persons_input_is_counted() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        let count = || manager.person_input_count("thread-a", "term-1");
+        assert_eq!(count().await, Some(0));
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::Written
+        );
+        assert_eq!(count().await, Some(0), "the pointer is not a person typing");
+        manager.write("thread-a", "term-1", "mcp").await.unwrap();
+        assert_eq!(count().await, Some(0), "an unmarked write is not a person");
+        manager
+            .write_from(
+                "thread-a",
+                "term-1",
+                "x",
+                TerminalInputOrigin::User("window"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count().await, Some(1));
+        assert_eq!(manager.person_input_count("thread-a", "none").await, None);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_refuses_a_draft_until_the_agent_starts_working() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        manager
+            .write_from(
+                "thread-a",
+                "term-1",
+                "half a prompt",
+                TerminalInputOrigin::User("window"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady,
+            "newer readiness evidence does not show the draft was submitted"
+        );
+        assert_eq!(backend.latest().writes(), ["half a prompt"]);
+        lease.publish_agent_status(TerminalAgentState::Working, false);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Working
+            })
+        })
+        .await;
+        mark_ready(&lease);
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::Written,
+            "a turn start shows the draft was submitted"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_treats_unmarked_input_as_a_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        // An older client's typing and the MCP terminal_write tool both arrive unmarked.
+        manager.write("thread-a", "term-1", "older").await.unwrap();
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady
+        );
+        assert_eq!(backend.latest().writes(), ["older"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_never_queues_the_pointer_behind_earlier_input() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        // The terminal's own reply, which leaves the input line clean, is stuck in the PTY.
+        let earlier = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .write_from(
+                        "thread-a",
+                        "term-1",
+                        "\x1b[0n",
+                        TerminalInputOrigin::Automatic,
+                    )
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || gate.wait_entered()
+        })
+        .await
+        .unwrap();
+        let pointer = tokio::spawn({
+            let manager = manager.clone();
+            let generation = generation.clone();
+            async move {
+                manager
+                    .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lease.publish_agent_status(TerminalAgentState::Blocked, false);
+        gate.open();
+        earlier.await.unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+            .await
+            .expect("the pointer write answers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, WriteWhenReady::Busy);
+        assert_eq!(
+            backend.latest().writes(),
+            ["\x1b[0n"],
+            "the pointer reached an approval prompt"
+        );
+        manager.shutdown().await;
+    }
+
+    /// The write permit is decided again on the writer's thread: a change between the queueing
+    /// and the write refuses it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_decides_at_the_moment_of_the_write() {
+        for change in ["blocked", "draft", "unwanted", "restart"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, slot) = write_when_ready_manager(backend.clone());
+            manager
+                .open(ai_terminal_input(root.path(), "term-1"))
+                .await
+                .unwrap();
+            let lease = next_lease(&slot, None).await;
+            let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+            mark_ready(&lease);
+            let process = backend.latest();
+            let gate = Arc::new(WriteGate::default());
+            let _open = OpenOnDrop(gate.clone());
+            {
+                let sessions = manager.inner.sessions.read().await;
+                let session = sessions[&("thread-a".to_owned(), "term-1".to_owned())].clone();
+                let pause = gate.clone();
+                *session
+                    .lock()
+                    .await
+                    .generation
+                    .write_guard_pause
+                    .lock()
+                    .unwrap() = Some(Arc::new(GuardPause(Box::new(move || pause.pass()))));
+            }
+            let unwanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pointer = tokio::spawn({
+                let manager = manager.clone();
+                let generation = generation.clone();
+                let unwanted = unwanted.clone();
+                async move {
+                    manager
+                        .write_when_ready(
+                            "thread-a",
+                            "term-1",
+                            &generation,
+                            "pointer",
+                            Box::new(move || !unwanted.load(std::sync::atomic::Ordering::Acquire)),
+                        )
+                        .await
+                }
+            });
+            tokio::task::spawn_blocking({
+                let gate = gate.clone();
+                move || gate.wait_entered()
+            })
+            .await
+            .unwrap();
+            let typed = match change {
+                "blocked" => {
+                    lease.publish_agent_status(TerminalAgentState::Blocked, false);
+                    None
+                }
+                "draft" => Some(tokio::spawn({
+                    let manager = manager.clone();
+                    async move {
+                        manager
+                            .write_from("thread-a", "term-1", "x", TerminalInputOrigin::User("w"))
+                            .await
+                    }
+                })),
+                "unwanted" => {
+                    unwanted.store(true, std::sync::atomic::Ordering::Release);
+                    None
+                }
+                _ => {
+                    manager
+                        .restart(ai_terminal_input(root.path(), "term-1"))
+                        .await
+                        .unwrap();
+                    None
+                }
+            };
+            if typed.is_some() {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while manager.person_input_count("thread-a", "term-1").await != Some(1) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the person's input is queued behind the pointer");
+            }
+            gate.open();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+                .await
+                .expect("the pointer write answers")
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome, WriteWhenReady::NotReady, "{change}");
+            if let Some(typed) = typed {
+                typed.await.unwrap().unwrap();
+            }
+            assert!(
+                !process.writes().iter().any(|write| write == "pointer"),
+                "{change}: the pointer was typed"
+            );
+            manager.shutdown().await;
+        }
+    }
+
+    /// A draft typed during a turn stays a draft when the mirror sees only a later progress report
+    /// of that turn: the coalesced report never moves the turn's start past the draft.
+    #[tokio::test]
+    async fn write_when_ready_keeps_a_draft_typed_before_coalesced_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        let mut events = manager.subscribe_metadata().await.events;
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        let current = manager.inner.sessions.read().await
+            [&("thread-a".to_owned(), "term-1".to_owned())]
+            .lock()
+            .await
+            .generation
+            .clone();
+        let paused = current.mirror_pause.write().await;
+        lease.publish_agent_status(TerminalAgentState::Working, false);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        manager
+            .write_from(
+                "thread-a",
+                "term-1",
+                "draft",
+                TerminalInputOrigin::User("w"),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        lease.publish_agent_progress();
+        drop(paused);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| {
+                status.state == TerminalAgentStatusState::Working
+            })
+        })
+        .await;
+        mark_ready(&lease);
+        next_agent_status(&mut events, |terminal| {
+            agent_status_is(terminal, |status| status.ready_for_prompt)
+        })
+        .await;
+        assert_eq!(
+            manager
+                .write_when_ready("thread-a", "term-1", &generation, "pointer", wanted())
+                .await
+                .unwrap(),
+            WriteWhenReady::NotReady,
+            "the pointer was typed into a draft"
+        );
+        assert_eq!(backend.latest().writes(), ["draft"]);
+        manager.shutdown().await;
+    }
+
+    /// The caller's guard is read with the session lock held: mail that stops being wanted while
+    /// the writer waits for that lock gets no pointer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_when_ready_reads_the_callers_guard_under_the_session_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, slot) = write_when_ready_manager(backend.clone());
+        manager
+            .open(ai_terminal_input(root.path(), "term-1"))
+            .await
+            .unwrap();
+        let lease = next_lease(&slot, None).await;
+        let generation = manager.live_generation("thread-a", "term-1").await.unwrap();
+        mark_ready(&lease);
+        let process = backend.latest();
+        let gate = Arc::new(WriteGate::default());
+        let _open = OpenOnDrop(gate.clone());
+        let session = manager.inner.sessions.read().await
+            [&("thread-a".to_owned(), "term-1".to_owned())]
+            .clone();
+        {
+            let pause = gate.clone();
+            *session
+                .lock()
+                .await
+                .generation
+                .write_guard_pause
+                .lock()
+                .unwrap() = Some(Arc::new(GuardPause(Box::new(move || pause.pass()))));
+        }
+        let unwanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pointer = tokio::spawn({
+            let manager = manager.clone();
+            let unwanted = unwanted.clone();
+            async move {
+                manager
+                    .write_when_ready(
+                        "thread-a",
+                        "term-1",
+                        &generation,
+                        "pointer",
+                        Box::new(move || !unwanted.load(std::sync::atomic::Ordering::Acquire)),
+                    )
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || gate.wait_entered()
+        })
+        .await
+        .unwrap();
+        let held = session.lock().await;
+        gate.open();
+        // The writer reaches the session lock and waits on it while the mail stops being wanted.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        unwanted.store(true, std::sync::atomic::Ordering::Release);
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pointer)
+            .await
+            .expect("the pointer write answers")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, WriteWhenReady::NotReady);
+        assert!(
+            !process.writes().iter().any(|write| write == "pointer"),
+            "the pointer was typed for mail nobody wants"
+        );
+        manager.shutdown().await;
+    }
+
+    const TEST_AGENT_ENDPOINT: &str = "http://127.0.0.1:3773/api/agent/call";
+    const TEST_OPEN_URL_ENDPOINT: &str = "http://127.0.0.1:3773/api/preview/open-url";
+
+    fn credential_manager(
+        backend: Arc<HistoryTestBackend>,
+        launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
+    ) -> (
+        TerminalManager,
+        crate::agent_messaging::terminal_credential::TerminalCredentials,
+    ) {
+        let credentials = crate::agent_messaging::terminal_credential::TerminalCredentials::new(
+            "env-1".to_owned(),
+            PathBuf::from("/state/runtime/agent"),
+        );
+        let hook_credentials = credentials.clone();
+        let manager = TerminalManager::new(
+            backend,
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                launch_preparer,
+                session_env: Some(TerminalManagerOptions::session_env_hook(
+                    move |launch, env| {
+                        let credentials = hook_credentials.clone();
+                        Box::pin(async move {
+                            crate::open_url::OpenUrlSession {
+                                endpoint: TEST_OPEN_URL_ENDPOINT.to_owned(),
+                                token: format!("open-url-{}", launch.terminal_id),
+                                shim_dir: PathBuf::from("/state/runtime/open-url"),
+                            }
+                            .apply(env);
+                            credentials.issue(&launch, env).await;
+                        })
+                    },
+                )),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        credentials.bind(
+            "http://127.0.0.1:3773/api/agent/call".to_owned(),
+            Arc::new(manager.clone()),
+        );
+        (manager, credentials)
+    }
+
+    fn ai_terminal_input(root: &Path, terminal_id: &str) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new("thread-a", terminal_id, root.to_path_buf(), 80, 24);
+        input.command = Some(TerminalLaunchCommand {
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            label: None,
+            activity: Some(crate::terminal::ProviderTerminalActivityLaunch {
+                driver_kind: "claudeAgent".to_owned(),
+                provider_instance_id: "claudeAgent".to_owned(),
+            }),
+            env: None,
+        });
+        input
+    }
+
+    fn last_agent_token(backend: &HistoryTestBackend) -> String {
+        backend
+            .spawns()
+            .last()
+            .and_then(|spawn| spawn.env.get("BIBCODE_AGENT_AUTH").cloned())
+            .expect("assertion failed: env contains BIBCODE_AGENT_AUTH")
+    }
+
+    #[tokio::test]
+    async fn terminal_env_agent_credential_only_for_ai_terminals() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+
+        manager
+            .open(ai_terminal_input(root.path(), "term-ai"))
+            .await
+            .unwrap();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-a",
+                "term-plain",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+
+        let spawns = backend.spawns();
+        assert_eq!(
+            spawns[0].env["BIBCODE_AGENT_ENDPOINT"],
+            "http://127.0.0.1:3773/api/agent/call"
+        );
+        let identity = credentials
+            .verify(&spawns[0].env["BIBCODE_AGENT_AUTH"])
+            .await
+            .expect("verify returned None, expected Some(terminal:thread-a/term-ai)");
+        assert_eq!(identity.address(), "terminal:thread-a/term-ai");
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_AUTH"));
+        assert!(!spawns[1].env.contains_key("BIBCODE_AGENT_ENDPOINT"));
+        manager.shutdown().await;
+    }
+
+    /// Prepares every AI Terminal with environment a project could choose, such as a version
+    /// manager's `[env]`.
+    struct OverlayPreparer;
+
+    impl TerminalLaunchPreparer for OverlayPreparer {
+        fn native_command(
+            &self,
+            input: &TerminalLaunchPreparationInput,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Option<crate::provider_terminal::NativeTerminalCommand>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::ready(Some(
+                crate::provider_terminal::NativeTerminalCommand {
+                    args: input.args.clone(),
+                    env: std::collections::BTreeMap::from([(
+                        "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                        "http://example.test/native".to_owned(),
+                    )]),
+                },
+            )))
+        }
+
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::from([
+                        (
+                            "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_AGENT_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                            "http://example.test/overlay".to_owned(),
+                        ),
+                        (
+                            "BIBCODE_OPEN_URL_AUTH".to_owned(),
+                            "chosen-by-the-project".to_owned(),
+                        ),
+                    ]),
+                    // A private key that names a launch variable is refused before the spawn.
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(LeaseSlot::default())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Prepares every AI Terminal with a pinned `PATH`, as a version manager's shim does.
+    struct PinnedPathPreparer;
+
+    impl TerminalLaunchPreparer for PinnedPathPreparer {
+        fn prepare(
+            &self,
+            input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::Prepared(
+                crate::provider_terminal::PreparedTerminalLaunch {
+                    executable: input.executable,
+                    args: input.args,
+                    env_overlay: std::collections::BTreeMap::from([(
+                        "PATH".to_owned(),
+                        "/pinned/tool/bin:/usr/bin".to_owned(),
+                    )]),
+                    private_env: std::collections::BTreeMap::new(),
+                    observer: Box::new(LeaseCapture(LeaseSlot::default())),
+                },
+            )))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_prepared_path_keeps_the_shim_folders_first() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, _credentials) =
+            credential_manager(backend.clone(), Some(Arc::new(PinnedPathPreparer)));
+        let mut input = ai_terminal_input(root.path(), "term-ai");
+        input
+            .env
+            .insert("PATH".to_owned(), "/caller/bin".to_owned());
+        manager.open(input).await.unwrap();
+        let spawn = backend.spawns().pop().expect("a spawn");
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            spawn.env["PATH"],
+            [
+                "/state/runtime/agent",
+                "/state/runtime/open-url",
+                "/pinned/tool/bin:/usr/bin",
+            ]
+            .join(separator),
+            "the pinned PATH drops the `bibcode` shim"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_prepared_environment_cannot_replace_the_agent_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) =
+            credential_manager(backend.clone(), Some(Arc::new(OverlayPreparer)));
+
+        // A caller's environment that already holds the server's own endpoints must not leave
+        // them open to the overlay.
+        for (terminal_id, caller_holds_the_endpoints) in [("term-ai", false), ("term-pre", true)] {
+            let mut input = ai_terminal_input(root.path(), terminal_id);
+            if caller_holds_the_endpoints {
+                input.env.insert(
+                    "BIBCODE_AGENT_ENDPOINT".to_owned(),
+                    TEST_AGENT_ENDPOINT.to_owned(),
+                );
+                input.env.insert(
+                    "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
+                    TEST_OPEN_URL_ENDPOINT.to_owned(),
+                );
+            }
+            manager.open(input).await.unwrap();
+
+            let spawn = backend.spawns().pop().expect("a spawn");
+            assert_eq!(
+                spawn.env["BIBCODE_AGENT_ENDPOINT"], TEST_AGENT_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_ENDPOINT"], TEST_OPEN_URL_ENDPOINT,
+                "{terminal_id}"
+            );
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_AUTH"],
+                format!("open-url-{terminal_id}")
+            );
+            assert!(
+                credentials
+                    .verify(&spawn.env["BIBCODE_AGENT_AUTH"])
+                    .await
+                    .is_some(),
+                "{terminal_id}: the spawned credential is the one the server issued"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_credential_is_refused_after_close_exit_restart_and_replacement() {
+        for ending in ["close", "exit", "restart", "replacement"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let shutdown = CancellationToken::new();
+            let revoker = credentials.spawn_revoker(manager.subscribe_events(), shutdown.clone());
+            let ended = ai_terminal_input(root.path(), "term-c");
+            manager.open(ended.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_process = backend.latest();
+            manager
+                .open(ai_terminal_input(root.path(), "term-e"))
+                .await
+                .unwrap();
+            let sibling = last_agent_token(&backend);
+            let before = manager.live_generation("thread-a", "term-c").await.unwrap();
+
+            match ending {
+                "close" => manager.close("thread-a", Some("term-c")).await.unwrap(),
+                "restart" => {
+                    manager.restart(ended.clone()).await.unwrap();
+                }
+                _ => {
+                    old_process.exit(0);
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while manager
+                            .live_generation("thread-a", "term-c")
+                            .await
+                            .is_some()
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("the process exit is published");
+                    if ending == "replacement" {
+                        manager.open(ended.clone()).await.unwrap();
+                    }
+                }
+            }
+
+            assert_eq!(credentials.verify(&old).await, None, "{ending}");
+            assert!(credentials.verify(&sibling).await.is_some(), "{ending}");
+            if matches!(ending, "restart" | "replacement") {
+                let after = manager.live_generation("thread-a", "term-c").await.unwrap();
+                assert_eq!(after.process, before.process + 2, "{ending}");
+                assert!(
+                    credentials
+                        .verify(&last_agent_token(&backend))
+                        .await
+                        .is_some(),
+                    "{ending}: the new process's token verifies"
+                );
+            }
+            shutdown.cancel();
+            revoker.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_the_new_token_survives_a_restart_and_a_delayed_old_exit() {
+        for exit_first in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let input = ai_terminal_input(root.path(), "term-c");
+            manager.open(input.clone()).await.unwrap();
+            let old = last_agent_token(&backend);
+            let old_generation = manager.live_generation("thread-a", "term-c").await.unwrap();
+            let snapshot = manager.restart(input).await.unwrap();
+            let new = last_agent_token(&backend);
+            assert_eq!(
+                manager.live_generation("thread-a", "term-c").await,
+                snapshot.generation
+            );
+
+            let exited = TerminalEvent::Exited {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 1,
+                exit_code: Some(0),
+                exit_signal: None,
+                generation: Some(old_generation),
+            };
+            let restarted = TerminalEvent::Restarted {
+                thread_id: "thread-a".to_owned(),
+                terminal_id: "term-c".to_owned(),
+                sequence: 2,
+                snapshot,
+            };
+            let (sender, receiver) = broadcast::channel(8);
+            let events = if exit_first {
+                [exited, restarted]
+            } else {
+                [restarted, exited]
+            };
+            for event in events {
+                sender.send(event).unwrap();
+            }
+            drop(sender);
+            credentials
+                .spawn_revoker(
+                    TerminalEventReceiver::new(receiver, false),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                credentials.verify(&new).await.is_some(),
+                "the new token was revoked (exit first: {exit_first})"
+            );
+            assert_eq!(credentials.verify(&old).await, None);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_env_a_restarting_generation_stops_verifying_before_its_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        let input = ai_terminal_input(root.path(), "term-c");
+        manager.open(input.clone()).await.unwrap();
+        let old = last_agent_token(&backend);
+        let barrier = Arc::new(PublisherBarrier {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *manager
+            .inner
+            .restart_after_exact_cleanup_barrier
+            .lock()
+            .expect("restart barrier lock") = Some(barrier.clone());
+        let restart_manager = manager.clone();
+        let restart = tokio::spawn(async move { restart_manager.restart(input).await });
+        tokio::time::timeout(Duration::from_secs(2), barrier.started.notified())
+            .await
+            .expect("the restart reached its cleanup barrier");
+
+        assert_eq!(
+            manager.live_generation("thread-a", "term-c").await,
+            None,
+            "an invalidated generation is not live while its session is removed"
+        );
+        assert_eq!(
+            credentials.verify(&old).await,
+            None,
+            "the old token verified during the restart's cleanup"
+        );
+
+        barrier.release.notify_one();
+        restart.await.unwrap().unwrap();
+        assert!(
+            credentials
+                .verify(&last_agent_token(&backend))
+                .await
+                .is_some()
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_no_token_verifies_while_a_bulk_close_or_shutdown_cleans_up() {
+        for ending in ["bulk close", "shutdown"] {
+            let root = tempfile::tempdir().unwrap();
+            let backend = Arc::new(HistoryTestBackend::default());
+            let (manager, credentials) = credential_manager(backend.clone(), None);
+            let mut tokens = Vec::new();
+            let mut held = Vec::new();
+            let mut generations = Vec::new();
+            for terminal in ["term-c", "term-e"] {
+                manager
+                    .open(ai_terminal_input(root.path(), terminal))
+                    .await
+                    .unwrap();
+                tokens.push(last_agent_token(&backend));
+                let generation = manager
+                    .require_session("thread-a", terminal)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .generation
+                    .clone();
+                // Holding the publication lock holds this generation's cleanup in `invalidate`.
+                let publication = generation
+                    .observation
+                    .observation()
+                    .attach_activity_publication(Arc::new(Mutex::new(())));
+                held.push(publication.lock_owned().await);
+                generations.push(generation);
+            }
+            let ending_manager = manager.clone();
+            let task = tokio::spawn(async move {
+                if ending == "shutdown" {
+                    ending_manager.shutdown().await;
+                } else {
+                    ending_manager.close("thread-a", None).await.unwrap();
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !generations.iter().any(|generation| generation.is_closing()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cleanup began");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            for token in &tokens {
+                assert_eq!(
+                    credentials.verify(token).await,
+                    None,
+                    "{ending}: a token verified while its generation waited for cleanup"
+                );
+            }
+            drop(held);
+            task.await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_credential_waiting_on_a_session_lock_fails_once_shutdown_begins() {
+        // Mutation caught: a verification that checked cancellation before it waited on the
+        // session lock returning the still-running generation after shutdown began.
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let (manager, credentials) = credential_manager(backend.clone(), None);
+        manager
+            .open(ai_terminal_input(root.path(), "term-c"))
+            .await
+            .unwrap();
+        let token = last_agent_token(&backend);
+        let attachment = manager
+            .attach(TerminalAttachInput {
+                size_claim: Some("owner".to_owned()),
+                ..TerminalAttachInput::existing("thread-a", "term-c")
+            })
+            .await
+            .unwrap();
+        let session = manager.require_session("thread-a", "term-c").await.unwrap();
+        let held = session.lock().await;
+
+        let verification = tokio::spawn({
+            let credentials = credentials.clone();
+            async move { credentials.verify(&token).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The attachment's cleanup queues on the same lock, and shutdown waits for it.
+        drop(attachment);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let shutdown = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.inner.cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shutdown began");
+        drop(held);
+
+        assert_eq!(
+            verification.await.unwrap(),
+            None,
+            "a verification waiting on the session lock succeeded after shutdown began"
+        );
+        shutdown.await.unwrap();
+    }
+
     #[tokio::test]
     async fn terminal_env_contains_open_url_vars() {
         let root = tempfile::tempdir().unwrap();
@@ -11193,11 +12984,11 @@ mod tests {
             TerminalManagerOptions {
                 subprocess_poll_interval: Duration::ZERO,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
-                    move |thread_id, env| {
+                    move |launch, env| {
                         let issued = hook_issued.clone();
                         Box::pin(async move {
                             let mut issued = issued.lock().unwrap();
-                            let token = format!("{thread_id}-token-{}", issued.len());
+                            let token = format!("{}-token-{}", launch.thread_id, issued.len());
                             issued.push(token.clone());
                             crate::open_url::OpenUrlSession {
                                 endpoint: "http://127.0.0.1:3773/api/preview/open-url".to_owned(),

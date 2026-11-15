@@ -6,9 +6,10 @@
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -53,8 +54,25 @@ impl EventPages<'_> {
 #[derive(Clone, Debug)]
 pub struct Repositories {
     database: Database,
+    agent_claims: Arc<AgentClaimHook>,
     #[cfg(test)]
     delivery_test_hooks: Arc<DeliveryRepositoryTestHooks>,
+}
+
+/// The agent message claim gate, shared by every clone, and the signal a hold it decides sends.
+#[derive(Default)]
+struct AgentClaimHook {
+    gate: std::sync::OnceLock<crate::agent_messaging::policy::AgentClaimGate>,
+    holds: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for AgentClaimHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentClaimHook")
+            .field("installed", &self.gate.get().is_some())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -88,9 +106,39 @@ impl Repositories {
     pub fn new(database: Database) -> Self {
         Self {
             database,
+            agent_claims: Arc::default(),
             #[cfg(test)]
             delivery_test_hooks: Arc::new(DeliveryRepositoryTestHooks::default()),
         }
+    }
+
+    /// Installs the agent message claim gate that `claim_provider_turn` asks first. The first
+    /// install wins.
+    pub(crate) fn set_agent_claim_gate(
+        &self,
+        gate: crate::agent_messaging::policy::AgentClaimGate,
+    ) {
+        let _ = self.agent_claims.gate.set(gate);
+    }
+
+    /// Whether the claim gate would make entry `command_id` wait (an open ask on its recipient,
+    /// or a row it cannot read), so the delivery worker skips it instead of claiming it again.
+    /// Reads only; a hold is still decided and written by the claim.
+    pub(crate) async fn agent_claim_waits(&self, command_id: String) -> Result<bool> {
+        let Some(gate) = self.agent_claims.gate.get().cloned() else {
+            return Ok(false);
+        };
+        self.database
+            .call(move |connection| {
+                Ok(gate(connection, &command_id)
+                    == crate::agent_messaging::policy::ClaimDecision::Wait)
+            })
+            .await
+    }
+
+    /// Wakes once after each hold the claim gate decided, so the entry can be withdrawn.
+    pub(crate) async fn agent_claim_held(&self) {
+        self.agent_claims.holds.notified().await;
     }
 
     pub fn database(&self) -> &Database {
@@ -1175,6 +1223,30 @@ impl Repositories {
             .await
     }
 
+    /// Whether a new turn on `thread_id` must wait although the thread is not running: it has
+    /// a pending approval, an open question, a held queued delivery, or a session that ended in
+    /// `error`. A person's send is queued then, so it never answers the approval or question
+    /// and never starts ahead of a paused queue.
+    pub async fn thread_blocks_new_turn(&self, thread_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let open_user_inputs = open_user_input_requests_sql("?1");
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM projection_pending_approvals WHERE thread_id = ?1 AND status = 'pending')
+                               OR EXISTS({open_user_inputs})
+                               OR EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND state = 'queued' AND held = 1)
+                               OR EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = ?1 AND status = 'error')"
+                        ),
+                        params![thread_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     /// OpenCode deliveries dismissed while uncertain whose pending turn marker still holds the
     /// queue: they are released once OpenCode shows the session idle.
     pub(crate) async fn list_dismissed_uncertain_opencode_markers(
@@ -1342,10 +1414,37 @@ impl Repositories {
         self.delivery_test_hooks
             .claim_calls
             .fetch_add(1, Ordering::SeqCst);
+        let gate = self.agent_claims.gate.get().cloned();
+        let claimed_at = updated_at.clone();
         // A closed (archived) chat panel starts nothing until it is reopened.
-        let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
-            params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
+        let result = self.database.call(move |connection| {
+            // In the claim's own call, so no claim slips between the decision and the claim.
+            if let Some(gate) = gate {
+                match gate(connection, &command_id) {
+                    crate::agent_messaging::policy::ClaimDecision::Proceed => {}
+                    crate::agent_messaging::policy::ClaimDecision::Wait => return Ok((None, false)),
+                    crate::agent_messaging::policy::ClaimDecision::Hold(reason) => {
+                        crate::agent_messaging::store::hold_pending_delivery(
+                            connection, &command_id, reason, &claimed_at,
+                        )?;
+                        // Signalled even when it was already held, so a left entry is withdrawn.
+                        return Ok((None, true));
+                    }
+                }
+            }
+            // An agent message's turn runs in its recipient's mode of now, which the gate has just
+            // checked against its sender's, never in the mode it was admitted or requeued in (R6).
+            // A person's message keeps the mode it was sent with.
+            connection.query_row(
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ?, payload_json = CASE WHEN EXISTS(SELECT 1 FROM agent_messages WHERE delivery_command_id = provider_turn_outbox.command_id AND sender_kind = 'agent') THEN COALESCE((SELECT json_set(provider_turn_outbox.payload_json, '$.runtimeMode', thread.runtime_mode) FROM projection_threads AS thread WHERE thread.thread_id = provider_turn_outbox.thread_id), payload_json) ELSE payload_json END WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            params![updated_at, command_id], decode_provider_turn_delivery).optional().map(|claimed| (claimed, false)).map_err(Into::into)
+        }).await;
+        let result = result.map(|(claimed, held)| {
+            if held {
+                self.agent_claims.holds.notify_one();
+            }
+            claimed
+        });
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
             let pause = self
@@ -1516,6 +1615,36 @@ impl Repositories {
                     connection,
                     &format!("{MESSAGE_SELECT} WHERE thread_id = ?{MESSAGE_LIST_ORDER}"),
                     [thread_id],
+                    decode_message,
+                )
+            })
+            .await
+    }
+    /// The threads with a started turn still running. A message's marker row, admitted but not
+    /// started, has no turn id and does not count.
+    pub async fn list_thread_ids_with_running_turns(&self) -> Result<Vec<String>> {
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT thread_id FROM projection_turns WHERE turn_id IS NOT NULL AND state = 'running' ORDER BY thread_id",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+    }
+    /// Every assistant message still streaming, in any thread.
+    pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!(
+                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 ORDER BY thread_id ASC, rowid ASC"
+                    ),
+                    [],
                     decode_message,
                 )
             })
@@ -3702,6 +3831,10 @@ pub struct ProjectionThreadMessage {
     /// The thread this message came from (a chat panel's provenance, slice X4).
     #[serde(default)]
     pub source_thread_id: Option<String>,
+    /// A person's request this message carries (`sendRequests.send`): `requestId`, `action`
+    /// and `sourceAddress`.
+    #[serde(default)]
+    pub person_send: Option<Value>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -4195,7 +4328,7 @@ pub struct AuthSession {
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json, code_review_prompt FROM projection_projects";
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json, side_chat, code_review FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id, person_send_json FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
@@ -4963,6 +5096,7 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
             "SELECT a.activity_id, a.occurred_at, a.session_id, a.label, a.tool, a.thread_id, a.outcome, a.target_json, s.mcp_named_client_id \
              FROM mcp_activity AS a LEFT JOIN auth_sessions AS s ON s.session_id = a.session_id \
              WHERE a.activity_id > ?1 AND (?2 IS NULL OR a.thread_id = ?2) \
+             AND a.tool NOT IN ('agent_message_send', 'agent_message_reply', 'agent_message_delivery') \
              ORDER BY a.activity_id LIMIT ?3",
         )?;
         statement
@@ -5041,8 +5175,12 @@ fn decode_transition(row: &Row<'_>) -> rusqlite::Result<TransitionRow> {
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
-    if event.metadata.get("actor").is_some() {
-        return "mcp-client";
+    if let Some(actor) = event.metadata.get("actor") {
+        return if actor.get("kind").and_then(Value::as_str) == Some("hosted-agent") {
+            "hosted-agent"
+        } else {
+            "mcp-client"
+        };
     }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
@@ -5185,6 +5323,7 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         resend_of_message_id: row.get(16)?,
         actor: decode_optional_json(row.get(17)?, "actor_json")?,
         source_thread_id: row.get(18)?,
+        person_send: decode_optional_json(row.get(19)?, "person_send_json")?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })

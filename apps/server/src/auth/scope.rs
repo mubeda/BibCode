@@ -209,6 +209,18 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // Outbound webhooks (#139 slice X8): settings an outside agent's `mcp-client` session,
         // which never holds `access:*`, cannot read or change.
         "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
+        // A person's requests to agents. An outside agent holds these scopes too; every
+        // handler's `require_person` refuses it.
+        // Terminal output is as private as the terminal, so reading it needs operate.
+        "sendRequests.send"
+        | "sendRequests.cancel"
+        | "sendRequests.dismiss"
+        | "sendRequests.getTerminalOutput" => {
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        }
+        "sendRequests.getAnswer" | "sendRequests.getHandoffText" | "sendRequests.subscribe" => {
+            Some(SCOPE_ORCHESTRATION_READ)
+        }
         // Connect an agent (#139): a person's own tool configuration, which an outside
         // agent's credential can neither read nor change.
         "mcpClients.getRegistrations" => Some(SCOPE_ACCESS_READ),

@@ -659,7 +659,7 @@ deletes the installed file during the session.
 **Which builds are hooked.** A build is hooked when all of these hold:
 
 - its `--version` line ends in `(Claude Code)`, and that version is between
-  2.1.220 and 2.1.323 (`MIN_ADDITIVE_HOOK_VERSION` and
+  2.1.220 and 2.1.325 (`MIN_ADDITIVE_HOOK_VERSION` and
   `MAX_ADDITIVE_HOOK_VERSION`). In those builds, BiBCode's `--settings` hooks are
   added to the user's own hooks rather than replacing them. A newer build runs
   unhooked until a BiBCode release raises the ceiling. That release first proves
@@ -737,10 +737,15 @@ main session: the first one heard, then each new `SessionStart` (`/clear` and
 resume start a new session).
 
 If the terminal cannot be prepared, its status reads **Status unavailable**.
-That happens on Windows, with a Claude Code outside 2.1.220 to 2.1.323, with an
+That happens on Windows, with a Claude Code outside 2.1.220 to 2.1.325, with an
 unsigned or re-signed build on macOS, behind a shim whose answer is refused or
 that is not mise, when a copy without block sharing outlasts the preparation
 budget, or when the probe or settings merge fails.
+
+A terminal does not inherit `CLAUDE_CODE_CHILD_SESSION` from the process that
+started BiBCode. Claude Code sets it for its own child processes, and an
+interactive Claude Code that inherits it saves no transcript, so BiBCode could
+not read its conversation.
 
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.

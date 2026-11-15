@@ -162,6 +162,24 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
         attach_console();
         return Some(desktop_thread_dispatch(std::env::args_os().skip(1)));
     }
+    // The AI Terminal's `bibcode` shim runs this executable: the desktop ships no `bibcode`.
+    if command.as_deref() == Some(OsStr::new("agent")) {
+        attach_console();
+        return Some(
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(crate::mcp::agent_cli::run_agent_args(
+                    std::env::args_os().skip(1),
+                )),
+                Err(error) => {
+                    let _ = writeln!(io::stderr(), "bibcode: {error}");
+                    1
+                }
+            },
+        );
+    }
     if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
     }

@@ -191,6 +191,7 @@ fn register_orchestration_rpc_inner(
                         workspace_admission,
                         command_claim,
                         &owner,
+                        None,
                     )
                     .await;
                 }
@@ -308,6 +309,225 @@ fn register_orchestration_rpc_inner(
     );
 }
 
+/// Who a server-built command acts for. The server dispatcher stamps the admission claim from
+/// it; no caller passes raw actor JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServerActor {
+    /// A signed-in person (`sendRequests.*`): nothing is stamped.
+    Person,
+    /// An agent BiBCode hosts (agent messaging).
+    HostedAgent { address: String, label: String },
+}
+
+/// An agent message's part of a server-built turn start: its row, committed with the queue
+/// entry, and whether the turn queues even when the recipient's session is not running.
+pub(crate) struct AgentTurn {
+    pub(crate) companion: crate::agent_messaging::store::AgentMessageCompanion,
+    pub(crate) force_queue: bool,
+}
+
+/// Starts or queues the turn of an agent message through the server dispatcher's own path.
+#[derive(Clone)]
+pub(crate) struct ServerTurnStarter {
+    engine: OrchestrationEngine,
+    registration: ProviderRegistration,
+    availability: Option<WorkspaceAdmissionController>,
+}
+
+impl ServerTurnStarter {
+    /// The provider kind a turn start of `model_selection` resolves to, as delivery resolves
+    /// it; `None` when the selection names no instance or its driver is unknown.
+    pub(crate) async fn provider_kind(&self, model_selection: &Value) -> Option<&'static str> {
+        let instance_id = model_selection
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .filter(|instance_id| !instance_id.trim().is_empty())?;
+        instance_provider_kind(&self.registration.settings_root, instance_id)
+            .await
+            .ok()
+    }
+
+    pub(crate) async fn queue_turn_start(
+        &self,
+        command: OrchestrationCommand,
+        actor: ServerActor,
+        agent: Option<AgentTurn>,
+    ) -> Result<Value, Value> {
+        dispatch_server_command(
+            self.engine.clone(),
+            self.registration.clone(),
+            self.availability.clone(),
+            command,
+            UploadOwner::Unauthenticated,
+            actor,
+            agent,
+        )
+        .await
+    }
+}
+
+pub(crate) fn server_turn_starter(
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> ServerTurnStarter {
+    let (registration, availability) = server_dispatch_parts(
+        &engine,
+        provider,
+        settings_root,
+        turn_delivery,
+        availability,
+        uploads,
+    );
+    ServerTurnStarter {
+        engine,
+        registration,
+        availability,
+    }
+}
+
+/// The server-only entry point for commands the server builds itself. It shares the inner
+/// dispatch functions with the public `orchestration.dispatchCommand` handler, which keeps its
+/// own decoding, refusals and actor stamping.
+pub(crate) type ServerCommandDispatcher = Arc<
+    dyn Fn(
+            OrchestrationCommand,
+            UploadOwner,
+            ServerActor,
+        ) -> futures_util::future::BoxFuture<'static, Result<Value, Value>>
+        + Send
+        + Sync,
+>;
+
+const SERVER_DISPATCH_TAG: &str = "server.dispatchCommand";
+
+pub(crate) fn server_command_dispatcher(
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> ServerCommandDispatcher {
+    let (registration, availability) = server_dispatch_parts(
+        &engine,
+        provider,
+        settings_root,
+        turn_delivery,
+        availability,
+        uploads,
+    );
+    Arc::new(move |command, owner, actor| {
+        Box::pin(dispatch_server_command(
+            engine.clone(),
+            registration.clone(),
+            availability.clone(),
+            command,
+            owner,
+            actor,
+            None,
+        ))
+    })
+}
+
+fn server_dispatch_parts(
+    engine: &OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
+    uploads: UploadRegistry,
+) -> (ProviderRegistration, Option<WorkspaceAdmissionController>) {
+    let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
+    let registration = ProviderRegistration {
+        provider,
+        settings_root,
+        attachments,
+        turn_delivery,
+        uploads,
+    };
+    let availability = availability
+        .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
+    (registration, availability)
+}
+
+/// The inner function of the server dispatcher and of [`ServerTurnStarter`]: the actor stamp,
+/// the person-request refusal and the shared dispatch path.
+async fn dispatch_server_command(
+    engine: OrchestrationEngine,
+    registration: ProviderRegistration,
+    availability: Option<WorkspaceAdmissionController>,
+    command: OrchestrationCommand,
+    owner: UploadOwner,
+    actor: ServerActor,
+    agent: Option<AgentTurn>,
+) -> Result<Value, Value> {
+    let carries_person_send = matches!(
+        &command,
+        OrchestrationCommand::ThreadTurnStart { message, .. } if message.person_send.is_some()
+    );
+    if carries_person_send && matches!(actor, ServerActor::HostedAgent { .. }) {
+        return Err(invalid_request(
+            SERVER_DISPATCH_TAG,
+            "an agent's message cannot carry a person's request",
+        ));
+    }
+    let payload_digest = canonical_command_digest(&command)
+        .map_err(|error| invalid_request(SERVER_DISPATCH_TAG, error))?;
+    let command_claim = engine
+        .acquire_command_admission(command.command_id())
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if let ServerActor::HostedAgent { address, label } = &actor {
+        command_claim.attribute_to(json!({
+            "kind": "hosted-agent",
+            "address": address,
+            "label": label,
+        }));
+    }
+    if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+        let workspace_admission = match &availability {
+            Some(availability) => Some(
+                availability
+                    .acquire_thread(thread_id, std::iter::empty())
+                    .await
+                    .map_err(workspace_admission_error)?,
+            ),
+            None => None,
+        };
+        return dispatch_turn_command(
+            engine,
+            registration,
+            command,
+            payload_digest,
+            SERVER_DISPATCH_TAG.to_owned(),
+            workspace_admission,
+            command_claim,
+            &owner,
+            agent,
+        )
+        .await;
+    }
+    if agent.is_some() {
+        return Err(invalid_request(
+            SERVER_DISPATCH_TAG,
+            "an agent message is delivered only by a turn start",
+        ));
+    }
+    dispatch_prepared_command(
+        engine,
+        Some(registration),
+        command,
+        payload_digest,
+        SERVER_DISPATCH_TAG.to_owned(),
+        command_claim,
+    )
+    .await
+}
+
 /// The command's own timestamp fields, at its root, that a client fills from its own clock.
 const CLIENT_TIMESTAMP_FIELDS: &[&str] =
     &["createdAt", "updatedAt", "completedAt", "implementedAt"];
@@ -413,6 +633,12 @@ pub(crate) async fn decode_public_orchestration_command(
     }
 
     const DEDICATED_AUTHORITY: &str = "worktree authority requires a dedicated server-resolved RPC";
+    // Only `sendRequests.send` stamps a person's request, through the server dispatcher.
+    if let OrchestrationCommand::ThreadTurnStart { message, .. } = &command
+        && message.person_send.is_some()
+    {
+        return Err("person-send requires a dedicated server-resolved RPC".to_owned());
+    }
     match &command {
         OrchestrationCommand::ProjectMetaUpdate {
             worktree_discovery: Some(_),
@@ -611,6 +837,7 @@ async fn dispatch_prepared_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 move || {
@@ -683,16 +910,27 @@ async fn dispatch_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
     owner: &UploadOwner,
+    agent: Option<AgentTurn>,
 ) -> RpcResult {
     let existing_receipt = dispatch
         .repositories()
         .get_command_receipt(command.command_id().to_owned())
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    // An agent message's row commits only with a new queue entry, which these paths never add.
+    let refuse_agent = |agent: &Option<AgentTurn>| {
+        agent.as_ref().map_or(Ok(()), |_| {
+            Err(invalid_request(
+                &request_tag,
+                "an agent message needs a new queue entry",
+            ))
+        })
+    };
     if existing_receipt
         .as_ref()
         .is_some_and(|receipt| receipt.payload_digest.is_none())
     {
+        refuse_agent(&agent)?;
         let result = dispatch
             .dispatch_with_command_claim(command, command_claim)
             .await
@@ -706,6 +944,7 @@ async fn dispatch_turn_command(
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     if !prepare_external {
+        refuse_agent(&agent)?;
         let result = dispatch
             .dispatch_with_admission_and_command_claim(
                 command,
@@ -713,6 +952,7 @@ async fn dispatch_turn_command(
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
+                    agent_message: None,
                 },
                 command_claim,
                 || {},
@@ -734,6 +974,7 @@ async fn dispatch_turn_command(
         workspace_admission,
         command_claim.clone(),
         owner,
+        agent,
     )
     .await;
     if result.is_err() {
@@ -758,7 +999,9 @@ async fn dispatch_reserved_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
     owner: &UploadOwner,
+    agent: Option<AgentTurn>,
 ) -> RpcResult {
+    let force_queue = agent.as_ref().is_some_and(|agent| agent.force_queue);
     let reusable = reusable_thread_attachments(&dispatch, &command, &request_tag).await?;
     let (mut command, prepared_batch) = prepare_attachments(
         &provider.attachments,
@@ -781,6 +1024,7 @@ async fn dispatch_reserved_turn_command(
     let mut delivery_state = crate::orchestration::TurnDeliveryState::Pending;
     if let OrchestrationCommand::ThreadTurnStart {
         thread_id,
+        message,
         queued,
         model_selection,
         bootstrap,
@@ -795,13 +1039,25 @@ async fn dispatch_reserved_turn_command(
             .await
             .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
             .is_some();
-        if *queued == Some(true) || compacting {
+        if *queued == Some(true) || compacting || force_queue {
             let session = dispatch
                 .repositories()
                 .get_thread_session(thread_id.clone())
                 .await
                 .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            // A person's request always waits behind a pending approval, an open question, a
+            // held queue or an errored session, so it never answers them or skips a paused queue.
+            let person_send_waits = message.person_send.is_some()
+                && dispatch
+                    .repositories()
+                    .thread_blocks_new_turn(thread_id.clone())
+                    .await
+                    .map_err(|error| {
+                        orchestration_error("OrchestrationDispatchCommandError", error)
+                    })?;
             let resolved = compacting
+                || force_queue
+                || person_send_waits
                 || session.is_some_and(|session| {
                     matches!(session.status.as_str(), "running" | "starting")
                 });
@@ -858,6 +1114,7 @@ async fn dispatch_reserved_turn_command(
             payload: delivery_payload,
             created_at,
         }),
+        agent_message: agent.map(|agent| agent.companion),
     };
     let turn_delivery = provider.turn_delivery.clone();
     let on_commit = move || {
@@ -911,7 +1168,7 @@ async fn dispatch_reserved_turn_command(
 
 async fn turn_identity(
     engine: &OrchestrationEngine,
-    settings_root: &PathBuf,
+    settings_root: &std::path::Path,
     command: &OrchestrationCommand,
 ) -> Result<(String, String, String, String, String), String> {
     let OrchestrationCommand::ThreadTurnStart {
@@ -945,16 +1202,7 @@ async fn turn_identity(
         .filter(|instance_id| !instance_id.trim().is_empty())
         .ok_or_else(|| format!("turn for thread {thread_id} has no provider instanceId"))?
         .to_owned();
-    let settings = ProviderSettingsStore::new(settings_root)
-        .get()
-        .await
-        .map_err(|error| error.to_string())?;
-    let driver = settings
-        .provider_instances
-        .get(&instance_id)
-        .map(|instance| instance.driver.as_str())
-        .unwrap_or(instance_id.as_str());
-    let provider_kind = canonical_provider_kind(driver).map_err(|error| error.to_string())?;
+    let provider_kind = instance_provider_kind(settings_root, &instance_id).await?;
     Ok((
         thread_id.clone(),
         message.message_id.clone(),
@@ -962,6 +1210,23 @@ async fn turn_identity(
         provider_kind.to_owned(),
         created_at.clone(),
     ))
+}
+
+/// The provider kind of `instance_id`: its configured driver, or the id itself for a built-in
+/// instance named after its driver.
+async fn instance_provider_kind(
+    settings_root: &std::path::Path,
+    instance_id: &str,
+) -> Result<&'static str, String> {
+    let settings = ProviderSettingsStore::new(settings_root)
+        .get()
+        .await
+        .map_err(|error| error.to_string())?;
+    let driver = settings
+        .provider_instances
+        .get(instance_id)
+        .map_or(instance_id, |instance| instance.driver.as_str());
+    canonical_provider_kind(driver).map_err(|error| error.to_string())
 }
 
 /// The attachments a turn start may send again by id alone: those an accepted command already
@@ -2601,6 +2866,9 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                     if let Some(source_thread_id) = &row.source_thread_id {
                         message["sourceThreadId"] = json!(source_thread_id);
                     }
+                    if let Some(person_send) = &row.person_send {
+                        message["personSend"] = person_send.clone();
+                    }
                     message
                 })
                 .collect(),
@@ -3415,6 +3683,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
                 },
@@ -3436,6 +3705,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
                 },
@@ -3457,6 +3727,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
                 },
@@ -3478,6 +3749,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
                 },
@@ -3499,6 +3771,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
                 },
@@ -3520,6 +3793,7 @@ mod tests {
                     resend_of_message_id: None,
                     actor: None,
                     source_thread_id: None,
+                    person_send: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
@@ -3703,6 +3977,7 @@ mod tests {
             resend_of_message_id: None,
             actor: None,
             source_thread_id: None,
+            person_send: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
         }
@@ -4757,38 +5032,51 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        // A server message 500 microseconds later, in the same millisecond.
-        let server_at = crate::persistence::format_timestamp(
-            time::OffsetDateTime::from_unix_timestamp_nanos(1_767_225_600_120_500_000).unwrap(),
-        );
-        engine
-            .repositories()
-            .database()
-            .call(move |connection| {
-                for (message_id, role, at) in [
-                    ("m-server", "assistant", server_at),
-                    ("m-client", "user", client_at),
-                ] {
-                    connection.execute(
-                        "INSERT INTO projection_thread_messages (message_id, thread_id, role, \
-                         text, is_streaming, created_at, updated_at) \
-                         VALUES (?1, 'thread-a', ?2, '', 0, ?3, ?3)",
-                        rusqlite::params![message_id, role, at],
-                    )?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let order: Vec<String> = engine
-            .repositories()
-            .list_messages_by_thread("thread-a".to_owned())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|message| message.message_id)
-            .collect();
-        assert_eq!(order, ["m-client", "m-server"]);
+        // Server messages 500 and 400 microseconds later, in the same millisecond: julianday
+        // alone rounds to the millisecond, so only the stored text keeps them apart.
+        for (thread_id, offset_ns) in [("thread-a", 500_000_i128), ("thread-b", 400_000)] {
+            let server_at = crate::persistence::format_timestamp(
+                time::OffsetDateTime::from_unix_timestamp_nanos(
+                    1_767_225_600_120_000_000 + offset_ns,
+                )
+                .unwrap(),
+            );
+            let client_at = client_at.clone();
+            let ids = [format!("{thread_id}-server"), format!("{thread_id}-client")];
+            let inserted = ids.clone();
+            engine
+                .repositories()
+                .database()
+                .call(move |connection| {
+                    for (message_id, role, at) in [
+                        (&inserted[0], "assistant", server_at),
+                        (&inserted[1], "user", client_at),
+                    ] {
+                        connection.execute(
+                            "INSERT INTO projection_thread_messages (message_id, thread_id, \
+                             role, text, is_streaming, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, '', 0, ?4, ?4)",
+                            rusqlite::params![message_id, thread_id, role, at],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let order: Vec<String> = engine
+                .repositories()
+                .list_messages_by_thread(thread_id.to_owned())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|message| message.message_id)
+                .collect();
+            assert_eq!(
+                order,
+                [ids[1].clone(), ids[0].clone()],
+                "{offset_ns} ns later"
+            );
+        }
     }
 
     /// #366 review: a user's answer is free-form data, even under a question id named like a
@@ -5298,6 +5586,7 @@ mod tests {
                         payload: serde_json::to_value(&command).expect("command payload"),
                         created_at: CREATED_AT.to_owned(),
                     }),
+                    agent_message: None,
                 },
                 || {},
             )
@@ -5365,6 +5654,7 @@ mod tests {
             workspace_admission,
             command_claim,
             owner,
+            None,
         )
         .await
     }

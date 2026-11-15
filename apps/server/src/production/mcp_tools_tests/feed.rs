@@ -670,6 +670,140 @@ async fn measure_one_page_over_5000_large_events() {
     database.close().await;
 }
 
+/// Agent messaging rows are the activity log's, not the outside agents' feed: no `agent.call`
+/// entry, so no webhook event, though the log's head moves past them.
+#[tokio::test]
+async fn agent_message_rows_are_not_in_the_change_feed() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let cursor = head(&harness, &agent).await;
+    let sink = crate::mcp::activity::agent_message_sink(harness.control.activity().clone());
+    for (tool, outcome) in [
+        ("agent_message_send", "accepted"),
+        ("agent_message_reply", "accepted"),
+        ("agent_message_delivery", "delivered"),
+    ] {
+        sink(crate::agent_messaging::MessageOutcome {
+            sender_address: "thread:a".to_owned(),
+            recipient_address: "thread:b".to_owned(),
+            tool,
+            outcome: outcome.to_owned(),
+            message_id: Some("m1".to_owned()),
+            conversation_id: Some("c1".to_owned()),
+            hop: None,
+            reason: None,
+            sender_title: Some("Caller".to_owned()),
+            recipient_title: Some("Recipient".to_owned()),
+        });
+    }
+    // An outside agent's own call, recorded after them.
+    for _ in 0..200 {
+        if harness.control.activity().recent().await.unwrap().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    activity_row(&harness, None).await;
+
+    let page = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+
+    assert_eq!(kinds(&page), ["agent.call"], "{page}");
+    assert_eq!(page["entries"][0]["tool"], "git_commit");
+    // The log's head moved past the three message rows and the outside call: 4 rows.
+    assert_eq!(
+        positions(page["cursor"].as_str().unwrap()).1,
+        positions(&cursor).1 + 4
+    );
+    let events: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| crate::webhooks::events::from_feed_entry(entry, None))
+        .collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    harness.shutdown().await;
+}
+
+async fn message_row(harness: &Harness) {
+    harness
+        .control
+        .activity()
+        .record(NewActivity {
+            session_id: "thread:a".into(),
+            label: Some("Caller".into()),
+            tool: "agent_message_delivery".into(),
+            thread_id: Some("a".into()),
+            outcome: "success".into(),
+            target: json!({ "recipient": "thread:b", "status": "delivered" }),
+        })
+        .await;
+}
+
+/// A page whose new rows are all agent message rows moves the activity position past them, so
+/// a reader that polls steadily never sees them pruned as dropped activity.
+#[tokio::test]
+async fn a_page_of_only_agent_message_rows_moves_the_cursor_past_them() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let cursor = head(&harness, &agent).await;
+    for _ in 0..3 {
+        message_row(&harness).await;
+    }
+
+    let page = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+
+    assert_eq!(kinds(&page), Vec::<&str>::new(), "{page}");
+    assert_eq!(page["more"], false, "{page}");
+    let moved = page["cursor"].as_str().unwrap().to_owned();
+    assert_eq!(positions(&moved).1, positions(&cursor).1 + 3, "{page}");
+    // Retention prunes the message rows; a reader that kept up lost nothing.
+    let (_, last) = positions(&moved);
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute("DELETE FROM mcp_activity WHERE activity_id <= ?", [last])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    activity_row(&harness, None).await;
+    let next = feed(&harness, &agent, json!({ "cursor": moved })).await;
+    assert_eq!(next["activityDropped"], false, "{next}");
+    assert_eq!(kinds(&next), ["agent.call"], "{next}");
+    harness.shutdown().await;
+}
+
+/// A page cut at its limit keeps every visible row after the cut for the next page, though
+/// message rows follow them.
+#[tokio::test]
+async fn a_cut_page_never_skips_a_visible_row_behind_message_rows() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let cursor = head(&harness, &agent).await;
+    activity_row(&harness, None).await;
+    activity_row(&harness, None).await;
+    message_row(&harness).await;
+
+    let first = feed(&harness, &agent, json!({ "cursor": cursor, "limit": 1 })).await;
+    assert_eq!(kinds(&first), ["agent.call"], "{first}");
+    assert_eq!(first["more"], true, "{first}");
+    let second = feed(
+        &harness,
+        &agent,
+        json!({ "cursor": first["cursor"], "limit": 1 }),
+    )
+    .await;
+
+    assert_eq!(kinds(&second), ["agent.call"], "{second}");
+    assert_eq!(
+        positions(second["cursor"].as_str().unwrap()).1,
+        positions(&cursor).1 + 3,
+        "{second}"
+    );
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_cursor_older_than_the_oldest_activity_row_reports_it_dropped() {
     let harness = Harness::new().await;

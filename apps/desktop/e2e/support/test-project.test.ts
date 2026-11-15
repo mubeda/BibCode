@@ -147,6 +147,53 @@ describe.each([
     expect(environment.BIBCODE_E2E_SHIM_DIRECTORY).toBe(context.shimDirectory);
   });
 
+  it("seeds the Profiler only when BIBCODE_E2E_PROFILER is 1", () => {
+    const read = (environment: NodeJS.ProcessEnv): { readonly enableProfiler?: boolean } => {
+      const context = prepareDesktopUiTestContext(environment);
+      contexts.push(context);
+      return JSON.parse(
+        NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+      ) as { readonly enableProfiler?: boolean };
+    };
+
+    expect(read({ BIBCODE_E2E_PLATFORM: platform }).enableProfiler).toBeUndefined();
+    expect(read({ BIBCODE_E2E_PLATFORM: platform, BIBCODE_E2E_PROFILER: "1" }).enableProfiler).toBe(
+      true,
+    );
+  });
+
+  it("turns on agent messaging, and keeps the machine's providers and HOME for a real run", () => {
+    const fixture: NodeJS.ProcessEnv = {
+      BIBCODE_E2E_PLATFORM: platform,
+      BIBCODE_E2E_AGENT_MESSAGING: "1",
+      HOME: "/host/home",
+      PATH: "/host/bin",
+    };
+    const context = prepareDesktopUiTestContext(fixture);
+    contexts.push(context);
+    const settingsOf = (stateRoot: string) =>
+      JSON.parse(
+        NodeFS.readFileSync(NodePath.join(stateRoot, "userdata", "settings.json"), "utf8"),
+      ) as Record<string, unknown>;
+    expect(settingsOf(context.stateRoot).agentMessaging).toEqual({ enabled: true });
+    expect(settingsOf(context.stateRoot).providers).toBeDefined();
+    expect(fixture.HOME).not.toBe("/host/home");
+
+    const real: NodeJS.ProcessEnv = {
+      BIBCODE_E2E_PLATFORM: platform,
+      BIBCODE_E2E_REAL_PROVIDERS: "1",
+      HOME: "/host/home",
+      PATH: "/host/bin",
+    };
+    const realContext = prepareDesktopUiTestContext(real);
+    contexts.push(realContext);
+    const realSettings = settingsOf(realContext.stateRoot);
+    expect(realSettings.providers).toBeUndefined();
+    expect(realSettings.enableTerminalAgentActivity).toBe(true);
+    expect(real.PATH).toBe("/host/bin");
+    if (platform !== "win") expect(real.HOME).toBe("/host/home");
+  });
+
   it("isolates provider user inventory inside the disposable run root", () => {
     const environment: NodeJS.ProcessEnv = {
       BIBCODE_E2E_PLATFORM: platform,

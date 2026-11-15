@@ -15,7 +15,7 @@ pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     AttachmentItem, SubprocessInspection, SubprocessInspections, TerminalAttachment, TerminalError,
     TerminalEventReceiver, TerminalManager, TerminalManagerOptions, TerminalMetadataAttachment,
-    TerminalSubprocessInspector, WorktreeRemovalGuard,
+    TerminalSessionLaunch, TerminalSubprocessInspector, WorktreeRemovalGuard, WriteWhenReady,
 };
 pub use model::{
     ProviderTerminalActivityLaunch, TerminalAgentStatus, TerminalAgentStatusState,
@@ -27,3 +27,4 @@ pub use model::{
 pub use pty::{
     ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
 };
+pub use writer::WriteGuard;

@@ -849,8 +849,11 @@ This conversation continues an earlier BiBCode thread whose provider session cou
 
 It lists user and assistant messages that are complete (not streaming), either
 delivered or without delivery state (replies and imported history), and not the
-turn itself: the last 40, within 24 000 characters. Newer messages win the
-budget; the first one that does not fit is cut with a `[truncated]` marker (or
+turn itself: the last 40, within 24 000 characters, and in front of them the
+person's first message when it is older than that tail (cut at 4 000 characters
+with `[truncated]`; a message of an agent's envelope is not the person's), then
+`[... N earlier messages left out ...]` when messages between the two were left
+out. Newer messages win the budget; the first one that does not fit is cut with a `[truncated]` marker (or
 left out when under 200 characters would remain), and older ones are dropped.
 Earlier text is untrusted (an assistant can repeat file or tool output), so any
 `bibcode_thread_context` inside it, in any letter case, has its underscores
@@ -859,7 +862,8 @@ spaces: only the real delimiters and role markers start a line.
 The projected user message keeps the typed text; only the provider receives the
 block, and Claude acknowledges the composed text it wrote. A turn starting with
 `/` (a provider command) is sent unchanged and leaves the handoff for the next
-turn, a thread without earlier messages settles it silently, and steering never
+turn, and so does an [agent message](#agent-messaging), which goes out as its
+envelope whole. A thread without earlier messages settles it silently, and steering never
 carries it. The handoff is settled once the turn is accepted or possibly
 received (ambiguous); a turn that definitely did not reach the provider leaves
 it for the next attempt.
@@ -881,7 +885,8 @@ You are in a side chat beside a BiBCode thread. Below are that thread's messages
 
 ```
 
-A busy host contributes what it has delivered: its streaming reply and queued
+The host's messages are built as in the handoff above, first message included, and the
+work log's count includes it. A busy host contributes what it has delivered: its streaming reply and queued
 messages are filtered out. An empty host gives the framing with "The thread has
 no messages yet." The seed is owed until the side chat has a
 `side-chat.context-shared` activity, appended once a turn that carried it was
@@ -1098,6 +1103,130 @@ environment, so durable delivery route fingerprints do not change with it.
 Which client claims a delivered request, and how browser-mode clients turn it
 into a prompt, is described in
 [Open requests and automation hosts](remote.md#open-requests-and-automation-hosts).
+
+### AI Terminal agent credential
+
+Every AI Terminal launch (a terminal started with an observed provider command, `command.activity`
+set) also gets the credential of `bibcode agent` (`agent_messaging/terminal_credential.rs`). No
+other terminal and no provider launch gets one.
+
+- `BIBCODE_AGENT_AUTH` holds a random credential, and `BIBCODE_AGENT_ENDPOINT` holds the
+  `POST /api/agent/call` URL of the server that started the terminal. The credential is bound to
+  the environment, the owner thread, the terminal id and the terminal's generation (its process),
+  and only its SHA-256 hash is kept. It is revoked when that process exits, is closed or is
+  replaced, and a server that stops loses every credential with its memory. Until the endpoint is
+  bound at start-up, launches get none.
+- The variable is not named `*_TOKEN` or `*_KEY`, for the same reason as the open-URL token:
+  Codex's default `shell_environment_policy` drops those names from the commands it runs. The
+  credential also reaches every other process in that terminal, as the open-URL token does:
+  a program in the terminal can use it, and the credential grants only the terminal's own
+  messaging operations. A Codex configuration whose `shell_environment_policy` keeps only a
+  fixed list of variables can still drop it, and BiBCode has no file fallback; whether the
+  variable reaches a command Codex runs under such a policy was not checked against a real Codex
+  terminal.
+- The server's values win. The hook removes any credential variable the caller supplied before it
+  issues its own, and the terminal manager lets no prepared environment (a version manager's
+  `[env]`, for one) replace either variable or the shim `PATH` prefix, so a project cannot send the
+  credential to an endpoint it chose. A prepared `PATH` keeps the hook's shim folders first.
+- At start-up the server writes the `bibcode` shim into `<state dir>/runtime/agent`
+  (a `sh` script that runs the server's executable with every argument, or `bibcode.exe` as a hard
+  link or a copy on Windows) and puts that folder first on an AI Terminal's `PATH`, in front of
+  the open-URL shim folder. A plain terminal keeps its own `bibcode`. The Windows shim has
+  not been tested.
+- The vendored `portable-pty` crate prints only the keys of a command's environment in its
+  `Debug` form, because the values hold this credential (see
+  `third_party/portable-pty/UPSTREAM.md`). `PtySpawnInput` and the Claude shim request print only the
+  keys of their environment as well, and no log or profiler record holds the credential.
+
+## Agent messaging
+
+Agents of one project message each other through `agent_messaging/` (see
+[Send requests and agent messaging](./rpc-and-orchestration.md#send-requests-and-agent-messaging)
+for the state machine and the RPC side, and the
+[MCP reference](../reference/mcp.md#provider-tools) for the tools). This section is the
+provider side: what a recipient receives and which rules decide whether it does.
+
+**Two envelopes.** An agent's message is delivered as the text of a normal user turn:
+
+```text
+<bibcode_agent_message>
+from: …  provider: …  address: …  message-id: …  conversation-id: …  [in-reply-to: …]
+This message comes from another agent, not from your user.
+---
+  <the text, indented>
+</bibcode_agent_message>
+```
+
+A person's request to an AI Terminal is stored as `<bibcode_person_request>` with BiBCode's lines
+first ("From the user of this project: <action>, sent from <title>.", `message-id: …`, and how to
+answer) and the text quoted after `---`. Titles are escaped to one line of at most 200 characters,
+control characters of both are written as `\u{..}`, both tag names have their underscores turned
+into hyphens in any letter case, and every line of the text is indented, so the text can neither
+close an envelope nor forge BiBCode's lines nor begin with `/name`, `$name` or `@path`. A person's
+request to a chat agent is not an envelope: it is the person's own turn, with `personSend`
+provenance.
+
+**An agent message is recognised by its stored row, never by its text.** Durable delivery asks the
+store whether the queue entry's `command_id` and message id belong to an `agent_messages` row of
+an agent sender. Only then does the driver get `deliver_agent_message` (Claude marks the line
+`client_composed`, which stops Claude Code from expanding `@path` text and still replays the line, as
+the delivery acknowledgement needs; the other drivers deliver as for a person). A person who
+pastes an envelope still sends a person's message. An agent message never carries the owed
+context handoff or a side chat seed: the envelope goes out whole, and the handoff waits for the
+next turn, as it does for a `/` command.
+
+**Literal delivery per provider** (spec R8: the text must not run a command, load a skill or
+expand a file). Measured when the envelope was added:
+
+| Provider | Result                                                                                                                                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude   | `@path` inside the envelope was expanded until the line carried `client_composed`; with it the text stays literal                                                                                          |
+| Codex    | 0.169.0 expands a skill named with `$` inside any text input and has no input flag to turn that off, so the envelope for a Codex recipient puts a zero-width space after each `$` a name character follows |
+| OpenCode | The envelope is kept as one literal text part                                                                                                                                                              |
+| Cursor   | Not probed (the probe needs a trusted folder)                                                                                                                                                              |
+
+`build_envelope` (`agent_messaging/envelope.rs`) applies the Codex rule for a chat recipient and a
+terminal inbox alike, to the text and to the sender's title. The recipient's provider is the
+driver of its instance, resolved from the provider settings as a turn start resolves it, so a
+custom instance counts before its first session; a terminal's is its launch driver. When a `$`
+was changed, one fixed BiBCode line in the header (before `---`, where the indented text cannot
+reach) says a zero-width space follows each dollar sign and asks the recipient to remove it
+before it runs or quotes code. The stored message, the activity log, the status and the sender's
+view keep the text as written. A person's request keeps its text, because a person may name a
+skill on purpose; only the source title in its header is changed, with the same line.
+
+The rule covers expansion by the provider's client, not a recipient model that decides to call a
+tool because of the text; the mode ceiling governs that.
+
+**Rules at the claim.** `claim_provider_turn` asks the claim gate (`agent_messaging/policy.rs`)
+inside its own database call:
+
+- the message is held with `messaging_off` while `agentMessaging.enabled` is false (the setting is
+  read live, so a claim at the instant it is switched off may still complete);
+- the message is held with `recipient_mode_above_sender` when the recipient's current runtime mode
+  is above the mode stored with the message (`approval-required` below `auto-accept-edits` below
+  `full-access`; an AI Terminal receives as `full-access`; a mode outside the three allows
+  nothing);
+- the claim waits, and the delivery worker skips the entry, while the recipient has an open
+  approval or question: a message is never an answer and never runs past one;
+- a message already held or final is never claimed, and a person's request or any entry without an
+  agent message row proceeds.
+
+An agent message's turn then runs in its recipient's current mode, not the mode it was queued in.
+The ceiling is also checked when the message is sent. A message sent to a paused queue (the
+recipient's last turn errored or was interrupted, or an entry a person has not released waits)
+is held with `recipient_queue_held` and queued behind the held entries, so it never starts an
+errored session and never overtakes a held message.
+
+**Hop limit, rate and backlog.** At most 8 agent-to-agent hops follow one person's message, 30
+agent messages per sender in 60 seconds, and 20 unconsumed agent messages per recipient. A
+person's message starts a hop chain again; an outside agent's message does not. A person's
+request is exempt from all three.
+
+**Where the code reads state.** The tools resolve the caller from the provider credential's thread,
+never from an argument, so a message cannot claim another sender. Another project's thread and a
+missing thread give the same `AgentMessagingUnknownRecipientError`. Nothing logs message text:
+the logs and the activity rows hold ids, addresses, thread titles, the status and the reason.
 
 ## Provider maintenance
 

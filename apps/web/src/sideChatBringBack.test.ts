@@ -29,7 +29,9 @@ vi.mock("./centerPanelStore", () => ({
 import {
   BRING_BACK_HOST_RUNNING_REASON,
   BRING_BACK_NO_ANSWER_REASON,
+  appendToComposerDraft,
   bringBackToHost,
+  composeAnswerBringBack,
   composeSideChatBringBack,
   resolveBringBackUnavailableReason,
 } from "./sideChatBringBack";
@@ -67,6 +69,74 @@ describe("composeSideChatBringBack", () => {
     expect(
       composeSideChatBringBack([user("question A"), user("question B"), assistant("answer to A")]),
     ).toBe("From the side chat:\n\n> answer to A");
+  });
+});
+
+describe("composeAnswerBringBack", () => {
+  it("quotes the given answer with the target's title and the action", () => {
+    expect(
+      composeAnswerBringBack({
+        targetTitle: "Parser agent",
+        action: "second-opinion",
+        answerText: "Looks right.\n\nCheck the edge case.",
+        truncated: false,
+      }),
+    ).toBe("Second opinion from Parser agent:\n\n> Looks right.\n>\n> Check the edge case.");
+    expect(
+      composeAnswerBringBack({
+        targetTitle: null,
+        action: "review",
+        answerText: "One bug.",
+        truncated: false,
+      }),
+    ).toBe("Review from another agent:\n\n> One bug.");
+  });
+
+  it("an empty answer is null", () => {
+    expect(
+      composeAnswerBringBack({
+        targetTitle: "A",
+        action: "review",
+        answerText: " \n ",
+        truncated: false,
+      }),
+    ).toBeNull();
+  });
+
+  it("a long answer is not cut", () => {
+    const long = "x".repeat(60_000);
+    const text = composeAnswerBringBack({
+      targetTitle: "A",
+      action: "review",
+      answerText: long,
+      truncated: false,
+    });
+    expect(text).toBe(`Review from A:\n\n> ${long}`);
+  });
+
+  it("a truncated answer says it was cut at 48,000 characters", () => {
+    expect(
+      composeAnswerBringBack({
+        targetTitle: "A",
+        action: "review",
+        answerText: "partial",
+        truncated: true,
+      }),
+    ).toBe("Review from A:\n\n> partial\n\n(The answer was cut at 48,000 characters.)");
+  });
+});
+
+describe("appendToComposerDraft", () => {
+  beforeEach(() => {
+    h.drafts.clear();
+    h.hostChatsOpened.length = 0;
+  });
+
+  it("adds the text after what is already typed and does not touch the center panel", () => {
+    h.drafts.set("source", "my notes");
+    appendToComposerDraft(scopeThreadRef(HOST.environmentId, ThreadId.make("source")), "answer");
+    expect(h.drafts.get("source")).toBe("my notes\n\nanswer");
+    expect(h.hostChatsOpened).toEqual([]);
   });
 });
 

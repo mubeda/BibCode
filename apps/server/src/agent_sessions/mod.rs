@@ -9,7 +9,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    io::{BufRead, BufReader, ErrorKind, Read},
+    io::{BufRead, BufReader, ErrorKind, Read, Seek},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -1124,20 +1124,57 @@ fn read_session(
     if file.size > MAX_TRANSCRIPT_BYTES {
         return None;
     }
-    let open = || {
-        File::open(&file.path).ok().map(|file| {
-            let records = RecordReader::new(file.take(MAX_TRANSCRIPT_BYTES));
-            match cancellation {
-                Some(cancellation) => records.with_cancellation(cancellation),
-                None => records,
-            }
-        })
-    };
     let fallback_session_id = file
         .path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
+    parse_session_file(
+        provider,
+        &File::open(&file.path).ok()?,
+        MAX_TRANSCRIPT_BYTES,
+        fallback_session_id,
+        file.modified,
+        cancellation,
+    )
+}
+
+/// Parses a transcript the caller already opened (and checked), reading at most the length it
+/// had when this is called: a live transcript keeps growing.
+pub(crate) fn parse_transcript(
+    provider: AgentSessionProvider,
+    file: File,
+    fallback_session_id: &str,
+) -> Option<ParsedSession> {
+    let metadata = file.metadata().ok()?;
+    parse_session_file(
+        provider,
+        &file,
+        metadata.len(),
+        fallback_session_id,
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        None,
+    )
+}
+
+/// Reads `file` from its start for each pass, at most `max_bytes` each time.
+fn parse_session_file(
+    provider: AgentSessionProvider,
+    file: &File,
+    max_bytes: u64,
+    fallback_session_id: &str,
+    modified: SystemTime,
+    cancellation: Option<&CancellationToken>,
+) -> Option<ParsedSession> {
+    let open = || {
+        let mut file = file.try_clone().ok()?;
+        file.rewind().ok()?;
+        let records = RecordReader::new(file.take(max_bytes));
+        Some(match cancellation {
+            Some(cancellation) => records.with_cancellation(cancellation),
+            None => records,
+        })
+    };
     let canonical = match provider {
         AgentSessionProvider::ClaudeAgent => HashSet::new(),
         AgentSessionProvider::Codex => {
@@ -1155,7 +1192,7 @@ fn read_session(
         &mut records,
         &canonical,
         fallback_session_id,
-        &iso(file.modified),
+        &iso(modified),
     );
     (!records.failed).then_some(session).flatten()
 }

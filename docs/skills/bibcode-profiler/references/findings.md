@@ -397,7 +397,8 @@ work, commit message generation, `worktree.remove`, provider checks such as
 Terminal's preparation runs its provider's probe, a mise shim's `which` and `env`,
 and `codesign` for a new Claude build), MCP tool calls that wait
 (`mcp.wait_for_thread`, `mcp.preview_*`, `mcp.device_*`, and any `mcp.*` tool
-whose RPC method is long-running), a webhook test event or redelivery
+whose RPC method is long-running), `sendRequests.getTerminalOutput` (a Codex AI Terminal's conversation
+waits on Codex for up to 5 s), a webhook test event or redelivery
 (`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint, and
 `webhooks.upsert`, which waits for the request in flight when a bearer token changes), and
 similar external or filesystem work) never

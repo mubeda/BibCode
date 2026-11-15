@@ -237,6 +237,70 @@ mod tests {
     use clap::{CommandFactory, FromArgMatches, Parser};
 
     #[test]
+    fn agent_cli_list_parses_to_an_agent_action() {
+        let action = Cli::try_parse_from(["bibcode", "agent", "list", "--json"])
+            .expect("parse agent list")
+            .into_action()
+            .expect("agent never resolves a data root");
+        assert!(matches!(
+            action,
+            CliAction::Agent(crate::mcp::agent_cli::AgentArgs {
+                json: true,
+                command: crate::mcp::agent_cli::AgentCommand::List,
+            })
+        ));
+    }
+
+    #[test]
+    fn agent_cli_send_parses_the_recipient_and_a_stdin_message() {
+        let action = Cli::try_parse_from([
+            "bibcode",
+            "agent",
+            "send",
+            "thread:b",
+            "-",
+            "--request-id",
+            "r-1",
+        ])
+        .expect("parse agent send")
+        .into_action()
+        .expect("agent never resolves a data root");
+        let CliAction::Agent(args) = action else {
+            panic!("an agent action");
+        };
+        assert!(!args.json);
+        assert!(matches!(
+            args.command,
+            crate::mcp::agent_cli::AgentCommand::Send { ref to, ref message, ref request_id }
+                if to == "thread:b" && message == "-" && request_id.as_deref() == Some("r-1")
+        ));
+    }
+
+    /// The parser `<desktop exe> agent …` and `bibcode agent …` use before the server's own
+    /// arguments, whose environment-backed values an AI Terminal may carry.
+    #[test]
+    fn agent_cli_desktop_dispatch_recognizes_agent() {
+        let cli = <crate::mcp::agent_cli::AgentCli as Parser>::try_parse_from([
+            "agent", "reply", "m-1", "-", "--json",
+        ])
+        .expect("parse the desktop's agent command");
+        assert!(cli.args.json);
+        assert!(matches!(
+            cli.args.command,
+            crate::mcp::agent_cli::AgentCommand::Reply { ref message, ref text, .. }
+                if message == "m-1" && text == "-"
+        ));
+    }
+
+    #[test]
+    fn agent_cli_is_not_a_server_configuration() {
+        let refused = Cli::try_parse_from(["bibcode", "agent", "inbox"])
+            .expect("parse agent inbox")
+            .into_server_config();
+        assert!(matches!(refused, Err(ConfigError::AgentCommandIsNotServer)));
+    }
+
+    #[test]
     fn owned_builder_inputs_cover_desktop_and_static_configuration() {
         let state_dir = "state".to_owned();
         let static_dir = "static".to_owned();
@@ -813,6 +877,10 @@ enum CliCommand {
     )]
     Thread(crate::mcp::thread_cli::ThreadArgs),
     #[command(
+        about = "Inside an AI Terminal that BiBCode started: list, message and read the other agents of its project."
+    )]
+    Agent(crate::mcp::agent_cli::AgentArgs),
+    #[command(
         about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
     )]
     Service(ServiceArgs),
@@ -1047,6 +1115,8 @@ pub enum CliAction {
         options: crate::mcp::relay::RelayOptions,
         args: crate::mcp::thread_cli::ThreadArgs,
     },
+    /// Calls the agent route named by the AI Terminal's own environment; touches no data root.
+    Agent(crate::mcp::agent_cli::AgentArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -1157,6 +1227,8 @@ pub enum ConfigError {
     McpCommandIsNotServer,
     #[error("thread cannot be converted into a server configuration")]
     ThreadCommandIsNotServer,
+    #[error("agent cannot be converted into a server configuration")]
+    AgentCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -1203,6 +1275,7 @@ impl Cli {
             | CliAction::McpCall { .. }
             | CliAction::McpTools(_) => Err(ConfigError::McpCommandIsNotServer),
             CliAction::Thread { .. } => Err(ConfigError::ThreadCommandIsNotServer),
+            CliAction::Agent(_) => Err(ConfigError::AgentCommandIsNotServer),
         }
     }
 
@@ -1225,6 +1298,7 @@ impl Cli {
         } = self;
         let command = match command {
             Some(CliCommand::OpenUrl { url }) => return Ok(CliAction::OpenUrl { url }),
+            Some(CliCommand::Agent(agent)) => return Ok(CliAction::Agent(agent)),
             Some(CliCommand::Storage(storage)) => {
                 let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
                 let request = select_data_root_request(

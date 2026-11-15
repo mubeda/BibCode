@@ -1,6 +1,7 @@
 //! Reusable BiBCode server runtime.
 
 pub mod activity;
+pub mod agent_messaging;
 mod agent_sessions;
 pub mod allocator;
 mod ansi;
@@ -39,6 +40,7 @@ pub mod pull_requests;
 pub mod remote_update;
 pub mod review;
 mod rpc;
+pub(crate) mod send_requests;
 pub mod server_settings;
 mod service_manager;
 pub mod signed_token;
@@ -125,6 +127,13 @@ pub enum RunError {
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
+    // Before the server's arguments, whose environment-backed values an AI Terminal may carry.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("agent")) {
+        return match mcp::agent_cli::run_agent_args(std::env::args_os().skip(1)).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        };
+    }
     match Cli::try_parse()?.into_action()? {
         CliAction::Run(config) => run_server(*config).await,
         CliAction::Storage(command) => run_storage_command(command).await,
@@ -152,6 +161,10 @@ pub async fn run_cli() -> Result<(), RunError> {
             }
         }
         CliAction::McpTools(options) => match mcp::call_cli::run_mcp_tools(options).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
+        CliAction::Agent(args) => match mcp::agent_cli::run_agent_cli(args).await {
             0 => Ok(()),
             code => std::process::exit(code),
         },

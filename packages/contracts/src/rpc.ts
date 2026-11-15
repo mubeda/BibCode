@@ -114,6 +114,22 @@ import {
   WebhooksUpsertResult,
 } from "./webhooks.ts";
 import {
+  SendRequest,
+  SendRequestError,
+  SendRequestsCancelInput,
+  SendRequestsCancelResult,
+  SendRequestsDismissInput,
+  SendRequestsGetAnswerInput,
+  SendRequestsGetAnswerResult,
+  SendRequestsGetHandoffTextInput,
+  SendRequestsGetHandoffTextResult,
+  SendRequestsGetTerminalOutputInput,
+  SendRequestsGetTerminalOutputResult,
+  SendRequestsSendInput,
+  SendRequestsStreamEvent,
+  SendRequestsSubscribeInput,
+} from "./sendRequests.ts";
+import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
   ActivityError,
@@ -643,6 +659,15 @@ export const WS_METHODS = {
   reviewReadFileVersion: "review.readFileVersion",
   reviewListDiffTools: "review.listDiffTools",
   reviewOpenDiffTool: "review.openDiffTool",
+
+  // A person's request to an agent
+  sendRequestsSend: "sendRequests.send",
+  sendRequestsCancel: "sendRequests.cancel",
+  sendRequestsDismiss: "sendRequests.dismiss",
+  sendRequestsSubscribe: "sendRequests.subscribe",
+  sendRequestsGetAnswer: "sendRequests.getAnswer",
+  sendRequestsGetHandoffText: "sendRequests.getHandoffText",
+  sendRequestsGetTerminalOutput: "sendRequests.getTerminalOutput",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -2218,6 +2243,59 @@ export const WsSubscribeUiIntentsRpc = Rpc.make(WS_METHODS.subscribeUiIntents, {
   stream: true,
 });
 
+/** A signed-in person's request to a specific agent. An agent's credential is refused. */
+export const WsSendRequestsSendRpc = Rpc.make(WS_METHODS.sendRequestsSend, {
+  payload: SendRequestsSendInput,
+  success: SendRequest,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** Withdraws a request the agent has not taken yet; `cancelled` is false once it was read. */
+export const WsSendRequestsCancelRpc = Rpc.make(WS_METHODS.sendRequestsCancel, {
+  payload: SendRequestsCancelInput,
+  success: SendRequestsCancelResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** Hides a request that has ended. */
+export const WsSendRequestsDismissRpc = Rpc.make(WS_METHODS.sendRequestsDismiss, {
+  payload: SendRequestsDismissInput,
+  success: SendRequest,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** Every undismissed request of the scope in pages, then each change. */
+export const WsSendRequestsSubscribeRpc = Rpc.make(WS_METHODS.sendRequestsSubscribe, {
+  payload: SendRequestsSubscribeInput,
+  success: SendRequestsStreamEvent,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+  stream: true,
+});
+
+/** The stored answer of a request, which stays readable after its agent is gone. */
+export const WsSendRequestsGetAnswerRpc = Rpc.make(WS_METHODS.sendRequestsGetAnswer, {
+  payload: SendRequestsGetAnswerInput,
+  success: SendRequestsGetAnswerResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** A thread's handoff text, built from its stored messages; nothing is sent to its agent. */
+export const WsSendRequestsGetHandoffTextRpc = Rpc.make(WS_METHODS.sendRequestsGetHandoffText, {
+  payload: SendRequestsGetHandoffTextInput,
+  success: SendRequestsGetHandoffTextResult,
+  error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+});
+
+/** The last output of an AI Terminal for a terminal source; only reads. `orchestration:operate`. */
+export const WsSendRequestsGetTerminalOutputRpc = Rpc.make(
+  WS_METHODS.sendRequestsGetTerminalOutput,
+  {
+    payload: SendRequestsGetTerminalOutputInput,
+    success: SendRequestsGetTerminalOutputResult,
+    error: Schema.Union([SendRequestError, EnvironmentRpcError]),
+  },
+);
+
 /** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
 export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
   payload: WebhooksListInput,
@@ -2482,6 +2560,13 @@ export const WsRpcGroup = RpcGroup.make(
   WsReviewReadFileVersionRpc,
   WsReviewListDiffToolsRpc,
   WsReviewOpenDiffToolRpc,
+  WsSendRequestsSendRpc,
+  WsSendRequestsCancelRpc,
+  WsSendRequestsDismissRpc,
+  WsSendRequestsSubscribeRpc,
+  WsSendRequestsGetAnswerRpc,
+  WsSendRequestsGetHandoffTextRpc,
+  WsSendRequestsGetTerminalOutputRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

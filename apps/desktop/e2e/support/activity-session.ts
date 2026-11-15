@@ -371,3 +371,13 @@ export async function configureDesktopActivityCodexExecutable(
     },
   ]);
 }
+
+/** Turns the server's agent messaging setting on or off through the same settings RPC. */
+export async function setDesktopAgentMessaging(enabled: boolean): Promise<void> {
+  await dispatchDesktopActivityCommands([], null, [
+    {
+      tag: "server.updateSettings",
+      payload: { patch: { agentMessaging: { enabled } } },
+    },
+  ]);
+}

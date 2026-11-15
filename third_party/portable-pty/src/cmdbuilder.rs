@@ -144,7 +144,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
                         continue;
                     }
                     if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
+                        log::trace!("adding SYS env: {:?}", name);
                         env.insert(
                             EnvEntry::map_key(name.clone().into()),
                             EnvEntry {
@@ -178,7 +178,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
                             value
                         };
 
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
+                        log::trace!("adding USER env: {:?}", name);
                         env.insert(
                             EnvEntry::map_key(name.clone().into()),
                             EnvEntry {
@@ -198,7 +198,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
 
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
 /// The interface is intentionally similar to that of `std::process::Command`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct CommandBuilder {
     args: Vec<OsString>,
@@ -213,6 +213,27 @@ pub struct CommandBuilder {
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
     controlling_tty: bool,
+}
+
+// BiBCode deviation: environment values can carry credentials, so `Debug` prints only their
+// keys. Reapply it when this vendored copy is synced.
+impl std::fmt::Debug for CommandBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("CommandBuilder");
+        debug
+            .field("args", &self.args)
+            .field("env_keys", &self.envs.keys().collect::<Vec<_>>())
+            .field("cwd", &self.cwd);
+        #[cfg(windows)]
+        debug
+            .field("job_list", &self.job_list)
+            .field("raw_windows_args", &self.raw_windows_args);
+        #[cfg(unix)]
+        debug.field("umask", &self.umask);
+        debug
+            .field("controlling_tty", &self.controlling_tty)
+            .finish()
+    }
 }
 
 impl CommandBuilder {

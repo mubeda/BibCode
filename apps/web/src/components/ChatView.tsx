@@ -17,6 +17,7 @@ import {
   type ServerProvider,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
+  type SendRequest,
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
@@ -206,6 +207,7 @@ import {
   selectThreadCenterPanelState,
   type ThreadCenterPanelState,
   type OpenTerminalPanelOptions,
+  revealTerminalSurface,
   useCenterPanelStore,
 } from "../centerPanelStore";
 import {
@@ -215,6 +217,7 @@ import {
 } from "../centerPanelLayout";
 import {
   CODE_REVIEW_SEND_FAILED_TITLE,
+  type PromptedPanelResult,
   takeComposerFocusRequest,
   useCenterPanelActions,
 } from "../centerPanelActions";
@@ -264,7 +267,7 @@ import ThreadTerminalPanel, {
   releaseTerminalUiResources,
 } from "./ThreadTerminalPanel";
 import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
-import { cn, randomHex } from "~/lib/utils";
+import { cn, randomHex, randomUUID } from "~/lib/utils";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
 import { type NewProjectScriptInput } from "./ProjectScriptsControl";
@@ -334,7 +337,51 @@ import {
 } from "./chat/RevertCheckpointDialog.logic";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
-import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
+import { readThreadShell, useProject, useThread, useThreadProposedPlans } from "../state/entities";
+import {
+  useCancelSendRequest,
+  useDismissSendRequest,
+  useGetHandoffText,
+  useGetTerminalOutput,
+  useSendRequest,
+  useSendRequests,
+} from "../state/sendRequests";
+import { ChatSendToAgentControl } from "./sendToAgent/ChatSendToAgentControl";
+import {
+  TerminalSendToAgentContext,
+  type TerminalSendToAgentServices,
+} from "./sendToAgent/TerminalSendComposer";
+import {
+  isAiTerminal,
+  makeTerminalOutputLoader,
+  shouldActivateSendPanel,
+} from "./sendToAgent/terminalSource.logic";
+import {
+  describeRowActionFailure,
+  selectRowsForThread,
+  SendRequestRows,
+} from "./sendToAgent/SendRequestRow";
+import { AnswerNotice } from "./sendToAgent/AnswerNotice";
+import type { OpenSendTarget } from "./sendToAgent/useSendTargetOpener";
+import { buildSecondOpinionContent } from "./sendToAgent/attachments.logic";
+import {
+  buildHandOffContent,
+  buildTakeOverContent,
+  type HandoffLoader,
+} from "./sendToAgent/handoff.logic";
+import { buildReviewPreviewContent } from "./sendToAgent/ReviewScopePicker";
+import {
+  buildReviewContent,
+  buildReviewScopeOptions,
+  reviewPanelProviders,
+  type StartNewPanelReviewInput,
+} from "./sendToAgent/review.logic";
+import {
+  sendChoiceKey,
+  type NewPanelProvider,
+  type PreviewContent,
+  type SendChoice,
+} from "./sendToAgent/sendToAgent.logic";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
@@ -436,6 +483,13 @@ const DiffPanel = lazy(() => import("./DiffPanel"));
 const SourceControlPanel = lazy(() => import("./SourceControlPanel"));
 /** Hosts with a terminal review being opened, so a double click opens one (#293). */
 const pendingTerminalReviewHosts = new Set<string>();
+const EMPTY_SEND_CONTENT: PreviewContent = { leadIn: "", attachments: [] };
+const PANEL_NOT_OPENED: PromptedPanelResult = {
+  threadId: null,
+  created: false,
+  messageId: null,
+  sent: "not-sent",
+};
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
@@ -927,6 +981,16 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
     threadWorktreePath,
   ]);
 
+  const aiTerminalIds = useMemo(
+    () =>
+      new Set(
+        knownTerminalSessions
+          .filter((session) => isAiTerminal(session.state.summary))
+          .map((session) => session.target.terminalId),
+      ),
+    [knownTerminalSessions],
+  );
+
   if (!project || !cwd) return null;
 
   return (
@@ -961,6 +1025,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       onAddTerminalContext={onAddTerminalContext}
       terminalLabelsById={terminalLabelsById}
       terminalLaunchLocationsById={terminalLaunchLocationsById}
+      aiTerminalIds={aiTerminalIds}
       keybindings={keybindings}
     />
   );
@@ -5124,6 +5189,326 @@ function ChatViewContent(props: ChatViewProps) {
       settings.codeReviewPrompt,
     ],
   );
+  // Send to agent (R101 to R106, R119): a person's request to another agent. The older servers
+  // do not know its methods, so nothing subscribes or sends without the capability.
+  const sendRequestsSupported = serverConfig?.environment.capabilities?.sendRequests === true;
+  const sendNewPanelProviders = useMemo<ReadonlyArray<NewPanelProvider>>(
+    () =>
+      codeReviewAgentActions.flatMap((action) =>
+        action.kind === "chat"
+          ? [
+              {
+                value: action.value,
+                selection: action.selection,
+                label: action.label,
+                disabledReason: action.disabled
+                  ? (action.disabledReason ?? `${action.label} is not available.`)
+                  : null,
+              },
+            ]
+          : [],
+      ),
+    [codeReviewAgentActions],
+  );
+  const createSendPanel = useLatestHandler(
+    async (
+      selection: DefaultAgentSelection,
+      options?: { readonly sourceUnmountsOnActivate: boolean },
+    ): Promise<ThreadId | null> => {
+      const entry = codeReviewAgentActions.find(
+        (action) => action.kind === "chat" && action.entry.instanceId === selection.instanceId,
+      )?.entry;
+      if (entry === undefined || !activeThread || !centerPanelLaunchContext) return null;
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+      });
+      return centerPanelActions.createChatPanel({
+        // A panel cannot host a panel: the new one is hosted by this panel's host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+        // A send from a panel other than the host, or from a center terminal, keeps its own
+        // surface active until the send succeeds (`revealSendPanel`): activating another panel
+        // unmounts the source and its preview with it.
+        activate: shouldActivateSendPanel({
+          hostThreadId: activeThread.hostThreadId ?? null,
+          sourceUnmountsOnActivate: options?.sourceUnmountsOnActivate ?? false,
+        }),
+      });
+    },
+  );
+  const revealSendPanel = useLatestHandler((panelThreadId: ThreadId) => {
+    if (!activeThread) return;
+    void centerPanelActions.openPanelThread(
+      scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId ?? activeThread.id),
+      panelThreadId,
+      // A panel's title is its tab label.
+      readThreadShell(scopeThreadRef(activeThread.environmentId, panelThreadId))?.title ?? "",
+      false,
+    );
+  });
+  const sendReviewProviders = useMemo(
+    () => reviewPanelProviders(codeReviewMenuReviewers),
+    [codeReviewMenuReviewers],
+  );
+  const sendNewPanelProvidersFor = useCallback(
+    (action: SendChoice["action"]) =>
+      action === "review" ? sendReviewProviders : sendNewPanelProviders,
+    [sendNewPanelProviders, sendReviewProviders],
+  );
+  const sendReview = useSendRequest(environmentId);
+  const getHandoffText = useGetHandoffText(environmentId);
+  const getTerminalOutput = useGetTerminalOutput(environmentId);
+  // A Review to a new panel: the panel starts with the review's modes and guard like the Code
+  // review button's, but its first message is the tracked request, not a bare turn.
+  const startNewPanelReview = useLatestHandler(
+    async (input: StartNewPanelReviewInput): Promise<PromptedPanelResult> => {
+      const reviewer = resolveSavedCodeReviewer(
+        codeReviewAgentActions,
+        input.selection,
+        providerInstanceEntries,
+      ).action;
+      if (reviewer === null || !activeThread || !centerPanelLaunchContext) return PANEL_NOT_OPENED;
+      const { entry } = reviewer;
+      const resolution = resolveProviderSessionDefault({
+        driver: entry.driverKind,
+        instanceId: entry.instanceId,
+        models: entry.models,
+        configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+        explicitSelection: resolveCodeReviewModelSelection(
+          settings.codeReviewModelSelection,
+          entry.instanceId,
+        ),
+      });
+      return centerPanelActions.createPromptedChatPanel({
+        // A panel cannot host a panel: a review from one is hosted by its host.
+        hostRef: scopeThreadRef(
+          activeThread.environmentId,
+          activeThread.hostThreadId ?? activeThread.id,
+        ),
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext.worktreePath,
+        branch: activeThread.branch ?? null,
+        modelSelection: resolution.modelSelection,
+        providerLabel: entry.displayName,
+        // A review from a panel other than the host keeps its own tab active until the send
+        // succeeds: an inactive chat panel unmounts, and its preview with it.
+        activate: !activeThread.hostThreadId,
+        label: `Code review · ${entry.displayName}`,
+        prompt: "",
+        ...resolveCodeReviewChatModes(entry.driverKind),
+        codeReview: true,
+        sendFirstMessage: async (panelThreadId) => {
+          const outcome = await input.send(panelThreadId);
+          return {
+            messageId: null,
+            outcome:
+              outcome.kind === "sent"
+                ? "sent"
+                : outcome.reason === "unknown_outcome"
+                  ? "unknown"
+                  : "failed",
+          };
+        },
+      });
+    },
+  );
+  // What the Send to agent preview shows for each action; an action without content opens no
+  // preview. Stable, so an open preview keeps its content while the git status refreshes.
+  const sendPreviewContentFor = useLatestHandler((choice: SendChoice): PreviewContent | null => {
+    if (choice.action === "message") return EMPTY_SEND_CONTENT;
+    if (choice.action === "second-opinion")
+      return buildSecondOpinionContent(choice.source.messages);
+    // Hand off and Take over from only read stored messages: no agent's session is touched.
+    const loadHandoff: HandoffLoader = (threadId) =>
+      getHandoffText({ sourceThreadId: choice.source.threadId, threadId });
+    if (choice.action === "hand-off") {
+      return buildHandOffContent({ source: choice.source, loadHandoff });
+    }
+    if (choice.action === "take-over") {
+      return choice.target.kind === "agent"
+        ? buildTakeOverContent({
+            source: choice.source,
+            picked: choice.target.row,
+            loadHandoff,
+            loadTerminalOutput: makeTerminalOutputLoader(getTerminalOutput, choice.source.threadId),
+          })
+        : null;
+    }
+    const pickKey = sendChoiceKey(choice);
+    const { target } = choice;
+    const guardLine =
+      target.kind === "new-panel"
+        ? (codeReviewMenuReviewers.find(
+            (reviewer) =>
+              reviewer.selection.kind === target.selection.kind &&
+              reviewer.selection.instanceId === target.selection.instanceId,
+          )?.guardLine ?? null)
+        : null;
+    return buildReviewPreviewContent({
+      options: buildReviewScopeOptions(gitStatusQuery.data ?? null),
+      pickKey,
+      contentFor: (scope) =>
+        buildReviewContent({
+          scope,
+          projectPrompt: activeProject?.codeReviewPrompt ?? "",
+          userPrompt: settings.codeReviewPrompt,
+          target,
+          guardLine,
+          sourceKey: pickKey,
+          source: choice.source,
+          send: sendReview,
+          newId: randomUUID,
+          startNewPanelReview,
+          revealPanel: (panelThreadId) => {
+            if (!activeThread?.hostThreadId) return;
+            void centerPanelActions.openPanelThread(
+              scopeThreadRef(activeThread.environmentId, activeThread.hostThreadId),
+              panelThreadId,
+              "Code review",
+              false,
+            );
+          },
+        }),
+    });
+  });
+  const sendToAgentControl = useMemo(
+    () =>
+      isServerThread && activeThreadRef !== null ? (
+        <ChatSendToAgentControl
+          threadRef={activeThreadRef}
+          serverSupported={sendRequestsSupported}
+          newPanelProvidersFor={sendNewPanelProvidersFor}
+          createPanel={createSendPanel}
+          revealPanel={revealSendPanel}
+          previewContentFor={sendPreviewContentFor}
+        />
+      ) : null,
+    [
+      activeThreadRef,
+      createSendPanel,
+      revealSendPanel,
+      isServerThread,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
+      sendRequestsSupported,
+    ],
+  );
+  const sendRequests = useSendRequests(
+    isServerThread && sendRequestsSupported ? environmentId : null,
+  );
+  const threadSendRequests = useMemo(
+    () => selectRowsForThread(sendRequests, threadId),
+    [sendRequests, threadId],
+  );
+  const cancelSendRequest = useCancelSendRequest(environmentId);
+  const dismissSendRequest = useDismissSendRequest(environmentId);
+  const handleCancelSendRequest = useCallback(
+    async (requestId: string) => {
+      const outcome = await cancelSendRequest(requestId);
+      if (outcome.kind === "failed") {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Couldn't cancel the request",
+            description: describeRowActionFailure(outcome),
+          }),
+        );
+      }
+    },
+    [cancelSendRequest],
+  );
+  const handleDismissSendRequest = useCallback(
+    async (requestId: string) => {
+      const outcome = await dismissSendRequest(requestId);
+      if (outcome.kind === "failed") {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Couldn't dismiss the request",
+            description: describeRowActionFailure(outcome),
+          }),
+        );
+      }
+    },
+    [dismissSendRequest],
+  );
+  // A request's target opens where it lives: an AI Terminal's tab, a panel of its host, else its
+  // own thread.
+  const handleOpenSendTarget = useCallback<OpenSendTarget>(
+    (target, terminalId) => {
+      if (terminalId !== null) {
+        revealTerminalSurface(target, terminalId);
+        void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(target) });
+        return;
+      }
+      const shell = readThreadShell(target);
+      const hostThreadId = shell?.hostThreadId ?? null;
+      const hostRef =
+        hostThreadId === null ? target : scopeThreadRef(target.environmentId, hostThreadId);
+      if (hostThreadId !== null) {
+        void centerPanelActions.openPanelThread(
+          hostRef,
+          target.threadId,
+          shell?.title ?? "",
+          false,
+        );
+      }
+      void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(hostRef) });
+    },
+    [centerPanelActions, navigate],
+  );
+  // What every AI Terminal control under this chat needs; null outside a stored thread.
+  const terminalSendServices = useMemo<TerminalSendToAgentServices | null>(
+    () =>
+      isServerThread
+        ? {
+            serverSupported: sendRequestsSupported,
+            newPanelProvidersFor: sendNewPanelProvidersFor,
+            createPanel: createSendPanel,
+            revealPanel: revealSendPanel,
+            previewContentFor: sendPreviewContentFor,
+            openSendTarget: handleOpenSendTarget,
+            cancelSendRequest: handleCancelSendRequest,
+            dismissSendRequest: handleDismissSendRequest,
+          }
+        : null,
+    [
+      createSendPanel,
+      handleCancelSendRequest,
+      handleDismissSendRequest,
+      handleOpenSendTarget,
+      isServerThread,
+      revealSendPanel,
+      sendNewPanelProvidersFor,
+      sendPreviewContentFor,
+      sendRequestsSupported,
+    ],
+  );
+  // A Review or Second opinion that is answered, or not, gets the notice with Bring back; the
+  // other actions keep the plain row.
+  const renderSendAnswer = useCallback(
+    (request: SendRequest) =>
+      activeThreadRef !== null &&
+      (request.action === "review" || request.action === "second-opinion") ? (
+        <AnswerNotice
+          request={request}
+          hostRef={activeThreadRef}
+          onOpen={handleOpenSendTarget}
+          onDismiss={handleDismissSendRequest}
+        />
+      ) : null,
+    [activeThreadRef, handleDismissSendRequest, handleOpenSendTarget],
+  );
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -7532,24 +7917,26 @@ function ChatViewContent(props: ChatViewProps) {
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "terminal" ? (
-      <PersistentThreadTerminalPanel
-        threadRef={activeThreadRef}
-        surface={activeRightPanelSurface}
-        launchContext={null}
-        focusRequestId={terminalFocusRequestId}
-        keybindings={keybindings}
-        onAddTerminalContext={addTerminalContextToDraft}
-        onSplitTerminal={splitPanelTerminal}
-        onSplitTerminalVertical={splitPanelTerminalVertical}
-        onNewTerminal={addTerminalSurface}
-        onActiveTerminalChange={activatePanelTerminal}
-        onCloseTerminal={closePanelTerminal}
-        splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
-        splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
-        newShortcutLabel={newTerminalShortcutLabel ?? undefined}
-        closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
-        workspaceUnavailable={workspaceUnavailable}
-      />
+      <TerminalSendToAgentContext.Provider value={terminalSendServices}>
+        <PersistentThreadTerminalPanel
+          threadRef={activeThreadRef}
+          surface={activeRightPanelSurface}
+          launchContext={null}
+          focusRequestId={terminalFocusRequestId}
+          keybindings={keybindings}
+          onAddTerminalContext={addTerminalContextToDraft}
+          onSplitTerminal={splitPanelTerminal}
+          onSplitTerminalVertical={splitPanelTerminalVertical}
+          onNewTerminal={addTerminalSurface}
+          onActiveTerminalChange={activatePanelTerminal}
+          onCloseTerminal={closePanelTerminal}
+          splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
+          splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
+          newShortcutLabel={newTerminalShortcutLabel ?? undefined}
+          closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+          workspaceUnavailable={workspaceUnavailable}
+        />
+      </TerminalSendToAgentContext.Provider>
     ) : activeRightPanelSurface?.kind === "diff" ? (
       diffSurfaceThreadRef !== null && diffSurfaceThread === null ? (
         <PanelDiffPendingState
@@ -7815,6 +8202,17 @@ function ChatViewContent(props: ChatViewProps) {
                         {sideChatHostRef !== null ? (
                           <SideChatBringBack hostRef={sideChatHostRef} summary={bringBackSummary} />
                         ) : null}
+                        {isServerThread && sendRequestsSupported ? (
+                          // Always mounted, so its status region exists before a state changes.
+                          <SendRequestRows
+                            environmentId={environmentId}
+                            requests={threadSendRequests}
+                            onOpen={handleOpenSendTarget}
+                            onCancel={handleCancelSendRequest}
+                            onDismiss={handleDismissSendRequest}
+                            renderAnswer={renderSendAnswer}
+                          />
+                        ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                         <div className="relative z-10">
                           <ChatComposer
@@ -7908,6 +8306,7 @@ function ChatViewContent(props: ChatViewProps) {
                             onExpandImage={onExpandTimelineImage}
                             onPageTimeline={pageTimeline}
                             historyMenu={historyMenu}
+                            sendToAgentControl={sendToAgentControl}
                           />
                         </div>
                       </div>
@@ -7943,60 +8342,64 @@ function ChatViewContent(props: ChatViewProps) {
           );
 
           return !isPanel && activeThreadRef ? (
-            <LiveCenterPanelWorkspace
-              workspaceRef={centerPanelWorkspaceRef}
-              state={centerPanelState}
-              hostLabel={centerHostLabel}
-              terminalLabelsById={activeTerminalLabelsById}
-              renderFocusedActions={(density) => (
-                <ChatHeaderActions
-                  density={density}
-                  activeThreadEnvironmentId={activeThread.environmentId}
-                  activeThreadId={activeThread.id}
-                  {...(routeKind === "draft" && draftId ? { draftId } : {})}
-                  activeProjectName={activeProject?.title}
-                  openInCwd={gitCwd}
-                  activeProjectScripts={activeProject?.scripts}
-                  preferredScriptId={
-                    activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-                  }
-                  keybindings={keybindings}
-                  availableEditors={availableEditors}
-                  reserveTitlebarControls={reserveCenterTitlebarControls}
-                  gitCwd={gitCwd}
-                  providerStatuses={providerStatuses as ServerProvider[]}
-                  settings={settings}
-                  canCreatePanel={centerPanelLaunchContext !== null}
-                  onCreateChatPanel={handleCreateChatPanel}
-                  onCreateSideChat={handleCreateSideChatFromMenu}
-                  sideChatUnavailableReason={sideChatUnavailableReason}
-                  onReopenChatPanel={handleReopenChatPanel}
-                  onOpenTerminalPanel={handleOpenTerminalPanel}
-                  onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-                  onRunProjectScript={runProjectScript}
-                  onAddProjectScript={saveProjectScript}
-                  onUpdateProjectScript={updateProjectScript}
-                  onDeleteProjectScript={deleteProjectScript}
-                  workspaceUnavailable={workspaceUnavailable}
-                />
-              )}
-              hostChatSurfaceBody={hostChatSurfaceBody}
-              hostThreadRef={activeThreadRef}
-              centerTerminalLaunchContext={centerTerminalLaunchContext}
-              keybindings={keybindings}
-              terminalFocusRequestId={terminalFocusRequestId}
-              onAddTerminalContext={addTerminalContextToDraft}
-              onFocusGroup={focusCenterPanelGroup}
-              onActivate={activateCenterPanelSurface}
-              onCloseSurface={closeCenterPanelSurface}
-              onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-              onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-              onCloseAllSurfaces={closeAllCenterPanelSurfaces}
-              onDropSurface={dropCenterPanelSurface}
-              onMergeGroup={mergeCenterPanelGroup}
-              onSetSplitRatio={setCenterPanelSplitRatio}
-              workspaceUnavailable={workspaceUnavailable}
-            />
+            <TerminalSendToAgentContext.Provider value={terminalSendServices}>
+              <LiveCenterPanelWorkspace
+                workspaceRef={centerPanelWorkspaceRef}
+                state={centerPanelState}
+                hostLabel={centerHostLabel}
+                terminalLabelsById={activeTerminalLabelsById}
+                renderFocusedActions={(density) => (
+                  <ChatHeaderActions
+                    density={density}
+                    activeThreadEnvironmentId={activeThread.environmentId}
+                    activeThreadId={activeThread.id}
+                    {...(routeKind === "draft" && draftId ? { draftId } : {})}
+                    activeProjectName={activeProject?.title}
+                    openInCwd={gitCwd}
+                    activeProjectScripts={activeProject?.scripts}
+                    preferredScriptId={
+                      activeProject
+                        ? (lastInvokedScriptByProjectId[activeProject.id] ?? null)
+                        : null
+                    }
+                    keybindings={keybindings}
+                    availableEditors={availableEditors}
+                    reserveTitlebarControls={reserveCenterTitlebarControls}
+                    gitCwd={gitCwd}
+                    providerStatuses={providerStatuses as ServerProvider[]}
+                    settings={settings}
+                    canCreatePanel={centerPanelLaunchContext !== null}
+                    onCreateChatPanel={handleCreateChatPanel}
+                    onCreateSideChat={handleCreateSideChatFromMenu}
+                    sideChatUnavailableReason={sideChatUnavailableReason}
+                    onReopenChatPanel={handleReopenChatPanel}
+                    onOpenTerminalPanel={handleOpenTerminalPanel}
+                    onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+                    onRunProjectScript={runProjectScript}
+                    onAddProjectScript={saveProjectScript}
+                    onUpdateProjectScript={updateProjectScript}
+                    onDeleteProjectScript={deleteProjectScript}
+                    workspaceUnavailable={workspaceUnavailable}
+                  />
+                )}
+                hostChatSurfaceBody={hostChatSurfaceBody}
+                hostThreadRef={activeThreadRef}
+                centerTerminalLaunchContext={centerTerminalLaunchContext}
+                keybindings={keybindings}
+                terminalFocusRequestId={terminalFocusRequestId}
+                onAddTerminalContext={addTerminalContextToDraft}
+                onFocusGroup={focusCenterPanelGroup}
+                onActivate={activateCenterPanelSurface}
+                onCloseSurface={closeCenterPanelSurface}
+                onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+                onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+                onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+                onDropSurface={dropCenterPanelSurface}
+                onMergeGroup={mergeCenterPanelGroup}
+                onSetSplitRatio={setCenterPanelSplitRatio}
+                workspaceUnavailable={workspaceUnavailable}
+              />
+            </TerminalSendToAgentContext.Provider>
           ) : (
             hostChatSurfaceBody
           );

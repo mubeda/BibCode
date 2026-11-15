@@ -16,6 +16,7 @@ import {
   createCenterPanelLayoutState,
   dropCenterPanelSurface,
   findCenterPanelGroup,
+  findCenterPanelGroupForSurface,
   insertCenterPanelSurface,
   mergeCenterPanelGroup,
   removeCenterPanelSurfaceIds,
@@ -114,7 +115,16 @@ interface CenterPanelStoreState {
   releaseClosingChatPanel: (ref: ScopedThreadRef, reshow: boolean) => void;
   clearReshowChatPanels: (keys: ReadonlySet<string>) => void;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
-  reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  /**
+   * Adds the panel's tab and makes it active. With `activate: false` it is added inactive, so the
+   * surface that asked for it stays mounted (an inactive chat panel is unmounted).
+   */
+  reserveChatPanel: (
+    ref: ScopedThreadRef,
+    threadId: ThreadId,
+    providerLabel?: string,
+    options?: { readonly activate?: boolean },
+  ) => void;
   releaseChatPanelReservation: (ref: ScopedThreadRef) => void;
   validateTerminalPanelPlacement: (
     ref: ScopedThreadRef,
@@ -595,11 +605,13 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
               insertSurface(current, chatSurface(threadId, providerLabel)),
             ),
           ),
-        reserveChatPanel: (ref, threadId, providerLabel) =>
+        reserveChatPanel: (ref, threadId, providerLabel, options) =>
           set((state) => {
             const panelKey = scopedThreadKey({ environmentId: ref.environmentId, threadId });
             const updated = withUpdatedThread(state, ref, (current) =>
-              insertSurface(current, chatSurface(threadId, providerLabel)),
+              options?.activate === false
+                ? appendInactiveSurface(current, chatSurface(threadId, providerLabel))
+                : insertSurface(current, chatSurface(threadId, providerLabel)),
             );
             if (
               updated.byThreadKey === state.byThreadKey &&
@@ -1003,4 +1015,18 @@ export function selectActiveCenterSurface(
   ref: ScopedThreadRef | null | undefined,
 ): CenterSurface | null {
   return selectFocusedCenterSurface(selectThreadCenterPanelState(byThreadKey, ref));
+}
+
+/** Shows an AI Terminal in its host thread's center panel, focusing it when it is already open. */
+export function revealTerminalSurface(ref: ScopedThreadRef, terminalId: string): void {
+  const store = useCenterPanelStore.getState();
+  const surfaceId = `terminal:${terminalId}`;
+  const state = store.byThreadKey[scopedThreadKey(ref)];
+  const group = state === undefined ? undefined : findCenterPanelGroupForSurface(state, surfaceId);
+  if (group === undefined) {
+    store.openTerminalPanel(ref, terminalId);
+    return;
+  }
+  store.activateSurface(ref, group.id, surfaceId);
+  store.focusGroup(ref, group.id);
 }

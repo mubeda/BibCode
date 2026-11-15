@@ -80,6 +80,7 @@ pub struct CommandAdmission {
     pub payload_digest: String,
     pub attachment_refs: Vec<AttachmentReference>,
     pub provider_turn: Option<NewProviderTurnDelivery>,
+    pub agent_message: Option<crate::agent_messaging::store::AgentMessageCompanion>,
 }
 
 #[derive(Clone, Debug)]

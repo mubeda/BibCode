@@ -1,0 +1,93 @@
+{
+  "recordedWith": "codex-cli 0.169.0, app-server --listen stdio://, thread/turns/list limit 20 sortDirection desc itemsView full; texts and ids anonymized",
+  "page": {
+    "data": [
+      {
+        "id": "turn-2",
+        "rootTurnId": "turn-2",
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "item-4",
+            "clientId": null,
+            "content": [
+              {
+                "type": "text",
+                "text": "Test question",
+                "text_elements": []
+              }
+            ],
+            "startedAtMs": 1794708323187,
+            "completedAtMs": 1794708323187
+          },
+          {
+            "type": "reasoning",
+            "id": "item-5",
+            "summary": [],
+            "content": [],
+            "startedAtMs": 1794708327113,
+            "completedAtMs": 1794708327114
+          },
+          {
+            "type": "agentMessage",
+            "moderation": null,
+            "id": "item-6",
+            "text": "Test answer",
+            "phase": "final_answer",
+            "memoryCitation": null,
+            "delivery": null,
+            "questions": null,
+            "startedAtMs": 1794708327116,
+            "completedAtMs": 1794708327188
+          }
+        ],
+        "itemsView": "full",
+        "status": "completed",
+        "error": null,
+        "startedAt": 1794708323,
+        "completedAt": 1794708327,
+        "durationMs": 4144
+      },
+      {
+        "id": "turn-1",
+        "rootTurnId": "turn-1",
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "item-1",
+            "clientId": null,
+            "content": [
+              {
+                "type": "text",
+                "text": "Test question",
+                "text_elements": []
+              }
+            ],
+            "startedAtMs": 1794708320445,
+            "completedAtMs": 1794708320445
+          },
+          {
+            "type": "agentMessage",
+            "moderation": null,
+            "id": "item-2",
+            "text": "Test answer",
+            "phase": "final_answer",
+            "memoryCitation": null,
+            "delivery": null,
+            "questions": null,
+            "startedAtMs": 1794708322870,
+            "completedAtMs": 1794708322920
+          }
+        ],
+        "itemsView": "full",
+        "status": "completed",
+        "error": null,
+        "startedAt": 1794708318,
+        "completedAt": 1794708323,
+        "durationMs": 4636
+      }
+    ],
+    "nextCursor": null,
+    "backwardsCursor": "{\"requestedThreadId\":\"thread-1\",\"rolloutOrdinal\":18,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+  }
+}

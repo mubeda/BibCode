@@ -1304,6 +1304,11 @@ impl ConnectMcpService {
             .and_then(|value| value.get("arguments"))
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if name == "agents_list" || name.starts_with("agent_message_") {
+            let messaging = self.control.as_ref().and_then(McpControl::agent_messaging);
+            return crate::mcp::tools::agent_messaging::run(scope, name, arguments, messaging)
+                .await;
+        }
         crate::mcp::tools::previews::run(
             scope,
             name,
@@ -2045,6 +2050,7 @@ fn tool_descriptors(devices_enabled: bool) -> Vec<Value> {
     if devices_enabled {
         tools.extend(device_tool_descriptors());
     }
+    tools.extend(crate::mcp::tools::agent_messaging::tool_descriptors());
     tools
 }
 

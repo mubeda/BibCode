@@ -21,6 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::agent_messaging::store::AgentMessageCompanion;
 use crate::orchestration::delivery::{
     CommandAdmission, TurnDeliveryFailureReason, TurnDeliveryState, TurnDeliveryTransition,
 };
@@ -178,7 +179,29 @@ pub struct ThreadMessageInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub source_thread_id: Option<String>,
+    /// A person's request this message carries. Only the server's `sendRequests.send` sets
+    /// it: public dispatch refuses it, and a claim whose actor is any agent kind may not
+    /// carry it.
+    #[serde(
+        rename = "personSend",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub person_send: Option<PersonSend>,
 }
+
+/// The provenance of a person's request on its message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PersonSend {
+    pub request_id: String,
+    pub action: String,
+    /// The agent the request came from; for a take-over, the agent whose work is taken over.
+    pub source_address: String,
+}
+
+/// The actor kinds of agents. A claim with one of them may never carry `personSend`.
+const AGENT_ACTOR_KINDS: &[&str] = &["mcp-client", "hosted-agent"];
 
 /// The longest `purpose` a created thread may carry.
 pub const MAX_THREAD_PURPOSE_CHARS: usize = 200;
@@ -3778,14 +3801,19 @@ fn spawn_worker(
 /// for, so nothing is admitted ahead of the copy a recovery sends or with a marker the
 /// compaction turn could take. The RPC checks this early too, but a recovery can begin between
 /// that check and admission; here it runs on the worker, which serializes it with the command
-/// that begins one.
+/// that begins one. A person's request (`personSend`) is queued the same way while the thread
+/// blocks a new turn (a pending approval or question, a held queue, an errored session), which
+/// can also begin after the RPC's own check.
 async fn queue_start_behind_unsettled_compaction(
     repositories: &Repositories,
     command: &mut OrchestrationCommand,
     admission: Option<&mut CommandAdmission>,
 ) -> Result<(), OrchestrationError> {
     let OrchestrationCommand::ThreadTurnStart {
-        thread_id, queued, ..
+        thread_id,
+        queued,
+        message,
+        ..
     } = command
     else {
         return Ok(());
@@ -3806,7 +3834,13 @@ async fn queue_start_behind_unsettled_compaction(
         .await
         .map_err(wrap_persistence)?
         .is_some();
-    if compacting {
+    let person_send_waits = !compacting
+        && message.person_send.is_some()
+        && repositories
+            .thread_blocks_new_turn(thread_id.clone())
+            .await
+            .map_err(wrap_persistence)?;
+    if compacting || person_send_waits {
         *queued = Some(true);
         turn.state = TurnDeliveryState::Queued;
         if let Some(payload) = turn.payload.as_object_mut() {
@@ -3943,20 +3977,26 @@ async fn process_envelope(
             payload_digest.clone(),
         )
         .await?;
-        if let Some(saved) = committed {
-            return Ok(ProcessEnvelopeOutcome {
-                result: DispatchResult {
-                    sequence: saved.sequence,
-                    thread_id: None,
-                    project_id: None,
-                    disposition: None,
-                },
-                accepted_new: true,
-            });
-        }
+        let refusal = match committed {
+            Ok(saved) => {
+                return Ok(ProcessEnvelopeOutcome {
+                    result: DispatchResult {
+                        sequence: saved.sequence,
+                        thread_id: None,
+                        project_id: None,
+                        disposition: None,
+                    },
+                    accepted_new: true,
+                });
+            }
+            Err(refusal) => refusal,
+        };
 
-        let detail = format!(
-            "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
+        let detail = refusal.map_or_else(
+            || format!(
+                "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
+            ),
+            str::to_owned,
         );
         repositories
             .finalize_command_receipt(CommandReceipt {
@@ -4035,13 +4075,22 @@ async fn process_envelope(
         }
         _ => ProjectionMode::Legacy,
     };
+    // Who the claim's server-stamped actor is: only an outside agent names a source thread,
+    // and no agent kind carries a person's request.
+    let actor_kind = command_claim
+        .actor()
+        .and_then(|actor| actor.get("kind"))
+        .and_then(Value::as_str);
+    let from_outside_agent = actor_kind == Some("mcp-client");
+    let from_any_agent = actor_kind.is_some_and(|kind| AGENT_ACTOR_KINDS.contains(&kind));
     let mut planned = match plan_command(
         repositories,
         model,
         &command,
         &prepared_worktree,
         &occurred_at,
-        command_claim.actor().is_some(),
+        from_outside_agent,
+        from_any_agent,
     )
     .await
     {
@@ -4075,6 +4124,12 @@ async fn process_envelope(
         .as_ref()
         .and_then(|value| value.provider_turn.as_ref())
     {
+        // An agent message admitted into a paused queue is published held, as its entry is.
+        let held = turn.state == TurnDeliveryState::Queued
+            && admission
+                .as_ref()
+                .and_then(|value| value.agent_message.as_ref())
+                .is_some_and(AgentMessageCompanion::is_held);
         planned.push(make_event(
             "thread.turn-delivery-updated",
             "thread",
@@ -4087,7 +4142,7 @@ async fn process_envelope(
                 "messageId": turn.message_id,
                 "state": turn_delivery_state_name(turn.state),
                 "provider": turn.provider_kind,
-                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, &turn.provider_instance_id, turn.mode.as_str(), false, None),
+                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, &turn.provider_instance_id, turn.mode.as_str(), held, None),
                 "detail": null,
                 "updatedAt": turn.created_at,
             }),
@@ -4478,7 +4533,8 @@ async fn plan_command(
     command: &OrchestrationCommand,
     prepared_worktree: &PreparedWorktreeCommand,
     occurred_at: &str,
-    from_agent: bool,
+    from_outside_agent: bool,
+    from_any_agent: bool,
 ) -> Result<Vec<NewOrchestrationEvent>, OrchestrationError> {
     let metadata = Value::Object(Default::default());
     match command {
@@ -5312,7 +5368,7 @@ async fn plan_command(
             // source, so the claim must carry the server-stamped actor, and the source must
             // share the target's worktree (the same host thread, or one hosts the other).
             if let Some(source_thread_id) = &message.source_thread_id {
-                if !from_agent {
+                if !from_outside_agent {
                     return invariant(
                         command,
                         "Only an outside agent's panel message may name a source thread."
@@ -5339,11 +5395,57 @@ async fn plan_command(
                     );
                 }
             }
+            // A person's request (`sendRequests.send`): never from an agent, never beside a
+            // source thread, and its source a live thread of the target's project.
+            if let Some(person_send) = &message.person_send {
+                if from_any_agent {
+                    return invariant(
+                        command,
+                        "Only a person's request may carry personSend.".to_owned(),
+                    );
+                }
+                if message.source_thread_id.is_some() {
+                    return invariant(
+                        command,
+                        "A person's request names no source thread.".to_owned(),
+                    );
+                }
+                let source_thread_id =
+                    person_send
+                        .source_address
+                        .strip_prefix("thread:")
+                        .or_else(|| {
+                            person_send
+                                .source_address
+                                .strip_prefix("terminal:")
+                                .and_then(|rest| rest.split_once('/'))
+                                .map(|(thread, _)| thread)
+                        });
+                let same_project = source_thread_id.is_some_and(|source_thread_id| {
+                    model.threads.get(source_thread_id).is_some_and(|source| {
+                        source.deleted_at.is_none() && source.project_id == thread.project_id
+                    })
+                });
+                if !same_project {
+                    return invariant(
+                        command,
+                        format!(
+                            "The request's source '{}' is not a live agent of this thread's project.",
+                            person_send.source_address
+                        ),
+                    );
+                }
+            }
             let mut user_payload = json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at});
             insert_optional(
                 &mut user_payload,
                 "sourceThreadId",
                 message.source_thread_id.as_ref().map(|v| json!(v)),
+            );
+            insert_optional(
+                &mut user_payload,
+                "personSend",
+                message.person_send.as_ref().map(|v| json!(v)),
             );
             let user = make_event(
                 "thread.message-sent",
@@ -5412,6 +5514,27 @@ async fn plan_command(
             let Some(row) = row.filter(|row| row.message_id == *message_id) else {
                 return invariant(command, "Only the queued head can be steered.".to_owned());
             };
+            // An agent message never steers a running turn (agent messaging spec, Part A).
+            let (head_command_id, head_message_id) =
+                (row.command_id.clone(), row.message_id.clone());
+            let agent_message = repositories
+                .database()
+                .call(move |connection| {
+                    crate::agent_messaging::store::is_agent_message_delivery(
+                        connection,
+                        &head_command_id,
+                        &head_message_id,
+                    )
+                })
+                .await
+                .map_err(wrap_persistence)?;
+            if agent_message {
+                return invariant(
+                    command,
+                    "An agent message waits for the running turn to end, so it cannot steer it."
+                        .to_owned(),
+                );
+            }
             let session = repositories
                 .get_thread_session(thread_id.clone())
                 .await
@@ -6197,6 +6320,13 @@ struct PersistCommandOutcome {
     result_sequence: i64,
 }
 
+const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
+const STALE_AGENT_MESSAGE_RELINK: &str = "agent-message-relink-stale";
+const AGENT_MESSAGE_WAITS_FOR_ANSWER: &str =
+    "An agent message waits for the open approval or question to be answered.";
+const AGENT_MESSAGE_NOT_RETRIED: &str =
+    "A failed agent message is not sent again. Its sender can send it again.";
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
@@ -6318,7 +6448,7 @@ async fn persist_command(
                     &mut copy_receipts,
                 )?;
                 match applied {
-                    CompactionStepOutcome::Stale => return Ok(None),
+                    CompactionStepOutcome::Stale => return Ok(Err(STALE_QUEUED_DELIVERY)),
                     // The failure is being recovered: the queued messages follow the copy.
                     CompactionStepOutcome::RecoveryBegun => hold = None,
                     CompactionStepOutcome::Applied => {}
@@ -6328,7 +6458,18 @@ async fn persist_command(
                 // Recheck inside the event transaction: another owner may have cancelled,
                 // promoted, interrupted, or started a turn since command planning.
                 if !can_promote_queued_provider_turn_on(&transaction, &thread_id, &message_id, automatic)? {
-                    return Ok(None);
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
+                }
+                // Send now skips the open-ask check for a person's message, never an agent's (R9).
+                if !automatic {
+                    let command_id: String = transaction.query_row(
+                        "SELECT command_id FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
+                        params![thread_id, message_id], |row| row.get(0))?;
+                    if crate::agent_messaging::store::is_agent_message_delivery(&transaction, &command_id, &message_id)?
+                        && crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
+                    {
+                        return Ok(Err(AGENT_MESSAGE_WAITS_FOR_ANSWER));
+                    }
                 }
                 transaction.execute("UPDATE provider_turn_outbox SET state = 'pending', mode = 'start', held = 0, last_error = NULL, updated_at = ? WHERE thread_id = ? AND message_id = ? AND state = 'queued'",
                     params![created_at, thread_id, message_id])?;
@@ -6336,7 +6477,7 @@ async fn persist_command(
             if let Some((thread_id, message_id, created_at, turn_id)) = steering {
                 let head = crate::persistence::queued_provider_turn_head_on(&transaction, &thread_id)?;
                 if !head.is_some_and(|row| row.message_id == message_id && crate::provider::supports_turn_steer(&row.provider_kind)) {
-                    return Ok(None);
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
                 }
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = 'pending', mode = 'steer', held = 0, last_error = NULL, updated_at = ?
@@ -6344,7 +6485,7 @@ async fn persist_command(
                        AND EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status = 'running' AND active_turn_id = ?)",
                     params![created_at, thread_id, message_id, turn_id],
                 )?;
-                if updated != 1 { return Ok(None); }
+                if updated != 1 { return Ok(Err(STALE_QUEUED_DELIVERY)); }
             }
             if let Some((thread_id, updated_at)) = hold {
                 for delivery_id in hold_queued_provider_turns(&transaction, &thread_id, &updated_at)? {
@@ -6463,10 +6604,43 @@ async fn persist_command(
                     )?;
                 }
                 if let Some(turn) = admission.provider_turn {
+                    // An agent message's hold was decided from a read before this command; the
+                    // queue it joins is checked again here, where commands are serialized, so a
+                    // message neither starts past a paused queue nor sits held in a released one.
+                    let held = match &admission.agent_message {
+                        Some(companion) => {
+                            let held = companion.is_held();
+                            if held !=crate::agent_messaging::store::queue_paused(&transaction, &turn.thread_id)? {
+                                return Ok(Err(crate::agent_messaging::policy::QUEUE_PAUSE_CHANGED));
+                            }
+                            held && turn.state == TurnDeliveryState::Queued
+                        }
+                        None => false,
+                    };
                     transaction.execute(
-                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
-                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at],
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, mode, attempts, last_error, created_at, updated_at, held) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)",
+                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn_delivery_state_name(turn.state), turn.mode.as_str(), turn.created_at, turn.created_at, held],
                     )?;
+                }
+                // The agent message and its queue entry commit together or not at all.
+                match admission.agent_message {
+                    Some(AgentMessageCompanion::Insert(message, limits)) => {
+                        // Counted and inserted in one transaction, so concurrent sends cannot
+                        // both take the last slot; a refusal rolls the queue entry back too.
+                        if let Some(limits) = &limits
+                            && let Err(refusal) = crate::agent_messaging::policy::enforce_limits(&transaction, &message, limits)?
+                        {
+                            return Ok(Err(refusal.detail()));
+                        }
+                        crate::agent_messaging::store::insert_message(&transaction, &message)?;
+                    }
+                    Some(AgentMessageCompanion::Relink(relink)) => {
+                        let updated_at = event_list.last().map(|event| event.occurred_at.as_str()).unwrap_or_default();
+                        if !crate::agent_messaging::store::apply_relink(&transaction, &relink, updated_at)? {
+                            return Ok(Err(STALE_AGENT_MESSAGE_RELINK));
+                        }
+                    }
+                    None => {}
                 }
             }
             hooks.maybe_pause_before_command_finalization();
@@ -6476,14 +6650,17 @@ async fn persist_command(
                 .transpose()?;
             hooks.maybe_pause_after_command_finalization();
             transaction.commit()?;
-            Ok(Some(PersistCommandOutcome {
+            Ok(Ok(PersistCommandOutcome {
                 committed,
                 result_sequence,
             }))
         })
         .await
         .map_err(wrap_persistence)?
-        .ok_or_else(|| OrchestrationError::Invariant { command_type: command.command_type().to_owned(), detail: "Queued delivery changed before promotion or steering.".to_owned() })?;
+        .map_err(|detail| OrchestrationError::Invariant {
+            command_type: command.command_type().to_owned(),
+            detail: detail.to_owned(),
+        })?;
     Ok(committed)
 }
 
@@ -6957,9 +7134,15 @@ async fn persist_turn_delivery_transition(
                 mode = row.mode.as_str().to_owned();
                 transaction.execute("UPDATE provider_turn_outbox SET last_error = ?, failure_reason = NULL WHERE command_id = ?", params![transition.detail, transition.command_id])?;
             } else {
+                // A delivery recovery found without its turn keeps that on the entry, so readers
+                // that wait for its turn (a send request, an agent message) can end instead. The
+                // event's delivery reason, which clients read, does not carry it.
+                let stored_reason = reason.or((found_without_turn
+                    && transition.next_state == TurnDeliveryState::Delivered)
+                    .then(|| TurnDeliveryFailureReason::FoundWithoutTurn.as_str()));
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = ?, last_error = ?, failure_reason = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
-                    params![next_state, transition.detail, reason, transition.updated_at, transition.command_id, state, transition.expected_attempt],
+                    params![next_state, transition.detail, stored_reason, transition.updated_at, transition.command_id, state, transition.expected_attempt],
                 )?;
                 if updated == 0 { return Ok(DeliveryTransitionCommit::Stale); }
                 if unchanged_retry {
@@ -7042,7 +7225,7 @@ async fn persist_turn_delivery_resolution(
     action: TurnDeliveryResolutionAction,
     updated_at: String,
     payload_digest: Option<String>,
-) -> Result<Option<OrchestrationEvent>, OrchestrationError> {
+) -> Result<Result<OrchestrationEvent, Option<&'static str>>, OrchestrationError> {
     let database = repositories.database().clone();
     let hooks = hooks.clone();
     let committed = database
@@ -7066,17 +7249,33 @@ async fn persist_turn_delivery_resolution(
                 )
                 .optional()?;
             let Some((delivery_command_id, provider, state, last_error, mode, held, provider_instance_id)) = current else {
-                return Ok(None);
+                return Ok(Err(None));
             };
+            // Decided here, so no window before the tracker withdraws the entry lets a failed
+            // agent message be sent as a person's retry; an uncertain one is the person's call.
+            if matches!(action, TurnDeliveryResolutionAction::Retry)
+                && crate::agent_messaging::store::is_agent_message_delivery(&transaction, &delivery_command_id, &message_id)?
+            {
+                if state == "failed" {
+                    return Ok(Err(Some(AGENT_MESSAGE_NOT_RETRIED)));
+                }
+                // Like Send now, a retry never takes an agent message past an open ask (R9).
+                if crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)? {
+                    return Ok(Err(Some(AGENT_MESSAGE_WAITS_FOR_ANSWER)));
+                }
+            }
             let resolvable = match action {
                 TurnDeliveryResolutionAction::Retry => state == "uncertain" || state == "failed",
                 TurnDeliveryResolutionAction::Dismiss => {
                     matches!(state.as_str(), "pending" | "sending" | "uncertain" | "failed")
                 }
-                TurnDeliveryResolutionAction::Cancel => state == "queued",
+                // A queued delivery, or a person's request still pending (unclaimed, for example
+                // behind a failed delivery), which `sendRequests.cancel` withdraws. The claim moves
+                // a pending row on this same worker, so a withdrawal and a claim exclude each other.
+                TurnDeliveryResolutionAction::Cancel => matches!(state.as_str(), "queued" | "pending"),
             };
             if !resolvable {
-                return Ok(None);
+                return Ok(Err(None));
             }
 
             let (next_state, detail, updated) = match action {
@@ -7084,7 +7283,7 @@ async fn persist_turn_delivery_resolution(
                     "dismissed",
                     last_error,
                     transaction.execute(
-                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state = 'queued'",
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND (state = 'queued' OR (state = 'pending' AND json_extract(payload_json, '$.message.personSend') IS NOT NULL))",
                         params![updated_at, delivery_command_id],
                     )?,
                 ),
@@ -7106,7 +7305,7 @@ async fn persist_turn_delivery_resolution(
                 ),
             };
             if updated == 0 {
-                return Ok(None);
+                return Ok(Err(None));
             }
 
             let mut payload = json!({
@@ -7163,11 +7362,11 @@ async fn persist_turn_delivery_resolution(
                 },
             )?;
             transaction.commit()?;
-            Ok(Some(saved))
+            Ok(Ok(saved))
         })
         .await
         .map_err(wrap_persistence)?;
-    if let Some(event) = &committed {
+    if let Ok(event) = &committed {
         let _ = events.send(event.clone());
     }
     Ok(committed)
@@ -8060,8 +8259,8 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id, written_sequence) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id, person_send_json, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
            written_sequence = excluded.written_sequence, thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
@@ -8069,7 +8268,8 @@ fn apply_messages_projector_tx(
            is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
            resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id), \
            actor_json = COALESCE(excluded.actor_json, projection_thread_messages.actor_json), \
-           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id)",
+           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id), \
+           person_send_json = COALESCE(excluded.person_send_json, projection_thread_messages.person_send_json)",
         params![
             required_str(payload, "messageId")?,
             required_str(payload, "threadId")?,
@@ -8090,6 +8290,7 @@ fn apply_messages_projector_tx(
                 .map(json_string)
                 .transpose()?,
             optional_string(payload.get("sourceThreadId")),
+            payload.get("personSend").map(json_string).transpose()?,
             event.sequence,
         ],
     )?;
@@ -8432,6 +8633,13 @@ fn apply_turns_projector_tx(
                         .optional()?
                         .is_some();
                     let updated = if existing_turn {
+                        // The provider reported the turn (an early item, settled or not) before it
+                        // ran: the turn keeps the message that started it, as a marker bound below
+                        // would. Only a turn first seen after the marker is that message's turn.
+                        transaction.execute(
+                            &format!("UPDATE projection_turns SET pending_message_id = (SELECT pending_message_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1) WHERE thread_id = ?1 AND turn_id = ?2 AND pending_message_id IS NULL AND row_id > (SELECT row_id FROM projection_turns WHERE thread_id = ?1 AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1)"),
+                            params![thread_id, turn_id],
+                        )?;
                         let updated = transaction.execute("UPDATE projection_turns SET state = 'running', started_at = COALESCE(started_at, ?) WHERE thread_id = ? AND turn_id = ?", params![updated_at, thread_id, turn_id])?;
                         transaction.execute(
                             &format!("DELETE FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION}"),
@@ -8932,8 +9140,12 @@ fn upsert_projection_state_tx(
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
-    if event.metadata.get("actor").is_some() {
-        return "mcp-client";
+    if let Some(actor) = event.metadata.get("actor") {
+        return if actor.get("kind").and_then(Value::as_str) == Some("hosted-agent") {
+            "hosted-agent"
+        } else {
+            "mcp-client"
+        };
     }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
@@ -10919,11 +11131,13 @@ mod tests {
                 payload_digest: canonical_command_digest(&first_payload).expect("first digest"),
                 attachment_refs: Vec::new(),
                 provider_turn: None,
+                agent_message: None,
             };
             let second_admission = CommandAdmission {
                 payload_digest: canonical_command_digest(&second_payload).expect("second digest"),
                 attachment_refs: Vec::new(),
                 provider_turn: None,
+                agent_message: None,
             };
 
             let (first, second) = tokio::join!(
@@ -12011,6 +12225,7 @@ mod tests {
                 payload: serde_json::to_value(command).expect("payload"),
                 created_at: created_at.to_owned(),
             }),
+            agent_message: None,
         }
     }
 
@@ -13388,6 +13603,7 @@ mod tests {
                 payload: serde_json::to_value(&command).expect("payload"),
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
             }),
+            agent_message: None,
         };
         let pause = hooks.pause_after_next_admission_commit();
         let dispatch_engine = engine.clone();
@@ -13553,6 +13769,7 @@ mod tests {
                 payload: serde_json::to_value(&command).expect("payload"),
                 created_at: "2026-08-01T00:00:01Z".to_owned(),
             }),
+            agent_message: None,
         };
         let pending_engine = engine.clone();
         let pending = tokio::spawn(async move {
@@ -13756,6 +13973,7 @@ mod tests {
                         payload_digest: "generic-project-payload".to_owned(),
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -13843,6 +14061,7 @@ mod tests {
                         payload_digest: "generic-project-payload".to_owned(),
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     || {},
                 )
@@ -14083,6 +14302,7 @@ mod tests {
                         payload_digest: digest,
                         attachment_refs: Vec::new(),
                         provider_turn: None,
+                        agent_message: None,
                     },
                     claim,
                     || {},
@@ -15494,6 +15714,229 @@ mod tests {
         }
         engine.set_checkpoint_hold_limit(None);
         engine.shutdown().await;
+    }
+
+    mod person_send_admission {
+        use super::*;
+
+        async fn engine() -> OrchestrationEngine {
+            let database = Database::open_in_memory().await.expect("database");
+            database
+                .call(|connection| {
+                    run_migrations(connection, None)?;
+                    Ok(())
+                })
+                .await
+                .expect("migrations");
+            let engine = OrchestrationEngine::start(database, EngineOptions::default())
+                .await
+                .expect("engine");
+            engine
+                .dispatch(project_create_command("person-send-project", "p"))
+                .await
+                .expect("project");
+            for thread_id in ["source", "target"] {
+                engine
+                    .dispatch(
+                        serde_json::from_value(json!({
+                            "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                            "threadId": thread_id, "projectId": "p", "title": thread_id,
+                            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "branch": null, "worktreePath": null,
+                            "createdAt": "2026-08-01T00:00:00Z",
+                        }))
+                        .expect("thread command"),
+                    )
+                    .await
+                    .expect("thread");
+            }
+            engine
+        }
+
+        fn turn(command_id: &str, message: Value) -> OrchestrationCommand {
+            let mut message_value = json!({
+                "messageId": command_id, "role": "user", "text": "Please review", "attachments": [],
+            });
+            if let (Value::Object(base), Value::Object(extra)) = (&mut message_value, message) {
+                base.extend(extra);
+            }
+            serde_json::from_value(json!({
+                "type": "thread.turn.start", "commandId": command_id, "threadId": "target",
+                "message": message_value, "runtimeMode": "full-access",
+                "interactionMode": "default", "queued": true,
+                "createdAt": "2026-08-01T00:00:01Z",
+            }))
+            .expect("turn command")
+        }
+
+        async fn dispatch_as(
+            engine: &OrchestrationEngine,
+            command: OrchestrationCommand,
+            actor: Option<Value>,
+        ) -> Result<DispatchResult, OrchestrationError> {
+            let claim = engine
+                .acquire_command_admission(command.command_id())
+                .await
+                .expect("claim");
+            if let Some(actor) = actor {
+                claim.attribute_to(actor);
+            }
+            engine.dispatch_with_command_claim(command, claim).await
+        }
+
+        fn detail(result: Result<DispatchResult, OrchestrationError>) -> String {
+            match result {
+                Err(OrchestrationError::Invariant { detail, .. }) => detail,
+                other => panic!("an invariant refusal, not {other:?}"),
+            }
+        }
+
+        fn mcp_client() -> Value {
+            json!({ "kind": "mcp-client", "clientId": "session", "label": "MCP · test" })
+        }
+
+        fn person_send() -> Value {
+            json!({ "personSend": {
+                "requestId": "r", "action": "review", "sourceAddress": "thread:source",
+            } })
+        }
+
+        #[tokio::test]
+        async fn person_send_is_refused_for_an_mcp_client_claim() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(&engine, turn("agent", person_send()), Some(mcp_client()));
+            assert!(detail(refused.await).contains("Only a person's request may carry personSend"));
+            // A person's request never names a source thread: the source-thread rule refuses it
+            // first today, and the person-send rule would refuse it too.
+            let both = json!({
+                "personSend": person_send()["personSend"].clone(),
+                "sourceThreadId": "source",
+            });
+            detail(dispatch_as(&engine, turn("both", both), None).await);
+            let elsewhere = json!({ "personSend": {
+                "requestId": "r", "action": "review", "sourceAddress": "thread:missing",
+            } });
+            assert!(
+                detail(dispatch_as(&engine, turn("elsewhere", elsewhere), None).await)
+                    .contains("is not a live agent of this thread's project")
+            );
+            dispatch_as(&engine, turn("person", person_send()), None)
+                .await
+                .expect("a person's request is admitted");
+            let stored = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT person_send_json FROM projection_thread_messages WHERE message_id = 'person'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?)
+                })
+                .await
+                .expect("the message is projected");
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored).unwrap(),
+                person_send()["personSend"]
+            );
+            engine.shutdown().await;
+        }
+
+        fn hosted_agent() -> Value {
+            json!({ "kind": "hosted-agent", "address": "thread:source", "label": "Source" })
+        }
+
+        #[tokio::test]
+        async fn a_hosted_agent_cannot_name_a_source_thread() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(
+                &engine,
+                turn("hosted-source", json!({ "sourceThreadId": "source" })),
+                Some(hosted_agent()),
+            );
+            assert!(
+                detail(refused.await)
+                    .contains("Only an outside agent's panel message may name a source thread.")
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn person_send_is_refused_for_a_hosted_agent_claim() {
+            let engine = engine().await;
+
+            let refused = dispatch_as(&engine, turn("hosted", person_send()), Some(hosted_agent()));
+            assert!(detail(refused.await).contains("Only a person's request may carry personSend"));
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn a_hosted_agent_actor_is_stored_as_its_own_kind() {
+            let engine = engine().await;
+            dispatch_as(&engine, turn("hosted", json!({})), Some(hosted_agent()))
+                .await
+                .expect("a hosted agent's message is admitted");
+            dispatch_as(&engine, turn("outside", json!({})), Some(mcp_client()))
+                .await
+                .expect("an outside agent's message is admitted");
+
+            let kinds = engine
+                .repositories()
+                .database()
+                .call(|connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT DISTINCT command_id, actor_kind FROM orchestration_events WHERE command_id IN ('hosted', 'outside') ORDER BY command_id",
+                    )?;
+                    let rows = statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .await
+                .expect("events");
+            assert_eq!(
+                kinds,
+                [
+                    ("hosted".to_owned(), "hosted-agent".to_owned()),
+                    ("outside".to_owned(), "mcp-client".to_owned()),
+                ]
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn source_thread_id_is_still_admitted_only_for_an_mcp_client_claim() {
+            let engine = engine().await;
+            let source = json!({ "sourceThreadId": "source" });
+            for actor in [
+                None,
+                Some(json!({ "kind": "hosted-agent", "address": "thread:source", "label": "a" })),
+            ] {
+                assert!(
+                    detail(
+                        dispatch_as(
+                            &engine,
+                            turn(&format!("refused-{}", actor.is_some()), source.clone()),
+                            actor
+                        )
+                        .await
+                    )
+                    .contains("Only an outside agent's panel message may name a source thread"),
+                );
+            }
+            // An outside agent passes the actor rule and reaches the worktree rule: these two
+            // threads do not share a worktree.
+            assert!(
+                detail(dispatch_as(&engine, turn("outside", source), Some(mcp_client())).await)
+                    .contains("is not another thread of this thread's worktree")
+            );
+            engine.shutdown().await;
+        }
     }
 }
 

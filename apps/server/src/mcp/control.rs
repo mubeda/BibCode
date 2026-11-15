@@ -431,6 +431,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     super::tools::panels::FAMILY,
     super::tools::clone::FAMILY,
     super::tools::files::FAMILY,
+    super::tools::agent_messaging::FAMILY,
 ];
 
 /// The spec and family of `name` for `kind` in `families`.
@@ -580,6 +581,7 @@ pub(super) struct Inner {
     previews: std::sync::OnceLock<super::tools::previews::PreviewServices>,
     /// The terminal manager the terminal tools use (slice T), attached by the runtime.
     terminals: std::sync::OnceLock<super::tools::terminals::TerminalServices>,
+    agent_messaging: std::sync::OnceLock<crate::agent_messaging::AgentMessaging>,
     /// The base the Files tools build transfer URLs on (slice X5): the bound address, set by
     /// the server once it has bound.
     transfer_base: std::sync::OnceLock<String>,
@@ -699,6 +701,7 @@ impl McpControl {
                 claims: super::outcome::Claims::default(),
                 previews: std::sync::OnceLock::new(),
                 terminals: std::sync::OnceLock::new(),
+                agent_messaging: std::sync::OnceLock::new(),
                 transfer_base: std::sync::OnceLock::new(),
             }),
         };
@@ -1050,6 +1053,16 @@ impl McpControl {
     /// The attached terminals; `None` on a server that attached none.
     pub(crate) fn terminals(&self) -> Option<&super::tools::terminals::TerminalServices> {
         self.inner.terminals.get()
+    }
+
+    /// Lets the agent messaging tools reach the messaging service. The first attachment wins.
+    pub(crate) fn attach_agent_messaging(&self, messaging: crate::agent_messaging::AgentMessaging) {
+        let _ = self.inner.agent_messaging.set(messaging);
+    }
+
+    /// The attached messaging service; `None` on a server that attached none.
+    pub(crate) fn agent_messaging(&self) -> Option<&crate::agent_messaging::AgentMessaging> {
+        self.inner.agent_messaging.get()
     }
 
     /// Sets the base (`http://host:port`) the Files tools build transfer URLs on: the address

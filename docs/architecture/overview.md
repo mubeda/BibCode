@@ -466,6 +466,17 @@ flowchart TB
   waits for the running ones to stop before the Profiler's teardown; see
   [Observability](../operations/observability.md).
 
+- **Send requests (`apps/server/src/send_requests/`)** own a signed-in person's requests to an
+  agent (Review, Second opinion, Hand off, Take over from, Message): the `send_requests` table,
+  the person-only `sendRequests.*` RPC methods, the follower that moves a request through
+  its states from the target's turn events, and the terminal mailbox side of a request.
+  **Agent messaging (`apps/server/src/agent_messaging/`)** owns one agent's messages to another
+  of its project: the `agent_messages` table, the policy (mode ceiling, claim gate, hop, rate
+  and backlog limits), the delivery tracker, the envelopes, the AI Terminal mailbox with its
+  pointer and credential, and the `agents_list` directory. The tools and `bibcode agent` are in
+  `apps/server/src/mcp/tools/agent_messaging.rs` and `mcp/agent_cli.rs`. See
+  [Agent messaging](#agent-messaging).
+
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -2398,6 +2409,16 @@ visible after the client parses the message; `structuredContent` and error text
 cannot carry escapes, so error text replaces those characters with `?` and
 clients decode `structuredContent` to the raw characters.
 
+### Agent messaging and the Profiler
+
+No Profiler event or finding was added for send requests or agent messaging, and no spawn, binary
+or re-exec mode either: delivery outcomes appear in the agent activity log with ids only, and the
+logs of both modules name ids, addresses, titles and outcomes, never a note, an attachment, a
+message, an answer or terminal text. The seven `sendRequests.*` methods are timed by the session
+wrappers like any other; `sendRequests.getTerminalOutput`, which waits on Codex for up to 5 seconds
+for a terminal's conversation, is in `is_long_running`, so a slow read raises no `rpc.slow` or
+`rpc.hang`. `POST /api/agent/call` is an HTTP route, outside the RPC wrappers.
+
 ### Readers
 
 [`reader.rs`](../../apps/server/src/diagnostics/profiler/reader.rs) is the
@@ -2472,6 +2493,13 @@ bounded memory, and works while the server is stopped.
   supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
+- **Agent route calls.** Each `POST /api/agent/call` from an AI Terminal with a
+  valid credential is timed as `agent.<operation>` (`agent.send`, `agent.inbox` and
+  the rest, `agent.invalid` for a body with no known operation) through the same
+  request timer as an MCP tool call. A refused credential is not timed, as an
+  unauthenticated `/mcp` request is not. The name is built only while the Profiler
+  runs and carries no argument, message text, body or credential. No operation is
+  long-running: each returns at once.
 - **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
   and the hang check). A tool is long-running when its `ToolSpec` says so
   (`mcp.wait_for_thread`, every `mcp.preview_*` and `mcp.device_*` call, network
@@ -3150,6 +3178,24 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   retries share one request scope across its runs within the 24-hour window, and
   Take over is stored on the identity (`mcp_named_clients.taken_over_at`,
   migration 71), so each later run starts read-only until Hand back.
+- **Agent message rows.** Each `agent_message_send`, `agent_message_reply` and
+  delivery outcome writes one `mcp_activity` row through `agent_message_writer`
+  (`mcp/activity.rs`). A row holds ids, addresses, thread titles and state
+  names, never message text. A thread title is free text that a person or an
+  agent wrote, so a row is not content-free. A refusal names the recipient's
+  title only after the send resolved it as a live thread of the caller's
+  project, so a row never confirms that a thread the caller may not see
+  exists. A send or reply the tool refuses before the service (messaging off,
+  a rejected argument) writes one row with the tool, the caller and the tag.
+  The sink maps each outcome to its row in the caller and queues at most 1,024
+  rows without waiting; past that it drops the row and logs one warning with
+  the count. The send and the tracker report independently, so in a rare
+  scheduling a message's `delivered` row is written before its `accepted` row;
+  each row carries the message id, its state and its own time. The runtime
+  closes the writer in its stop, after the tracker and before the profiler's
+  teardown: every queued row is written, the stop never waits on a send in
+  flight, and a row reported after that is dropped. The change feed and webhooks skip
+  these rows, and the feed's cursor moves past them.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
   the activity log by a monotonic cursor without reading payload text other than
   an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same
@@ -3157,6 +3203,39 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
 - **Drift test.** `mcp::reference_docs` fails when a registered client tool,
   a `feed::ERRORS` tag or a webhook event type is missing from
   `docs/reference/`.
+
+## Agent messaging
+
+Two paths move text between the agents of one project, and neither gives an agent more
+access than it has. A **send request** is a signed-in person's request, made with Send to agent,
+that reaches a specific chat agent or AI Terminal as the person's own message (and, on a chat
+target, with `personSend` provenance the engine admits only from the server's person-send path).
+An **agent message** is sent by one agent to another with `agents_list`, `agent_message_send`,
+`agent_message_reply`, `agent_message_status` and `agent_message_cancel` (provider tools no outside
+`bibcode mcp` client sees), or by an AI Terminal's agent with `bibcode agent`. It is off by
+default (`agentMessaging.enabled`, Settings → Agents → Agent integrations → Agent messaging).
+The contract is the [MCP reference](../reference/mcp.md#provider-tools); the flow, the tables
+(migrations 75 and 76), the states and the restart rules are in
+[RPC and orchestration](./rpc-and-orchestration.md#send-requests-and-agent-messaging); the provider
+side (envelopes, literal delivery, the claim gate) is in
+[Provider architecture](./providers.md#agent-messaging); readiness and the conversation readers
+are in [Activity observation](./activity-observation.md#prompt-readiness).
+
+- **State owners.** The target's own turn queue owns a chat message's delivery; `send_requests`
+  and `agent_messages` own the status the sender reads. A chat message and its queue entry are
+  written in one transaction. An AI Terminal's mail is a set of rows bound to the terminal's
+  process (generation), never a queue entry.
+- **Trust boundaries.** `sendRequests.*` refuses an outside agent's session. A hosted agent's
+  tools run as the thread of its provider credential, and `bibcode agent` as the terminal of its
+  credential, which only a running generation of an AI Terminal holds; no call names its sender.
+  Terminal text and a CLI conversation are read for a preview only, and only a person's
+  `orchestration:operate` session may read them.
+- **What reaches a terminal.** Only the fixed pointer line, typed under a write permit decided at
+  the PTY write boundary, once per ready period. Message text is read by the agent itself with
+  `bibcode agent inbox`.
+- **Shutdown.** The runtime's stop ends, in this order and before the profiler's teardown, the
+  request follower, the delivery tracker, the pointer, the activity writer (after it writes every
+  queued row) and the credential revoker.
 
 ## Outbound webhooks
 

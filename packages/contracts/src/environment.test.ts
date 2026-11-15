@@ -69,6 +69,10 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).codeReviews).toBe(false);
     expect(decodeTerminalCapabilities({ codeReviews: true }).codeReviews).toBe(true);
   });
+  it("sendRequests defaults to false and decodes true", () => {
+    expect(decodeTerminalCapabilities({}).sendRequests).toBe(false);
+    expect(decodeTerminalCapabilities({ sendRequests: true }).sendRequests).toBe(true);
+  });
   it("reads host metrics as off for an older server and keeps advertised support", () => {
     expect(decodeTerminalCapabilities({}).hostMetrics).toBe(false);
     expect(decodeTerminalCapabilities({ hostMetrics: true }).hostMetrics).toBe(true);
@@ -136,6 +140,10 @@ describe("execution environment contracts", () => {
   it("defaults the profiler capability off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).profiler).toBe(false);
     expect(decodeTerminalCapabilities({ profiler: true }).profiler).toBe(true);
+  });
+  it("the agentMessaging capability defaults to false", () => {
+    expect(decodeTerminalCapabilities({}).agentMessaging).toBe(false);
+    expect(decodeTerminalCapabilities({ agentMessaging: true }).agentMessaging).toBe(true);
   });
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);

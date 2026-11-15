@@ -12,6 +12,7 @@ import { CENTER_PANEL_ROOT_GROUP_ID } from "./centerPanelLayout";
 import {
   HOST_SURFACE_ID,
   migratePersistedCenterPanelState,
+  revealTerminalSurface,
   selectActivityPaneState,
   selectActiveCenterSurface,
   selectFocusedCenterPanelGroup,
@@ -86,6 +87,18 @@ describe("centerPanelStore", () => {
         threadId: PANEL_A,
         providerLabel: "Claude",
       });
+    });
+
+    it("reveals an AI Terminal: opens a missing tab and focuses one that is already open", () => {
+      revealTerminalSurface(HOST, "term-1");
+      expect(rootGroup().activeSurfaceId).toBe("terminal:term-1");
+      store().openChatPanel(HOST, PANEL_A);
+      expect(rootGroup().activeSurfaceId).toBe(`chat:${PANEL_A}`);
+
+      revealTerminalSurface(HOST, "term-1");
+
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "terminal:term-1", `chat:${PANEL_A}`]);
+      expect(rootGroup().activeSurfaceId).toBe("terminal:term-1");
     });
 
     it("re-activates existing surfaces without duplication", () => {
@@ -560,6 +573,17 @@ describe("centerPanelStore", () => {
       expect(surfaceIds()).toEqual([HOST_SURFACE_ID]);
       store().reserveChatPanel(HOST, SIDE, "Side chat · Codex");
       expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${SIDE}`]);
+    });
+  });
+
+  describe("reserved panels that stay inactive", () => {
+    it("adds the tab and keeps the active surface, so the surface that asked stays mounted", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      store().reserveChatPanel(HOST, ThreadId.make("review-panel"), "Code review", {
+        activate: false,
+      });
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, "chat:review-panel"]);
+      expect(selectActiveCenterSurface(store().byThreadKey, HOST)?.id).toBe(`chat:${PANEL_A}`);
     });
   });
 

@@ -6,6 +6,7 @@ import type { TerminalContextSelection } from "~/lib/terminalContext";
 import type { CenterSurface } from "~/centerPanelStore";
 import { useKnownTerminalSessions } from "~/state/terminalSessions";
 
+import { isAiTerminal } from "./sendToAgent/terminalSource.logic";
 import ThreadTerminalPanel from "./ThreadTerminalPanel";
 
 interface CenterTerminalPanelProps {
@@ -61,6 +62,10 @@ export function CenterTerminalPanel({
     () => (command ? new Map([[terminalId, command]]) : undefined),
     [command, terminalId],
   );
+  const aiTerminalIds = useMemo(
+    () => (isAiTerminal(activeSummary) ? new Set([terminalId]) : undefined),
+    [activeSummary, terminalId],
+  );
   const terminalLabelsById = useMemo(
     () => new Map([[terminalId, label ?? resolveTerminalSessionLabel(terminalId, activeSummary)]]),
     [activeSummary, label, terminalId],
@@ -89,6 +94,7 @@ export function CenterTerminalPanel({
       {...(terminalCommandsById ? { terminalCommandsById } : {})}
       keybindings={keybindings}
       workspaceUnavailable={workspaceUnavailable}
+      {...(aiTerminalIds ? { aiTerminalIds } : {})}
     />
   );
 }

@@ -79,7 +79,7 @@ export function applyThreadDetailEvent(
           branch: event.payload.branch,
           worktreePath: event.payload.worktreePath,
           // An outside agent's thread names it and why (#139, slice X1).
-          ...(event.metadata.actor !== undefined
+          ...(event.metadata.actor?.kind === "mcp-client"
             ? {
                 requester: {
                   actor: event.metadata.actor,
@@ -275,6 +275,7 @@ export function applyThreadDetailEvent(
         ...(event.payload.sourceThreadId !== undefined
           ? { sourceThreadId: event.payload.sourceThreadId }
           : {}),
+        ...(event.payload.personSend !== undefined ? { personSend: event.payload.personSend } : {}),
         createdAt: event.payload.createdAt,
         updatedAt: event.payload.updatedAt,
       };

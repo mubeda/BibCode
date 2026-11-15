@@ -126,6 +126,23 @@ describe("ServerSettings supported provider defaults", () => {
   });
 });
 
+describe("ServerSettings agent messaging", () => {
+  it("agent messaging is off by default", () => {
+    expect(decodeServerSettings({}).agentMessaging.enabled).toBe(false);
+    expect(DEFAULT_SERVER_SETTINGS.agentMessaging).toEqual({ enabled: false });
+    expect(decodeServerSettings({ agentMessaging: { enabled: true } }).agentMessaging.enabled).toBe(
+      true,
+    );
+  });
+
+  it("a patch may carry agentMessaging.enabled alone", () => {
+    expect(decodeServerSettingsPatch({ agentMessaging: { enabled: true } })).toEqual({
+      agentMessaging: { enabled: true },
+    });
+    expect(() => decodeServerSettingsPatch({ agentMessaging: { enabled: "yes" } })).toThrow();
+  });
+});
+
 describe("ServerSettings agent activity", () => {
   it("defaults Chat on and AI Terminal off", () => {
     expect(decodeServerSettings({})).toMatchObject({

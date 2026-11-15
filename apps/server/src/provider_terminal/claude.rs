@@ -37,7 +37,10 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
-use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
+use super::model::{
+    ObservedConversation, PromptEvidence, TerminalAgentReport, TerminalAgentState,
+    TerminalObserverGenerationLease,
+};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -97,7 +100,7 @@ const MIN_PROVEN_HTTP_HOOK_VERSION: (u64, u64, u64) = (2, 1, 63);
 /// (`tests::live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`, a release step
 /// in docs/operations/release.md). A newer build runs unhooked until a release raises it.
 const MIN_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 220);
-const MAX_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 323);
+const MAX_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 325);
 /// The `--version` line of a genuine build ends in this marker. A multi-call shim such as mise
 /// answers with its own dotted version, which must never pass as a Claude version.
 const CLAUDE_VERSION_MARKER: &str = "(Claude Code)";
@@ -194,7 +197,7 @@ impl fmt::Debug for ClaudeShimResolution {
 }
 
 /// A launch of a multi-call shim, as the terminal would start it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ClaudeShimRequest<'a> {
     /// The path the terminal invokes, such as `~/.local/share/mise/shims/claude`.
     pub invoked: &'a Path,
@@ -203,6 +206,23 @@ pub struct ClaudeShimRequest<'a> {
     pub cwd: &'a Path,
     pub launch_env: &'a BTreeMap<String, String>,
     pub process_attribution: &'a ProcessAttributionRegistry,
+}
+
+/// The launch environment carries the terminal's credential, so only its keys are printed.
+impl fmt::Debug for ClaudeShimRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeShimRequest")
+            .field("invoked", &self.invoked)
+            .field("manager", &self.manager)
+            .field("cwd", &self.cwd)
+            .field(
+                "launch_env_keys",
+                &self.launch_env.keys().collect::<Vec<_>>(),
+            )
+            .field("process_attribution", &self.process_attribution)
+            .finish()
+    }
 }
 
 /// Finds the real install behind a multi-call shim. Its answer is untrusted: preparation
@@ -1466,9 +1486,37 @@ struct ClaudeHookState {
     request_permits: Arc<Semaphore>,
     /// Where the main agent's state goes, whatever the activity setting says (#187).
     status: TerminalObserverGenerationLease,
+    status_order: Arc<Mutex<ClaudeStatusOrder>>,
+}
+
+/// The order the main agent's state follows. Hooks are numbered as they arrive, before their
+/// bodies are read, because concurrent bodies complete in any order.
+#[derive(Debug, Default)]
+struct ClaudeStatusOrder {
     /// The main session the state follows: the first one heard, then each new `SessionStart`
     /// (`/clear` and resume begin a new session).
-    status_session: Arc<Mutex<Option<String>>>,
+    session: Option<String>,
+    /// The number of the newest authenticated hook.
+    accepted: u64,
+    /// The number of the newest hook whose state was published.
+    applied: u64,
+}
+
+impl ClaudeHookState {
+    fn status_order(&self) -> std::sync::MutexGuard<'_, ClaudeStatusOrder> {
+        self.status_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Numbers an authenticated hook before its body is read and withdraws readiness: until
+    /// the observer reads it, the hook may carry a prompt or an ask.
+    fn accept_hook(&self) -> u64 {
+        let mut order = self.status_order();
+        order.accepted += 1;
+        self.status.clear_ready_for_prompt();
+        order.accepted
+    }
 }
 
 async fn run_claude_observer(
@@ -1499,7 +1547,7 @@ async fn run_claude_observer(
         requests: request_sender,
         request_permits: Arc::new(Semaphore::new(CLAUDE_HOOK_REQUEST_CAPACITY)),
         status: generation.clone(),
-        status_session: Arc::new(Mutex::new(None)),
+        status_order: Arc::default(),
     };
     let router = Router::new()
         .route("/claude-hook", post(capture_claude_hook))
@@ -1552,6 +1600,8 @@ async fn drive_claude_observer(
             }
         }
     }
+    // No hook can arrive now, so the next turn or ask would go unseen.
+    generation.clear_ready_for_prompt();
     publish_claude_listener_unavailable(&inner);
     interrupt_claude_activity(&inner, &active_actors, &active_work_items, event_sequence).await;
     // A hook server that ended on its own leaves the process running its pinned copy with its
@@ -1840,12 +1890,18 @@ async fn capture_claude_hook(
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
+    let authenticated = authorized(&headers, &state.token, &state.correlation);
     let Ok(_permit) = state.request_permits.clone().try_acquire_owned() else {
+        // A refused hook is lost, so whatever it said goes unseen.
+        if authenticated {
+            state.accept_hook();
+        }
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    if !authorized(&headers, &state.token, &state.correlation) {
+    if !authenticated {
         return StatusCode::FORBIDDEN;
     }
+    let arrival = state.accept_hook();
     // Activity admission is taken before the body arrives, so a body that spans a disable and
     // re-enable never creates activity under the new admission.
     let admission = state.activity.admit();
@@ -1883,7 +1939,7 @@ async fn capture_claude_hook(
     let Ok(hook) = serde_json::from_slice::<ClaudeStatusHook>(&bytes) else {
         return rejected();
     };
-    publish_claude_hook_status(&state, &hook);
+    publish_claude_hook_status(&state, &hook, arrival);
     if hook
         .hook_event_name
         .as_deref()
@@ -1988,8 +2044,8 @@ const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
 
 /// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
 /// prompt, message and tool content included.
-#[derive(Debug, Default, serde::Deserialize)]
-struct ClaudeStatusHook {
+#[derive(Default, serde::Deserialize)]
+pub(super) struct ClaudeStatusHook {
     #[serde(default)]
     hook_event_name: Option<String>,
     #[serde(default)]
@@ -2001,6 +2057,24 @@ struct ClaudeStatusHook {
     tool_name: Option<String>,
     #[serde(default)]
     notification_type: Option<String>,
+    /// The session's transcript as the CLI reports it: untrusted, only ever recorded (R112).
+    #[serde(default)]
+    transcript_path: Option<String>,
+}
+
+/// The transcript path names a folder on the person's machine, so it is never printed.
+impl fmt::Debug for ClaudeStatusHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeStatusHook")
+            .field("hook_event_name", &self.hook_event_name)
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id.is_some())
+            .field("tool_name", &self.tool_name)
+            .field("notification_type", &self.notification_type)
+            .field("transcript_path", &self.transcript_path.is_some())
+            .finish()
+    }
 }
 
 /// What one Claude hook says about the main agent.
@@ -2011,29 +2085,47 @@ enum ClaudeAgentReport {
     ToolFinished,
 }
 
-/// Publishes the main agent's state a hook reports, for the main session only.
-fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) {
+/// Publishes the main agent's state a hook reports, for the main session only, in the order
+/// the hooks arrived: a hook older than one already published changes nothing, and only the
+/// newest hook can make the terminal ready.
+fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook, arrival: u64) {
     let Some(report) = claude_hook_agent_status(hook) else {
         return;
     };
     let Some(session_id) = safe_text(hook.session_id.as_deref()) else {
         return;
     };
-    {
-        let mut bound = state
-            .status_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match bound.as_deref() {
-            Some(root) if root == session_id => {}
-            Some(_) if hook.hook_event_name.as_deref() != Some("SessionStart") => return,
-            _ => *bound = Some(session_id.to_owned()),
+    let mut order = state.status_order();
+    if arrival < order.applied {
+        return;
+    }
+    match order.session.as_deref() {
+        Some(root) if root == session_id => {}
+        Some(_) if hook.hook_event_name.as_deref() != Some("SessionStart") => return,
+        _ => order.session = Some(session_id.to_owned()),
+    }
+    order.applied = arrival;
+    // A subagent's hook names its own transcript; only the main agent's names the conversation.
+    if hook.agent_id.is_none() {
+        match hook
+            .transcript_path
+            .as_deref()
+            .and_then(claude_transcript_path)
+        {
+            Some(transcript_path) => state.status.publish_conversation(ObservedConversation {
+                session_id: session_id.to_owned(),
+                transcript_path,
+            }),
+            None => state.status.bind_conversation_session(session_id),
         }
     }
     match report {
-        ClaudeAgentReport::Set(agent_state, failed) => {
-            state.status.publish_agent_status(agent_state, failed);
-        }
+        // Claude's hooks are its only stream and carry no snapshot, so the newest is fresh.
+        ClaudeAgentReport::Set(agent_state, failed) => state.status.report_agent_evidence(
+            TerminalAgentReport::Set(agent_state, failed),
+            claude_hook_ready_for_prompt(hook) && arrival == order.accepted,
+            PromptEvidence::Fresh,
+        ),
         ClaudeAgentReport::ToolFinished => {
             state
                 .status
@@ -2042,6 +2134,27 @@ fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) 
                 })
         }
     }
+}
+
+/// A transcript path a hook may name: absolute, a `.jsonl` file, without control characters,
+/// and short enough to be a path. Where it points is checked only when it is read.
+fn claude_transcript_path(path: &str) -> Option<std::path::PathBuf> {
+    const MAX_TRANSCRIPT_PATH_BYTES: usize = 4096;
+    if path.len() > MAX_TRANSCRIPT_PATH_BYTES || path.chars().any(char::is_control) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path);
+    (path.is_absolute() && path.extension() == Some(std::ffi::OsStr::new("jsonl"))).then_some(path)
+}
+
+/// Whether a Claude hook proves the CLI waits for the user's next prompt: only Claude's
+/// `idle_prompt` notification does, sent once the prompt has waited for input a while. `Stop`
+/// does not: a Stop hook of the project or the user runs beside this one and can block the
+/// stop, and Claude then continues without a new prompt and without another hook to say so.
+pub(super) fn claude_hook_ready_for_prompt(hook: &ClaudeStatusHook) -> bool {
+    safe_text(hook.session_id.as_deref()).is_some()
+        && safe_text(hook.hook_event_name.as_deref()) == Some("Notification")
+        && safe_text(hook.notification_type.as_deref()) == Some("idle_prompt")
 }
 
 /// The main agent's state a Claude hook reports, for the left panel (#187). A subagent's own
@@ -3657,8 +3770,9 @@ mod tests {
         assert!(additive_hook_version("2.1.312"));
         assert!(additive_hook_version("2.1.314"));
         assert!(additive_hook_version("2.1.323"));
+        assert!(additive_hook_version("2.1.325"));
         assert!(
-            !additive_hook_version("2.1.324"),
+            !additive_hook_version("2.1.326"),
             "a build newer than the last proven one runs unhooked until the ceiling is raised"
         );
         assert!(!additive_hook_version("2026.10.19.1"));
@@ -4254,6 +4368,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hook_server_that_ends_withdraws_readiness() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let generation = TerminalObserverGeneration::new(
+            "thread-hook-exit".to_owned(),
+            "terminal-hook-exit".to_owned(),
+        );
+        let root = tempfile::tempdir().expect("observer resources");
+        let generation_dir = root.path().join("generation");
+        std::fs::create_dir(&generation_dir).expect("generation directory");
+        let inner = Arc::new(ClaudeObserverInner {
+            resources: Arc::new(ClaudeObserverResources {
+                listener: Mutex::new(None),
+                overlay_path: generation_dir.join("settings.json"),
+                runtime_dir: root.path().to_path_buf(),
+                generation_dir,
+                cleaned: AtomicBool::new(false),
+            }),
+            publisher: TerminalGenerationActivityPublisher::new(
+                generation.clone(),
+                projection,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+            provider_instance_id: "claudeAgent".to_owned(),
+            token: Arc::new("unused".to_owned()),
+            correlation: Arc::new("unused".to_owned()),
+            spawned: AtomicBool::new(true),
+            activity: Arc::new(TerminalAgentActivityControl::enabled()),
+            listener_lifecycle: AtomicU64::new(pack_claude_listener_lifecycle(
+                ClaudeListenerLifecycle {
+                    ready: true,
+                    epoch: 1,
+                },
+            )),
+        });
+        let lease = generation.observation();
+        lease.publish_agent_status(TerminalAgentState::Done, false);
+        lease.mark_ready_for_prompt();
+        let (_requests, receiver) = mpsc::channel(1);
+
+        drive_claude_observer(inner, lease.clone(), receiver, Box::pin(async {})).await;
+
+        let status = lease.subscribe_agent_status().borrow().expect("a status");
+        assert_eq!(status.state, TerminalAgentState::Done);
+        assert!(
+            !status.ready_for_prompt,
+            "a terminal whose hooks can no longer arrive reads ready"
+        );
+    }
+
+    #[tokio::test]
     async fn dormant_shutdown_reconciliation_does_not_publish_interruptions() {
         let database = Database::open_in_memory().await.expect("database");
         database
@@ -4409,7 +4581,8 @@ mod tests {
     #[test]
     fn status_hooks_keep_no_prompt_or_tool_content() {
         // Mutation caught: the status path decoding a hook whole, so a prompt or tool output
-        // is read and held while AI Terminal activity is off (#187).
+        // is read and held while AI Terminal activity is off (#187). The transcript path is
+        // held for R112, but never printed.
         let hook: ClaudeStatusHook = serde_json::from_value(json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "s",
@@ -4420,8 +4593,72 @@ mod tests {
         }))
         .expect("status hook");
         let kept = format!("{hook:?}");
-        for private in ["private prompt", "private tool", "transcript"] {
+        for private in [
+            "private prompt",
+            "private tool",
+            "/private/transcript.jsonl",
+        ] {
             assert!(!kept.contains(private), "{kept}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_idle_notification_makes_a_claude_terminal_ready() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let status = generation.observation().subscribe_agent_status();
+        let (requests, _request_receiver) = mpsc::channel(4);
+        let state = ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+            status_order: Arc::default(),
+        };
+
+        for (event, notification, expected) in [
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
+            ("Stop", None, (TerminalAgentState::Done, false)),
+            (
+                "Notification",
+                Some("idle_prompt"),
+                (TerminalAgentState::Done, true),
+            ),
+            (
+                "UserPromptSubmit",
+                None,
+                (TerminalAgentState::Working, false),
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer token".parse().unwrap());
+            headers.insert(
+                CLAUDE_HOOK_CORRELATION_HEADER,
+                "correlation".parse().unwrap(),
+            );
+            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let body = json!({
+                "hook_event_name": event,
+                "session_id": "s",
+                "notification_type": notification,
+            });
+            let response =
+                capture_claude_hook(State(state.clone()), headers, Body::from(body.to_string()))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{event}");
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| (observation.state, observation.ready_for_prompt)),
+                Some(expected),
+                "{event} {notification:?}"
+            );
         }
     }
 
@@ -4440,7 +4677,7 @@ mod tests {
             requests,
             request_permits: Arc::new(Semaphore::new(4)),
             status: generation.observation(),
-            status_session: Arc::new(Mutex::new(None)),
+            status_order: Arc::default(),
         };
         let send = |token: &str, body: Value| {
             let mut headers = HeaderMap::new();
@@ -4560,5 +4797,306 @@ mod tests {
             status.borrow().map(|observation| observation.state),
             Some(TerminalAgentState::Working)
         );
+    }
+
+    fn status_only_hook_state(generation: &TerminalObserverGeneration) -> ClaudeHookState {
+        let (requests, _request_receiver) = mpsc::channel(4);
+        ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+            status_order: Arc::default(),
+        }
+    }
+
+    fn authenticated_hook_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert(
+            CLAUDE_HOOK_CORRELATION_HEADER,
+            "correlation".parse().unwrap(),
+        );
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    }
+
+    async fn send_status_hook(state: &ClaudeHookState, body: Body) -> StatusCode {
+        capture_claude_hook(State(state.clone()), authenticated_hook_headers(), body)
+            .await
+            .into_response()
+            .status()
+    }
+
+    fn idle_prompt_hook() -> Value {
+        json!({"hook_event_name":"Notification","session_id":"s","notification_type":"idle_prompt"})
+    }
+
+    #[tokio::test]
+    async fn an_idle_hook_read_before_a_newer_hook_never_restores_readiness() {
+        // Mutation caught: a hook publishing in body-completion order, so an idle_prompt whose
+        // body arrives after a newer prompt, approval or lost hook makes a busy terminal ready.
+        for (newer, newer_state) in [
+            (
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string(),
+                TerminalAgentState::Working,
+            ),
+            (
+                json!({"hook_event_name":"PermissionRequest","session_id":"s"}).to_string(),
+                TerminalAgentState::Blocked,
+            ),
+            ("{".to_owned(), TerminalAgentState::Done),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let status = generation.observation().subscribe_agent_status();
+            let state = status_only_hook_state(&generation);
+            let stop = json!({"hook_event_name":"Stop","session_id":"s"}).to_string();
+            assert_eq!(
+                send_status_hook(&state, Body::from(stop)).await,
+                StatusCode::NO_CONTENT
+            );
+
+            let (idle_body, idle_chunks) =
+                mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+            let idle = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    send_status_hook(
+                        &state,
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(idle_chunks)),
+                    )
+                    .await
+                }
+            });
+            while state.request_permits.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+            send_status_hook(&state, Body::from(newer.clone())).await;
+            idle_body
+                .send(Ok(idle_prompt_hook().to_string().into()))
+                .await
+                .expect("idle body");
+            drop(idle_body);
+            assert_eq!(idle.await.expect("idle hook"), StatusCode::NO_CONTENT);
+
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| (observation.state, observation.ready_for_prompt)),
+                Some((newer_state, false)),
+                "an idle hook older than {newer} restored readiness"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_authenticated_hook_withdraws_readiness() {
+        // Mutation caught: a hook whose body is too large or malformed returning before it
+        // withdraws readiness, so the prompt it carried leaves the terminal ready.
+        for lost in [
+            Body::from(vec![b' '; CLAUDE_HOOK_BODY_LIMIT + 1]),
+            Body::from("{\"hook_event_name\":\"UserPromptSubmit\""),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let status = generation.observation().subscribe_agent_status();
+            let state = status_only_hook_state(&generation);
+            send_status_hook(&state, Body::from(idle_prompt_hook().to_string())).await;
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| observation.ready_for_prompt),
+                Some(true)
+            );
+
+            send_status_hook(&state, lost).await;
+
+            assert_eq!(
+                status
+                    .borrow()
+                    .map(|observation| observation.ready_for_prompt),
+                Some(false),
+                "a hook the observer could not read left the terminal ready"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_hook_refused_for_capacity_withdraws_readiness() {
+        // Mutation caught: a hook refused because every request slot is busy returning before
+        // it withdraws readiness, so the prompt it carried leaves the terminal ready.
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let status = generation.observation().subscribe_agent_status();
+        let state = status_only_hook_state(&generation);
+        send_status_hook(&state, Body::from(idle_prompt_hook().to_string())).await;
+        let mut forged = authenticated_hook_headers();
+        forged.insert("authorization", "Bearer wrong".parse().unwrap());
+        let forged = capture_claude_hook(
+            State(state.clone()),
+            forged,
+            Body::from(json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string()),
+        )
+        .await
+        .into_response()
+        .status();
+        assert_eq!(forged, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status
+                .borrow()
+                .map(|observation| observation.ready_for_prompt),
+            Some(true),
+            "an unauthenticated request withdrew readiness"
+        );
+        let _busy = state
+            .request_permits
+            .clone()
+            .try_acquire_many_owned(4)
+            .expect("every request slot");
+
+        let refused = send_status_hook(
+            &state,
+            Body::from(json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}).to_string()),
+        )
+        .await;
+
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            status
+                .borrow()
+                .map(|observation| observation.ready_for_prompt),
+            Some(false),
+            "a hook refused for capacity left the terminal ready"
+        );
+    }
+
+    const OBSERVED_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+    const NEXT_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn transcript_of(session: &str) -> String {
+        format!("/home/test-user/.claude/projects/-work-sample/{session}.jsonl")
+    }
+
+    fn session_start(session: &str, transcript_path: &str) -> Body {
+        Body::from(
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "transcript_path": transcript_path,
+            })
+            .to_string(),
+        )
+    }
+
+    fn observed(session: &str) -> crate::provider_terminal::ObservedConversation {
+        crate::provider_terminal::ObservedConversation {
+            session_id: session.to_owned(),
+            transcript_path: transcript_of(session).into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_records_the_observed_conversation() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        let lease = generation.observation();
+        assert_eq!(
+            lease.observed_conversation(),
+            Some(observed(OBSERVED_SESSION))
+        );
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_ignores_a_relative_or_non_jsonl_path() {
+        for path in [
+            format!("projects/-work-sample/{OBSERVED_SESSION}.jsonl"),
+            format!("/home/test-user/.claude/projects/-work-sample/{OBSERVED_SESSION}.json"),
+            "/home/test-user/.claude/projects/-work-sample/".to_owned(),
+            format!("/home/test-user/\u{7}/{OBSERVED_SESSION}.jsonl"),
+        ] {
+            let generation =
+                TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+            let state = status_only_hook_state(&generation);
+
+            send_status_hook(&state, session_start(OBSERVED_SESSION, &path)).await;
+
+            assert_eq!(
+                generation.observation().observed_conversation(),
+                None,
+                "{path:?} was recorded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_never_rebinds_for_a_subagent() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        for event in ["SessionStart", "PreToolUse", "Stop"] {
+            send_status_hook(
+                &state,
+                Body::from(
+                    json!({
+                        "hook_event_name": event,
+                        "session_id": NEXT_SESSION,
+                        "agent_id": "agent-1",
+                        "tool_name": "Read",
+                        "transcript_path": transcript_of(NEXT_SESSION),
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        }
+
+        let lease = generation.observation();
+        assert_eq!(
+            lease.observed_conversation(),
+            Some(observed(OBSERVED_SESSION))
+        );
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
+    }
+
+    #[tokio::test]
+    async fn claude_status_hook_a_new_session_after_clear_replaces_it() {
+        let generation = TerminalObserverGeneration::new("thread".to_owned(), "term".to_owned());
+        let state = status_only_hook_state(&generation);
+        send_status_hook(
+            &state,
+            session_start(OBSERVED_SESSION, &transcript_of(OBSERVED_SESSION)),
+        )
+        .await;
+
+        send_status_hook(
+            &state,
+            session_start(NEXT_SESSION, &transcript_of(NEXT_SESSION)),
+        )
+        .await;
+        assert_eq!(
+            generation.observation().observed_conversation(),
+            Some(observed(NEXT_SESSION))
+        );
+
+        // A new session whose path is unusable leaves no stale conversation behind.
+        send_status_hook(&state, session_start(OBSERVED_SESSION, "relative.jsonl")).await;
+        let lease = generation.observation();
+        assert_eq!(lease.observed_conversation(), None);
+        assert_eq!(lease.observed_session().as_deref(), Some(OBSERVED_SESSION));
     }
 }

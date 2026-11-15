@@ -13,9 +13,11 @@
         "threadId": "a'nl^",
         "outcome": "0",
         "target": {
-          "sha": "�",
-          "worktreeKey": "",
-          "transferId": "\u0000"
+          "sha": "",
+          "worktreeKey": "toString",
+          "cloneId": "_f<H 6u",
+          "recipient": "0",
+          "conversationId": "😀"
         }
       }
     }

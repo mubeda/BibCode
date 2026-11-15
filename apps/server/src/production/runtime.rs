@@ -117,6 +117,22 @@ pub struct ProductionRuntime {
     mcp_control: crate::mcp::control::McpControl,
     /// Outbound webhooks and their dispatcher (#139 slice X8).
     webhooks: crate::webhooks::Webhooks,
+    /// Stops the follower that moves send requests through their states.
+    send_requests_follower: CancellationToken,
+    /// Stops the tracker that moves agent messages through their states.
+    agent_message_tracker: CancellationToken,
+    /// The tracker's task, joined in the stop so its last outcome reaches the activity writer.
+    agent_message_tracker_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Writes agent message rows to the activity log; closed and drained in the stop.
+    agent_message_writer: crate::mcp::activity::AgentMessageWriter,
+    /// AI Terminal credentials for agent messaging.
+    terminal_credentials: Arc<crate::agent_messaging::terminal_credential::TerminalCredentials>,
+    /// The terminal manager, which the credentials verify a generation against once bound.
+    terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations>,
+    /// Stops the task that revokes the credentials of ended terminal processes.
+    terminal_credential_revoker: CancellationToken,
+    /// Stops the task that tells AI Terminals about their agent mail.
+    terminal_pointer: CancellationToken,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -173,6 +189,26 @@ pub fn finalize_rpc_registry(
 impl ProductionRuntime {
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
         self.provider_runtime.attach_connect_mcp(service).await;
+    }
+
+    /// The AI Terminal credentials, which lifecycle binds to the agent call route.
+    #[must_use]
+    pub fn terminal_credentials(
+        &self,
+    ) -> Arc<crate::agent_messaging::terminal_credential::TerminalCredentials> {
+        self.terminal_credentials.clone()
+    }
+
+    /// Binds the AI Terminal credentials to `endpoint`, the agent call route, and to this
+    /// runtime's terminal manager: AI Terminals launched from now on get a credential.
+    pub fn bind_terminal_credentials(&self, endpoint: String) {
+        self.terminal_credentials
+            .bind(endpoint, self.terminal_live.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_manager_for_test(&self) -> TerminalManager {
+        self.terminal_services.terminal_manager_for_test()
     }
 
     /// The outside-agent MCP tools, for the `/mcp` endpoint.
@@ -380,6 +416,10 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
+        // Before any delivery can be claimed.
+        repositories.set_agent_claim_gate(crate::agent_messaging::policy::claim_gate(
+            control.agent_messaging_enabled_signal(),
+        ));
         let activity_projections = ActivityProjections::new(
             ActivityRepository::new(repositories.database().clone()),
             chat_activity_controller.clone(),
@@ -463,16 +503,29 @@ impl ProductionRuntime {
         let open_url =
             crate::open_url::OpenUrlEnvironment::new(state_paths.open_url_shim_dir.clone());
         let terminal_open_url = open_url.clone();
+        // Bound to its endpoint and the terminal manager by lifecycle; until then AI Terminals
+        // launch without one. The hook holds it weakly: once bound it holds the manager.
+        let terminal_credentials = Arc::new(
+            crate::agent_messaging::terminal_credential::TerminalCredentials::new(
+                config.environment_id.clone(),
+                state_paths.state_dir.join("runtime/agent"),
+            ),
+        );
+        let hook_credentials = Arc::downgrade(&terminal_credentials);
         let terminal_manager = TerminalManager::with_process_attribution(
             Arc::new(PortablePtyBackend),
             TerminalManagerOptions {
                 launch_preparer: provider_terminal_preparer,
                 session_env: Some(TerminalManagerOptions::session_env_hook(
-                    move |thread_id, env| {
+                    move |launch, env| {
                         let open_url = terminal_open_url.clone();
+                        let credentials = hook_credentials.upgrade();
                         Box::pin(async move {
-                            if let Some(session) = open_url.issue(thread_id).await {
+                            if let Some(session) = open_url.issue(launch.thread_id).await {
                                 session.apply(env);
+                            }
+                            if let Some(credentials) = credentials {
+                                credentials.issue(&launch, env).await;
                             }
                         })
                     },
@@ -481,6 +534,7 @@ impl ProductionRuntime {
             },
             process_attribution.clone(),
         );
+        let terminal_credential_events = terminal_manager.subscribe_events();
         let diagnostic_bundle = DiagnosticBundleService::new(
             &state_paths.logs_dir,
             DiagnosticBundleIdentity {
@@ -645,7 +699,14 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let terminal_live: Arc<dyn crate::agent_messaging::terminal_credential::LiveGenerations> =
+            Arc::new(terminal_manager.clone());
+        let terminal_pointer = crate::agent_messaging::pointer::TerminalPointer::new(
+            repositories.database().clone(),
+            Arc::new(terminal_manager.clone()),
+        );
         let shell_terminals = terminal_manager.clone();
+        let send_request_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -807,21 +868,99 @@ impl ProductionRuntime {
             ));
         webhooks.wake_on(auth.subscribe_access());
         crate::webhooks::register_webhooks_rpc(&mut registry, webhooks.clone());
+        let send_requests = crate::send_requests::service::SendRequestsService::new(
+            repositories.database().clone(),
+            repositories.clone(),
+            crate::production::orchestration_rpc::server_command_dispatcher(
+                orchestration.clone(),
+                provider_runtime.clone(),
+                config.state_dir(),
+                turn_delivery.clone(),
+                Some(workspace_availability.clone()),
+                attachment_uploads.clone(),
+            ),
+        )
+        .with_terminal_output(Arc::new(send_request_terminals))
+        // Before the request sink below: the service's pointer carries none, so no cycle.
+        .with_terminal_mail(terminal_pointer.clone());
+        crate::send_requests::rpc::register_send_requests_rpc(&mut registry, send_requests.clone());
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),
             auth.clone(),
             orchestration.clone(),
             control.mcp_server_signal(),
-            mcp_activity,
+            mcp_activity.clone(),
         );
+        let (agent_message_outcomes, agent_message_writer) =
+            crate::mcp::activity::agent_message_writer(mcp_activity);
         mcp_control.attach_terminals(mcp_terminals);
+        let agent_messaging = crate::agent_messaging::AgentMessaging::new(
+            orchestration.clone(),
+            control.agent_messaging_enabled_signal(),
+        )
+        .with_starter(crate::production::orchestration_rpc::server_turn_starter(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            config.state_dir(),
+            turn_delivery.clone(),
+            Some(workspace_availability.clone()),
+            attachment_uploads.clone(),
+        ));
+        // Before the pointer starts, so a stored answer reaches its request before any
+        // generation end of the earlier run can.
+        if let Err(error) =
+            crate::send_requests::terminal::fail_open_terminal_requests(&send_requests).await
+        {
+            tracing::warn!(%error, "open terminal requests were kept open at start");
+        }
+        let terminal_pointer_task = CancellationToken::new();
+        // Attached before the pointer is shared: its sinks are per clone.
+        let terminal_pointer = terminal_pointer
+            .with_request_sink(crate::send_requests::terminal::request_state_sink(
+                send_requests.clone(),
+            ))
+            .with_generation_end_sink(crate::send_requests::terminal::generation_end_sink(
+                send_requests.clone(),
+            ));
+        // Terminal deliveries reach the activity log through the same sink as chat ones.
+        let agent_messaging = start_terminal_messaging(
+            agent_messaging,
+            &terminal_pointer,
+            Some(agent_message_outcomes.clone()),
+            terminal_pointer_task.clone(),
+        );
+        mcp_control.attach_agent_messaging(agent_messaging.clone());
 
+        // Late, so a failed start leaves no follower running.
+        let send_requests_follower = CancellationToken::new();
+        send_requests.start_follower(orchestration.clone(), send_requests_follower.clone());
+        let terminal_credential_revoker = CancellationToken::new();
+        terminal_credentials.spawn_revoker(
+            terminal_credential_events,
+            terminal_credential_revoker.clone(),
+        );
+        let agent_message_tracker = CancellationToken::new();
+        let agent_message_tracker_task =
+            crate::agent_messaging::delivery::AgentMessageTracker::start(
+                orchestration.clone(),
+                Some(agent_message_outcomes),
+                control.agent_messaging_enabled_signal(),
+                agent_message_tracker.clone(),
+            );
         // Last before the runtime exists, so a failed start leaves no collector running.
         host_metrics.start_background();
         Ok(Self {
             mcp_control,
             webhooks,
+            send_requests_follower,
+            agent_message_tracker,
+            agent_message_tracker_task: std::sync::Mutex::new(Some(agent_message_tracker_task)),
+            agent_message_writer,
+            terminal_credentials,
+            terminal_live,
+            terminal_credential_revoker,
+            terminal_pointer: terminal_pointer_task,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -1017,6 +1156,34 @@ impl ProductionRuntime {
         // the profiler's teardown.
         self.webhooks.shutdown().await;
         steps.mark("webhooks");
+        // A stopped follower resumes from its first sweep on the next start.
+        self.send_requests_follower.cancel();
+        steps.mark("send-requests-follower");
+        // A stopped tracker resumes from its first reconciliation on the next start. Its join is
+        // bounded by the database and the engine, the only things it waits on, which both run
+        // until the `orchestration` step below.
+        self.agent_message_tracker.cancel();
+        let tracker = self
+            .agent_message_tracker_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(tracker) = tracker
+            && let Err(error) = tracker.await
+        {
+            tracing::warn!(%error, "the agent message tracker ended abnormally");
+        }
+        steps.mark("agent-message-tracker");
+        // Before the activity writer closes, so its last terminal outcomes still reach the
+        // log, and before the profiler's teardown: a stopped pointer rescans on the next start.
+        self.terminal_pointer.cancel();
+        steps.mark("terminal-pointer");
+        // After the tracker and the MCP calls, while the database is open and before the
+        // profiler's teardown: every queued agent message row is written, then the writer ends.
+        self.agent_message_writer.close().await;
+        steps.mark("agent-message-activity");
+        self.terminal_credential_revoker.cancel();
+        steps.mark("terminal-credential-revoker");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         steps.mark("process-monitor");
@@ -1382,6 +1549,23 @@ struct GitReviewBackend;
 const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Gives `messaging` its terminal pointer and `outcomes`, then starts the pointer task with that
+/// same service, which it returns for every other caller. A sink added to the returned service
+/// afterwards would miss the pointer's copy, so the sink goes in here.
+pub(crate) fn start_terminal_messaging(
+    messaging: crate::agent_messaging::AgentMessaging,
+    pointer: &crate::agent_messaging::pointer::TerminalPointer,
+    outcomes: Option<crate::agent_messaging::OutcomeSink>,
+    shutdown: CancellationToken,
+) -> crate::agent_messaging::AgentMessaging {
+    let mut messaging = messaging.with_terminals(pointer.clone());
+    if let Some(outcomes) = outcomes {
+        messaging = messaging.with_outcomes(outcomes);
+    }
+    pointer.start(messaging.clone(), shutdown);
+    messaging
+}
+
 /// Each review preview source is bounded like a Git Manager commit diff.
 pub(super) const MAX_REVIEW_SOURCE_DIFF_BYTES: usize =
     crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
@@ -2989,6 +3173,151 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// `sendRequests.getTerminalOutput` reads a real terminal through the runtime's terminal
+    /// manager, not the "not available" refusal of a service with no output source.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_requests_get_terminal_output_reads_the_runtime_terminal_manager() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let workspace_root = state.path().join("output-project");
+        std::fs::create_dir(&workspace_root).expect("workspace");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create","commandId":"output-project","projectId":"output-project",
+                    "title":"Project","workspaceRoot":workspace_root,"defaultModelSelection":null,
+                    "createdAt":"2026-08-01T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project");
+        let thread_id = load_snapshot(&runtime.orchestration.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let terminal = runtime.terminal_services.terminal_manager_for_test();
+        let mut input =
+            TerminalOpenInput::new(thread_id.clone(), "output-terminal", workspace_root, 80, 24);
+        input.command = Some(TerminalLaunchCommand {
+            executable: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'terminal-tail-marker\\n'; sleep 30".to_owned(),
+            ],
+            label: Some("Output".to_owned()),
+            activity: None,
+            env: None,
+        });
+        terminal.open(input).await.expect("terminal starts");
+
+        let read = || {
+            runtime.registry.invoke_local(
+                "sendRequests.getTerminalOutput",
+                json!({
+                    "sourceThreadId": thread_id, "threadId": thread_id,
+                    "terminalId": "output-terminal", "source": "output", "part": "last-answer",
+                }),
+                crate::rpc::RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+        };
+        let text = timeout(Duration::from_secs(10), async {
+            loop {
+                let result = read()
+                    .await
+                    .expect("the runtime reads the terminal's output");
+                let text = result["text"].as_str().unwrap_or_default().to_owned();
+                if text.contains("terminal-tail-marker") {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the terminal's output arrives");
+        assert!(text.contains("terminal-tail-marker"), "{text}");
+        runtime.shutdown().await;
+    }
+
+    /// No terminal survives a restart, so the runtime ends a stored open terminal request at
+    /// start.
+    #[tokio::test]
+    async fn runtime_start_ends_an_open_terminal_request() {
+        use crate::send_requests::store::{
+            SendAction, SendRequestRow, SendRequestStore, SendState,
+        };
+
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let store = SendRequestStore::new(database.clone());
+        let at = "2026-11-14T00:00:00.000Z".to_owned();
+        store
+            .insert_if_absent(SendRequestRow {
+                request_id: "before-restart".to_owned(),
+                project_id: "p1".to_owned(),
+                source_address: "thread:a".to_owned(),
+                source_thread_id: "a".to_owned(),
+                action: SendAction::Review,
+                target_address: "terminal:b/term-1".to_owned(),
+                target_thread_id: "b".to_owned(),
+                taken_over_address: None,
+                args_digest: "digest".to_owned(),
+                note_chars: 1,
+                attachment_chars: 0,
+                target_message_id: None,
+                command_id: None,
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                answering_turn_id: None,
+                answer_message_id: None,
+                answer_text: None,
+                answer_truncated: false,
+                terminal_generation: Some(1),
+                state: SendState::Delivered,
+                reason: None,
+                created_at: at.clone(),
+                updated_at: at,
+                dismissed_at: None,
+            })
+            .await
+            .expect("request stored");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+        let row = store
+            .get("before-restart")
+            .await
+            .expect("read")
+            .expect("kept");
+        assert_eq!(
+            (row.state, row.reason.as_deref()),
+            (SendState::NotAnswered, Some("recipient_gone"))
+        );
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn host_metrics_start_with_the_runtime_and_stop_in_quiesce() {
         let state = TempDir::new().expect("state");
@@ -3718,6 +4047,163 @@ mod tests {
         .await
         .expect("optional provider observation must fail open");
 
+        runtime.shutdown().await;
+    }
+
+    /// The stop writes the agent message rows still queued and ends their writer, before the
+    /// profiler's teardown.
+    #[tokio::test]
+    async fn quiesce_writes_the_queued_agent_message_rows_and_ends_their_writer() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        for _ in 0..20 {
+            messaging.refused(
+                "agent_message_send",
+                &crate::agent_messaging::AgentCaller::Thread("missing".to_owned()),
+                crate::agent_messaging::AgentMessagingError::Disabled,
+            );
+        }
+
+        let _ = runtime.quiesce_for_update().await;
+
+        assert!(
+            runtime.agent_message_writer.is_closed(),
+            "the stop ended the writer"
+        );
+        let rows: i64 = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'agent_message_send'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("the rows are readable");
+        assert_eq!(rows, 20, "every queued row was written");
+        runtime.shutdown().await;
+    }
+
+    /// A send whose future is suspended after its message was admitted, before it reports,
+    /// never holds up the stop: the stop reaches the profiler's teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiesce_completes_while_a_send_is_suspended_before_its_report() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({ "agentMessaging": { "enabled": true } }),
+        );
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            auth,
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime starts");
+        let workspace = TempDir::new().expect("workspace");
+        let mut commands = vec![json!({
+            "type": "project.create", "commandId": "project-create", "projectId": "p1",
+            "title": "Project", "workspaceRoot": workspace.path(),
+            "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "createdAt": "2026-11-14T00:00:00.000Z",
+        })];
+        for thread_id in ["a", "b"] {
+            commands.push(json!({
+                "type": "thread.create", "commandId": format!("create-{thread_id}"),
+                "threadId": thread_id, "projectId": "p1", "title": thread_id,
+                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": "full-access", "createdAt": "2026-11-14T00:00:00.000Z",
+            }));
+        }
+        for command in commands {
+            runtime
+                .orchestration
+                .dispatch(serde_json::from_value(command).expect("command"))
+                .await
+                .expect("dispatch");
+        }
+        let messaging = runtime
+            .mcp_control
+            .agent_messaging()
+            .expect("messaging is attached")
+            .clone();
+        let mut send = Box::pin(messaging.send(
+            "a",
+            crate::agent_messaging::SendRequest {
+                to: "thread:b".to_owned(),
+                text: "hello".to_owned(),
+                client_request_id: None,
+            },
+        ));
+        // Polled by hand until its message is admitted, then never again.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let admitted: i64 = database
+                    .call(|connection| {
+                        Ok(connection.query_row(
+                            "SELECT COUNT(*) FROM agent_messages",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .await
+                    .expect("messages are readable");
+                if admitted > 0 {
+                    break;
+                }
+                assert!(
+                    send.as_mut().poll(&mut context).is_pending(),
+                    "the send stays suspended until its admission is seen"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the message is admitted");
+
+        tokio::time::timeout(Duration::from_secs(30), runtime.quiesce_for_update())
+            .await
+            .expect("the stop never waits on the suspended send")
+            .expect("the stop succeeds");
+
+        drop(send);
         runtime.shutdown().await;
     }
 

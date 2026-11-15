@@ -132,9 +132,12 @@ Follow one process across restarts by `kind` and `label`; its `pid` changes.
 A request the server handled that crossed a latency tier. Requests under every
 tier write nothing.
 
-- `method`: an RPC method, or `mcp.<tool>` for a `/mcp` tool call (an outside
+- `method`: an RPC method, `mcp.<tool>` for a `/mcp` tool call (an outside
   agent's tool such as `mcp.wait_for_thread` or `mcp.profiler_findings`, or a
-  provider's `mcp.preview_*` and `mcp.device_*`);
+  provider's `mcp.preview_*` and `mcp.device_*`), or `agent.<operation>` for an
+  AI Terminal's authenticated `POST /api/agent/call` (`agent.list`,
+  `agent.send`, `agent.reply`, `agent.status`, `agent.cancel`, `agent.inbox`, or
+  `agent.invalid` for a body that names no known operation);
 - `outcome`: `success`, `failure`, or `first-item` for a stream timed to its
   first item;
 - `ms`: handler time;
@@ -527,11 +530,14 @@ before it. A stop with no slow step records nothing.
   stop, in order;
 - `durationMs`: the stage so far;
 - `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
-  name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
-  `git-writes`, `operational-logs` or `orchestration`.
+  name such as `http-drain`, `webhooks`, `send-requests-follower`,
+  `agent-message-tracker`, `turn-delivery`, `provider-runtime`, `git-writes`,
+  `operational-logs` or `orchestration`.
 
 The `quiesce` steps run in this order: `profiler-begin-stopping`,
-`mcp-control`, `webhooks`, `process-monitor`, `host-metrics`, `tool-updates`,
+`mcp-control`, `webhooks`, `send-requests-follower`, `agent-message-tracker`,
+`terminal-pointer`, `agent-message-activity`, `terminal-credential-revoker`,
+`process-monitor`, `host-metrics`, `tool-updates`,
 `capability-discovery`, `preview-gateway`, `device-manager`,
 `diff-tool-launcher`, `preview-tunnels`, `freeze-process-ownership`,
 `managed-endpoint`, `workspace`, `status-broadcaster`,

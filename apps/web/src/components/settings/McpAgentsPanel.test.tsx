@@ -243,4 +243,27 @@ describe("McpAgentsPanel", () => {
       }),
     ).toBe("PR #7 · 1 file");
   });
+
+  const messageRow = (target: Record<string, string>) => ({
+    id: 2,
+    occurredAt: "2026-10-30T10:00:00.000Z",
+    clientId: "thread:t1",
+    label: "Claude thread",
+    tool: "agent_message_delivery",
+    threadId: "t1",
+    outcome: "success",
+    target,
+  });
+
+  it("describes an agent message by its recipient and state", () => {
+    expect(
+      activityTargetText(
+        messageRow({ recipient: "thread:t2", recipientTitle: "Codex panel", status: "delivered" }),
+      ),
+    ).toBe("to Codex panel · delivered");
+  });
+
+  it("names no id when the recipient has no title", () => {
+    expect(activityTargetText(messageRow({ recipient: "thread:t2" }))).toBe("to another agent");
+  });
 });

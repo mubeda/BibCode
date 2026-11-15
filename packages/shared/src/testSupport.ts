@@ -45,11 +45,13 @@ export function makeTestExecutionEnvironmentCapabilities(
     webhookQuestionEvents: false,
     webhookBearerToken: false,
     webhookStatusKinds: false,
+    agentMessaging: false,
     sideChats: false,
     codeReviews: false,
     conversationOnlyRewind: false,
     threadDeleteOnlyIfUnused: false,
     hostMetrics: false,
+    sendRequests: false,
     ...overrides,
   };
 }

@@ -26,7 +26,8 @@ Words used below:
   terminal. It connects with an `mcp-client` credential and sees the tools on this page.
 - **Provider**: an agent BiBCode itself launched for a thread. It reaches the same `/mcp`
   endpoint with a provider credential and sees only the provider `preview_*` and
-  `device_*` tools. This page does not cover providers. A Codex chat reaches it as the MCP
+  `device_*` tools and the five agent messaging tools. This page covers the messaging tools
+  under [Provider tools](#provider-tools) and says nothing more about the others. A Codex chat reaches it as the MCP
   server `bibcode_thread`, which BiBCode adds to each launch as
   `-c mcp_servers.bibcode_thread.url=…` and `-c mcp_servers.bibcode_thread.bearer_token_env_var=…`.
   That key is BiBCode's own: Codex merges overrides into a table of the same name, so a
@@ -266,6 +267,71 @@ Each run mints a new credential, but every `bibcode thread` run shares one `clie
 scope, so the `--request-id` retry above works across runs. Only the "thread this agent
 opened or last drove" rule of `send_panel_message` does not carry over between runs (it does
 for a [named client](#named-clients---client-name)).
+
+### From an AI Terminal: `bibcode agent`
+
+`bibcode agent` is for the agent that runs inside an AI Terminal BiBCode started. It reaches
+the same operations as the [provider tools](#provider-tools) from a shell command, so an agent
+with no MCP connection can message the other agents of its project. It is not an outside
+agent's tool: it works only with the credential BiBCode put in that terminal's own
+environment, and a plain shell has none. The desktop executable takes it as
+`<desktop exe> agent`.
+
+| Command                                   | Operation                                                                                    |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `bibcode agent list`                      | `agents_list`                                                                                |
+| `bibcode agent send <address> <message>`  | `agent_message_send`                                                                         |
+| `bibcode agent reply <message-id> <text>` | `agent_message_reply`; also answers a person's request, by the message id the request prints |
+| `bibcode agent status <message-id>`       | `agent_message_status`                                                                       |
+| `bibcode agent cancel <message-id>`       | `agent_message_cancel`                                                                       |
+| `bibcode agent inbox`                     | Prints this terminal's new messages, oldest first, and marks each one it printed as read     |
+
+- `-` as the message or the reply reads it from standard input.
+- `send` and `reply` take `--request-id <id>` (1 to 256 characters), the `clientRequestId` of the
+  tool. Without it one is made up and printed. After an interrupted run, run the same command
+  with the id it printed: it returns the original message instead of sending twice.
+- `--json` prints one document, `{ "ok": true, "result": { ... } }` or
+  `{ "ok": false, "error": { "kind", "message" } }`, with `requestId` added for `send` and
+  `reply`, also on failure. `kind` is the error type of the [provider tools](#errors-of-the-provider-tools).
+- Exit codes: 0 success; 1 any failure; 2 a usage error.
+- `inbox` prints each message inside its envelope, exactly as stored. A message from another
+  agent is in the [agent envelope](#the-agent-envelope). A person's request is in the
+  [person-request envelope](#the-person-request-envelope), which names the user as its source,
+  carries the `message-id` and tells the agent to answer with
+  `bibcode agent reply <message-id> <answer>`. An agent that reads one treats it as the user's
+  request, not as another agent's message.
+- Without a terminal credential the command stops with `AgentMessagingNoIdentityError`: "This
+  command has no agent identity. Run it in an AI Terminal that BiBCode started."
+
+How it works:
+
+- BiBCode puts three things into every AI Terminal it starts, and into no other terminal. The
+  variable `BIBCODE_AGENT_AUTH` holds a credential bound to that terminal's current process
+  (its generation), and `BIBCODE_AGENT_ENDPOINT` holds the route
+  `POST /api/agent/call` of the server that started it. The variable is not named `*_TOKEN`,
+  because Codex's default `shell_environment_policy` drops variables whose names contain
+  `KEY`, `SECRET` or `TOKEN` from the commands it runs. Any value of either variable that
+  the caller or a project's prepared environment supplied is removed and replaced. A user
+  `shell_environment_policy` of Codex that keeps only a fixed list can still drop
+  `BIBCODE_AGENT_AUTH`, and no fallback file exists; whether a given Codex configuration
+  passes it has not been checked live.
+- The `bibcode` shim sits in the folder `runtime/agent` of the server's state folder, and that
+  folder goes first on the AI Terminal's `PATH` (and on no other terminal's). A project's
+  prepared environment (a version manager's `PATH`) keeps that folder, and the open-URL shim
+  folder, in front of its own entries. The shim is a `sh` script that runs the server's
+  executable with every argument; on Windows it is `bibcode.exe`, a hard link to the
+  executable or a copy. The Windows form has not been tested.
+- `POST /api/agent/call` takes `Authorization: Bearer <credential>` and a body of at most
+  256 KiB: `{ "operation": "list" | "send" | "reply" | "status" | "cancel" | "inbox",
+  "arguments": { ... } }`, with no other field (a sender is refused). It answers
+  `{ "ok": true, "result" }` or `{ "ok": false, "error": { "kind", "message" } }`. Only the
+  credential of a terminal whose generation still runs opens it: a credential from an ended
+  or replaced process, and any other bearer (an MCP, pairing or provider credential), gets
+  `401` with `AgentMessagingNoIdentityError`. The caller is always that terminal, never a
+  field of the body. The command never prints or logs the credential, and it sends it
+  without a proxy and follows no redirect.
+- The credential is revoked when its process ends, is closed or is replaced. It names the
+  terminal for these operations and grants nothing else.
 
 ### One tool from a shell: `bibcode mcp call` and `bibcode mcp tools`
 
@@ -1069,6 +1135,9 @@ every level) or `operate` (hidden and refused at read-only). Hints: R read-only,
 destructive, I idempotent, O open-world. **Keyed** is how a repeat behaves (see
 [Retries](#retries-and-clientrequestid)).
 
+The five agent messaging tools a thread's own agent sees are not in this index; they are under
+[Provider tools](#provider-tools).
+
 | Tool                          | Family                       | Set             | Access               | Hints | Keyed          |
 | ----------------------------- | ---------------------------- | --------------- | -------------------- | ----- | -------------- |
 | `list_projects_and_threads`   | Threads                      | `workspace`     | read                 | RI    | no             |
@@ -1498,7 +1567,7 @@ Waits until a thread's turn settles, needs a person, fails, or the timeout passe
 - `status`: string. With `messageId` and a finished turn: `completed`, `interrupted` or `error` (the turn's own outcome, whatever newer turns are doing). Otherwise the thread status (`awaiting_approval`, `awaiting_input`, `delivery_failed`, `running`, `error`, `interrupted`, `idle`), or `queued` when the message has not been admitted yet and the wait is not otherwise done.
 - `turnId`: string or null. The selected turn (null while the message is queued or no turn exists).
 - `turnState`: string or null, the turn's state (`running`, `completed`, `interrupted`, `error`).
-- `settled`: boolean. With `messageId`: the selected turn is `completed`, `interrupted` or `error`. Without: the session is idle, nothing is queued or starting, and the latest turn is not running.
+- `settled`: boolean. With `messageId`: the selected turn is `completed`, `interrupted` or `error`. Without: the session is idle, nothing is queued or starting, and the latest turn is not running. A `completed` turn settles only once its reply stops streaming: until then `settled` is false and `reply.streaming` is true.
 - `timedOut`: boolean. True only when the timeout passed while the wait was not done. `status`, `turnState` and `reply` then show the state at that moment.
 - `effectiveTimeoutMs`: integer, the timeout actually used.
 - `queuedAhead`: integer or null. Set only while the message is queued: how many queued messages are ahead of it (0 means next).
@@ -3389,7 +3458,7 @@ Types data into a terminal as keystrokes: end a command with `\n` to run it. It 
 
 #### `terminal_read`
 
-Reads a terminal's output. Without `cursor` it returns the last `tailChars` characters (4000 unless set). With `cursor` (the `nextCursor` of an earlier read, or `cursor` from `terminal_write`) it returns up to 16,000 characters written after that point. Also returns the terminal's `status` and `exitCode`, so a finished terminal can still be read.
+Reads a terminal's output. Without `cursor` it returns the last `tailChars` characters (4000 unless set), which does not start partway through an escape sequence that opened in the 4 KiB before it; with `raw`, a tail can exceed `tailChars` by one unfinished sequence still arriving, returned whole. With `cursor` (the `nextCursor` of an earlier read, or `cursor` from `terminal_write`) it returns up to 16,000 characters written after that point. Also returns the terminal's `status` and `exitCode`, so a finished terminal can still be read.
 
 - **Set / scope:** Terminals · `terminal:operate`
 - **Access:** Full access only (family refuses below, although the tool is a read)
@@ -3410,7 +3479,7 @@ Reads a terminal's output. Without `cursor` it returns the last `tailChars` char
 - `text` (string): the output of this page, escape sequences removed unless `raw`.
 - `nextCursor` (string, opaque `<epoch>:<offset>`): pass it as `cursor` to continue exactly after this page. When a page ends inside an unfinished escape sequence, `nextCursor` stops before the sequence so the next read returns it whole, and an unfinished sequence that fills the whole page is skipped once it has ended; `text` can then be empty while `more` is true.
 - `dropped` (boolean): the output at your `cursor` is no longer retained (the terminal keeps about 1 MiB, or it was restarted, cleared or reopened, or the cursor is past the end), and this page starts at the oldest output kept. Always false for a read without `cursor`.
-- `more` (boolean): output exists beyond `nextCursor`; read again with `cursor: nextCursor`.
+- `more` (boolean): output exists beyond `nextCursor`; read again with `cursor: nextCursor`. Without `raw`, it is false, with a `nextCursor` before the end, while all that is left is an escape sequence still arriving: read again from `nextCursor` later. In an exited terminal such a sequence never ends, so `nextCursor` is the end.
 - `status` (string): `"starting"`, `"running"`, `"exited"` or `"error"`.
 - `exitCode` (integer or null).
 - A page whose escaped text is too long for a result (over 80,000 characters) is retried with half the page size, down to 500 characters, so a read normally fits. If even 500 characters do not fit, `structuredContent` is `{ truncated: true, error: "The result is too long to return; ask for fewer or newer records." }`.
@@ -4588,6 +4657,337 @@ Catching up on profiler findings from the last hour, then reading the next page.
 
 The second page is requested with the same `since` and `kind` and `"cursor":"2026-10-31T09:21:15Z|9e01c4d2a7a1b2c3"`; stop when `nextCursor` is `null`. (Treat the cursor as opaque; the one shown is only an illustration.)
 
+## Provider tools
+
+Five tools let an agent that BiBCode started message the other agents of its project. They
+belong to the provider credential of a thread, so the agent of a chat thread or panel sees
+them in its own `tools/list`, and an outside `bibcode mcp` client does not: they are not in
+the [tool index](#tool-index), and a client that names one gets `McpUnknownToolError`. The
+caller is always the thread of the credential. No argument names a sender, and an unknown
+argument is refused (`AgentMessagingInvalidArgumentError`: "<tool> takes only ..."). An AI
+Terminal's agent reaches the same five operations with
+[`bibcode agent`](#from-an-ai-terminal-bibcode-agent).
+
+The setting **Agent messaging** (Settings → Agents → Agent integrations,
+`agentMessaging.enabled`) is off by default. While it is off, `agents_list`,
+`agent_message_send` and `agent_message_status` return `AgentMessagingDisabledError`.
+`agent_message_cancel` still works, so a sender can take a message back. `agent_message_reply`
+still answers a person's request, which a person sent with Send to agent and which the setting
+does not govern, and refuses any other reply. A message that already waits is held while the
+setting is off and released when it is on again.
+
+An address is `thread:<threadId>` for a chat agent or a panel, and
+`terminal:<threadId>/<terminalId>` for an AI Terminal (`<threadId>` is the thread that owns the
+terminal). Only agents of the caller's own project are reachable. Any other address, another
+project's included, is `AgentMessagingUnknownRecipientError`, the same answer for both, so a
+result never shows whether another project exists.
+
+Every message is sent in an envelope that names the sender and says the text is not from the
+user. The recipient's turn starts with it after the recipient's running turn ends; nothing
+interrupts a turn. A message to a chat agent is queued in that agent's own message queue
+behind its turn and shows in its transcript with the sender's chip. A message to an AI Terminal
+is stored in that terminal's mailbox and never typed into it: see
+[What an AI Terminal agent sees](#what-an-ai-terminal-agent-sees).
+
+#### Provider tool: agents_list
+
+Lists the other agents of the caller's project: the chat agents and panels that are not deleted
+or archived, in creation order, and the AI Terminals whose process runs. Takes no arguments.
+The caller itself is not listed.
+
+Result: `{ "agents": [ { "address", "title", "provider", "kind", "status", "canReceive" } ] }`.
+
+- `kind` is `chat` or `terminal`. `provider` is the provider instance of a chat agent, and the
+  driver kind of a terminal (`claudeAgent`, `codex`, `opencode` or another).
+- `status` of a chat agent is `waiting` (it has an open approval or question), `working`,
+  `error`, `stopped` or `ready`. A terminal reads `working`, `blocked`, `waiting`, `ready` (it
+  waits for a prompt and BiBCode can tell), `done` or `unavailable`.
+- `canReceive` is false when the agent runs with more access than the caller (the mode
+  ceiling below). For a terminal it is also false when BiBCode does not observe that provider,
+  when the status is `unavailable`, and when the caller does not run with `full-access`,
+  because a terminal receives as `full-access`.
+- A message to a terminal that BiBCode does not observe (a Cursor terminal, for one) is
+  stored, but no pointer line is typed for it. Its agent reads the message only when it runs
+  `bibcode agent inbox`.
+- A result over 80,000 characters drops agents from the end and sets `truncated`.
+
+Errors: `AgentMessagingDisabledError`, `AgentMessagingInvalidArgumentError`,
+`AgentMessagingUnknownRecipientError` (the caller's own thread no longer exists),
+`McpStorageError`.
+
+#### Provider tool: agent_message_send
+
+Sends a message to another agent of the project and returns at once. The recipient reads it
+later.
+
+Arguments: `to` (an address from `agents_list`, required), `text` (1 to 16,000 characters,
+required; text of only whitespace is refused) and `clientRequestId` (optional, a non-empty
+string).
+
+Result: `{ "messageId", "conversationId", "status", "hop" }`. `status` is `accepted` or `held`
+for a chat agent and `queued` or `held` for a terminal. `hop` is 1 for a message that starts a
+conversation.
+
+A repeat with the same `clientRequestId`, recipient and text returns a receipt for the stored
+message with its current status (so `completed`, `cancelled` or `failed` too, not only the first
+status), also after the recipient is gone, and a concurrent repeat is answered from the stored
+message. The
+same id with another recipient or text is `AgentMessagingConflictError`.
+
+Errors: `AgentMessagingDisabledError`, `AgentMessagingInvalidArgumentError` (an empty or too long
+text, an unknown field), `AgentMessagingUnknownRecipientError` (an unknown, archived, deleted,
+other-project or own address, or a terminal that is not an AI Terminal or does not run),
+`AgentMessagingModeCeilingError`, `AgentMessagingHopLimitError`, `AgentMessagingRateLimitError`,
+`AgentMessagingBacklogLimitError`, `AgentMessagingConflictError`, `McpStorageError`.
+
+#### Provider tool: agent_message_reply
+
+Replies to a message the caller received.
+
+Arguments: `inReplyTo` (the `message-id` of the envelope, required), `text` (1 to 16,000
+characters, required for a reply to an agent) and `clientRequestId` (optional). A reply to a
+person's request to a terminal is the exception: the server checks only that the text is not
+empty, the tool schema still advertises 16,000, and the request keeps the first 48,000
+characters as its answer (`truncated` beyond that).
+
+The reply goes to the sender of that message, in the same conversation, and returns at once
+with `{ "messageId", "conversationId", "status", "hop" }`; the hop follows the rules below. A
+message the caller never received reads as unknown. A person's request to a terminal is
+answered the same way: the reply is stored as the answer to that request and starts no turn
+anywhere, and a request can be answered once.
+
+Errors: `AgentMessagingDisabledError` (except for a person's request),
+`AgentMessagingInvalidArgumentError`, `AgentMessagingUnknownMessageError` (no such message, or
+the caller did not receive it), `AgentMessagingRecipientGoneError` (the sender is deleted or its
+terminal ended; a stored receipt still answers a retry), `AgentMessagingModeCeilingError`,
+`AgentMessagingHopLimitError`, `AgentMessagingRateLimitError`, `AgentMessagingBacklogLimitError`,
+`AgentMessagingConflictError`, `McpStorageError`.
+
+#### Provider tool: agent_message_status
+
+Reads the status of a message the caller sent. It never waits.
+
+Arguments: `messageId` (required).
+
+Result: `{ "status", "updatedAt", "reason"?, "replyMessageId"? }`. `reason` is present when the
+message has one (a `held` or `failed` message). `replyMessageId` is the newest reply, once the
+recipient replied.
+
+The statuses, in the order a message goes through them:
+
+| Status      | Chat recipient                                        | AI Terminal recipient                        |
+| ----------- | ----------------------------------------------------- | -------------------------------------------- |
+| `accepted`  | Stored; BiBCode has not started the delivery yet      | -                                            |
+| `queued`    | Waiting behind the recipient's running turn           | Stored in the terminal's mailbox             |
+| `held`      | Waiting for a person or a condition (see the reasons) | The same, for the setting only               |
+| `delivered` | Handed to the recipient's provider                    | The pointer line was typed into the terminal |
+| `consumed`  | The recipient's turn took the message                 | `bibcode agent inbox` returned it            |
+| `completed` | The recipient's turn finished                         | The terminal replied                         |
+| `cancelled` | The sender cancelled it (final)                       | The same (final)                             |
+| `failed`    | See the reasons (final)                               | See the reasons (final)                      |
+
+The reasons are `messaging_off`, `recipient_mode_above_sender`, `recipient_queue_held` and
+`delivery_uncertain` for `held`, and `recipient_gone`, `recipient_turn_failed` and
+`delivery_failed` for `failed`. `recipient_turn_failed` also covers a restart that found the
+message delivered at an idle provider with no turn of it: BiBCode stopped before it recorded the
+turn, nothing is sent again, and the reply cannot be read. `recipient_gone` also ends the mail of a terminal whose process
+ended before it read it.
+
+Errors: `AgentMessagingDisabledError`, `AgentMessagingInvalidArgumentError`,
+`AgentMessagingUnknownMessageError` (no such message, or the caller did not send it),
+`McpStorageError`.
+
+#### Provider tool: agent_message_cancel
+
+Cancels a message the caller sent while it is `accepted`, `queued` or `held` and was not
+handed to the recipient. For a terminal that is until `bibcode agent inbox` returned it. It works
+while agent messaging is off.
+
+Arguments: `messageId` (required).
+
+Result: `{ "status": "cancelled" }`, also when the message was already cancelled.
+
+Errors: `AgentMessagingNotCancellableError` (a chat message already delivered to its provider,
+or any message that is consumed or final; a terminal message that was delivered, with its pointer
+typed, can still be cancelled until `bibcode agent inbox` returns it),
+`AgentMessagingInvalidArgumentError`, `AgentMessagingUnknownMessageError`, `McpStorageError`.
+
+### Limits and rules
+
+- **Text.** 1 to 16,000 characters, counted as Unicode scalar values. A reply to a person's
+  request has no 16,000 limit (see `agent_message_reply`); its stored answer is cut at 48,000.
+- **Mode ceiling.** A recipient runs with at most the sender's access, in the order
+  `approval-required`, `auto-accept-edits`, `full-access`. It is checked when the message is sent
+  (`AgentMessagingModeCeilingError`) and again when the delivery is claimed: a message whose
+  recipient runs above its sender's mode by then is held with `recipient_mode_above_sender`, and
+  goes on when the recipient is at or below it again. A chat recipient's mode is the one it runs
+  with. A terminal receives as `full-access`, so only a `full-access` sender can message one, and
+  a terminal sends with the runtime mode of the thread that owns it. An unknown mode allows
+  nothing.
+- **Hop limit.** One conversation holds at most 8 agent-to-agent hops. A message sent during a
+  turn that a message of hop `n` started has hop `n + 1`, and past 8 it is
+  `AgentMessagingHopLimitError`: a person has to write in a thread before the agents go on. Only
+  a signed-in person's message starts the count again, never time and never an outside agent's
+  message. A terminal's hop is the highest hop its inbox returned since a person last typed
+  into it.
+- **Rate.** A sender may send 30 agent messages in 60 seconds (`AgentMessagingRateLimitError`).
+- **Backlog.** A recipient may hold 20 agent messages it has not consumed
+  (`AgentMessagingBacklogLimitError`). The rate and the backlog are checked in the transaction
+  that stores the message, so concurrent sends cannot both take the last slot. A person's request
+  is never refused by either.
+- **Queue pause.** A chat recipient whose last turn ended in an error or an interruption, or that
+  still has a held queue entry, has a paused queue. A new message to it is `held` with
+  `recipient_queue_held`, behind what already waits, until a person releases the queue with Send
+  now. A message never restarts an errored recipient and never overtakes held entries.
+- **Open questions.** A message never runs past an open approval or question of its recipient: it
+  waits until the person answered.
+- **One project.** Every address must be in the caller's project.
+- **Not the user.** The envelope tells the recipient that the text is not from its user. No
+  message counts as the person's approval.
+
+### The agent envelope
+
+A message to a chat agent starts the recipient's turn with this text, and `bibcode agent inbox`
+prints the same form for a terminal:
+
+```text
+<bibcode_agent_message>
+from: <sender title>
+provider: <sender provider>
+address: <sender address>
+message-id: <id>
+conversation-id: <id>
+in-reply-to: <id>            (only in a reply)
+This message comes from another agent, not from your user.
+---
+  <the text, every later line indented by two spaces>
+</bibcode_agent_message>
+```
+
+A title or id is one line of at most 200 characters. Control characters are written as
+`\u{..}` (a newline and a tab of the text stay). Both envelope tag names, in any letter case,
+have their underscores replaced by hyphens, so the text can neither close the envelope nor forge
+BiBCode's own lines. The text starts after two spaces, so a leading `/name`, `$name` or `@path`
+cannot start a provider command, a skill or a file reference. BiBCode decides that a delivery is
+an agent message from the message row it stored, never from the text, so a person who pastes an
+envelope still sends a person's message. It marks the envelope to Claude as client-composed,
+which stops Claude Code from expanding an `@path` inside it; OpenCode keeps it as one literal
+text part. Codex 0.169.0 expands a skill named with `$` inside any text input and has no input
+flag that turns that off, so the text a Codex recipient (a chat agent or an AI Terminal) is
+delivered has a zero-width space after each `$` that a letter, a digit, `_` or `-` follows. A
+`$` before a space, other punctuation or the end of the text stays as it is. The same applies to
+the sender's title in the `from` line. A recipient is a Codex recipient when its provider
+instance runs the Codex driver, a custom instance or one that never started included. When at
+least one `$` was changed, the envelope's header carries one more line, before `---`:
+
+```text
+BiBCode: a zero-width space follows each dollar sign in this message, so Codex cannot load a skill from it. Remove it before you run or quote code from this message.
+```
+
+The text is indented after `---`, so it can neither forge nor hide that line. The stored message
+and its status keep the text as written. A person's request keeps its text, and only a source
+title it names is changed, with the same line. Cursor was not probed: that is a known gap of
+literal delivery.
+
+### The person-request envelope
+
+A person's request to an AI Terminal (Send to agent from a chat or from another terminal) is
+stored in its own envelope, and `bibcode agent inbox` prints it as stored:
+
+```text
+<bibcode_person_request>
+From the user of this project: <action>, sent from <source title>.
+message-id: person-send:<request id>
+BiBCode: answer this request with `bibcode agent reply person-send:<request id> <answer>`.
+---
+  <the request text, quoted as in the agent envelope>
+</bibcode_person_request>
+```
+
+BiBCode's lines come first, and the quoted text cannot imitate them. The request comes from the
+user, not from an agent, so the setting, the mode ceiling, the hop count, the rate and the
+backlog do not apply to it.
+
+### What an AI Terminal agent sees
+
+BiBCode never types a message into an AI Terminal. It stores the message in that terminal's
+mailbox, bound to the terminal's current process. When the terminal's agent waits for a prompt
+and nobody typed into the terminal since the agent last started a turn, BiBCode pastes one fixed
+line followed by Enter: "BiBCode: you have new messages. Run `bibcode agent inbox` to read
+them." The line names no message, title or sender. The agent then runs the command to read its
+mail. Mail of an earlier process of the terminal is failed with `recipient_gone` and never given
+to a later one. The rules for "waits for a prompt" are in
+[Activity observation](../architecture/activity-observation.md#prompt-readiness) and the
+mailbox is described in [Agent messaging](../architecture/providers.md#agent-messaging).
+
+A Claude Code terminal counts as waiting for a prompt only after Claude's `idle_prompt`
+notification, which Claude sends once the prompt has waited for input a while, and which it may
+never send while the person is active in that terminal. The pointer line can arrive late or not at all then; this is an
+accepted limit. `bibcode agent inbox` always works.
+
+A message a terminal sends keeps the generation that sent it. A restarted terminal at the same
+address can neither read the status of nor cancel its predecessor's messages: it gets
+`AgentMessagingUnknownMessageError`, as for a message it never sent. A reply to a message whose
+terminal sender has since restarted or exited is refused with `AgentMessagingRecipientGoneError`
+and never reaches the new process. The rate and backlog limits still count per address; the hop
+ledger is kept per generation, so a restarted terminal starts a fresh one.
+
+### Accepted limits
+
+These are decisions, not bugs:
+
+- A Claude Code terminal reads ready for the pointer line only after Claude's `idle_prompt`
+  notification (see above).
+- A Claude Code build outside the hooked versions (2.1.220 to 2.1.325), or any terminal that
+  reads **Status unavailable**, has no observer, so `canReceive` is false and the pointer line is
+  never typed. Its agent can still read mail with `bibcode agent inbox`.
+- A fresh agent is not ready before its first end-of-turn signal. A CLI that waits on its own
+  start-up question (a folder trust or sign-in prompt) has sent none, so the pointer line is not
+  typed until it answers.
+- A Codex terminal's conversation is its newest 20 turns only.
+- A Claude terminal whose transcript is under a config folder other than the one BiBCode derives
+  (`CLAUDE_CONFIG_DIR` of the launch environment, else the server's, else `.claude`) falls back to
+  the recent output.
+- The server launches no Claude session id of its own, so a forged hook can name another Claude
+  session of the same working directory, and its transcript can be read for a Send to agent. Those
+  files belong to the same user.
+- A terminal tail (`terminal_read` without a cursor, and the output a Send to agent attaches)
+  looks back 4,096 bytes for the escape that opens a sequence it cuts into. A sequence that started
+  further back, such as a long clipboard payload, can still leave its remainder at the start.
+- A developer database that ran an earlier build of the unreleased migration 76 lacks
+  `sender_terminal_generation` and the unique index over sender, generation and `clientRequestId`.
+- The Windows `bibcode.exe` shim was not tested.
+
+### Errors of the provider tools
+
+| `_tag` or `kind`                      | Meaning                                                                                                                                             |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AgentMessagingDisabledError`         | Agent messaging is off. Turn it on in Settings → Agents → Agent integrations.                                                                       |
+| `AgentMessagingUnknownRecipientError` | No agent with that address in this project. Call `agents_list`.                                                                                     |
+| `AgentMessagingInvalidArgumentError`  | An empty or too long text, or a missing or unknown argument. The message names the argument only.                                                   |
+| `AgentMessagingUnknownMessageError`   | No message with that id that the caller may use.                                                                                                    |
+| `AgentMessagingRecipientGoneError`    | The agent a reply would go to no longer exists.                                                                                                     |
+| `AgentMessagingModeCeilingError`      | The recipient runs with more access than the caller. The message names both modes.                                                                  |
+| `AgentMessagingConflictError`         | The `clientRequestId` was already used for a different message.                                                                                     |
+| `AgentMessagingHopLimitError`         | The conversation reached 8 hops. A person has to write first.                                                                                       |
+| `AgentMessagingNotCancellableError`   | The message was already handed to its recipient.                                                                                                    |
+| `AgentMessagingRateLimitError`        | 30 messages in the last 60 seconds. Wait.                                                                                                           |
+| `AgentMessagingBacklogLimitError`     | The recipient has 20 messages it has not read. Try again later.                                                                                     |
+| `AgentCommandTransportError`          | Only from `bibcode agent`: the call never got an answer from the server (no connection, a body over the size limit, or an answer without a result). |
+| `AgentMessagingNoIdentityError`       | `bibcode agent` ran without an AI Terminal's credential.                                                                                            |
+| `McpStorageError`                     | BiBCode could not read its store. Try again.                                                                                                        |
+
+A refusal never quotes the caller's text.
+
+BiBCode writes one row of the [agent activity log](#attribution-and-the-activity-log) for each
+send and reply call (an accepted one, or a refusal with its error tag) and one for these
+delivery steps: `delivered`, `consumed` and `failed` of a chat or terminal message, and
+`completed` of a chat message. A terminal message's completion, every `held` and `cancelled`
+change and the `accepted` and `queued` states write no row of their own. A row holds the two addresses, the two
+thread titles, the message and conversation ids, the status and the reason, and never message
+text. The log's writer queues at most 1,024 rows and drops a row past that. `changes_since` and
+webhooks skip these rows: an agent never reads another agent's messaging activity through them.
+
 ## Error reference
 
 Every error type the MCP layer itself returns, generated from `feed::ERRORS`
@@ -4597,6 +4997,9 @@ the tool ran, as the app sees it (for example `GitOperationFailedError`,
 `GitManagerOperationError`, `GitCommandError`, `WorktreeRemovalError`,
 `PullRequestsOperationError`, `ProjectWriteFileError`, `UiIntentError`, `UploadError`); its
 `message` says what failed, and the tool sections above list the ones each tool can return.
+
+The agent messaging tools of a provider return their own `AgentMessaging*` types, listed under
+[Errors of the provider tools](#errors-of-the-provider-tools).
 
 | Tag                                     | Meaning                                                                                                                                                                                              | What fixes it                                                                                                                                         |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
