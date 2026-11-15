@@ -703,6 +703,7 @@ impl ProductionRuntime {
             Arc::new(terminal_manager.clone()),
         );
         let shell_terminals = terminal_manager.clone();
+        let send_request_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -875,7 +876,8 @@ impl ProductionRuntime {
                 Some(workspace_availability.clone()),
                 attachment_uploads.clone(),
             ),
-        );
+        )
+        .with_terminal_output(Arc::new(send_request_terminals));
         crate::send_requests::rpc::register_send_requests_rpc(&mut registry, send_requests.clone());
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
@@ -3143,6 +3145,79 @@ mod tests {
             .await
             .expect("thread moved");
         readmission_after(&terminal, created).await;
+        runtime.shutdown().await;
+    }
+
+    /// `sendRequests.getTerminalOutput` reads a real terminal through the runtime's terminal
+    /// manager, not the "not available" refusal of a service with no output source.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_requests_get_terminal_output_reads_the_runtime_terminal_manager() {
+        let state = TempDir::new().expect("state");
+        let runtime = start_quiesce_runtime(&state).await;
+        let workspace_root = state.path().join("output-project");
+        std::fs::create_dir(&workspace_root).expect("workspace");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create","commandId":"output-project","projectId":"output-project",
+                    "title":"Project","workspaceRoot":workspace_root,"defaultModelSelection":null,
+                    "createdAt":"2026-08-01T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project");
+        let thread_id = load_snapshot(&runtime.orchestration.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let terminal = runtime.terminal_services.terminal_manager_for_test();
+        let mut input =
+            TerminalOpenInput::new(thread_id.clone(), "output-terminal", workspace_root, 80, 24);
+        input.command = Some(TerminalLaunchCommand {
+            executable: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'terminal-tail-marker\\n'; sleep 30".to_owned(),
+            ],
+            label: Some("Output".to_owned()),
+            activity: None,
+            env: None,
+        });
+        terminal.open(input).await.expect("terminal starts");
+
+        let read = || {
+            runtime.registry.invoke_local(
+                "sendRequests.getTerminalOutput",
+                json!({
+                    "sourceThreadId": thread_id, "threadId": thread_id,
+                    "terminalId": "output-terminal", "source": "output", "part": "last-answer",
+                }),
+                crate::rpc::RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+        };
+        let text = timeout(Duration::from_secs(10), async {
+            loop {
+                let result = read()
+                    .await
+                    .expect("the runtime reads the terminal's output");
+                let text = result["text"].as_str().unwrap_or_default().to_owned();
+                if text.contains("terminal-tail-marker") {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the terminal's output arrives");
+        assert!(text.contains("terminal-tail-marker"), "{text}");
         runtime.shutdown().await;
     }
 

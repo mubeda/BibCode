@@ -376,9 +376,6 @@ impl SendRequestsService {
         }
     }
 
-    // Production attaches the terminal manager in `production/runtime.rs`, which this change
-    // could not edit; until then only tests call it.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn with_terminal_output(
         mut self,
         source: std::sync::Arc<dyn TerminalOutputSource>,
