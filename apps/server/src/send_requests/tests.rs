@@ -3197,3 +3197,242 @@ async fn handoff_refuses_an_unknown_thread() {
     }
     harness.shutdown().await;
 }
+
+/// A terminal that holds `text` and records every `tail` call. It has no write method.
+struct FakeTerminalOutput {
+    text: String,
+    calls: std::sync::Mutex<Vec<(String, String, usize)>>,
+}
+
+impl FakeTerminalOutput {
+    fn new(text: String) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            text,
+            calls: std::sync::Mutex::default(),
+        })
+    }
+}
+
+impl crate::send_requests::service::TerminalOutputSource for FakeTerminalOutput {
+    fn tail<'a>(
+        &'a self,
+        owner_thread_id: &'a str,
+        terminal_id: &'a str,
+        max_chars: usize,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<crate::send_requests::service::TerminalTail, crate::terminal::TerminalError>,
+    > {
+        self.calls.lock().unwrap().push((
+            owner_thread_id.to_owned(),
+            terminal_id.to_owned(),
+            max_chars,
+        ));
+        Box::pin(async move {
+            let (clean, _) = crate::ansi::strip_escapes(&self.text);
+            let count = clean.chars().count();
+            Ok(crate::send_requests::service::TerminalTail {
+                text: clean
+                    .chars()
+                    .skip(count.saturating_sub(max_chars))
+                    .collect(),
+                truncated: count > max_chars,
+            })
+        })
+    }
+}
+
+fn terminal_output_input(source_thread_id: &str, thread_id: &str, source: &str) -> Value {
+    json!({
+        "sourceThreadId": source_thread_id, "threadId": thread_id, "terminalId": "term-1",
+        "source": source, "part": "handoff",
+    })
+}
+
+async fn read_terminal_output(
+    service: SendRequestsService,
+    context: RpcSessionContext,
+    input: Value,
+) -> Result<Value, Value> {
+    let mut registry = RpcRegistry::empty();
+    register_send_requests_rpc(&mut registry, service);
+    registry
+        .invoke_local(
+            "sendRequests.getTerminalOutput",
+            input,
+            context,
+            CancellationToken::new(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn get_terminal_output_returns_the_last_16000_characters_without_escapes() {
+    let harness = harness().await;
+    let text = format!(
+        "{}\u{1b}[31mred\u{1b}[0m{}\u{1b}[3",
+        "a".repeat(20_000),
+        "b".repeat(20_000)
+    );
+    let service = harness
+        .send_requests()
+        .with_terminal_output(FakeTerminalOutput::new(text));
+
+    let result = read_terminal_output(service, person(), terminal_output_input("b", "a", "output"))
+        .await
+        .expect("readable");
+
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 16_000);
+    assert!(
+        text.chars().all(|c| c == 'b'),
+        "the tail is the last output"
+    );
+    assert!(!text.contains('\u{1b}'));
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["usedSource"], "output");
+    assert_eq!(result["fellBack"], false);
+    assert_eq!(result["startMissing"], false);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_of_an_empty_terminal_is_an_empty_text() {
+    let harness = harness().await;
+    let service = harness
+        .send_requests()
+        .with_terminal_output(FakeTerminalOutput::new(String::new()));
+
+    let result = read_terminal_output(service, person(), terminal_output_input("b", "a", "output"))
+        .await
+        .expect("readable");
+
+    assert_eq!(result["text"], "");
+    assert_eq!(result["truncated"], false);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_refuses_a_hosted_agent_a_terminal_credential_and_an_mcp_session() {
+    let harness = harness().await;
+    for access in [
+        McpAccess::FullAccess,
+        McpAccess::ReadOnly,
+        McpAccess::ApprovalRequired,
+    ] {
+        let (agent, _) = harness.agent(access).await;
+        let context =
+            RpcSessionContext::authenticated(agent.principal.clone(), harness.auth.clone());
+        let fake = FakeTerminalOutput::new("secret terminal text".to_owned());
+        let service = harness.send_requests().with_terminal_output(fake.clone());
+
+        let error =
+            read_terminal_output(service, context, terminal_output_input("b", "a", "output"))
+                .await
+                .expect_err("an outside agent is refused");
+
+        assert_eq!(error["reason"], "person_only", "{error}");
+        assert!(!error.to_string().contains("secret terminal text"));
+        assert!(fake.calls.lock().unwrap().is_empty(), "nothing was read");
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_refuses_a_terminal_of_another_project() {
+    let harness = harness().await;
+    let fake = FakeTerminalOutput::new("secret terminal text".to_owned());
+    let service = harness.send_requests().with_terminal_output(fake.clone());
+
+    let error = read_terminal_output(
+        service.clone(),
+        person(),
+        terminal_output_input("b", "c", "output"),
+    )
+    .await
+    .expect_err("another project");
+    assert_eq!(error["reason"], "other_project", "{error}");
+    let error = read_terminal_output(
+        service,
+        person(),
+        terminal_output_input("b", "missing", "output"),
+    )
+    .await
+    .expect_err("unknown thread");
+    assert_eq!(error["reason"], "unknown_thread", "{error}");
+    assert!(fake.calls.lock().unwrap().is_empty());
+    assert!(!error.to_string().contains("secret terminal text"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_only_reads() {
+    let harness = harness().await;
+    let fake = FakeTerminalOutput::new("hello".to_owned());
+    let service = harness.send_requests().with_terminal_output(fake.clone());
+    let before = untouched_state(&harness, "a").await;
+
+    read_terminal_output(service, person(), terminal_output_input("b", "a", "output"))
+        .await
+        .expect("readable");
+
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        vec![("a".to_owned(), "term-1".to_owned(), 16_000)],
+        "one read, of the owner thread's terminal"
+    );
+    assert_eq!(untouched_state(&harness, "a").await, before);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_terminal_output_conversation_request_falls_back_to_output_until_a_reader_exists() {
+    let harness = harness().await;
+    let service = harness
+        .send_requests()
+        .with_terminal_output(FakeTerminalOutput::new("hello".to_owned()));
+
+    let result = read_terminal_output(
+        service,
+        person(),
+        terminal_output_input("b", "a", "conversation"),
+    )
+    .await
+    .expect("readable");
+
+    assert_eq!(result["usedSource"], "output");
+    assert_eq!(result["fellBack"], true);
+    assert_eq!(result["text"], "hello");
+    harness.shutdown().await;
+}
+
+/// What the real reader returns for terminal output `raw`: the history keeps the last
+/// `raw_window_chars` characters, then `plain_tail` makes plain text of them.
+fn read_like_the_terminal_manager(
+    raw: &str,
+    max_chars: usize,
+) -> crate::send_requests::service::TerminalTail {
+    use crate::send_requests::service::{plain_tail, raw_window_chars};
+    let window = raw_window_chars(max_chars);
+    let count = raw.chars().count();
+    let kept: String = raw.chars().skip(count.saturating_sub(window)).collect();
+    plain_tail(&kept, count > window, max_chars)
+}
+
+#[test]
+fn get_terminal_output_drops_an_osc_payload_whose_start_is_cut_off() {
+    let raw = format!("\u{1b}]0;{}\u{7}OK", "x".repeat(16_000));
+
+    let tail = read_like_the_terminal_manager(&raw, 16_000);
+
+    assert_eq!(tail.text, "OK");
+}
+
+#[test]
+fn get_terminal_output_text_is_plain_text() {
+    let raw = "\u{9b}31mred\u{9b}0m\0a\u{8}b\u{7f}c\td\r\ne\u{85}f";
+
+    let tail = read_like_the_terminal_manager(raw, 16_000);
+
+    assert_eq!(tail.text, "31mred0mabc\td\nef");
+}

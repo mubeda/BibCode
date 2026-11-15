@@ -9,6 +9,7 @@ import type {
   SendRequest,
   SendRequestError,
   SendRequestsGetHandoffTextInput,
+  SendRequestsGetTerminalOutputInput,
   SendRequestsSendInput,
 } from "@bibcode/contracts";
 import { useCallback, useMemo } from "react";
@@ -97,6 +98,19 @@ export function useGetHandoffText(environmentId: EnvironmentId) {
     async (input: SendRequestsGetHandoffTextInput) => {
       const result = await run({ environmentId, input });
       if (result._tag !== "Success") throw new Error("The handoff text could not be read.");
+      return result.value;
+    },
+    [environmentId, run],
+  );
+}
+
+/** An AI Terminal's recent output, as the server reads it; rejects when it cannot be read. */
+export function useGetTerminalOutput(environmentId: EnvironmentId) {
+  const run = useAtomCommand(sendRequestsEnvironment.getTerminalOutput, { reportFailure: false });
+  return useCallback(
+    async (input: SendRequestsGetTerminalOutputInput) => {
+      const result = await run({ environmentId, input });
+      if (result._tag !== "Success") throw new Error("The terminal output could not be read.");
       return result.value;
     },
     [environmentId, run],

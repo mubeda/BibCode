@@ -13,6 +13,8 @@ import {
   SendRequestError,
   SendRequestState,
   SendRequestsGetAnswerResult,
+  SendRequestsGetTerminalOutputInput,
+  SendRequestsGetTerminalOutputResult,
   SendRequestsSendInput,
   SendRequestsStreamEvent,
 } from "./sendRequests.ts";
@@ -23,6 +25,8 @@ const decodeStreamEvent = Schema.decodeUnknownSync(SendRequestsStreamEvent);
 const decodeAnswer = Schema.decodeUnknownSync(SendRequestsGetAnswerResult);
 const decodeError = Schema.decodeUnknownSync(SendRequestError);
 const isAddress = Schema.is(AgentAddress);
+const decodeTerminalOutputInput = Schema.decodeUnknownSync(SendRequestsGetTerminalOutputInput);
+const decodeTerminalOutputResult = Schema.decodeUnknownSync(SendRequestsGetTerminalOutputResult);
 
 const sendInput = {
   requestId: "request-1",
@@ -165,5 +169,36 @@ describe("send request contracts", () => {
       SEND_REQUEST_LEAD_IN_MAX_CHARS,
       SEND_REQUEST_ANSWER_MAX_CHARS,
     ]).toEqual([48_000, 16_000, 48_000]);
+  });
+});
+
+describe("sendRequests.getTerminalOutput", () => {
+  const input = {
+    sourceThreadId: "thread-a",
+    threadId: "thread-a",
+    terminalId: "term-1",
+    source: "conversation",
+    part: "handoff",
+  };
+  const result = {
+    threadId: "thread-a",
+    terminalId: "term-1",
+    text: "$ make test",
+    truncated: false,
+    usedSource: "output",
+    fellBack: true,
+    startMissing: false,
+  };
+
+  it("accepts the input and the result the server sends", () => {
+    expect(decodeTerminalOutputInput(input, strict)).toEqual(input);
+    expect(decodeTerminalOutputResult(result, strict)).toEqual(result);
+  });
+
+  it("refuses an unknown source, an unknown part and a missing terminal", () => {
+    const decode = decodeTerminalOutputInput;
+    expect(() => decode({ ...input, source: "screen" })).toThrow();
+    expect(() => decode({ ...input, part: "everything" })).toThrow();
+    expect(() => decode({ ...input, terminalId: "" })).toThrow();
   });
 });

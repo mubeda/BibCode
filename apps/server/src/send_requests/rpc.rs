@@ -7,7 +7,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::service::{
-    SendRequestsGetHandoffTextInput, SendRequestsSendInput, SendRequestsService, refusal,
+    SendRequestsGetHandoffTextInput, SendRequestsGetTerminalOutputInput, SendRequestsSendInput,
+    SendRequestsService, refusal,
 };
 use crate::rpc::RpcRegistry;
 
@@ -77,6 +78,17 @@ pub(crate) fn register_send_requests_rpc(registry: &mut RpcRegistry, service: Se
             async move {
                 let input = decode::<SendRequestsGetHandoffTextInput>(request.payload)?;
                 encode(service.handoff_text(&context, input).await?)
+            }
+        },
+    );
+    let terminal_output = service.clone();
+    registry.register_unary_with_context(
+        "sendRequests.getTerminalOutput",
+        move |request, context, _| {
+            let service = terminal_output.clone();
+            async move {
+                let input = decode::<SendRequestsGetTerminalOutputInput>(request.payload)?;
+                encode(service.get_terminal_output(&context, input).await?)
             }
         },
     );
