@@ -725,28 +725,39 @@ the Implement check. Restore the line before the full suite.
 The default suite also includes `send-to-agent.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/send-to-agent.e2e.ts`). It runs with **Agent
 messaging** off, against the fixture providers and the Codex Terminal fixture,
-in six cases that share one app session and run in order. The primary thread is
-titled after its project until its first message, then after that message, so
-the spec reads titles from the fixture rather than assuming "main".
+in six cases that share one app session and run in order. Earlier specs of the
+shared session have already sent messages to the primary chat and left panels
+open, so the spec reads the primary chat's title from the preview and builds its
+own agents: a Claude panel and a Codex panel, each titled "Panel: <provider>"
+when made through **Send to agent**.
 
 1. A **Message** from the primary Codex chat to a new Claude panel reaches that
-   panel's provider and the panel labels it "Message, sent from <project>".
-2. With a `[[slow]]` turn running in the Codex chat, a **Message** from the
-   Claude panel shows "Queued for <title>". **Cancel** turns the row into
-   "Cancelled" with **Dismiss** and no **Cancel**, and after the slow turn is
-   released the Codex provider never received the note. **Dismiss** removes the
-   row.
-3. A **Second opinion** from the Claude panel whose note holds `[[slow]]` shows
-   "<title> read it" with **Open**, and no **Dismiss** or **Cancel**.
-4. Once the slow turn is released, the answer notice reads "<title> answered" in
-   the Claude panel and is still there after a reload of the window.
-5. **Bring back** puts the quoted answer in the Claude composer, removes the
+   panel's provider and the panel labels it "Message, sent from <title>" with
+   the title the preview named.
+2. A **Message** from the Claude panel to a new Codex panel starts a `[[slow]]`
+   turn there. A second **Message** to that panel shows "Queued for Panel:
+   Codex". **Cancel** turns the row into "Cancelled" with **Dismiss** and no
+   **Cancel**. A third **Message** queues behind the same turn. After the slow
+   turn is released and the provider has received the third message, the
+   cancelled note was never received. **Dismiss** removes the row.
+3. A **Second opinion** from the Claude panel to the Codex panel, whose note
+   holds `[[slow]]`, shows "Panel: Codex read it" with **Open**, and no
+   **Dismiss** or **Cancel**.
+4. Once the slow turn is released, the answer notice reads "Panel: Codex
+   answered" in the Claude panel and is still there after a reload of the window.
+5. **Bring back** puts "Second opinion from Panel: Codex:" and the answer, quoted
+   with `>`, in the Claude composer (compared without whitespace), removes the
    notice and adds no provider input in the next second.
-6. A Codex Terminal's **Send to agent** sends a **Message** to the busy chat.
-   The **Send requests** button reads "Send requests, 1 request", its popover
-   lists the queued row, **Cancel** shows "Cancelled", and clicking **Dismiss** on
-   the last row removes the button and leaves keyboard focus on **Send to agent**
-   in the same panel.
+6. With a `[[slow]]` turn running in the Codex panel, a Codex Terminal's **Send to
+   agent** sends a **Message** to it. The **Send requests** button reads "Send
+   requests, 1 request", and its popover (the dialog that holds the row) lists
+   "Queued for Panel: Codex". **Cancel** in the popover shows "Cancelled", and
+   clicking **Dismiss** on the last row removes the button and leaves keyboard
+   focus on **Send to agent** in the same panel.
+
+The spec closes the three panels it opened and removes the slow-turn release
+file when it ends. A release file left in the fixture project shows as a change
+in the diff that `pierre-diffs.e2e.ts` reads, which then fails.
 
 The embedded driver's Enter key does not activate a focused button, so case 6
 clicks **Dismiss**. Dismiss with the keyboard alone stays a manual check (step 8
