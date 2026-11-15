@@ -247,8 +247,8 @@ impl TerminalOutputSource for crate::terminal::TerminalManager {
 
 /// How many raw characters to read so `plain_tail` can return `max_chars` of plain text.
 pub(crate) fn raw_window_chars(max_chars: usize) -> usize {
-    // shortcut: an escape sequence longer than the extra window still leaks its payload when
-    // its start is cut off, until the history reader can start a window at a sequence boundary.
+    // The history tail never starts inside an escape sequence, so this window only needs room
+    // for the escapes `plain_tail` removes.
     max_chars.saturating_mul(4)
 }
 

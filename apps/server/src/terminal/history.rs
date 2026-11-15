@@ -294,31 +294,44 @@ impl TerminalHistory {
             pieces.push(piece);
         }
         let mut text: String = pieces.into_iter().rev().collect();
-        let inside = self.cut_sequence_len(&text);
-        text.drain(..inside);
+        let end = match self.cut_sequence_len(&text) {
+            Ok(inside) => {
+                text.drain(..inside);
+                self.total_bytes_written
+            }
+            // A sequence still arriving: an empty window at its ESC, so a read continuing from
+            // the window's end gets the sequence whole.
+            Err(started) => {
+                let end = self.total_bytes_written - (text.len() + started) as u64;
+                text.clear();
+                end
+            }
+        };
         HistoryWindow {
             epoch: self.epoch,
-            start: self.total_bytes_written - text.len() as u64,
-            end: self.total_bytes_written,
+            start: end - text.len() as u64,
+            end,
             text,
             dropped: false,
         }
     }
 
     /// How many leading bytes of `tail`, the end of the retained output, belong to an escape
-    /// sequence that starts before it, so a reader never sees half a sequence as text.
-    fn cut_sequence_len(&self, tail: &str) -> usize {
+    /// sequence that starts before it, so a reader never sees half a sequence as text. A
+    /// sequence that has not ended yet is `Err` with how many bytes before `tail` it starts.
+    fn cut_sequence_len(&self, tail: &str) -> Result<usize, usize> {
         let cut = self.total_bytes - tail.len();
         // shortcut: a sequence started more than this before the cut still leaks its rest;
         // widen the lookback if long OSC payloads (clipboard, images) show up in tails.
         let before = self.retained_range(cut.saturating_sub(ESCAPE_LOOKBACK_BYTES), cut);
         let Some(escape) = before.rfind('\x1b') else {
-            return 0;
+            return Ok(0);
         };
         let started = before.len() - escape;
         let joined = [&before[escape..], tail].concat();
         crate::ansi::escape_end(joined.as_bytes(), 0)
-            .map_or(tail.len(), |end| end.saturating_sub(started))
+            .map(|end| end.saturating_sub(started))
+            .ok_or(started)
     }
 
     /// The retained bytes from `from` to `to`, counted from the oldest retained byte, widened

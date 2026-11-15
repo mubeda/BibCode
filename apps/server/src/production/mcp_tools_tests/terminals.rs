@@ -957,6 +957,33 @@ async fn an_escape_still_arriving_keeps_the_cursor_before_it() {
     fixture.shutdown().await;
 }
 
+/// A tail that would start inside an escape still arriving keeps its cursor at that escape, so
+/// the read after the escape ends strips it whole.
+#[tokio::test]
+async fn a_tail_cut_inside_an_escape_still_arriving_continues_from_the_escape() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("old\u{1b}[38;2;255;");
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "old")
+        .await;
+    let tail = fixture
+        .read(&agent, json!({ "terminalId": terminal_id, "tailChars": 4 }))
+        .await;
+    assert_eq!(tail["text"], "", "{tail}");
+    backend.latest().emit("0;0mRED");
+    let done = fixture
+        .read_until(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": tail["nextCursor"] }),
+            "RED",
+        )
+        .await;
+    assert_eq!(done["text"], "RED", "{done}");
+    fixture.shutdown().await;
+}
+
 #[derive(Clone, Default)]
 struct CapturedLog(Arc<Mutex<Vec<u8>>>);
 
