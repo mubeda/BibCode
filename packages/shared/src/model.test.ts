@@ -10,6 +10,8 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   buildProviderOptionSelectionsFromDescriptors,
+  fallbackModelOption,
+  replacedRetiredCodexModel,
   createModelCapabilities,
   createModelSelection,
   getModelSelectionBooleanOptionValue,
@@ -821,5 +823,62 @@ describe("applyClaudePromptEffortPrefix", () => {
     expect(applyClaudePromptEffortPrefix("Ultrathink: already", "ultrathink")).toBe(
       "Ultrathink: already",
     );
+  });
+});
+
+describe("replacedRetiredCodexModel (#380)", () => {
+  const codex = ProviderInstanceId.make("codex");
+  const sentDefault = { instanceId: codex, model: "auto" };
+
+  it("names the retired model a thread stored when the send replaced it with Codex's default", () => {
+    expect(replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5.4" }, sentDefault)).toBe(
+      "gpt-5.4",
+    );
+    expect(
+      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5.4-mini" }, sentDefault),
+    ).toBe("gpt-5.4-mini");
+    // Through an alias.
+    expect(
+      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5-codex" }, sentDefault),
+    ).toBe("gpt-5.4");
+  });
+
+  it("is null when the stored model is kept, as with API-key sign-in", () => {
+    expect(
+      replacedRetiredCodexModel(
+        { instanceId: codex, model: "gpt-5.4" },
+        { instanceId: codex, model: "gpt-5.4" },
+      ),
+    ).toBeNull();
+  });
+
+  it("is null for a model Codex still runs, no stored model, or another instance", () => {
+    expect(
+      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-6.2-sol" }, sentDefault),
+    ).toBeNull();
+    expect(replacedRetiredCodexModel({ instanceId: codex, model: "auto" }, sentDefault)).toBeNull();
+    expect(replacedRetiredCodexModel(null, sentDefault)).toBeNull();
+    expect(
+      replacedRetiredCodexModel(
+        { instanceId: ProviderInstanceId.make("codex-work"), model: "gpt-5.4" },
+        sentDefault,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("fallbackModelOption (#380)", () => {
+  const option = (slug: string, isCustom = false) => ({ slug, isCustom });
+
+  it("prefers the auto entry wherever a saved order put it", () => {
+    expect(fallbackModelOption([option("gpt-6.2-sol"), option("auto")])?.slug).toBe("auto");
+  });
+
+  it("falls back to the first built-in model, then to the first model", () => {
+    expect(fallbackModelOption([option("mine", true), option("gpt-6.2-sol")])?.slug).toBe(
+      "gpt-6.2-sol",
+    );
+    expect(fallbackModelOption([option("mine", true)])?.slug).toBe("mine");
+    expect(fallbackModelOption([])).toBeNull();
   });
 });

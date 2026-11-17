@@ -256,13 +256,14 @@ describe("packaged Source Control review", () => {
       const stageAll = [...document.querySelectorAll<HTMLElement>("button")].find((button) =>
         button.textContent?.startsWith("Stage All Changes"),
       );
-      const panel = review?.closest<HTMLElement>(".surface-subheader");
-      if (!review || !stageAll || !panel) return null;
+      const header = review?.parentElement;
+      if (!review || !stageAll || !header) return null;
       const bounds = review.getBoundingClientRect();
       return {
         text: review.textContent?.trim(),
         clipped: review.scrollWidth > review.clientWidth,
-        insideHeader: bounds.right <= panel.getBoundingClientRect().right,
+        insideHeader:
+          bounds.right <= header.getBoundingClientRect().right && bounds.right <= window.innerWidth,
         height: bounds.height,
         stageAllHeight: stageAll.getBoundingClientRect().height,
       };

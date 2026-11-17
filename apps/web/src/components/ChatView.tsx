@@ -71,7 +71,11 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
-import { applyClaudePromptEffortPrefix, resolvePromptInjectedEffort } from "@bibcode/shared/model";
+import {
+  applyClaudePromptEffortPrefix,
+  replacedRetiredCodexModel,
+  resolvePromptInjectedEffort,
+} from "@bibcode/shared/model";
 import { canonicalizeLegacyComposerFileReferences } from "@bibcode/shared/composerReferences";
 import { resolveProviderSessionDefault } from "@bibcode/shared/providerSessionDefaults";
 import { CHAT_LIST_ANCHOR_OFFSET } from "@bibcode/shared/chatList";
@@ -6821,6 +6825,21 @@ function ChatViewContent(props: ChatViewProps) {
         });
         if (settingsResult._tag === "Failure") {
           failure = settingsResult;
+        } else {
+          // #380: the thread stored a model Codex retired, and this send replaced it with
+          // Codex's default. The thread now stores that choice, so this shows once.
+          const retiredModel = ctxSelectedModel
+            ? replacedRetiredCodexModel(activeThread?.modelSelection, ctxSelectedModelSelection)
+            : null;
+          if (retiredModel !== null) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "warning",
+                title: `Codex retired ${retiredModel}`,
+                description: "This thread now uses Codex's default model.",
+              }),
+            );
+          }
         }
       }
 

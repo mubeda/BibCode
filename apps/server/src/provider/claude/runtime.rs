@@ -2603,27 +2603,37 @@ impl ClaudeProviderRuntime {
                 .unwrap_or_default(),
             Decision::Accept | Decision::Deny => Vec::new(),
         };
+        // Claude Code before 2.1.207 rejects an allow without `updatedInput`, so the reply echoes
+        // the input Claude asked about.
+        let allow = |session_rules: Option<&[Value]>| {
+            let mut response = json!({ "behavior": "allow" });
+            if let Some(input) = pending.as_ref().map(|pending| &pending.raw["input"])
+                && !input.is_null()
+            {
+                response["updatedInput"] = input.clone();
+            }
+            if let Some(rules) = session_rules {
+                response["updatedPermissions"] = json!(rules);
+            }
+            response
+        };
         let (response, payload) = match decision {
             Decision::Deny => (
-                json!({ "behavior": "deny" }),
+                json!({ "behavior": "deny", "message": "The user denied this tool use." }),
                 json!({ "decision": decision }),
             ),
-            Decision::AcceptForSession if !session_rules.is_empty() => (
-                json!({ "behavior": "allow", "updatedPermissions": session_rules }),
-                json!({ "decision": decision }),
-            ),
+            Decision::AcceptForSession if !session_rules.is_empty() => {
+                (allow(Some(&session_rules)), json!({ "decision": decision }))
+            }
             // No rule to apply: a one-time allow, recorded as one, with the reason.
             Decision::AcceptForSession => (
-                json!({ "behavior": "allow" }),
+                allow(None),
                 json!({
                     "decision": Decision::Accept,
                     "reason": "Claude offered no session rule for this request, so it was approved once.",
                 }),
             ),
-            Decision::Accept => (
-                json!({ "behavior": "allow" }),
-                json!({ "decision": decision }),
-            ),
+            Decision::Accept => (allow(None), json!({ "decision": decision })),
         };
         let events = pending
             .map(|pending| {
@@ -3559,11 +3569,22 @@ fn claude_hook_native_event_id(value: &Value) -> Option<String> {
 /// destination becomes `session`. A suggested mode change is dropped: it would move the session
 /// to another permission mode while the thread still shows the one the person chose.
 fn session_permission_updates(suggestions: &Value) -> Vec<Value> {
+    // Only what "always allow" means: more allow rules and more readable folders. Anything else,
+    // a malformed entry included, is not a rule to apply.
+    let non_empty = |update: &Value, key: &str| {
+        update[key]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    };
     suggestions
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|suggestion| suggestion["type"] != "setMode")
+        .filter(|suggestion| match suggestion["type"].as_str() {
+            Some("addRules") => suggestion["behavior"] == "allow" && non_empty(suggestion, "rules"),
+            Some("addDirectories") => non_empty(suggestion, "directories"),
+            _ => false,
+        })
         .filter_map(|suggestion| {
             let mut update = suggestion.as_object()?.clone();
             update.insert("destination".to_owned(), json!("session"));

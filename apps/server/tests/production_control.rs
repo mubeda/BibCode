@@ -424,10 +424,7 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
     assert_eq!(settings["enableAssistantStreaming"], false);
     assert_eq!(settings["enableProviderUpdateChecks"], false);
     assert_eq!(settings["automaticGitFetchInterval"], 180_000);
-    assert_eq!(
-        settings["textGenerationModelSelection"]["model"],
-        "gpt-5.4-mini"
-    );
+    assert_eq!(settings["textGenerationModelSelection"]["model"], "auto");
     assert_eq!(
         settings["providers"]["codex"]["binaryPath"],
         hermetic_providers::missing_provider_executable(&test_config(directory.path()).state_dir())

@@ -2710,6 +2710,7 @@ fn accept_for_session_applies_the_suggested_rules_to_the_session_only() {
         resolved.response,
         json!({
             "behavior": "allow",
+            "updatedInput": { "command": "touch made.txt" },
             "updatedPermissions": [
                 {
                     "type": "addRules",
@@ -2733,7 +2734,10 @@ fn accept_allows_once_and_adds_no_session_rule() {
     let mut runtime = runtime_with_bash_approval(bash_suggestions());
     let resolved = runtime.resolve_permission_request("request-1", Decision::Accept);
 
-    assert_eq!(resolved.response, json!({ "behavior": "allow" }));
+    assert_eq!(
+        resolved.response,
+        json!({ "behavior": "allow", "updatedInput": { "command": "touch made.txt" } })
+    );
     assert_eq!(resolved.events[0].payload, json!({ "decision": "accept" }));
 }
 
@@ -2742,11 +2746,19 @@ fn accept_for_session_without_a_usable_rule_allows_once_and_says_so() {
     for suggestions in [
         json!([]),
         json!([{ "type": "setMode", "mode": "acceptEdits", "destination": "session" }]),
+        // Malformed or not an allow: none of these is a rule to apply.
+        json!([{}]),
+        json!([{ "type": "addRules", "rules": [], "behavior": "allow" }]),
+        json!([{ "type": "addRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
+        json!([{ "type": "removeRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
     ] {
         let mut runtime = runtime_with_bash_approval(suggestions);
         let resolved = runtime.resolve_permission_request("request-1", Decision::AcceptForSession);
 
-        assert_eq!(resolved.response, json!({ "behavior": "allow" }));
+        assert_eq!(
+            resolved.response,
+            json!({ "behavior": "allow", "updatedInput": { "command": "touch made.txt" } })
+        );
         assert_eq!(
             resolved.events[0].payload,
             json!({
@@ -2762,7 +2774,10 @@ fn deny_refuses_the_tool() {
     let mut runtime = runtime_with_bash_approval(bash_suggestions());
     let resolved = runtime.resolve_permission_request("request-1", Decision::Deny);
 
-    assert_eq!(resolved.response["behavior"], "deny");
+    assert_eq!(
+        resolved.response,
+        json!({ "behavior": "deny", "message": "The user denied this tool use." })
+    );
     assert_eq!(resolved.events[0].payload, json!({ "decision": "deny" }));
 }
 

@@ -1142,7 +1142,8 @@ export default function SourceControlPanel({
     <div className="flex min-w-0 flex-1 items-center gap-2">
       <span className="truncate text-sm font-medium">{status?.refName ?? "Source Control"}</span>
       {vsBaseLabel ? (
-        <span className="shrink-0 text-xs text-muted-foreground">{vsBaseLabel}</span>
+        // Truncates before it can push Review out of a narrow panel.
+        <span className="min-w-0 truncate text-xs text-muted-foreground">{vsBaseLabel}</span>
       ) : null}
       {status?.pr?.state === "open" ? (
         <button

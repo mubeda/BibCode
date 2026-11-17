@@ -108,13 +108,27 @@ Codex's collaboration mode (Plan) requires a model name. For a thread with no
 chosen model BiBCode sends the model Codex reported when it opened the thread,
 and `gpt-6.1-sol` only when Codex reported none.
 
-Codex retired `gpt-5.4` and `gpt-5.4-mini` for ChatGPT sign-in. A thread or a
-saved default that still names one, or the aliases `5.4` and `gpt-5-codex`,
-starts without a model when Codex is signed in with ChatGPT, and the thread
-shows one warning line that names the retired model. The model picker then
-shows **Codex default**, and the next message stores that choice. With API-key
-sign-in the stored model is sent unchanged. Any other model name that Codex
-refuses is passed through, and Codex's own error is shown.
+Codex retired `gpt-5.4` and `gpt-5.4-mini` for ChatGPT sign-in, and its model
+list no longer offers them there. A thread or a saved default that still names
+one, or the aliases `5.4` and `gpt-5-codex`, is handled when it is used:
+
+- In the app, the model picker shows **Codex default** for it. The next message
+  starts without a model, stores that choice on the thread, and shows one notice
+  that names the retired model.
+- A message that does not come from the app (an agent message, an MCP client)
+  starts the session without a model when BiBCode knows Codex is signed in with
+  ChatGPT, and the thread shows a warning line at each such session start until
+  the stored model is changed.
+- A saved default is not rewritten. It is skipped while the list does not offer
+  it.
+
+With API-key sign-in the list still offers the model and the stored choice is
+sent unchanged, with no notice. Before BiBCode has read the sign-in type, and
+for any other model name that Codex refuses, the name is passed through and
+Codex's own error is shown.
+
+Switching a thread from a named model to **Codex default** restarts its Codex
+session, because a running session cannot be told to drop its model.
 
 ## Custom endpoints and secrets
 

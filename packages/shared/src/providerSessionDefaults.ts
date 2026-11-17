@@ -14,6 +14,7 @@ import {
 import {
   buildProviderOptionSelectionsFromDescriptors,
   createModelSelection,
+  fallbackModelOption,
   getProviderCapabilityDescriptors,
   getProviderOptionCurrentValue,
   PROVIDER_EFFORT_OPTION_IDS,
@@ -126,7 +127,7 @@ function getInvariantProviderModel(
 }
 
 function getFallbackModel(models: ReadonlyArray<ServerProviderModel>): ServerProviderModel | null {
-  return models.find((model) => !model.isCustom) ?? models[0] ?? null;
+  return fallbackModelOption(models);
 }
 
 function getProviderDefaultModel(driver: ProviderDriverKind): string {

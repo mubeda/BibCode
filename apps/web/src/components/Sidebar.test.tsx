@@ -209,6 +209,38 @@ staticDescribe("Sidebar global event helpers", () => {
     expect(projectHeaderActionCount({ showsPullRequests: true, showsPipelines: true })).toBe(5);
   });
 
+  // #382: a collapsed card hides the open chat, so that chat is not in the ordered list.
+  it("traverses from the edge when the open chat is not listed", () => {
+    const first = makeThread("first");
+    const second = makeThread("second");
+    const hidden = makeThread("hidden");
+    const navigateToThread = vi.fn();
+    const base = {
+      orderedThreadKeys: [threadKeyOf(first), threadKeyOf(second)],
+      currentThreadKey: threadKeyOf(hidden),
+      jumpThreadKeys: [],
+      threadByKey: new Map([
+        [threadKeyOf(first), first],
+        [threadKeyOf(second), second],
+      ]),
+      navigateToThread,
+    };
+    expect(
+      handleSidebarNavigationKeyDown({
+        ...base,
+        event: navigationEvent(),
+        resolveCommand: () => "thread.next",
+      }),
+    ).toBe(true);
+    expect(navigateToThread).toHaveBeenLastCalledWith(scopeThreadRef(ENV_MAIN, first.id));
+    handleSidebarNavigationKeyDown({
+      ...base,
+      event: navigationEvent(),
+      resolveCommand: () => "thread.previous",
+    });
+    expect(navigateToThread).toHaveBeenLastCalledWith(scopeThreadRef(ENV_MAIN, second.id));
+  });
+
   it("handles traversal and numbered jump shortcuts across every guard", () => {
     const first = makeThread("first");
     const second = makeThread("second");
@@ -735,40 +767,43 @@ staticDescribe("Sidebar full render", () => {
   });
 
   // #382: an explicit collapse hides every descendant, the open chat's card included.
-  staticDescribe.each(["environments", "repositories"] as const)("a collapsed card in %s", (view) => {
-    const collapse = () =>
-      h.uiStore.setState({
-        sidebarView: view,
-        projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+  staticDescribe.each(["environments", "repositories"] as const)(
+    "a collapsed card in %s",
+    (view) => {
+      const collapse = () =>
+        h.uiStore.setState({
+          sidebarView: view,
+          projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+        });
+
+      it("hides the open worktree row and every other card", () => {
+        baseScenario();
+        collapse();
+        const markup = render(<Sidebar />);
+        expect(markup).not.toContain("thread-row-thread-active");
+        expect(markup).not.toContain("thread-row-thread-idle");
+        expect(markup).not.toContain('data-testid="primary-card-project-a"');
       });
 
-    it("hides the open worktree row and every other card", () => {
-      baseScenario();
-      collapse();
-      const markup = render(<Sidebar />);
-      expect(markup).not.toContain("thread-row-thread-active");
-      expect(markup).not.toContain("thread-row-thread-idle");
-      expect(markup).not.toContain('data-testid="primary-card-project-a"');
-    });
+      it("hides the primary card when its chat is the open one", () => {
+        baseScenario();
+        h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
+        collapse();
+        const markup = render(<Sidebar />);
+        expect(markup).not.toContain('data-testid="primary-card-project-a"');
+        expect(markup).not.toContain("more chat");
+      });
 
-    it("hides the primary card when its chat is the open one", () => {
-      baseScenario();
-      h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
-      collapse();
-      const markup = render(<Sidebar />);
-      expect(markup).not.toContain('data-testid="primary-card-project-a"');
-      expect(markup).not.toContain("more chat");
-    });
-
-    it("shows the cards again when expanded", () => {
-      baseScenario();
-      h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
-      h.uiStore.setState({ sidebarView: view });
-      const markup = render(<Sidebar />);
-      expect(markup).toContain('data-testid="primary-card-project-a"');
-      expect(markup).toContain("thread-row-thread-active");
-    });
-  });
+      it("shows the cards again when expanded", () => {
+        baseScenario();
+        h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
+        h.uiStore.setState({ sidebarView: view });
+        const markup = render(<Sidebar />);
+        expect(markup).toContain('data-testid="primary-card-project-a"');
+        expect(markup).toContain("thread-row-thread-active");
+      });
+    },
+  );
 
   it("writes only an environment card's own expansion keys, not the repository row's", () => {
     groupedScenario();

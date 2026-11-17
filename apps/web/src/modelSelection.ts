@@ -9,6 +9,7 @@ import {
 } from "@bibcode/contracts";
 import {
   createModelSelection,
+  fallbackModelOption,
   normalizeModelSlug,
   resolveSelectableModel,
 } from "@bibcode/shared/model";
@@ -253,7 +254,7 @@ export function resolveAppModelSelectionForInstance(
   const options = getAppModelOptionsForInstance(settings, entry);
   return (
     resolveSelectableModel(entry.driverKind, selectedModel, options) ??
-    options[0]?.slug ??
+    fallbackModelOption(options)?.slug ??
     entry.models[0]?.slug ??
     null
   );

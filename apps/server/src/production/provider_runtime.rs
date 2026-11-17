@@ -11069,12 +11069,17 @@ async fn reconcile_model_selection(
             .as_ref()
             .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
         let options_changed = entry.launch.options != target_options;
-        if !model_changed && !options_changed && !launch_only_changed {
+        let model_cleared = codex_model_cleared(
+            &entry.launch.provider,
+            entry.launch.model.as_deref(),
+            target_model.as_deref(),
+        );
+        if !model_changed && !options_changed && !launch_only_changed && !model_cleared {
             return Ok(());
         }
-        if launch_only_changed {
+        if launch_only_changed || model_cleared {
             let mut launch = entry.launch.clone();
-            if model_changed {
+            if model_changed || model_cleared {
                 launch.model.clone_from(&target_model);
             }
             launch.options = target_options;
@@ -11409,6 +11414,15 @@ fn command_thread_id(command: &OrchestrationCommand) -> Option<&str> {
         | OrchestrationCommand::ThreadRevertComplete { thread_id, .. } => Some(thread_id),
         _ => None,
     }
+}
+
+/// Whether a Codex session that names a model was switched to "Codex default" (`auto`).
+///
+/// A running Codex session cannot be told to forget its model, so it restarts without one.
+/// Without the restart the session keeps the named model while the next message's route names
+/// none, and that message is refused.
+fn codex_model_cleared(provider: &str, running: Option<&str>, target: Option<&str>) -> bool {
+    provider == "codex" && running.is_some() && target.is_none()
 }
 
 fn model_from_selection(selection: &Value) -> Option<String> {
@@ -35431,6 +35445,23 @@ done
         );
         driver.shutdown().await.expect("OpenCode should shut down");
         server.abort();
+    }
+
+    #[test]
+    fn switching_a_named_codex_model_to_the_default_restarts_the_session() {
+        assert!(super::codex_model_cleared(
+            "codex",
+            Some("gpt-6.2-sol"),
+            None
+        ));
+        // Nothing to clear, a model change, and providers whose "auto" is a real model.
+        assert!(!super::codex_model_cleared("codex", None, None));
+        assert!(!super::codex_model_cleared("codex", Some("a"), Some("b")));
+        assert!(!super::codex_model_cleared(
+            "cursor",
+            Some("composer-2"),
+            None
+        ));
     }
 
     #[test]

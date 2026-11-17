@@ -8,7 +8,11 @@ import {
   type ServerProvider,
   type ServerProviderModel,
 } from "@bibcode/contracts";
-import { createModelCapabilities, resolveSelectableModel } from "@bibcode/shared/model";
+import {
+  createModelCapabilities,
+  fallbackModelOption,
+  resolveSelectableModel,
+} from "@bibcode/shared/model";
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
@@ -114,10 +118,5 @@ export function getDefaultServerModel(
   provider: ProviderDriverKind,
 ): string {
   const models = getProviderModels(providers, provider);
-  return (
-    models.find((model) => !model.isCustom)?.slug ??
-    models[0]?.slug ??
-    DEFAULT_MODEL_BY_PROVIDER[provider] ??
-    DEFAULT_MODEL
-  );
+  return fallbackModelOption(models)?.slug ?? DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
 }

@@ -839,6 +839,11 @@ pub fn parse_model_list_response(
             .get("model")
             .and_then(Value::as_str)
             .ok_or_else(|| "model entry missing model".to_owned())?;
+        // `auto` is reserved for the entry above: a second row with that slug would give the
+        // picker two choices with one value.
+        if slug == AUTO_MODEL {
+            continue;
+        }
         let display_name = model
             .get("displayName")
             .and_then(Value::as_str)
@@ -1759,6 +1764,19 @@ mod tests {
         assert_eq!(
             models.iter().map(|model| &model.slug).collect::<Vec<_>>(),
             ["auto", "gpt-other", "gpt-6.2-sol"]
+        );
+    }
+
+    #[test]
+    fn a_reported_model_named_auto_does_not_duplicate_the_default_entry() {
+        let models = parse_model_list_response(
+            &json!({ "data": [{ "model": "auto", "isDefault": true }, { "model": "gpt-other" }] }),
+            &["auto".to_owned()],
+        )
+        .expect("model list");
+        assert_eq!(
+            models.iter().map(|model| &model.slug).collect::<Vec<_>>(),
+            ["auto", "gpt-other"]
         );
     }
 

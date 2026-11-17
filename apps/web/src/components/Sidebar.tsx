@@ -517,7 +517,12 @@ export function handleSidebarNavigationKeyDown(input: {
     traversalDirection !== null
       ? resolveAdjacentThreadId({
           threadIds: input.orderedThreadKeys,
-          currentThreadId: input.currentThreadKey,
+          // The open chat is not listed while its card is collapsed: traverse from the edge.
+          currentThreadId:
+            input.currentThreadKey !== null &&
+            input.orderedThreadKeys.includes(input.currentThreadKey)
+              ? input.currentThreadKey
+              : null,
           direction: traversalDirection,
         })
       : (() => {
@@ -3355,7 +3360,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
-          aria-current={moduleRouteActive ? "page" : holdsOpenChatWhileCollapsed ? "true" : undefined}
+          aria-current={
+            moduleRouteActive ? "page" : holdsOpenChatWhileCollapsed ? "true" : undefined
+          }
           data-selected={projectSelected}
           isActive={moduleRouteActive || projectSelected || holdsOpenChatWhileCollapsed}
           size="sm"

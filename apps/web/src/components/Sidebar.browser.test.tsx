@@ -591,7 +591,8 @@ describe("SidebarThreadRow browser interactions", () => {
     const key = derivePhysicalProjectKey(projectA);
     h.uiStore.setState({ projectExpandedById: { [key]: true } });
     const { container, root } = await mount(<Sidebar />);
-    const header = () => container.querySelector<HTMLElement>('[data-mock="SidebarMenuButton"][aria-expanded]')!;
+    const header = () =>
+      container.querySelector<HTMLElement>('[data-mock="SidebarMenuButton"][aria-expanded]')!;
     const cards = () =>
       container.querySelectorAll('[data-testid^="primary-card-"], [data-testid^="thread-row-"]');
     // The harness store does not notify subscribers, so the new state needs a render.

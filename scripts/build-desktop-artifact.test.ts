@@ -426,6 +426,18 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(plan.updaterBundleDir, path.join(release, "bundle", "macos"));
       assert.equal(plan.symbols?.binary, path.join(release, "bibcode-desktop"));
 
+      // The complete caller: a bundle that exists only in the other target folder is copied.
+      yield* fs.makeDirectory(plan.bundleDir, { recursive: true });
+      yield* fs.writeFileString(path.join(plan.bundleDir, "BiBCode_1.2.3_aarch64.dmg"), "dmg");
+      const artifacts = yield* buildTauriDesktopArtifact(
+        { platform: "mac", arch: "arm64", target: "dmg", outputDir: "out", skipBuild: true },
+        { CARGO_TARGET_DIR: cargoTargetDir },
+        { write: () => undefined, host: { platform: "darwin", arch: "arm64" }, repoRoot },
+      );
+      const copied = path.join(repoRoot, "out", "BiBCode_1.2.3_aarch64.dmg");
+      assert.deepStrictEqual(artifacts, [copied]);
+      assert.equal(yield* fs.readFileString(copied), "dmg");
+
       // An empty value means unset, as it does for Cargo.
       const unset = yield* resolveTauriBuildPlan(
         { platform: "mac", target: "dmg", arch: "arm64" },
