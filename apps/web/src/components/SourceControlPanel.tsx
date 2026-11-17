@@ -23,6 +23,7 @@ import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import {
+  BotIcon,
   ChevronDownIcon,
   CloudUploadIcon,
   DownloadIcon,
@@ -30,7 +31,6 @@ import {
   GitCommitIcon,
   ListChecksIcon,
   ListIcon,
-  ScanSearchIcon,
   SparklesIcon,
   SquareIcon,
   Undo2Icon,
@@ -1168,8 +1168,7 @@ export default function SourceControlPanel({
                 aria-disabled={codeReviewButton.disabled}
                 aria-label="Review changes"
                 className={cn("ml-auto shrink-0", codeReviewButton.disabled && "opacity-64")}
-                size="icon-xs"
-                variant="ghost"
+                size="sm"
                 onClick={() => {
                   if (!codeReviewButton.disabled && codeReviewScope) {
                     codeReview.onStart(codeReviewScope);
@@ -1178,7 +1177,8 @@ export default function SourceControlPanel({
               />
             }
           >
-            <ScanSearchIcon aria-hidden="true" className="size-3.5" />
+            <BotIcon aria-hidden="true" />
+            Review
           </TooltipTrigger>
           <TooltipPopup side="bottom">
             {codeReviewButton.reason ?? (

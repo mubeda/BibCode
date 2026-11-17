@@ -248,6 +248,32 @@ describe("packaged Source Control review", () => {
     modifyTrackedFile();
     await openSourceControl();
 
+    // #375: at a narrow window the button keeps its whole "Review" label and is as tall as
+    // Stage All.
+    await setDesktopUiWindowSize(960, 900);
+    const reviewLayout = await browser.execute(() => {
+      const review = document.querySelector<HTMLElement>('button[aria-label="Review changes"]');
+      const stageAll = [...document.querySelectorAll<HTMLElement>("button")].find((button) =>
+        button.textContent?.startsWith("Stage All Changes"),
+      );
+      const panel = review?.closest<HTMLElement>(".surface-subheader");
+      if (!review || !stageAll || !panel) return null;
+      const bounds = review.getBoundingClientRect();
+      return {
+        text: review.textContent?.trim(),
+        clipped: review.scrollWidth > review.clientWidth,
+        insideHeader: bounds.right <= panel.getBoundingClientRect().right,
+        height: bounds.height,
+        stageAllHeight: stageAll.getBoundingClientRect().height,
+      };
+    });
+    expect(reviewLayout).toMatchObject({ text: "Review", clipped: false, insideHeader: true });
+    expect(reviewLayout!.height).toBeGreaterThanOrEqual(reviewLayout!.stageAllHeight);
+    await browser.saveScreenshot(
+      NodePath.join(preparedArtifactDirectory, "review-button-narrow.png"),
+    );
+    await setDesktopUiWindowSize(1_280, 900);
+
     const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
     // The saved reviewer is the default, chat Codex.
     await browser.$('button[aria-label="Review changes"]').click();

@@ -2425,7 +2425,7 @@ operations and amend.
 
 #### Review changes
 
-**Review changes**, the icon button in the Source Control header, starts a code
+**Review**, the button with the bot icon in the Source Control header, starts a code
 review of the checkout the panel shows:
 
 - **Scope.** With commits on the branch that are not on `origin/<default

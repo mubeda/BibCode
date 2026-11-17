@@ -150,6 +150,8 @@ interface CapturedButtonProps {
   "aria-label"?: string;
   "aria-pressed"?: boolean;
   className?: string;
+  size?: string;
+  variant?: string;
 }
 
 interface CapturedMenuItemProps {
@@ -1146,6 +1148,38 @@ describe("SourceControlPanel", () => {
       [...markup.matchAll(/data-testid="tooltip">(.*?)<\/div>/g)].map((match) =>
         match[1]!.replaceAll("&#x27;", "'"),
       );
+
+    it("is a labelled button with Stage All's size and color and a bot icon (#375)", () => {
+      testState.statusQuery.data = stagingStatus({
+        refName: "main",
+        isDefaultRef: true,
+        defaultRefName: "main",
+        aheadOfDefaultCount: 0,
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [UNSTAGED_FILE], insertions: 1, deletions: 0 },
+      });
+      const onStart = vi.fn();
+      const markup = render(reviewProps(null, onStart));
+      const review = reviewButton()!;
+      const stageAll = buttonsByText("Stage All Changes (1)")[0]!;
+
+      expect(flattenText(review.children)).toBe("Review");
+      expect(review.size).toBe("sm");
+      expect(review.size).toBe(stageAll.size);
+      expect(review.variant).toBe(stageAll.variant);
+      expect(markup).toMatch(/<svg[^>]*lucide-bot[^>]*aria-hidden="true"/);
+
+      review.onClick!();
+      expect(onStart).toHaveBeenCalledTimes(1);
+      expect(testState.runStage).not.toHaveBeenCalled();
+    });
+
+    it("stays dimmed while disabled, so it does not look like an enabled Stage All (#375)", () => {
+      testState.statusQuery.data = status();
+      render(reviewProps());
+      expect((reviewButton() as Record<string, unknown>)["aria-disabled"]).toBe(true);
+      expect(reviewButton()!.className).toContain("opacity-64");
+    });
 
     it("is absent without a review handler", () => {
       render(buildProps());
