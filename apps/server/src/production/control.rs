@@ -2699,7 +2699,7 @@ fn apply_settings_defaults(settings: &mut Value) {
             "addProjectBaseDirectory": "",
             "textGenerationModelSelection": {
                 "instanceId": "codex",
-                "model": "gpt-5.4-mini",
+                "model": "auto",
             },
             "providers": crate::server_settings::built_in_provider_defaults(),
             "providerInstances": {},

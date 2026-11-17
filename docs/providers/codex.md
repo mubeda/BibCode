@@ -94,6 +94,28 @@ provider status. Existing-thread model pickers are locked to the Codex driver,
 but must not be treated as proof that every displayed Codex instance can safely
 resume the same provider session. Prefer the instance that created the thread.
 
+## Default model
+
+BiBCode has no built-in Codex model. A thread, an AI Terminal or a setting that
+nobody chose a model for stores `auto`, and BiBCode then starts Codex without
+naming a model, so Codex runs its own recommended one. The model picker lists
+this choice first as **Codex default**, followed by the name of the model that
+Codex's `model/list` marks with `isDefault`, for example **Codex default
+(GPT-6.2-Sol)**. When Codex marks none, or its list cannot be read, the entry
+reads **Codex default**. A model you choose is sent as chosen.
+
+Codex's collaboration mode (Plan) requires a model name. For a thread with no
+chosen model BiBCode sends the model Codex reported when it opened the thread,
+and `gpt-6.1-sol` only when Codex reported none.
+
+Codex retired `gpt-5.4` and `gpt-5.4-mini` for ChatGPT sign-in. A thread or a
+saved default that still names one, or the aliases `5.4` and `gpt-5-codex`,
+starts without a model when Codex is signed in with ChatGPT, and the thread
+shows one warning line that names the retired model. The model picker then
+shows **Codex default**, and the next message stores that choice. With API-key
+sign-in the stored model is sent unchanged. Any other model name that Codex
+refuses is passed through, and Codex's own error is shown.
+
 ## Custom endpoints and secrets
 
 Add account-specific variables in the provider instance's **Environment

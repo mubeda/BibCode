@@ -14598,15 +14598,32 @@ impl ProviderDriverFactory for NativeProviderDriverFactory {
         Box::pin(async move {
             let activity_enabled = self.activity_controller.snapshot().enabled;
             match request.provider.as_str() {
-                "codex" => Ok(Arc::new(
-                    CodexDriver::spawn(
+                "codex" => {
+                    let mut request = request;
+                    let retired_model = match &self.published_inventory {
+                        Some(inventory) => retired_codex_model_for_chatgpt(
+                            &inventory.read().await,
+                            request
+                                .provider_instance_id
+                                .as_deref()
+                                .unwrap_or(&request.provider),
+                            request.model.as_deref(),
+                        ),
+                        None => None,
+                    };
+                    if retired_model.is_some() {
+                        request.model = None;
+                    }
+                    let mut driver = CodexDriver::spawn(
                         request,
                         self.attachments.clone(),
                         self.attribution.clone(),
                         activity_enabled,
                     )
-                    .await?,
-                ) as Arc<dyn ProviderDriver>),
+                    .await?;
+                    driver.retired_model = retired_model;
+                    Ok(Arc::new(driver) as Arc<dyn ProviderDriver>)
+                }
                 "cursor" => Ok(Arc::new(
                     CursorDriver::spawn(
                         request,
@@ -14999,6 +15016,8 @@ struct CodexDriver {
     custom_models: Vec<String>,
     /// The `config.toml` this Codex reads, named when Codex refuses it.
     config_path: String,
+    /// The retired model the thread stored, which this session was started without.
+    retired_model: Option<&'static str>,
 }
 
 fn codex_activity_target_ids(
@@ -15141,6 +15160,7 @@ impl CodexDriver {
             provider_label: request.provider_label,
             custom_models: request.custom_models,
             config_path,
+            retired_model: None,
         })
     }
 
@@ -15271,6 +15291,9 @@ impl ProviderDriver for CodexDriver {
                 .start()
                 .await
                 .map_err(|error| codex_start_error(error, &self.config_path))?;
+            if let Some(model) = self.retired_model {
+                self.runtime.warn(&retired_codex_model_notice(model)).await;
+            }
             Ok(StartedSession {
                 resume_cursor: session
                     .resume_cursor
@@ -19017,6 +19040,30 @@ fn model_offers_boolean_option(model: &Value, option: &str) -> bool {
                     && descriptor.get("type").and_then(Value::as_str) == Some("boolean")
             })
         })
+}
+
+/// The retired model a Codex launch names, when the inventory published for `instance_id` says
+/// that Codex is signed in with ChatGPT. An API-key session still runs these models, and with no
+/// published sign-in the model is passed through, so Codex's own answer is shown.
+fn retired_codex_model_for_chatgpt(
+    inventory: &[Value],
+    instance_id: &str,
+    model: Option<&str>,
+) -> Option<&'static str> {
+    let retired = crate::provider::codex::model::retired_model(model?)?;
+    let auth_type = inventory
+        .iter()
+        .find(|snapshot| snapshot.get("instanceId").and_then(Value::as_str) == Some(instance_id))?
+        .get("auth")?
+        .get("type")?
+        .as_str()?;
+    (auth_type == "chatgpt").then_some(retired)
+}
+
+fn retired_codex_model_notice(model: &str) -> String {
+    format!(
+        "Codex retired {model} for ChatGPT sign-in, so this session uses Codex's default model. Choose a model in the model picker to use another one."
+    )
 }
 
 /// Whether `model` offers the boolean `option` in the inventory published for `instance_id`, or
@@ -35384,6 +35431,42 @@ done
         );
         driver.shutdown().await.expect("OpenCode should shut down");
         server.abort();
+    }
+
+    #[test]
+    fn a_retired_codex_model_is_dropped_only_for_chatgpt_sign_in() {
+        let inventory = |auth: Value| vec![json!({ "instanceId": "codex", "auth": auth })];
+        let chatgpt = inventory(json!({ "status": "authenticated", "type": "chatgpt" }));
+        for (stored, retired) in [("gpt-5.4", "gpt-5.4"), ("gpt-5.4-mini", "gpt-5.4-mini")] {
+            assert_eq!(
+                super::retired_codex_model_for_chatgpt(&chatgpt, "codex", Some(stored)),
+                Some(retired)
+            );
+        }
+        // A model Codex still runs, or none at all, is left alone.
+        for kept in [Some("gpt-6.2-sol"), None] {
+            assert_eq!(
+                super::retired_codex_model_for_chatgpt(&chatgpt, "codex", kept),
+                None
+            );
+        }
+        // An API-key session still runs the model, and an unknown sign-in is not guessed.
+        for auth in [
+            json!({ "status": "authenticated", "type": "apiKey" }),
+            json!({ "status": "authenticated" }),
+            json!({ "status": "unauthenticated" }),
+        ] {
+            assert_eq!(
+                super::retired_codex_model_for_chatgpt(&inventory(auth), "codex", Some("gpt-5.4")),
+                None
+            );
+        }
+        // Another instance's sign-in does not count.
+        assert_eq!(
+            super::retired_codex_model_for_chatgpt(&chatgpt, "codex-work", Some("gpt-5.4")),
+            None
+        );
+        assert!(super::retired_codex_model_notice("gpt-5.4").contains("gpt-5.4"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import {
+  CODEX_AUTO_MODEL,
   ProviderDriverKind,
   TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH,
   type ModelSelection,
@@ -122,7 +123,8 @@ function providerArguments(
 ): ReadonlyArray<string> {
   const model = resolution.modelSelection.model;
   if (driver === ProviderDriverKind.make("codex")) {
-    const args = ["--model", model];
+    // No chosen model: Codex starts with its own recommended one.
+    const args = model === CODEX_AUTO_MODEL ? [] : ["--model", model];
     if (resolution.effort !== null) {
       args.push("--config", `model_reasoning_effort="${resolution.effort}"`);
     }

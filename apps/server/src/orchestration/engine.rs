@@ -4561,7 +4561,7 @@ async fn plan_command(
             let selection = default_model_selection
                 .as_ref()
                 .and_then(|value| value.cloned())
-                .unwrap_or_else(|| json!({"instanceId":"codex","model":"gpt-5.4"}));
+                .unwrap_or_else(|| json!({"instanceId":"codex","model":"auto"}));
             Ok(vec![
                 make_event(
                     "project.created",
@@ -14653,7 +14653,7 @@ mod tests {
             .expect("default thread");
         assert_eq!(
             default_thread.model_selection,
-            json!({"instanceId":"codex","model":"gpt-5.4"})
+            json!({"instanceId":"codex","model":"auto"})
         );
         assert_eq!(
             result.thread_id.as_deref(),

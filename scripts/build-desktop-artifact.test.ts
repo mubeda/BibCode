@@ -411,7 +411,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       yield* fs.makeDirectory(path.join(repoRoot, "apps", "desktop"), { recursive: true });
       yield* fs.writeFileString(
         path.join(repoRoot, "apps", "desktop", "package.json"),
-        JSON.stringify({ version: "1.2.3" }),
+        '{"version":"1.2.3"}',
       );
       const cargoTargetDir = path.resolve(repoRoot, "..", "shared-cargo-target");
       const release = path.join(cargoTargetDir, "aarch64-apple-darwin", "release");

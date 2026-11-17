@@ -90,6 +90,55 @@
     "version": "0.1.1",
     "models": [
       {
+        "slug": "auto",
+        "name": "Codex default",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                }
+              ],
+              "currentValue": "medium"
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": false
+                },
+                {
+                  "id": "priority",
+                  "label": "Priority",
+                  "description": "Priority capacity",
+                  "isDefault": true
+                }
+              ],
+              "currentValue": "priority"
+            }
+          ]
+        }
+      },
+      {
         "slug": "gpt-5.3-codex",
         "name": "GPT-5.3-Codex",
         "isCustom": false,

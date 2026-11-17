@@ -702,7 +702,8 @@ describe("resolveModelSlugForProvider", () => {
 
   it("falls back to the provider default when the model is empty", () => {
     expect(resolveModelSlugForProvider(CLAUDE, null)).toBe("claude-sonnet-5");
-    expect(resolveModelSlugForProvider(CODEX, "")).toBe("gpt-5.4");
+    // Codex has no built-in default model: "auto" names none (#380).
+    expect(resolveModelSlugForProvider(CODEX, "")).toBe("auto");
   });
 
   it("falls back to the global default for an unknown provider", () => {

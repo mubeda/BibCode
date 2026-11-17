@@ -1229,6 +1229,12 @@ impl CodexSessionRuntime {
         Ok(self.inner.session.lock().await.clone())
     }
 
+    /// Shows the person one warning line in the thread.
+    pub async fn warn(&self, message: &str) {
+        self.emit("runtime.warning", None, None, json!({ "message": message }))
+            .await;
+    }
+
     pub async fn refresh_mcp_status(&self) {
         let completion = match self.inner.mcp_status.refresh().await {
             Ok(completion) => completion,
@@ -1292,7 +1298,8 @@ impl CodexSessionRuntime {
             client_user_message_id,
             prompt: input,
             attachments,
-            model: session.model.clone(),
+            model: self.inner.options.model.clone(),
+            reported_model: session.model.clone(),
             service_tier: turn_options.service_tier,
             effort: turn_options.effort,
             interaction_mode,

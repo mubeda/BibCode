@@ -48,7 +48,8 @@ const SOURCES: [(AgentSessionProvider, &str); 2] = [
 ];
 /// Mirrors `DEFAULT_MODEL_BY_PROVIDER` in `packages/contracts/src/model.ts`.
 const CLAUDE_DEFAULT_MODEL: &str = "claude-sonnet-5";
-const CODEX_DEFAULT_MODEL: &str = "gpt-5.4";
+/// No chosen model: Codex runs its own recommended one.
+const CODEX_DEFAULT_MODEL: &str = crate::provider::codex::model::AUTO_MODEL;
 const IMPORTED_RUNTIME_MODE: &str = "full-access";
 const USED_BEFORE_IMPORT: &str =
     "This session's thread was used before its import finished, so it keeps its own conversation.";

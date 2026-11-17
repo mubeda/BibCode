@@ -91,7 +91,7 @@ fn missing_codex_rollout_is_a_recoverable_resume_failure() {
 }
 
 #[test]
-fn automatic_codex_model_resolves_to_the_supported_default() {
+fn automatic_codex_model_names_no_model() {
     let payload = build_turn_start_params(&BuildTurnStartInput {
         thread_id: "provider-thread-1".to_owned(),
         runtime_mode: CodexRuntimeMode::FullAccess,
@@ -99,12 +99,18 @@ fn automatic_codex_model_resolves_to_the_supported_default() {
         prompt: Some("hello".to_owned()),
         attachments: vec![],
         model: Some("auto".to_owned()),
+        reported_model: Some("gpt-6.2-sol".to_owned()),
         service_tier: None,
         effort: None,
         interaction_mode: Some("default".to_owned()),
     });
-    assert_eq!(payload["model"], "gpt-5.4");
-    assert_eq!(payload["collaborationMode"]["settings"]["model"], "gpt-5.4");
+    // "auto" is no chosen model: the turn names none, and the collaboration mode, which requires
+    // a name, takes the one Codex reported for the thread.
+    assert!(payload.get("model").is_none());
+    assert_eq!(
+        payload["collaborationMode"]["settings"]["model"],
+        "gpt-6.2-sol"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -2572,6 +2578,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
                 "url": "data:image/png;base64,abc",
             })],
             model: Some("gpt-5.3-codex".to_owned()),
+            reported_model: None,
             service_tier: None,
             effort: None,
             interaction_mode: Some("default".to_owned()),
@@ -2588,6 +2595,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
             prompt: Some("Make a plan".to_owned()),
             attachments: vec![],
             model: Some("gpt-5.3-codex".to_owned()),
+            reported_model: None,
             service_tier: None,
             effort: Some("medium".to_owned()),
             interaction_mode: Some("plan".to_owned()),
@@ -10892,6 +10900,7 @@ fn codex_edge_turn_params(provider_thread_id: &str, prompt: &str) -> Value {
         prompt: Some(prompt.to_owned()),
         attachments: Vec::new(),
         model: None,
+        reported_model: None,
         service_tier: Some("fast".to_owned()),
         effort: Some("high".to_owned()),
         interaction_mode: None,

@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const DEFAULT_MODEL: &str = "gpt-5.4";
+/// The slug of "no model chosen": Codex then runs its own recommended model.
+pub const AUTO_MODEL: &str = "auto";
+/// Used only where Codex requires a model name and has reported none. A retired model stops a
+/// session at Codex's own question, so the name a person did not choose comes from Codex.
+const FALLBACK_MODEL: &str = "gpt-6.1-sol";
+const AUTO_MODEL_NAME: &str = "Codex default";
 
 const BIBCODE_BROWSER_TOOL_INSTRUCTIONS: &str = r#"
 
@@ -670,8 +675,12 @@ pub struct BuildTurnStartInput {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Value>,
+    /// The model the person chose. `None` or `auto` sends no model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The model Codex reported for the thread, for fields that require a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,7 +750,8 @@ pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
         payload["clientUserMessageId"] = json!(client_user_message_id);
     }
 
-    if let Some(model) = input.model.as_ref().map(|value| resolve_turn_model(value)) {
+    let chosen_model = input.model.as_deref().and_then(chosen_turn_model);
+    if let Some(model) = chosen_model.as_ref() {
         payload["model"] = json!(model);
     }
     if let Some(service_tier) = input.service_tier.as_ref() {
@@ -751,11 +761,11 @@ pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
         payload["effort"] = json!(effort);
     }
     if let Some(mode) = input.interaction_mode.as_ref() {
-        let model = input
-            .model
-            .as_ref()
-            .map(|value| resolve_turn_model(value))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        // The collaboration mode requires a name: the chosen model, else the one Codex reported
+        // for this thread.
+        let model = chosen_model
+            .or_else(|| input.reported_model.clone())
+            .unwrap_or_else(|| FALLBACK_MODEL.to_owned());
         payload["collaborationMode"] = json!({
             "mode": mode,
             "settings": {
@@ -800,7 +810,30 @@ pub fn parse_model_list_response(
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| "model/list response missing data array".to_owned())?;
-    let mut models = Vec::with_capacity(data.len() + custom_models.len());
+    let mut models = Vec::with_capacity(data.len() + custom_models.len() + 1);
+    // "No model chosen" is the first entry, named after the default Codex reports, so the picker
+    // shows what Codex will run and the request names no model.
+    let default_model = data
+        .iter()
+        .find(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true));
+    models.push(CodexProviderModel {
+        slug: AUTO_MODEL.to_owned(),
+        name: default_model
+            .and_then(|model| {
+                model
+                    .get("displayName")
+                    .or_else(|| model.get("model"))
+                    .and_then(Value::as_str)
+            })
+            .map_or_else(
+                || AUTO_MODEL_NAME.to_owned(),
+                |name| format!("{AUTO_MODEL_NAME} ({})", to_display_name(name)),
+            ),
+        is_custom: false,
+        capabilities: default_model
+            .or_else(|| data.first())
+            .map_or(Value::Null, map_model_capabilities),
+    });
     for model in data {
         let slug = model
             .get("model")
@@ -824,6 +857,7 @@ pub fn parse_model_list_response(
         .collect::<std::collections::HashSet<_>>();
     let fallback_capabilities = models
         .iter()
+        .skip(1)
         .find(|model| !model.capabilities.is_null())
         .map(|model| model.capabilities.clone())
         .unwrap_or(Value::Null);
@@ -856,7 +890,7 @@ pub fn fallback_models(
     let model = configured_model
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_MODEL);
+        .unwrap_or(AUTO_MODEL);
     let selected_effort = configured_effort
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -880,7 +914,11 @@ pub fn fallback_models(
         .collect::<Vec<_>>();
     let mut models = vec![json!({
         "slug": model,
-        "name": to_display_name(model),
+        "name": if model == AUTO_MODEL {
+            AUTO_MODEL_NAME.to_owned()
+        } else {
+            to_display_name(model)
+        },
         "isCustom": false,
         "capabilities": {
             "optionDescriptors": [
@@ -1167,12 +1205,23 @@ fn normalize_model_slug(model: &str, preferred_id: Option<&str>) -> String {
     normalized
 }
 
-fn resolve_turn_model(model: &str) -> String {
-    if model.trim().eq_ignore_ascii_case("auto") {
-        DEFAULT_MODEL.to_owned()
-    } else {
-        normalize_model_slug(model, None)
+/// The retired model that `model` names, directly or through an alias.
+///
+/// Codex retired these for sessions signed in with ChatGPT on 31 August 2026. A session that
+/// names one stops at Codex's own "no longer available" question. API-key sessions still run them.
+#[must_use]
+pub fn retired_model(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-5.4" | "5.4" | "gpt-5-codex" => Some("gpt-5.4"),
+        "gpt-5.4-mini" => Some("gpt-5.4-mini"),
+        _ => None,
     }
+}
+
+fn chosen_turn_model(model: &str) -> Option<String> {
+    let model = model.trim();
+    (!model.is_empty() && !model.eq_ignore_ascii_case(AUTO_MODEL))
+        .then(|| normalize_model_slug(model, None))
 }
 
 fn to_display_name(display_name: &str) -> String {
@@ -1578,9 +1627,10 @@ mod tests {
             &[" ".to_owned(), "gpt-test".to_owned(), "custom".to_owned()],
         )
         .expect("fallback model payload should parse");
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].name, "GPT-Test");
-        assert!(models[1].is_custom);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].slug, "auto");
+        assert_eq!(models[1].name, "GPT-Test");
+        assert!(models[2].is_custom);
 
         assert!(parse_skills_list_response(&json!({}), "/workspace").is_err());
         assert!(
@@ -1616,14 +1666,119 @@ mod tests {
             prompt: Some(String::new()),
             attachments: Vec::new(),
             model: None,
+            reported_model: None,
             service_tier: None,
             effort: None,
             interaction_mode: Some("plan".to_owned()),
         });
         assert_eq!(
             turn["collaborationMode"]["settings"]["model"],
-            DEFAULT_MODEL
+            FALLBACK_MODEL
         );
+        assert!(turn.get("model").is_none());
+    }
+
+    fn plan_turn(model: Option<&str>, reported_model: Option<&str>) -> Value {
+        build_turn_start_params(&BuildTurnStartInput {
+            thread_id: "thread".to_owned(),
+            runtime_mode: CodexRuntimeMode::ApprovalRequired,
+            client_user_message_id: None,
+            prompt: Some(String::new()),
+            attachments: Vec::new(),
+            model: model.map(str::to_owned),
+            reported_model: reported_model.map(str::to_owned),
+            service_tier: None,
+            effort: None,
+            interaction_mode: Some("plan".to_owned()),
+        })
+    }
+
+    #[test]
+    fn a_turn_names_no_model_when_none_was_chosen() {
+        for unchosen in [None, Some("auto"), Some(" AUTO "), Some("")] {
+            let turn = plan_turn(unchosen, Some("gpt-reported"));
+            assert!(turn.get("model").is_none(), "{unchosen:?}");
+            // The collaboration mode requires a name: the one Codex reported for the thread.
+            assert_eq!(
+                turn["collaborationMode"]["settings"]["model"],
+                "gpt-reported"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_models_are_recognized_by_name_and_alias() {
+        for (stored, retired) in [
+            ("gpt-5.4", "gpt-5.4"),
+            (" GPT-5.4 ", "gpt-5.4"),
+            ("5.4", "gpt-5.4"),
+            ("gpt-5-codex", "gpt-5.4"),
+            ("gpt-5.4-mini", "gpt-5.4-mini"),
+        ] {
+            assert_eq!(retired_model(stored), Some(retired), "{stored}");
+        }
+        for current in ["auto", "gpt-6.2-sol", "gpt-5.3-codex", "gpt-5.6-sol", ""] {
+            assert_eq!(retired_model(current), None, "{current}");
+        }
+    }
+
+    #[test]
+    fn a_turn_names_the_chosen_model() {
+        let turn = plan_turn(Some("gpt-6-astra"), Some("gpt-reported"));
+        assert_eq!(turn["model"], "gpt-6-astra");
+        assert_eq!(
+            turn["collaborationMode"]["settings"]["model"],
+            "gpt-6-astra"
+        );
+    }
+
+    #[test]
+    fn the_built_in_fallback_is_never_a_retired_model() {
+        let turn = plan_turn(None, None);
+        let fallback = turn["collaborationMode"]["settings"]["model"]
+            .as_str()
+            .expect("fallback model");
+        assert_eq!(fallback, "gpt-6.1-sol");
+        assert!(!["gpt-5.4", "gpt-5.4-mini"].contains(&fallback));
+    }
+
+    #[test]
+    fn the_model_list_starts_with_the_default_codex_reports() {
+        let models = parse_model_list_response(
+            &json!({ "data": [
+                { "model": "gpt-other", "displayName": "GPT Other" },
+                { "model": "gpt-6.2-sol", "displayName": "GPT-6.2-Sol", "isDefault": true },
+            ]}),
+            &[],
+        )
+        .expect("model list");
+        assert_eq!(models[0].slug, "auto");
+        assert_eq!(models[0].name, "Codex default (GPT-6.2-Sol)");
+        assert!(!models[0].is_custom);
+        assert_eq!(models[0].capabilities, models[2].capabilities);
+        assert_eq!(
+            models.iter().map(|model| &model.slug).collect::<Vec<_>>(),
+            ["auto", "gpt-other", "gpt-6.2-sol"]
+        );
+    }
+
+    #[test]
+    fn the_default_entry_names_no_model_when_codex_reports_no_default() {
+        let models = parse_model_list_response(
+            &json!({ "data": [{ "model": "gpt-other", "displayName": "GPT Other" }] }),
+            &[],
+        )
+        .expect("model list");
+        assert_eq!(models[0].slug, "auto");
+        assert_eq!(models[0].name, "Codex default");
+
+        // The list could not be read at all: the same entry, and no retired name.
+        let fallback = fallback_models(None, None, None, &[]);
+        assert_eq!(fallback[0]["slug"], "auto");
+        assert_eq!(fallback[0]["name"], "Codex default");
+        assert!(!fallback.iter().any(|model| {
+            ["gpt-5.4", "gpt-5.4-mini"].contains(&model["slug"].as_str().unwrap_or_default())
+        }));
     }
 
     #[test]
